@@ -117,7 +117,7 @@ jobs:
           fi
 
       - name: Download production Workbench
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: maintainer-workbench
           path: frontend/maintainer-workbench/dist
@@ -142,7 +142,7 @@ jobs:
       contents: write
     steps:
       - name: Download release archives
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: release-assets

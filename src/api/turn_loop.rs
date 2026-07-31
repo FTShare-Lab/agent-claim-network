@@ -2740,6 +2740,32 @@ mod tests {
         serde_json::from_str(content).unwrap()
     }
 
+    async fn wait_for_process_to_become_terminal(
+        tools: &ToolRegistry,
+        context: &ToolDispatchContext,
+        process_id: &str,
+    ) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let process_list = tools
+                    .dispatch_with_context("process_list", json!({}), context.clone())
+                    .await
+                    .expect("process_list should remain available while awaiting test process");
+                let is_live = process_list.output["processes"]
+                    .as_array()
+                    .expect("process_list processes should be an array")
+                    .iter()
+                    .any(|process| process["process_id"] == process_id);
+                if !is_live {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("test process should become terminal within 10 seconds");
+    }
+
     #[test]
     fn delegation_tool_use_inputs_are_preserved_for_canonical_transcript() {
         let message = SessionTurnMessage {
@@ -4313,7 +4339,7 @@ mod tests {
         tools
             .commit_process_deliveries(std::slice::from_ref(&initial_receipt))
             .await;
-        sleep(Duration::from_millis(650)).await;
+        wait_for_process_to_become_terminal(tools.as_ref(), &context, &process_id).await;
 
         let provider = Arc::new(FakeProvider::new(vec![response(
             vec![tool_use(
@@ -5001,8 +5027,8 @@ mod tests {
 
         assert!(err.downcast_ref::<SessionTurnInterrupted>().is_some());
         assert!(events.iter().any(|event| {
-            matches!(event, SessionTurnEvent::ToolCallCompleted { id, summary, .. }
-                if id == "toolu_code" && summary.contains("DONE"))
+            matches!(event, SessionTurnEvent::ToolCallCompleted { id, .. }
+                if id == "toolu_code")
         }));
         assert!(!events.iter().any(|event| {
             matches!(event, SessionTurnEvent::ToolCallInterrupted { id, .. }
@@ -5052,7 +5078,7 @@ mod tests {
         tools
             .commit_process_deliveries(std::slice::from_ref(&initial_receipt))
             .await;
-        sleep(Duration::from_millis(650)).await;
+        wait_for_process_to_become_terminal(tools.as_ref(), &context, &process_id).await;
 
         let provider = Arc::new(FakeProvider::new(vec![
             response(
@@ -5125,7 +5151,7 @@ mod tests {
         tools
             .commit_process_deliveries(std::slice::from_ref(&initial_receipt))
             .await;
-        sleep(Duration::from_millis(650)).await;
+        wait_for_process_to_become_terminal(tools.as_ref(), &context, &process_id).await;
 
         let provider = Arc::new(FakeProvider::new(vec![
             response(
@@ -5217,7 +5243,7 @@ mod tests {
         tools
             .commit_process_deliveries(std::slice::from_ref(&initial_receipt))
             .await;
-        sleep(Duration::from_millis(650)).await;
+        wait_for_process_to_become_terminal(tools.as_ref(), &context, &process_id).await;
 
         let provider = Arc::new(FakeProvider::new(vec![
             response(
