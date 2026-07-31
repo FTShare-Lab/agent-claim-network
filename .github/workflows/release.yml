@@ -52,7 +52,7 @@ jobs:
         run: npm run build
 
       - name: Upload production Workbench
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: maintainer-workbench
           path: frontend/maintainer-workbench/dist
@@ -126,7 +126,7 @@ jobs:
         run: scripts/package_release.sh "${{ matrix.target }}"
 
       - name: Upload release archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
           path: |
