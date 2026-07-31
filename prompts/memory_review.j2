@@ -1,0 +1,7 @@
+请审阅上方最近有效 session 消息窗口，判断是否需要更新 persistent memory。
+
+如果消息窗口以 compact summary 开头，该 summary 只是此前对话的压缩上下文；请结合后续原始消息判断是否有稳定、可复用的 memory 信号。
+
+如需保存、修正、合并、去重或删除 memory entry，只调用 `memory` 工具。
+
+如果没有值得保存或更新的内容，只回复 `Nothing to save.` 并停止。

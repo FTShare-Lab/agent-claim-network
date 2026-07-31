@@ -1,0 +1,169 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate release version
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        run: scripts/check_version_consistency.sh
+
+  frontend:
+    needs: validate
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/maintainer-workbench/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend/maintainer-workbench
+        run: npm ci
+
+      - name: Verify frontend
+        working-directory: frontend/maintainer-workbench
+        run: |
+          npm run lint
+          npm run test
+
+      - name: Build production Workbench
+        working-directory: frontend/maintainer-workbench
+        run: npm run build
+
+      - name: Upload production Workbench
+        uses: actions/upload-artifact@v4
+        with:
+          name: maintainer-workbench
+          path: frontend/maintainer-workbench/dist
+          if-no-files-found: error
+
+  package:
+    needs:
+      - validate
+      - frontend
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain and target
+        run: |
+          rustup toolchain install 1.90 --profile minimal
+          rustup target add --toolchain 1.90 "${{ matrix.target }}"
+
+      - name: Test native target
+        run: |
+          if [[ "${RUNNER_OS}" == "macOS" ]]; then
+            export MACOSX_DEPLOYMENT_TARGET=11.0
+          fi
+          cargo +1.90 test --locked --target "${{ matrix.target }}"
+
+      - name: Build release binaries
+        run: |
+          if [[ "${RUNNER_OS}" == "macOS" ]]; then
+            export MACOSX_DEPLOYMENT_TARGET=11.0
+          fi
+          cargo +1.90 build --release --locked --bins --target "${{ matrix.target }}"
+
+      - name: Verify binary metadata
+        run: |
+          "target/${{ matrix.target }}/release/acn" --version
+          "target/${{ matrix.target }}/release/acn-router" --version
+          "target/${{ matrix.target }}/release/acn-maintainer" --version
+          "target/${{ matrix.target }}/release/acn" --help >/dev/null
+          "target/${{ matrix.target }}/release/acn-router" --help >/dev/null
+          "target/${{ matrix.target }}/release/acn-maintainer" --help >/dev/null
+          file "target/${{ matrix.target }}/release/acn"
+          if [[ "${RUNNER_OS}" == "Linux" ]]; then
+            for binary in acn acn-router acn-maintainer; do
+              if ldd "target/${{ matrix.target }}/release/${binary}" | grep -Eq 'libssl|libcrypto'; then
+                echo "${binary} must not depend on the system OpenSSL runtime" >&2
+                exit 1
+              fi
+            done
+          fi
+
+      - name: Download production Workbench
+        uses: actions/download-artifact@v5
+        with:
+          name: maintainer-workbench
+          path: frontend/maintainer-workbench/dist
+
+      - name: Package release archive
+        run: scripts/package_release.sh "${{ matrix.target }}"
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            target/release-packages/*.tar.gz
+            target/release-packages/*.sha256
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push'
+    needs: package
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@v5
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify release archives
+        working-directory: release-assets
+        run: |
+          sha256sum --check *.sha256
+          cat *.sha256 | sort -k2 > SHA256SUMS
+
+      - name: Create or resume draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          release_state="${RUNNER_TEMP}/acn-release.json"
+          if gh release view "${GITHUB_REF_NAME}" --json isDraft >"${release_state}" 2>/dev/null; then
+            test "$(jq -r .isDraft "${release_state}")" = "true"
+          else
+            gh release create "${GITHUB_REF_NAME}" --draft --verify-tag --generate-notes
+          fi
+          gh release upload "${GITHUB_REF_NAME}" release-assets/* --clobber
+          gh release edit "${GITHUB_REF_NAME}" --draft=false

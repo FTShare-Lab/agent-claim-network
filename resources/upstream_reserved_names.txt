@@ -1,0 +1,7 @@
+data
+skills
+config.toml
+acn.md
+logs
+tmp
+.git

@@ -1,0 +1,15 @@
+stages:
+  - verify
+
+version-consistency:
+  stage: verify
+  image: rust:1.90
+  variables:
+    RUSTUP_TOOLCHAIN: "1.90.0"
+  interruptible: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH'
+  script:
+    - scripts/check_version_consistency.sh

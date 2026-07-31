@@ -1,0 +1,11 @@
+/target
+/data
+/frontend-rebuild
+/.claude/worktrees/
+
+.DS_Store
+.vscode
+CLAUDE.local.md
+
+config.toml
+export_env.sh

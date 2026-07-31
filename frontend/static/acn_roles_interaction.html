@@ -1,0 +1,4449 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Claim Network 角色与知识流转</title>
+  <link rel="icon" href="data:,">
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6fafd;
+      --bg-2: #eaf4fa;
+      --ink: #18243a;
+      --ink-2: #34465e;
+      --muted: #596b83;
+      --line: #d8e3ea;
+      --line-strong: #b6c8d5;
+      --panel: #ffffff;
+      --panel-soft: #eef6fa;
+      --blue: #3376ad;
+      --blue-soft: #e4f1f9;
+      --green: #287d60;
+      --green-soft: #e5f5ee;
+      --rust: #aa513f;
+      --rust-soft: #fbece7;
+      --plum: #7355aa;
+      --plum-soft: #f0ebfa;
+      --amber: #93671f;
+      --amber-soft: #faf1dc;
+      --shadow: 0 14px 36px rgba(41, 78, 104, 0.11), 0 2px 8px rgba(41, 78, 104, 0.045);
+      --shadow-tight: 0 6px 18px rgba(41, 78, 104, 0.085), 0 1px 3px rgba(41, 78, 104, 0.04);
+      --radius: 12px;
+      --radius-sm: 9px;
+      --radius-lg: 14px;
+      --space-1: 4px;
+      --space-2: 8px;
+      --space-3: 12px;
+      --space-4: 16px;
+      --space-5: 24px;
+      --space-6: 32px;
+      --space-7: 48px;
+      --mono: "SFMono-Regular", "Cascadia Code", "Liberation Mono", Consolas, monospace;
+      --sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+      font-family: var(--sans);
+      font-size: 16px;
+      line-height: 1.5;
+      background: var(--bg);
+      color: var(--ink);
+      font-synthesis: none;
+      text-rendering: optimizeLegibility;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      min-height: 100vh;
+      margin: 0;
+      background:
+        var(--bg);
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      pointer-events: none;
+      background-image:
+        linear-gradient(to right, oklch(0.62 0.03 232 / 0.12) 1px, transparent 1px),
+        linear-gradient(to bottom, oklch(0.62 0.03 232 / 0.1) 1px, transparent 1px);
+      background-size: 44px 44px;
+      mask-image: linear-gradient(to bottom, black 0, transparent 72%);
+    }
+
+    a {
+      color: var(--blue);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    button {
+      font: inherit;
+      color: inherit;
+    }
+
+    .skip-link {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      z-index: 20;
+      padding: 10px 14px;
+      border-radius: var(--radius-sm);
+      background: var(--ink);
+      color: white;
+      transform: translateY(-160%);
+      transition: transform 180ms ease-out;
+    }
+
+    .skip-link:focus {
+      transform: translateY(0);
+    }
+
+    .app {
+      display: grid;
+      grid-template-columns: 292px minmax(0, 1fr);
+      gap: var(--space-5);
+      width: min(1500px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: var(--space-5) 0 var(--space-6);
+    }
+
+    .sidebar {
+      position: sticky;
+      top: var(--space-5);
+      align-self: start;
+      display: grid;
+      gap: var(--space-5);
+      min-height: calc(100vh - 48px);
+      padding: var(--space-4);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: oklch(0.99 0.005 220 / 0.82);
+      box-shadow: var(--shadow-tight);
+      backdrop-filter: blur(14px);
+    }
+
+    .brand {
+      display: grid;
+      grid-template-columns: 52px 1fr;
+      gap: var(--space-3);
+      align-items: center;
+    }
+
+    .brand-mark {
+      display: grid;
+      width: 52px;
+      height: 52px;
+      place-items: center;
+      border: 1px solid oklch(0.62 0.08 238 / 0.28);
+      border-radius: var(--radius);
+      background: linear-gradient(145deg, var(--blue-soft), white);
+      color: var(--blue);
+      font-weight: 800;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .brand-title {
+      display: grid;
+      gap: 3px;
+    }
+
+    .brand-title strong {
+      font-size: 18px;
+      line-height: 1.15;
+      text-wrap: balance;
+    }
+
+    .brand-title span {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .brand-copy {
+      margin: 0;
+      color: var(--ink-2);
+      font-size: 14px;
+      line-height: 1.65;
+      text-wrap: pretty;
+    }
+
+    .nav {
+      display: grid;
+      gap: var(--space-2);
+    }
+
+    .nav button {
+      display: grid;
+      grid-template-columns: 32px 1fr;
+      gap: var(--space-3);
+      align-items: center;
+      min-height: 50px;
+      padding: var(--space-2);
+      border: 1px solid transparent;
+      border-radius: var(--radius);
+      background: transparent;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .nav button:hover,
+    .nav button:focus-visible {
+      border-color: var(--line);
+      background: var(--panel-soft);
+      outline: 3px solid oklch(0.48 0.105 238 / 0.18);
+      outline-offset: 0;
+    }
+
+    .nav button[aria-selected="true"] {
+      border-color: oklch(0.48 0.105 238 / 0.24);
+      background: var(--blue-soft);
+      color: var(--blue);
+    }
+
+    .nav-index {
+      display: grid;
+      width: 32px;
+      height: 32px;
+      place-items: center;
+      border-radius: var(--radius-sm);
+      background: var(--ink);
+      color: white;
+      font-family: var(--mono);
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .nav button[aria-selected="true"] .nav-index {
+      background: var(--blue);
+    }
+
+    .nav-label {
+      display: block;
+      color: var(--ink);
+      font-weight: 750;
+      line-height: 1.15;
+    }
+
+    .nav-desc {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .sidebar-note {
+      padding: var(--space-3);
+      border: 1px solid oklch(0.5 0.09 162 / 0.25);
+      border-radius: var(--radius);
+      background: var(--green-soft);
+      color: oklch(0.32 0.055 162);
+      font-size: 13px;
+      line-height: 1.65;
+    }
+
+    .content {
+      min-width: 0;
+    }
+
+    .topline {
+      display: flex;
+      justify-content: space-between;
+      gap: var(--space-5);
+      align-items: end;
+      margin-bottom: var(--space-5);
+      padding: var(--space-5);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: oklch(0.99 0.006 220 / 0.86);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(14px);
+    }
+
+    .topline-main {
+      max-width: 850px;
+    }
+
+    .kicker {
+      display: inline-flex;
+      align-items: center;
+      min-height: 30px;
+      margin-bottom: var(--space-3);
+      padding: 5px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: white;
+      color: var(--blue);
+      font-size: 13px;
+      font-weight: 750;
+    }
+
+    h1,
+    h2,
+    h3,
+    h4 {
+      margin: 0;
+      line-height: 1.16;
+      letter-spacing: 0;
+      text-wrap: balance;
+    }
+
+    h1 {
+      max-width: 780px;
+      font-size: 44px;
+      font-weight: 820;
+    }
+
+    .topline p {
+      max-width: 76ch;
+      margin: var(--space-4) 0 0;
+      color: var(--ink-2);
+      font-size: 16px;
+      line-height: 1.75;
+      text-wrap: pretty;
+    }
+
+    .topline-aside {
+      min-width: 244px;
+      padding: var(--space-4);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+    }
+
+    .topline-aside strong {
+      display: block;
+      margin-bottom: var(--space-2);
+      color: var(--ink);
+      font-size: 15px;
+    }
+
+    .topline-aside p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+
+    .topline-principles {
+      display: grid;
+      gap: var(--space-2);
+      margin: 0;
+      padding-left: 18px;
+      color: var(--ink-2);
+      font-size: 15px;
+      line-height: 1.6;
+    }
+
+    .topline-principles code {
+      font-family: var(--mono);
+      color: var(--ink-2);
+    }
+
+    .page {
+      display: none;
+    }
+
+    .page.active {
+      display: block;
+    }
+
+    .section {
+      margin-top: var(--space-6);
+    }
+
+    .section:first-child {
+      margin-top: 0;
+    }
+
+    .section-head {
+      display: grid;
+      gap: var(--space-2);
+      margin-bottom: var(--space-4);
+    }
+
+    .section-head h2 {
+      font-size: 27px;
+      font-weight: 800;
+    }
+
+    .section-head p {
+      max-width: 82ch;
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.7;
+      text-wrap: pretty;
+    }
+
+    .grid {
+      display: grid;
+      gap: var(--space-4);
+    }
+
+    .grid.two {
+      grid-template-columns: minmax(0, 1fr) minmax(320px, 0.45fr);
+    }
+
+    .grid.three {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: var(--panel);
+      box-shadow: var(--shadow-tight);
+    }
+
+    .panel-pad {
+      padding: var(--space-5);
+    }
+
+    .inspector {
+      min-height: 380px;
+      padding: var(--space-5);
+    }
+
+    .inspector h3 {
+      margin-bottom: var(--space-3);
+      font-size: 21px;
+    }
+
+    .inspector p {
+      margin: 0;
+      color: var(--ink-2);
+      line-height: 1.7;
+      text-wrap: pretty;
+    }
+
+    .inspector ul {
+      margin: var(--space-4) 0 0;
+      padding-left: 19px;
+      color: var(--muted);
+      line-height: 1.72;
+    }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-2);
+      margin-top: var(--space-4);
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      min-height: 30px;
+      padding: 5px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--panel-soft);
+      color: var(--ink-2);
+      font-size: 12px;
+      font-weight: 720;
+    }
+
+    .network-stage {
+      position: relative;
+      min-height: 540px;
+      padding: var(--space-5);
+      overflow: hidden;
+      background:
+        linear-gradient(145deg, oklch(0.99 0.004 220), oklch(0.955 0.016 210));
+    }
+
+    .network-stage::before {
+      content: "";
+      position: absolute;
+      inset: 72px 50px 76px;
+      border: 1px solid oklch(0.48 0.105 238 / 0.12);
+      border-radius: var(--radius-lg);
+      background:
+        linear-gradient(to right, transparent 49.9%, oklch(0.48 0.105 238 / 0.2) 49.9% 50.1%, transparent 50.1%),
+        linear-gradient(to bottom, transparent 49.9%, oklch(0.5 0.09 162 / 0.2) 49.9% 50.1%, transparent 50.1%);
+      pointer-events: none;
+    }
+
+    .stage-label {
+      position: relative;
+      display: flex;
+      justify-content: space-between;
+      gap: var(--space-4);
+      margin-bottom: var(--space-5);
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .server-row,
+    .agent-row {
+      position: relative;
+      display: grid;
+      gap: var(--space-4);
+      z-index: 1;
+    }
+
+    .server-row {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      margin-bottom: 92px;
+    }
+
+    .agent-row {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .node {
+      position: relative;
+      display: grid;
+      gap: var(--space-3);
+      min-height: 168px;
+      padding: var(--space-4);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: oklch(0.99 0.004 220 / 0.94);
+      box-shadow: var(--shadow-tight);
+      text-align: left;
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+
+    .node:hover,
+    .node:focus-visible,
+    .node.active {
+      border-color: var(--line-strong);
+      outline: 3px solid oklch(0.48 0.105 238 / 0.18);
+      outline-offset: 2px;
+    }
+
+    .node[data-role="maintainer"] {
+      background: linear-gradient(150deg, white, var(--rust-soft));
+    }
+
+    .node[data-role="router"] {
+      background: linear-gradient(150deg, white, var(--blue-soft));
+    }
+
+    .node[data-role="agent"] {
+      background: linear-gradient(150deg, white, var(--green-soft));
+    }
+
+    .node-top {
+      display: flex;
+      justify-content: space-between;
+      gap: var(--space-3);
+      align-items: center;
+    }
+
+    .node-mark {
+      display: grid;
+      width: 40px;
+      height: 40px;
+      place-items: center;
+      border-radius: var(--radius-sm);
+      background: var(--ink);
+      color: white;
+      font-weight: 840;
+    }
+
+    .node[data-role="maintainer"] .node-mark {
+      background: var(--rust);
+    }
+
+    .node[data-role="router"] .node-mark {
+      background: var(--blue);
+    }
+
+    .node[data-role="agent"] .node-mark {
+      background: var(--green);
+    }
+
+    .node small {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 760;
+    }
+
+    .node h3,
+    .node-title {
+      display: block;
+      font-size: 20px;
+      font-weight: 760;
+    }
+
+    .node p,
+    .node-copy {
+      display: block;
+      margin: 0;
+      color: var(--ink-2);
+      font-size: 14px;
+      line-height: 1.6;
+      text-wrap: pretty;
+    }
+
+    .flow-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: var(--space-3);
+      margin-top: var(--space-4);
+    }
+
+    .flow-item {
+      padding: var(--space-3);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel-soft);
+      min-height: 96px;
+    }
+
+    .flow-item strong {
+      display: block;
+      margin-bottom: var(--space-2);
+      color: var(--ink);
+      font-size: 14px;
+    }
+
+    .flow-item span {
+      display: block;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .principles {
+      display: grid;
+      grid-template-columns: 1.1fr 1fr 1fr;
+      gap: var(--space-4);
+    }
+
+    .principle {
+      padding: var(--space-5);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: var(--panel);
+    }
+
+    .principle strong {
+      display: block;
+      margin-bottom: var(--space-3);
+      font-size: 18px;
+    }
+
+    .principle p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.7;
+      text-wrap: pretty;
+    }
+
+    .tab-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-2);
+      margin-bottom: var(--space-4);
+    }
+
+    .tab-row button {
+      min-height: 44px;
+      padding: 8px 14px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--panel);
+      color: var(--ink-2);
+      font-weight: 760;
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+
+    .tab-row button:hover,
+    .tab-row button:focus-visible {
+      outline: 3px solid oklch(0.48 0.105 238 / 0.18);
+      outline-offset: 2px;
+    }
+
+    .tab-row button[aria-selected="true"] {
+      border-color: oklch(0.48 0.105 238 / 0.3);
+      background: var(--blue);
+      color: white;
+    }
+
+    .quickstart-view {
+      display: none;
+    }
+
+    .quickstart-view.active {
+      display: block;
+    }
+
+    .quickstart-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 0.82fr) minmax(420px, 0.58fr);
+      gap: var(--space-4);
+      align-items: stretch;
+    }
+
+    .quickstart-card {
+      padding: var(--space-5);
+    }
+
+    .quickstart-card.hero {
+      display: grid;
+      align-content: start;
+      gap: var(--space-4);
+      background:
+        linear-gradient(145deg, oklch(0.995 0.003 218), oklch(0.94 0.022 224));
+      overflow: hidden;
+    }
+
+    .quickstart-kicker {
+      width: max-content;
+      padding: 5px 10px;
+      border-radius: 999px;
+      background: var(--blue-soft);
+      color: var(--blue);
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .quickstart-card h3 {
+      font-size: 23px;
+      line-height: 1.2;
+      text-wrap: balance;
+    }
+
+    .quickstart-card p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.72;
+      text-wrap: pretty;
+    }
+
+    .setup-list {
+      display: grid;
+      gap: var(--space-3);
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .setup-list li {
+      display: grid;
+      grid-template-columns: 42px minmax(0, 1fr);
+      gap: var(--space-3);
+      padding: var(--space-3);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel-soft);
+    }
+
+    .setup-list b {
+      display: grid;
+      width: 42px;
+      height: 42px;
+      place-items: center;
+      border-radius: var(--radius-sm);
+      background: var(--ink);
+      color: white;
+      font-family: var(--mono);
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .setup-list strong {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--ink);
+      font-size: 15px;
+    }
+
+    .setup-list span {
+      display: block;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+      text-wrap: pretty;
+    }
+
+    .quickstart-code pre {
+      min-height: 424px;
+    }
+
+    .quickstart-strip {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: var(--space-3);
+      margin-top: var(--space-4);
+    }
+
+    .quickstart-mini {
+      min-height: 140px;
+      padding: var(--space-4);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+    }
+
+    .quickstart-mini code {
+      display: inline-block;
+      margin-bottom: var(--space-3);
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: var(--green-soft);
+      color: var(--green);
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 760;
+    }
+
+    .quickstart-mini strong {
+      display: block;
+      margin-bottom: var(--space-2);
+      font-size: 16px;
+    }
+
+    .quickstart-mini p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.62;
+      text-wrap: pretty;
+    }
+
+    .difference-board {
+      display: grid;
+      gap: var(--space-4);
+    }
+
+    .difference-lead {
+      padding: var(--space-5);
+      border: 1px solid oklch(0.51 0.085 48 / 0.24);
+      border-radius: var(--radius-lg);
+      background: linear-gradient(135deg, var(--rust-soft), oklch(0.99 0.004 220));
+    }
+
+    .difference-lead h3 {
+      margin-bottom: var(--space-2);
+      font-size: 23px;
+      line-height: 1.2;
+    }
+
+    .difference-lead p {
+      max-width: 88ch;
+      margin: 0;
+      color: var(--ink-2);
+      line-height: 1.75;
+      text-wrap: pretty;
+    }
+
+    .difference-not {
+      padding: var(--space-4) var(--space-5);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: var(--paper);
+    }
+
+    .difference-not strong {
+      display: block;
+      margin-bottom: var(--space-2);
+      color: var(--ink-1);
+      font-size: 13px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .difference-not ul {
+      margin: 0;
+      padding-left: 1.15em;
+      color: var(--ink-2);
+      line-height: 1.7;
+    }
+
+    .difference-not li + li {
+      margin-top: 0.35em;
+    }
+
+    .difference-cards {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: var(--space-3);
+    }
+
+    .fit-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: var(--space-3);
+    }
+
+    .fit-card {
+      padding: var(--space-5);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: var(--panel);
+      box-shadow: var(--shadow-tight);
+    }
+
+    .fit-card h3 {
+      margin-bottom: var(--space-3);
+      font-size: 20px;
+    }
+
+    .fit-card p {
+      margin: 0 0 var(--space-3);
+      color: var(--ink-2);
+      line-height: 1.7;
+      text-wrap: pretty;
+    }
+
+    .fit-card ul {
+      display: grid;
+      gap: var(--space-2);
+      margin: 0;
+      padding-left: 18px;
+      color: var(--muted);
+      line-height: 1.65;
+    }
+
+    .difference-card {
+      padding: var(--space-4);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+    }
+
+    .difference-card code {
+      display: inline-block;
+      margin-bottom: var(--space-3);
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: var(--plum-soft);
+      color: var(--plum);
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 760;
+    }
+
+    .difference-card h3 {
+      margin-bottom: var(--space-2);
+      font-size: 18px;
+    }
+
+    .difference-card p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.65;
+      text-wrap: pretty;
+    }
+
+    .phase-board {
+      display: grid;
+      gap: var(--space-3);
+      padding: var(--space-4);
+    }
+
+    .lane-head,
+    .phase-row {
+      display: grid;
+      grid-template-columns: 130px repeat(3, minmax(0, 1fr));
+      gap: var(--space-3);
+    }
+
+    .lane-head div,
+    .phase-label,
+    .phase-cell {
+      min-height: 72px;
+      border-radius: var(--radius);
+    }
+
+    .lane-head div {
+      display: grid;
+      place-items: center;
+      background: var(--panel-soft);
+      color: var(--muted);
+      font-size: 15px;
+      font-weight: 820;
+      text-align: center;
+    }
+
+    .phase-label {
+      display: grid;
+      align-content: center;
+      padding: var(--space-3);
+      background: var(--ink);
+      color: white;
+      font-family: var(--mono);
+      font-size: 15px;
+      font-weight: 760;
+      line-height: 1.5;
+    }
+
+    .phase-cell {
+      padding: var(--space-3);
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.65;
+    }
+
+    .phase-cell strong {
+      display: block;
+      margin-bottom: 5px;
+      color: var(--ink);
+      font-size: 14px;
+    }
+
+    .phase-row.active .phase-cell {
+      border-color: oklch(0.48 0.105 238 / 0.26);
+      background: var(--blue-soft);
+      color: var(--ink-2);
+    }
+
+    .role-sheet {
+      padding: var(--space-5);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: var(--panel);
+      min-height: 250px;
+    }
+
+    .role-sheet h3 {
+      margin-bottom: var(--space-3);
+      font-size: 20px;
+    }
+
+    .role-sheet p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.7;
+      text-wrap: pretty;
+    }
+
+    .role-list {
+      margin: var(--space-4) 0 0;
+      padding: 0;
+      list-style: none;
+      display: grid;
+      gap: var(--space-2);
+    }
+
+    .role-list li {
+      display: grid;
+      grid-template-columns: 10px 1fr;
+      gap: var(--space-2);
+      color: var(--ink-2);
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    .role-list li::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      margin-top: 8px;
+      border-radius: 50%;
+      background: var(--blue);
+    }
+
+    .comparison-lead {
+      display: grid;
+      grid-template-columns: minmax(0, 0.92fr) minmax(360px, 1fr);
+      gap: var(--space-4);
+      align-items: stretch;
+    }
+
+    .comparison-statement {
+      min-height: 260px;
+      padding: var(--space-5);
+      border: 1px solid oklch(0.45 0.09 232 / 0.2);
+      border-radius: var(--radius-lg);
+      background:
+        linear-gradient(145deg, oklch(0.995 0.003 218), var(--blue-soft));
+      box-shadow: var(--shadow-tight);
+    }
+
+    .comparison-statement h3 {
+      margin-bottom: var(--space-3);
+      font-size: 24px;
+    }
+
+    .comparison-statement p {
+      margin: 0;
+      color: var(--ink-2);
+      line-height: 1.75;
+      text-wrap: pretty;
+    }
+
+    .comparison-statement p + p {
+      margin-top: var(--space-4);
+    }
+
+    .comparison-route {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: var(--space-3);
+    }
+
+    .comparison-step {
+      display: grid;
+      align-content: start;
+      gap: var(--space-2);
+      min-height: 162px;
+      padding: var(--space-4);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      box-shadow: var(--shadow-tight);
+    }
+
+    .comparison-step code {
+      width: max-content;
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: var(--panel-soft);
+      color: var(--ink-2);
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 760;
+    }
+
+    .comparison-step strong {
+      font-size: 16px;
+    }
+
+    .comparison-step span {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+      text-wrap: pretty;
+    }
+
+    .comparison-step:nth-child(1) {
+      border-color: oklch(0.48 0.075 160 / 0.25);
+      background: var(--green-soft);
+    }
+
+    .comparison-step:nth-child(2) {
+      border-color: oklch(0.45 0.09 232 / 0.24);
+      background: var(--blue-soft);
+    }
+
+    .comparison-step:nth-child(3) {
+      border-color: oklch(0.51 0.085 48 / 0.25);
+      background: var(--rust-soft);
+    }
+
+    .advantage-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: var(--space-4);
+    }
+
+    .advantage-card {
+      display: grid;
+      align-content: start;
+      gap: var(--space-3);
+      min-height: 268px;
+      padding: var(--space-5);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: var(--panel);
+      box-shadow: var(--shadow-tight);
+    }
+
+    .advantage-card code {
+      display: inline-flex;
+      align-items: center;
+      width: max-content;
+      height: 30px;
+      padding: 0 9px;
+      border-radius: 999px;
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 780;
+      line-height: 1;
+    }
+
+    .advantage-card h3 {
+      font-size: 19px;
+    }
+
+    .advantage-card p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.7;
+      text-wrap: pretty;
+    }
+
+    .advantage-card ul {
+      display: grid;
+      gap: var(--space-2);
+      margin: 0;
+      padding-left: 18px;
+      color: var(--ink-2);
+      font-size: 13px;
+      line-height: 1.58;
+    }
+
+    .advantage-card.autonomy code {
+      background: var(--green-soft);
+      color: var(--green);
+    }
+
+    .advantage-card.dispute-card code {
+      background: var(--plum-soft);
+      color: var(--plum);
+    }
+
+    .advantage-card.provenance code {
+      background: var(--blue-soft);
+      color: var(--blue);
+    }
+
+    .advantage-card.governance code {
+      background: var(--rust-soft);
+      color: var(--rust);
+    }
+
+    .matrix {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border-radius: var(--radius-lg);
+      background: var(--panel);
+      font-size: 14px;
+    }
+
+    .matrix th,
+    .matrix td {
+      padding: var(--space-4);
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+      text-align: left;
+      line-height: 1.62;
+    }
+
+    .matrix th {
+      background: var(--panel-soft);
+      color: var(--ink);
+      font-weight: 820;
+    }
+
+    .matrix tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .workbench-grid {
+      display: grid;
+      grid-template-columns: 0.72fr 1fr;
+      gap: var(--space-4);
+      align-items: start;
+    }
+
+    .workbench-menu {
+      display: grid;
+      gap: var(--space-3);
+    }
+
+    .workbench-menu button {
+      display: grid;
+      gap: var(--space-2);
+      min-height: 96px;
+      padding: var(--space-4);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      text-align: left;
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+
+    .workbench-menu button:hover,
+    .workbench-menu button:focus-visible {
+      outline: 3px solid oklch(0.48 0.105 238 / 0.18);
+      outline-offset: 2px;
+    }
+
+    .workbench-menu button[aria-selected="true"] {
+      border-color: oklch(0.55 0.115 42 / 0.34);
+      background: var(--rust-soft);
+    }
+
+    .workbench-menu strong {
+      font-size: 17px;
+    }
+
+    .workbench-menu span {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .console-panel {
+      padding: var(--space-5);
+      background:
+        linear-gradient(180deg, oklch(0.26 0.035 238), oklch(0.19 0.035 238));
+      color: oklch(0.95 0.01 220);
+      min-height: 470px;
+      border-color: oklch(0.32 0.035 238);
+    }
+
+    .console-panel h3 {
+      margin-bottom: var(--space-3);
+      font-size: 24px;
+    }
+
+    .console-panel p {
+      margin: 0;
+      color: oklch(0.82 0.018 226);
+      line-height: 1.72;
+      text-wrap: pretty;
+    }
+
+    .console-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: var(--space-3);
+      margin-top: var(--space-5);
+    }
+
+    .console-box {
+      min-height: 132px;
+      padding: var(--space-4);
+      border: 1px solid oklch(0.62 0.03 230 / 0.28);
+      border-radius: var(--radius);
+      background: oklch(0.3 0.035 238 / 0.72);
+    }
+
+    .console-box strong {
+      display: block;
+      margin-bottom: var(--space-2);
+      color: white;
+      font-size: 14px;
+    }
+
+    .console-box span {
+      display: block;
+      color: oklch(0.82 0.018 226);
+      font-size: 14px;
+      line-height: 1.62;
+    }
+
+    .console-box a {
+      color: oklch(0.9 0.035 80);
+      font-weight: 780;
+      text-decoration: none;
+      overflow-wrap: anywhere;
+    }
+
+    .console-box a:hover {
+      text-decoration: underline;
+    }
+
+    .object-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: var(--space-3);
+    }
+
+    .object-card {
+      display: grid;
+      gap: var(--space-3);
+      min-height: 148px;
+      padding: var(--space-4);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      text-align: left;
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+
+    .object-card:hover,
+    .object-card:focus-visible,
+    .object-card.active {
+      outline: 3px solid oklch(0.47 0.08 310 / 0.18);
+      outline-offset: 2px;
+      border-color: oklch(0.47 0.08 310 / 0.28);
+    }
+
+    .object-card code {
+      justify-self: start;
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: var(--plum-soft);
+      color: var(--plum);
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+
+    .object-card strong {
+      font-size: 17px;
+    }
+
+    .object-card span {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .panel.object-flow-board {
+      padding: var(--space-5);
+      overflow: hidden;
+      background:
+        linear-gradient(150deg, oklch(0.99 0.004 220), oklch(0.958 0.017 206));
+    }
+
+    .object-flow-top {
+      display: flex;
+      justify-content: space-between;
+      gap: var(--space-4);
+      align-items: start;
+      margin-bottom: var(--space-4);
+    }
+
+    .object-flow-top h3 {
+      font-size: 21px;
+    }
+
+    .object-flow-top p {
+      max-width: 74ch;
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.7;
+      text-wrap: pretty;
+    }
+
+    .object-lanes {
+      display: grid;
+      gap: var(--space-3);
+    }
+
+    .object-lane {
+      display: grid;
+      grid-template-columns: 178px minmax(0, 1fr);
+      gap: var(--space-3);
+      align-items: stretch;
+    }
+
+    .lane-type,
+    .lane-steps li {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: oklch(0.995 0.003 220 / 0.94);
+    }
+
+    .lane-type {
+      display: grid;
+      align-content: center;
+      gap: var(--space-2);
+      padding: var(--space-3);
+    }
+
+    .lane-type code {
+      width: max-content;
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: var(--plum-soft);
+      color: var(--plum);
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 760;
+    }
+
+    .lane-type strong {
+      font-size: 17px;
+    }
+
+    .lane-type span {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .lane-steps {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: var(--space-3);
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .lane-steps li {
+      position: relative;
+      min-height: 112px;
+      padding: var(--space-3);
+    }
+
+    .lane-steps li:not(:last-child)::after {
+      content: "";
+      position: absolute;
+      top: 50%;
+      right: -12px;
+      width: 12px;
+      height: 2px;
+      background: oklch(0.58 0.035 220 / 0.46);
+      transform: translateY(-50%);
+    }
+
+    .lane-steps b {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--ink);
+      font-size: 13px;
+    }
+
+    .lane-steps span {
+      display: block;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.58;
+      text-wrap: pretty;
+    }
+
+    .object-lane.claim .lane-type,
+    .object-lane.claim .lane-steps li {
+      border-color: oklch(0.48 0.105 238 / 0.22);
+      background: var(--blue-soft);
+    }
+
+    .object-lane.policy .lane-type,
+    .object-lane.policy .lane-steps li {
+      border-color: oklch(0.55 0.115 42 / 0.24);
+      background: var(--rust-soft);
+    }
+
+    .object-lane.dispute .lane-type,
+    .object-lane.dispute .lane-steps li {
+      border-color: oklch(0.43 0.072 292 / 0.24);
+      background: var(--plum-soft);
+    }
+
+    .object-lane.memory .lane-type,
+    .object-lane.memory .lane-steps li {
+      border-color: oklch(0.5 0.09 162 / 0.24);
+      background: var(--green-soft);
+    }
+
+    .code-panel {
+      overflow: hidden;
+      background: oklch(0.18 0.035 238);
+      color: oklch(0.93 0.01 220);
+    }
+
+    .code-head {
+      display: flex;
+      justify-content: space-between;
+      gap: var(--space-3);
+      align-items: center;
+      padding: var(--space-3) var(--space-4);
+      border-bottom: 1px solid oklch(0.42 0.035 238 / 0.45);
+      color: oklch(0.78 0.018 226);
+      font-size: 13px;
+      font-weight: 750;
+    }
+
+    pre {
+      min-height: 355px;
+      margin: 0;
+      padding: var(--space-4);
+      overflow: auto;
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.65;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .memory-map {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: var(--space-4);
+    }
+
+    .memory-box {
+      padding: var(--space-5);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: var(--panel);
+    }
+
+    .memory-box:nth-child(2) {
+      border-color: oklch(0.5 0.09 162 / 0.28);
+      background: var(--green-soft);
+    }
+
+    .memory-box h3 {
+      margin-bottom: var(--space-3);
+      font-size: 19px;
+    }
+
+    .memory-subgrid {
+      display: grid;
+      gap: var(--space-3);
+      margin-top: var(--space-4);
+    }
+
+    .memory-subbox {
+      padding: var(--space-4);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel-soft);
+    }
+
+    .memory-subbox h4 {
+      margin-bottom: var(--space-2);
+      font-size: 16px;
+    }
+
+    .memory-box p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.7;
+      text-wrap: pretty;
+    }
+
+    .memory-box ul {
+      margin: var(--space-4) 0 0;
+      padding-left: 19px;
+      color: var(--muted);
+      line-height: 1.72;
+    }
+
+    .panel.memory-session {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: var(--space-3);
+      padding: var(--space-5);
+      background:
+        linear-gradient(145deg, oklch(0.99 0.004 220), oklch(0.955 0.016 210));
+    }
+
+    .memory-session-card {
+      padding: var(--space-4);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+    }
+
+    .memory-session-card h3 {
+      margin-bottom: var(--space-2);
+      font-size: 18px;
+    }
+
+    .memory-session-card p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.68;
+      text-wrap: pretty;
+    }
+
+    .memory-session-card ul {
+      display: grid;
+      gap: var(--space-2);
+      margin: 0;
+      padding-left: 19px;
+      color: var(--muted);
+      line-height: 1.68;
+      text-wrap: pretty;
+    }
+
+    .example-grid {
+      display: grid;
+      grid-template-columns: 0.78fr 1fr;
+      gap: var(--space-4);
+    }
+
+    .example-reading-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: var(--space-3);
+      margin-bottom: var(--space-4);
+    }
+
+    .example-reading-note {
+      min-height: 112px;
+      padding: var(--space-4);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(255, 255, 255, 0.86);
+    }
+
+    .example-reading-note code {
+      display: block;
+      width: max-content;
+      margin-bottom: var(--space-2);
+      color: var(--blue);
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .example-reading-note strong {
+      display: block;
+      margin-bottom: var(--space-2);
+      font-size: 15px;
+    }
+
+    .example-reading-note span {
+      display: block;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.58;
+      text-wrap: pretty;
+    }
+
+    .story-list {
+      display: grid;
+      gap: var(--space-3);
+    }
+
+    .detail-grid {
+      margin-top: var(--space-4);
+    }
+
+    .story-step {
+      display: grid;
+      grid-template-columns: 42px 1fr;
+      gap: var(--space-3);
+      min-height: 108px;
+      padding: var(--space-3);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      text-align: left;
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+
+    .story-step:hover,
+    .story-step:focus-visible,
+    .story-step.active {
+      outline: 3px solid oklch(0.63 0.12 82 / 0.2);
+      outline-offset: 2px;
+      border-color: oklch(0.63 0.12 82 / 0.32);
+      background: var(--amber-soft);
+    }
+
+    .story-step .step-no {
+      display: grid;
+      width: 42px;
+      height: 42px;
+      place-items: center;
+      border-radius: var(--radius-sm);
+      background: var(--green);
+      color: white;
+      font-family: var(--mono);
+      font-weight: 840;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .story-step strong {
+      display: block;
+      margin-bottom: var(--space-1);
+      font-size: 15px;
+    }
+
+    .story-step .story-actor {
+      display: block;
+      margin-bottom: 5px;
+      color: var(--blue);
+      font-family: var(--mono);
+      font-size: 10px;
+      font-weight: 820;
+      letter-spacing: 0.06em;
+      line-height: 1.35;
+      text-transform: uppercase;
+    }
+
+    .story-step span {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .inspector .story-detail-eyebrow {
+      margin-bottom: var(--space-2);
+      color: var(--blue);
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 820;
+      letter-spacing: 0.07em;
+      line-height: 1.4;
+      text-transform: uppercase;
+    }
+
+    .inspector .story-detail-lead {
+      color: var(--ink-2);
+      font-size: 15px;
+      line-height: 1.75;
+    }
+
+    .story-detail-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: var(--space-3);
+      margin-top: var(--space-4);
+    }
+
+    .story-detail-block {
+      min-height: 128px;
+      padding: var(--space-4);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel-soft);
+    }
+
+    .story-detail-block strong {
+      display: block;
+      margin-bottom: var(--space-2);
+      color: var(--ink);
+      font-size: 13px;
+    }
+
+    .story-detail-block span {
+      display: block;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.62;
+      text-wrap: pretty;
+    }
+
+    .story-route {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 22px minmax(0, 1fr) 22px minmax(0, 1fr);
+      gap: var(--space-2);
+      align-items: stretch;
+      margin-top: var(--space-4);
+      padding: var(--space-3);
+      border: 1px solid rgba(57, 127, 188, 0.16);
+      border-radius: var(--radius);
+      background: linear-gradient(145deg, #f7fbfe, #edf7fc);
+    }
+
+    .story-route-node {
+      min-width: 0;
+      padding: var(--space-3);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.9);
+    }
+
+    .story-route-node small {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 10px;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+    }
+
+    .story-route-node code,
+    .story-route-node strong {
+      display: block;
+      color: var(--ink);
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 760;
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+    }
+
+    .story-route-arrow {
+      display: grid;
+      place-items: center;
+      color: var(--blue);
+      font-size: 17px;
+      font-weight: 840;
+    }
+
+    .evidence-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: var(--space-4);
+    }
+
+    .evidence {
+      min-height: 178px;
+      padding: var(--space-5);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: var(--panel);
+    }
+
+    .evidence h3 {
+      margin-bottom: var(--space-3);
+      font-size: 18px;
+    }
+
+    .evidence p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.65;
+      text-wrap: pretty;
+    }
+
+    .evidence code {
+      display: inline-block;
+      margin-top: var(--space-3);
+      padding: 5px 8px;
+      border-radius: var(--radius-sm);
+      background: var(--panel-soft);
+      color: var(--ink-2);
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+
+    .evidence a {
+      display: inline-block;
+      margin-top: var(--space-3);
+      padding: 5px 8px;
+      border-radius: var(--radius-sm);
+      background: var(--panel-soft);
+      color: var(--blue);
+      font-family: var(--mono);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+
+    .source-list {
+      display: grid;
+      gap: var(--space-3);
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .source-list li {
+      padding: var(--space-4);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      color: var(--muted);
+      line-height: 1.65;
+    }
+
+    .source-list strong {
+      display: block;
+      color: var(--ink);
+      font-size: 15px;
+    }
+
+    .source-list a {
+      display: inline-block;
+      margin-top: var(--space-2);
+      font-weight: 760;
+    }
+
+    /* Interactive Field Guide：同一角色语义，不把说明页压成控制台。 */
+    body {
+      background:
+        radial-gradient(circle at 7% 2%, rgba(57, 127, 188, 0.12), transparent 34rem),
+        radial-gradient(circle at 92% 18%, rgba(115, 85, 170, 0.085), transparent 30rem),
+        linear-gradient(180deg, var(--bg) 0%, #fbfdff 58%, var(--bg) 100%);
+    }
+
+    body::before {
+      display: block;
+      background:
+        radial-gradient(circle at 16% 8%, rgba(255, 255, 255, 0.92), transparent 22rem),
+        radial-gradient(circle at 86% 30%, rgba(47, 143, 110, 0.07), transparent 26rem);
+      mask-image: none;
+      opacity: 0.9;
+    }
+
+    ::selection {
+      background: #d7ebf7;
+      color: var(--ink);
+    }
+
+    :where(a, button, [tabindex]):focus-visible {
+      outline: 3px solid rgba(57, 127, 188, 0.72);
+      outline-offset: 3px;
+    }
+
+    .app {
+      grid-template-columns: 284px minmax(0, 1fr);
+      gap: 28px;
+      width: min(1540px, calc(100% - 40px));
+    }
+
+    .sidebar {
+      min-height: calc(100vh - 48px);
+      padding: 18px;
+      border: 0;
+      border-radius: var(--radius-lg);
+      background: rgba(255, 255, 255, 0.88);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px) saturate(1.08);
+    }
+
+    .brand-mark {
+      border-color: rgba(57, 127, 188, 0.22);
+      border-radius: var(--radius);
+      background: linear-gradient(145deg, #dff0fa, #ffffff);
+      color: var(--blue);
+    }
+
+    .brand-copy {
+      color: var(--ink-2);
+    }
+
+    .nav {
+      gap: 6px;
+    }
+
+    .nav button {
+      grid-template-columns: 34px minmax(0, 1fr);
+      min-height: 52px;
+      padding: 8px;
+      border-color: transparent;
+      border-radius: var(--radius);
+    }
+
+    .nav button:hover,
+    .nav button:focus-visible {
+      border-color: rgba(57, 127, 188, 0.14);
+      background: rgba(255, 255, 255, 0.94);
+      box-shadow: 0 4px 12px rgba(41, 78, 104, 0.07);
+      text-decoration: none;
+    }
+
+    .nav button[aria-selected="true"] {
+      border-color: rgba(57, 127, 188, 0.2);
+      background: linear-gradient(135deg, #e2f1fa, #f7fbfe);
+      color: var(--blue);
+      box-shadow: 0 6px 16px rgba(57, 127, 188, 0.11);
+    }
+
+    .nav-index {
+      width: 34px;
+      height: 34px;
+      border-radius: 10px;
+      background: #edf4f8;
+      color: #526981;
+    }
+
+    .nav button[aria-selected="true"] .nav-index {
+      background: var(--blue);
+      color: white;
+    }
+
+    .nav-label {
+      font-weight: 780;
+    }
+
+    .sidebar-note {
+      border-color: rgba(47, 143, 110, 0.18);
+      background: linear-gradient(145deg, #e9f7f1, #f7fcf9);
+      color: #365f52;
+    }
+
+    .topline {
+      position: relative;
+      align-items: end;
+      margin-bottom: var(--space-6);
+      padding: clamp(24px, 3vw, 40px);
+      overflow: hidden;
+      border: 0;
+      border-radius: var(--radius-lg);
+      background:
+        radial-gradient(circle at 92% 8%, rgba(57, 127, 188, 0.14), transparent 20rem),
+        linear-gradient(145deg, #ffffff 10%, #edf7fc 100%);
+      box-shadow: var(--shadow);
+      backdrop-filter: none;
+    }
+
+    .topline::after {
+      content: "";
+      position: absolute;
+      right: -70px;
+      bottom: -100px;
+      width: 260px;
+      height: 260px;
+      border: 1px solid rgba(57, 127, 188, 0.13);
+      border-radius: 50%;
+      box-shadow:
+        0 0 0 36px rgba(57, 127, 188, 0.035),
+        0 0 0 78px rgba(57, 127, 188, 0.025);
+      pointer-events: none;
+    }
+
+    .topline-main,
+    .topline-aside {
+      position: relative;
+      z-index: 1;
+    }
+
+    h1 {
+      max-width: 820px;
+      color: var(--ink);
+      font-size: clamp(36px, 4.1vw, 50px);
+      font-weight: 790;
+      letter-spacing: -0.035em;
+    }
+
+    .topline p {
+      color: var(--ink-2);
+    }
+
+    .topline-aside {
+      border: 1px solid rgba(57, 127, 188, 0.13);
+      background: rgba(255, 255, 255, 0.78);
+      box-shadow: none;
+    }
+
+    .topline-aside strong {
+      color: var(--ink);
+    }
+
+    .topline-principles li::marker {
+      color: var(--blue);
+    }
+
+    .kicker {
+      border-color: rgba(57, 127, 188, 0.16);
+      background: rgba(255, 255, 255, 0.8);
+      color: var(--blue);
+    }
+
+    .section {
+      margin-top: 36px;
+    }
+
+    .section-head {
+      gap: 8px;
+      margin-bottom: 18px;
+    }
+
+    .section-head h2 {
+      color: var(--ink);
+      font-size: 28px;
+      font-weight: 790;
+      letter-spacing: -0.022em;
+    }
+
+    .section-head p {
+      color: var(--muted);
+    }
+
+    .grid,
+    .quickstart-grid,
+    .difference-board,
+    .workbench-grid,
+    .example-grid,
+    .memory-map,
+    .comparison-lead {
+      gap: 16px;
+    }
+
+    .panel,
+    .difference-lead,
+    .comparison-statement,
+    .role-sheet,
+    .memory-box {
+      border: 0;
+      border-radius: var(--radius-lg);
+      background: var(--panel);
+      box-shadow: var(--shadow-tight);
+    }
+
+    .principle,
+    .quickstart-mini,
+    .difference-card,
+    .fit-card,
+    .comparison-step,
+    .advantage-card,
+    .workbench-menu button,
+    .object-card,
+    .memory-subbox,
+    .memory-session-card,
+    .story-step,
+    .evidence,
+    .flow-item,
+    .source-list li {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: none;
+    }
+
+    .quickstart-card.hero {
+      background:
+        radial-gradient(circle at 100% 0, rgba(57, 127, 188, 0.15), transparent 19rem),
+        linear-gradient(145deg, #ffffff, #edf7fc);
+    }
+
+    .quickstart-kicker {
+      background: var(--blue-soft);
+      color: var(--blue);
+    }
+
+    .setup-list {
+      gap: 12px;
+    }
+
+    .setup-list li {
+      border-color: var(--line);
+      border-radius: var(--radius);
+      background: rgba(255, 255, 255, 0.78);
+    }
+
+    .setup-list b {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      background: var(--blue);
+    }
+
+    .quickstart-strip,
+    .difference-cards,
+    .fit-grid,
+    .flow-strip,
+    .principles,
+    .advantage-grid,
+    .comparison-route,
+    .evidence-grid,
+    .object-grid {
+      gap: 14px;
+    }
+
+    .quickstart-mini,
+    .difference-card,
+    .fit-card,
+    .principle,
+    .advantage-card,
+    .evidence {
+      background: rgba(255, 255, 255, 0.86);
+    }
+
+    .tab-row {
+      width: fit-content;
+      max-width: 100%;
+      gap: 5px;
+      padding: 5px;
+      border: 1px solid rgba(57, 127, 188, 0.1);
+      border-radius: var(--radius-lg);
+      background: rgba(228, 241, 249, 0.72);
+    }
+
+    .tab-row button {
+      min-height: 40px;
+      padding: 8px 14px;
+      border: 0;
+      border-radius: 10px;
+      background: transparent;
+      color: var(--ink-2);
+    }
+
+    .tab-row button:hover,
+    .tab-row button:focus-visible {
+      background: rgba(255, 255, 255, 0.68);
+    }
+
+    .tab-row button[aria-selected="true"] {
+      border: 0;
+      background: white;
+      color: var(--blue);
+      box-shadow: 0 4px 12px rgba(41, 78, 104, 0.1);
+    }
+
+    .network-stage {
+      border: 0;
+      background:
+        radial-gradient(circle at 50% 44%, rgba(57, 127, 188, 0.12), transparent 19rem),
+        radial-gradient(circle at 78% 76%, rgba(47, 143, 110, 0.08), transparent 17rem),
+        linear-gradient(145deg, #fbfdff, #edf6fb);
+      box-shadow: var(--shadow);
+    }
+
+    .network-stage::before {
+      border-color: rgba(57, 127, 188, 0.12);
+      background:
+        linear-gradient(to right, transparent 49.9%, rgba(57, 127, 188, 0.17) 49.9% 50.1%, transparent 50.1%),
+        linear-gradient(to bottom, transparent 49.9%, rgba(47, 143, 110, 0.15) 49.9% 50.1%, transparent 50.1%);
+    }
+
+    .node {
+      border: 0;
+      border-radius: var(--radius);
+      background: rgba(255, 255, 255, 0.94);
+      box-shadow: 0 8px 22px rgba(41, 78, 104, 0.1);
+    }
+
+    .node[data-role="maintainer"] {
+      background: linear-gradient(150deg, #ffffff, var(--rust-soft));
+    }
+
+    .node[data-role="router"] {
+      background: linear-gradient(150deg, #ffffff, var(--blue-soft));
+    }
+
+    .node[data-role="agent"] {
+      background: linear-gradient(150deg, #ffffff, var(--green-soft));
+    }
+
+    .node:hover,
+    .node:focus-visible,
+    .node.active {
+      border-color: transparent;
+      outline-color: rgba(57, 127, 188, 0.28);
+      box-shadow: 0 13px 28px rgba(41, 78, 104, 0.15);
+    }
+
+    .node.active {
+      transform: translateY(-3px);
+    }
+
+    .node-mark {
+      border-radius: 10px;
+    }
+
+    .flow-item {
+      background: rgba(255, 255, 255, 0.82);
+    }
+
+    .phase-board {
+      gap: 14px;
+      padding: 18px;
+    }
+
+    .lane-head,
+    .phase-row {
+      gap: 12px;
+    }
+
+    .lane-head div {
+      background: #edf5f9;
+    }
+
+    .phase-label {
+      border-radius: var(--radius);
+      background: linear-gradient(145deg, #20324d, #2f4868);
+    }
+
+    .phase-cell {
+      border-color: var(--line);
+      background: rgba(255, 255, 255, 0.9);
+    }
+
+    .phase-row.active .phase-cell {
+      border-color: rgba(57, 127, 188, 0.24);
+      background: var(--blue-soft);
+      box-shadow: 0 5px 14px rgba(57, 127, 188, 0.07);
+    }
+
+    .matrix {
+      border-radius: var(--radius-lg);
+      box-shadow: none;
+    }
+
+    .matrix th {
+      background: #edf5f9;
+    }
+
+    .workbench-menu {
+      gap: 12px;
+    }
+
+    .workbench-menu button {
+      min-height: 100px;
+      background: rgba(255, 255, 255, 0.88);
+    }
+
+    .workbench-menu button:hover,
+    .workbench-menu button:focus-visible {
+      border-color: rgba(170, 81, 63, 0.25);
+      background: #fffaf8;
+    }
+
+    .workbench-menu button[aria-selected="true"] {
+      border-color: rgba(170, 81, 63, 0.24);
+      background: var(--rust-soft);
+      color: var(--rust);
+    }
+
+    .console-panel,
+    .code-panel {
+      border: 0;
+      background: linear-gradient(180deg, #1d2b45, #121e34);
+      box-shadow: 0 12px 28px rgba(24, 36, 58, 0.18);
+    }
+
+    .console-box {
+      border-color: rgba(216, 227, 234, 0.2);
+      background: rgba(52, 70, 94, 0.7);
+    }
+
+    .object-card {
+      background: rgba(255, 255, 255, 0.9);
+    }
+
+    .object-card:hover,
+    .object-card:focus-visible,
+    .object-card.active {
+      border-color: rgba(115, 85, 170, 0.28);
+      background: var(--plum-soft);
+    }
+
+    .panel.object-flow-board {
+      background:
+        radial-gradient(circle at 94% 2%, rgba(115, 85, 170, 0.08), transparent 20rem),
+        linear-gradient(145deg, #ffffff, #f1f7fb);
+    }
+
+    .lane-type,
+    .lane-steps li {
+      border-radius: var(--radius);
+    }
+
+    .memory-map {
+      align-items: stretch;
+    }
+
+    .memory-box:nth-child(2) {
+      border: 0;
+      background:
+        radial-gradient(circle at 100% 0, rgba(47, 143, 110, 0.11), transparent 17rem),
+        linear-gradient(145deg, #ffffff, #edf8f3);
+    }
+
+    .memory-subbox {
+      background: rgba(255, 255, 255, 0.72);
+    }
+
+    .panel.memory-session {
+      background:
+        radial-gradient(circle at 5% 0, rgba(57, 127, 188, 0.1), transparent 18rem),
+        linear-gradient(145deg, #ffffff, #eef7fb);
+    }
+
+    .comparison-statement {
+      background:
+        radial-gradient(circle at 100% 0, rgba(57, 127, 188, 0.12), transparent 18rem),
+        linear-gradient(145deg, #ffffff, #edf7fc);
+    }
+
+    .comparison-step:nth-child(1) {
+      background: var(--green-soft);
+    }
+
+    .comparison-step:nth-child(2) {
+      background: var(--blue-soft);
+    }
+
+    .comparison-step:nth-child(3) {
+      background: var(--rust-soft);
+    }
+
+    .story-step:hover,
+    .story-step:focus-visible,
+    .story-step.active {
+      border-color: rgba(147, 103, 31, 0.28);
+      background: var(--amber-soft);
+    }
+
+    .story-step .step-no {
+      border-radius: 10px;
+      background: var(--green);
+      color: white;
+    }
+
+    @media (prefers-reduced-motion: no-preference) {
+      .page.active,
+      .quickstart-view.active {
+        animation: field-guide-enter 240ms cubic-bezier(0.22, 1, 0.36, 1);
+      }
+
+      .nav button,
+      .tab-row button,
+      .node,
+      .phase-cell,
+      .workbench-menu button,
+      .object-card,
+      .story-step,
+      .quickstart-mini,
+      .difference-card,
+      .fit-card,
+      .advantage-card,
+      .evidence {
+        transition:
+          color 180ms ease-out,
+          border-color 180ms ease-out,
+          background-color 180ms ease-out,
+          box-shadow 220ms cubic-bezier(0.22, 1, 0.36, 1),
+          transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+      }
+
+      .nav button:hover {
+        transform: translateX(2px);
+      }
+
+      .workbench-menu button:hover,
+      .object-card:hover,
+      .story-step:hover,
+      .quickstart-mini:hover,
+      .difference-card:hover,
+      .fit-card:hover,
+      .advantage-card:hover,
+      .evidence:hover {
+        transform: translateY(-2px);
+      }
+    }
+
+    @keyframes field-guide-enter {
+      from {
+        opacity: 0;
+        transform: translateY(7px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html {
+        scroll-behavior: auto;
+      }
+
+      *,
+      *::before,
+      *::after {
+        scroll-behavior: auto !important;
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+      }
+
+      .skip-link {
+        transition: none;
+      }
+
+      .node.active,
+      .nav button:hover,
+      .workbench-menu button:hover,
+      .object-card:hover,
+      .story-step:hover {
+        transform: none;
+      }
+    }
+
+    @media (max-width: 1180px) {
+      .app {
+        grid-template-columns: 1fr;
+        gap: 18px;
+        width: min(100% - 24px, 1500px);
+        padding-top: 0;
+      }
+
+      .content {
+        scroll-margin-top: 88px;
+      }
+
+      .sidebar {
+        position: sticky;
+        top: 0;
+        z-index: 20;
+        grid-template-columns: auto minmax(0, 1fr);
+        gap: 12px;
+        align-items: center;
+        min-height: auto;
+        padding: 9px 10px;
+        border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+        background: rgba(255, 255, 255, 0.95);
+        box-shadow: 0 7px 22px rgba(41, 78, 104, 0.11);
+      }
+
+      .brand {
+        grid-template-columns: 38px auto;
+        gap: 9px;
+      }
+
+      .brand-mark {
+        width: 38px;
+        height: 38px;
+        font-size: 11px;
+      }
+
+      .brand-title strong {
+        max-width: 112px;
+        font-size: 13px;
+      }
+
+      .brand-title span,
+      .brand-copy,
+      .sidebar-note {
+        display: none;
+      }
+
+      .nav {
+        display: flex;
+        gap: 7px;
+        min-width: 0;
+        overflow-x: auto;
+        overscroll-behavior-inline: contain;
+        padding-right: 28px;
+        scrollbar-width: none;
+        scroll-snap-type: x proximity;
+      }
+
+      .nav::-webkit-scrollbar {
+        display: none;
+      }
+
+      .sidebar::after {
+        content: "";
+        position: absolute;
+        z-index: 2;
+        top: 0;
+        right: 0;
+        bottom: 0;
+        width: 42px;
+        background: linear-gradient(90deg, rgba(255, 255, 255, 0), rgba(255, 255, 255, 0.98) 72%);
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 160ms ease;
+      }
+
+      .sidebar.nav-has-more::after {
+        opacity: 1;
+      }
+
+      .nav button {
+        flex: 0 0 auto;
+        grid-template-columns: 24px auto;
+        min-height: 42px;
+        padding: 5px 10px 5px 6px;
+        scroll-snap-align: start;
+      }
+
+      .nav button:hover {
+        transform: none;
+      }
+
+      .nav-index {
+        width: 24px;
+        height: 24px;
+        border-radius: 8px;
+        font-size: 9px;
+      }
+
+      .nav-desc {
+        display: none;
+      }
+
+      .nav-label {
+        font-size: 13px;
+      }
+
+      .topline,
+      .grid.two,
+      .workbench-grid,
+      .example-grid,
+      .comparison-lead,
+      .memory-map {
+        grid-template-columns: 1fr;
+      }
+
+      .topline {
+        display: grid;
+      }
+
+      .object-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .quickstart-grid,
+      .fit-grid,
+      .difference-cards {
+        grid-template-columns: 1fr;
+      }
+
+      .advantage-grid,
+      .evidence-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 820px) {
+      .app {
+        width: 100%;
+        padding: 0 12px 32px;
+      }
+
+      .sidebar {
+        grid-template-columns: minmax(0, 1fr);
+        margin: 0 -12px;
+        padding: 8px 12px;
+        border-radius: 0 0 12px 12px;
+      }
+
+      .brand {
+        display: none;
+      }
+
+      .topline {
+        padding: 22px 18px;
+      }
+
+      h1 {
+        font-size: clamp(31px, 9vw, 39px);
+      }
+
+      .section {
+        margin-top: 30px;
+      }
+
+      .section-head h2 {
+        font-size: 25px;
+      }
+
+      .server-row,
+      .agent-row,
+      .flow-strip,
+      .principles,
+      .example-reading-grid,
+      .story-detail-grid,
+      .grid.three,
+      .console-grid,
+      .comparison-route,
+      .advantage-grid,
+      .object-grid,
+      .object-lane,
+      .lane-steps,
+      .memory-session,
+      .evidence-grid,
+      .quickstart-strip {
+        grid-template-columns: 1fr;
+      }
+
+      .server-row {
+        margin-bottom: 14px;
+      }
+
+      .network-stage {
+        min-height: auto;
+        padding: 18px;
+      }
+
+      .network-stage::before {
+        display: none;
+      }
+
+      .node {
+        min-height: 0;
+      }
+
+      .object-flow-top {
+        display: grid;
+      }
+
+      .lane-steps li:not(:last-child)::after {
+        top: auto;
+        right: auto;
+        bottom: -12px;
+        left: 24px;
+        width: 2px;
+        height: 12px;
+        transform: none;
+      }
+
+      .panel.memory-session {
+        grid-template-columns: 1fr;
+      }
+
+      .story-route {
+        grid-template-columns: 1fr;
+      }
+
+      .story-route-arrow {
+        min-height: 14px;
+        transform: rotate(90deg);
+      }
+
+      .topline-aside {
+        min-width: 0;
+      }
+
+      .phase-board,
+      .panel.table-wrap {
+        overflow-x: auto;
+      }
+
+      .lane-head,
+      .phase-row {
+        min-width: 720px;
+      }
+
+      .matrix {
+        min-width: 760px;
+      }
+
+      .workbench-menu,
+      .object-grid {
+        display: flex;
+        gap: 12px;
+        overflow-x: auto;
+        padding-bottom: 5px;
+        scroll-snap-type: x proximity;
+      }
+
+      .workbench-menu button {
+        flex: 0 0 224px;
+        min-height: 112px;
+        scroll-snap-align: start;
+      }
+
+      .object-card {
+        flex: 0 0 196px;
+        min-height: 138px;
+        scroll-snap-align: start;
+      }
+
+      .quickstart-code pre {
+        min-height: 360px;
+      }
+    }
+
+    @media (max-width: 560px) {
+      .topline::after {
+        right: -125px;
+        bottom: -150px;
+      }
+
+      .topline-aside {
+        padding: 14px;
+      }
+
+      .tab-row {
+        width: 100%;
+      }
+
+      .tab-row button {
+        flex: 1 1 auto;
+      }
+
+      .panel-pad,
+      .inspector,
+      .console-panel,
+      .panel.object-flow-board,
+      .panel.memory-session,
+      .quickstart-card,
+      .phase-board {
+        padding: 16px;
+      }
+
+      .quickstart-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .topline p,
+      .section-head p {
+        font-size: 14px;
+      }
+    }
+
+    @media print {
+      body {
+        background: white;
+      }
+
+      body::before,
+      .sidebar {
+        display: none;
+      }
+
+      .app {
+        display: block;
+        width: 100%;
+        padding: 0;
+      }
+
+      .page,
+      .quickstart-view {
+        display: block !important;
+      }
+
+      .page + .page {
+        margin-top: 40px;
+        padding-top: 32px;
+        border-top: 1px solid var(--line-strong);
+      }
+
+      .topline,
+      .panel,
+      .memory-box,
+      .role-sheet {
+        box-shadow: none;
+      }
+    }
+    /* ACN 字标与 landing 统一：正方形描边框 + 渐变填色；收紧侧栏段落间距 */
+    .sidebar{gap:var(--space-4)}
+    .brand{grid-template-columns:auto minmax(0,1fr)}
+    .brand-mark{
+      width:44px;height:44px;padding:0;border:1px solid rgba(40,60,90,.18);border-radius:10px;
+      background:linear-gradient(115deg,#7c73ff,#5b8fff 55%,#2bb88f);
+      -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;color:transparent;
+      font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"PingFang SC","Noto Sans CJK SC",sans-serif;
+      font-weight:700;letter-spacing:.02em;font-variant-numeric:tabular-nums;
+      font-size:1.1rem;cursor:pointer;transition:opacity .15s ease;
+    }
+    .brand-mark:hover,.brand-mark:focus-visible{opacity:.82;outline:none}
+  </style>
+  <noscript>
+    <style>
+      .page,
+      .quickstart-view {
+        display: block !important;
+      }
+
+      .page + .page {
+        margin-top: var(--space-7);
+        padding-top: var(--space-7);
+        border-top: 1px solid var(--line-strong);
+      }
+    </style>
+  </noscript>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要内容</a>
+  <div class="app">
+    <aside class="sidebar" aria-label="页面导航">
+      <div class="brand">
+        <div class="brand-mark" translate="no" role="button" tabindex="0" aria-label="返回首页">ACN</div>
+        <div class="brand-title">
+          <strong>Agent Claim Network</strong>
+          <span>角色与知识流转 · v0.2.1</span>
+        </div>
+      </div>
+      <p class="brand-copy">让 Agent 的判断可发现、可追溯、可冲突；未接团队时也可独立完成任务。</p>
+      <nav class="nav" role="tablist" aria-label="内容分区">
+        <button id="tab-page-quickstart" type="button" role="tab" aria-selected="true" aria-controls="page-quickstart" tabindex="0" data-page="quickstart">
+          <span class="nav-index">01</span>
+          <span><span class="nav-label">快速上手</span><span class="nav-desc">QuickStart：用法与差异</span></span>
+        </button>
+        <button id="tab-page-overview" type="button" role="tab" aria-selected="false" aria-controls="page-overview" tabindex="-1" data-page="overview">
+          <span class="nav-index">02</span>
+          <span><span class="nav-label">团队网络</span><span class="nav-desc">Maintainer + Router + N * Agents</span></span>
+        </button>
+        <button id="tab-page-cycle" type="button" role="tab" aria-selected="false" aria-controls="page-cycle" tabindex="-1" data-page="cycle">
+          <span class="nav-index">03</span>
+          <span><span class="nav-label">Session 三阶段</span><span class="nav-desc">inbox、交互、finalize</span></span>
+        </button>
+        <button id="tab-page-roles" type="button" role="tab" aria-selected="false" aria-controls="page-roles" tabindex="-1" data-page="roles">
+          <span class="nav-index">04</span>
+          <span><span class="nav-label">角色边界</span><span class="nav-desc">谁写入，谁检索，谁治理</span></span>
+        </button>
+        <button id="tab-page-workbench" type="button" role="tab" aria-selected="false" aria-controls="page-workbench" tabindex="-1" data-page="workbench">
+          <span class="nav-index">05</span>
+          <span><span class="nav-label">Maintainer 管理台</span><span class="nav-desc">管理团队侧各类对象</span></span>
+        </button>
+        <button id="tab-page-objects" type="button" role="tab" aria-selected="false" aria-controls="page-objects" tabindex="-1" data-page="objects">
+          <span class="nav-index">06</span>
+          <span><span class="nav-label">对象语义及其流转</span><span class="nav-desc">claim、policy、trace、dispute、memory</span></span>
+        </button>
+        <button id="tab-page-memory" type="button" role="tab" aria-selected="false" aria-controls="page-memory" tabindex="-1" data-page="memory">
+          <span class="nav-index">07</span>
+          <span><span class="nav-label">记忆机制</span><span class="nav-desc">私有上下文与团队判断</span></span>
+        </button>
+        <button id="tab-page-comparison" type="button" role="tab" aria-selected="false" aria-controls="page-comparison" tabindex="-1" data-page="comparison">
+          <span class="nav-index">08</span>
+          <span><span class="nav-label">ACN 与 MCP 知识库</span><span class="nav-desc">协议与工具如何组合</span></span>
+        </button>
+        <button id="tab-page-examples" type="button" role="tab" aria-selected="false" aria-controls="page-examples" tabindex="-1" data-page="examples">
+          <span class="nav-index">09</span>
+          <span><span class="nav-label">示例链路</span><span class="nav-desc">借用、冲突与治理</span></span>
+        </button>
+        <button id="tab-page-evidence" type="button" role="tab" aria-selected="false" aria-controls="page-evidence" tabindex="-1" data-page="evidence">
+          <span class="nav-index">10</span>
+          <span><span class="nav-label">实现依据</span><span class="nav-desc">代码、docs、前端页面</span></span>
+        </button>
+      </nav>
+      <div class="sidebar-note">
+        Agent 持有判断与私有上下文；Maintainer 与 Router 负责治理与发现，不接管 Agent 本地权威。未配置两项 endpoint 时为单人模式。
+      </div>
+    </aside>
+
+    <main id="main" class="content" tabindex="-1">
+      <header class="topline">
+        <div class="topline-main">
+          <h1>ACN 角色与知识流转</h1>
+          <p>Agent 面向人类完成任务并持有判断；Router 让团队 Claim 可发现；Maintainer 维护投递、生命周期与治理入口。</p>
+        </div>
+        <aside class="topline-aside" aria-label="设计原则">
+          <strong>设计主旨</strong>
+          <ul class="topline-principles">
+            <li>所有外部信息不能 <code>sudo</code> 写入 Agent。</li>
+            <li>Policy 与外部 Claim 只有被 Agent 结合自身上下文主动内化后，才成为它自己的判断。</li>
+            <li>相同外部信息被内化的方式可能因 Agent 而异。</li>
+            <li>Maintainer 管理 Policy、Dispute 与团队镜像；Agent 保留本地 Claim 的最终判断权。</li>
+          </ul>
+        </aside>
+      </header>
+
+      <section id="page-quickstart" class="page active" role="tabpanel" aria-labelledby="tab-page-quickstart">
+        <div class="section">
+          <div class="section-head">
+            <h2 id="quickstart-title">快速上手 QuickStart</h2>
+            <p>ACN 通过终端 TUI 承载日常任务，并在团队模式下让稳定判断与分歧进入可发现、可治理的协作网络。</p>
+          </div>
+          <div class="tab-row" role="tablist" aria-label="快速上手内容切换">
+            <button id="tab-quickstart-usage" type="button" role="tab" aria-selected="true" aria-controls="quickstart-panel-usage" tabindex="0" data-quickstart="usage">使用方法</button>
+            <button id="tab-quickstart-difference" type="button" role="tab" aria-selected="false" aria-controls="quickstart-panel-difference" tabindex="-1" data-quickstart="difference">Claim 网络</button>
+          </div>
+
+          <div id="quickstart-panel-usage" class="quickstart-view active" role="tabpanel" aria-labelledby="tab-quickstart-usage" data-quickstart-panel="usage">
+            <div class="quickstart-grid">
+              <article class="panel quickstart-card hero">
+                <span class="quickstart-kicker">ACN TUI</span>
+                <h3>一次准备，之后在终端里工作。</h3>
+                <p>首次使用只需要准备 LLM API key、安装可执行文件并生成默认配置。新 Session 会读取个人说明、私有 Memory、本地 Claim 与可用 Skill；团队模式还会同步 Inbox，并加入 Router scope 概览。</p>
+                <p>更详细的使用方法参考 <code>docs/user_guide.md</code>。</p>
+                <ol class="setup-list">
+                  <li><b>01</b><span><strong>配置环境变量</strong>把 <code>ACN_LLM_API_KEY</code> 加入 shell 环境；Web Search 使用独立的 <code>GLM_API_KEY</code>。</span></li>
+                  <li><b>02</b><span><strong>安装 ACN</strong>运行 <code>brew install FTShare-Lab/tap/acn</code>，安装 <code>acn</code>、<code>acn-router</code>、<code>acn-maintainer</code> 和 Maintainer Workbench；之后即可通过 <code>acn</code> 在任意目录启动。</span></li>
+                  <li><b>03</b><span><strong>生成默认配置</strong>首次运行 <code>acn</code> 只创建 <code>~/.acn/config.toml</code>，随后因 <code>agent_id</code> 为空退出；这是预期的初始化流程。</span></li>
+                  <li><b>04</b><span><strong>填写身份与模型</strong>写入唯一的 <code>agent_id</code>，以及同一 LLM 服务的协议、base URL、模型名和 key 环境变量。需要团队协作时，成对填写 Maintainer / Router 地址；都留空则为单人模式。</span></li>
+                  <li><b>05</b><span><strong>写个人说明</strong>再次启动后编辑 <code>~/.acn/&lt;upstream&gt;/ACN.md</code>，放入希望新 Session 长期遵守的项目约定和协作方式。</span></li>
+                </ol>
+              </article>
+
+              <div class="panel code-panel quickstart-code">
+                <div class="code-head"><span>daily commands</span><span>shell</span></div>
+                <pre><code># 安装 ACN
+brew install FTShare-Lab/tap/acn
+
+# 追加环境变量到 ~/.zshrc，执行前替换 LLM key
+cat &gt;&gt; ~/.zshrc &lt;&lt;'EOF'
+
+# ACN local environment
+export ACN_LLM_API_KEY="你的 LLM API key"
+# Web Search 使用的独立凭据
+# export GLM_API_KEY="你的 Web Search API key"
+EOF
+
+# 让当前终端立即生效
+source ~/.zshrc
+
+# 首次运行只写出配置后退出
+acn
+
+# 填写 agent_id / LLM；需要时再填团队 endpoint
+vi ~/.acn/config.toml
+
+# 日常启动，可在任意目录运行
+acn
+
+# 指定工作目录，工具和 ! shell command 都以它为 cwd
+acn --cd ~/Workspace/project
+
+# 恢复历史会话
+acn --resume
+
+# TUI 内常用输入
+/help       查看命令
+/compact    压缩上下文
+/copy       复制最近一条 Assistant 回复
+/inbox      团队模式下同步 Maintainer 消息
+/mcp        查看 MCP server 与工具
+/ps         查看和管理受管后台进程
+/resume     在 TUI 内选择并恢复历史会话
+/skills     查看技能
+/subagents  查看当前 Session 的子代理
+/exit       结束会话
+!pwd        在当前 workspace cwd 运行本地 shell 命令
+@path       添加本地文件附件，支持文本、图片和 PDF
+Ctrl+V      从剪贴板粘贴图片附件
+Ctrl+O      光标位于附件时预览当前输入框和队列里的附件</code></pre>
+              </div>
+            </div>
+
+            <div class="quickstart-strip">
+              <article class="quickstart-mini"><code>cwd</code><strong>目录语义</strong><p>statusline 显示的 cwd 就是工具和 <code>!cmd</code> 的 cwd；不传 <code>--cd</code> 时使用启动终端所在目录。</p></article>
+              <article class="quickstart-mini"><code>mode</code><strong>运行模式</strong><p>成对配置 Maintainer / Router 即进入团队模式：同步 Inbox、查询 Router、上传 Claim mirror 与符合条件的 Dispute。都留空为单人模式，不发团队请求、也不攒待补传队列。</p></article>
+              <article class="quickstart-mini"><code>memory</code><strong>个人上下文</strong><p><code>ACN.md</code> 和私有 Memory 只属于当前 Agent，不会被团队侧直接读取或改写。</p></article>
+              <article class="quickstart-mini"><code>session</code><strong>Session 生命周期</strong><p>启动或恢复时先处理本地 pending Inbox；团队模式再拉取新消息。退出后由后台 supervisor 串行完成 recap、本地 Claim 与 Trace，团队产物仅在团队模式上传。</p></article>
+              <article class="quickstart-mini"><code>tools</code><strong>可扩展工具</strong><p>Skill 显式提供工作流；MCP 接入外部工具；<code>/ps</code> 管理 <code>code_run</code> 启动的受管进程。它们不改变三角色协议。</p></article>
+              <article class="quickstart-mini"><code>subagents</code><strong>Session 子代理</strong><p>子代理是主 Agent 发起的会话内委托，不是第四种 ACN 角色，也不拥有独立的 Inbox、Memory、Claim 身份或 finalize。</p></article>
+              <article class="quickstart-mini"><code>web</code><strong>团队管理页面</strong><p>访问 Maintainer 页面查看 Overview、Claims、Disputes、Policies、Agents、Sweep、Router Query、HTTP Audits、Team Auth 和 Settings。</p></article>
+              <article class="quickstart-mini"><code>prompt</code><strong>System Prompt 固定</strong><p>每个 Session 启动时渲染并写入 <code>system_prompt.md</code>；之后的 <code>/inbox</code>、Memory 写入、Skill 或 Claim 变化都不修改该快照，resume 仍复用原文件。</p></article>
+            </div>
+          </div>
+
+          <div id="quickstart-panel-difference" class="quickstart-view" role="tabpanel" aria-labelledby="tab-quickstart-difference" data-quickstart-panel="difference">
+            <div class="difference-board">
+              <article class="difference-lead">
+                <h3>ACN 的特色是带归属的团队判断网络。</h3>
+                <p>Agent 把可复用结论沉淀为 Claim；Router 负责发现，Maintainer 负责投递与生命周期治理。冲突留下 dispute，而不是压成一句共识。未接团队服务时，同一套 TUI 仍可独立完成任务。</p>
+              </article>
+
+              <aside class="difference-not" aria-label="不是什么">
+                <strong>不是什么</strong>
+                <ul>
+                  <li>不是「再做一个 coding agent」：终端干活这一层它有，但那不是 ACN 要补的缺口。</li>
+                  <li>不是团队共用一本 git / wiki 经验笔记：共享的是带 holder 的 Claim，不是谁都能改的同一份 Markdown。</li>
+                  <li>不是自动团队共识：外部 Claim / Policy 只是输入，不能 <code>sudo</code> 改写 Agent 的私有判断。</li>
+                </ul>
+              </aside>
+
+              <div class="difference-cards">
+                <article class="difference-card">
+                  <code>claim</code>
+                  <h3>可检索的判断</h3>
+                  <p>Claim 带 holder、scope、confidence 与证据摘要。借用不等于复制；没有形成自己的稳定判断时，不创建本地 Claim。</p>
+                </article>
+                <article class="difference-card">
+                  <code>network</code>
+                  <h3>发现与治理</h3>
+                  <p>Router 按 scope / 语义召回候选与相关 dispute；Maintainer 管 policy、stale 建议、dispute 解决和 inbox 投递，不越权改写 Agent 本机权威。</p>
+                </article>
+                <article class="difference-card">
+                  <code>boundary</code>
+                  <h3>上传边界</h3>
+                  <p>会上传 Claim 镜像与符合条件的 dispute；不会上传 <code>MEMORY.md</code>、<code>USER.md</code>、会话记录和 Trace。</p>
+                </article>
+              </div>
+
+              <div class="panel table-wrap">
+                <table class="matrix">
+                  <thead>
+                    <tr>
+                      <th>维度</th>
+                      <th>单人模式</th>
+                      <th>团队模式</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>默认工作方式</td>
+                      <td>完整 TUI：工具、Memory、本机 Claim / Trace、后台 finalize。</td>
+                      <td>额外同步 Inbox、查询 Router，并上传团队产物。</td>
+                    </tr>
+                    <tr>
+                      <td>长期知识</td>
+                      <td>私有 Memory + 本机 Claim。</td>
+                      <td>私有 Memory 仍私有；可共享判断以 Claim mirror 进入团队检索。</td>
+                    </tr>
+                    <tr>
+                      <td>多 Agent 协作</td>
+                      <td>不涉及。</td>
+                      <td>Router 发现候选；Trace 留在 holder 本机；Dispute 保留冲突。</td>
+                    </tr>
+                    <tr>
+                      <td>外部知识权限</td>
+                      <td>工具结果进入当前推理，由当前 Agent 决定是否采纳。</td>
+                      <td>外部 Claim / Policy 只是输入，须主动内化才成为自己的判断。</td>
+                    </tr>
+                    <tr>
+                      <td>冲突与过期</td>
+                      <td>本机自行更新或废弃 Claim。</td>
+                      <td>可上报 dispute；Maintainer 可做 stale 建议与 policy 投递。</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="page-overview" class="page" role="tabpanel" aria-labelledby="tab-page-overview">
+        <div class="section">
+          <div class="section-head">
+            <h2 id="overview-title">团队网络</h2>
+            <p>单人模式只运行 Agent；团队模式同时配置 Maintainer 与 Router，各个 Agent 独立连接两项服务，彼此不直接通信。<br>点击角色节点查看细节。</p>
+          </div>
+          <div class="grid two">
+            <div class="panel network-stage">
+              <div class="stage-label">
+                <span>团队模式：Maintainer 与 Router 可独立部署，但必须同时配置</span>
+                <span>Agent hosts：独立 harness</span>
+              </div>
+              <div class="server-row">
+                <button class="node active" type="button" aria-pressed="true" data-role="maintainer">
+                  <span class="node-top"><span class="node-mark">M</span><small>policy / lifecycle / admin</small></span>
+                  <span class="node-title">Maintainer</span>
+                  <span class="node-copy">维护 policy、dispute、claim mirror 和投递台账，并提供前端管理台。</span>
+                </button>
+                <button class="node" type="button" aria-pressed="false" data-role="router">
+                  <span class="node-top"><span class="node-mark">R</span><small>index / retrieval</small></span>
+                  <span class="node-title">Router</span>
+                  <span class="node-copy">从团队镜像和 dispute 重建索引，向 Agent 返回候选 claim。</span>
+                </button>
+              </div>
+              <div class="agent-row">
+                <button class="node" type="button" aria-pressed="false" data-role="agent">
+                  <span class="node-top"><span class="node-mark">A</span><small>human-facing</small></span>
+                  <span class="node-title">Agent A</span>
+                  <span class="node-copy">持有本地 claim、USER/MEMORY、tools、skills，执行用户任务。</span>
+                </button>
+                <button class="node" type="button" aria-pressed="false" data-role="agent">
+                  <span class="node-top"><span class="node-mark">A</span><small>independent</small></span>
+                  <span class="node-title">Agent B</span>
+                  <span class="node-copy">可借用 Router 返回的 Claim；形成冲突时在团队模式下报告 Dispute。</span>
+                </button>
+                <button class="node" type="button" aria-pressed="false" data-role="agent">
+                  <span class="node-top"><span class="node-mark">A</span><small>scalable</small></span>
+                  <span class="node-title">Agent N</span>
+                  <span class="node-copy">团队中可以有很多 Agent；它们通过配置指向团队侧 Maintainer 与 Router 服务，而不是彼此直连。</span>
+                </button>
+              </div>
+            </div>
+            <aside id="role-detail" class="panel inspector" aria-label="角色详情" aria-live="polite">
+              <h3>Maintainer：<br>治理者与管理员入口</h3>
+              <p>Maintainer 与 Router 是团队模式下的两项服务，可独立部署但必须同时配置。Maintainer 维护 Policy、Dispute、Outbox、send log 和各 Agent 的 Claim mirror，也提供 Workbench。</p>
+              <ul>
+                <li>发布 PolicyUpdate 或 ClaimAttributeUpdate，支持全员广播和定向投递。</li>
+                <li>接收 Agent 上传的 Claim mirror 与 Dispute 记录。</li>
+                <li>运行 stale sweep、废弃 policy、resolve dispute，并保留治理历史。</li>
+                <li>不写入 Agent 私有 memory 或本地 claim，只管理团队侧镜像和投递输入。</li>
+              </ul>
+              <div class="chips"><span class="chip">admin workbench</span><span class="chip">outbox</span><span class="chip">claim mirror</span><span class="chip">policy lifecycle</span></div>
+            </aside>
+          </div>
+          <div class="flow-strip">
+            <div class="flow-item"><strong>Policy 下发</strong><span>团队模式下由 Maintainer 通过 Outbox/Inbox 投递，Agent 决定是否内化。</span></div>
+            <div class="flow-item"><strong>Claim 镜像</strong><span>Agent 先写本地 Claim；团队模式再上传 mirror，进入共享材料。</span></div>
+            <div class="flow-item"><strong>Router 检索</strong><span>团队模式下，Agent 按 scope 或 query 查询候选 Claim 与 Dispute 摘要。</span></div>
+            <div class="flow-item"><strong>Dispute 上报</strong><span>团队模式下，Agent 发现符合条件的冲突后报告 Maintainer，保留为治理对象。</span></div>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-head">
+            <h2>三条纪律</h2>
+            <p>页面后续所有时序和对象说明，都围绕这三条展开。</p>
+          </div>
+          <div class="principles">
+            <div class="principle">
+              <strong>团队没有绝对真理</strong>
+              <p>Policy 和 Router 返回结果都是输入。Agent 可以跳过、借用、改写或内化，不能被远端强行改写。</p>
+            </div>
+            <div class="principle">
+              <strong>Claim 不是共享 Memory</strong>
+              <p>Claim 是带 holder、scope、status、confidence、evidence 的协作判断；Agent 私有 Memory 不上传，也不与 Claim 建立结构化绑定。</p>
+            </div>
+            <div class="principle">
+              <strong>冲突不是失败</strong>
+              <p>Dispute 记录 Claim 之间的冲突，为后续复审、废弃、更新和知识碰撞提供入口。</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="page-cycle" class="page" role="tabpanel" aria-labelledby="tab-page-cycle">
+        <div class="section">
+          <div class="section-head">
+            <h2 id="cycle-title">Session 三阶段</h2>
+            <p>一次 Agent Session 可以看成三个边界动作。单人模式只执行本地职责，表格中的 Maintainer 与 Router 动作仅在团队模式启用。</p>
+          </div>
+          <div class="tab-row" role="tablist" aria-label="阶段选择">
+            <button id="tab-phase-inbox" type="button" role="tab" aria-selected="true" aria-controls="phase-detail" tabindex="0" data-phase="inbox">inbox 阶段</button>
+            <button id="tab-phase-run-turn" type="button" role="tab" aria-selected="false" aria-controls="phase-detail" tabindex="-1" data-phase="run_turn">交互阶段</button>
+            <button id="tab-phase-finalize" type="button" role="tab" aria-selected="false" aria-controls="phase-detail" tabindex="-1" data-phase="finalize">finalize 阶段</button>
+          </div>
+          <div class="grid two">
+            <div class="panel phase-board">
+              <div class="lane-head">
+                <div>时间</div>
+                <div>Agent</div>
+                <div>Maintainer</div>
+                <div>Router</div>
+              </div>
+              <div class="phase-row active" data-phase-row="inbox">
+                <div class="phase-label">01<br>session 前</div>
+                <div class="phase-cell"><strong>收件与处理</strong>先处理本地 pending；团队模式再 pull、持久化并发送 receipt ACK。</div>
+                <div class="phase-cell"><strong>投递 Outbox</strong>团队模式按 broadcast 或 target Agent 返回消息，ACK 只确认已收件。</div>
+                <div class="phase-cell"><strong>Scope 概览</strong>团队模式获取 scopes_overview；本阶段不裁决 Claim。</div>
+              </div>
+              <div class="phase-row" data-phase-row="run_turn">
+                <div class="phase-label">02<br>交互中</div>
+                <div class="phase-cell"><strong>面向用户</strong>使用冻结 prompt、Tools、Skills、本地 Claim；团队模式可 consult_router。</div>
+                <div class="phase-cell"><strong>团队治理</strong>保留 Policy、Dispute、mirror，不写入 Agent 私域。</div>
+                <div class="phase-cell"><strong>候选召回</strong>按需返回 candidate_claims 与相关 Dispute。</div>
+              </div>
+              <div class="phase-row" data-phase-row="finalize">
+                <div class="phase-label">03<br>session 后</div>
+                <div class="phase-cell"><strong>复盘沉淀</strong>后台 supervisor 回顾可验证的 Session 内容，形成本地 Claim 与 Trace。</div>
+                <div class="phase-cell"><strong>接收上报</strong>团队模式保存 Claim mirror 与符合条件的 Dispute，后续 sweep 或 resolve。</div>
+                <div class="phase-cell"><strong>派生视图</strong>团队数据变化后重建 claim_index 和 scopes_overview。</div>
+              </div>
+            </div>
+            <aside id="phase-detail" class="panel inspector" role="tabpanel" aria-labelledby="tab-phase-inbox" aria-live="polite">
+              <h3>inbox：<br>外部输入进入 Agent 的前置门</h3>
+              <p>Agent 在启动、恢复或执行 <code>/inbox</code> 时处理本地 pending 消息；团队模式还会拉取新的 PolicyUpdate 与 ClaimAttributeUpdate。</p>
+              <ul>
+                <li>pull 失败不致命，本地 pending inbox 仍可继续处理。</li>
+                <li>远端 receipt ACK 在消息持久化后发送，只表示可靠收件，不表示 LLM 已完成内化。</li>
+                <li>本地消息以 lease 进入 claimed；成功后写 <code>handled_at</code>，失败释放 lease 供下次重试。</li>
+                <li>有 Claim 产出时写 Inbox Trace，保留 Policy 到 Claim 的转换。</li>
+              </ul>
+              <div class="chips"><span class="chip">durable receipt</span><span class="chip">receipt ACK</span><span class="chip">handled_at</span><span class="chip">retryable lease</span></div>
+            </aside>
+          </div>
+        </div>
+      </section>
+
+      <section id="page-roles" class="page" role="tabpanel" aria-labelledby="tab-page-roles">
+        <div class="section">
+          <div class="section-head">
+            <h2 id="roles-title">角色边界</h2>
+            <p>ACN 的中心节点负责发现和治理，不替 Agent 思考。Agent 是判断主体，也是 claim 的真正作者。</p>
+          </div>
+          <div class="grid three">
+            <article class="role-sheet">
+              <h3>Agent：人类任务执行者</h3>
+              <p>像通用助手一样处理用户多轮对话。它有自己的 harness、USER/MEMORY、Tools、Skills 和本地 Claim。</p>
+              <ul class="role-list">
+                <li>处理 Inbox，把外部 Policy 或建议选择性内化。</li>
+                <li>团队模式下查询 Router，借用但不盲信外部 Claim。</li>
+                <li>finalize 时沉淀本地 Claim 与 Trace，并在团队模式下报告符合条件的 Dispute。</li>
+                <li>可创建 Session 子代理执行内部委托；责任与知识身份仍归主 Agent。</li>
+              </ul>
+            </article>
+            <article class="role-sheet">
+              <h3>Router：团队知识检索器</h3>
+              <p>维护可重建的派生索引，按 scope/task query 返回候选 claim 和 dispute 摘要。</p>
+              <ul class="role-list">
+                <li>扫描 team/agents/*/claims 与 maintainer/disputes。</li>
+                <li>默认过滤 deprecated claim，保留 stale 状态提示。</li>
+                <li>不裁决事实，不提供按 id 单独 fetch 的绕行接口。</li>
+              </ul>
+            </article>
+            <article class="role-sheet">
+              <h3>Maintainer：团队治理与管理台</h3>
+              <p>维护 policy、dispute 和 outbox，扫描 claim mirror 并投递状态调整建议，同时给外部管理员提供前端页面。</p>
+              <ul class="role-list">
+                <li>发布 policy 或 claim 属性更新建议，支持广播和定向投递。</li>
+                <li>接收 claim mirror 和 dispute；stale sweep 只投递建议，resolve 更新 dispute 治理状态。</li>
+                <li>管理员可在前端查看与管理 agents、policies、claims、disputes。</li>
+              </ul>
+            </article>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-head">
+            <h2>谁能做什么</h2>
+          </div>
+          <div class="panel table-wrap">
+            <table class="matrix">
+              <thead>
+                <tr>
+                  <th>问题</th>
+                  <th>Agent</th>
+                  <th>Router</th>
+                  <th>Maintainer</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>谁与人类对话？</td>
+                  <td>是，Agent 是用户任务的执行主体。</td>
+                  <td>否，只响应 Agent 查询。</td>
+                  <td>否，面向管理员做团队治理。</td>
+                </tr>
+                <tr>
+                  <td>谁能写入 Agent 本地知识？</td>
+                  <td>只有 Agent 自己。</td>
+                  <td>不能，只返回候选 claim。</td>
+                  <td>不能，只投递 policy 或更新建议。</td>
+                </tr>
+                <tr>
+                  <td>管理员在哪里操作？</td>
+                  <td>不直接进入私有 harness。</td>
+                  <td>通常不编辑 Router 派生索引。</td>
+                  <td>在 Maintainer 前端管理 agent 状态、policy、claim mirror 和 dispute。</td>
+                </tr>
+                <tr>
+                  <td>谁处理冲突？</td>
+                  <td>形成自己的判断；团队模式下可发现并报告 Dispute。</td>
+                  <td>检索时附带相关 dispute 摘要。</td>
+                  <td>可 resolve dispute，也可发 claim 更新建议。</td>
+                </tr>
+                <tr>
+                  <td>谁管理生命周期？</td>
+                  <td>维护自己的本地 claim。</td>
+                  <td>根据状态过滤和展示候选。</td>
+                  <td>发布/废弃 policy，评估 stale，维护团队侧状态。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="page-workbench" class="page" role="tabpanel" aria-labelledby="tab-page-workbench">
+        <div class="section">
+          <div class="section-head">
+            <h2 id="workbench-title">Maintainer 管理台</h2>
+              <p>Maintainer 不只是后台服务，也有前端页面。外部管理员在这里查看 agents、policies、claim mirrors、disputes、sweep 建议与 Team Auth。它管理的是团队镜像和治理流程，不越权改写 Agent 私有 Memory 或本地 claim 判断。<a href="../app/"><br>打开 Maintainer 管理台</a></p>
+          </div>
+          <div class="workbench-grid">
+            <div class="workbench-menu" role="tablist" aria-label="管理台区域">
+              <button id="tab-workbench-agents" type="button" role="tab" aria-selected="true" aria-controls="workbench-detail" tabindex="0" data-workbench="agents">
+                <strong>Agents</strong>
+                <span>检查注册 agent、活跃度、claim 传播健康度和最近活动。</span>
+              </button>
+              <button id="tab-workbench-policies" type="button" role="tab" aria-selected="false" aria-controls="workbench-detail" tabindex="-1" data-workbench="policies">
+                <strong>Policies</strong>
+                <span>发布团队 policy、定向投递、广播投递、废弃旧 policy。</span>
+              </button>
+              <button id="tab-workbench-claims" type="button" role="tab" aria-selected="false" aria-controls="workbench-detail" tabindex="-1" data-workbench="claims">
+                <strong>Claims</strong>
+                <span>浏览各 agent 的镜像 claim，按 holder、scope、status、dispute 过滤。</span>
+              </button>
+              <button id="tab-workbench-disputes" type="button" role="tab" aria-selected="false" aria-controls="workbench-detail" tabindex="-1" data-workbench="disputes">
+                <strong>Disputes</strong>
+                <span>查看 open/resolved 冲突，进入相关 claim，执行 resolve，必要时发送 claim attribute update。</span>
+              </button>
+              <button id="tab-workbench-team-auth" type="button" role="tab" aria-selected="false" aria-controls="workbench-detail" tabindex="-1" data-workbench="team_auth">
+                <strong>Team Auth</strong>
+                <span>创建、一次性复制与撤销绑定 Agent 的团队访问 key。</span>
+              </button>
+            </div>
+            <aside id="workbench-detail" class="panel console-panel" role="tabpanel" aria-labelledby="tab-workbench-agents" aria-live="polite">
+              <h3>Agents 页面：查看团队成员与传播健康度</h3>
+              <p>管理员可以检查已注册 agent、mirror claim 数、active/stale/deprecated 分布、最近活动和 policy delivery 状态。</p>
+              <div class="console-grid">
+                <div class="console-box"><strong>可见内容</strong><span>agent_id、mirror_claims、claim 状态分布、last_activity 与 delivery summary。</span></div>
+                <div class="console-box"><strong>典型动作</strong><span>筛选 agent，查看详情，定位投递滞后或陈旧 claim。</span></div>
+                <div class="console-box"><strong>边界</strong><span>这里只展示团队侧状态，不进入 Agent 私有 tools、skills、USER/MEMORY。</span></div>
+                <div class="console-box"><strong>相关页面</strong><span><a href="../app/">Maintainer 管理台</a></span></div>
+              </div>
+            </aside>
+          </div>
+        </div>
+      </section>
+
+      <section id="page-objects" class="page" role="tabpanel" aria-labelledby="tab-page-objects">
+        <div class="section">
+          <div class="section-head">
+            <h2 id="objects-title">对象语义</h2>
+            <p>点击对象查看语义、边界和 YAML 风格示例。Claim 是可协作的判断单元；USER/MEMORY 是 Agent 私有上下文，两者不是同一种存储。</p>
+          </div>
+          <div class="object-grid" role="tablist" aria-label="对象选择">
+            <button id="tab-object-claim" class="object-card active" type="button" role="tab" aria-selected="true" aria-controls="object-detail" tabindex="0" data-object="claim"><code>core</code><strong>Claim</strong><span>Agent 持有的断言，团队可流转的知识单元。</span></button>
+            <button id="tab-object-policy" class="object-card" type="button" role="tab" aria-selected="false" aria-controls="object-detail" tabindex="-1" data-object="policy"><code>input</code><strong>Policy</strong><span>Maintainer 发布的规则或更新建议，不是团队真理。</span></button>
+            <button id="tab-object-trace" class="object-card" type="button" role="tab" aria-selected="false" aria-controls="object-detail" tabindex="-1" data-object="trace"><code>link</code><strong>Trace</strong><span>记录 claim/policy 的使用与产出链路。</span></button>
+            <button id="tab-object-dispute" class="object-card" type="button" role="tab" aria-selected="false" aria-controls="object-detail" tabindex="-1" data-object="dispute"><code>conflict</code><strong>Dispute</strong><span>保存 claim 间冲突，供后续复审和治理。</span></button>
+            <button id="tab-object-memory" class="object-card" type="button" role="tab" aria-selected="false" aria-controls="object-detail" tabindex="-1" data-object="memory"><code>private</code><strong>Memory</strong><span>USER/MEMORY 属于单个 Agent，不能直接团队共享。</span></button>
+          </div>
+          <div class="grid two detail-grid">
+            <aside id="object-detail" class="panel inspector" role="tabpanel" aria-labelledby="tab-object-claim" aria-live="polite">
+              <h3>Claim：可协作的判断对象</h3>
+              <p>Claim 表示某个 Agent 在特定上下文下持有的判断。它带 holder、scope、confidence、status、source_claim_ids 和 evidence_summary，因此可被检索、复用、追溯和质疑。</p>
+              <ul>
+                <li>借用外部 claim 不等于污染长期知识，只有内化后才成为本地 claim。</li>
+                <li>source_claim_ids 保留内化来源，可指向外部 claim 或 policy。</li>
+                <li>团队侧保存 claim mirror，Router 据此重建检索索引。</li>
+              </ul>
+              <div class="chips"><span class="chip">holder</span><span class="chip">scope</span><span class="chip">confidence</span><span class="chip">status</span></div>
+            </aside>
+            <div class="panel code-panel">
+              <div class="code-head">
+                <span id="object-code-title">claim 示例</span>
+                <span>YAML / boundary</span>
+              </div>
+              <pre id="object-code">id: claim_d7894444
+name: dsl_trade_offs_analysis
+statement: DSL adoption involves clear trade-offs…
+scope: technical-education / programming / cost-benefit-analysis
+holder: agent-a
+confidence: medium
+status: active
+created_at: 2026-04-28T05:34:18Z
+source_claim_ids:
+- claim_5bba1a02
+evidence_summary: Synthesized from practical experience with DSL tools…</pre>
+            </div>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-head">
+            <h2>对象流转</h2>
+            <p>下面用 Agent-m 与 Agent-n 表示两个独立 Agent，说明对象从哪里产生、在哪里被治理、如何被另一侧看到。</p>
+          </div>
+          <div class="panel object-flow-board">
+            <div class="object-flow-top">
+              <h3>Agent-m / Agent-n / Maintainer / Router</h3>
+              <p>Claim 是跨 Agent 流动的判断单元；Trace 是本地来源账本；<br>Policy 与 Dispute 是治理输入；Memory 留在单个 Agent 内部。</p>
+            </div>
+            <div class="object-lanes" role="group" aria-label="对象跨角色流转图">
+              <article class="object-lane claim">
+                <div class="lane-type"><code>Claim</code><strong>协作断言</strong><span>把单个 Agent 的判断镜像为可检索、可复用、可质疑的团队知识对象，但不等同于共享 Memory。</span></div>
+                <ol class="lane-steps">
+                  <li><b>Agent-m</b><span>session 后抽取本地 claim，并保留 holder、scope、confidence 与 evidence。</span></li>
+                  <li><b>Maintainer</b><span>接收 claim mirror；sweep 只检测 stale/deprecated 候选并向 holder 投递属性调整建议。</span></li>
+                  <li><b>Router</b><span>基于 mirror 重建 claim_index，按 scope/query 返回候选 claim。</span></li>
+                  <li><b>Agent-n</b><span>看到（Agent-m 的）候选 claim 后，借用、跳过，或结合自身上下文内化为新 claim。</span></li>
+                </ol>
+              </article>
+              <article class="object-lane policy">
+                <div class="lane-type"><code>Policy</code><strong>治理输入</strong><span>由 Maintainer 投递，进入 Agent inbox，但不直接改写 Agent 判断。</span></div>
+                <ol class="lane-steps">
+                  <li><b>Maintainer</b><span>发布 PolicyUpdate 或 ClaimAttributeUpdate，可广播也可定向发送。</span></li>
+                  <li><b>Agent-m</b><span>处理 Inbox 后判断是否跳过、内化或更新本地 Claim；团队模式下还可报告符合条件的 Dispute。</span></li>
+                  <li><b>Agent-n</b><span>同一 policy 在自己的上下文中处理，处理结果可以不同于 Agent-m。</span></li>
+                  <li><b>Trace</b><span>如果 policy 产生 claim 更新，Agent 写 trace 记录输入与输出关系。</span></li>
+                </ol>
+              </article>
+              <article class="object-lane">
+                <div class="lane-type"><code>Trace</code><strong>来源账本</strong><span>解释 claim/policy 如何参与任务，以及哪些新 claim 被产出。</span></div>
+                <ol class="lane-steps">
+                  <li><b>Agent-m</b><span>在 inbox 内化或 finalize 时写 trace，记录 input_claims 与 output_claims。</span></li>
+                  <li><b>本地存储</b><span>trace 跟随该 Agent 的 claims/traces 目录，用于复盘来源链路。</span></li>
+                  <li><b>团队侧</b><span>Maintainer 和 Router 主要治理 claim/dispute，目前的设计中不参与管理 trace。</span></li>
+                  <li><b>Agent-n</b><span>无法看到他人的 trace。</span></li>
+                </ol>
+              </article>
+              <article class="object-lane dispute">
+                <div class="lane-type"><code>Dispute</code><strong>团队冲突对象</strong><span>团队模式把不同 Claim 的不兼容性保存下来，而不是让系统强行统一口径。</span></div>
+                <ol class="lane-steps">
+                  <li><b>Agent-m</b><span>在团队模式下发现至少两条 Claim 之间存在不兼容后报告 Dispute；Policy 不能被 Dispute 直接引用。</span></li>
+                  <li><b>Maintainer</b><span>记录 open/resolved 状态，resolve 时保留文件和 summary。</span></li>
+                  <li><b>Router</b><span>查询候选 claim 时附带相关 dispute 摘要，提醒使用者存在争议。</span></li>
+                  <li><b>Agent-n</b><span>读取候选 claim 时看到 dispute，并可在需要时形成自己的判断或新 dispute。</span></li>
+                </ol>
+              </article>
+              <article class="object-lane memory">
+                <div class="lane-type"><code>Memory</code><strong>私有记忆</strong><span>USER/MEMORY 属于单个 Agent，不跨 Agent 复制，也不直接进入团队共享。</span></div>
+                <ol class="lane-steps">
+                  <li><b>Agent-m Session 启动时</b><span>在 system prompt 中注入自己的 USER.md、MEMORY.md 和本地 claim 快照，并冻结为当前 Session 的 system prompt 快照。<br>为保持前缀一致性，此后该 Session 的 system prompt 不再变化。</span></li>
+                  <li><b>Agent-m Session 中</b><span>注入的 Memory 快照影响判断与执行，Agent 也可通过 <code>memory</code> 工具主动更新磁盘内容；当前 prompt 快照不会随之改变。</span></li>
+                  <li><b>可选后台 Review</b><span>按配置 cadence 在用户 turn 后运行独立模型调用，只开放 Memory 工具；失败只记录 warning，不改变已完成的用户 turn。</span></li>
+                  <li><b>Agent-n</b><span>无法以任何形式读取 Agent-m 的 Memory 及 Session 信息。</span></li>
+                </ol>
+              </article>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="page-memory" class="page" role="tabpanel" aria-labelledby="tab-page-memory">
+        <div class="section">
+          <div class="section-head">
+            <h2 id="memory-title">记忆机制</h2>
+            <p>私有 Memory 服务单个 Agent 的跨 Session 连续性；Claim 是独立、自包含的协作判断。二者可以同时影响当前任务，但不共享身份、来源字段或存储结构。</p>
+          </div>
+          <div class="memory-map">
+            <div class="memory-box">
+              <h3>私有记忆：Agent 自己的长期上下文</h3>
+              <p>私有记忆不会以任何直接形式被团队可见或进入流转，它只在当前 Agent 的 session 中作为上下文影响判断。Agent Memory 不会被 Maintainer / Router / 其他 Agent 看见。<br><br><b>更新时机</b>：<br>1. Session 中 Agent 主动调用 <code>memory</code> 工具；<br>2. Session 中来自旁路的定期非阻塞性 memory review 任务。</p>
+              <div class="memory-subgrid">
+                <div class="memory-subbox">
+                  <h4>USER.md</h4>
+                  <p>记录用户偏好、沟通习惯和用户画像。它服务当前 Agent 的个性化体验，永不进入团队 claim。</p>
+                </div>
+                <div class="memory-subbox">
+                  <h4>MEMORY.md</h4>
+                  <p>保存项目经验、工具经验和稳定约定。它是普通私有 Markdown，不保存 Claim ID、来源关系或其他结构化绑定。</p>
+                </div>
+              </div>
+            </div>
+            <div class="memory-box">
+              <h3>团队知识：Claim 作为协作对象</h3>
+              <p>Claim 不是 Memory 文件公开化，而是 Agent 基于当前可验证上下文形成并落盘的独立判断对象，携带 holder、scope、status、confidence 与 evidence；团队模式只上传它的 mirror。<br><br><b>更新时机</b>：<br>1. Session 启动、恢复或 <code>/inbox</code> 时处理 Policy；<br>2. Session 交互中形成稳定判断；<br>3. Session 结束时复盘可验证的对话与工具结果。</p>
+              <div class="memory-subgrid">
+                <div class="memory-subbox">
+                  <h4>Claim</h4>
+                  <p>承载团队可检索、可借用、可内化的判断，是 ACN 跨 Agent 协作的基本单位。</p>
+                </div>
+                <div class="memory-subbox">
+                  <h4>Trace / Dispute</h4>
+                  <p>Trace 留在 Agent 本地解释 Claim 的来源链路；团队模式下报告的 Dispute 进入团队侧，且只能引用 Claim 之间的冲突。</p>
+                </div>
+                <div class="memory-subbox">
+                  <h4>Maintainer / Router</h4>
+                  <p>Maintainer 管理生命周期与治理动作；Router 负责让团队 claim 能被 Agent 查询和发现。</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-head">
+            <h2>私有上下文与团队判断如何并存</h2>
+            <p>Memory 与 Claim 不会互相覆盖或建立结构化绑定。它们在 Session 中同时作为上下文出现，由 Agent 结合当前任务、工具结果和用户对话作出判断。</p>
+          </div>
+          <div class="panel memory-session">
+            <article class="memory-session-card">
+              <h3>启动时</h3>
+              <ul>
+                <li>注入私有 Memory、本地 Claim；团队模式再加入 Router scope overview。渲染后的 system prompt 持久化并在整个 Session（包括 resume）中保持不变。</li>
+              </ul>
+            </article>
+            <article class="memory-session-card">
+              <h3>交互中</h3>
+              <ul>
+                <li>可调用 Tools、Skills、MCP、Session Search；团队模式还可查询 Router。外部 Claim 和工具结果都不会自动写入 Memory。</li>
+                <li>Memory 写入立即落盘但不改变当前 system prompt；新 Claim 必须用独立、自包含的 statement、scope 和 evidence summary 表达，不能让团队反查私有 Memory 条目。</li>
+              </ul>
+            </article>
+            <article class="memory-session-card">
+              <h3>结束时</h3>
+              <ul>
+                <li>Finalize 基于可验证的 Session 内容形成或更新本地 Claim 与 Trace；团队模式再上传 mirror、报告符合条件的 Dispute。Finalize 不把 system prompt 或 Memory 更新本身当作证据，也不修改 Memory。</li>
+              </ul>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="page-comparison" class="page" role="tabpanel" aria-labelledby="tab-page-comparison">
+        <div class="section">
+          <div class="section-head">
+            <h2 id="comparison-title">ACN 与朴素 MCP 知识库</h2>
+            <p>MCP 是 ACN 已支持的外部工具协议，两者并不互斥。这里比较的是“通过 MCP 查询共享资料”与“通过 ACN 协议治理 Agent 判断”：前者解决资料可达性，后者处理自治、来源、分歧和生命周期。</p>
+          </div>
+          <div class="comparison-lead">
+            <article class="comparison-statement">
+              <h3>MCP 扩展工具边界，ACN 组织判断及其治理边界。</h3>
+              <p>MCP 知识库适合作为外部资料入口；ACN Agent 可以照常使用这类 MCP server。工具返回内容进入当前任务上下文，但不会因此自动获得 Claim 身份或治理状态。</p>
+              <p>ACN 刻意保留判断层：外部 Claim、Policy 和工具结果都只是输入。Agent 必须结合当前任务、私有上下文与本地 Claim，才可能形成新的、自包含的判断。</p>
+            </article>
+            <div class="comparison-route" role="group" aria-label="ACN 内化路径">
+              <div class="comparison-step">
+                <code>input</code>
+                <strong>外部知识进入</strong>
+                <span>Router 返回候选 claim，Maintainer 投递 policy 或更新建议；它们都不是直接写入。</span>
+              </div>
+              <div class="comparison-step">
+                <code>agent</code>
+                <strong>Agent 自主判断</strong>
+                <span>结合当前任务、私有 Memory、本地 Claim 和用户上下文，决定借用、跳过、改写；团队模式下还可报告冲突。</span>
+              </div>
+              <div class="comparison-step">
+                <code>network</code>
+                <strong>团队侧治理</strong>
+                <span>团队模式上传新 Claim mirror 与 Dispute，Router 据此重建检索视图；Trace 只留在产出它的 Agent 本地。</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-head">
+            <h2>设计优势</h2>
+            <p>ACN 的优势来自对象边界和权限边界，而不只是多了一个检索入口。</p>
+          </div>
+          <div class="advantage-grid">
+            <article class="advantage-card autonomy">
+              <code>autonomy</code>
+              <h3>Agent 自治</h3>
+              <p>外部管理者不是超级 Agent，也没有 sudo 权限。Policy 和外部 claim 需要被 Agent 主动处理，才会成为它自己的本地判断。</p>
+              <ul>
+                <li>私有 memory 不被团队侧直接读取或改写。</li>
+                <li>同一输入可以被不同 Agent 以不同方式内化。</li>
+              </ul>
+            </article>
+            <article class="advantage-card dispute-card">
+              <code>dispute</code>
+              <h3>分歧可见</h3>
+              <p>普通知识库容易把冲突处理成覆盖、删除或人工备注。ACN 允许不同 Agent 对同一问题形成不同 claim，并用 dispute 把差异保留下来。</p>
+              <ul>
+                <li>冲突不是失败，而是复审入口。</li>
+                <li>开发、产品、商务等视角可以共存。</li>
+              </ul>
+            </article>
+            <article class="advantage-card provenance">
+              <code>provenance</code>
+              <h3>来源可追溯</h3>
+              <p>ACN 不只回答“知识是什么”，还回答谁在什么上下文形成了判断、适用 scope 是什么、confidence 如何、是否有冲突、生命周期状态是什么。</p>
+              <ul>
+                <li>Claim 带 holder、scope、status、confidence 和 evidence。</li>
+                <li>本地 Trace 记录输入 claim/policy 与输出 claim 的链路，不上传团队侧。</li>
+              </ul>
+            </article>
+            <article class="advantage-card governance">
+              <code>governance</code>
+              <h3>治理不越权</h3>
+              <p>Maintainer 管理 policy/dispute 生命周期和投递范围，Router 管理检索范围，但都不替 Agent 生产或改写本地判断字段。团队治理给方向，执行仍由 Agent 完成。</p>
+              <ul>
+                <li>上级指导可以成为 policy，但不是完整执行方案。</li>
+                <li>Agent 的个性化判断会反哺团队知识多元化。</li>
+              </ul>
+            </article>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-head">
+            <h2>关键差异</h2>
+            <p>二者可以组合：MCP 负责访问外部资料，ACN 负责让 Agent 形成的判断带着来源、状态与分歧流动。</p>
+          </div>
+          <div class="panel table-wrap">
+            <table class="matrix">
+              <thead>
+                <tr>
+                  <th>维度</th>
+                  <th>通过 MCP 查询共享资料</th>
+                  <th>ACN</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>知识进入 Agent</td>
+                  <td>Tool 返回资源或数据；是否采用、如何持久化由宿主应用定义。</td>
+                  <td>返回的是候选 claim 或 policy 输入，Agent 结合自身上下文选择性内化。</td>
+                </tr>
+                <tr>
+                  <td>冲突处理</td>
+                  <td>取决于上游知识库的数据模型；MCP 本身不定义 Claim 或 Dispute 生命周期。</td>
+                  <td>不同 claim 可以并存；dispute 显式记录差异，等待 Maintainer 复审或 resolve。</td>
+                </tr>
+                <tr>
+                  <td>来源与适用范围</td>
+                  <td>取决于上游系统是否提供来源、权限和适用范围字段；MCP 负责传输这些结果。</td>
+                  <td>Claim 携带 holder、scope、confidence、evidence、status；Agent 本地 Trace 记录输入和输出链路。</td>
+                </tr>
+                <tr>
+                  <td>管理者权限</td>
+                  <td>由上游系统定义；协议本身不表达团队治理与 Agent 本地判断之间的权限边界。</td>
+                  <td>Maintainer 管理团队侧镜像、生命周期和投递，不直接改写 Agent 私有 memory 或本地 claim。</td>
+                </tr>
+                <tr>
+                  <td>团队协作效果</td>
+                  <td>更适合统一资料和标准口径。</td>
+                  <td>更适合小团队多视角协作：允许共识形成，也允许暂时保留有价值的差异。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="page-examples" class="page" role="tabpanel" aria-labelledby="tab-page-examples">
+        <div class="section">
+          <div class="section-head">
+            <h2 id="examples-title">两条从判断到治理的完整链路</h2>
+            <p>第一条链路展示一个 Agent 的经验如何被另一个 Agent 发现、改写并继续传递；第二条展示两个高置信度判断发生冲突后，团队如何复审而不越权覆盖 holder 的本地 Claim。</p>
+          </div>
+          <div class="example-reading-grid" aria-label="示例阅读提示">
+            <article class="example-reading-note">
+              <code>candidate ≠ answer</code>
+              <strong>Router 只把候选送进上下文</strong>
+              <span>检索命中不会自动复制 Claim。接收方仍要结合当前任务、工具证据与私有上下文作出自己的判断。</span>
+            </article>
+            <article class="example-reading-note">
+              <code>trace stays local</code>
+              <strong>来源链属于产出它的 Agent</strong>
+              <span>新的 Claim 可以记录 source_claim_ids；更完整的输入到输出关系写入本地 Trace，不上传团队服务。</span>
+            </article>
+            <article class="example-reading-note">
+              <code>governance ≠ sudo</code>
+              <strong>Maintainer 给出结论和建议</strong>
+              <span>Resolve 与 ClaimAttributeUpdate 让治理结论可见，但只有 holder Agent 能修改自己的本地 Claim。</span>
+            </article>
+          </div>
+          <div class="tab-row" role="tablist" aria-label="示例选择">
+            <button id="tab-example-retry" type="button" role="tab" aria-selected="true" aria-controls="story-panel" tabindex="0" data-example="retry">借用与改写：429 重试边界</button>
+            <button id="tab-example-pool" type="button" role="tab" aria-selected="false" aria-controls="story-panel" tabindex="-1" data-example="pool">冲突与治理：连接池预算</button>
+          </div>
+          <div id="story-panel" class="example-grid" role="tabpanel" aria-labelledby="tab-example-retry">
+            <div id="story-list" class="story-list" role="tablist" aria-label="示例步骤">
+              <button id="tab-story-retry-0" class="story-step active" type="button" role="tab" aria-selected="true" aria-controls="story-detail" tabindex="0" data-story-index="0"><span class="step-no">01</span><span><span class="story-actor">ops-agent · session A</span><strong>事故证据进入当前任务</strong><span>日志显示 429、Retry-After 与重复 POST 同时出现，Agent 先区分可重试性和幂等边界。</span></span></button>
+              <button id="tab-story-retry-1" class="story-step" type="button" role="tab" aria-selected="false" aria-controls="story-detail" tabindex="-1" data-story-index="1"><span class="step-no">02</span><span><span class="story-actor">finalize · ops-agent</span><strong>形成第一条本地 Claim</strong><span>可验证结论写成 claim_7a31c9e2，并用本地 Trace 记录产出过程。</span></span></button>
+              <button id="tab-story-retry-2" class="story-step" type="button" role="tab" aria-selected="false" aria-controls="story-detail" tabindex="-1" data-story-index="2"><span class="step-no">03</span><span><span class="story-actor">maintainer + router</span><strong>镜像成为可发现候选</strong><span>团队模式上传 Claim mirror；Router 刷新后按 scope 返回完整候选。</span></span></button>
+              <button id="tab-story-retry-3" class="story-step" type="button" role="tab" aria-selected="false" aria-controls="story-detail" tabindex="-1" data-story-index="3"><span class="step-no">04</span><span><span class="story-actor">release-agent · session B</span><strong>另一个 Agent 主动查询</strong><span>批量发布任务缺少稳定重试规则，release-agent 通过 consult_router 取得候选。</span></span></button>
+              <button id="tab-story-retry-4" class="story-step" type="button" role="tab" aria-selected="false" aria-controls="story-detail" tabindex="-1" data-story-index="4"><span class="step-no">05</span><span><span class="story-actor">release-agent · local judgment</span><strong>借用，但不照抄</strong><span>结合异步游标和 idempotency key，Agent 形成适用于发布流水线的新判断。</span></span></button>
+              <button id="tab-story-retry-5" class="story-step" type="button" role="tab" aria-selected="false" aria-controls="story-detail" tabindex="-1" data-story-index="5"><span class="step-no">06</span><span><span class="story-actor">finalize · release-agent</span><strong>来源继续向后传递</strong><span>新 Claim 引用来源 Claim；Trace 留在本地，Claim mirror 进入下一轮团队检索。</span></span></button>
+            </div>
+            <aside id="story-detail" class="panel inspector" role="tabpanel" aria-labelledby="tab-story-retry-0" aria-live="polite">
+              <p class="story-detail-eyebrow">ops-agent · session A</p>
+              <h3>事故证据进入当前任务</h3>
+              <p class="story-detail-lead">支付网关连续返回 429，同时业务侧发现一个 POST 被重复执行。Agent 没有把“重试”当成单一开关，而是先核对 Retry-After、请求幂等性和现有 idempotency key。</p>
+              <div class="story-detail-grid">
+                <div class="story-detail-block"><strong>发生了什么</strong><span>工具读取日志和接口契约后，Agent 得到可验证但仍只属于当前 Session 的工程结论：限流响应可以等待后重试，非幂等写入必须先具备去重条件。</span></div>
+                <div class="story-detail-block"><strong>解释说明</strong><span>此时还没有 Claim，也没有团队上传。原始日志、用户输入和私有上下文不会因为一次分析自动进入 Router 或 Maintainer。</span></div>
+              </div>
+              <div class="story-route" aria-label="本步骤的输入、判断和输出">
+                <div class="story-route-node"><small>INPUT</small><code>429 日志 + API 契约</code></div>
+                <span class="story-route-arrow" aria-hidden="true">→</span>
+                <div class="story-route-node"><small>AGENT DECISION</small><strong>区分幂等与非幂等重试</strong></div>
+                <span class="story-route-arrow" aria-hidden="true">→</span>
+                <div class="story-route-node"><small>OUTPUT</small><code>待 finalize 的稳定判断</code></div>
+              </div>
+              <div class="chips"><span class="chip">session evidence</span><span class="chip">ops-agent</span><span class="chip">payments/api/retry</span></div>
+            </aside>
+          </div>
+        </div>
+      </section>
+
+      <section id="page-evidence" class="page" role="tabpanel" aria-labelledby="tab-page-evidence">
+        <div class="section">
+          <div class="section-head">
+            <h2 id="evidence-title">实现依据</h2>
+            <p>这一页列出页面内容对应的 docs、Rust 模块、prompt 和 Maintainer 前端页面。</p>
+          </div>
+          <div class="evidence-grid">
+            <article class="evidence"><h3>核心设计</h3><p>定义 Claim、Policy、Trace、Dispute、角色职责和数据边界。</p><code>docs/core_behavior.md</code></article>
+            <article class="evidence"><h3>Session 主流程</h3><p>实现 Session 创建、turn journal、compact、finalize checkpoint 与团队上传边界。</p><code>src/agent/session_engine/</code></article>
+            <article class="evidence"><h3>Inbox 生命周期</h3><p>实现可靠收件、receipt ACK、本地 lease、handled 状态与 Inbox Trace。</p><code>src/agent/inbox.rs</code></article>
+            <article class="evidence"><h3>Router 查询</h3><p>刷新 claim_index/scopes_overview，返回 candidate_claims 与 dispute refs。</p><code>src/router/service.rs</code></article>
+            <article class="evidence"><h3>Maintainer 治理</h3><p>发布 policy、resolve dispute；stale sweep 只投递 ClaimAttributeUpdate 建议，不直接改写 claim。</p><code>src/maintainer.rs</code></article>
+            <article class="evidence"><h3>Memory 边界</h3><p>双文件私有存储、原子更新、后台 Review，以及与 Claim 无结构化绑定的边界。</p><code>docs/memory_design.md</code></article>
+            <article class="evidence"><h3>System Prompt</h3><p>注入私有上下文、Skill、本地 Claim 与可选 Router scope，并为每个 Session 冻结快照。</p><code>prompts/agent_system.j2</code></article>
+            <article class="evidence"><h3>Maintainer 前端</h3><p>已有 Agents、Policies、Claims、Disputes、Sweep、Router Query、HTTP Audits、Team Auth 与 Settings 页面。</p><a href="../app/">打开 Maintainer 管理台</a></article>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const roleDetails = {
+      maintainer: {
+        title: "Maintainer：<br>治理者与管理员入口",
+        body: "Maintainer 与 Router 是团队模式下的两项服务，可独立部署但必须同时配置。Maintainer 维护 Policy、Dispute、Outbox、send log 和各 Agent 的 Claim mirror，也提供 Workbench。",
+        bullets: [
+          "发布 PolicyUpdate 或 ClaimAttributeUpdate，支持全员广播和定向投递。",
+          "接收 Agent 上传的 Claim mirror 与 Dispute 记录。",
+          "运行 stale sweep 并投递属性调整建议，废弃 policy，resolve dispute，保留治理历史。",
+          "它不能 sudo 写入 Agent 私有 memory 或本地 claim，只能投递输入和管理团队侧镜像。"
+        ],
+        tags: ["admin workbench", "outbox", "claim mirror", "policy lifecycle"]
+      },
+      router: {
+        title: "Router：<br>让 claim 可发现",
+        body: "Router 只维护派生视图和检索入口。它扫描团队镜像 claim 与 maintainer/disputes，重建 claim_index 和 scopes_overview，查询时返回候选 claim 与相关 dispute 摘要。",
+        bullets: [
+          "claim_index 只保存 id、path、open/resolved dispute ids，可完全重算。",
+          "默认不召回 deprecated claim，stale claim 以状态暴露。",
+          "查询结果返回完整 candidate_claims，但不暴露单独 fetch_claim_by_id 接口。",
+          "Router 不裁决事实，只提供带状态和争议信息的上下文。"
+        ],
+        tags: ["claim_index", "scopes_overview", "candidate_claims", "no verdict"]
+      },
+      agent: {
+        title: "Agent：<br>交互主体与 claim 生产者",
+        body: "Agent 是真正与人类多轮交互的对象。每个 Agent 有自己的 harness，包括 Tools、Skills、MCP、USER/MEMORY、本地 Claim 和 Session subagents。来自 Maintainer 或 Router 的信息只是一种输入。",
+        bullets: [
+          "启动或恢复时处理本地 pending Inbox；团队模式再拉取远端消息。",
+          "团队模式下可 consult_router，借用外部 Claim，但不盲信。",
+          "Session 后 finalize，基于可验证内容形成本地 Claim 与 Trace。",
+          "团队模式上传 Claim mirror，并报告符合条件的 Dispute；单人模式不积累补传队列。",
+          "Subagent 是 Session 内部委托，不拥有独立 ACN Agent 身份。"
+        ],
+        tags: ["human-facing", "private harness", "selective internalization", "claim holder"]
+      }
+    };
+
+    const phaseDetails = {
+      inbox: {
+        title: "inbox：<br>外部输入进入 Agent 的前置门",
+        body: "Agent 在启动、恢复或执行 /inbox 时处理本地 pending 消息；团队模式还会向 Maintainer 拉取新的 PolicyUpdate 与 ClaimAttributeUpdate。收件可靠性与业务内化状态分别记录。",
+        bullets: [
+          "pull 失败不致命，本地 pending inbox 仍可继续处理。",
+          "消息先持久化，再发送 receipt ACK；ACK 只表示已经可靠收件。",
+          "本地消息通过 lease 领取，内化成功后写 handled_at，失败释放 lease。",
+          "deprecated policy 可确定性地标记直接来源 claim 为 deprecated。",
+          "有产出时写 inbox trace，把 policy 到 claim 的转换留痕。"
+        ],
+        tags: ["durable receipt", "receipt ACK", "handled_at", "policy trace"]
+      },
+      run_turn: {
+        title: "交互阶段：<br>多轮对话与任务执行",
+        body: "新 Session 把私有 USER/MEMORY、本地有效 Claim、available Skills 与可选 Router scope overview 渲染为冻结的 system prompt。后续 turn 和 resume 都复用这份持久化快照。",
+        bullets: [
+          "本地 claims 是 Agent 自有立场快照，不是团队真理。",
+          "团队模式下，Router scope overview 只提示团队知识范围，具体内容要 query。",
+          "Router 返回 candidate_claims 与 disputes，Agent 自己判断是否采用。",
+          "Tools、Skills、MCP、Subagent 与 Session Search 服务当前任务，不改变三角色身份。",
+          "工具结果和候选 Claim 不会自动成为 Memory 或 Claim。"
+        ],
+        tags: ["system prompt", "private memory", "consult_router", "user task"]
+      },
+      finalize: {
+        title: "finalize：<br>把 session 经验变成团队内流动对象",
+        body: "Session 结束后由 finalize supervisor 恢复 checkpoint，基于可验证的 transcript、工具结果和已见候选 Claim 形成 recap、本地 Claim 与 Trace；团队模式再处理共享产物。",
+        bullets: [
+          "Trace 留在 Agent 本地，记录 input_claims 与 output_claims，解释新 claim 的来源链路。",
+          "团队模式下，Dispute 必须引用至少两条不同且已在上下文出现的 Claim。",
+          "Finalize 不更新 USER/MEMORY，也不把 system prompt、Memory 更新或未读取的 Router Claim 当作证据。",
+          "团队模式下 Maintainer 接收新 mirror/dispute，Router 后续刷新派生索引。",
+          "单人模式不发团队请求，也不创建待日后补传的队列。"
+        ],
+        tags: ["recap", "trace", "validate before I/O", "report_dispute"]
+      }
+    };
+
+    const workbenchDetails = {
+      agents: {
+        title: "Agents 页面：查看团队成员与传播健康度",
+        body: "管理员可以在 Agents 页面检查已注册 agent、mirror claim 数、active/stale/deprecated 分布、最近活动和 policy delivery 状态。Agent 的注册在 Maintainer 视角是懒注册：pull_inbox 或 claim mirror 目录会让它进入团队视图。",
+        boxes: [
+          ["可见内容", "agent_id、mirror_claims、active/stale/deprecated claim 数、last_activity、delivery summary。"],
+          ["典型动作", "筛选 agent，查看详情抽屉，定位投递是否滞后或 claim 是否陈旧。"],
+          ["边界", "管理员看到的是团队侧状态，不进入 Agent 私有 tools、skills、USER/MEMORY。"],
+          ["相关页面", '<a href="../app/">Maintainer 管理台</a>']
+        ]
+      },
+      policies: {
+        title: "Policies 页面：发布、定向、广播、废弃",
+        body: "管理员可以在 Policies 页面发布新的 PolicyUpdate，发布 claim attribute update suggestion，也可以废弃已有 active policy。投递可以是全员广播，也可以选择特定 target_agents。",
+        boxes: [
+          ["可见内容", "policy 状态、scope、message_type、target agents、outbox、send_log、delivery stats。"],
+          ["典型动作", "发布团队规则，向某些 Agent 推送 claim 更新建议，废弃旧 policy。"],
+          ["边界", "Policy 到达 Agent 后仍需 Agent 自己内化，不能直接成为 Agent 本地判断。"],
+          ["相关页面", '<a href="../app/">Maintainer 管理台</a>']
+        ]
+      },
+      claims: {
+        title: "Claims 页面：浏览团队镜像知识",
+        body: "管理员可以在 Claims 页面浏览所有 Agent 上传到团队侧的 claim mirror，并按 holder、status、scope、关键词和 dispute 状态过滤。详情抽屉展示 statement、evidence、source_claim_ids 与 dispute 链接。",
+        boxes: [
+          ["可见内容", "claim id、holder、status、confidence、scope、statement、evidence_summary。"],
+          ["典型动作", "定位特定领域 claim，查看某个 claim 是否被 dispute，跳转相关 dispute 或 claim。"],
+          ["边界", "这里管理的是 mirror 视图。是否采纳或改写，仍由各 Agent 在本地完成。"],
+          ["相关页面", '<a href="../app/">Maintainer 管理台</a>']
+        ]
+      },
+      disputes: {
+        title: "Disputes 页面：处理冲突而不是抹平冲突",
+        body: "管理员可以在 Disputes 页面查看 open/resolved dispute，按关键词、状态、严重度过滤，进入相关 claim，并执行 resolve。Resolve 保留原 Dispute 记录，只更新 status、resolved_at 和 summary；必要时还可以向对应 Agent 发送 claim attribute update，让 resolve 消息被 Agent 察觉并应用。",
+        boxes: [
+          ["可见内容", "dispute id、name、reporter_agent_id、claims、summary、status、created_at。"],
+          ["典型动作", "查看冲突双方 claim，给出复审结论，将 dispute 标记为 resolved，并按需发出 claim attribute update。"],
+          ["边界", "Resolve 是团队治理结论，不会自动重写每个 Agent 的私有 memory；Agent 仍需处理投递消息后应用。"],
+          ["相关页面", '<a href="../app/">Maintainer 管理台</a>']
+        ]
+      },
+      team_auth: {
+        title: "Team Auth：管理 Agent 到团队服务的访问凭据",
+        body: "管理员可以为 Agent 创建或撤销团队 key。创建成功时明文只显示一次；之后列表只保留可审计元数据。Maintainer 与 Router 分别启用各自的 Team Auth 后，同一团队 key 才会保护对应的写入或查询；这不取代 Workbench 自身的管理员 Basic Auth。",
+        boxes: [
+          ["可见内容", "key_id、agent_id、generated_time 与 active/revoked 状态；列表不展示 key_hash 或明文。"],
+          ["典型动作", "为 Agent 创建唯一 active key，一次性复制明文；凭据不再需要时执行 revoke。"],
+          ["安全边界", "list/create/revoke 需要启用 Maintainer admin auth；router-service 是保留身份，不在列表中，也不能由用户创建或撤销。"],
+          ["请求语义", "Agent 请求使用 { auth, data } 信封并绑定对象归属；鉴权失败时团队交互降级，本地普通会话继续。"]
+        ]
+      }
+    };
+
+    const objectDetails = {
+      claim: {
+        title: "Claim：可协作的判断对象",
+        body: "Claim 表示某个 Agent 在某个上下文下持有的判断。它不是绝对真理，但因为带 holder、scope、confidence、status、source_claim_ids 和 evidence_summary，所以能被检索、复用、追溯和质疑。",
+        bullets: [
+          "借用外部 claim 不等于污染长期知识，只有内化后才成为本地 claim。",
+          "source_claim_ids 保留内化来源，可指向外部 claim 或 policy。",
+          "团队侧保存 claim mirror，Router 据此重建检索索引；它不需要与 Maintainer 形成同机部署硬约束。"
+        ],
+        tags: ["holder", "scope", "confidence", "status"],
+        codeTitle: "claim 示例",
+        code: `id: claim_d7894444
+name: dsl_trade_offs_analysis
+statement: DSL adoption involves clear trade-offs…
+scope: technical-education / programming / cost-benefit-analysis
+holder: agent-a
+confidence: medium
+status: active
+created_at: 2026-04-28T05:34:18Z
+source_claim_ids:
+- claim_5bba1a02
+evidence_summary: Synthesized from practical experience with DSL tools…`
+      },
+      policy: {
+        title: "Policy：规则输入，不是团队真理",
+        body: "Policy 由 Maintainer 发布，可以是团队规则，也可以是针对 claim 的属性更新建议。它通过 inbox 抵达 Agent，但必须经 Agent 主动内化才会进入判断体系。",
+        bullets: [
+          "普通发布/废弃走 PolicyUpdate，claim 属性建议走 ClaimAttributeUpdate。",
+          "Policy 支持 target_agents；None 或空列表表示广播。",
+          "policy id 可作为 trace input 或 claim source。"
+        ],
+        tags: ["PolicyUpdate", "ClaimAttributeUpdate", "targeted", "broadcast"],
+        codeTitle: "policy 示例",
+        code: `id: policy_12504441
+name: dsl_answer_style
+statement: |
+  当用户询问 DSL 领域特定语言时，回答应包含：定义、适合场景、优缺点、常见例子，
+  并避免把 DSL 说成只能用于编译器领域。
+scope: agent-claim-network / prompt-design / llm-mode
+status: active
+created_at: 2026-04-28T05:33:58Z`
+      },
+      trace: {
+        title: "Trace：claim 使用与产出的链路账本",
+        body: "Trace 记录某段 session recap 或 inbox 内化用了哪些 claim/policy，又产出了哪些 claim。它保存在产出它的 Agent 本地，用于回看来源链路，不上传团队侧。",
+        bullets: [
+          "input_claims 可以包含 claim_xxx 或 policy_xxx。",
+          "finalize 只有确实使用或产出 Claim 时才写 Trace；compact 只压缩上下文，不承担 finalize。",
+          "inbox 内化也会写 trace，记录 policy 到 claim 的转换；其他 Agent 无法读取。"
+        ],
+        tags: ["input_claims", "output_claims", "audit trail", "recap"],
+        codeTitle: "trace 示例",
+        code: `id: trace_e263aaab
+name: inbox_policy_internalization
+task: 处理 inbox PolicyUpdate 并内化为本地 claim
+agent: agent-b
+input_claims:
+- policy_12504441
+output_claims:
+- claim_7116dca3
+created_at: 2026-04-28T05:34:22Z`
+      },
+      dispute: {
+        title: "Dispute：让冲突成为一等对象",
+        body: "Dispute 记录 Claim 之间的不兼容或冲突。它属于团队治理流：Agent 在团队模式下发现并报告给 Maintainer，Router 查询时可以附带摘要。",
+        bullets: [
+          "Dispute 至少引用两条不同 claim，不能自我引用。",
+          "open dispute 提醒候选 claim 存在争议，但不阻塞工作。",
+          "Maintainer resolve 后更新 status/resolved_at/summary，文件仍保留。",
+          "Resolve 还可以通过给对应 Agent 发 claim attribute update，让 resolve 消息被 Agent 察觉并应用。",
+          "单人模式不报告 Dispute，也不维护以后补传的队列。"
+        ],
+        tags: ["open", "resolved", "conflict", "summary"],
+        codeTitle: "dispute 示例",
+        code: `id: dispute_df6ade0c
+name: api_timeout_contract_strict_vs_resilient
+reporter_agent_id: agent-a
+claims:
+- claim_9af5a7ea
+- claim_eda0a7af
+summary: 两条 claim 对下游 API 超时后应立即失败还是降级继续的工程约束相互冲突…
+status: open
+created_at: 2026-04-28T05:35:01Z`
+      },
+      memory: {
+        title: "Memory：Agent 私有长期上下文",
+        body: "私有 Memory 分为 USER 和 MEMORY。它们只属于当前 Agent，在 Session 启动时注入，Session 中可通过 Memory 工具更新；磁盘更新不会改变当前 Session 已冻结的 system prompt。",
+        bullets: [
+          "USER 记录用户偏好和沟通习惯，产品级硬约束是永不进团队 claim。",
+          "MEMORY 记录项目经验、工具经验和稳定约定，是普通私有 Markdown。",
+          "Memory 与 Claim 不挂 ID、不保存来源关系、不互相覆盖，也不做影子索引。",
+          "Agent 可基于私有经验形成自包含 Claim，但不能让团队反查或泄露具体 Memory 条目。"
+        ],
+        tags: ["USER.md", "MEMORY.md", "private", "frozen snapshot"],
+        codeTitle: "memory 边界",
+        code: `<acn_home>/<upstream>/data/agents/<agent-id>/memories/
+  USER.md      # 用户偏好，永不进入团队 claim
+  MEMORY.md    # 私有经验，不保存 Claim 绑定
+
+session start:
+  private memory + local claims + optional router scopes -> frozen system prompt
+
+finalize_session:
+  verifiable session content -> local claims / traces
+  team mode -> claim mirrors / eligible disputes
+  不产出 memory ops`
+      }
+    };
+
+    const stories = {
+      retry: [
+        {
+          actor: "ops-agent · session A",
+          title: "事故证据进入当前任务",
+          summary: "日志显示 429、Retry-After 与重复 POST 同时出现，Agent 先区分可重试性和幂等边界。",
+          detail: "支付网关连续返回 429，同时业务侧发现一个 POST 被重复执行。工具读取日志和接口契约后，Agent 得到可验证但仍只属于当前 Session 的工程结论：限流响应可以等待后重试，非幂等写入必须先具备去重条件。",
+          boundary: "此时还没有 Claim，也没有团队上传。原始日志、用户输入和私有上下文不会因为一次分析自动进入 Router 或 Maintainer。",
+          input: "429 日志 + API 契约",
+          decision: "区分幂等与非幂等重试",
+          output: "待 finalize 的稳定判断",
+          tags: ["session evidence", "ops-agent", "payments/api/retry"]
+        },
+        {
+          actor: "finalize · ops-agent",
+          title: "形成第一条本地 Claim",
+          summary: "可验证结论写成 claim_7a31c9e2，并用本地 Trace 记录产出过程。",
+          detail: "Finalize 判断这条结论可以跨任务复用，于是创建 active/high 的 claim_7a31c9e2：429 重试应遵守 Retry-After；非幂等写入只有在具备 idempotency key 或等价去重机制时才能自动重试。",
+          boundary: "Claim 的 holder 是 ops-agent，source_claim_ids 为空；它来自当前 Session 的可验证内容，而不是把 system prompt、Memory 或整段日志复制成团队知识。trace_58a4f0b1 记录本次产出，但只保存在 ops-agent 本地。",
+          input: "session recap",
+          decision: "结论稳定且可复用",
+          output: "claim_7a31c9e2 + trace_58a4f0b1",
+          tags: ["claim active", "confidence high", "trace local"]
+        },
+        {
+          actor: "maintainer + router",
+          title: "镜像成为可发现候选",
+          summary: "团队模式上传 Claim mirror；Router 刷新后按 scope 返回完整候选。",
+          detail: "ops-agent 将 claim_7a31c9e2 的 mirror 上传 Maintainer。Router 从团队 mirror 重建派生索引，并把 payments/api/retry 暴露在 scope overview；后续查询会拿到完整 Claim 字段及相关 Dispute 摘要。",
+          boundary: "Maintainer 只保存镜像，不成为 Claim holder；Router 只维护可重建的检索视图。trace_58a4f0b1、原始 Session 和 ops-agent 的私有 Memory 都不会上传。",
+          input: "claim_7a31c9e2 mirror",
+          decision: "按 scope 建立派生索引",
+          output: "可检索 candidate claim",
+          tags: ["maintainer mirror", "router derived view", "no private memory"]
+        },
+        {
+          actor: "release-agent · session B",
+          title: "另一个 Agent 主动查询",
+          summary: "批量发布任务缺少稳定重试规则，release-agent 通过 consult_router 取得候选。",
+          detail: "几天后，release-agent 设计一个可断点续跑的批量发布流程。本地 Claim 不足以回答失败重试边界，于是它根据 scope overview 调用 consult_router，获得 claim_7a31c9e2 及其状态、置信度和证据摘要。",
+          boundary: "Router 命中只把候选放进当前上下文，不会写入 release-agent 的本地 Claim。Agent 仍可跳过候选。",
+          input: "批量发布任务 + router query",
+          decision: "候选相关，但尚未采纳",
+          output: "claim_7a31c9e2 in context",
+          tags: ["consult_router", "candidate only", "validated source id"]
+        },
+        {
+          actor: "release-agent · local judgment",
+          title: "借用，但不照抄",
+          summary: "结合异步游标和 idempotency key，Agent 形成适用于发布流水线的新判断。",
+          detail: "release-agent 检查当前流水线，确认每批任务都有持久游标、稳定 idempotency key 和最大尝试次数。它借用“限流与幂等必须分开处理”的原则，但将结论改写为适合异步发布的规则：只重放尚未提交的批次，并优先采用服务端 Retry-After。",
+          boundary: "原 Claim 没有被复制或修改。新判断属于 release-agent，适用 scope、evidence_summary 和 confidence 都由它基于自己的上下文负责。",
+          input: "claim_7a31c9e2 + 流水线约束",
+          decision: "结合本地证据做上下文化改写",
+          output: "待产出的 release retry claim",
+          tags: ["agent autonomy", "contextual adaptation", "new holder"]
+        },
+        {
+          actor: "finalize · release-agent",
+          title: "来源继续向后传递",
+          summary: "新 Claim 引用来源 Claim；Trace 留在本地，Claim mirror 进入下一轮团队检索。",
+          detail: "Finalize 创建 claim_b8427fd0，并把 source_claim_ids 写为 [claim_7a31c9e2]。本地 trace_c6e9a214 记录输入来源与输出 Claim；团队模式只上传新 Claim mirror，Router 刷新后，第三个 Agent 可以继续发现这条带来源的派生判断。",
+          boundary: "source_claim_ids 表达的是 Claim 来源，不是对整段推理的复制证明；完整 Session transcript 和 Trace 仍属于 release-agent 本地。团队侧只能看到自包含的 Claim 与其来源 ID。",
+          input: "claim_7a31c9e2",
+          decision: "形成自己的稳定判断",
+          output: "claim_b8427fd0 + trace_c6e9a214",
+          tags: ["source_claim_ids", "trace local", "claim mirror uploaded"]
+        }
+      ],
+      pool: [
+        {
+          actor: "runtime-agent + db-agent",
+          title: "两个高置信度 Claim 同时成立",
+          summary: "runtime-agent 主张连接池提升到 96；db-agent 根据集群预算坚持总连接数不超过 40。",
+          detail: "runtime-agent 的压测显示 32 个 worker 在 pool=96 时吞吐最佳，形成 claim_14d9a6c3。db-agent 根据生产集群连接预算形成 claim_6eb17f40：同一服务的连接池上限必须控制在 40。两条 Claim 都是 active/high，scope 都指向 platform/prod/db-capacity。",
+          boundary: "ACN 不会因为创建时间、置信度或 Router 排名自动覆盖其中一条，允许不同 holder 维护不同判断，形成冲突等待 Maintainer 裁决。",
+          input: "吞吐压测 / 数据库容量预算",
+          decision: "各自形成有证据的判断",
+          output: "claim_14d9a6c3 + claim_6eb17f40",
+          tags: ["two holders", "active claims", "same scope"]
+        },
+        {
+          actor: "platform-agent · router query",
+          title: "检索把冲突带进当前任务",
+          summary: "platform-agent 规划生产扩容时同时拿到两条候选，排名无法替代容量判断。",
+          detail: "platform-agent 查询 platform/prod/db-capacity，Router 返回两条完整候选。一个解释 worker 需求，一个解释数据库硬预算；它们都与当前任务相关，但无法在同一生产集群配置中同时执行。",
+          boundary: "Router 的职责是发现相关判断和已知 Dispute，不是选择胜者。即使某条候选分数更高，Agent 也必须结合当前系统证据判断适用性。",
+          input: "扩容任务 + 两条 candidate claims",
+          decision: "识别为真实约束冲突",
+          output: "冲突进入 platform-agent 上下文",
+          tags: ["router recall", "ranking ≠ truth", "conflict visible"]
+        },
+        {
+          actor: "finalize · platform-agent",
+          title: "任务继续，同时报告 Dispute",
+          summary: "Agent 先给出保守可执行方案，再把不能兼容的来源 Claim 报告给 Maintainer。",
+          detail: "platform-agent 没有阻塞当前工作：它选择“总连接数不超过 40，并通过有界队列吸收 worker 并发”，形成 claim_a31f2e84，来源包含两条候选。同时 finalize 创建 open 的 dispute_0f83c2ad，明确指出 pool=96 与集群预算不兼容。",
+          boundary: "Dispute 是复审入口，不是运行时的阻塞。Agent 可以在暴露不确定性的同时完成任务；团队模式才会上报 Dispute，相关 Trace 仍留在 platform-agent 本地。",
+          input: "claim_14d9a6c3 + claim_6eb17f40",
+          decision: "采用保守方案并显式报告冲突",
+          output: "claim_a31f2e84 + dispute_0f83c2ad",
+          tags: ["dispute open", "task continues", "trace local"]
+        },
+        {
+          actor: "maintainer · review",
+          title: "复审给出团队治理结论",
+          summary: "Maintainer 核对容量数据后 resolve Dispute，但不直接修改任何 Agent 的本地 Claim。",
+          detail: "复审确认 40 是当前生产集群的聚合连接预算，pool=96 的压测没有计入共享数据库上的其他服务。Maintainer 将 dispute_0f83c2ad 标记为 resolved，并保留结论：worker 需求应通过有界队列处理，除非数据库预算发生变化。",
+          boundary: "Resolve 更新的是 Dispute 的 status、resolved_at 和 summary。claim_14d9a6c3 此刻仍由 runtime-agent 持有，Maintainer 没有权限把它直接改成 stale 或 deprecated。",
+          input: "open dispute + 容量复审证据",
+          decision: "确认当前 scope 下的预算边界",
+          output: "dispute_0f83c2ad resolved",
+          tags: ["maintainer review", "resolved history kept", "no direct claim write"]
+        },
+        {
+          actor: "maintainer · targeted outbox",
+          title: "通过 Inbox 发送属性更新建议",
+          summary: "Maintainer 定向发布 ClaimAttributeUpdate，建议 runtime-agent 废弃不再适用的 Claim。",
+          detail: "Maintainer 创建 policy_4c1d8e72，message_type=claim_attribute_update，target_agents=[runtime-agent]，建议将 claim_14d9a6c3 标记为 deprecated。消息经 Outbox 投递落到 Agent 本地 Inbox。",
+          boundary: "Policy 是治理输入，不是远程写命令。Maintainer 不会绕过 runtime-agent 修改其权威文件。",
+          input: "resolved dispute",
+          decision: "向 holder 发送定向更新建议",
+          output: "policy_4c1d8e72 → runtime-agent inbox",
+          tags: ["claim_attribute_update", "targeted delivery", "receipt ≠ handled"]
+        },
+        {
+          actor: "runtime-agent · inbox internalization",
+          title: "Holder 自己完成最终更新",
+          summary: "runtime-agent 复核本地证据后接受建议，更新 Claim 并让新的状态重新进入团队视图。",
+          detail: "runtime-agent 领取本地 Inbox，读取完整 Policy 和复审结论，再核对当前集群预算。确认原压测结论缺少关键约束后，它把 claim_14d9a6c3 更新为 deprecated，并写入 updated_at；处理 Trace 记录 policy_4c1d8e72 到该 Claim 更新的来源关系。",
+          boundary: "最终写入发生在 holder Agent 本地。更新后的 mirror 再上传 Maintainer，Router 同步更新检索视图。",
+          input: "policy_4c1d8e72 + 本地复核",
+          decision: "接受建议并更新自己的 Claim",
+          output: "claim_14d9a6c3 deprecated",
+          tags: ["holder writes", "updated_at set", "history preserved"]
+        }
+      ]
+    };
+
+    function renderInspector(target, data) {
+      target.innerHTML = `
+        <h3>${data.title}</h3>
+        <p>${data.body}</p>
+        <ul>${data.bullets.map((item) => `<li>${item}</li>`).join("")}</ul>
+        <div class="chips">${data.tags.map((tag) => `<span class="chip">${tag}</span>`).join("")}</div>
+      `;
+    }
+
+    function setRovingSelection(buttons, activeButton) {
+      buttons.forEach((button) => {
+        const active = button === activeButton;
+        button.setAttribute("aria-selected", String(active));
+        button.tabIndex = active ? 0 : -1;
+      });
+    }
+
+    function switchPage(page, { updateHash = true, shouldScroll = true } = {}) {
+      const activeButton = document.querySelector(`.nav button[data-page="${page}"]`);
+      const activePanel = document.getElementById(`page-${page}`);
+      if (!activeButton || !activePanel) return;
+
+      const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+      setRovingSelection(document.querySelectorAll(".nav button"), activeButton);
+      document.querySelectorAll(".page").forEach((section) => {
+        const active = section === activePanel;
+        section.classList.toggle("active", active);
+        section.hidden = !active;
+      });
+      if (updateHash && window.location.hash !== `#${page}`) {
+        window.history.pushState(null, "", `#${page}`);
+      }
+      if (window.matchMedia("(max-width: 1040px)").matches) {
+        window.requestAnimationFrame(() => {
+          revealPrimaryTab(activeButton, reducedMotion ? "auto" : "smooth");
+        });
+      }
+      if (shouldScroll) {
+        document.getElementById("main").scrollIntoView({ block: "start", behavior: reducedMotion ? "auto" : "smooth" });
+      }
+    }
+
+    // ACN 字标：点击 / 回车 / 空格 返回默认页（quickstart）
+    (function () {
+      var mark = document.querySelector('.brand-mark');
+      if (!mark) return;
+      var goHome = function () { switchPage('quickstart', { shouldScroll: true }); };
+      mark.addEventListener('click', goHome);
+      mark.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); goHome(); }
+      });
+    })();
+
+    function revealPrimaryTab(activeButton, behavior = "smooth") {
+      const primaryNav = activeButton?.closest(".sidebar > .nav");
+      if (!primaryNav || !window.matchMedia("(max-width: 1040px)").matches) return;
+      const targetLeft = activeButton.offsetLeft - (primaryNav.clientWidth - activeButton.offsetWidth) / 2;
+      primaryNav.scrollTo({ left: Math.max(0, targetLeft), behavior });
+    }
+
+    function syncPrimaryNavCue() {
+      const primaryNav = document.querySelector(".sidebar > .nav");
+      const sidebar = document.querySelector(".sidebar");
+      if (!primaryNav || !sidebar) return;
+      const remaining = primaryNav.scrollWidth - primaryNav.clientWidth - primaryNav.scrollLeft;
+      sidebar.classList.toggle("nav-has-more", remaining > 8);
+    }
+
+    function switchRole(role, selectedNode = document.querySelector(`.node[data-role="${role}"]`)) {
+      document.querySelectorAll(".node").forEach((node) => {
+        const active = node === selectedNode;
+        node.classList.toggle("active", active);
+        node.setAttribute("aria-pressed", String(active));
+      });
+      renderInspector(document.getElementById("role-detail"), roleDetails[role]);
+    }
+
+    function switchPhase(phase) {
+      const activeButton = document.querySelector(`[data-phase="${phase}"]`);
+      setRovingSelection(document.querySelectorAll("[data-phase]"), activeButton);
+      document.querySelectorAll("[data-phase-row]").forEach((row) => {
+        row.classList.toggle("active", row.dataset.phaseRow === phase);
+      });
+      const detail = document.getElementById("phase-detail");
+      detail.setAttribute("aria-labelledby", activeButton.id);
+      renderInspector(detail, phaseDetails[phase]);
+    }
+
+    function switchQuickstart(key) {
+      const activeButton = document.querySelector(`[data-quickstart="${key}"]`);
+      setRovingSelection(document.querySelectorAll("[data-quickstart]"), activeButton);
+      document.querySelectorAll("[data-quickstart-panel]").forEach((panel) => {
+        const active = panel.dataset.quickstartPanel === key;
+        panel.classList.toggle("active", active);
+        panel.hidden = !active;
+      });
+    }
+
+    function switchWorkbench(key) {
+      const data = workbenchDetails[key];
+      const activeButton = document.querySelector(`[data-workbench="${key}"]`);
+      setRovingSelection(document.querySelectorAll("[data-workbench]"), activeButton);
+      const detail = document.getElementById("workbench-detail");
+      detail.setAttribute("aria-labelledby", activeButton.id);
+      detail.innerHTML = `
+        <h3>${data.title}</h3>
+        <p>${data.body}</p>
+        <div class="console-grid">
+          ${data.boxes.map(([title, text]) => `<div class="console-box"><strong>${title}</strong><span>${text}</span></div>`).join("")}
+        </div>
+      `;
+    }
+
+    function switchObject(key) {
+      const data = objectDetails[key];
+      const activeButton = document.querySelector(`.object-card[data-object="${key}"]`);
+      document.querySelectorAll(".object-card").forEach((button) => {
+        const active = button === activeButton;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-selected", String(active));
+        button.tabIndex = active ? 0 : -1;
+      });
+      const detail = document.getElementById("object-detail");
+      detail.setAttribute("aria-labelledby", activeButton.id);
+      renderInspector(detail, data);
+      document.getElementById("object-code-title").textContent = data.codeTitle;
+      document.getElementById("object-code").textContent = data.code;
+    }
+
+    function renderStory(key, selectedIndex = 0) {
+      const list = document.getElementById("story-list");
+      list.innerHTML = stories[key].map((item, index) => `
+        <button id="tab-story-${key}-${index}" class="story-step ${index === selectedIndex ? "active" : ""}" type="button" role="tab" aria-selected="${index === selectedIndex}" aria-controls="story-detail" tabindex="${index === selectedIndex ? "0" : "-1"}" data-story-index="${index}">
+          <span class="step-no">${String(index + 1).padStart(2, "0")}</span>
+          <span><span class="story-actor">${item.actor}</span><strong>${item.title}</strong><span>${item.summary}</span></span>
+        </button>
+      `).join("");
+      list.querySelectorAll(".story-step").forEach((button) => {
+        button.addEventListener("click", () => selectStory(key, Number(button.dataset.storyIndex)));
+      });
+      enableRovingTablist(list);
+      selectStory(key, selectedIndex);
+    }
+
+    function selectStory(key, index) {
+      const item = stories[key][index];
+      document.querySelectorAll(".story-step").forEach((button) => {
+        const active = Number(button.dataset.storyIndex) === index;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-selected", String(active));
+        button.tabIndex = active ? 0 : -1;
+      });
+      const detail = document.getElementById("story-detail");
+      detail.setAttribute("aria-labelledby", `tab-story-${key}-${index}`);
+      detail.innerHTML = `
+        <p class="story-detail-eyebrow">${item.actor}</p>
+        <h3>${item.title}</h3>
+        <p class="story-detail-lead">${item.detail}</p>
+        <div class="story-detail-grid">
+          <div class="story-detail-block"><strong>发生了什么</strong><span>${item.summary}</span></div>
+          <div class="story-detail-block"><strong>解释说明</strong><span>${item.boundary}</span></div>
+        </div>
+        <div class="story-route" aria-label="本步骤的输入、判断和输出">
+          <div class="story-route-node"><small>INPUT</small><code>${item.input}</code></div>
+          <span class="story-route-arrow" aria-hidden="true">→</span>
+          <div class="story-route-node"><small>AGENT / SERVICE DECISION</small><strong>${item.decision}</strong></div>
+          <span class="story-route-arrow" aria-hidden="true">→</span>
+          <div class="story-route-node"><small>OUTPUT</small><code>${item.output}</code></div>
+        </div>
+        <div class="chips"><span class="chip">step ${index + 1}</span>${item.tags.map((tag) => `<span class="chip">${tag}</span>`).join("")}</div>
+      `;
+    }
+
+    function switchExample(key) {
+      const activeButton = document.querySelector(`[data-example="${key}"]`);
+      setRovingSelection(document.querySelectorAll("[data-example]"), activeButton);
+      document.getElementById("story-panel").setAttribute("aria-labelledby", activeButton.id);
+      renderStory(key, 0);
+    }
+
+    function enableRovingTablist(tablist) {
+      if (tablist.dataset.rovingReady === "true") return;
+      tablist.dataset.rovingReady = "true";
+      tablist.addEventListener("keydown", (event) => {
+        if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+        const tabs = [...tablist.querySelectorAll('[role="tab"]')];
+        const currentIndex = tabs.indexOf(event.target.closest('[role="tab"]'));
+        if (currentIndex < 0) return;
+        event.preventDefault();
+        let nextIndex = currentIndex;
+        if (event.key === "Home") nextIndex = 0;
+        if (event.key === "End") nextIndex = tabs.length - 1;
+        if (event.key === "ArrowRight" || event.key === "ArrowDown") nextIndex = (currentIndex + 1) % tabs.length;
+        if (event.key === "ArrowLeft" || event.key === "ArrowUp") nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+        tabs[nextIndex].focus();
+        tabs[nextIndex].click();
+      });
+    }
+
+    document.querySelectorAll(".nav button").forEach((button) => {
+      button.addEventListener("click", () => switchPage(button.dataset.page));
+    });
+    document.querySelectorAll(".node").forEach((button) => {
+      button.addEventListener("click", () => switchRole(button.dataset.role, button));
+    });
+    document.querySelectorAll("[data-phase]").forEach((button) => {
+      button.addEventListener("click", () => switchPhase(button.dataset.phase));
+    });
+    document.querySelectorAll("[data-quickstart]").forEach((button) => {
+      button.addEventListener("click", () => switchQuickstart(button.dataset.quickstart));
+    });
+    document.querySelectorAll("[data-workbench]").forEach((button) => {
+      button.addEventListener("click", () => switchWorkbench(button.dataset.workbench));
+    });
+    document.querySelectorAll(".object-card").forEach((button) => {
+      button.addEventListener("click", () => switchObject(button.dataset.object));
+    });
+    document.querySelectorAll("[data-example]").forEach((button) => {
+      button.addEventListener("click", () => switchExample(button.dataset.example));
+    });
+
+    switchQuickstart("usage");
+    switchRole("maintainer");
+    switchPhase("inbox");
+    switchWorkbench("agents");
+    switchObject("claim");
+    switchExample("retry");
+    document.querySelectorAll('[role="tablist"]').forEach(enableRovingTablist);
+
+    const primaryNav = document.querySelector(".sidebar > .nav");
+    primaryNav?.addEventListener("scroll", syncPrimaryNavCue, { passive: true });
+    window.addEventListener("resize", () => {
+      window.requestAnimationFrame(() => {
+        syncPrimaryNavCue();
+        revealPrimaryTab(primaryNav?.querySelector('[aria-selected="true"]'), "auto");
+      });
+    });
+    window.addEventListener("load", () => {
+      window.requestAnimationFrame(() => {
+        revealPrimaryTab(primaryNav?.querySelector('[aria-selected="true"]'), "auto");
+        syncPrimaryNavCue();
+      });
+    }, { once: true });
+    syncPrimaryNavCue();
+
+    const initialPage = window.location.hash.slice(1);
+    const initialPageExists = document.querySelector(`.nav button[data-page="${initialPage}"]`);
+    const resolvedInitialPage = initialPageExists ? initialPage : "quickstart";
+    if (!initialPageExists) window.history.replaceState(null, "", `#${resolvedInitialPage}`);
+    switchPage(resolvedInitialPage, { updateHash: false, shouldScroll: false });
+
+    window.addEventListener("hashchange", () => {
+      const page = window.location.hash.slice(1);
+      if (document.querySelector(`.nav button[data-page="${page}"]`)) {
+        switchPage(page, { updateHash: false, shouldScroll: true });
+      }
+    });
+  </script>
+</body>
+</html>

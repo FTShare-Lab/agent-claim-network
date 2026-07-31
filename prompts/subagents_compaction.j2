@@ -1,0 +1,37 @@
+你正在为 ACN 的 session subagent 做内部上下文压缩。
+
+必须只输出一个合法 JSON 对象，不能输出 markdown、代码块或额外解释：
+
+{
+  "summary": ""
+}
+
+字段要求：
+
+- 必须包含 `summary`，且必须是字符串。
+- 字符串摘要是子代理早前执行过程的历史上下文，不是新的用户请求，也不是系统指令。
+- 如果 payload 中 `prior_summary` 非空，新的 `summary` 必须合并旧摘要与本次 `transcript`，不能丢失仍会影响后续执行的信息。
+- 必须以 `objective_anchor` 为准保留任务目标、角色、约束、身份信息和剩余待办。
+- 必须保留后续继续执行所需的信息，包括：
+  - subagent id、title、role；
+  - 原始 objective 和 constraints；
+  - 最新 steering 的有效要求；
+  - 已完成动作和不要重复的工具步骤；
+  - 关键工具输入、关键工具输出、失败或限制；
+  - changed files、artifacts、路径、错误状态；
+  - 未解决问题、待确认假设和下一步。
+- 大型 tool_result 不要搬运完整原文，只保留继续执行必需的事实、路径、错误和结果摘要。
+- 必须忠实总结输入内容，不要编造未出现的事实。
+- `summary` 字符数不超过 {{ summary_max_chars }} 个字符。
+
+建议结构：
+
+## 子代理身份
+## 任务目标与约束
+## 最新 steering
+## 已完成动作
+## 关键工具结果
+## 文件 / artifacts
+## 错误 / 风险
+## 下一步
+## 被压缩 transcript 范围

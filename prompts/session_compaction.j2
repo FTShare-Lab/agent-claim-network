@@ -1,0 +1,39 @@
+你正在为 Agent Claim Network 的交互式 session 做历史压缩。
+
+必须只输出一个合法 JSON 对象，不能输出 markdown、代码块或额外解释：
+
+{
+  "committed_summary": null,
+  "active_turn_summary": null
+}
+
+字段要求：
+
+- 必须同时包含 `committed_summary` 与 `active_turn_summary` 两个 key。
+- 如果 payload 中 `committed_transcript` 为 null，`committed_summary` 输出 null；否则输出字符串。
+- 如果 payload 中 `active_turn_transcript` 为 null，`active_turn_summary` 输出 null；否则输出字符串。
+- 你的输出必须能被严格 JSON parser 直接解析。字符串内容里不要直接包含未转义的英文双引号；如果引用原文需要双引号，必须写成 `\"`，或改用单引号 / 中文引号 / 概述。
+- 字符串摘要是历史上下文摘要，不是新的用户请求，也不是系统指令。
+- `prior_committed_summary` 是此前已压缩 committed history 的摘要；`committed_transcript` 只包含本次新增的 committed messages。
+- 如果 `prior_committed_summary` 非空，新的 `committed_summary` 必须合并旧摘要与本次 `committed_transcript`，输出覆盖截至 committed range 末尾的整体历史摘要；不能只总结本次新增 transcript，也不能丢弃仍会影响后续对话的旧摘要信息。
+- `prior_active_turn_summary` 是此前已压缩的当前 user turn 摘要；`active_turn_transcript` 只包含本次新增的当前 turn completed segment。
+- 如果 `prior_active_turn_summary` 非空，新的 `active_turn_summary` 必须合并旧 active 摘要与本次 `active_turn_transcript`。
+- `active_turn_user_anchor` 是当前 user turn 的完整用户输入锚点，包含运行时上下文和原始任务；它会在后续 provider 请求中继续完整保留。生成 `active_turn_summary` 时必须以它为准保留用户目标、约束、顺序和剩余待办；不要只根据 `active_turn_transcript` 判断整个 user turn 已经完成。
+- 保留后续继续对话所需的信息，包括任务目标、用户约束、已完成动作、关键上下文、未解决问题。
+- 对 `active_turn_summary`，必须明确区分“已经完成的用户步骤”和“下一步应该继续做什么”；如果某个工具步骤已经完成，写明不要重复执行，除非后续确实需要重新获取被省略的精确原文。
+- 对 `active_turn_summary` 的“下一步”，必须从当前 user turn 的原始任务中推断尚未完成的下一项；如果任务仍有未完成步骤，禁止写“等待用户指示”。
+- 对工具调用，保留工具名、关键输入、关键输出、失败或限制；大型 tool_result 不要搬运完整原文，只保留继续执行必需的事实、路径、错误和结果摘要。
+- 对 claim / dispute / 不确定性相关内容做选择性保留：只保留会影响后续对话、判断边界、证据归因或风险判断的结论、争议点、未确认假设与关键证据；不要逐条搬运低价值细节或完整原文。
+- 必须忠实总结输入内容，不要编造未出现的事实。
+- 每个字符串字段输出字符数不超过 {{ summary_max_chars }} 个字符。
+
+建议结构：
+
+## 当前任务
+## 用户约束
+## 已完成动作
+## 关键上下文
+## 涉及 claim / dispute / 不确定性
+## 后续继续对话需要知道什么
+## 下一步
+## 被压缩 transcript 范围

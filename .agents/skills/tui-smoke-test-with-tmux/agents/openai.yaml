@@ -1,0 +1,4 @@
+interface:
+  display_name: "TUI tmux 冒烟测试"
+  short_description: "用 tmux 验证 ACN TUI 交互和画面"
+  default_prompt: "Use $tui-smoke-test-with-tmux to verify the ACN TUI after terminal UI changes."

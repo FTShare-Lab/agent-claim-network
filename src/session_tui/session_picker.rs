@@ -1,0 +1,257 @@
+//! /resume session 选择器。
+//!
+//! 本模块只维护可恢复 session 列表的键盘选择与渲染；真正的 session 打开由 App 状态机
+//! 接收事件后异步执行，避免 UI 组件直接读写存储。
+
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
+
+use crate::session::ResumedSessionSummary;
+
+use super::app_event::{AppEvent, AppEventSender};
+
+pub(super) struct SessionPickerState {
+    sessions: Vec<ResumedSessionSummary>,
+    selected: usize,
+    event_tx: AppEventSender,
+}
+
+impl SessionPickerState {
+    pub(super) fn new(sessions: Vec<ResumedSessionSummary>, event_tx: AppEventSender) -> Self {
+        Self {
+            sessions,
+            selected: 0,
+            event_tx,
+        }
+    }
+
+    pub(super) fn handle_key_event(&mut self, key: KeyEvent) {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return;
+        }
+        match key.code {
+            KeyCode::Up => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Down => {
+                let max_selected = self.sessions.len().saturating_sub(1);
+                self.selected = self.selected.saturating_add(1).min(max_selected);
+            }
+            KeyCode::Enter => {
+                if let Some(session) = self.sessions.get(self.selected) {
+                    self.event_tx
+                        .send(AppEvent::PickerSessionSelected(session.metadata.id.clone()));
+                }
+            }
+            KeyCode::Esc => self.event_tx.send(AppEvent::PickerCancelled),
+            _ => {}
+        }
+    }
+
+    pub(super) fn render_inline_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let table_width = usize::from(width.saturating_sub(4)).max(1);
+        let mut lines = vec![Line::from("Session Resume"), Line::from("")];
+        if self.sessions.is_empty() {
+            lines.push(Line::from("No resumable sessions. Press Esc to return."));
+            return lines;
+        }
+
+        lines.push(Line::from(
+            "id                 closed_at            status  last_message",
+        ));
+        for (index, session) in self.sessions.iter().enumerate() {
+            let id = session.metadata.id.as_str();
+            let closed_at = session
+                .metadata
+                .closed_at
+                .map(|time| time.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                .unwrap_or_else(|| "-".into());
+            let status = format!("{:?}", session.metadata.status).to_lowercase();
+            let last_user = truncate_to_width(
+                session.last_user_text.as_deref().unwrap_or(""),
+                table_width.saturating_sub(48),
+            );
+            let marker = if index == self.selected { "›" } else { " " };
+            let line = format!("{marker} {id:<18} {closed_at:<20} {status:<7} {last_user}");
+            let style = if index == self.selected {
+                Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default().fg(ratatui::style::Color::DarkGray)
+            };
+            lines.push(padded_line(line, table_width, style));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from("↑↓ Navigate  Enter Select  Esc Cancel"));
+        lines
+    }
+
+    #[cfg(test)]
+    fn selected(&self) -> usize {
+        self.selected
+    }
+}
+
+fn padded_line(text: String, width: usize, style: Style) -> Line<'static> {
+    let mut line = Line::styled(text, style);
+    let current_width = line.width();
+    if current_width < width {
+        line.push_span(Span::styled(" ".repeat(width - current_width), style));
+    }
+    line
+}
+
+fn truncate_to_width(text: &str, max_width: usize) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::new();
+    let mut width: usize = 0;
+    for ch in normalized.chars() {
+        let ch_width = ch.to_string().width();
+        if width.saturating_add(ch_width) > max_width {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::claim::{AgentId, SessionId};
+    use crate::session::{SessionMetadata, SessionStatus};
+    use chrono::Utc;
+    use crossterm::event::{KeyEvent, KeyEventKind, KeyModifiers};
+    use std::str::FromStr;
+
+    fn summary(id: &str) -> ResumedSessionSummary {
+        let now = Utc::now();
+        ResumedSessionSummary {
+            metadata: SessionMetadata {
+                id: SessionId::from_str(id).unwrap(),
+                agent_id: AgentId::new("agent-a").unwrap(),
+                status: SessionStatus::Closed,
+                created_at: now,
+                updated_at: now,
+                closed_at: Some(now),
+                source: "tui".into(),
+                model: "test-model".into(),
+                system_prompt_path: "system_prompt.md".into(),
+                message_count: 0,
+                finalized_at: None,
+                recapped_until: 0,
+                compaction: None,
+            },
+            last_user_text: Some("hello".into()),
+        }
+    }
+
+    #[test]
+    fn picker_up_down_clamps_at_boundaries() {
+        let (event_tx, _event_rx) = AppEventSender::channel();
+        let mut picker = SessionPickerState::new(
+            vec![summary("session_aaaaaaaa"), summary("session_bbbbbbbb")],
+            event_tx,
+        );
+
+        picker.handle_key_event(KeyEvent::from(KeyCode::Up));
+        assert_eq!(picker.selected(), 0);
+        picker.handle_key_event(KeyEvent::from(KeyCode::Down));
+        picker.handle_key_event(KeyEvent::from(KeyCode::Down));
+        assert_eq!(picker.selected(), 1);
+    }
+
+    #[test]
+    fn picker_ignores_key_release_events() {
+        let (event_tx, _event_rx) = AppEventSender::channel();
+        let mut picker = SessionPickerState::new(
+            vec![summary("session_aaaaaaaa"), summary("session_bbbbbbbb")],
+            event_tx,
+        );
+
+        picker.handle_key_event(KeyEvent::new_with_kind(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+
+        assert_eq!(picker.selected(), 0);
+    }
+
+    #[test]
+    fn picker_render_header_uses_truncated_closed_at_and_last_message_name() {
+        let (event_tx, _event_rx) = AppEventSender::channel();
+        let picker = SessionPickerState::new(vec![summary("session_aaaaaaaa")], event_tx);
+        let rendered = picker
+            .render_inline_lines(100)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("last_message"));
+        assert!(!rendered.contains("last message"));
+        assert!(!rendered.contains("+00:00"));
+    }
+
+    #[test]
+    fn picker_render_marks_selected_row_with_visible_marker() {
+        let (event_tx, _event_rx) = AppEventSender::channel();
+        let mut picker = SessionPickerState::new(
+            vec![summary("session_aaaaaaaa"), summary("session_bbbbbbbb")],
+            event_tx,
+        );
+
+        let initial = picker
+            .render_inline_lines(100)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(initial
+            .iter()
+            .any(|line| line.starts_with("› session_aaaaaaaa")));
+
+        picker.handle_key_event(KeyEvent::from(KeyCode::Down));
+        let moved = picker
+            .render_inline_lines(100)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(moved
+            .iter()
+            .any(|line| line.starts_with("› session_bbbbbbbb")));
+    }
+
+    #[test]
+    fn picker_enter_sends_selected_session_id() {
+        let (event_tx, mut event_rx) = AppEventSender::channel();
+        let mut picker = SessionPickerState::new(vec![summary("session_aaaaaaaa")], event_tx);
+
+        picker.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+        assert_eq!(
+            event_rx.try_recv().unwrap(),
+            AppEvent::PickerSessionSelected(SessionId::from_str("session_aaaaaaaa").unwrap())
+        );
+    }
+
+    #[test]
+    fn picker_esc_sends_cancelled() {
+        let (event_tx, mut event_rx) = AppEventSender::channel();
+        let mut picker = SessionPickerState::new(vec![summary("session_aaaaaaaa")], event_tx);
+
+        picker.handle_key_event(KeyEvent::from(KeyCode::Esc));
+
+        assert_eq!(event_rx.try_recv().unwrap(), AppEvent::PickerCancelled);
+    }
+
+    #[test]
+    fn picker_empty_list_does_not_send_on_enter() {
+        let (event_tx, mut event_rx) = AppEventSender::channel();
+        let mut picker = SessionPickerState::new(Vec::new(), event_tx);
+
+        picker.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+        assert!(event_rx.try_recv().is_err());
+    }
+}

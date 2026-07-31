@@ -1,0 +1,11 @@
+# 主对话 LLM；变量名需与 [agent.llm].api_key_env 一致
+# export ACN_LLM_API_KEY=<YOUR_KEY_HERE>
+
+# 用于模型 Web Search
+# export GLM_API_KEY=<YOUR_KEY_HERE>
+
+# 仅在团队服务启用 key 鉴权时使用；不是 LLM API key。
+# export ACN_AUTH_KEY=<YOUR_TEAM_KEY_HERE>
+
+# Maintainer 管理台启用登录鉴权时使用
+# export ACN_MAINTAINER_ADMIN_PASSWORD=<YOUR_PASSWORD_HERE>

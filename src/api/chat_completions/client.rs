@@ -1,0 +1,629 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures::StreamExt;
+use rand::Rng;
+
+use crate::api::endpoint::{resolve_llm_endpoint, LlmEndpointKind};
+use crate::api::llm_http::{read_llm_error_body, LlmHttpError, LlmHttpPhase};
+
+use super::protocol::{ChatCompletionRequest, ChatCompletionResponse};
+use super::streaming::{drain_sse_frames, sse_frame_data, ChatStreamAccumulator};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatStreamEvent {
+    ContentDelta { text: String },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ChatCompletionsError {
+    #[error("{0}")]
+    Http(#[from] LlmHttpError),
+    #[error("LLM provider authentication failed (401): {0}")]
+    Auth(String),
+    #[error("LLM provider returned HTTP {status}: {body}")]
+    Status { status: u16, body: String },
+    #[error("LLM response JSON parse failed: {0}")]
+    ResponseJson(#[from] serde_json::Error),
+    #[error("Chat Completions endpoint 配置无效: {0}")]
+    InvalidEndpoint(String),
+    #[error("Chat Completions 输出不符合预期: {reason}; raw={raw}")]
+    OutputShape { reason: String, raw: String },
+}
+
+pub struct ChatCompletionsClient {
+    http: reqwest::Client,
+    endpoint: Arc<String>,
+    api_key: Arc<String>,
+    retry_count: u32,
+    retry_base_delay: Duration,
+    retry_max_delay: Duration,
+    timeout: Duration,
+}
+
+impl ChatCompletionsClient {
+    pub fn new(
+        endpoint: String,
+        api_key: String,
+        timeout: Duration,
+        retry_count: u32,
+        retry_base_delay: Duration,
+        retry_max_delay: Duration,
+    ) -> Result<Self, ChatCompletionsError> {
+        let http = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .map_err(|error| {
+                ChatCompletionsError::Http(LlmHttpError::new(
+                    error,
+                    LlmHttpPhase::BuildClient,
+                    Some(timeout),
+                ))
+            })?;
+        Ok(Self {
+            http,
+            endpoint: Arc::new(
+                resolve_llm_endpoint(&endpoint, LlmEndpointKind::OpenAiChatCompletions)
+                    .map_err(|error| ChatCompletionsError::InvalidEndpoint(error.to_string()))?,
+            ),
+            api_key: Arc::new(api_key),
+            retry_count,
+            retry_base_delay,
+            retry_max_delay,
+            timeout,
+        })
+    }
+
+    fn http_error(&self, error: reqwest::Error, phase: LlmHttpPhase) -> ChatCompletionsError {
+        ChatCompletionsError::Http(LlmHttpError::new(error, phase, Some(self.timeout)))
+    }
+
+    pub(crate) fn retry_count(&self) -> u32 {
+        self.retry_count
+    }
+
+    pub(crate) fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    pub async fn send(
+        &self,
+        request: &ChatCompletionRequest,
+        emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
+    ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
+        self.send_with_retry_count(request, self.retry_count, emit)
+            .await
+    }
+
+    pub async fn send_with_retry_count(
+        &self,
+        request: &ChatCompletionRequest,
+        retry_count: u32,
+        emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
+    ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
+        if request.stream {
+            self.send_streaming_with_retry(request, retry_count, emit)
+                .await
+        } else {
+            self.send_json_with_retry(request, retry_count).await
+        }
+    }
+
+    async fn send_json_with_retry(
+        &self,
+        request: &ChatCompletionRequest,
+        retry_count: u32,
+    ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
+        let mut last_retryable = None;
+        for attempt in 0..=retry_count {
+            match self.send_json_once(request).await {
+                Ok(value) => return Ok(value),
+                Err(e) if is_retryable(&e) && attempt < retry_count => {
+                    let backoff =
+                        compute_backoff(attempt, self.retry_base_delay, self.retry_max_delay);
+                    log::warn!(
+                        target: "api",
+                        "Chat Completions 调用失败，{}ms 后重试 ({}/{}): {}",
+                        backoff.as_millis(),
+                        attempt + 1,
+                        retry_count,
+                        e
+                    );
+                    last_retryable = Some(e);
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(
+            last_retryable.unwrap_or_else(|| ChatCompletionsError::OutputShape {
+                reason: "retry loop 未返回结果".into(),
+                raw: String::new(),
+            }),
+        )
+    }
+
+    async fn send_json_once(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
+        let resp = self
+            .http
+            .post(self.endpoint.as_str())
+            .bearer_auth(self.api_key.as_str())
+            .header("content-type", "application/json")
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| self.http_error(error, LlmHttpPhase::SendRequest))?;
+        response_json(resp, self.timeout).await
+    }
+
+    async fn send_streaming_with_retry(
+        &self,
+        request: &ChatCompletionRequest,
+        retry_count: u32,
+        emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
+    ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
+        let mut last_retryable = None;
+        for attempt in 0..=retry_count {
+            let mut emitted = false;
+            let result = {
+                let mut tracking_emit = |event| {
+                    emitted = true;
+                    emit(event);
+                };
+                self.send_streaming_once(request, &mut tracking_emit).await
+            };
+            match result {
+                Ok(value) => return Ok(value),
+                Err(e) if !emitted && is_retryable(&e) && attempt < retry_count => {
+                    let backoff =
+                        compute_backoff(attempt, self.retry_base_delay, self.retry_max_delay);
+                    log::warn!(
+                        target: "api",
+                        "Chat Completions stream 调用失败，{}ms 后重试 ({}/{}): {}",
+                        backoff.as_millis(),
+                        attempt + 1,
+                        retry_count,
+                        e
+                    );
+                    last_retryable = Some(e);
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(
+            last_retryable.unwrap_or_else(|| ChatCompletionsError::OutputShape {
+                reason: "stream retry loop 未返回结果".into(),
+                raw: String::new(),
+            }),
+        )
+    }
+
+    async fn send_streaming_once(
+        &self,
+        request: &ChatCompletionRequest,
+        emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
+    ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
+        let resp = self
+            .http
+            .post(self.endpoint.as_str())
+            .bearer_auth(self.api_key.as_str())
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| self.http_error(error, LlmHttpPhase::SendRequest))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let body = read_llm_error_body(resp, self.timeout).await;
+            return Err(ChatCompletionsError::Auth(body));
+        }
+        if !status.is_success() {
+            let body = read_llm_error_body(resp, self.timeout).await;
+            return Err(ChatCompletionsError::Status {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let mut sse_buffer = Vec::new();
+        let mut accumulator = ChatStreamAccumulator::default();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.map_err(|error| self.http_error(error, LlmHttpPhase::ReadStreamBody))?;
+            sse_buffer.extend_from_slice(&chunk);
+            for frame in drain_sse_frames(&mut sse_buffer) {
+                if let Some(data) = sse_frame_data(&frame)? {
+                    accumulator.apply_frame(&data, emit)?;
+                }
+            }
+        }
+        if !sse_buffer.is_empty() {
+            if let Some(data) = sse_frame_data(&sse_buffer)? {
+                accumulator.apply_frame(&data, emit)?;
+            }
+        }
+        accumulator.finish()
+    }
+}
+
+async fn response_json(
+    resp: reqwest::Response,
+    timeout: Duration,
+) -> Result<ChatCompletionResponse, ChatCompletionsError> {
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let body = read_llm_error_body(resp, timeout).await;
+        return Err(ChatCompletionsError::Auth(body));
+    }
+    if !status.is_success() {
+        let body = read_llm_error_body(resp, timeout).await;
+        return Err(ChatCompletionsError::Status {
+            status: status.as_u16(),
+            body,
+        });
+    }
+    let body = resp.text().await.map_err(|error| {
+        ChatCompletionsError::Http(LlmHttpError::new(
+            error,
+            LlmHttpPhase::ReadResponseBody,
+            Some(timeout),
+        ))
+    })?;
+    serde_json::from_str(&body).map_err(ChatCompletionsError::ResponseJson)
+}
+
+fn is_retryable(error: &ChatCompletionsError) -> bool {
+    match error {
+        ChatCompletionsError::Http(error) => error.is_retryable(),
+        ChatCompletionsError::Status { status, .. } => *status == 429 || *status >= 500,
+        ChatCompletionsError::Auth(_)
+        | ChatCompletionsError::ResponseJson(_)
+        | ChatCompletionsError::InvalidEndpoint(_)
+        | ChatCompletionsError::OutputShape { .. } => false,
+    }
+}
+
+fn compute_backoff(attempt: u32, base: Duration, max: Duration) -> Duration {
+    let factor = 1u32.checked_shl(attempt.min(10)).unwrap_or(u32::MAX);
+    let raw = base.saturating_mul(factor);
+    let capped = raw.min(max);
+    let center = u64::try_from(capped.as_millis()).unwrap_or(u64::MAX);
+    if center == 0 {
+        return Duration::ZERO;
+    }
+    let half = center / 2;
+    let low = center.saturating_sub(half);
+    let high = center.saturating_add(half);
+    let jittered = rand::thread_rng().gen_range(low..=high);
+    let max_ms = u64::try_from(max.as_millis()).unwrap_or(u64::MAX);
+    Duration::from_millis(jittered.min(max_ms))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+    use crate::api::chat_completions::{ChatMessage, ChatToolCall};
+
+    #[tokio::test]
+    async fn chat_completions_parses_non_stream_text() {
+        let body = json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "hello"},
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string();
+        let (endpoint, _requests) = spawn_server("application/json", body).await;
+        let client = test_client(endpoint);
+
+        let response = client.send(&request(false), &mut |_| {}).await.unwrap();
+
+        assert_eq!(
+            response.choices[0].message.content.as_deref(),
+            Some("hello")
+        );
+        assert_eq!(
+            response.choices[0].finish_reason,
+            Some(crate::api::ChatFinishReason::Stop)
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_treats_null_tool_calls_as_empty() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "hello",
+                    "tool_calls": null
+                },
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string();
+        let (endpoint, _requests) = spawn_server("application/json", body).await;
+        let client = test_client(endpoint);
+
+        let response = client.send(&request(false), &mut |_| {}).await.unwrap();
+
+        assert_eq!(
+            response.choices[0].message.content.as_deref(),
+            Some("hello")
+        );
+        assert!(response.choices[0].message.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_completions_parses_non_stream_tool_calls() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "file_read", "arguments": "{\"path\":\"Cargo.toml\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })
+        .to_string();
+        let (endpoint, _requests) = spawn_server("application/json", body).await;
+        let client = test_client(endpoint);
+
+        let response = client.send(&request(false), &mut |_| {}).await.unwrap();
+
+        assert_eq!(response.choices[0].message.tool_calls[0].id, "call_1");
+        assert_eq!(
+            response.choices[0].finish_reason,
+            Some(crate::api::ChatFinishReason::ToolCalls)
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_streams_text_delta() {
+        let body = sse_response(vec![
+            json!({"choices":[{"delta":{"role":"assistant"}}]}),
+            json!({"choices":[{"delta":{"content":"hel"}}]}),
+            json!({"choices":[{"delta":{"content":"lo"},"finish_reason":"stop"}]}),
+        ]);
+        let (endpoint, _requests) = spawn_server("text/event-stream", body).await;
+        let client = test_client(endpoint);
+        let mut events = Vec::new();
+
+        let response = client
+            .send(&request(true), &mut |event| events.push(event))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.choices[0].message.content.as_deref(),
+            Some("hello")
+        );
+        assert_eq!(
+            events,
+            vec![
+                ChatStreamEvent::ContentDelta { text: "hel".into() },
+                ChatStreamEvent::ContentDelta { text: "lo".into() }
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_stream_treats_null_tool_calls_as_empty_delta() {
+        let body = sse_response(vec![
+            json!({"choices":[{"delta":{"role":"assistant","tool_calls":null}}]}),
+            json!({"choices":[{"delta":{"content":"ok","tool_calls":null},"finish_reason":"stop"}]}),
+        ]);
+        let (endpoint, _requests) = spawn_server("text/event-stream", body).await;
+        let client = test_client(endpoint);
+
+        let response = client.send(&request(true), &mut |_| {}).await.unwrap();
+
+        assert_eq!(response.choices[0].message.content.as_deref(), Some("ok"));
+        assert!(response.choices[0].message.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_completions_stream_parses_final_usage_chunk() {
+        let body = sse_response(vec![
+            json!({"choices":[{"delta":{"role":"assistant"}}]}),
+            json!({"choices":[], "usage": {"total_tokens": 5}}),
+            json!({"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}),
+            json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "total_tokens": 12
+                }
+            }),
+        ]);
+        let (endpoint, _requests) = spawn_server("text/event-stream", body).await;
+        let client = test_client(endpoint);
+
+        let response = client.send(&request(true), &mut |_| {}).await.unwrap();
+
+        assert_eq!(
+            response
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.get("total_tokens"))
+                .and_then(serde_json::Value::as_u64),
+            Some(12)
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_streams_tool_call_arguments() {
+        let body = sse_response(vec![
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"file_read","arguments":"{\"path\""}}]}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\"Cargo.toml\"}"}}]},"finish_reason":"tool_calls"}]}),
+        ]);
+        let (endpoint, _requests) = spawn_server("text/event-stream", body).await;
+        let client = test_client(endpoint);
+
+        let response = client.send(&request(true), &mut |_| {}).await.unwrap();
+
+        assert_eq!(
+            response.choices[0].message.tool_calls,
+            vec![ChatToolCall::function(
+                "call_1",
+                "file_read",
+                "{\"path\":\"Cargo.toml\"}"
+            )]
+        );
+        assert_eq!(
+            response.choices[0].finish_reason,
+            Some(crate::api::ChatFinishReason::ToolCalls)
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_timeout_error_names_llm_timeout() {
+        let endpoint = spawn_hanging_server().await;
+        let client = ChatCompletionsClient::new(
+            endpoint,
+            "test-key".into(),
+            Duration::from_millis(50),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        let error = client
+            .send(&request(false), &mut |_| {})
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("LLM request timeout after 50ms"));
+        assert!(error.contains("sending LLM request"));
+    }
+
+    #[tokio::test]
+    async fn chat_completions_stream_body_error_names_stream_phase() {
+        let body = sse_response(vec![json!({
+            "choices": [{
+                "delta": {
+                    "role": "assistant",
+                    "content": "hello"
+                }
+            }]
+        })]);
+        let endpoint = spawn_raw_response(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+            body.len() + 64,
+            body
+        ))
+        .await;
+        let client = test_client(endpoint);
+
+        let error = client
+            .send(&request(true), &mut |_| {})
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("LLM response body"));
+        assert!(error.contains("reading LLM stream response body"));
+    }
+
+    fn request(stream: bool) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "test-model".into(),
+            messages: vec![ChatMessage::user("hello")],
+            reasoning_effort: None,
+            tools: None,
+            max_tokens: 128,
+            stream,
+            stream_options: None,
+            temperature: None,
+        }
+    }
+
+    fn test_client(endpoint: String) -> ChatCompletionsClient {
+        ChatCompletionsClient::new(
+            endpoint,
+            "test-key".into(),
+            Duration::from_secs(5),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap()
+    }
+
+    fn sse_response(events: Vec<serde_json::Value>) -> String {
+        let mut body = String::new();
+        for event in events {
+            body.push_str("data: ");
+            body.push_str(&event.to_string());
+            body.push_str("\n\n");
+        }
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    async fn spawn_hanging_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0; 8192];
+            let _ = socket.read(&mut buf).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        format!("http://{addr}")
+    }
+
+    async fn spawn_raw_response(response: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0; 8192];
+            let _ = socket.read(&mut buf).await.unwrap();
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn spawn_server(
+        content_type: &'static str,
+        body: String,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests_for_task = requests.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0; 8192];
+            let n = socket.read(&mut buf).await.unwrap();
+            requests_for_task
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&buf[..n]).to_string());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{addr}"), requests)
+    }
+}

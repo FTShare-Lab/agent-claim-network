@@ -1,0 +1,23 @@
+name: Version consistency
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  version-consistency:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check version consistency
+        env:
+          # 此任务只读取 Cargo 元数据，使用 Runner 预装工具链以避免下载项目开发组件。
+          RUSTUP_TOOLCHAIN: stable
+        run: scripts/check_version_consistency.sh

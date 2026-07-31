@@ -1,0 +1,64 @@
+# 本默认配置只列出首次使用或部署时通常需要修改的字段。
+# 其他可选参数及默认值见 docs/config_parameters.md。
+upstream = "default"
+
+[upstreams.default]
+# 稳定 Agent 身份：只能使用小写字母、数字、_ 和 -。
+agent_id = ""
+# 仅在团队服务启用 key 鉴权时使用；不是 LLM API key。
+acn_key_env = ""
+# 两个 endpoint 都留空时以单人模式运行；团队模式必须同时配置。
+maintainer_endpoint = ""
+router_endpoint = ""
+
+[storage]
+acn_home = "~/.acn"
+
+# 默认只监听本机；对外部署时按实际网络边界修改。
+[router.daemon]
+listen = "127.0.0.1:8061"
+
+[router.auth.team]
+enabled = false
+
+[router.retrieval]
+enabled = true
+rerank_enabled = true
+
+[router.embedding]
+provider = "openai_compatible"
+endpoint = "https://api.openai.com/v1/embeddings"
+model = "text-embedding-3-small"
+api_key_env = "EMBEDDING_API_KEY"
+
+[router.rerank]
+provider = "openai_compatible_chat"
+endpoint = "https://api.openai.com/v1/chat/completions"
+model = "gpt-5.6-luna"
+api_key_env = "OPENAI_API_KEY"
+
+# 默认只监听本机；对外部署时按实际网络边界修改。
+[maintainer.daemon]
+listen = "127.0.0.1:8062"
+
+[maintainer.auth.admin]
+enabled = false
+username = "admin"
+password_env = "ACN_MAINTAINER_ADMIN_PASSWORD"
+
+[maintainer.auth.team]
+enabled = false
+
+[agent.llm]
+provider = "openai_compatible_chat"
+endpoint = ""
+model = ""
+reasoning_effort = "none"
+api_key_env = "ACN_LLM_API_KEY"
+max_tokens = 65536
+context_window = 200000
+
+# 用于模型 Web Search；GLM_API_KEY 仅供 web_search 使用。
+[agent.tool.web]
+endpoint = "https://open.bigmodel.cn/api/paas/v4/web_search"
+api_key_env = "GLM_API_KEY"
