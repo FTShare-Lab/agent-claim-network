@@ -68,9 +68,9 @@
 
 - Apple Silicon Mac（macOS 11 及以上）
 - Intel Mac（macOS 11 及以上）
-- x86_64 Ubuntu 22.04
+- x86_64 GNU/Linux（以 Ubuntu 22.04、glibc 2.35 为构建与验证基线）
 
-当前不支持 Windows。其他 Linux 发行版尚未纳入正式发布验证范围。
+Linux Release 面向使用兼容 glibc 的 x86_64 发行版，其他发行版尚未逐一验证。当前不支持 Alpine/musl、Linux ARM64 和 Windows。
 
 推荐通过 Homebrew 安装：
 

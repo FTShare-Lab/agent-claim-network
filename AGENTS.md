@@ -49,7 +49,11 @@ Agent Claim Network（ACN）是 Rust 实现的通用领域协作型助手，主�
 - Router 只返回可引用的候选 claim 与 dispute 信息，不拥有 agent 私有 Memory。
 - Maintainer 的 claim 属性更新是建议；agent 在 inbox 内化后决定本地变更。
 - 单人模式不得发起团队网络请求，也不为未来补传偷偷积累团队上传队列。
-- Team Auth、MCP token、LLM key 只保存环境变量名；不要在测试、文档或日志写入真实 secret。
+- Team Auth、MCP token、LLM key 只保存环境变量名；仓库任何位置都不得出现明文密钥或其他真实 secret，包括测试、fixture、示例、文档、日志和错误信息。
+- 仓库任何位置都不得出现内网域名；`localhost`、`127.0.0.1` 等明确的本机回环地址除外。测试与示例需要域名时使用标准保留域名或中性占位符。
+- 路径、变量名、fixture 和示例数据不得包含可能暴露真实用户名、姓名缩写或内部账号的信息；使用 `user`、`example`、临时目录等中性名称。
+- Rust、JavaScript/TypeScript、Python、Shell等代码文件中，不以 Codex/GPT/OpenAI、Claude/Claude Code/CC/Anthropic、Hermes/HA/Hermes Agent、GA/Generic Agent、非凸/非凸科技/ft.tech/non-convex/ftai 作为实现来源、兼容对象、架构标签、变量/fixture 名或注释描述。运行时真实默认值及协议、模型、API、序列化标识等兼容性所必需的名称除外，例如 `gpt-5.5`、`openai_chat_compatible`。
+- Markdown 与 HTML 文档不受上一条外部主体名称限制，但仍必须遵守明文密钥、内网域名和真实用户信息的禁令。
 - 修改协议 DTO 前检查持久化兼容、HTTP 客户端/服务端、prompt 与相关测试。
 
 ## 测试规范

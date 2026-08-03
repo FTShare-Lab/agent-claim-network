@@ -68,15 +68,17 @@ Currently supported:
 
 - Apple Silicon Macs running macOS 11 or later
 - Intel Macs running macOS 11 or later
-- x86_64 Ubuntu 22.04
+- x86_64 GNU/Linux, with Ubuntu 22.04 and glibc 2.35 as the build and validation baseline
 
-Windows is not currently supported. Other Linux distributions are not yet part of the official release validation matrix.
+The Linux release targets x86_64 distributions with a compatible glibc; other distributions have not been validated individually. Alpine/musl, Linux ARM64, and Windows are not currently supported.
 
 The recommended installation method is Homebrew:
 
 ```bash
 brew install FTShare-Lab/tap/acn
 ```
+
+Linux users must first install Homebrew by following [Homebrew on Linux](https://docs.brew.sh/Homebrew-on-Linux), or download the GNU/Linux archive directly from [GitHub Releases](https://github.com/FTShare-Lab/agent-claim-network/releases).
 
 This installs `acn`, `acn-router`, `acn-maintainer`, and the Maintainer Workbench. To upgrade later:
 
