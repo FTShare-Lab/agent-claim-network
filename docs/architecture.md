@@ -166,7 +166,7 @@ Policy 消息自包含完整 payload；Agent 不需要也不允许直接读取 M
 
 ## 鉴权与故障边界
 
-- LLM、Web、MCP bearer 与 Team Auth secret 从环境变量读取。
+- LLM、Web、MCP bearer 与 Team Auth secret 从环境变量读取；通过 `acn mcp login` 获得的 MCP OAuth token 按 server 配置保存在系统 keyring，或 selected upstream runtime 下权限受限的 `.mcp-oauth/` 目录。
 - Team Auth 请求使用带 `agent_id` 与 key 的信封；服务端可按配置启用校验。
 - Maintainer 管理页面与管理 API 可以启用独立 Basic Auth。
 - Router/Maintainer 网络错误按可重试性分类并进入 warning；本地持久化失败仍是当前操作的硬错误。

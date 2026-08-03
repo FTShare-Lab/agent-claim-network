@@ -182,7 +182,7 @@ acn supervisor status
 acn supervisor jobs
 
 acn mcp list
-acn mcp add / add-json / remove / enable / disable / status
+acn mcp add / add-json / remove / enable / disable / login / logout / status
 
 acn update
 ```

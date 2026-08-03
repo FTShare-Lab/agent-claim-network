@@ -190,10 +190,11 @@ MCP server 按连接方式分两类：
 - `acn mcp list`
 - `acn mcp get <name> [--json]`
 - `acn mcp add <name> [-e KEY=VALUE] [--env-var KEY] -- <command...>`
-- `acn mcp add <name> --url <url> [--bearer-token-env-var ENV]`
+- `acn mcp add <name> --url <url> [--bearer-token-env-var ENV] [--oauth-client-id ID] [--oauth-callback-port PORT] [--oauth-credentials-store keyring|file]`
 - `acn mcp add-json <name> '<server-json>'`
 - `acn mcp remove <name>`
 - `acn mcp enable <name>` / `acn mcp disable <name>`
+- `acn mcp login <name> [--no-browser]` / `acn mcp logout <name>`
 
 字段要点：
 
@@ -205,8 +206,18 @@ MCP server 按连接方式分两类：
 - `enabled_tools` / `disabled_tools` 按 MCP server 原始 tool name 过滤。
 - `-e KEY=VALUE` 会把 value 写入 `.mcp.json`，真实 token 推荐用 `--env-var KEY` 或 `--bearer-token-env-var ENV`。
 - `add-json` 接受单个 `McpServerConfig` JSON，支持上文列出的全部字段，不接受完整的 `{"mcpServers": {...}}`。输入的 `type: "http"` 会规范化并保存为 `type: "streamable_http"`。
-- 不要在 `add-json` 中直接写入 token；stdio 使用 `env_vars`，远程 HTTP 使用 `bearer_token_env_var`。未知字段以及尚未支持的 `sse`、`oauth`、`headers` 会被拒绝。
-- 当前不支持 OAuth、浏览器授权回调和 MCP elicitation；需要这类交互鉴权的 server 暂时不能完成登录。
+- 不要在 `add-json` 中直接写入 token；stdio 使用 `env_vars`，远程 HTTP 使用 `bearer_token_env_var`。未知字段以及尚未支持的 `sse`、嵌套 `oauth`、`headers` 会被拒绝。
+- `oauth_client_id` 是预注册的 public client ID；未配置时使用 dynamic client registration。当前不支持 client secret、CIMD 或 device flow。
+- `oauth_callback_port` 固定 loopback callback 端口，适用于授权服务预登记了固定 redirect URI 的场景；不配置时每次登录使用随机端口。
+- `oauth_credentials_store` 可取 `keyring`（默认）或 `file`。`file` 将凭据写入 `<acn_home>/<upstream>/.mcp-oauth/mcp-oauth-<sha256>.json`；Unix 上目录权限为 `0700`、文件权限为 `0600`，适合没有 Secret Service / D-Bus 的 headless Linux。
+- `acn mcp login <name>` 仅适用于支持 OAuth discovery，且支持 dynamic client registration 或已配置 `oauth_client_id` 的 `streamable_http` server。它使用 PKCE 完成授权；`--no-browser` 会打印授权 URL，并要求粘贴浏览器地址栏中的完整 redirect URL，适用于 SSH/headless 环境。
+- 凭据按 selected upstream、server name 与 URL 三者隔离。`logout` 只删除该 server 的本地凭据，不请求远端 token revocation；`remove` 先删除 server 配置，再尽力清理对应本地凭据，凭据库不可用时会给出 warning，但不会恢复已删除的配置。
+- 登录 scope 会合并已有 grant、`WWW-Authenticate` challenge 与 protected resource metadata 的要求；仅当这些来源均为空时，才使用授权服务器 metadata 的 `scopes_supported`。授权服务器支持且请求 scope 非空时会追加 `offline_access`；暂不支持在 `.mcp.json` 中手工指定 scope。
+- 同一个 server 上 `bearer_token_env_var` 优先于 OAuth：配置了它就不再查询系统凭据库。
+- 连接期间 access token 过期会用 refresh token 自动续期；refresh 失败时需要重新 `login`。
+- 当前不支持 MCP Tasks，也不宣告 `2026-07-28` Tasks extension。
+- 标准 `rmcp 3.0.1` 不暴露旧版 `execution.taskSupport` 字段，ACN 不额外解析或自动过滤该字段。`taskSupport = "required"` 的 legacy 工具可能仍显示为 `exposed`，随后因普通 `tools/call` 被 server 拒绝；这不影响同一 `2025-11-25` server 上的普通工具。已知的 legacy Tasks 工具应通过 `disabled_tools` 手动关闭。
+- 当前不支持 MCP elicitation；需要 server 在工具调用中展示 URL 或表单的交互无法完成。
 - 外部修改 `.mcp.json` 后，已运行的 TUI 不会热加载；需要重启 TUI，或后续使用专门的 reload 能力。
 
 ### `[agent.memory]`
