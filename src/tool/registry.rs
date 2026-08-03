@@ -600,7 +600,7 @@ impl ToolRegistry {
         if self.access.delegation_child {
             "Use write_stdin and process_list only with processes you own; you cannot inspect or control your parent or sibling subagents' processes."
         } else {
-            "Use process_list to inspect all live managed processes in this root session, including direct subagent processes. write_stdin can poll any listed process; a subagent-owned process accepts only an empty poll or Ctrl-C from you."
+            "Use process_list to inspect all live managed processes in this root session, including direct subagent processes. write_stdin can poll, send Ctrl-C to, or hard-terminate any listed process; a subagent-owned process does not accept text or other control sequences from you."
         }
     }
 
@@ -615,7 +615,7 @@ impl ToolRegistry {
             )
         } else {
             format!(
-                "Write to, poll, interrupt, or hard-terminate your own live code_run processes. You may also observe any live subagent-owned process in this root session: for a subagent-owned process, only empty chars (read-only poll) or exactly Ctrl-C (\\u0003) is accepted; text, terminate=true, and other control sequences are rejected. Cross-owner polls never advance that subagent's output-delivery state; omit cursors for a retained snapshot, or reuse the returned cursor pair for an incremental read. {common}"
+                "Write to, poll, interrupt, or hard-terminate your own live code_run processes. You may also observe, interrupt, or hard-terminate any live subagent-owned process in this root session: for a subagent-owned process, only empty chars (read-only poll), exactly Ctrl-C (\\u0003), or terminate=true is accepted; text and other control sequences are rejected. Cross-owner reads never advance that subagent's output-delivery state; omit cursors for a retained snapshot, or reuse the returned cursor pair for an incremental read. {common}"
             )
         }
     }

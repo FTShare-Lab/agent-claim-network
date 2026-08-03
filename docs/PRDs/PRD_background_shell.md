@@ -68,7 +68,7 @@ nohup server >server.log 2>&1 &
 
 - 同一个 `code_run` 同时支持短命令和长命令。
 - 长命令超过初始等待窗口后返回 `process_id`，原 tool call 正常闭合。
-- agent 可以继续执行其他工作，之后按 `process_id` 观察、写入、软中断或硬终止自己拥有的进程。
+- agent 可以继续执行其他工作，之后按 `process_id` 观察、写入、软中断或硬终止其有权管理的进程。
 - 支持 PTY、交互式 stdin、Ctrl-C 和长时间轮询。
 - turn interrupt 不自动杀掉已经登记的后台终端。
 - session / subagent / ACN 正常收束时清理其拥有的全部受管进程。
@@ -189,9 +189,9 @@ nohup server >server.log 2>&1 &
 - `chars` 为空：不写入，只轮询自上次读取后的新增输出。
 - `\u0003`：发送 Ctrl-C 软中断。PTY 下它作用于当前前台进程组；它可能中断当前命令，但不会关闭仍在运行的交互 shell 或 SSH session。pipe 下由 ProcessManager 请求 SIGINT。
 - `\u0004`：PTY 下发送 Ctrl-D。
-- `terminate=true`：复用 `/ps` 的 ProcessManager 管理路径，对自己拥有的完整受管进程组发送 SIGKILL。它不能与非空 `chars` 同时使用。终止完成后返回成功的 `process_terminated` outcome 和信号；输出内的 `success=false` 仍表示子进程不是自然零码退出，不得据此把终止操作解释为失败。
+- `terminate=true`：复用 `/ps` 的 ProcessManager 管理路径，对调用方有权管理的完整受管进程组发送 SIGKILL。subagent 只能终止自己的 entry；main 还可终止同一 Agent、同一 root session 中的 subagent entry。它不能与非空 `chars` 同时使用。终止完成后返回成功的 `process_terminated` outcome 和信号；输出内的 `success=false` 仍表示子进程不是自然零码退出，不得据此把终止操作解释为失败。
 - `tty = false` 时只允许空轮询、Ctrl-C interrupt 或 `terminate=true`；其他输入返回 stdin 不可用错误。
-- 子 agent 只能访问自己 owner 的 entry。主 agent 对同一 root session 的子 agent entry 只能空轮询或发送精确的 `\u0003`；不能写入文本、Ctrl-D、Esc、Ctrl-Z、`terminate=true` 或其他控制序列。对子 agent entry 的空轮询是观察操作，不推进其 owner 的 output-delivery cursor；主 agent 如需增量读取，使用返回的`stdout_cursor` / `stderr_cursor` 成对继续轮询。
+- 子 agent 只能访问自己 owner 的 entry。主 agent 对同一 root session 的子 agent entry 可以空轮询、发送精确的 `\u0003` 或使用 `terminate=true`；不能写入文本、Ctrl-D、Esc、Ctrl-Z 或其他控制序列。对子 agent entry 的读取是观察操作，不推进其 owner 的 output-delivery cursor；主 agent 如需增量读取，使用返回的`stdout_cursor` / `stderr_cursor` 成对继续轮询。
 - 返回的 `state` 描述 ACN 管理的外层进程。交互 shell 或 SSH session 仍为`running`，不代表它最近执行的内部命令仍在运行。
 - `max_output_chars` 通常省略，默认每个 stdout/stderr stream 最多返回 `1048576` 个字符。连续输出超过本次上限时只返回可见前缀，并把 cursor 指向该前缀末尾；包含该 tool result 的 provider request 成功后，下一次隐式轮询从新 cursor 继续。provider 失败或 turn 取消则不提交该页，后续可重新取得相同前缀。
 - 如果 retained buffer 已经因容量上限形成 head/tail gap，则先按当前单次上限分页交付 retained head；随后用一个携带 `truncated` / `omitted_bytes` 的空页面把 cursor 推进到 tail 起点，明确确认中间内容已不可恢复；最后继续分页交付 retained tail。每一步都等待 provider 成功确认，不要求突破用户配置的单次回传上限。
@@ -211,7 +211,7 @@ nohup server >server.log 2>&1 &
 - 结果至少包含 `process_id`、`owner`、`command`、`cwd`、`tty`、`state`、`started_at`。`owner` 对main 显示 `main`，对子 agent 显示其 `subagent_id`。
 - 不暴露 OS PID，不读取或消费输出，不列出已退出 entry；主 agent 的可见范围严格限于同一`owner_agent_id + root_session_id`，子 agent 不能查看 parent、sibling、其他 Agent 或其他 session。
 
-Ctrl-C 只用于软中断当前前台任务；关闭交互 shell/SSH 应发送其正常退出命令。模型需要终止自己拥有的异常受管进程时，使用现有`write_stdin(terminate=true)`，不新增 `process_signal` / `process_stop` 工具。主 agent 可以按`process_list` 返回的 ACN `process_id` 对同一 root session 的子 agent 进程发送 Ctrl-C，但不能跨 owner 硬终止。ProcessManager 内部继续提供 list、terminate one、terminate all 和 PTY进程组清理，供 `write_stdin(terminate=true)`、owner shutdown、容量淘汰以及 TUI/runtime 管理面复用。
+Ctrl-C 只用于软中断当前前台任务；关闭交互 shell/SSH 应发送其正常退出命令。模型需要终止异常受管进程时，使用现有`write_stdin(terminate=true)`，不新增 `process_signal` / `process_stop` 工具。主 agent 可以按`process_list` 返回的 ACN `process_id` 对同一 root session 的子 agent 进程发送 Ctrl-C 或硬终止，但仍不能跨 owner 写入任意文本。ProcessManager 内部继续提供 list、terminate one、terminate all 和 PTY进程组清理，供 `write_stdin(terminate=true)`、owner shutdown、容量淘汰以及 TUI/runtime 管理面复用。
 
 ### D7. PTY 与 pipe 双后端
 
@@ -304,7 +304,7 @@ code_run tool_use
 
 - 尚未登记成功的 foreground spawn 随 tool future 取消清理。
 - 已登记且已经成为后台 terminal 的进程不随当前 turn interrupt 自动终止。
-- `write_stdin("\u0003")` 可以请求当前前台进程组软中断；`write_stdin(terminate=true)` 可以硬终止调用方自己拥有的完整受管进程组，runtime 仍可强制终止单个或全部受管进程。
+- `write_stdin("\u0003")` 可以请求当前前台进程组软中断；`write_stdin(terminate=true)` 可以硬终止调用方有权管理的完整受管进程组，runtime 仍可强制终止单个或全部受管进程。
 - owner session finalize / close、subagent 收束和 ACN 正常 shutdown 会清理对应进程。
 
 不支持跨 ACN 重启，因此 runtime 异常退出后的重连和状态恢复不在范围内。
@@ -424,8 +424,8 @@ process_list
 - main 的 `process_list` 返回同一 `owner_agent_id + root_session_id` 下 main 与全部直接 subagent 的live entry，并在每一项中返回 `owner`，让用户面对的 main 能回答当前后台任务及其归属。
 - subagent 的 `process_list` 只返回该 subagent-owned live entry。
 - subagent 的 `write_stdin` 只能操作自己的 entry；不能访问 parent 或 sibling。
-- main 对自己的 entry 保留完整既有 `write_stdin` 语义。对同一 root session 的 subagent entry，只能空轮询或发送精确 Ctrl-C (`\u0003`)；不允许文本、Ctrl-D、Esc、Ctrl-Z、`terminate=true` 或其他控制序列。空轮询不推进 subagent 的 output-delivery cursor，避免 main 的观察吞掉 child 后续应读取的输出。
-- main 的跨 owner Ctrl-C 是受管 session 的软中断，不是任意 signal 或 hard terminate。main 与subagent 都只能通过 `write_stdin(terminate=true)` 硬终止自己拥有的 entry；跨 owner 强制终止仍由用户 TUI `/ps → t → y` 执行。模型工具面不新增 `process_signal` / `process_stop`。
+- main 对自己的 entry 保留完整既有 `write_stdin` 语义。对同一 root session 的 subagent entry，可以空轮询、发送精确 Ctrl-C (`\u0003`) 或使用 `terminate=true`；不允许文本、Ctrl-D、Esc、Ctrl-Z 或其他控制序列。跨 owner 读取不推进 subagent 的 output-delivery cursor，避免 main 的观察吞掉 child 后续应读取的输出。
+- main 的跨 owner Ctrl-C 是受管 session 的软中断；`terminate=true` 是 SIGINT 被忽略或无法完整收束进程组时的硬终止兜底。它只适用于同一 Agent、同一 root session 内的 live entry，不改变 subagent owner、输出交付或生命周期归属。模型工具面不新增 `process_signal` / `process_stop`。
 
 用户 TUI 同样是 root session 的控制面。`/ps` 聚合当前 root session 中 main 与全部 subagent 的live entry，用户可以选择并 terminate 任意一行；它不显示其他历史 session 或其他 ACN Agent 的进程。
 
@@ -620,14 +620,14 @@ write_stdin_max_poll_timeout_ms = 300000
 23. 旧 `code_run` 非零 exit code 的结构化诊断保持可用。
 24. delegation 身份环境变量在后台 terminal 中保持正确。
 25. main 的 `process_list` 返回本 root session 全部 live entry（带 `owner`），subagent 的`process_list` 只返回自己的 live entry；两者均不消费输出，且能恢复可用于 `write_stdin` 的内部 `process_id`。
-26. subagent 与 parent / sibling 的模型视图保持隔离；main 对 child 只可空轮询或发送 Ctrl-C，不能`terminate=true`，subagent 收束时仍清理自己的全部进程。
+26. subagent 与 parent / sibling 的模型视图保持隔离；main 对 child 可空轮询、发送 Ctrl-C 或`terminate=true`，但不能写入任意文本，subagent 收束时仍清理自己的全部进程。
 27. `/ps` 与 `/mcp` 在 turn 运行期间立即打开，不进入 queued input，关闭面板后 turn 输出继续正常显示。
 28. `/ps` 超过 viewport 高度后，`↑` / `↓` 移动会同步调整 `list_offset`，选中行始终可见；`/mcp` server/tool 列表具备同等滚动行为。
 29. `/ps` `TerminateConfirm` 只响应 `↑`、`↓`、`y` / `Y`、`n` / `N`、`Esc`；Command body滚动时 footer 始终固定在页面最后一行，其他按键不改变状态。
 30. terminate 确认绑定 `process_id` 而不是行号；确认前目标自然退出不会误杀刷新后同位置的其他进程。
 31. 确认 terminate 后硬终止完整受管进程组，异步状态从 `terminating` 刷新到行消失，选择落点符合相邻行规则。
 32. `/ps` 只显示 live entry，按 `running → terminating`、开始时间倒序、`process_id` 升序稳定排列；终态 entry 不出现，`STARTED` 与精确到秒、最多三个单位的 `ELAPSED` 在不同终端宽度下正确显示；turn idle 时保持面板打开，`ELAPSED` 仍按秒持续增加。
-33. main 与 subagent 模型均注册 `code_run`、`write_stdin`、`process_list`：child 的 list / write严格 owner 隔离；main 在本 root session 跨 owner list、空轮询和 Ctrl-C 的受控监督能力正确，文案按角色明确说明边界。
+33. main 与 subagent 模型均注册 `code_run`、`write_stdin`、`process_list`：child 的 list / write严格 owner 隔离；main 在本 root session 跨 owner list、空轮询、Ctrl-C 和 `terminate=true` 的受控监督能力正确，文案按角色明确说明边界。
 34. `/ps` 聚合当前 root session 的 main 与全部 subagent entry，`OWNER` 列、面板标题和确认页显示正确，不混入其他 session 或 Agent。
 35. TUI terminate subagent-owned process 只停止目标进程组，不取消 subagent；subagent 后续读取能观察到终止结果。
 36. 每个 owner 独立应用 64-entry 与最近 8-entry 保护策略；一个 owner 达到容量上限不会淘汰其他 owner 的 live entry。
@@ -676,7 +676,7 @@ write_stdin
 process_list
 ```
 
-不向模型暴露 `process_signal`、`process_stop` 或 `process_resize`，runtime 也不实现动态`process_resize`。`process_list` 是受控的只读恢复入口，用于恢复上下文压缩后丢失的内部`process_id`；`write_stdin(terminate=true)` 在不增加第四个工具的前提下提供 own-entry 硬终止，TUI/runtime 控制面继续拥有 root-session 聚合强制管理能力。
+不向模型暴露 `process_signal`、`process_stop` 或 `process_resize`，runtime 也不实现动态`process_resize`。`process_list` 是受控的只读恢复入口，用于恢复上下文压缩后丢失的内部`process_id`；`write_stdin(terminate=true)` 在不增加第四个工具的前提下提供 owner-aware 硬终止，其中 main 可终止本 root session 的 child entry，TUI/runtime 控制面继续拥有 root-session 聚合强制管理能力。
 
 ### P3. 后台完成不主动唤醒 agent
 
@@ -684,7 +684,7 @@ process_list
 
 ### P4. subagent 所有权隔离与 main 受控监督
 
-subagent 创建的进程仍归该 subagent 所有，subagent 只在自己的 `process_list` / `write_stdin` 视图中操作它；subagent 可以 `terminate=true` 硬终止自己的 entry，收束时清理其全部受管进程，不发生 handoff。parent/main agent 可以通过 root-session 聚合 `process_list` 查看 main 与全部直接subagent 的 live entry，并对 child 执行空轮询或 Ctrl-C，但不能发送任意终端输入或 hard terminate。用户 TUI `/ps` 可以查看和 terminate main 与全部 subagent 的进程。
+subagent 创建的进程仍归该 subagent 所有，subagent 只在自己的 `process_list` / `write_stdin` 视图中操作它；subagent 可以 `terminate=true` 硬终止自己的 entry，收束时清理其全部受管进程，不发生 handoff。parent/main agent 可以通过 root-session 聚合 `process_list` 查看 main 与全部直接subagent 的 live entry，并对 child 执行空轮询、Ctrl-C 或 `terminate=true`，但不能发送任意终端输入。用户 TUI `/ps` 可以查看和 terminate main 与全部 subagent 的进程。
 
 ### P5. 暂时只支持 macOS/Linux
 
@@ -706,8 +706,8 @@ subagent 创建的进程仍归该 subagent 所有，subagent 只在自己的 `pr
 - 现有 `code_run` 改造成统一的短命令与受管终端执行入口。
 - 长命令通过 yield 返回 `process_id`，不依赖 shell `&`。
 - 模型工具面只有 `code_run`、`write_stdin`、`process_list`。
-- main 和每个 subagent 都获得这三个工具；child 模型视图严格按 owner 隔离，main 对当前 root session 具有带 `owner` 的聚合查询、空轮询和 Ctrl-C 监督能力；每个模型可通过`write_stdin(terminate=true)` 硬终止自己的 entry，用户 `/ps` 聚合全部 owner 并可 hard terminate。
-- PTY、stdin、分页 poll 和进程管理属于同一受管 terminal session；Ctrl-C 是软中断，`terminate=true`是 own-entry 硬终止。
+- main 和每个 subagent 都获得这三个工具；child 模型视图严格按 owner 隔离，main 对当前 root session 具有带 `owner` 的聚合查询、空轮询、Ctrl-C 和 `terminate=true` 监督能力；subagent 只能硬终止自己的 entry，用户 `/ps` 聚合全部 owner 并可 hard terminate。
+- PTY、stdin、分页 poll 和进程管理属于同一受管 terminal session；Ctrl-C 是软中断，`terminate=true`是 owner-aware 硬终止。
 - tool call 生命周期与进程生命周期分离。
 - root terminal process 是管理边界，不实现 `detached_running`。
 - `nohup` 正常允许执行，但不会得到超出 ProcessManager 所有权边界的特殊保证。
@@ -769,7 +769,7 @@ TODO：
 
 - [x] 将 `code_run` 输入改为 `script/type/cwd/tty/yield_time_ms/max_output_chars`，删除旧运行时`timeout`；实现 yield clamp、初始等待和短命令/`ProcessRunning` 双返回。
 - [x] 保证 ProcessManager 先登记、`code_run` 后等待；yield 返回后 tool call 正常闭合，watcher继续 drain output 和观察退出。
-- [x] 实现 `write_stdin(process_id, chars, terminate, yield_time_ms, max_output_chars)` 的写入、空字符 poll、own-entry 硬终止、chunk cursor、stdin_open、exit/failure 返回和分页读取语义。
+- [x] 实现 `write_stdin(process_id, chars, terminate, yield_time_ms, max_output_chars)` 的写入、空字符 poll、owner-aware 硬终止、chunk cursor、stdin_open、exit/failure 返回和分页读取语义。
 - [x] 实现只列 live entry 且不消费 output 的角色化 `process_list`：subagent 只看 owner，main 看同一root session 全部 owner；字段、排序和状态符合 D6。
 - [x] 在 parent 与 delegation 工具定义中注册三个进程工具，在 memory review 等 profile 中保持不可见。
 - [x] 实现 `BackgroundProcessCompleted` 领域事件与最小 completion notification，但本阶段不主动发起provider request。
@@ -832,7 +832,7 @@ TODO：
 TODO：
 
 - [x] bootstrap/session runtime 创建一个 root-session ProcessManager；main 与每个 delegation registry获得不同 owner handle，同时继续 clone 同一个进程级 `McpConnectionManager`。
-- [x] owner identity 包含 session/agent/subagent 维度，`process_id` 在 ProcessManager 内全局唯一；child list/write 严格 owner scoped，main 可按 root session 聚合 list、只读 poll 和 Ctrl-C，runtime 聚合API 同样按 root session scoped。
+- [x] owner identity 包含 session/agent/subagent 维度，`process_id` 在 ProcessManager 内全局唯一；child list/write 严格 owner scoped，main 可按 root session 聚合 list、只读 poll、Ctrl-C 和 `terminate=true`，runtime 聚合API 同样按 root session scoped。
 - [x] subagent completed、failed、abandoned、future cancel 和 parent session shutdown 时清理对应owner 全部进程，不转交 main，也不影响其他 owner。
 - [x] TUI 聚合 snapshot 保存 owner 信息，terminate 仍只按稳定 `process_id` 定位目标进程组。
 - [x] 保持 delegation 身份环境变量、并发 runner 和 MCP parent/child 共享连接语义。

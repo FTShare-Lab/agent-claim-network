@@ -657,12 +657,6 @@ impl ToolRegistry {
             ));
         }
         if args.terminate {
-            if cross_owner {
-                return Err(ToolError::InvalidArgs(
-                    "a main agent may only poll or send Ctrl-C (\\u0003) to a subagent-owned process"
-                        .into(),
-                ));
-            }
             let _ = self
                 .process_manager
                 .terminate_live_for_root_matching(
@@ -677,7 +671,7 @@ impl ToolRegistry {
         } else if !chars.is_empty() {
             if cross_owner && chars != "\u{3}" {
                 return Err(ToolError::InvalidArgs(
-                    "a main agent may only poll or send Ctrl-C (\\u0003) to a subagent-owned process"
+                    "a main agent may only poll, send Ctrl-C (\\u0003), or use terminate=true on a subagent-owned process"
                         .into(),
                 ));
             }

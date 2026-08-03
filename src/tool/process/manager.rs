@@ -1339,7 +1339,8 @@ impl ProcessManager {
         (entry.owner == *owner).then_some(entry)
     }
 
-    /// parent agent 的受控观察/中断入口：只在同一 agent、同一 root session 内定位 live entry。
+    /// parent agent 的受控观察/中断/终止入口：只在同一 agent、同一 root session 内
+    /// 定位 live entry。
     /// 子 agent 仍须走 `find_for_owner`，不能借此访问 parent 或 sibling。
     pub(crate) async fn find_live_for_root(
         &self,

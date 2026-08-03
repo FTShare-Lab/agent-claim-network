@@ -518,7 +518,7 @@ async fn process_list_is_owner_scoped_and_write_stdin_reads_terminal_result() {
 
 #[tokio::test]
 #[cfg(unix)]
-async fn main_agent_manages_subagent_live_processes_without_taking_input_ownership() {
+async fn main_agent_can_terminate_subagent_process_without_taking_input_ownership() {
     let dir = tempfile::tempdir().unwrap();
     let main_registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
     let child_registry = main_registry.clone().for_delegation(None);
@@ -529,20 +529,26 @@ async fn main_agent_manages_subagent_live_processes_without_taking_input_ownersh
         current_turn_id: Some(subagent_id.into()),
         ..ToolDispatchContext::default()
     };
+    let emit_tail_marker = dir.path().join("emit-child-tail");
 
     let running = child_registry
         .dispatch_with_context(
             "code_run",
-            json!({"script": "printf child-output; sleep 30", "yield_time_ms": 50}),
+            json!({
+                "script": "trap '' INT; printf child-initial; while [ ! -f emit-child-tail ]; do sleep 0.01; done; printf child-tail; while :; do sleep 1; done",
+                "yield_time_ms": 50,
+            }),
             child_context.clone(),
         )
         .await
         .unwrap();
     assert_eq!(running.outcome, ToolExecutionOutcome::ProcessRunning);
     let process_id = running.output["process_id"].as_str().unwrap().to_string();
+    acknowledge_process_output(&child_registry, &running).await;
+    std::fs::write(emit_tail_marker, b"ready").unwrap();
 
     let child_list = child_registry
-        .dispatch_with_context("process_list", json!({}), child_context)
+        .dispatch_with_context("process_list", json!({}), child_context.clone())
         .await
         .unwrap();
     assert_eq!(child_list.output["processes"].as_array().unwrap().len(), 1);
@@ -560,7 +566,7 @@ async fn main_agent_manages_subagent_live_processes_without_taking_input_ownersh
     let root_poll = main_registry
         .dispatch_with_context(
             "write_stdin",
-            json!({"process_id": process_id, "chars": "", "yield_time_ms": 50}),
+            json!({"process_id": process_id, "chars": "", "yield_time_ms": 300}),
             file_tool_context(&session),
         )
         .await
@@ -568,7 +574,7 @@ async fn main_agent_manages_subagent_live_processes_without_taking_input_ownersh
     assert_eq!(root_poll.outcome, ToolExecutionOutcome::ProcessRunning);
     assert!(root_poll.output["stdout"]
         .as_str()
-        .is_some_and(|stdout| stdout.contains("child-output")));
+        .is_some_and(|stdout| stdout.contains("child-tail")));
     assert!(
         root_poll.process_delivery_receipt.is_none(),
         "main observation must not advance the subagent output-delivery cursor"
@@ -584,18 +590,7 @@ async fn main_agent_manages_subagent_live_processes_without_taking_input_ownersh
         .expect_err("main must not send arbitrary input to a subagent process");
     assert!(cross_owner_input
         .to_string()
-        .contains("may only poll or send Ctrl-C"));
-    let cross_owner_terminate = main_registry
-        .dispatch_with_context(
-            "write_stdin",
-            json!({"process_id": process_id, "terminate": true}),
-            file_tool_context(&session),
-        )
-        .await
-        .expect_err("main must not hard-terminate a subagent process through write_stdin");
-    assert!(cross_owner_terminate
-        .to_string()
-        .contains("may only poll or send Ctrl-C"));
+        .contains("may only poll, send Ctrl-C"));
 
     let snapshots = main_registry
         .process_snapshots_for_root_session(&session)
@@ -611,11 +606,48 @@ async fn main_agent_manages_subagent_live_processes_without_taking_input_ownersh
             json!({"process_id": process_id, "chars": r"\u0003", "yield_time_ms": 50}),
             file_tool_context(&session),
         )
-        .await;
+        .await
+        .unwrap();
+    assert_eq!(interrupted.outcome, ToolExecutionOutcome::ProcessRunning);
     assert!(
-        interrupted.is_ok(),
-        "main Ctrl-C should be accepted: {interrupted:?}"
+        interrupted.process_delivery_receipt.is_none(),
+        "main interrupt must not advance the subagent output-delivery cursor"
     );
+
+    let terminated = main_registry
+        .dispatch_with_context(
+            "write_stdin",
+            json!({"process_id": process_id, "terminate": true, "yield_time_ms": 500}),
+            file_tool_context(&session),
+        )
+        .await;
+    let terminated = terminated.expect("main must hard-terminate a subagent process");
+    assert_eq!(
+        terminated.outcome,
+        ToolExecutionOutcome::ProcessTerminated {
+            signal: Some(libc::SIGKILL),
+        }
+    );
+    assert_eq!(terminated.output["state"], "terminated");
+    assert!(
+        terminated.process_delivery_receipt.is_none(),
+        "main termination must not consume the subagent terminal result"
+    );
+
+    let child_final = child_registry
+        .dispatch_with_context(
+            "write_stdin",
+            json!({"process_id": process_id, "chars": "", "yield_time_ms": 50}),
+            child_context,
+        )
+        .await
+        .expect("subagent must still receive its terminal result");
+    assert_eq!(child_final.output["state"], "terminated");
+    assert_eq!(child_final.output["signal"], libc::SIGKILL);
+    assert!(child_final.output["stdout"]
+        .as_str()
+        .is_some_and(|stdout| stdout.contains("child-tail")));
+    assert!(child_final.process_delivery_receipt.is_some());
 
     main_registry
         .cleanup_processes_for_owner(&session, Some(subagent_id))

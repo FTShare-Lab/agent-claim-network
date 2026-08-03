@@ -263,7 +263,10 @@ fn wait_subagents_and_code_run_descriptions_use_runtime_limits() {
         .contains("Each result includes owner"));
     assert!(write_stdin
         .description
-        .contains("only empty chars (read-only poll) or exactly Ctrl-C"));
+        .contains("only empty chars (read-only poll), exactly Ctrl-C"));
+    assert!(write_stdin
+        .description
+        .contains("or terminate=true is accepted"));
 
     let child_tools = registry.clone().for_delegation(None).definitions();
     let child_process_list = child_tools
