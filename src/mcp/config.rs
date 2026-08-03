@@ -50,6 +50,12 @@ pub struct McpServerConfig {
     pub url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bearer_token_env_var: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_callback_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_credentials_store: Option<McpOAuthCredentialsStore>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -58,6 +64,14 @@ pub enum McpTransportKind {
     Stdio,
     #[serde(rename = "streamable_http", alias = "http")]
     StreamableHttp,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpOAuthCredentialsStore {
+    #[default]
+    Keyring,
+    File,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +86,9 @@ pub enum McpTransportConfig {
     StreamableHttp {
         url: String,
         bearer_token_env_var: Option<String>,
+        oauth_client_id: Option<String>,
+        oauth_callback_port: Option<u16>,
+        oauth_credentials_store: McpOAuthCredentialsStore,
     },
 }
 
@@ -101,6 +118,12 @@ pub enum McpConfigError {
     MissingUrl { name: String },
     #[error("MCP server '{name}' 的 {field} 必须大于 0")]
     InvalidTimeout { name: String, field: &'static str },
+    #[error("MCP server '{name}' 的 oauth_callback_port 必须在 1..=65535")]
+    InvalidOAuthCallbackPort { name: String },
+    #[error("MCP server '{name}' 的 oauth_client_id 不能为空")]
+    InvalidOAuthClientId { name: String },
+    #[error("MCP server '{name}' 的 {field} 仅适用于 streamable_http")]
+    HttpOnlyField { name: String, field: &'static str },
     #[error(transparent)]
     Storage(#[from] StorageError),
 }
@@ -138,6 +161,9 @@ impl McpServerConfig {
             cwd: None,
             url: None,
             bearer_token_env_var: None,
+            oauth_client_id: None,
+            oauth_callback_port: None,
+            oauth_credentials_store: None,
         }
     }
 
@@ -156,6 +182,9 @@ impl McpServerConfig {
             cwd: None,
             url: Some(url),
             bearer_token_env_var,
+            oauth_client_id: None,
+            oauth_callback_port: None,
+            oauth_credentials_store: None,
         }
     }
 
@@ -196,6 +225,21 @@ impl McpServerConfig {
     pub fn transport_config(&self, name: &str) -> Result<McpTransportConfig, McpConfigError> {
         match self.transport_kind(name)? {
             McpTransportKind::Stdio => {
+                for (field, configured) in [
+                    ("oauth_client_id", self.oauth_client_id.is_some()),
+                    ("oauth_callback_port", self.oauth_callback_port.is_some()),
+                    (
+                        "oauth_credentials_store",
+                        self.oauth_credentials_store.is_some(),
+                    ),
+                ] {
+                    if configured {
+                        return Err(McpConfigError::HttpOnlyField {
+                            name: name.to_string(),
+                            field,
+                        });
+                    }
+                }
                 let command = required_non_empty(&self.command, name, MissingField::Command)?;
                 Ok(McpTransportConfig::Stdio {
                     command,
@@ -207,9 +251,27 @@ impl McpServerConfig {
             }
             McpTransportKind::StreamableHttp => {
                 let url = required_non_empty(&self.url, name, MissingField::Url)?;
+                let oauth_client_id = self
+                    .oauth_client_id
+                    .as_ref()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+                if self.oauth_client_id.is_some() && oauth_client_id.is_none() {
+                    return Err(McpConfigError::InvalidOAuthClientId {
+                        name: name.to_string(),
+                    });
+                }
+                if self.oauth_callback_port == Some(0) {
+                    return Err(McpConfigError::InvalidOAuthCallbackPort {
+                        name: name.to_string(),
+                    });
+                }
                 Ok(McpTransportConfig::StreamableHttp {
                     url,
                     bearer_token_env_var: self.bearer_token_env_var.clone(),
+                    oauth_client_id,
+                    oauth_callback_port: self.oauth_callback_port,
+                    oauth_credentials_store: self.oauth_credentials_store.unwrap_or_default(),
                 })
             }
         }
@@ -381,6 +443,9 @@ mod tests {
             cwd: None,
             url: None,
             bearer_token_env_var: None,
+            oauth_client_id: None,
+            oauth_callback_port: None,
+            oauth_credentials_store: None,
         };
         let http = McpServerConfig {
             transport: None,
@@ -396,6 +461,9 @@ mod tests {
             cwd: None,
             url: Some("https://example.com/mcp".to_string()),
             bearer_token_env_var: None,
+            oauth_client_id: None,
+            oauth_callback_port: None,
+            oauth_credentials_store: None,
         };
 
         assert_eq!(
@@ -433,6 +501,36 @@ mod tests {
         let encoded = serde_json::to_string(&server).unwrap();
         assert!(encoded.contains(r#""type":"streamable_http""#));
         assert!(!encoded.contains(r#""type":"http""#));
+    }
+
+    #[test]
+    fn validates_http_oauth_options_and_rejects_them_for_stdio() {
+        let mut http = McpServerConfig::streamable_http("https://example.com/mcp".into(), None);
+        http.oauth_client_id = Some("public-client".into());
+        http.oauth_callback_port = Some(8765);
+        http.oauth_credentials_store = Some(McpOAuthCredentialsStore::File);
+
+        assert_eq!(
+            http.transport_config("remote").unwrap(),
+            McpTransportConfig::StreamableHttp {
+                url: "https://example.com/mcp".into(),
+                bearer_token_env_var: None,
+                oauth_client_id: Some("public-client".into()),
+                oauth_callback_port: Some(8765),
+                oauth_credentials_store: McpOAuthCredentialsStore::File,
+            }
+        );
+
+        let mut stdio =
+            McpServerConfig::stdio("server".into(), Vec::new(), BTreeMap::new(), Vec::new());
+        stdio.oauth_client_id = Some("public-client".into());
+        assert!(matches!(
+            stdio.transport_config("local"),
+            Err(McpConfigError::HttpOnlyField {
+                field: "oauth_client_id",
+                ..
+            })
+        ));
     }
 
     #[test]

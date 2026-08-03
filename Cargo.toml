@@ -52,14 +52,18 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 sse-stream = "0.2.3"
 axum = "0.8"
-rmcp = { version = "0.15.0", default-features = false, features = [
+rmcp = { version = "=3.0.1", default-features = false, features = [
+    "auth",
     "client",
     "macros",
+    "reqwest",
     "schemars",
     "server",
     "transport-child-process",
     "transport-streamable-http-client-reqwest",
 ] }
+keyring = "4"
+oauth2 = { version = "5", default-features = false }
 
 chrono = { version = "0.4", features = ["serde"] }
 iana-time-zone = "0.1"

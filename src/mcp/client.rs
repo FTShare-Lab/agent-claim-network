@@ -1,36 +1,38 @@
 //! 单个 MCP server 的 client lifecycle。
 //!
-//! 基于官方 `rmcp` SDK 建立 stdio / Streamable HTTP 连接，统一处理 initialize、
-//! tools/list、tools/call、progress notification 和硬超时。
+//! 基于官方 `rmcp` SDK 建立 stdio / Streamable HTTP 连接，自动协商新旧 MCP 生命周期，
+//! 并统一处理 tools/list、tools/call、progress notification 和硬超时。
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use futures::{stream::BoxStream, StreamExt};
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, CancelledNotificationParam, ClientInfo, ClientRequest,
-    CreateElicitationRequestParams, CreateElicitationResult, ElicitationAction, ErrorCode,
-    GetExtensions, Implementation, ListToolsResult, Meta, NumberOrString, PaginatedRequestParams,
-    ProgressNotificationParam, ProgressToken, ProtocolVersion, Request, RequestId, ServerInfo,
-    ServerJsonRpcMessage, ServerResult, TaskSupport, Tool,
+    ElicitRequestParams, ElicitResult, ElicitationAction, ErrorCode, GetExtensions, GetMeta,
+    Implementation, ListToolsResult, NumberOrString, PaginatedRequestParams,
+    ProgressNotificationParam, ProtocolVersion, Request, RequestId, ServerInfo,
+    ServerJsonRpcMessage, ServerResult, Tool,
 };
 use rmcp::service::{
     NotificationContext, Peer, PeerRequestOptions, RoleClient, RunningService,
     RunningServiceCancellationToken, RxJsonRpcMessage, TxJsonRpcMessage,
 };
+use rmcp::transport::auth::AuthClient;
 use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::transport::streamable_http_client::{
-    SseError, StreamableHttpClient, StreamableHttpClientTransportConfig, StreamableHttpError,
-    StreamableHttpPostResponse,
+    AuthRequiredError, SseError, StreamableHttpClient, StreamableHttpClientTransportConfig,
+    StreamableHttpError, StreamableHttpPostResponse,
 };
 use rmcp::transport::{StreamableHttpClientTransport, Transport};
+use rmcp::{ClientLifecycleMode, ClientServiceExt};
 use serde_json::{json, Map, Value};
 use sse_stream::{Sse, SseStream};
 use tokio::io::AsyncReadExt;
@@ -41,11 +43,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::MCP_CONNECTION_SHUTDOWN_TIMEOUT_SECS;
 use crate::mcp::config::{McpServerConfig, McpTransportConfig};
+use crate::mcp::oauth;
 use crate::mcp::redact::redact_mcp_sensitive_text;
 
-pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
-const UNSUPPORTED_INTERACTIVE_AUTH_MESSAGE: &str =
-    "MCP server requires OAuth or interactive elicitation, which is not supported yet";
+pub const LEGACY_MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 const HEADER_PROTOCOL_VERSION: &str = "MCP-Protocol-Version";
 const HEADER_SESSION_ID: &str = "Mcp-Session-Id";
 const HEADER_LAST_EVENT_ID: &str = "Last-Event-Id";
@@ -55,9 +56,6 @@ const STDERR_CAPTURE_MAX_CHARS: usize = 8_000;
 /// rmcp 的 stdio graceful shutdown 自身也使用同一秒级窗口；超时后还要向进程组发信号、
 /// 等待 root 退出并 reap。额外保留一秒，避免把正在完成强制收束的 transport 误判为泄漏。
 const PENDING_CONNECT_CLOSE_GRACE: Duration = Duration::from_secs(1);
-/// 仅在 ACN 的 HTTP adapter 内传递绝对单请求 deadline；发出 HTTP 前会从 `_meta` 移除，server 不可见。
-const ACN_LOCAL_TOOL_DEADLINE_META_FIELD: &str = "acn.localToolDeadlineMillis";
-static MCP_TOOL_DEADLINE_EPOCH: LazyLock<time::Instant> = LazyLock::new(time::Instant::now);
 const TURN_CANCELLATION_REASON: &str = "ACN turn cancelled";
 const TOOL_TIMEOUT_CANCELLATION_REASON: &str = "request timeout";
 const CALLER_ABORT_CANCELLATION_REASON: &str = "caller future dropped";
@@ -66,6 +64,9 @@ const LIFECYCLE_CANCELLATION_REASON: &str = "MCP client lifecycle replaced or di
 /// 只在 ACN HTTP adapter 内传递的 request cancellation；它保存在 rmcp extensions，永不序列化给 server。
 #[derive(Clone)]
 struct AcnMcpHttpRequestCancellation(CancellationToken);
+/// 仅在 ACN HTTP adapter 内传递绝对单请求 deadline；保存在 rmcp extensions，永不序列化给 server。
+#[derive(Clone, Copy)]
+struct AcnMcpHttpRequestDeadline(time::Instant);
 const DEFAULT_ENV_VARS_UNIX: &[&str] = &[
     "HOME",
     "LOGNAME",
@@ -349,11 +350,13 @@ pub enum McpClientError {
     },
     #[error("MCP server '{server}' bearer token 环境变量 '{env_var}' 未设置或为空")]
     MissingBearerToken { server: String, env_var: String },
-    #[error("MCP server '{server}' initialize 超时: {timeout_secs}s")]
+    #[error("MCP server '{server}' OAuth 凭据读取失败: {message}")]
+    OAuthCredentials { server: String, message: String },
+    #[error("MCP server '{server}' 建连协商超时: {timeout_secs}s")]
     StartupTimeout { server: String, timeout_secs: u64 },
-    #[error("MCP server '{server}' initialize 连接失败: {message}")]
+    #[error("MCP server '{server}' 建连协商失败: {message}")]
     InitializeConnection { server: String, message: String },
-    #[error("MCP server '{server}' initialize 失败: {message}")]
+    #[error("MCP server '{server}' MCP 协商失败: {message}")]
     Initialize { server: String, message: String },
     #[error("MCP server '{server}' tools/list 超时: {timeout_secs}s")]
     ListToolsTimeout { server: String, timeout_secs: u64 },
@@ -418,6 +421,7 @@ impl McpClientError {
             | Self::ListToolsTimeout { .. } => true,
             Self::HttpClient { .. }
             | Self::MissingBearerToken { .. }
+            | Self::OAuthCredentials { .. }
             | Self::Initialize { .. }
             | Self::ListToolsRequest { .. }
             | Self::ListToolsPaginationLimit { .. }
@@ -436,6 +440,7 @@ impl McpClient {
     pub(crate) async fn connect(
         server_name: String,
         server: &McpServerConfig,
+        mcp_config_path: &Path,
         workspace_root: &Path,
         progress_callback: Option<McpProgressCallback>,
         connect_release_fence: Arc<McpConnectReleaseFence>,
@@ -478,42 +483,53 @@ impl McpClient {
             McpTransportConfig::StreamableHttp {
                 url,
                 bearer_token_env_var,
+                oauth_credentials_store,
+                ..
             } => {
                 let transport = streamable_http_transport(
+                    mcp_config_path,
                     &server_name,
                     url,
                     bearer_token_env_var,
+                    oauth_credentials_store,
                     tool_timeout,
                     Arc::clone(&connect_release_fence),
                 )
                 .await?;
-                (PendingTransport::StreamableHttp(transport), true)
+                (transport, true)
             }
         };
+        let startup = StartupDeadline {
+            timeout: startup_timeout,
+            timeout_secs: server.startup_timeout_secs(),
+        };
         let service = match transport {
-            PendingTransport::Stdio(transport) => time::timeout(
-                startup_timeout,
-                rmcp::serve_client(handler.clone(), transport),
-            )
-            .await
-            .map_err(|_| McpClientError::StartupTimeout {
-                server: server_name.clone(),
-                timeout_secs: server.startup_timeout_secs(),
-            })?
-            .map_err(|err| initialize_service_error(&server_name, err))?,
-            PendingTransport::StreamableHttp(transport) => time::timeout(
-                startup_timeout,
-                rmcp::serve_client(handler.clone(), transport),
-            )
-            .await
-            .map_err(|_| McpClientError::StartupTimeout {
-                server: server_name.clone(),
-                timeout_secs: server.startup_timeout_secs(),
-            })?
-            .map_err(|err| initialize_service_error(&server_name, err))?,
+            PendingTransport::Stdio(transport) => {
+                serve_pending_transport(handler, transport, &server_name, startup).await?
+            }
+            PendingTransport::StreamableHttp(transport) => {
+                serve_pending_transport(handler, transport, &server_name, startup).await?
+            }
+            PendingTransport::StreamableHttpOAuth(transport) => {
+                serve_pending_transport(handler, transport, &server_name, startup).await?
+            }
         };
 
-        let server_info = service.peer().peer_info().cloned();
+        let peer_info = service
+            .peer()
+            .peer_info()
+            .ok_or_else(|| McpClientError::Initialize {
+                server: server_name.clone(),
+                message: "rmcp completed MCP negotiation without peer information".to_string(),
+            })?;
+        let server_info = peer_info.server_info.clone().map(|server_info| {
+            let mut server_info = ServerInfo::new(peer_info.capabilities.clone())
+                .with_server_info(server_info)
+                .with_protocol_version(peer_info.protocol_version.clone());
+            server_info.instructions = peer_info.instructions.clone();
+            server_info.meta = peer_info.meta.clone();
+            server_info
+        });
         let shutdown_token = service.cancellation_token();
         let lifecycle_cancel = CancellationToken::new();
         Ok(Self {
@@ -571,7 +587,7 @@ impl McpClient {
         let mut tools = Vec::new();
         let mut cursor = None;
         for _ in 0..page_limit {
-            let params = Some(PaginatedRequestParams { meta: None, cursor });
+            let params = Some(PaginatedRequestParams::default().with_cursor(cursor));
             let result: ListToolsResult = peer
                 .list_tools(params)
                 .await
@@ -636,7 +652,7 @@ impl McpClient {
         let mut tools = Vec::new();
         let mut cursor = None;
         for _ in 0..page_limit {
-            let params = PaginatedRequestParams { meta: None, cursor };
+            let params = PaginatedRequestParams::default().with_cursor(cursor);
             let http_request_cancellation = self.uses_streamable_http.then(CancellationToken::new);
             let mut request =
                 ClientRequest::ListToolsRequest(rmcp::model::ListToolsRequest::with_param(params));
@@ -647,12 +663,14 @@ impl McpClient {
                         http_request_cancellation.clone(),
                     ));
             }
-            let options = PeerRequestOptions {
-                timeout: Some(deadline.saturating_duration_since(time::Instant::now())),
-                meta: self
-                    .uses_streamable_http
-                    .then(|| local_request_deadline_meta(deadline)),
-            };
+            if self.uses_streamable_http {
+                request
+                    .extensions_mut()
+                    .insert(AcnMcpHttpRequestDeadline(deadline));
+            }
+            let options = PeerRequestOptions::with_timeout(
+                deadline.saturating_duration_since(time::Instant::now()),
+            );
             let handle = tokio::select! {
                 biased;
                 () = self.lifecycle_cancel.cancelled() => {
@@ -737,6 +755,26 @@ impl McpClient {
         cancellation: Option<CancellationToken>,
         deadline: time::Instant,
     ) -> Result<CallToolResult, McpClientError> {
+        let _ = progress_token;
+        self.call_tool_cancellable_until_with_progress_registration(
+            tool_name,
+            arguments,
+            None,
+            cancellation,
+            deadline,
+        )
+        .await
+    }
+
+    /// 使用 rmcp 为当前 request 分配的 progress token 注册回调。
+    pub(crate) async fn call_tool_cancellable_until_with_progress_registration(
+        &self,
+        tool_name: &str,
+        arguments: Option<Value>,
+        progress_registration: Option<&mut (dyn FnMut(String) + Send)>,
+        cancellation: Option<CancellationToken>,
+        deadline: time::Instant,
+    ) -> Result<CallToolResult, McpClientError> {
         let arguments = match arguments {
             Some(Value::Object(map)) => Some(map),
             None | Some(Value::Null) => None,
@@ -747,23 +785,15 @@ impl McpClient {
                 });
             }
         };
-        let mut meta = progress_token
-            .map(|token| {
-                Meta::with_progress_token(ProgressToken(NumberOrString::String(Arc::from(token))))
-            })
-            .unwrap_or_default();
-        let params = CallToolRequestParams {
-            meta: None,
-            name: tool_name.to_string().into(),
-            arguments,
-            task: None,
+        let params = match arguments {
+            Some(arguments) => {
+                CallToolRequestParams::new(tool_name.to_string()).with_arguments(arguments)
+            }
+            None => CallToolRequestParams::new(tool_name.to_string()),
         };
         let timeout_secs = self.tool_timeout.as_secs();
         // 共享 transport 的 outbound queue、service mutex 与 response 都属于同一个请求生命
         // 周期；deadline 必须从 admission 前开始，不能只包住拿到 RequestHandle 之后的 rx.await。
-        if self.uses_streamable_http {
-            meta.extend(local_request_deadline_meta(deadline));
-        }
         let peer = tokio::select! {
             biased;
             () = self.lifecycle_cancel.cancelled() => {
@@ -798,10 +828,14 @@ impl McpClient {
                     http_request_cancellation.clone(),
                 ));
         }
-        let options = PeerRequestOptions {
-            timeout: Some(deadline.saturating_duration_since(time::Instant::now())),
-            meta: Some(meta),
-        };
+        if self.uses_streamable_http {
+            request
+                .extensions_mut()
+                .insert(AcnMcpHttpRequestDeadline(deadline));
+        }
+        let options = PeerRequestOptions::with_timeout(
+            deadline.saturating_duration_since(time::Instant::now()),
+        );
         let handle = tokio::select! {
             biased;
             () = self.lifecycle_cancel.cancelled() => {
@@ -828,6 +862,9 @@ impl McpClient {
             handle = peer.send_cancellable_request(request, options) => handle
                 .map_err(|err| self.tool_service_error(tool_name, timeout_secs, err))?,
         };
+        if let Some(register) = progress_registration {
+            register(progress_token_to_string(&handle.progress_token));
+        }
         let response = self
             .await_tool_response_with_cancellation(
                 tool_name,
@@ -1176,10 +1213,10 @@ fn schedule_request_cancellation(
 ) {
     std::mem::drop(tokio::spawn(async move {
         if let Err(error) = peer
-            .notify_cancelled(CancelledNotificationParam {
-                request_id,
-                reason: Some(reason.to_string()),
-            })
+            .notify_cancelled(CancelledNotificationParam::new(
+                Some(request_id),
+                Some(reason.to_string()),
+            ))
             .await
         {
             log::debug!(target: "mcp", "MCP cancellation notification failed: {error}");
@@ -1246,7 +1283,8 @@ fn client_initialize_error_is_retryable(error: &rmcp::service::ClientInitializeE
         rmcp::service::ClientInitializeError::ExpectedInitResponse(_)
         | rmcp::service::ClientInitializeError::ExpectedInitResult(_)
         | rmcp::service::ClientInitializeError::ConflictInitResponseId(_, _)
-        | rmcp::service::ClientInitializeError::JsonRpcError(_) => false,
+        | rmcp::service::ClientInitializeError::JsonRpcError(_)
+        | _ => false,
     }
 }
 
@@ -1271,7 +1309,11 @@ fn retryable_streamable_http_establishment_error(
         | StreamableHttpError::TokioJoinError(_)
         | StreamableHttpError::Deserialize(_)
         | StreamableHttpError::MissingSessionIdInResponse
-        | StreamableHttpError::AuthRequired(_) => false,
+        | StreamableHttpError::Auth(_)
+        | StreamableHttpError::AuthRequired(_)
+        | StreamableHttpError::InsufficientScope(_)
+        | StreamableHttpError::ReservedHeaderConflict(_)
+        | _ => false,
     }
 }
 
@@ -1307,6 +1349,9 @@ fn service_error_is_http_tool_timeout(error: &rmcp::service::ServiceError) -> bo
 enum PendingTransport {
     Stdio(PendingConnectTransport<TokioChildProcess>),
     StreamableHttp(PendingConnectTransport<StreamableHttpClientTransport<AcnMcpHttpClient>>),
+    StreamableHttpOAuth(
+        PendingConnectTransport<StreamableHttpClientTransport<AuthClient<AcnMcpHttpClient>>>,
+    ),
 }
 
 /// Streamable HTTP 适配层的错误。JSON body 的本地 deadline 与底层 reqwest 失败必须可区分，
@@ -1323,16 +1368,25 @@ enum AcnMcpHttpError {
 
 #[derive(Clone)]
 struct AcnMcpHttpClient {
+    server_name: String,
     inner: reqwest::Client,
+    oauth_managed: bool,
     protocol_version: Arc<StdMutex<String>>,
     fallback_tool_http_response_timeout: Duration,
 }
 
 impl AcnMcpHttpClient {
-    fn new(inner: reqwest::Client, fallback_tool_http_response_timeout: Duration) -> Self {
+    fn new(
+        server_name: String,
+        inner: reqwest::Client,
+        oauth_managed: bool,
+        fallback_tool_http_response_timeout: Duration,
+    ) -> Self {
         Self {
+            server_name,
             inner,
-            protocol_version: Arc::new(StdMutex::new(MCP_PROTOCOL_VERSION.to_string())),
+            oauth_managed,
+            protocol_version: Arc::new(StdMutex::new(LEGACY_MCP_PROTOCOL_VERSION.to_string())),
             fallback_tool_http_response_timeout,
         }
     }
@@ -1344,7 +1398,7 @@ impl AcnMcpHttpClient {
         }
     }
 
-    fn update_protocol_version(&self, message: &ServerJsonRpcMessage) {
+    fn update_legacy_protocol_version(&self, message: &ServerJsonRpcMessage) {
         let ServerJsonRpcMessage::Response(response) = message else {
             return;
         };
@@ -1358,40 +1412,67 @@ impl AcnMcpHttpClient {
         *guard = result.protocol_version.to_string();
     }
 
-    fn request_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        request.header(HEADER_PROTOCOL_VERSION, self.protocol_version())
+    fn request_protocol_version(&self, message: &rmcp::model::ClientJsonRpcMessage) -> String {
+        let protocol_version = match message {
+            rmcp::model::ClientJsonRpcMessage::Request(request) => request
+                .request
+                .get_meta()
+                .protocol_version()
+                .map(|version| version.to_string())
+                .or_else(|| match &request.request {
+                    ClientRequest::InitializeRequest(request) => {
+                        Some(request.params.protocol_version.to_string())
+                    }
+                    _ => None,
+                }),
+            _ => None,
+        }
+        .unwrap_or_else(|| self.protocol_version());
+        let mut guard = match self.protocol_version.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = protocol_version.clone();
+        protocol_version
+    }
+
+    fn request_headers(
+        &self,
+        mut request: reqwest::RequestBuilder,
+        custom_headers: HashMap<reqwest::header::HeaderName, reqwest::header::HeaderValue>,
+        protocol_version: String,
+    ) -> reqwest::RequestBuilder {
+        request = request.header(HEADER_PROTOCOL_VERSION, protocol_version);
+        for (name, value) in custom_headers {
+            request = request.header(name, value);
+        }
+        request
+    }
+
+    fn unauthorized_error(
+        &self,
+        header: Option<&reqwest::header::HeaderValue>,
+        auth_token_present: bool,
+    ) -> StreamableHttpError<AcnMcpHttpError> {
+        let message =
+            streamable_http_auth_error_message(&self.server_name, header, auth_token_present);
+        if self.oauth_managed {
+            return StreamableHttpError::AuthRequired(AuthRequiredError::new(message));
+        }
+        StreamableHttpError::UnexpectedServerResponse(Cow::from(message))
     }
 }
 
-fn local_request_deadline_meta(deadline: time::Instant) -> Meta {
-    let deadline_millis = u64::try_from(
-        deadline
-            .saturating_duration_since(*MCP_TOOL_DEADLINE_EPOCH)
-            .as_millis(),
-    )
-    .unwrap_or(u64::MAX);
-    let mut meta = Meta::default();
-    meta.insert(
-        ACN_LOCAL_TOOL_DEADLINE_META_FIELD.to_string(),
-        Value::Number(deadline_millis.into()),
-    );
-    meta
-}
-
-/// 从即将发出的本地受限 request 移除绝对 deadline。该字段只能留在 adapter 内，不能泄露给 MCP server。
-fn take_acn_local_tool_deadline(
-    message: &mut rmcp::model::ClientJsonRpcMessage,
-) -> Option<time::Instant> {
+/// 从即将发出的本地受限 request 取得绝对 deadline。extensions 不参与 JSON 序列化，server 不可见。
+fn acn_local_tool_deadline(message: &rmcp::model::ClientJsonRpcMessage) -> Option<time::Instant> {
     let rmcp::model::ClientJsonRpcMessage::Request(request) = message else {
         return None;
     };
-    let meta = match &mut request.request {
-        ClientRequest::CallToolRequest(call) => call.extensions.get_mut::<Meta>(),
-        ClientRequest::ListToolsRequest(list) => list.extensions.get_mut::<Meta>(),
-        _ => None,
-    };
-    let deadline_millis = meta?.remove(ACN_LOCAL_TOOL_DEADLINE_META_FIELD)?.as_u64()?;
-    (*MCP_TOOL_DEADLINE_EPOCH).checked_add(Duration::from_millis(deadline_millis))
+    request
+        .request
+        .extensions()
+        .get::<AcnMcpHttpRequestDeadline>()
+        .map(|deadline| deadline.0)
 }
 
 /// 从 request extensions 取得本地取消 token。extensions 是 rmcp 的进程内载体，不会写入 JSON-RPC。
@@ -1414,22 +1495,26 @@ impl StreamableHttpClient for AcnMcpHttpClient {
     async fn get_stream(
         &self,
         uri: Arc<str>,
-        session_id: Arc<str>,
+        session_id: Option<Arc<str>>,
         last_event_id: Option<String>,
         auth_token: Option<String>,
+        custom_headers: HashMap<reqwest::header::HeaderName, reqwest::header::HeaderValue>,
     ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
         let mut request_builder = self.request_headers(
-            self.inner
-                .get(uri.as_ref())
-                .header(
-                    reqwest::header::ACCEPT,
-                    [EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE].join(", "),
-                )
-                .header(HEADER_SESSION_ID, session_id.as_ref()),
+            self.inner.get(uri.as_ref()).header(
+                reqwest::header::ACCEPT,
+                [EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE].join(", "),
+            ),
+            custom_headers,
+            self.protocol_version(),
         );
+        if let Some(session_id) = session_id {
+            request_builder = request_builder.header(HEADER_SESSION_ID, session_id.as_ref());
+        }
         if let Some(last_event_id) = last_event_id {
             request_builder = request_builder.header(HEADER_LAST_EVENT_ID, last_event_id);
         }
+        let auth_token_present = auth_token.is_some();
         if let Some(auth_header) = auth_token {
             request_builder = request_builder.bearer_auth(auth_header);
         }
@@ -1437,6 +1522,12 @@ impl StreamableHttpClient for AcnMcpHttpClient {
             .send()
             .await
             .map_err(streamable_http_request_error)?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(self.unauthorized_error(
+                response.headers().get(reqwest::header::WWW_AUTHENTICATE),
+                auth_token_present,
+            ));
+        }
         if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
             return Err(StreamableHttpError::ServerDoesNotSupportSse);
         }
@@ -1452,8 +1543,14 @@ impl StreamableHttpClient for AcnMcpHttpClient {
         uri: Arc<str>,
         session_id: Arc<str>,
         auth_token: Option<String>,
+        custom_headers: HashMap<reqwest::header::HeaderName, reqwest::header::HeaderValue>,
     ) -> Result<(), StreamableHttpError<Self::Error>> {
-        let mut request_builder = self.request_headers(self.inner.delete(uri.as_ref()));
+        let mut request_builder = self.request_headers(
+            self.inner.delete(uri.as_ref()),
+            custom_headers,
+            self.protocol_version(),
+        );
+        let auth_token_present = auth_token.is_some();
         if let Some(auth_header) = auth_token {
             request_builder = request_builder.bearer_auth(auth_header);
         }
@@ -1462,6 +1559,12 @@ impl StreamableHttpClient for AcnMcpHttpClient {
             .send()
             .await
             .map_err(streamable_http_request_error)?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(self.unauthorized_error(
+                response.headers().get(reqwest::header::WWW_AUTHENTICATE),
+                auth_token_present,
+            ));
+        }
         if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
             return Ok(());
         }
@@ -1474,14 +1577,20 @@ impl StreamableHttpClient for AcnMcpHttpClient {
     async fn post_message(
         &self,
         uri: Arc<str>,
-        mut message: rmcp::model::ClientJsonRpcMessage,
+        message: rmcp::model::ClientJsonRpcMessage,
         session_id: Option<Arc<str>>,
         auth_token: Option<String>,
+        custom_headers: HashMap<reqwest::header::HeaderName, reqwest::header::HeaderValue>,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        let mut request = self.request_headers(self.inner.post(uri.as_ref()).header(
-            reqwest::header::ACCEPT,
-            [EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE].join(", "),
-        ));
+        let protocol_version = self.request_protocol_version(&message);
+        let mut request = self.request_headers(
+            self.inner.post(uri.as_ref()).header(
+                reqwest::header::ACCEPT,
+                [EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE].join(", "),
+            ),
+            custom_headers,
+            protocol_version,
+        );
         let auth_token_present = auth_token.is_some();
         if let Some(auth_header) = auth_token {
             request = request.bearer_auth(auth_header);
@@ -1490,15 +1599,15 @@ impl StreamableHttpClient for AcnMcpHttpClient {
             request = request.header(HEADER_SESSION_ID, session_id.as_ref());
         }
         // rmcp 的同 session HTTP worker 需要先拿到 response headers 才能继续处理下一条 request。
-        // ACN 受限 request 从 caller admission 起带绝对 deadline；adapter 在发 HTTP 前去掉本地元数据，
-        // 使 queue 等待、headers 与 JSON body 共享同一窗口。SSE 一旦建立不再受此 body 保护截断。
+        // ACN 受限 request 从 caller admission 起带绝对 deadline；adapter 通过不序列化的 extensions
+        // 取得 deadline，使 queue 等待、headers 与 JSON body 共享同一窗口。SSE 一旦建立不再受此 body 保护截断。
         let request_cancellation = acn_http_request_cancellation(&message);
         let is_tool_call = matches!(
             &message,
             rmcp::model::ClientJsonRpcMessage::Request(request)
                 if matches!(&request.request, ClientRequest::CallToolRequest(_))
         );
-        let tool_response_deadline = take_acn_local_tool_deadline(&mut message).or_else(|| {
+        let tool_response_deadline = acn_local_tool_deadline(&message).or_else(|| {
             is_tool_call.then(|| time::Instant::now() + self.fallback_tool_http_response_timeout)
         });
         let send_request = request.json(&message).send();
@@ -1525,12 +1634,10 @@ impl StreamableHttpClient for AcnMcpHttpClient {
             }
         };
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(StreamableHttpError::UnexpectedServerResponse(Cow::from(
-                streamable_http_auth_error_message(
-                    response.headers().get(reqwest::header::WWW_AUTHENTICATE),
-                    auth_token_present,
-                ),
-            )));
+            return Err(self.unauthorized_error(
+                response.headers().get(reqwest::header::WWW_AUTHENTICATE),
+                auth_token_present,
+            ));
         }
         let status = response.status();
         if matches!(
@@ -1555,7 +1662,7 @@ impl StreamableHttpClient for AcnMcpHttpClient {
                                 if let Ok(message) =
                                     serde_json::from_str::<ServerJsonRpcMessage>(data)
                                 {
-                                    client.update_protocol_version(&message);
+                                    client.update_legacy_protocol_version(&message);
                                 }
                             }
                         }
@@ -1587,7 +1694,7 @@ impl StreamableHttpClient for AcnMcpHttpClient {
                         message = response_json => message.map_err(streamable_http_request_error)?,
                     }
                 };
-                self.update_protocol_version(&message);
+                self.update_legacy_protocol_version(&message);
                 Ok(StreamableHttpPostResponse::Json(message, session_id))
             }
             _ => Err(StreamableHttpError::UnexpectedContentType(
@@ -1598,6 +1705,7 @@ impl StreamableHttpClient for AcnMcpHttpClient {
 }
 
 fn streamable_http_auth_error_message(
+    server_name: &str,
     header: Option<&reqwest::header::HeaderValue>,
     auth_token_present: bool,
 ) -> String {
@@ -1607,14 +1715,16 @@ fn streamable_http_auth_error_message(
         .unwrap_or_else(|| "<missing WWW-Authenticate header>".to_string());
     if auth_token_present {
         return format!(
-            "MCP server authentication failed: bearer token was rejected; WWW-Authenticate: {challenge}"
+            "MCP server authentication failed: bearer token was rejected; run `acn mcp logout {server_name}` then `acn mcp login {server_name}` if this server uses OAuth; WWW-Authenticate: {challenge}"
         );
     }
     if raw.is_some_and(is_oauth_or_interactive_auth_challenge) {
-        return format!("{UNSUPPORTED_INTERACTIVE_AUTH_MESSAGE}; WWW-Authenticate: {challenge}");
+        return format!(
+            "MCP server requires OAuth login; run `acn mcp login {server_name}`; WWW-Authenticate: {challenge}"
+        );
     }
     format!(
-        "MCP server requires authentication; configure bearer_token_env_var for bearer-token servers. {UNSUPPORTED_INTERACTIVE_AUTH_MESSAGE}; WWW-Authenticate: {challenge}"
+        "MCP server requires authentication; configure bearer_token_env_var for bearer-token servers or run `acn mcp login {server_name}` for OAuth; WWW-Authenticate: {challenge}"
     )
 }
 
@@ -1687,9 +1797,9 @@ impl ClientHandler for AcnMcpClientHandler {
 
     fn create_elicitation(
         &self,
-        _request: CreateElicitationRequestParams,
+        _request: ElicitRequestParams,
         _context: rmcp::service::RequestContext<RoleClient>,
-    ) -> impl Future<Output = Result<CreateElicitationResult, rmcp::ErrorData>> + Send + '_ {
+    ) -> impl Future<Output = Result<ElicitResult, rmcp::ErrorData>> + Send + '_ {
         std::future::ready(Ok(unsupported_elicitation_result()))
     }
 
@@ -1714,14 +1824,11 @@ fn emit_progress(
     }
 }
 
-fn unsupported_elicitation_result() -> CreateElicitationResult {
-    CreateElicitationResult {
-        action: ElicitationAction::Decline,
-        content: Some(json!({
-            "ok": false,
-            "error": "MCP server requires OAuth or interactive elicitation, which is not supported yet"
-        })),
-    }
+fn unsupported_elicitation_result() -> ElicitResult {
+    ElicitResult::new(ElicitationAction::Decline).with_content(json!({
+        "ok": false,
+        "error": "MCP server requires interactive elicitation, which is not supported"
+    }))
 }
 
 #[allow(
@@ -1764,14 +1871,20 @@ async fn stdio_transport(
     ))
 }
 
+/// bearer token 与 OAuth 互斥：配置了 `bearer_token_env_var` 就不查 OAuth 凭据存储。
+///
+/// OAuth server 交给 rmcp 的 `AuthClient` 包住 `AcnMcpHttpClient`，由它在每次请求前取
+/// access token 并在过期时用 refresh token 续期；`config.auth_header` 保持为空，否则
+/// `AuthClient` 会直接透传这个固定 token 而不再刷新。
 async fn streamable_http_transport(
+    mcp_config_path: &Path,
     server_name: &str,
     url: String,
     bearer_token_env_var: Option<String>,
+    oauth_credentials_store: crate::mcp::config::McpOAuthCredentialsStore,
     fallback_tool_http_response_timeout: Duration,
     connect_release_fence: Arc<McpConnectReleaseFence>,
-) -> Result<PendingConnectTransport<StreamableHttpClientTransport<AcnMcpHttpClient>>, McpClientError>
-{
+) -> Result<PendingTransport, McpClientError> {
     let bearer_token = match bearer_token_env_var {
         Some(env_var) => {
             let value =
@@ -1789,7 +1902,21 @@ async fn streamable_http_transport(
         }
         None => None,
     };
-    // 初始化由 `McpClient::connect` 的 startup timeout 约束，discovery 由 manager 的 timeout
+    let authorization = match bearer_token {
+        Some(_) => None,
+        None => oauth::authorization_manager(
+            mcp_config_path,
+            server_name,
+            &url,
+            oauth_credentials_store,
+        )
+        .await
+        .map_err(|error| McpClientError::OAuthCredentials {
+            server: server_name.to_string(),
+            message: error.to_string(),
+        })?,
+    };
+    // 建连协商由 `McpClient::connect` 的 startup timeout 约束，OAuth metadata discovery 由 manager 的 timeout
     // 约束；不能把 startup timeout 设为整个 reqwest client 的默认值，否则合法长 SSE tool call
     // 会早于 `tool_timeout_secs` 被截断。
     let client =
@@ -1803,34 +1930,69 @@ async fn streamable_http_transport(
     if let Some(token) = bearer_token {
         config = config.auth_header(token);
     }
-    Ok(PendingConnectTransport::new(
-        StreamableHttpClientTransport::with_client(
-            AcnMcpHttpClient::new(client, fallback_tool_http_response_timeout),
-            config,
+    let http_client = AcnMcpHttpClient::new(
+        server_name.to_string(),
+        client,
+        authorization.is_some(),
+        fallback_tool_http_response_timeout,
+    );
+    let registration = connect_release_fence.register_transport();
+    Ok(match authorization {
+        Some(manager) => PendingTransport::StreamableHttpOAuth(PendingConnectTransport::new(
+            StreamableHttpClientTransport::with_client(
+                AuthClient::new(http_client, manager),
+                config,
+            ),
+            registration,
+        )),
+        None => PendingTransport::StreamableHttp(PendingConnectTransport::new(
+            StreamableHttpClientTransport::with_client(http_client, config),
+            registration,
+        )),
+    })
+}
+
+/// MCP 建连协商的超时约束，用于在多种 transport 间共享同一套超时与错误语义。
+#[derive(Clone, Copy)]
+struct StartupDeadline {
+    timeout: Duration,
+    timeout_secs: u64,
+}
+
+/// 三种 transport 的建连协商只有静态类型不同，超时与错误映射完全一致。
+async fn serve_pending_transport<T>(
+    handler: AcnMcpClientHandler,
+    transport: PendingConnectTransport<T>,
+    server_name: &str,
+    startup: StartupDeadline,
+) -> Result<RunningService<RoleClient, AcnMcpClientHandler>, McpClientError>
+where
+    T: Transport<RoleClient> + Send + 'static,
+{
+    time::timeout(
+        startup.timeout,
+        handler.serve_with_lifecycle(
+            transport,
+            ClientLifecycleMode::Auto {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                legacy_version: Some(ProtocolVersion::V_2025_11_25),
+            },
         ),
-        connect_release_fence.register_transport(),
-    ))
+    )
+    .await
+    .map_err(|_| McpClientError::StartupTimeout {
+        server: server_name.to_string(),
+        timeout_secs: startup.timeout_secs,
+    })?
+    .map_err(|err| initialize_service_error(server_name, err))
 }
 
 fn client_info() -> ClientInfo {
-    ClientInfo {
-        meta: None,
-        protocol_version: protocol_version_2025_11_25(),
-        capabilities: Default::default(),
-        client_info: Implementation {
-            name: "agent_claim_network".to_string(),
-            title: Some("Agent Claim Network".to_string()),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            description: None,
-            icons: None,
-            website_url: None,
-        },
-    }
-}
-
-fn protocol_version_2025_11_25() -> ProtocolVersion {
-    serde_json::from_str::<ProtocolVersion>("\"2025-11-25\"")
-        .unwrap_or(ProtocolVersion::V_2025_06_18)
+    let mut info = ClientInfo::default();
+    info.protocol_version = ProtocolVersion::V_2025_11_25;
+    info.client_info = Implementation::new("agent_claim_network", env!("CARGO_PKG_VERSION"))
+        .with_title("Agent Claim Network");
+    info
 }
 
 fn stdio_env(
@@ -1912,10 +2074,6 @@ fn progress_token_to_string(token: &rmcp::model::ProgressToken) -> String {
     }
 }
 
-pub fn tool_requires_task(tool: &Tool) -> bool {
-    tool.task_support() == TaskSupport::Required
-}
-
 pub fn call_tool_result_to_json(result: &CallToolResult) -> Value {
     let content = serde_json::to_value(&result.content).unwrap_or_else(|_| Value::Array(vec![]));
     let meta = result
@@ -1935,6 +2093,142 @@ pub fn call_tool_result_to_json(result: &CallToolResult) -> Value {
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+
+    #[tokio::test]
+    async fn oauth_managed_post_refreshes_after_server_rejects_unexpired_token() {
+        use axum::{
+            extract::State,
+            http::{header, HeaderMap, StatusCode},
+            response::{IntoResponse, Response},
+            routing::post,
+            Json, Router,
+        };
+        use rmcp::model::{PingRequest, RequestId};
+        use rmcp::transport::auth::{
+            AuthorizationManager, AuthorizationMetadata, CredentialStore, InMemoryCredentialStore,
+            StoredCredentials,
+        };
+
+        #[derive(Clone)]
+        struct ServerState {
+            authorizations: Arc<StdMutex<Vec<String>>>,
+            token_requests: Arc<AtomicUsize>,
+        }
+
+        async fn mcp_endpoint(State(state): State<ServerState>, headers: HeaderMap) -> Response {
+            let authorization = headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            state
+                .authorizations
+                .lock()
+                .unwrap()
+                .push(authorization.clone());
+            if authorization == "Bearer old-token" {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    [(
+                        header::WWW_AUTHENTICATE,
+                        r#"Bearer resource_metadata="https://auth.example.test/resource?token=secret""#,
+                    )],
+                )
+                    .into_response();
+            }
+            StatusCode::ACCEPTED.into_response()
+        }
+
+        async fn token_endpoint(State(state): State<ServerState>) -> Json<Value> {
+            state.token_requests.fetch_add(1, Ordering::SeqCst);
+            Json(json!({
+                "access_token": "new-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": "refresh-token",
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = ServerState {
+            authorizations: Arc::new(StdMutex::new(Vec::new())),
+            token_requests: Arc::new(AtomicUsize::new(0)),
+        };
+        let server = tokio::spawn({
+            let state = state.clone();
+            async move {
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route("/mcp", post(mcp_endpoint))
+                        .route("/token", post(token_endpoint))
+                        .with_state(state),
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let base_url = format!("http://{address}");
+        let store = InMemoryCredentialStore::new();
+        store
+            .save(
+                serde_json::from_value::<StoredCredentials>(json!({
+                    "client_id": "test-client",
+                    "token_response": {
+                        "access_token": "old-token",
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                        "refresh_token": "refresh-token"
+                    }
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut manager = AuthorizationManager::new(format!("{base_url}/mcp"))
+            .await
+            .unwrap();
+        let mut metadata = AuthorizationMetadata::default();
+        metadata.authorization_endpoint = format!("{base_url}/authorize");
+        metadata.token_endpoint = format!("{base_url}/token");
+        manager.set_metadata(metadata);
+        manager.set_credential_store(store);
+        manager.configure_client_id("test-client").unwrap();
+        let client = AuthClient::new(
+            AcnMcpHttpClient::new(
+                "remote".into(),
+                reqwest::Client::new(),
+                true,
+                Duration::from_secs(1),
+            ),
+            manager,
+        );
+        let message = rmcp::model::ClientJsonRpcMessage::request(
+            ClientRequest::PingRequest(PingRequest::default()),
+            RequestId::Number(1),
+        );
+
+        let response = client
+            .post_message(
+                Arc::<str>::from(format!("{base_url}/mcp")),
+                message,
+                None,
+                None,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        server.abort();
+        assert!(matches!(response, StreamableHttpPostResponse::Accepted));
+        assert_eq!(state.token_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *state.authorizations.lock().unwrap(),
+            vec!["Bearer old-token", "Bearer new-token"]
+        );
+    }
 
     #[test]
     fn connection_establishment_retries_transient_io_failures() {
@@ -2011,19 +2305,24 @@ mod tests {
         assert_eq!(result.action, ElicitationAction::Decline);
         assert_eq!(
             result.content.unwrap()["error"],
-            "MCP server requires OAuth or interactive elicitation, which is not supported yet"
+            "MCP server requires interactive elicitation, which is not supported"
         );
     }
 
     #[test]
-    fn streamable_http_auth_challenge_reports_unsupported_oauth() {
+    fn client_does_not_advertise_tasks_extension() {
+        assert!(!client_info().capabilities.supports_tasks());
+    }
+
+    #[test]
+    fn streamable_http_auth_challenge_prompts_for_login() {
         let header = reqwest::header::HeaderValue::from_static(
             r#"Bearer resource_metadata="https://auth.example.test/.well-known/oauth-protected-resource?token=secret""#,
         );
 
-        let message = streamable_http_auth_error_message(Some(&header), false);
+        let message = streamable_http_auth_error_message("remote", Some(&header), false);
 
-        assert!(message.contains(UNSUPPORTED_INTERACTIVE_AUTH_MESSAGE));
+        assert!(message.contains("acn mcp login remote"));
         assert!(message.contains("Bearer resource_metadata"));
         assert!(!message.contains("secret"));
     }
@@ -2032,10 +2331,49 @@ mod tests {
     fn streamable_http_auth_challenge_reports_rejected_bearer_token() {
         let header = reqwest::header::HeaderValue::from_static(r#"Bearer realm="mcp""#);
 
-        let message = streamable_http_auth_error_message(Some(&header), true);
+        let message = streamable_http_auth_error_message("remote", Some(&header), true);
 
         assert!(message.contains("bearer token was rejected"));
+        assert!(message.contains("acn mcp logout remote"));
         assert!(message.contains("WWW-Authenticate: Bearer"));
+    }
+
+    #[test]
+    fn unauthorized_response_distinguishes_oauth_from_static_bearer() {
+        let header = reqwest::header::HeaderValue::from_static(
+            r#"Bearer resource_metadata="https://auth.example.test/resource?token=secret""#,
+        );
+        let oauth_client = AcnMcpHttpClient::new(
+            "remote".into(),
+            reqwest::Client::new(),
+            true,
+            Duration::from_secs(1),
+        );
+        let static_client = AcnMcpHttpClient::new(
+            "remote".into(),
+            reqwest::Client::new(),
+            false,
+            Duration::from_secs(1),
+        );
+
+        let oauth_error = oauth_client.unauthorized_error(Some(&header), true);
+        let static_error = static_client.unauthorized_error(Some(&header), true);
+
+        let StreamableHttpError::AuthRequired(challenge) = oauth_error else {
+            panic!("OAuth-managed 401 should trigger token refresh");
+        };
+        assert!(challenge
+            .www_authenticate_header
+            .contains("resource_metadata"));
+        assert!(challenge
+            .www_authenticate_header
+            .contains("acn mcp login remote"));
+        assert!(!challenge.www_authenticate_header.contains("secret"));
+        let StreamableHttpError::UnexpectedServerResponse(message) = static_error else {
+            panic!("static bearer 401 should remain an actionable configuration error");
+        };
+        assert!(message.contains("bearer token was rejected"));
+        assert!(!message.contains("secret"));
     }
 
     #[test]
@@ -2049,12 +2387,12 @@ mod tests {
                 captured.lock().unwrap().push(event);
             })),
         };
-        let params = ProgressNotificationParam {
-            progress_token: rmcp::model::ProgressToken(rmcp::model::NumberOrString::Number(1)),
-            progress: 1.0,
-            total: Some(2.0),
-            message: Some("half".to_string()),
-        };
+        let params = ProgressNotificationParam::new(
+            rmcp::model::ProgressToken(rmcp::model::NumberOrString::Number(1)),
+            1.0,
+        )
+        .with_total(2.0)
+        .with_message("half");
 
         emit_progress(
             handler.progress_callback.clone(),

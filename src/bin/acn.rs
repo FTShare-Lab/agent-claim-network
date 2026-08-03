@@ -12,11 +12,12 @@ use agent_claim_network::config::{
 };
 use agent_claim_network::mcp::config::{
     read_mcp_json_config, validate_server_name, write_mcp_json_config_atomic, McpJsonConfig,
-    McpServerConfig, McpTransportKind,
+    McpOAuthCredentialsStore, McpServerConfig, McpTransportKind,
 };
 use agent_claim_network::mcp::connection_manager::{
     McpConnectionManager, McpRuntimeState, McpServerStatus,
 };
+use agent_claim_network::mcp::oauth;
 use agent_claim_network::session::{
     cleanup_old_sessions, SessionCleanupConfig, SessionCleanupEntry, SessionCleanupOutcome,
     SessionCleanupReport, SessionMetadata, SessionStatus,
@@ -477,6 +478,13 @@ enum McpCommand {
     Disable {
         name: String,
     },
+    Login {
+        name: String,
+        no_browser: bool,
+    },
+    Logout {
+        name: String,
+    },
     Status {
         name: Option<String>,
     },
@@ -499,6 +507,9 @@ enum McpAddTransport {
     StreamableHttp {
         url: String,
         bearer_token_env_var: Option<String>,
+        oauth_client_id: Option<String>,
+        oauth_callback_port: Option<u16>,
+        oauth_credentials_store: Option<McpOAuthCredentialsStore>,
     },
 }
 
@@ -531,13 +542,20 @@ async fn execute_mcp_command(path: &Path, command: McpCommand) -> anyhow::Result
                 McpAddTransport::StreamableHttp {
                     url,
                     bearer_token_env_var,
+                    oauth_client_id,
+                    oauth_callback_port,
+                    oauth_credentials_store,
                 } => {
                     if !add.env.is_empty() || !add.env_vars.is_empty() {
                         anyhow::bail!(
                             "streamable_http server 不支持 -e/--env-var；请使用 --bearer-token-env-var"
                         );
                     }
-                    McpServerConfig::streamable_http(url, bearer_token_env_var)
+                    let mut server = McpServerConfig::streamable_http(url, bearer_token_env_var);
+                    server.oauth_client_id = oauth_client_id;
+                    server.oauth_callback_port = oauth_callback_port;
+                    server.oauth_credentials_store = oauth_credentials_store;
+                    server
                 }
             };
             add_mcp_server(path, add.name, server).await
@@ -545,11 +563,26 @@ async fn execute_mcp_command(path: &Path, command: McpCommand) -> anyhow::Result
         McpCommand::AddJson { name, server } => add_mcp_server(path, name, server).await,
         McpCommand::Remove { name } => {
             let mut cfg = read_mcp_json_config(path).await?;
-            if cfg.servers.remove(&name).is_none() {
-                anyhow::bail!("MCP server 不存在: {name}");
-            }
+            let server = cfg
+                .servers
+                .get(&name)
+                .with_context(|| format!("MCP server 不存在: {name}"))?
+                .clone();
+            let clear_oauth = server.transport_kind(&name)? == McpTransportKind::StreamableHttp;
+            cfg.servers.remove(&name);
             write_mcp_json_config_atomic(path, &cfg).await?;
-            Ok(format!("removed MCP server '{name}'\n"))
+            let mut output = format!("removed MCP server '{name}'\n");
+            if clear_oauth {
+                if let Err(error) = oauth::logout(path, &name, &server).await {
+                    log::warn!(
+                        "MCP server '{name}' 配置已删除，但本地 OAuth 凭据清理失败: {error}"
+                    );
+                    output.push_str(&format!(
+                        "warning: MCP server '{name}' 配置已删除，但本地 OAuth 凭据清理失败：{error}\n"
+                    ));
+                }
+            }
+            Ok(output)
         }
         McpCommand::Enable { name } => {
             let mut cfg = read_mcp_json_config(path).await?;
@@ -570,6 +603,24 @@ async fn execute_mcp_command(path: &Path, command: McpCommand) -> anyhow::Result
             server.enabled = Some(false);
             write_mcp_json_config_atomic(path, &cfg).await?;
             Ok(format!("disabled MCP server '{name}'\n"))
+        }
+        McpCommand::Login { name, no_browser } => {
+            let cfg = read_mcp_json_config(path).await?;
+            let server = cfg
+                .servers
+                .get(&name)
+                .with_context(|| format!("MCP server 不存在: {name}"))?;
+            oauth::login(path, &name, server, no_browser).await?;
+            Ok(format!("logged in to MCP server '{name}'\n"))
+        }
+        McpCommand::Logout { name } => {
+            let cfg = read_mcp_json_config(path).await?;
+            let server = cfg
+                .servers
+                .get(&name)
+                .with_context(|| format!("MCP server 不存在: {name}"))?;
+            oauth::logout(path, &name, server).await?;
+            Ok(format!("logged out of MCP server '{name}'\n"))
         }
         McpCommand::Status { name } => {
             let workspace_root = std::env::current_dir().context("读取当前工作目录失败")?;
@@ -641,6 +692,9 @@ where
             { parse_mcp_name_command(&args, &mut index, &mut config, &mut upstream, "disable") }
                 .map(|name| McpCommand::Disable { name })?
         }
+        "login" => parse_mcp_login(&args, &mut index, &mut config, &mut upstream)?,
+        "logout" => parse_mcp_name_command(&args, &mut index, &mut config, &mut upstream, "logout")
+            .map(|name| McpCommand::Logout { name })?,
         "status" => parse_mcp_status(&args, &mut index, &mut config, &mut upstream)?,
         other => anyhow::bail!("未知 mcp 子命令: {other}\n{}", mcp_usage()),
     };
@@ -720,6 +774,9 @@ fn parse_mcp_add(
     let mut env_vars = Vec::new();
     let mut url = None;
     let mut bearer_token_env_var = None;
+    let mut oauth_client_id = None;
+    let mut oauth_callback_port = None;
+    let mut oauth_credentials_store = None;
     let mut stdio_command = None;
     while *index < args.len() {
         match args[*index].as_str() {
@@ -766,6 +823,33 @@ fn parse_mcp_add(
                 validate_env_key("--bearer-token-env-var", &key)?;
                 bearer_token_env_var = Some(key);
             }
+            "--oauth-client-id" => {
+                *index += 1;
+                let client_id = take_mcp_value(args, index, "--oauth-client-id 后缺少 client ID")?;
+                if client_id.trim().is_empty() {
+                    anyhow::bail!("--oauth-client-id 不能为空");
+                }
+                oauth_client_id = Some(client_id);
+            }
+            "--oauth-callback-port" => {
+                *index += 1;
+                let raw = take_mcp_value(args, index, "--oauth-callback-port 后缺少端口")?;
+                let port = raw
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|port| *port > 0)
+                    .context("--oauth-callback-port 必须在 1..=65535")?;
+                oauth_callback_port = Some(port);
+            }
+            "--oauth-credentials-store" => {
+                *index += 1;
+                let value = take_mcp_value(args, index, "--oauth-credentials-store 后缺少类型")?;
+                oauth_credentials_store = Some(match value.as_str() {
+                    "keyring" => McpOAuthCredentialsStore::Keyring,
+                    "file" => McpOAuthCredentialsStore::File,
+                    _ => anyhow::bail!("--oauth-credentials-store 仅支持 keyring 或 file"),
+                });
+            }
             "-h" | "--help" => {
                 eprintln!("{}", mcp_usage());
                 std::process::exit(0);
@@ -783,10 +867,19 @@ fn parse_mcp_add(
         McpAddTransport::StreamableHttp {
             url,
             bearer_token_env_var,
+            oauth_client_id,
+            oauth_callback_port,
+            oauth_credentials_store,
         }
     } else {
-        if bearer_token_env_var.is_some() {
-            anyhow::bail!("stdio server 不支持 --bearer-token-env-var；请使用 -e 或 --env-var");
+        if bearer_token_env_var.is_some()
+            || oauth_client_id.is_some()
+            || oauth_callback_port.is_some()
+            || oauth_credentials_store.is_some()
+        {
+            anyhow::bail!(
+                "stdio server 不支持 HTTP/OAuth 选项；请使用 -e 或 --env-var 传递 stdio 凭据"
+            );
         }
         let command_parts =
             stdio_command.context("mcp add stdio server 需要在 -- 后提供 command")?;
@@ -805,6 +898,43 @@ fn parse_mcp_add(
         env,
         env_vars,
     }))
+}
+
+fn parse_mcp_login(
+    args: &[String],
+    index: &mut usize,
+    config: &mut Option<PathBuf>,
+    upstream: &mut Option<String>,
+) -> anyhow::Result<McpCommand> {
+    let name = take_mcp_value(args, index, "mcp login 后缺少 server name")?;
+    validate_server_name(&name)?;
+    let mut no_browser = false;
+    while *index < args.len() {
+        match args[*index].as_str() {
+            "--no-browser" => {
+                no_browser = true;
+                *index += 1;
+            }
+            "--config" => {
+                *index += 1;
+                *config = Some(PathBuf::from(take_mcp_value(
+                    args,
+                    index,
+                    "--config 后缺少路径",
+                )?));
+            }
+            "--upstream" => {
+                *index += 1;
+                *upstream = Some(take_mcp_value(args, index, "--upstream 后缺少名称")?);
+            }
+            "-h" | "--help" => {
+                eprintln!("{}", mcp_usage());
+                std::process::exit(0);
+            }
+            other => anyhow::bail!("未知 mcp login 参数: {other}"),
+        }
+    }
+    Ok(McpCommand::Login { name, no_browser })
 }
 
 fn parse_mcp_name_command(
@@ -1016,6 +1146,24 @@ fn mcp_server_text(path: &Path, name: &str, server: &McpServerConfig) -> String 
                 "bearer_token_env_var: {}\n",
                 server.bearer_token_env_var.as_deref().unwrap_or("-")
             ));
+            text.push_str(&format!(
+                "oauth_client_id: {}\n",
+                server.oauth_client_id.as_deref().unwrap_or("-")
+            ));
+            text.push_str(&format!(
+                "oauth_callback_port: {}\n",
+                server
+                    .oauth_callback_port
+                    .map(|port| port.to_string())
+                    .unwrap_or_else(|| "random".to_string())
+            ));
+            text.push_str(&format!(
+                "oauth_credentials_store: {}\n",
+                match server.oauth_credentials_store.unwrap_or_default() {
+                    McpOAuthCredentialsStore::Keyring => "keyring",
+                    McpOAuthCredentialsStore::File => "file",
+                }
+            ));
         }
         Err(err) => text.push_str(&format!("error: {err}\n")),
     }
@@ -1213,14 +1361,16 @@ fn mcp_usage() -> &'static str {
   acn mcp list [--config <path>] [--upstream <name>]
   acn mcp get <name> [--json] [--config <path>] [--upstream <name>]
   acn mcp add <name> [-e KEY=VALUE] [--env-var KEY] [--config <path>] [--upstream <name>] -- <command...>
-  acn mcp add <name> --url <url> [--bearer-token-env-var ENV] [--config <path>] [--upstream <name>]
+  acn mcp add <name> --url <url> [--bearer-token-env-var ENV] [--oauth-client-id ID] [--oauth-callback-port PORT] [--oauth-credentials-store keyring|file] [--config <path>] [--upstream <name>]
   acn mcp add-json <name> '<server-json>' [--config <path>] [--upstream <name>]
   acn mcp remove <name> [--config <path>] [--upstream <name>]
   acn mcp enable <name> [--config <path>] [--upstream <name>]
   acn mcp disable <name> [--config <path>] [--upstream <name>]
+  acn mcp login <name> [--no-browser] [--config <path>] [--upstream <name>]
+  acn mcp logout <name> [--config <path>] [--upstream <name>]
   acn mcp status [name] [--config <path>] [--upstream <name>]
 
-管理选中 upstream 的 MCP server 配置文件 <acn_home>/<upstream>/.mcp.json。add/add-json 只保存配置；status 才会真实连接 server。
+管理选中 upstream 的 MCP server 配置文件 <acn_home>/<upstream>/.mcp.json。add/add-json 只保存配置；status 才会真实连接 server。login 仅适用于支持 OAuth discovery，且支持动态注册或已配置 public client ID 的 streamable_http server。
 
 选项:
   --config <path>             指定 config.toml，用于定位 <acn_home>
@@ -1229,6 +1379,10 @@ fn mcp_usage() -> &'static str {
   --env-var KEY               stdio server 运行时从当前进程继承的环境变量名
   --url <url>                 添加 streamable_http MCP endpoint
   --bearer-token-env-var ENV  streamable_http bearer token 所在环境变量名
+  --oauth-client-id ID        预注册的 public OAuth client ID；不支持 client secret
+  --oauth-callback-port PORT  固定 loopback callback 端口；默认使用随机端口
+  --oauth-credentials-store S OAuth 凭据存储：keyring（默认）或 file
+  --no-browser                不打开浏览器，提示粘贴完整 redirect URL
   <server-json>                单个 server JSON；type=http 会保存为 streamable_http
   --json                      get 时输出原始 JSON
 "
@@ -1525,7 +1679,7 @@ fn acn_usage() -> &'static str {
   acn update [--url <git-url>] [--branch <branch>] [--config <path>]
   acn session cleanup [--apply] [options]
   acn supervisor <status|jobs|stop> [options]
-  acn mcp <list|get|add|remove|enable|disable|status> [options]
+  acn mcp <list|get|add|remove|enable|disable|login|logout|status> [options]
 
 启动 ACN 交互式 TUI session。普通用户通常只需要运行 `acn`；后台 finalize supervisor 会自动启动，无需手动管理。
 
@@ -1558,9 +1712,11 @@ MCP 配置命令:
   acn mcp get <name>                  查看单个 MCP server 的详细配置
   acn mcp add <name> ...              新增 stdio server 或 streamable_http endpoint
   acn mcp add-json <name> <json>      从单个 server JSON 新增 MCP server
-  acn mcp remove <name>               删除 MCP server 配置
+  acn mcp remove <name>               删除 MCP server 配置及其本地 OAuth 凭据
   acn mcp enable <name>               启用 MCP server
   acn mcp disable <name>              禁用但保留 MCP server 配置
+  acn mcp login <name>                OAuth 登录；headless 环境可加 --no-browser
+  acn mcp logout <name>               只删除本地 OAuth 凭据，不做远端 revocation
   acn mcp status [name]               连接检查 MCP server
 "
 }
@@ -2416,6 +2572,8 @@ api_key_env = "UNUSED_TEST_LLM_KEY"
         assert!(usage.contains("acn mcp remove <name>"));
         assert!(usage.contains("acn mcp enable <name>"));
         assert!(usage.contains("acn mcp disable <name>"));
+        assert!(usage.contains("acn mcp login <name>"));
+        assert!(usage.contains("acn mcp logout <name>"));
         assert!(usage.contains("acn mcp status [name]"));
         assert!(!usage.contains("接入 client 后可用"));
         assert!(!usage.contains("--upstream n"));
@@ -2671,7 +2829,7 @@ retry_max_delay_ms = 5000
     }
 
     #[test]
-    fn parse_mcp_add_http_accepts_bearer_token_env_var() {
+    fn parse_mcp_add_http_accepts_auth_options() {
         let cli = super::parse_mcp_cli_from([
             "acn",
             "mcp",
@@ -2681,6 +2839,12 @@ retry_max_delay_ms = 5000
             "https://mcp.linear.app/mcp",
             "--bearer-token-env-var",
             "LINEAR_API_KEY",
+            "--oauth-client-id",
+            "linear-public-client",
+            "--oauth-callback-port",
+            "8765",
+            "--oauth-credentials-store",
+            "file",
         ])
         .unwrap();
 
@@ -2689,14 +2853,89 @@ retry_max_delay_ms = 5000
                 super::McpAddTransport::StreamableHttp {
                     url,
                     bearer_token_env_var,
+                    oauth_client_id,
+                    oauth_callback_port,
+                    oauth_credentials_store,
                 } => {
                     assert_eq!(url, "https://mcp.linear.app/mcp");
                     assert_eq!(bearer_token_env_var.as_deref(), Some("LINEAR_API_KEY"));
+                    assert_eq!(oauth_client_id.as_deref(), Some("linear-public-client"));
+                    assert_eq!(oauth_callback_port, Some(8765));
+                    assert_eq!(
+                        oauth_credentials_store,
+                        Some(super::McpOAuthCredentialsStore::File)
+                    );
                 }
                 other => panic!("unexpected transport: {other:?}"),
             },
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_mcp_login_and_logout_accept_common_options() {
+        let login = super::parse_mcp_cli_from([
+            "acn",
+            "mcp",
+            "login",
+            "remote",
+            "--config",
+            "config.toml",
+            "--upstream",
+            "agent_hub",
+            "--no-browser",
+        ])
+        .unwrap();
+        let logout = super::parse_mcp_cli_from(["acn", "mcp", "logout", "remote"]).unwrap();
+
+        assert_eq!(login.upstream.as_deref(), Some("agent_hub"));
+        assert_eq!(
+            login.config.as_deref(),
+            Some(std::path::Path::new("config.toml"))
+        );
+        assert!(matches!(
+            login.command,
+            super::McpCommand::Login {
+                ref name,
+                no_browser: true,
+            } if name == "remote"
+        ));
+        assert!(matches!(
+            logout.command,
+            super::McpCommand::Logout { ref name } if name == "remote"
+        ));
+    }
+
+    #[tokio::test]
+    async fn mcp_login_rejects_stdio_server_before_starting_browser_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        let mut cfg = agent_claim_network::mcp::config::McpJsonConfig::default();
+        cfg.servers.insert(
+            "local".to_string(),
+            agent_claim_network::mcp::config::McpServerConfig::stdio(
+                "server".to_string(),
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+                Vec::new(),
+            ),
+        );
+        agent_claim_network::mcp::config::write_mcp_json_config_atomic(&path, &cfg)
+            .await
+            .unwrap();
+
+        let error = super::execute_mcp_command(
+            &path,
+            super::McpCommand::Login {
+                name: "local".to_string(),
+                no_browser: false,
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("仅 streamable_http server 可登录"));
     }
 
     #[test]
@@ -2931,6 +3170,42 @@ retry_max_delay_ms = 5000
         )
         .await
         .unwrap();
+        let cfg = agent_claim_network::mcp::config::read_mcp_json_config(&path)
+            .await
+            .unwrap();
+        assert!(cfg.servers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_remove_deletes_config_when_oauth_credential_cleanup_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        let mut server = agent_claim_network::mcp::config::McpServerConfig::streamable_http(
+            "https://example.test/mcp".to_string(),
+            None,
+        );
+        server.oauth_credentials_store =
+            Some(agent_claim_network::mcp::config::McpOAuthCredentialsStore::File);
+        let mut cfg = agent_claim_network::mcp::config::McpJsonConfig::default();
+        cfg.servers.insert("remote".to_string(), server);
+        agent_claim_network::mcp::config::write_mcp_json_config_atomic(&path, &cfg)
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join(".mcp-oauth"), "not a directory")
+            .await
+            .unwrap();
+
+        let output = super::execute_mcp_command(
+            &path,
+            super::McpCommand::Remove {
+                name: "remote".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(output.contains("removed MCP server 'remote'"));
+        assert!(output.contains("OAuth 凭据清理失败"));
         let cfg = agent_claim_network::mcp::config::read_mcp_json_config(&path)
             .await
             .unwrap();

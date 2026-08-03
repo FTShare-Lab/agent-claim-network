@@ -6,7 +6,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -21,8 +20,7 @@ use crate::config::{
     MCP_RECONNECT_MAX_RETRIES, MCP_RECONNECT_RETRY_BASE_DELAY_MS, MCP_RECONNECT_RETRY_MAX_DELAY_MS,
 };
 use crate::mcp::client::{
-    tool_requires_task, McpClient, McpClientError, McpConnectReleaseFence, McpProgressCallback,
-    McpProgressEvent,
+    McpClient, McpClientError, McpConnectReleaseFence, McpProgressCallback, McpProgressEvent,
 };
 use crate::mcp::config::{
     read_mcp_json_config, write_mcp_json_config_atomic, McpConfigError, McpJsonConfig,
@@ -140,7 +138,6 @@ pub struct McpConnectionManager {
     config_path: PathBuf,
     workspace_root: PathBuf,
     progress_router: Arc<McpProgressRouter>,
-    progress_counter: AtomicU64,
     config_write_lock: tokio::sync::Mutex<()>,
     state: Mutex<McpManagerState>,
     /// `RunningService::close_with_timeout` 超时后会失去 join handle，无法再确认旧 transport
@@ -244,7 +241,6 @@ pub enum McpToolFilterReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpToolUnsupportedReason {
-    TaskRequired,
     InvalidSchema,
 }
 
@@ -408,12 +404,6 @@ impl McpProgressRouter {
     }
 }
 
-impl McpProgressRegistration {
-    fn token(&self) -> String {
-        self.token.clone()
-    }
-}
-
 impl Drop for McpProgressRegistration {
     fn drop(&mut self) {
         self.router.unregister(&self.server_name, &self.token);
@@ -444,7 +434,6 @@ impl McpConnectionManager {
             config_path,
             workspace_root,
             progress_router: Arc::new(McpProgressRouter::new(progress_callback)),
-            progress_counter: AtomicU64::new(1),
             config_write_lock: tokio::sync::Mutex::new(()),
             state: Mutex::new(McpManagerState::default()),
             release_gates: Arc::new(TransportReleaseGates::default()),
@@ -470,6 +459,7 @@ impl McpConnectionManager {
         > = futures::stream::FuturesUnordered::new();
         for (name, server, generation, attempt, stale_attempt) in enabled {
             let stale_client = stale_clients.remove(&name);
+            let config_path = self.config_path.clone();
             let workspace_root = self.workspace_root.clone();
             let progress_callback = self.progress_router.callback();
             let release_gates = Arc::clone(&self.release_gates);
@@ -488,6 +478,7 @@ impl McpConnectionManager {
                         name,
                         server,
                         generation,
+                        config_path,
                         workspace_root,
                         progress_callback,
                         attempt,
@@ -664,11 +655,16 @@ impl McpConnectionManager {
         };
         // 只读实时 tools/list 属于这一次 tools/call 的 admission，不能给后续 call 重置 timeout。
         let deadline = lease.client.next_tool_deadline();
-        let progress_registration = progress_reporter.map(|reporter| {
-            let token = self.next_progress_token();
-            self.progress_router
-                .register(server_name.to_string(), token, reporter)
-        });
+        let mut progress_registration = None;
+        let mut register_progress = |token| {
+            if let Some(reporter) = &progress_reporter {
+                progress_registration = Some(self.progress_router.register(
+                    server_name.to_string(),
+                    token,
+                    reporter.clone(),
+                ));
+            }
+        };
         let mut result = if require_read_only {
             match lease
                 .client
@@ -699,12 +695,10 @@ impl McpConnectionManager {
                     } else {
                         lease
                             .client
-                            .call_tool_cancellable_until(
+                            .call_tool_cancellable_until_with_progress_registration(
                                 tool_name,
                                 arguments,
-                                progress_registration
-                                    .as_ref()
-                                    .map(McpProgressRegistration::token),
+                                Some(&mut register_progress),
                                 cancellation.clone(),
                                 deadline,
                             )
@@ -719,18 +713,21 @@ impl McpConnectionManager {
         } else {
             lease
                 .client
-                .call_tool_cancellable_until(
+                .call_tool_cancellable_until_with_progress_registration(
                     tool_name,
                     arguments,
-                    progress_registration
-                        .as_ref()
-                        .map(McpProgressRegistration::token),
+                    Some(&mut register_progress),
                     cancellation,
                     deadline,
                 )
                 .await
                 .map_err(McpManagerError::Client)
         };
+        if progress_registration.is_some() {
+            // rmcp 将 notification 放到独立任务执行；让已经排队的 progress 先完成，
+            // 再析构 registration，避免响应先返回时丢失同一 SSE 流中的末尾进度。
+            tokio::task::yield_now().await;
+        }
         if result.is_ok()
             && !self.ready_client_matches(server_name, lease.generation, &lease.client)
         {
@@ -833,6 +830,7 @@ impl McpConnectionManager {
             server_name.to_string(),
             server,
             generation,
+            self.config_path.clone(),
             self.workspace_root.clone(),
             self.progress_router.callback(),
             attempt,
@@ -890,6 +888,7 @@ impl McpConnectionManager {
             server_name.to_string(),
             server,
             generation,
+            self.config_path.clone(),
             self.workspace_root.clone(),
             self.progress_router.callback(),
             attempt,
@@ -962,6 +961,7 @@ impl McpConnectionManager {
             server_name.to_string(),
             server,
             generation,
+            self.config_path.clone(),
             self.workspace_root.clone(),
             self.progress_router.callback(),
             attempt,
@@ -1258,11 +1258,6 @@ impl McpConnectionManager {
             Err(poisoned) => poisoned.into_inner(),
         }
     }
-
-    fn next_progress_token(&self) -> String {
-        let id = self.progress_counter.fetch_add(1, Ordering::Relaxed);
-        format!("acn-mcp-{id}")
-    }
 }
 
 /// 返回未在关闭窗口内释放的 server 名；调用方若要建立 replacement client 必须把它视为硬失败。
@@ -1428,16 +1423,17 @@ impl McpToolFilterReason {
 impl McpToolUnsupportedReason {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::TaskRequired => "task_required",
             Self::InvalidSchema => "invalid_schema",
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_server(
     name: String,
     server: McpServerConfig,
     generation: u64,
+    mcp_config_path: PathBuf,
     workspace_root: PathBuf,
     progress_callback: Option<McpProgressCallback>,
     attempt: Arc<ConnectAttempt>,
@@ -1457,6 +1453,7 @@ async fn connect_server(
                 name.clone(),
                 server.clone(),
                 generation,
+                mcp_config_path.clone(),
                 workspace_root.clone(),
                 progress_callback.clone(),
                 attempt.release_fence(),
@@ -1520,10 +1517,12 @@ fn reconnect_backoff(retry_index: u32) -> Duration {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_server_once(
     name: String,
     server: McpServerConfig,
     generation: u64,
+    mcp_config_path: PathBuf,
     workspace_root: PathBuf,
     progress_callback: Option<McpProgressCallback>,
     connect_release_fence: Arc<McpConnectReleaseFence>,
@@ -1532,6 +1531,7 @@ async fn connect_server_once(
     match McpClient::connect(
         name.clone(),
         &server,
+        &mcp_config_path,
         &workspace_root,
         progress_callback.clone(),
         connect_release_fence,
@@ -1698,10 +1698,6 @@ fn classify_tools(server: &McpServerConfig, tools: Vec<Tool>) -> Vec<McpToolSnap
                     McpToolExposure::Filtered {
                         reason: McpToolFilterReason::DisabledTools,
                     }
-                } else if tool_requires_task(&tool) {
-                    McpToolExposure::Unsupported {
-                        reason: McpToolUnsupportedReason::TaskRequired,
-                    }
                 } else if input_schema_is_invalid(&tool) {
                     McpToolExposure::Unsupported {
                         reason: McpToolUnsupportedReason::InvalidSchema,
@@ -1712,10 +1708,6 @@ fn classify_tools(server: &McpServerConfig, tools: Vec<Tool>) -> Vec<McpToolSnap
             } else if disabled_tools.contains(&raw_name) {
                 McpToolExposure::Filtered {
                     reason: McpToolFilterReason::DisabledTools,
-                }
-            } else if tool_requires_task(&tool) {
-                McpToolExposure::Unsupported {
-                    reason: McpToolUnsupportedReason::TaskRequired,
                 }
             } else if input_schema_is_invalid(&tool) {
                 McpToolExposure::Unsupported {
@@ -1781,7 +1773,6 @@ impl McpServerStatus {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
     use std::convert::Infallible;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1794,7 +1785,7 @@ mod tests {
     use axum::routing::post;
     use axum::{Json, Router};
     use futures::{stream, StreamExt};
-    use rmcp::model::{JsonObject, TaskSupport, ToolExecution};
+    use rmcp::model::JsonObject;
     use serde_json::json;
     use tokio::net::TcpListener;
     use tokio::sync::Notify;
@@ -1834,22 +1825,6 @@ mod tests {
             tools[2].exposure,
             McpToolExposure::Filtered {
                 reason: McpToolFilterReason::NotInEnabledTools
-            }
-        );
-    }
-
-    #[test]
-    fn classify_tools_marks_task_required_as_unsupported() {
-        let server = McpServerConfig::streamable_http("https://example.com/mcp".into(), None);
-        let mut task_tool = tool("long_task");
-        task_tool.execution = Some(ToolExecution::new().with_task_support(TaskSupport::Required));
-
-        let tools = classify_tools(&server, vec![task_tool]);
-
-        assert_eq!(
-            tools[0].exposure,
-            McpToolExposure::Unsupported {
-                reason: McpToolUnsupportedReason::TaskRequired
             }
         );
     }
@@ -1951,7 +1926,7 @@ mod tests {
         assert_eq!(progress_events.lock().unwrap().len(), 1);
         let routed = routed_progress_events.lock().unwrap();
         assert_eq!(routed.len(), 1);
-        assert_eq!(routed[0].progress_token, "acn-mcp-1");
+        assert!(!routed[0].progress_token.is_empty());
         assert_eq!(routed[0].message.as_deref(), Some("half"));
     }
 
@@ -2810,12 +2785,12 @@ mod tests {
         assert_eq!(result_json["content"][0]["text"], "pong");
         let routed = routed_progress_events.lock().unwrap();
         assert_eq!(routed.len(), 1);
-        assert_eq!(routed[0].progress_token, "acn-mcp-1");
+        assert!(!routed[0].progress_token.is_empty());
         assert_eq!(routed[0].message.as_deref(), Some("half"));
     }
 
     #[tokio::test]
-    async fn streamable_http_uses_negotiated_protocol_version_after_initialize() {
+    async fn streamable_http_falls_back_to_legacy_protocol_when_discover_is_unsupported() {
         let seen_headers = Arc::new(StdMutex::new(Vec::<(String, Option<String>)>::new()));
         let handler_headers = Arc::clone(&seen_headers);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2850,6 +2825,9 @@ mod tests {
         );
         let seen = seen_headers.lock().unwrap();
         assert!(seen.iter().any(|(method, header)| {
+            method == "server/discover" && header.as_deref() == Some("2026-07-28")
+        }));
+        assert!(seen.iter().any(|(method, header)| {
             method == "initialize" && header.as_deref() == Some("2025-11-25")
         }));
         assert!(seen.iter().any(|(method, header)| {
@@ -2858,6 +2836,50 @@ mod tests {
         assert!(seen.iter().any(|(method, header)| {
             method == "tools/list" && header.as_deref() == Some("2025-06-18")
         }));
+    }
+
+    #[tokio::test]
+    async fn streamable_http_uses_discovered_protocol_version_without_initialize() {
+        let seen_headers = Arc::new(StdMutex::new(Vec::<(String, Option<String>)>::new()));
+        let handler_headers = Arc::clone(&seen_headers);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let app = Router::new().route(
+                "/mcp",
+                post(move |headers: HeaderMap, Json(payload): Json<Value>| {
+                    let handler_headers = Arc::clone(&handler_headers);
+                    async move { discovered_protocol_http_mcp(headers, payload, handler_headers) }
+                })
+                .get(http_sse),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        let mut cfg = McpJsonConfig::default();
+        cfg.servers.insert(
+            "http_server".to_string(),
+            McpServerConfig::streamable_http(format!("http://{addr}/mcp"), None),
+        );
+        write_mcp_json_config_atomic(&path, &cfg).await.unwrap();
+        let manager = McpConnectionManager::new(path, dir.path().to_path_buf(), None);
+
+        manager.refresh_all().await.unwrap();
+
+        let snapshot = manager.snapshot().await;
+        assert_eq!(
+            snapshot.servers["http_server"].status,
+            McpServerStatus::Ready
+        );
+        let seen = seen_headers.lock().unwrap();
+        assert!(seen.iter().any(|(method, header)| {
+            method == "server/discover" && header.as_deref() == Some("2026-07-28")
+        }));
+        assert!(seen.iter().any(|(method, header)| {
+            method == "tools/list" && header.as_deref() == Some("2026-07-28")
+        }));
+        assert!(!seen.iter().any(|(method, _)| method == "initialize"));
     }
 
     #[tokio::test]
@@ -2900,7 +2922,7 @@ mod tests {
 
         assert_eq!(server.status, McpServerStatus::Failed);
         let error = server.last_error.as_deref().unwrap_or_default();
-        assert!(error.contains("MCP server requires OAuth or interactive elicitation"));
+        assert!(error.contains("acn mcp login http_server"));
         assert!(error.contains("Bearer resource_metadata"));
         assert!(!error.contains("secret"));
         assert_eq!(
@@ -2967,7 +2989,7 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(err.contains("MCP server requires OAuth or interactive elicitation"));
+        assert!(err.contains("acn mcp login http_server"));
         assert!(err.contains("Bearer resource_metadata"));
         assert!(!err.contains("secret"));
         assert_eq!(
@@ -4936,6 +4958,7 @@ mod tests {
             "stdio_server".to_string(),
             server,
             generation,
+            manager.config_path.clone(),
             dir.path().to_path_buf(),
             None,
             Arc::clone(&attempt),
@@ -5016,34 +5039,39 @@ mod tests {
     }
 
     fn tool(name: &'static str) -> Tool {
-        Tool {
-            name: Cow::Borrowed(name),
-            title: None,
-            description: Some(Cow::Borrowed("test tool")),
-            input_schema: Arc::new(JsonObject::from_iter([(
+        Tool::new(
+            name,
+            "test tool",
+            Arc::new(JsonObject::from_iter([(
                 "type".to_string(),
                 Value::String("object".to_string()),
             )])),
-            output_schema: None,
-            annotations: None,
-            execution: None,
-            icons: None,
-            meta: None,
-        }
+        )
     }
 
     fn stdio_mock_script() -> &'static str {
-        r#"while IFS= read -r line; do
+        r#"response_id() {
+  printf '%s' "$1" | sed -n 's/.*"id":[[:space:]]*\([0-9][0-9]*\).*/\1/p'
+}
+progress_token() {
+  printf '%s' "$1" | sed -n 's/.*"progressToken":[[:space:]]*"\{0,1\}\([^",}]*\).*/\1/p'
+}
+while IFS= read -r line; do
+id=$(response_id "$line")
 case "$line" in
+  *'"method":"server/discover"'*)
+    printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id"
+    ;;
   *'"method":"initialize"'*)
-    printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"stdio-mock","version":"1.0.0"}}}'
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"stdio-mock","version":"1.0.0"}}}\n' "$id"
     ;;
   *'"method":"tools/list"'*)
-    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"ping","description":"Ping tool","inputSchema":{"type":"object","properties":{"text":{"type":"string","description":"Input text"}}}}]}}'
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"ping","description":"Ping tool","inputSchema":{"type":"object","properties":{"text":{"type":"string","description":"Input text"}}}}]}}\n' "$id"
     ;;
   *'"method":"tools/call"'*)
-    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"acn-mcp-1","progress":1,"total":2,"message":"half"}}'
-    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}'
+    token=$(progress_token "$line")
+    printf '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"%s","progress":1,"total":2,"message":"half"}}\n' "$token"
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}\n' "$id"
     ;;
 esac
 done
@@ -5064,6 +5092,9 @@ while IFS= read -r line; do
   esac
   id=$(response_id "$line")
   case "$line" in
+    *'"method":"server/discover"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id"
+      ;;
     *'"method":"initialize"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"strict-stdio-mock","version":"1.0.0"}}}\n' "$id"
       ;;
@@ -5085,6 +5116,9 @@ done
 while IFS= read -r line; do
   id=$(response_id "$line")
   case "$line" in
+    *'"method":"server/discover"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id"
+      ;;
     *'"method":"initialize"'*)
       printf 'initialize %s\n' "$$" >> "$MCP_FIXTURE_LOG"
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"counting-stdio-mock","version":"1.0.0"}}}\n' "$id"
@@ -5118,6 +5152,9 @@ response_id() {
 while IFS= read -r line; do
   id=$(response_id "$line")
   case "$line" in
+    *'"method":"server/discover"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id"
+      ;;
     *'"method":"initialize"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"retry-stdio-mock","version":"1.0.0"}}}\n' "$id"
       ;;
@@ -5136,6 +5173,9 @@ done
 while IFS= read -r line; do
   id=$(response_id "$line")
   case "$line" in
+    *'"method":"server/discover"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id"
+      ;;
     *'"method":"initialize"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"reconnect-in-flight-stdio-mock","version":"1.0.0"}}}\n' "$id"
       ;;
@@ -5155,14 +5195,21 @@ done
     }
 
     fn slow_stdio_mock_script() -> &'static str {
-        r#"while IFS= read -r line; do
+        r#"response_id() {
+  printf '%s' "$1" | sed -n 's/.*"id":[[:space:]]*\([0-9][0-9]*\).*/\1/p'
+}
+while IFS= read -r line; do
+id=$(response_id "$line")
 case "$line" in
+  *'"method":"server/discover"'*)
+    printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id"
+    ;;
   *'"method":"initialize"'*)
     sleep 1
-    printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"slow-stdio-mock","version":"1.0.0"}}}'
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"slow-stdio-mock","version":"1.0.0"}}}\n' "$id"
     ;;
   *'"method":"tools/list"'*)
-    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"ping","description":"Ping tool","inputSchema":{"type":"object"}}]}}'
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"ping","description":"Ping tool","inputSchema":{"type":"object"}}]}}\n' "$id"
     ;;
 esac
 done
@@ -5170,12 +5217,19 @@ done
     }
 
     fn slow_initialize_stdio_mock_script() -> &'static str {
-        r#"while IFS= read -r line; do
+        r#"response_id() {
+  printf '%s' "$1" | sed -n 's/.*"id":[[:space:]]*\([0-9][0-9]*\).*/\1/p'
+}
+while IFS= read -r line; do
+id=$(response_id "$line")
 case "$line" in
+  *'"method":"server/discover"'*)
+    printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id"
+    ;;
   *'"method":"initialize"'*)
     printf '%s\n' "$$" > "$MCP_SLOW_INITIALIZE_PID_FILE"
     sleep 30
-    printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"slow-initialize-mock","version":"1.0.0"}}}'
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"slow-initialize-mock","version":"1.0.0"}}}\n' "$id"
     ;;
 esac
 done
@@ -5195,6 +5249,9 @@ response_id() {
 while IFS= read -r line; do
   id=$(response_id "$line")
   case "$line" in
+    *'"method":"server/discover"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id"
+      ;;
     *'"method":"initialize"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"descendant-stdio-mock","version":"1.0.0"}}}\n' "$id"
       ;;
@@ -5216,6 +5273,9 @@ response_id() {
 while IFS= read -r line; do
   id="$(response_id "$line")"
   case "$line" in
+    *'"method":"server/discover"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id"
+      ;;
     *'"method":"initialize"'*)
       printf 'initialize %s\n' "$$" >> "$MCP_REPLACEMENT_EVENTS_FILE"
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"replacement-stdio-mock","version":"1.0.0"}}}\n' "$id"
@@ -5229,13 +5289,20 @@ done
     }
 
     fn crashing_stdio_mock_script() -> &'static str {
-        r#"while IFS= read -r line; do
+        r#"response_id() {
+  printf '%s' "$1" | sed -n 's/.*"id":[[:space:]]*\([0-9][0-9]*\).*/\1/p'
+}
+while IFS= read -r line; do
+id=$(response_id "$line")
 case "$line" in
+  *'"method":"server/discover"'*)
+    printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id"
+    ;;
   *'"method":"initialize"'*)
-    printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"crashing-stdio-mock","version":"1.0.0"}}}'
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"crashing-stdio-mock","version":"1.0.0"}}}\n' "$id"
     ;;
   *'"method":"tools/list"'*)
-    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"ping","description":"Ping tool","inputSchema":{"type":"object"}}]}}'
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"ping","description":"Ping tool","inputSchema":{"type":"object"}}]}}\n' "$id"
     ;;
   *'"method":"tools/call"'*)
     exit 1
@@ -5316,6 +5383,14 @@ done
     async fn http_mcp(Json(payload): Json<Value>) -> impl IntoResponse {
         let id = payload.get("id").cloned().unwrap_or(Value::Null);
         let method = payload.get("method").and_then(Value::as_str).unwrap_or("");
+        if method == "server/discover" {
+            return Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32601, "message": "Method not found"}
+            }))
+            .into_response();
+        }
         if method == "notifications/initialized" {
             return StatusCode::ACCEPTED.into_response();
         }
@@ -5615,6 +5690,14 @@ done
             .lock()
             .unwrap()
             .push((method.clone(), protocol_header.clone()));
+        if method == "server/discover" {
+            return Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32601, "message": "Method not found"}
+            }))
+            .into_response();
+        }
         if method == "initialize" {
             let mut headers = HeaderMap::new();
             headers.insert("Mcp-Session-Id", HeaderValue::from_static("test-session"));
@@ -5647,6 +5730,69 @@ done
                 "jsonrpc": "2.0",
                 "id": id,
                 "result": {
+                    "tools": [{
+                        "name": "ping",
+                        "description": "Ping tool",
+                        "inputSchema": {"type": "object"}
+                    }]
+                }
+            }))
+            .into_response();
+        }
+        Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {}
+        }))
+        .into_response()
+    }
+
+    fn discovered_protocol_http_mcp(
+        headers: HeaderMap,
+        payload: Value,
+        seen_headers: SeenProtocolHeaders,
+    ) -> axum::response::Response {
+        let id = payload.get("id").cloned().unwrap_or(Value::Null);
+        let method = payload
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let protocol_header = headers
+            .get("mcp-protocol-version")
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        seen_headers
+            .lock()
+            .unwrap()
+            .push((method.clone(), protocol_header.clone()));
+        if protocol_header.as_deref() != Some("2026-07-28") {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "wrong protocol header"})),
+            )
+                .into_response();
+        }
+        if method == "server/discover" {
+            return Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "resultType": "complete",
+                    "supportedVersions": ["2026-07-28"],
+                    "capabilities": {"tools": {}},
+                    "ttlMs": 0,
+                    "cacheScope": "private"
+                }
+            }))
+            .into_response();
+        }
+        if method == "tools/list" {
+            return Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "resultType": "complete",
                     "tools": [{
                         "name": "ping",
                         "description": "Ping tool",

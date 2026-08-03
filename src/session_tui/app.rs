@@ -2380,6 +2380,12 @@ mod tests {
                     post(|Json(payload): Json<Value>| async move {
                         let id = payload.get("id").cloned().unwrap_or(Value::Null);
                         match payload.get("method").and_then(Value::as_str) {
+                            Some("server/discover") => Json(json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {"code": -32601, "message": "Method not found"}
+                            }))
+                            .into_response(),
                             Some("notifications/initialized") => {
                                 StatusCode::ACCEPTED.into_response()
                             }

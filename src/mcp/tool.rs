@@ -256,7 +256,6 @@ fn redact_value_strings(value: &mut Value) {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
     use std::sync::Arc;
 
     use rmcp::model::{Tool, ToolAnnotations};
@@ -436,14 +435,9 @@ mod tests {
 
     #[test]
     fn mcp_tool_result_is_bounded() {
-        let result = CallToolResult {
-            content: vec![rmcp::model::Content::text(
-                "x".repeat(MAX_MCP_TOOL_RESULT_JSON_CHARS + 100),
-            )],
-            structured_content: None,
-            is_error: Some(false),
-            meta: None,
-        };
+        let result = CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+            "x".repeat(MAX_MCP_TOOL_RESULT_JSON_CHARS + 100),
+        )]);
 
         let value = mcp_tool_result_to_value(&result);
         let raw = serde_json::to_string(&value).unwrap();
@@ -454,16 +448,12 @@ mod tests {
 
     #[test]
     fn mcp_error_tool_result_is_redacted_before_model_visibility() {
-        let result = CallToolResult {
-            content: vec![rmcp::model::Content::text(
-                "Authorization: Bearer secret-token url=https://user:pass@example.test/mcp?token=abc",
-            )],
-            structured_content: Some(json!({
-                "OPENAI_API_KEY=secret-token": "OPENAI_API_KEY=secret-token"
-            })),
-            is_error: Some(true),
-            meta: None,
-        };
+        let mut result = CallToolResult::error(vec![rmcp::model::ContentBlock::text(
+            "Authorization: Bearer secret-token url=https://user:pass@example.test/mcp?token=abc",
+        )]);
+        result.structured_content = Some(json!({
+            "OPENAI_API_KEY=secret-token": "OPENAI_API_KEY=secret-token"
+        }));
 
         let value = mcp_tool_result_to_value(&result);
         let raw = serde_json::to_string(&value).unwrap();
@@ -505,17 +495,11 @@ mod tests {
             title: None,
             description: Some("Test tool".to_string()),
             exposure,
-            raw_tool: Tool {
-                name: Cow::Borrowed(name),
-                title: None,
-                description: Some(Cow::Borrowed("Test tool")),
-                input_schema: Arc::new(schema.as_object().cloned().unwrap_or_default()),
-                output_schema: None,
-                annotations: None,
-                execution: None,
-                icons: None,
-                meta: None,
-            },
+            raw_tool: Tool::new(
+                name,
+                "Test tool",
+                Arc::new(schema.as_object().cloned().unwrap_or_default()),
+            ),
         }
     }
 
