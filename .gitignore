@@ -7,5 +7,5 @@
 .vscode
 CLAUDE.local.md
 
-config.toml
+/config.toml
 export_env.sh
