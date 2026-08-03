@@ -127,7 +127,7 @@ pub fn build_agent_cli_session_engine_with_mcp(
         session_search_summarizer,
         SessionSearchConfig::from(&cfg.agent.tool),
     ));
-    let attachment_limits = AttachmentLimits::from(&cfg.agent.attachment);
+    let attachment_limits = AttachmentLimits::from_configs(&cfg.agent.attachment, &cfg.agent.tool);
     let mut base_tool_registry = ToolRegistry::new(&cfg.agent.tool)?
         .with_process_id_attempts(cfg.agent.session.id_mint_max_attempts())
         .with_process_owner_agent_id(context.agent_id.clone())

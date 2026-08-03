@@ -179,7 +179,7 @@ Unix 文件名可包含 `ESC`、Tab、CR 等 C0/C1 控制字符。补全不能�
 | --- | --- | --- |
 | 图片 | `png`、`jpg`、`jpeg`、`gif`、`webp` | `Image { media_type, data }` 多模态块。 |
 | PDF | `pdf` | `Document { media_type: application/pdf, data, filename }` 多模态块。 |
-| 文本 | 其他全部路径 | 一段文本块：`Attached file: <文件名>`、绝对 `Path` 和完整 UTF-8 正文。 |
+| 文本 | 其他全部路径 | 不超过字符上限时为 `Attached file: <文件名>`、绝对 `Path` 和完整 UTF-8 正文；超过上限时只提供路径、实际字符数和 `file_read` 指引。 |
 
 图片不只信任扩展名：必须能识别为 PNG/JPEG/GIF/WebP 并成功解码。最长边超过 2048 像素时，按 2048、1536、1024、768、512 的阶梯等比缩小并重新编码，直到满足大小上限；JPEG 保留 JPEG，其他重编码为 PNG。PDF 必须具有 `%PDF-` 文件头。文本必须是有效 UTF-8。
 
@@ -204,6 +204,8 @@ max_files_per_turn = 5
 - `clipboard_image_enabled = false` 只禁用 `Ctrl+V` 图片入口。
 
 图片 resize/downsample 的最大边长和媒体上下文预算都是内部实现约束，不提供 TOML 配置项；用户可配置的附件参数仅为上述四项。
+
+文本附件还复用 `[agent.tool].file_read_max_chars` 作为单个文件的 Unicode 字符上限，默认 `100000`。多个文本文件分别判断，不设置单轮合计字符预算。正文不超过上限时完整内联，并可形成等价的完整读取许可；超过上限时不截断、不注入预览，只向模型提供路径、实际字符数和 `file_read` 提示，同时在 TUI 显示非致命 warning，不发放读取许可。文本仍同时受 5 MiB 文件大小限制；该字符上限不适用于 PDF、磁盘图片或剪贴板图片。
 
 `memories/MEMORY.md` 和 `memories/USER.md`（先按词法消解 `.` / `..` 后判断）是受保护路径。它们必须通过 memory 工具访问，`@路径`、附件公共读取层和 `file_read` 都拒绝读取。
 
@@ -309,6 +311,8 @@ QueuedInput
 
 这是用户主动提供的上下文，不生成伪造的工具调用历史。
 
+超出 `file_read_max_chars` 的文本附件仍占用一个附件数量名额，但 user content 中只有有界路径说明。该降级不终止 turn；模型如需正文，必须按提示使用 `file_read` 分页读取。
+
 ### 5.3 会话 content block、provider 映射与 base64
 
 会话协议在既有 skill、工具调用和工具结果内容之外，显式区分 `Text`、
@@ -342,7 +346,7 @@ file id、清理远端文件及处理跨 provider 的生命周期差异。后续
 
 ### 5.4 失败与可恢复性
 
-发送前的错误不会吞掉用户输入。发送后文件可能被替换、删除或权限改变，因此 turn loop 再次读取时仍可能失败；这时 turn 按普通失败语义落入 journal，而不会写入不完整的 canonical transcript。
+发送前的错误不会吞掉用户输入。发送后文件可能被替换、删除或权限改变，因此 turn loop 再次读取时仍可能失败；这时 turn 按普通失败语义落入 journal，而不会写入不完整的 canonical transcript。文本正文只超过字符上限不是错误：turn 继续，并把路径降级说明作为 canonical user content；正文不会进入 provider 请求或 canonical transcript。
 
 目录内容只在提交时取一次快照；之后目录变化不会改写已提交 turn 的上下文。
 
@@ -491,12 +495,14 @@ block 外置为 session 内的不可变、内容寻址文件，并在原位置�
 - 文本/PDF/图片的 `@路径` 解析、大小/数量限制、相对 workspace、目录上下文排序，以及最多扫描 1001 项、最多输出 1000 项的截断；
 - 文件和剪贴板图片合并计数，删除 `[Image #N]` 即撤销附件；
 - 图片实际 media type 与 PDF `%PDF-` 文件头校验；文本文件的 UTF-8 校验，以及 `file_read` 读取文本时既有行号、分页和 keyword window 语义；
+- 文本文件在 `<`、`=`、`>` `file_read_max_chars` 时分别完整内联、完整内联和路径降级；多个文本文件分别计限，超限 warning 不终止 turn，也不形成读取许可；
+- PDF、磁盘图片和剪贴板图片不应用文本字符上限，继续只受既有大小、数量、格式和图片规格化约束；
 - `file_read` 读取图片/PDF 时保留短工具结果，并在内部 meta user message 中追加正确的媒体 block；
 - Anthropic image/document 与 OpenAI Chat image/file 的 JSON 映射正确；不支持媒体的 model/provider 错误可透传或包装为明确错误；
 
 #### 持久化与恢复
 
-- 文本附件完整进入 canonical message，但用户显示不含 `Attached file:` 正文；
+- 限额内文本附件完整进入 canonical message，但用户显示不含 `Attached file:` 正文；超字符上限的文本只保存路径降级说明，不保存正文；
 - 目录上下文进入模型输入，但用户显示不含 `[Referenced directory: ...]` 内容；
 - 目录上下文作为展开后的 `user_text` 同时写入 `UserInputAccepted` 与 canonical message；
 - `canonical_user_message` 新事件只含 hash，序列化结果不含附件正文；

@@ -141,6 +141,53 @@ impl LlmDelegationExecutor {
 
 #[async_trait]
 impl DelegationExecutor for LlmDelegationExecutor {
+    async fn begin_task(
+        &self,
+        context: &DelegationExecutionContext,
+    ) -> Result<(), DelegationExecutionError> {
+        let tools = self.tool_registry_template.clone().for_delegation(None);
+        tools
+            .begin_file_read_state_checkpoint(
+                &context.metadata.parent_session_id,
+                context.metadata.id.as_str(),
+            )
+            .await
+            .map_err(DelegationExecutionError::new)
+    }
+
+    async fn finish_task(
+        &self,
+        context: &DelegationExecutionContext,
+        committed: bool,
+    ) -> Result<(), DelegationExecutionError> {
+        let tools = self.tool_registry_template.clone().for_delegation(None);
+        let result = if committed {
+            tools
+                .commit_file_read_state_checkpoint(
+                    &context.metadata.parent_session_id,
+                    context.metadata.id.as_str(),
+                )
+                .await
+        } else {
+            tools
+                .rollback_file_read_state_checkpoint(
+                    &context.metadata.parent_session_id,
+                    context.metadata.id.as_str(),
+                )
+                .await
+        };
+        if let Err(error) = result {
+            tools
+                .clear_delegation_file_read_state(
+                    &context.metadata.parent_session_id,
+                    context.metadata.id.as_str(),
+                )
+                .await;
+            return Err(DelegationExecutionError::new(error));
+        }
+        Ok(())
+    }
+
     async fn execute(
         &self,
         context: DelegationExecutionContext,
@@ -315,27 +362,31 @@ impl DelegationExecutor for LlmDelegationExecutor {
             .cleanup_processes_for_owner(&metadata.parent_session_id, Some(metadata.id.as_str()))
             .await;
         process_cleanup_guard.disarm();
-        let turn = turn_result.map_err(|err| DelegationExecutionError::new(err.to_string()))?;
-        append_completed_turn_messages(&progress, &turn)
-            .await
-            .map_err(|err| DelegationExecutionError::new(err.to_string()))?;
-        let summary = assistant_text_from_turn(&turn);
-        let summary = if summary.trim().is_empty() {
-            "subagent completed without textual result".to_string()
-        } else {
-            summary
-        };
-        let (reported_changed_files, artifacts) = extract_result_references(&summary);
-        let changed_files = merge_changed_files(&turn, reported_changed_files);
-        progress
-            .update(Some("completed".into()), summary.clone(), artifacts.clone())
-            .await
-            .map_err(|err| DelegationExecutionError::new(err.to_string()))?;
-        Ok(DelegationExecutionOutcome {
-            summary,
-            changed_files,
-            artifacts,
-        })
+        let outcome = async {
+            let turn = turn_result.map_err(|err| DelegationExecutionError::new(err.to_string()))?;
+            append_completed_turn_messages(&progress, &turn)
+                .await
+                .map_err(|err| DelegationExecutionError::new(err.to_string()))?;
+            let summary = assistant_text_from_turn(&turn);
+            let summary = if summary.trim().is_empty() {
+                "subagent completed without textual result".to_string()
+            } else {
+                summary
+            };
+            let (reported_changed_files, artifacts) = extract_result_references(&summary);
+            let changed_files = merge_changed_files(&turn, reported_changed_files);
+            progress
+                .update(Some("completed".into()), summary.clone(), artifacts.clone())
+                .await
+                .map_err(|err| DelegationExecutionError::new(err.to_string()))?;
+            Ok(DelegationExecutionOutcome {
+                summary,
+                changed_files,
+                artifacts,
+            })
+        }
+        .await;
+        outcome
     }
 }
 

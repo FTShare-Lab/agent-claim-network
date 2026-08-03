@@ -110,12 +110,15 @@ pub use chat_completions::{
     ChatImageUrl, ChatMessage, ChatMessageContent, ChatStreamEvent, ChatStreamOptions, ChatTool,
     ChatToolCall, ChatToolCallFunction,
 };
-pub(crate) use compaction_projection::FILE_EDIT_AUTHORITY_COMPACTION_NOTICE;
 pub use compaction_projection::{
     active_segment_has_large_tool_result, active_segment_messages, active_segments_hash,
     estimated_projected_segment_tokens, large_tool_result_omission_text,
     project_turn_message_tool_results, project_turn_messages_tool_results, provider_safe_segments,
     MessageRange, ProviderProjectionBudget,
+};
+pub(crate) use compaction_projection::{
+    ensure_compaction_request_within_context_window, omit_turn_messages_tool_results,
+    project_compaction_input_tool_results, FILE_EDIT_AUTHORITY_COMPACTION_NOTICE,
 };
 pub use embedding::{
     build_embedding_client, ArkMultimodalEmbeddingClient, EmbeddingCacheFingerprint,
@@ -130,6 +133,7 @@ pub use provider::{
     ContextUsageSnapshot, ContextUsageSource, ProviderAdapter, ProviderEvent, ProviderRequest,
     ProviderResponse, ProviderStop, ToolSpec,
 };
+pub(crate) use structured_json::StructuredJsonAttemptRequest;
 pub use structured_json::{StructuredJsonAttemptReport, StructuredJsonCaller};
 pub use token_estimate::{
     estimate_json_tokens, estimate_provider_request_context_tokens,

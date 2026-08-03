@@ -245,7 +245,28 @@ Summary 生成必须套现有 LLM retry 逻辑，受 `[agent.llm].retry_count` �
 - 总尝试次数为 `1 + retry_count`。
 - provider/transport 失败按现有 LLM retry 策略重试。
 - structured JSON 解析失败或 shape error 也按同一个 retry budget 重试。
+- compaction request 禁用 provider adapter 的内层 retry，由上述单一控制器统一计数，避免两层重试相乘。
 - retry 耗尽后，本次 compact 失败，不移动任何 compaction / recap 指针。
+
+主会话和 delegation 生成 summary 时优先使用完整 transcript。只有完整 summary 请求
+超出 context window，才把超过 `tool_result_raw_max_chars` 的单个 tool result 替换为有界
+省略说明；该版本仍然超限时再省略本次输入中的全部 tool result。canonical
+`messages.jsonl`、turn journal 和 delegation transcript 始终保留原文。
+
+发起 summary provider 请求前还要计算 system prompt、summary payload 和最大输出预留：
+
+1. 完整 transcript 超限时，先按 `tool_result_raw_max_chars` 省略大型 tool result，再重新估算。
+2. 大型结果省略版仍超限时，把本次 summary 输入中的所有 tool result 都替换为固定长度说明，再重新估算。
+3. 全部结果省略版仍超限时在本地失败，不调用 provider，不写 `started` audit，也不推进 committed / active frontier。
+4. 输入预算复用 statusline 和 soft planner 的 provider-neutral 本地粗估：system
+   prompt 和 messages 按 Unicode 字符数约 `4 chars/token` 计算，并另行预留本次调用的
+   最大输出 token。
+5. structured JSON parse / shape retry 会追加纠错消息，因此每一次真实 provider
+   attempt 前都必须对当次最终 messages 重新检查；重试请求超限时在本地结束，不能把
+   超限的第二次请求发给 provider。
+
+该保护只约束 compaction summary 请求，不新增单轮 `file_read` 总预算，也不改变正常
+provider raw tail 的选择规则。
 
 指针推进必须保持 compact 与 recap 侧原子成功：
 
@@ -302,7 +323,7 @@ Compact 进行中时，TUI 只用 live box 顶部状态表达进度：
 - `tail_hard_ctx_ratio`：hard limit，compact 后 `raw + runtime-only projection` 的最大比例。
   用户原始文本不截断；Skill/附件只在完整候选超限后改成 session 资产引用。默认 `0.30`。
 - `tail_previous_real_user_turns`：希望保留的最近 previous real user turn 数量。实现应优先保留这些 turn的用户需求和 assistant 语义，必要时压缩其中的大型 tool_result。默认 `4`，建议允许的最大值为 `5`。
-- `tool_result_raw_max_chars`：单个 tool_result 允许进入 raw tail 的最大字符数。超过后默认进入 summary，raw tail 不保留大段 preview。默认 `4096`。
+- `tool_result_raw_max_chars`：单个 tool_result 允许进入 raw tail 的最大字符数；也作为完整 summary 请求超限后的第一档降级阈值。summary 输入能容纳完整 transcript 时不使用该阈值；完整请求超限后先省略大型结果，仍超限再省略全部结果。默认 `4096`。
 
 `tail_target_ctx_ratio` 与 `tail_hard_ctx_ratio` 只描述 compact 之后的 provider projection 形状，不能在自动 compact 触发判断之前直接拒绝尚未压缩的 active turn。每次 request 的 runtime-only projection（例如后台进程状态）参与自动 compact 的总 context 估算；一旦执行 compact，planner 从 target/hard budget 中预留这部分动态上下文，最后校验合并后的投影。
 
@@ -338,6 +359,8 @@ Compact 进行中时，TUI 只用 live box 顶部状态表达进度：
 - compact 进行中 TUI live box 标题显示 `Compacting · Session history`，内容不显示`thinking...`、`compacting session...`、`compaction started` 或 `compaction completed`。
 - compact 失败时 TUI 显示 `Compaction failed: ...`，`Compaction` 首字母大写。
 - compaction summary 使用结构化 JSON 输出，shape error 按 `[agent.llm].retry_count` 限制重试。
+- 主会话和 delegation 的 compaction summary 请求优先携带完整工具结果；完整请求超限后依次降级为“大型结果省略”和“全部结果省略”，canonical transcript 始终保留原文。
+- 全部 tool result 省略后仍超限则不调用 provider，也不推进 compaction frontier。每次 JSON retry 同样按最终请求重新执行保守预算检查。
 - 推进 committed compact frontier / `recapped_until` 时，summary 与 recap/finalize 侧必须同时成功；手动 `/compact` 与自动 preflight compact 遵循同一原子提交语义。
 - 自动 compact 只在 provider request preflight 触发，不再依赖 turn commit 后的单独检查。
 - 旧 `session.yaml.compaction` 可迁移；旧 `compaction_checkpoint.yaml` 不兼容、不恢复。

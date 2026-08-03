@@ -599,6 +599,7 @@ mod tests {
             enabled: true,
             max_file_bytes: 1024,
             max_files_per_turn: 2,
+            ..AttachmentLimits::default()
         };
         assert!(matches!(
             resolve_at_paths(&text, Path::new("."), &tight, 0),
@@ -643,6 +644,7 @@ mod tests {
             enabled: true,
             max_file_bytes: 16,
             max_files_per_turn: 5,
+            ..AttachmentLimits::default()
         };
         let text = format!("@{}", path.display());
         assert!(matches!(

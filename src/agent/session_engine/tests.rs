@@ -5,12 +5,13 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 
 use super::super::fs::{
     LocalFsClaimStore, LocalFsInboxReader, LocalFsMemoryStore, LocalFsReportedDisputeClaimSetStore,
@@ -22,17 +23,19 @@ use super::{
     active_provider_safe_segments, active_segments_hash, append_acn_md,
     auto_compact_should_trigger, auto_compact_trigger_threshold_tokens,
     auto_compact_trigger_tokens, compacted_committed_summary_message, compacted_context_for_turn,
-    compaction_tail_token_limit, delegation_summary_projection,
+    compaction_tail_token_limit, compaction_transcript_projection, delegation_summary_projection,
     estimate_compacted_committed_summary_message_tokens, finish_cancelled_turn_journal,
-    hash_session_segment, parse_compaction_summary_outcome, project_provider_context,
-    select_compaction_summary_end_index, session_messages_to_turn_messages,
+    hash_session_segment, is_canonical_messages_committed_error, parse_compaction_summary_outcome,
+    project_provider_context, select_compaction_summary_end_index,
+    session_compaction_transcript_projection, session_messages_to_turn_messages,
     session_messages_to_turn_transcript, spawn_turn_control_journal_forwarder,
     ActiveProjectionContext, CompactionAuditScope, CompactionAuditSummaryContext,
     CompactionAuditTrigger, CompactionRanges, CompactionSummaryInputs, ManualCompactionOutcome,
     PreflightCompactionRequest, PreflightCompactor, ProviderContextUsageAnchor,
     ProviderProjectionBudget, SessionCompactionNoopReason, SessionCompactionResult, SessionEngine,
-    SessionEvent, TurnJournalEmitter, TurnJournalSink, COMPACTION_CHECKPOINT_SCHEMA_VERSION,
-    DELEGATION_PROJECTION_MAX_CHARS, DELEGATION_PROJECTION_MAX_ITEMS, MEDIA_BLOCK_ESTIMATED_TOKENS,
+    SessionEvent, SessionTurnCommittedPostCommitError, TurnJournalEmitter, TurnJournalSink,
+    COMPACTION_CHECKPOINT_SCHEMA_VERSION, DELEGATION_PROJECTION_MAX_CHARS,
+    DELEGATION_PROJECTION_MAX_ITEMS, MEDIA_BLOCK_ESTIMATED_TOKENS,
 };
 use crate::agent::{
     InboxReader, LocalClaimStore, MemoryStore, ReportedDisputeClaimSetStore, SessionRuntimeStatus,
@@ -203,6 +206,52 @@ impl ProviderAdapter for RecordingProvider {
     }
 }
 
+struct BlockingAfterFileReadProvider {
+    calls: AtomicUsize,
+    second_call_started: Notify,
+}
+
+impl BlockingAfterFileReadProvider {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            second_call_started: Notify::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl ProviderAdapter for BlockingAfterFileReadProvider {
+    fn emit_preflight_context_estimate(&self) -> bool {
+        false
+    }
+
+    async fn send(
+        &self,
+        _request: ProviderRequest,
+        _emit: &mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> anyhow::Result<ProviderResponse> {
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => Ok(ProviderResponse {
+                assistant_message: SessionTurnMessage {
+                    role: "assistant".into(),
+                    content: vec![SessionTurnContentBlock::ToolUse {
+                        id: "toolu_read".into(),
+                        name: "file_read".into(),
+                        input: json!({"path": "note.txt", "show_linenos": false}),
+                    }],
+                },
+                stop: ProviderStop::ToolUse,
+            }),
+            1 => {
+                self.second_call_started.notify_one();
+                std::future::pending().await
+            }
+            call => anyhow::bail!("unexpected provider call {call}"),
+        }
+    }
+}
+
 struct FinalizingStateCheckingProvider {
     session_yaml: PathBuf,
 }
@@ -305,6 +354,23 @@ fn response_step(text: &str, events: Vec<ProviderEvent>) -> ProviderStep {
     ProviderStep::Response {
         response: provider_response(text),
         events,
+    }
+}
+
+fn tool_use_step(id: &str, name: &str, input: serde_json::Value) -> ProviderStep {
+    ProviderStep::Response {
+        response: ProviderResponse {
+            assistant_message: SessionTurnMessage {
+                role: "assistant".into(),
+                content: vec![SessionTurnContentBlock::ToolUse {
+                    id: id.into(),
+                    name: name.into(),
+                    input,
+                }],
+            },
+            stop: ProviderStop::ToolUse,
+        },
+        events: Vec::new(),
     }
 }
 
@@ -1498,9 +1564,9 @@ async fn preflight_compaction_summarizes_oversized_previous_turn_instead_of_fail
         r#"{"new_claims": [], "used_claim_ids": [], "new_disputes": []}"#,
     )]));
     let (mut engine, store) = build_test_engine(&dir, provider);
-    engine.context_window = 1_000;
-    engine.compaction.tail_target_ctx_ratio = 0.01;
-    engine.compaction.tail_hard_ctx_ratio = 0.30;
+    engine.context_window = 10_000;
+    engine.compaction.tail_target_ctx_ratio = 0.001;
+    engine.compaction.tail_hard_ctx_ratio = 0.03;
     let mut session = create_test_session(&store, "session_c0ffee06").await;
     session
         .append_messages(&[
@@ -1598,9 +1664,9 @@ async fn preflight_externalizes_skill_and_attachment_only_after_full_projection_
     )]));
     let (mut engine, store) = build_test_engine(&dir, provider);
     // 给 compact wrapper 留出扩展空间，同时仍保证大 Skill/附件正文必须外置。
-    engine.context_window = 3_000;
-    engine.compaction.tail_target_ctx_ratio = 0.10;
-    engine.compaction.tail_hard_ctx_ratio = 0.25;
+    engine.context_window = 40_000;
+    engine.compaction.tail_target_ctx_ratio = 0.0075;
+    engine.compaction.tail_hard_ctx_ratio = 0.01875;
     let mut session = create_test_session(&store, "session_c0ffee11").await;
     let active_suffix = oversized_active_suffix(
         "keep this original request".into(),
@@ -1705,11 +1771,12 @@ async fn provider_only_externalization_does_not_change_committed_transcript_or_v
             spec_path,
         }],
     );
-    // 给 compact wrapper 留出扩展空间，同时仍保证大 Skill/附件正文必须外置。
-    engine.context_window = 3_000;
+    // Summary 请求允许使用完整 context window；最终 raw tail 只允许占其中 10%。
+    // 因此 summary 能安全容纳原始 anchor，而最终 provider projection 仍必须外置重型块。
+    engine.context_window = 50_000;
     engine.compaction.auto_compact_ctx_ratio = 0.00001;
     engine.compaction.tail_target_ctx_ratio = 0.10;
-    engine.compaction.tail_hard_ctx_ratio = 0.25;
+    engine.compaction.tail_hard_ctx_ratio = 0.10;
     let mut session = create_test_session(&store, "session_c0ffee14").await;
     let mut events = Vec::new();
 
@@ -1759,10 +1826,10 @@ async fn preflight_retries_once_with_half_summary_limit_after_reference_projecti
         ),
     ]));
     let (mut engine, store) = build_test_engine(&dir, provider.clone());
-    engine.context_window = 4_000;
-    engine.compaction.tail_target_ctx_ratio = 0.10;
+    engine.context_window = 40_000;
+    engine.compaction.tail_target_ctx_ratio = 0.01;
     // 首次 4000 字符摘要仍超限，重试后的 2000 字符摘要可连同 wrapper 放入预算。
-    engine.compaction.tail_hard_ctx_ratio = 0.275;
+    engine.compaction.tail_hard_ctx_ratio = 0.0275;
     engine.compaction.summary_max_chars = 4_000;
     let mut session = create_test_session(&store, "session_c0ffee12").await;
     let active_suffix = oversized_active_suffix(
@@ -1841,8 +1908,8 @@ async fn preflight_errors_after_single_retry_when_plain_user_text_remains_over_h
 
     assert!(error
         .to_string()
-        .contains("Split the current plain-text request or start a new session"));
-    assert_eq!(provider.requests().await.len(), 2);
+        .contains("remains over budget after omitting all tool results"));
+    assert!(provider.requests().await.is_empty());
     assert!(session.read_metadata().await.unwrap().compaction.is_none());
 }
 
@@ -1872,6 +1939,304 @@ async fn run_turn_failure_writes_failed_journal_without_canonical_messages() {
     assert_eq!(turn.assistant_text, "partial output");
     assert_eq!(turn.non_streaming_fallbacks.len(), 1);
     assert_eq!(turn.non_streaming_fallbacks[0].attempt, 5);
+}
+
+#[tokio::test]
+async fn committed_turn_keeps_file_read_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    tokio::fs::write(dir.path().join("note.txt"), "before\n")
+        .await
+        .unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        tool_use_step(
+            "toolu_read",
+            "file_read",
+            json!({"path": "note.txt", "show_linenos": false}),
+        ),
+        response_step("read complete", Vec::new()),
+    ]));
+    let tools = Arc::new(
+        ToolRegistry::new(&ToolConfig {
+            workspace_root: dir.path().to_path_buf(),
+            ..ToolConfig::default()
+        })
+        .unwrap(),
+    );
+    let (engine, store) = build_test_engine_with_tools(&dir, provider, Arc::clone(&tools));
+    let mut session = create_test_session(&store, "session_bbbbbbc1").await;
+
+    engine
+        .run_turn(&mut session, "read the file", |_| {})
+        .await
+        .unwrap();
+
+    let write = tools
+        .dispatch_with_context(
+            "file_write",
+            json!({"path": "note.txt", "content": "after\n"}),
+            ToolDispatchContext {
+                current_session_id: Some(session.metadata.id.clone()),
+                ..ToolDispatchContext::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(write.output["status"], "success");
+    assert_eq!(
+        tokio::fs::read_to_string(dir.path().join("note.txt"))
+            .await
+            .unwrap(),
+        "after\n"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_turn_rolls_back_new_file_read_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    tokio::fs::write(dir.path().join("note.txt"), "before\n")
+        .await
+        .unwrap();
+    let mut steps = vec![tool_use_step(
+        "toolu_read",
+        "file_read",
+        json!({"path": "note.txt", "show_linenos": false}),
+    )];
+    steps.extend(exhausted_stream_failure_steps(
+        "provider failed after read",
+        "partial after read",
+    ));
+    let provider = Arc::new(RecordingProvider::new(steps));
+    let tools = Arc::new(
+        ToolRegistry::new(&ToolConfig {
+            workspace_root: dir.path().to_path_buf(),
+            ..ToolConfig::default()
+        })
+        .unwrap(),
+    );
+    let (engine, store) = build_test_engine_with_tools(&dir, provider, Arc::clone(&tools));
+    let mut session = create_test_session(&store, "session_bbbbbbc2").await;
+
+    engine
+        .run_turn(&mut session, "read then continue", |_| {})
+        .await
+        .unwrap_err();
+
+    let write = tools
+        .dispatch_with_context(
+            "file_write",
+            json!({"path": "note.txt", "content": "after\n"}),
+            ToolDispatchContext {
+                current_session_id: Some(session.metadata.id.clone()),
+                ..ToolDispatchContext::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        write.outcome,
+        crate::api::ToolExecutionOutcome::BusinessFailure
+    );
+    assert_eq!(write.output["status"], "error");
+    assert_eq!(
+        tokio::fs::read_to_string(dir.path().join("note.txt"))
+            .await
+            .unwrap(),
+        "before\n"
+    );
+}
+
+#[tokio::test]
+async fn aborted_turn_rolls_back_new_file_read_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    tokio::fs::write(dir.path().join("note.txt"), "before\n")
+        .await
+        .unwrap();
+    let provider = Arc::new(BlockingAfterFileReadProvider::new());
+    let tools = Arc::new(
+        ToolRegistry::new(&ToolConfig {
+            workspace_root: dir.path().to_path_buf(),
+            ..ToolConfig::default()
+        })
+        .unwrap(),
+    );
+    let (engine, store) = build_test_engine_with_tools(&dir, provider.clone(), Arc::clone(&tools));
+    let session = create_test_session(&store, "session_bbbbbbc5").await;
+    let session_id = session.metadata.id.clone();
+
+    let turn = tokio::spawn(async move {
+        let mut session = session;
+        engine
+            .run_turn(&mut session, "read then wait", |_| {})
+            .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        provider.second_call_started.notified(),
+    )
+    .await
+    .expect("provider should block after file_read");
+    turn.abort();
+    assert!(turn.await.unwrap_err().is_cancelled());
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if tools
+                .begin_file_read_state_checkpoint(&session_id, "probe")
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("drop guard should release the aborted turn checkpoint");
+    tools
+        .rollback_file_read_state_checkpoint(&session_id, "probe")
+        .await
+        .unwrap();
+
+    let write = tools
+        .dispatch_with_context(
+            "file_write",
+            json!({"path": "note.txt", "content": "after\n"}),
+            ToolDispatchContext {
+                current_session_id: Some(session_id),
+                ..ToolDispatchContext::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        write.outcome,
+        crate::api::ToolExecutionOutcome::BusinessFailure
+    );
+    assert_eq!(write.output["status"], "error");
+    assert_eq!(
+        tokio::fs::read_to_string(dir.path().join("note.txt"))
+            .await
+            .unwrap(),
+        "before\n"
+    );
+}
+
+#[tokio::test]
+async fn late_steer_rolls_back_file_read_authority_before_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    tokio::fs::write(dir.path().join("note.txt"), "before\n")
+        .await
+        .unwrap();
+    let (control, control_rx) = SessionTurnControl::channel();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        tool_use_step(
+            "toolu_read",
+            "file_read",
+            json!({"path": "note.txt", "show_linenos": false}),
+        ),
+        ProviderStep::ResponseAndSteer {
+            response: provider_response("must not commit"),
+            events: Vec::new(),
+            control,
+        },
+    ]));
+    let tools = Arc::new(
+        ToolRegistry::new(&ToolConfig {
+            workspace_root: dir.path().to_path_buf(),
+            ..ToolConfig::default()
+        })
+        .unwrap(),
+    );
+    let (engine, store) = build_test_engine_with_tools(&dir, provider, Arc::clone(&tools));
+    let mut session = create_test_session(&store, "session_bbbbbbc3").await;
+
+    engine
+        .run_turn_with_attachments_controlled(
+            &mut session,
+            "read then finish",
+            Vec::new(),
+            Some(control_rx),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+    assert!(session.read_messages().await.unwrap().is_empty());
+    let write = tools
+        .dispatch_with_context(
+            "file_write",
+            json!({"path": "note.txt", "content": "after\n"}),
+            ToolDispatchContext {
+                current_session_id: Some(session.metadata.id.clone()),
+                ..ToolDispatchContext::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        write.outcome,
+        crate::api::ToolExecutionOutcome::BusinessFailure
+    );
+    assert_eq!(write.output["status"], "error");
+}
+
+#[tokio::test]
+async fn late_cancel_rolls_back_file_read_authority_before_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    tokio::fs::write(dir.path().join("note.txt"), "before\n")
+        .await
+        .unwrap();
+    let (control, control_rx) = SessionTurnControl::channel();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        tool_use_step(
+            "toolu_read",
+            "file_read",
+            json!({"path": "note.txt", "show_linenos": false}),
+        ),
+        ProviderStep::ResponseAndCancel {
+            response: provider_response("must not commit"),
+            events: Vec::new(),
+            control,
+        },
+    ]));
+    let tools = Arc::new(
+        ToolRegistry::new(&ToolConfig {
+            workspace_root: dir.path().to_path_buf(),
+            ..ToolConfig::default()
+        })
+        .unwrap(),
+    );
+    let (engine, store) = build_test_engine_with_tools(&dir, provider, Arc::clone(&tools));
+    let mut session = create_test_session(&store, "session_bbbbbbc4").await;
+
+    engine
+        .run_turn_with_attachments_controlled(
+            &mut session,
+            "read then finish",
+            Vec::new(),
+            Some(control_rx),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+    assert!(session.read_messages().await.unwrap().is_empty());
+    let write = tools
+        .dispatch_with_context(
+            "file_write",
+            json!({"path": "note.txt", "content": "after\n"}),
+            ToolDispatchContext {
+                current_session_id: Some(session.metadata.id.clone()),
+                ..ToolDispatchContext::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        write.outcome,
+        crate::api::ToolExecutionOutcome::BusinessFailure
+    );
+    assert_eq!(write.output["status"], "error");
 }
 
 #[tokio::test(start_paused = true)]
@@ -2575,9 +2940,9 @@ async fn manual_compact_post_summary_failure_writes_failed_audit() {
         response_step("not json", Vec::new()),
     ]));
     let (mut engine, store) = build_test_engine(&dir, provider.clone());
-    engine.context_window = 1_000;
-    engine.compaction.tail_target_ctx_ratio = 0.20;
-    engine.compaction.tail_hard_ctx_ratio = 0.30;
+    engine.context_window = 20_000;
+    engine.compaction.tail_target_ctx_ratio = 0.015;
+    engine.compaction.tail_hard_ctx_ratio = 0.0225;
     engine.compaction.tail_previous_real_user_turns = 1;
     let mut session = create_test_session(&store, "session_face0006").await;
     session
@@ -2604,6 +2969,44 @@ async fn manual_compact_post_summary_failure_writes_failed_audit() {
     assert!(audit_log.contains(r#""kind":"model_attempt""#));
     assert!(audit_log.contains(r#""kind":"failed""#));
     assert!(!audit_log.contains(r#""kind":"completed""#));
+}
+
+#[tokio::test]
+async fn manual_compact_over_budget_summary_does_not_start_recap_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.context_window = 1_024;
+    engine.compaction.tail_target_ctx_ratio = 0.05;
+    engine.compaction.tail_hard_ctx_ratio = 0.075;
+    engine.compaction.tail_previous_real_user_turns = 1;
+    let mut session = create_test_session(&store, "session_face000a").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "old request ".repeat(120)),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "old answer ".repeat(120)),
+            NewSessionMessage::text(SessionMessageRole::User, "latest request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "latest answer"),
+        ])
+        .await
+        .unwrap();
+
+    let error = engine
+        .compact_session_checkpoint_with_events(&mut session, &mut |_| {})
+        .await
+        .expect_err("summary output reserve should exceed the context window");
+
+    assert!(error
+        .to_string()
+        .contains("remains over budget after omitting all tool results"));
+    assert!(provider.requests().await.is_empty());
+    let metadata = session.read_metadata().await.unwrap();
+    assert_eq!(metadata.recapped_until, 0);
+    assert!(metadata.compaction.is_none());
+    let audit_log = tokio::fs::read_to_string(&session.paths.compaction_events_jsonl)
+        .await
+        .unwrap_or_default();
+    assert!(!audit_log.contains(r#""kind":"started""#));
 }
 
 #[tokio::test]
@@ -3514,6 +3917,318 @@ fn test_compaction_audit_context(
     }
 }
 
+#[tokio::test]
+async fn compaction_summary_prefers_full_tool_results_when_request_fits() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        r#"{"committed_summary":"full summary","active_turn_summary":null}"#,
+        Vec::new(),
+    )]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.context_window = 6_000;
+    engine.compaction.tool_result_raw_max_chars = 16;
+    let session = create_test_session(&store, "session_c0ffee20").await;
+    let raw_marker = format!("FULL_SUMMARY_TOOL_RESULT_{}", "X".repeat(4_000));
+    let transcript = compaction_transcript_projection(
+        vec![SessionTurnMessage {
+            role: "user".into(),
+            content: vec![SessionTurnContentBlock::ToolResult {
+                tool_use_id: "toolu_summary".into(),
+                content: raw_marker,
+            }],
+        }],
+        engine.compaction.tool_result_raw_max_chars,
+    );
+    let inputs = CompactionSummaryInputs {
+        audit: test_compaction_audit_context(CompactionAuditScope::Committed),
+        committed_start_index: Some(0),
+        committed_end_index: Some(1),
+        prior_committed_summary: None,
+        committed_transcript: Some(&transcript.full),
+        committed_transcript_with_large_tool_results_omitted: Some(
+            &transcript.large_tool_results_omitted,
+        ),
+        committed_transcript_with_tool_results_omitted: Some(&transcript.tool_results_omitted),
+        prior_active_turn_summary: None,
+        active_turn_user_anchor: None,
+        active_turn_start_segment: None,
+        active_turn_end_segment: None,
+        active_turn_transcript: None,
+        active_turn_transcript_with_large_tool_results_omitted: None,
+        active_turn_transcript_with_tool_results_omitted: None,
+        summary_max_chars: 6000,
+    };
+
+    engine
+        .generate_compaction_summary(&session, &inputs, &mut |_| {})
+        .await
+        .expect("full compaction summary input");
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 1);
+    let payload = last_user_text(&requests[0]);
+    assert!(payload.contains("FULL_SUMMARY_TOOL_RESULT"));
+    assert!(!payload.contains("tool_result omitted from compaction summary input"));
+}
+
+#[tokio::test]
+async fn compaction_summary_omits_only_large_tool_results_when_full_input_is_over_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        r#"{"committed_summary":"projected summary","active_turn_summary":null}"#,
+        Vec::new(),
+    )]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.context_window = 4_000;
+    engine.compaction.tool_result_raw_max_chars = 128;
+    let session = create_test_session(&store, "session_c0ffee24").await;
+    let transcript = compaction_transcript_projection(
+        vec![
+            SessionTurnMessage {
+                role: "user".into(),
+                content: vec![SessionTurnContentBlock::ToolResult {
+                    tool_use_id: "toolu_large".into(),
+                    content: format!("LARGE_SUMMARY_TOOL_RESULT_{}", "X".repeat(40_000)),
+                }],
+            },
+            SessionTurnMessage {
+                role: "user".into(),
+                content: vec![SessionTurnContentBlock::ToolResult {
+                    tool_use_id: "toolu_small".into(),
+                    content: "SMALL_SUMMARY_TOOL_RESULT".into(),
+                }],
+            },
+        ],
+        engine.compaction.tool_result_raw_max_chars,
+    );
+    let inputs = CompactionSummaryInputs {
+        audit: test_compaction_audit_context(CompactionAuditScope::Committed),
+        committed_start_index: Some(0),
+        committed_end_index: Some(2),
+        prior_committed_summary: None,
+        committed_transcript: Some(&transcript.full),
+        committed_transcript_with_large_tool_results_omitted: Some(
+            &transcript.large_tool_results_omitted,
+        ),
+        committed_transcript_with_tool_results_omitted: Some(&transcript.tool_results_omitted),
+        prior_active_turn_summary: None,
+        active_turn_user_anchor: None,
+        active_turn_start_segment: None,
+        active_turn_end_segment: None,
+        active_turn_transcript: None,
+        active_turn_transcript_with_large_tool_results_omitted: None,
+        active_turn_transcript_with_tool_results_omitted: None,
+        summary_max_chars: 6000,
+    };
+
+    engine
+        .generate_compaction_summary(&session, &inputs, &mut |_| {})
+        .await
+        .expect("large-only omission compaction summary");
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 1);
+    let payload = last_user_text(&requests[0]);
+    assert!(payload.contains("tool_result omitted from compaction summary input"));
+    assert!(!payload.contains("LARGE_SUMMARY_TOOL_RESULT"));
+    assert!(payload.contains("SMALL_SUMMARY_TOOL_RESULT"));
+}
+
+#[tokio::test]
+async fn compaction_summary_falls_back_to_omitting_all_tool_results_before_provider_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        r#"{"committed_summary":"bounded summary","active_turn_summary":null}"#,
+        Vec::new(),
+    )]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.context_window = 6_000;
+    engine.compaction.tool_result_raw_max_chars = 100_000;
+    let session = create_test_session(&store, "session_c0ffee21").await;
+    let raw_marker = format!("RAW_SUMMARY_TOOL_RESULT_{}", "X".repeat(40_000));
+    let transcript = compaction_transcript_projection(
+        vec![SessionTurnMessage {
+            role: "user".into(),
+            content: vec![SessionTurnContentBlock::ToolResult {
+                tool_use_id: "toolu_summary".into(),
+                content: raw_marker.clone(),
+            }],
+        }],
+        engine.compaction.tool_result_raw_max_chars,
+    );
+    assert!(transcript
+        .full
+        .iter()
+        .any(|message| message.content.contains("RAW_SUMMARY_TOOL_RESULT")));
+
+    let inputs = CompactionSummaryInputs {
+        audit: test_compaction_audit_context(CompactionAuditScope::Committed),
+        committed_start_index: Some(0),
+        committed_end_index: Some(1),
+        prior_committed_summary: None,
+        committed_transcript: Some(&transcript.full),
+        committed_transcript_with_large_tool_results_omitted: Some(
+            &transcript.large_tool_results_omitted,
+        ),
+        committed_transcript_with_tool_results_omitted: Some(&transcript.tool_results_omitted),
+        prior_active_turn_summary: None,
+        active_turn_user_anchor: None,
+        active_turn_start_segment: None,
+        active_turn_end_segment: None,
+        active_turn_transcript: None,
+        active_turn_transcript_with_large_tool_results_omitted: None,
+        active_turn_transcript_with_tool_results_omitted: None,
+        summary_max_chars: 6000,
+    };
+
+    engine
+        .generate_compaction_summary(&session, &inputs, &mut |_| {})
+        .await
+        .expect("fallback compaction summary");
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].retry_count_override, Some(0));
+    let payload = last_user_text(&requests[0]);
+    assert!(payload.contains("tool_result omitted from compaction summary input"));
+    assert!(!payload.contains("RAW_SUMMARY_TOOL_RESULT"));
+    assert!(raw_marker.contains("RAW_SUMMARY_TOOL_RESULT"));
+}
+
+#[tokio::test]
+async fn compaction_summary_rejects_over_budget_payload_without_provider_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.context_window = 1_024;
+    let session = create_test_session(&store, "session_c0ffee22").await;
+    let transcript = vec![TurnMessage {
+        role: "user".into(),
+        content: "plain non-tool content".into(),
+    }];
+    let inputs = CompactionSummaryInputs {
+        audit: test_compaction_audit_context(CompactionAuditScope::Committed),
+        committed_start_index: Some(0),
+        committed_end_index: Some(1),
+        prior_committed_summary: None,
+        committed_transcript: Some(&transcript),
+        committed_transcript_with_large_tool_results_omitted: Some(&transcript),
+        committed_transcript_with_tool_results_omitted: Some(&transcript),
+        prior_active_turn_summary: None,
+        active_turn_user_anchor: None,
+        active_turn_start_segment: None,
+        active_turn_end_segment: None,
+        active_turn_transcript: None,
+        active_turn_transcript_with_large_tool_results_omitted: None,
+        active_turn_transcript_with_tool_results_omitted: None,
+        summary_max_chars: 6000,
+    };
+
+    let error = engine
+        .generate_compaction_summary(&session, &inputs, &mut |_| {})
+        .await
+        .expect_err("max output reserve leaves no room for summary input");
+
+    assert!(error
+        .to_string()
+        .contains("remains over budget after omitting all tool results"));
+    assert!(provider.requests().await.is_empty());
+    assert!(session.read_metadata().await.unwrap().compaction.is_none());
+}
+
+#[tokio::test]
+async fn compaction_summary_rechecks_budget_before_json_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        response_step(&"界".repeat(4_000), Vec::new()),
+        response_step(
+            r#"{"committed_summary":"must not be requested","active_turn_summary":null}"#,
+            Vec::new(),
+        ),
+    ]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.context_window = 1_500;
+    engine.json_caller = Arc::new(StructuredJsonCaller::new(
+        provider.clone(),
+        256,
+        1,
+        Duration::ZERO,
+        Duration::ZERO,
+    ));
+    let session = create_test_session(&store, "session_c0ffee23").await;
+    let transcript = vec![TurnMessage {
+        role: "user".into(),
+        content: "plain summary input".into(),
+    }];
+    let inputs = CompactionSummaryInputs {
+        audit: test_compaction_audit_context(CompactionAuditScope::Committed),
+        committed_start_index: Some(0),
+        committed_end_index: Some(1),
+        prior_committed_summary: None,
+        committed_transcript: Some(&transcript),
+        committed_transcript_with_large_tool_results_omitted: Some(&transcript),
+        committed_transcript_with_tool_results_omitted: Some(&transcript),
+        prior_active_turn_summary: None,
+        active_turn_user_anchor: None,
+        active_turn_start_segment: None,
+        active_turn_end_segment: None,
+        active_turn_transcript: None,
+        active_turn_transcript_with_large_tool_results_omitted: None,
+        active_turn_transcript_with_tool_results_omitted: None,
+        summary_max_chars: 6000,
+    };
+
+    let error = engine
+        .generate_compaction_summary(&session, &inputs, &mut |_| {})
+        .await
+        .expect_err("retry correction should exceed the local compaction budget");
+
+    assert!(error
+        .to_string()
+        .contains("provider attempt exceeds context window"));
+    assert_eq!(provider.requests().await.len(), 1);
+}
+
+#[test]
+fn compaction_summary_projections_redact_memory_tool_input_and_output() {
+    let messages = vec![
+        test_message(
+            0,
+            SessionMessageRole::Assistant,
+            vec![SessionContentBlock::tool_use(
+                "toolu_memory",
+                "memory",
+                json!({
+                    "action": "write",
+                    "content": "PRIVATE_MEMORY_INPUT"
+                }),
+            )],
+        ),
+        test_message(
+            1,
+            SessionMessageRole::User,
+            vec![SessionContentBlock::tool_result(
+                "toolu_memory",
+                "PRIVATE_MEMORY_OUTPUT",
+            )],
+        ),
+    ];
+
+    let projection = session_compaction_transcript_projection(&messages, 4_096);
+
+    for transcript in [
+        projection.full,
+        projection.large_tool_results_omitted,
+        projection.tool_results_omitted,
+    ] {
+        let serialized = serde_json::to_string(&transcript).unwrap();
+        assert!(serialized.contains("tool_use memory input omitted"));
+        assert!(serialized.contains("tool_result memory output omitted"));
+        assert!(!serialized.contains("PRIVATE_MEMORY_INPUT"));
+        assert!(!serialized.contains("PRIVATE_MEMORY_OUTPUT"));
+    }
+}
+
 #[test]
 fn parse_compaction_summary_outcome_requires_committed_and_active_shape() {
     let inputs = CompactionSummaryInputs {
@@ -3522,11 +4237,15 @@ fn parse_compaction_summary_outcome_requires_committed_and_active_shape() {
         committed_end_index: Some(2),
         prior_committed_summary: None,
         committed_transcript: Some(&[]),
+        committed_transcript_with_large_tool_results_omitted: Some(&[]),
+        committed_transcript_with_tool_results_omitted: Some(&[]),
         prior_active_turn_summary: None,
         active_turn_user_anchor: None,
         active_turn_start_segment: None,
         active_turn_end_segment: None,
         active_turn_transcript: None,
+        active_turn_transcript_with_large_tool_results_omitted: None,
+        active_turn_transcript_with_tool_results_omitted: None,
         summary_max_chars: 6000,
     };
     let ok = parse_compaction_summary_outcome(
@@ -3575,11 +4294,15 @@ fn parse_compaction_summary_outcome_requires_committed_and_active_shape() {
         committed_end_index: None,
         prior_committed_summary: None,
         committed_transcript: None,
+        committed_transcript_with_large_tool_results_omitted: None,
+        committed_transcript_with_tool_results_omitted: None,
         prior_active_turn_summary: None,
         active_turn_user_anchor: None,
         active_turn_start_segment: Some(0),
         active_turn_end_segment: Some(1),
         active_turn_transcript: Some(&active_transcript),
+        active_turn_transcript_with_large_tool_results_omitted: Some(&active_transcript),
+        active_turn_transcript_with_tool_results_omitted: Some(&active_transcript),
         summary_max_chars: 6000,
     };
     let err = parse_compaction_summary_outcome(
@@ -4457,7 +5180,25 @@ async fn preflight_committed_tail_does_not_noop_when_full_raw_tail_exceeds_budge
         .unwrap();
 
     assert_eq!(plan.ranges.summary_end_index, 4);
-    assert!(plan.committed_transcript.is_some());
+    let full = plan.committed_transcript.as_ref().unwrap();
+    assert!(full
+        .iter()
+        .any(|message| message.content.contains(&"A".repeat(1_000))));
+    let projected = plan
+        .committed_transcript_with_large_tool_results_omitted
+        .as_ref()
+        .unwrap();
+    assert!(projected.iter().any(|message| message
+        .content
+        .contains("tool_result omitted from compaction summary input")));
+    assert!(!projected
+        .iter()
+        .any(|message| message.content.contains(&"A".repeat(1_000))));
+    assert!(messages[2].content.iter().any(|block| matches!(
+        block,
+        SessionContentBlock::ToolResult { content, .. }
+            if content.contains(&"A".repeat(1_000))
+    )));
 }
 
 #[tokio::test]
@@ -5656,4 +6397,16 @@ fn historical_provider_context_flattens_media_blocks_without_base64() {
     assert!(flattened.contains("[image attachment media_type=image/png"));
     assert!(flattened.contains("filename=brief.pdf"));
     assert!(!flattened.contains(&huge_base64));
+}
+
+#[test]
+fn post_commit_cleanup_error_keeps_canonical_commit_classification() {
+    let committed_error = anyhow::Error::new(SessionTurnCommittedPostCommitError {
+        source: anyhow::anyhow!("clear active compaction failed"),
+    });
+
+    assert!(is_canonical_messages_committed_error(&committed_error));
+    assert!(!is_canonical_messages_committed_error(&anyhow::anyhow!(
+        "provider failed before commit"
+    )));
 }

@@ -845,13 +845,16 @@ impl AgentTurnLoop {
             skill_instructions,
         } = request;
         let mut provider_messages = history;
-        let (user_message, text_attachment_reads) = session_user_message(
+        let (user_message, text_attachment_reads, attachment_warnings) = session_user_message(
             user_text,
             user_attachments,
             skill_instructions,
             &self.attachment_limits,
         )
         .await?;
+        for message in attachment_warnings {
+            emit(SessionTurnEvent::Warning { message });
+        }
         let turn_started_at = self.now();
         provider_messages.push(user_message_with_runtime_context(
             &user_message,
@@ -1341,6 +1344,43 @@ impl AgentTurnLoop {
     pub async fn clear_file_read_state(&self, session_id: &SessionId) {
         self.tools.clear_file_read_state(session_id).await;
     }
+
+    pub(crate) async fn clear_parent_file_read_state(&self, session_id: &SessionId) {
+        self.tools.clear_parent_file_read_state(session_id).await;
+    }
+
+    pub(crate) async fn begin_file_read_state_checkpoint(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+    ) -> anyhow::Result<()> {
+        self.tools
+            .begin_file_read_state_checkpoint(session_id, turn_id)
+            .await
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub(crate) async fn commit_file_read_state_checkpoint(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+    ) -> anyhow::Result<()> {
+        self.tools
+            .commit_file_read_state_checkpoint(session_id, turn_id)
+            .await
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub(crate) async fn rollback_file_read_state_checkpoint(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+    ) -> anyhow::Result<()> {
+        self.tools
+            .rollback_file_read_state_checkpoint(session_id, turn_id)
+            .await
+            .map_err(anyhow::Error::msg)
+    }
 }
 
 fn non_streaming_fallback_delay(attempt: u32) -> Duration {
@@ -1445,7 +1485,7 @@ async fn session_user_message(
     attachments: Vec<SessionAttachment>,
     skill_instructions: Vec<SkillInstructions>,
     limits: &AttachmentLimits,
-) -> anyhow::Result<(SessionTurnMessage, Vec<TextAttachmentRead>)> {
+) -> anyhow::Result<(SessionTurnMessage, Vec<TextAttachmentRead>, Vec<String>)> {
     if !limits.enabled && !attachments.is_empty() {
         anyhow::bail!("附件功能已禁用");
     }
@@ -1469,20 +1509,32 @@ async fn session_user_message(
     );
     blocks.push(SessionTurnContentBlock::text(user_text));
     let mut text_reads = Vec::<TextAttachmentRead>::new();
+    let mut warnings = Vec::<String>::new();
     for attachment in attachments {
-        let (block, text_read) = session_attachment_block(attachment, limits).await?;
+        let (block, text_read, warning) = session_attachment_block(attachment, limits).await?;
         blocks.push(block);
         if let Some(text_read) = text_read {
             text_reads.push(text_read);
         }
+        if let Some(warning) = warning {
+            warnings.push(warning);
+        }
     }
-    Ok((SessionTurnMessage::user_content(blocks), text_reads))
+    Ok((
+        SessionTurnMessage::user_content(blocks),
+        text_reads,
+        warnings,
+    ))
 }
 
 async fn session_attachment_block(
     attachment: SessionAttachment,
     limits: &AttachmentLimits,
-) -> anyhow::Result<(SessionTurnContentBlock, Option<TextAttachmentRead>)> {
+) -> anyhow::Result<(
+    SessionTurnContentBlock,
+    Option<TextAttachmentRead>,
+    Option<String>,
+)> {
     match attachment {
         SessionAttachment::LocalImage { path } => {
             let media = crate::attachment::read_image_attachment(&path, limits)
@@ -1490,6 +1542,7 @@ async fn session_attachment_block(
                 .context("读取图片附件失败")?;
             Ok((
                 SessionTurnContentBlock::image(media.media_type, media.data),
+                None,
                 None,
             ))
         }
@@ -1515,6 +1568,7 @@ async fn session_attachment_block(
             Ok((
                 SessionTurnContentBlock::image(media.media_type, media.data),
                 None,
+                None,
             ))
         }
         SessionAttachment::TextFile { path } => read_text_file_block(&path, limits).await,
@@ -1536,6 +1590,7 @@ async fn session_attachment_block(
                     media.source_name,
                 ),
                 None,
+                None,
             ))
         }
     }
@@ -1544,7 +1599,11 @@ async fn session_attachment_block(
 async fn read_text_file_block(
     path: &Path,
     limits: &AttachmentLimits,
-) -> anyhow::Result<(SessionTurnContentBlock, Option<TextAttachmentRead>)> {
+) -> anyhow::Result<(
+    SessionTurnContentBlock,
+    Option<TextAttachmentRead>,
+    Option<String>,
+)> {
     // 先固定并校验真实目标，再从同一 canonical 路径读取。这样符号链接在读取后
     // 被切换时，不会让正文来自受保护文件、许可却绑定到另一个目标。
     let canonical_path = tokio::fs::canonicalize(path)
@@ -1560,6 +1619,28 @@ async fn read_text_file_block(
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("attachment");
+    let actual_chars = content.chars().count();
+    if actual_chars > limits.max_text_chars {
+        let provider_text = format!(
+            "Attached text file body omitted: {name}\nPath: {}\nCharacters: \
+             {actual_chars}\nThe file exceeds the per-file text attachment limit of {} \
+             characters. Use file_read with this path to inspect it before editing.",
+            path.display(),
+            limits.max_text_chars,
+        );
+        let warning = format!(
+            "文本附件 `{}` 共 {} 个字符，超过单文件上限 {}；已仅向模型提供路径，\
+             未注入正文，也未授予读取许可。",
+            path.display(),
+            actual_chars,
+            limits.max_text_chars,
+        );
+        return Ok((
+            SessionTurnContentBlock::text(provider_text),
+            None,
+            Some(warning),
+        ));
+    }
     let provider_text = format!(
         "Attached file: {name}\nPath: {}\n\n{content}",
         path.display()
@@ -1571,6 +1652,7 @@ async fn read_text_file_block(
             content,
             provider_text,
         }),
+        None,
     ))
 }
 
@@ -3700,6 +3782,190 @@ mod tests {
             .to_string()
             .contains("MEMORY.md / USER.md 必须通过 memory 工具访问"));
         assert!(provider.requests.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn text_attachment_at_character_limit_is_fully_inlined() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unicode.txt");
+        tokio::fs::write(&path, "你好").await.unwrap();
+        let provider = Arc::new(FakeProvider::new(vec![response(
+            vec![SessionTurnContentBlock::text("完成")],
+            ProviderStop::Done,
+        )]));
+        let turn_loop = tool_loop(provider.clone()).with_attachment_limits(AttachmentLimits {
+            max_text_chars: 2,
+            ..AttachmentLimits::default()
+        });
+        let mut request = request();
+        request.user_attachments =
+            vec![crate::api::SessionAttachment::TextFile { path: path.clone() }];
+        let mut events = Vec::new();
+
+        turn_loop
+            .run_session_turn(request, &mut |event| events.push(event))
+            .await
+            .unwrap();
+
+        let requests = provider.requests.lock().await;
+        assert!(requests[0]
+            .messages
+            .iter()
+            .flat_map(text_blocks)
+            .any(|text| text.contains("Attached file: unicode.txt") && text.contains("你好")));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, SessionTurnEvent::Warning { .. })));
+    }
+
+    #[tokio::test]
+    async fn text_attachments_apply_character_limit_per_file_not_per_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        tokio::fs::write(&first, "甲乙丙丁").await.unwrap();
+        tokio::fs::write(&second, "一二三四").await.unwrap();
+        let provider = Arc::new(FakeProvider::new(vec![response(
+            vec![SessionTurnContentBlock::text("完成")],
+            ProviderStop::Done,
+        )]));
+        let turn_loop = tool_loop(provider.clone()).with_attachment_limits(AttachmentLimits {
+            max_text_chars: 4,
+            ..AttachmentLimits::default()
+        });
+        let mut request = request();
+        request.user_attachments = vec![
+            crate::api::SessionAttachment::TextFile { path: first },
+            crate::api::SessionAttachment::TextFile { path: second },
+        ];
+        let mut events = Vec::new();
+
+        turn_loop
+            .run_session_turn(request, &mut |event| events.push(event))
+            .await
+            .unwrap();
+
+        let requests = provider.requests.lock().await;
+        let text = requests[0]
+            .messages
+            .iter()
+            .flat_map(text_blocks)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("甲乙丙丁"));
+        assert!(text.contains("一二三四"));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, SessionTurnEvent::Warning { .. })));
+    }
+
+    #[tokio::test]
+    async fn oversized_text_attachment_degrades_to_path_without_read_permission() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.txt");
+        let original = "敏感正文不应内联";
+        tokio::fs::write(&path, original).await.unwrap();
+        let tools = Arc::new(
+            ToolRegistry::new(&ToolConfig {
+                workspace_root: dir.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let provider = Arc::new(FakeProvider::new(vec![
+            response(
+                vec![tool_use(
+                    "toolu_write",
+                    "file_write",
+                    json!({"path": "oversized.txt", "content": "after\n"}),
+                )],
+                ProviderStop::ToolUse,
+            ),
+            response(
+                vec![SessionTurnContentBlock::text("未修改")],
+                ProviderStop::Done,
+            ),
+        ]));
+        let turn_loop = tool_loop_with_tools(provider.clone(), tools).with_attachment_limits(
+            AttachmentLimits {
+                max_text_chars: 4,
+                ..AttachmentLimits::default()
+            },
+        );
+        let mut request = request();
+        request.current_session_id = Some("session_aaaaaaaa".parse().unwrap());
+        request.current_turn_id = Some("turn_oversized_attachment".into());
+        request.user_attachments =
+            vec![crate::api::SessionAttachment::TextFile { path: path.clone() }];
+        let mut events = Vec::new();
+
+        let turn = turn_loop
+            .run_session_turn(request, &mut |event| events.push(event))
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), original);
+        let result = tool_result_content(&turn.messages[2], "toolu_write");
+        assert_eq!(result["outcome"]["kind"], "business_failure");
+        let requests = provider.requests.lock().await;
+        let first_request_text = requests[0]
+            .messages
+            .iter()
+            .flat_map(text_blocks)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(first_request_text.contains(&path.display().to_string()));
+        assert!(first_request_text.contains("Characters: 8"));
+        assert!(first_request_text.contains("Use file_read"));
+        assert!(!first_request_text.contains(original));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                SessionTurnEvent::Warning { message }
+                    if message.contains("超过单文件上限 4")
+                        && message.contains("未授予读取许可")
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn text_character_limit_does_not_apply_to_pdf_attachment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("brief.pdf");
+        tokio::fs::write(&path, b"%PDF-1.7 fake").await.unwrap();
+        let provider = Arc::new(FakeProvider::new(vec![response(
+            vec![SessionTurnContentBlock::text("完成")],
+            ProviderStop::Done,
+        )]));
+        let turn_loop = tool_loop(provider.clone()).with_attachment_limits(AttachmentLimits {
+            max_text_chars: 1,
+            ..AttachmentLimits::default()
+        });
+        let mut request = request();
+        request.user_attachments = vec![crate::api::SessionAttachment::DocumentFile {
+            path,
+            media_type: "application/pdf".into(),
+        }];
+        let mut events = Vec::new();
+
+        turn_loop
+            .run_session_turn(request, &mut |event| events.push(event))
+            .await
+            .unwrap();
+
+        let requests = provider.requests.lock().await;
+        assert!(requests[0].messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    SessionTurnContentBlock::Document { media_type, .. }
+                        if media_type == "application/pdf"
+                )
+            })
+        }));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, SessionTurnEvent::Warning { .. })));
     }
 
     #[tokio::test]

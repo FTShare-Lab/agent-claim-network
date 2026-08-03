@@ -7,14 +7,16 @@
 #[cfg(test)]
 use anyhow::Context;
 use num_traits::ToPrimitive;
+use std::collections::HashSet;
 
 use crate::api::{
     active_segment_has_large_tool_result as shared_active_segment_has_large_tool_result,
     active_segments_hash as shared_active_segments_hash, estimate_json_tokens,
     estimate_session_turn_messages_tokens, estimate_text_tokens,
     estimated_projected_segment_tokens, large_tool_result_omission_text,
-    project_turn_message_tool_results, provider_safe_segments, SessionTurnMessage,
-    FILE_EDIT_AUTHORITY_COMPACTION_NOTICE,
+    omit_turn_messages_tool_results, project_compaction_input_tool_results,
+    project_turn_message_tool_results, provider_safe_segments, SessionTurnContentBlock,
+    SessionTurnMessage, TurnMessage, FILE_EDIT_AUTHORITY_COMPACTION_NOTICE,
 };
 pub(super) use crate::api::{active_segment_messages, MessageRange, ProviderProjectionBudget};
 use crate::session::{
@@ -24,7 +26,7 @@ use crate::session::{
 
 use super::transcript::{
     flatten_session_content_lossy, is_real_user_turn, session_message_to_turn_message,
-    session_messages_to_turn_messages,
+    session_messages_to_turn_messages, turn_messages_to_transcript,
 };
 use super::MEDIA_BLOCK_ESTIMATED_TOKENS;
 
@@ -46,6 +48,76 @@ pub(super) struct ActiveTurnCompactionMatch {
     pub(super) summary: String,
     pub(super) cursor: ActiveTurnCompactionCursor,
     pub(super) cursor_matches_active_suffix: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CompactionTranscriptProjection {
+    pub(super) full: Vec<TurnMessage>,
+    pub(super) large_tool_results_omitted: Vec<TurnMessage>,
+    pub(super) tool_results_omitted: Vec<TurnMessage>,
+}
+
+pub(super) fn compaction_transcript_projection(
+    messages: Vec<SessionTurnMessage>,
+    tool_result_raw_max_chars: usize,
+) -> CompactionTranscriptProjection {
+    let messages = redact_memory_tool_messages(messages);
+    let large_tool_results_omitted =
+        project_compaction_input_tool_results(messages.clone(), tool_result_raw_max_chars);
+    let tool_results_omitted = omit_turn_messages_tool_results(messages.clone());
+    CompactionTranscriptProjection {
+        full: turn_messages_to_transcript(messages.iter().collect()),
+        large_tool_results_omitted: turn_messages_to_transcript(
+            large_tool_results_omitted.iter().collect(),
+        ),
+        tool_results_omitted: turn_messages_to_transcript(tool_results_omitted.iter().collect()),
+    }
+}
+
+fn redact_memory_tool_messages(mut messages: Vec<SessionTurnMessage>) -> Vec<SessionTurnMessage> {
+    let memory_tool_use_ids = messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            SessionTurnContentBlock::ToolUse { id, name, .. } if name == "memory" => {
+                Some(id.clone())
+            }
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    for message in &mut messages {
+        for block in &mut message.content {
+            let replacement = match block {
+                SessionTurnContentBlock::ToolUse { name, .. } if name == "memory" => {
+                    Some("[tool_use memory input omitted from recap transcript]")
+                }
+                SessionTurnContentBlock::ToolResult { tool_use_id, .. }
+                    if memory_tool_use_ids.contains(tool_use_id) =>
+                {
+                    Some("[tool_result memory output omitted from recap transcript]")
+                }
+                _ => None,
+            };
+            if let Some(text) = replacement {
+                *block = SessionTurnContentBlock::text(text);
+            }
+        }
+    }
+    messages
+}
+
+pub(super) fn session_compaction_transcript_projection(
+    messages: &[SessionMessage],
+    tool_result_raw_max_chars: usize,
+) -> CompactionTranscriptProjection {
+    compaction_transcript_projection(
+        messages
+            .iter()
+            .cloned()
+            .map(session_message_to_turn_message)
+            .collect(),
+        tool_result_raw_max_chars,
+    )
 }
 
 pub(super) fn compacted_context_for_turn(

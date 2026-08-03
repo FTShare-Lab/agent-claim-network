@@ -13,11 +13,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::api::{
-    estimate_provider_request_context_tokens, estimate_session_turn_messages_tokens,
-    estimated_projected_segment_tokens, project_turn_messages_tool_results, provider_safe_segments,
-    ContextUsageSnapshot, ContextUsageSource, ProviderProjectionBudget, SessionTurnContentBlock,
-    SessionTurnEvent, SessionTurnMessage, SessionTurnPreflight, StructuredJsonCaller, ToolSpec,
-    FILE_EDIT_AUTHORITY_COMPACTION_NOTICE,
+    ensure_compaction_request_within_context_window, estimate_provider_request_context_tokens,
+    estimate_session_turn_messages_tokens, estimated_projected_segment_tokens,
+    omit_turn_messages_tool_results, project_compaction_input_tool_results,
+    project_turn_messages_tool_results, provider_safe_segments, ContextUsageSnapshot,
+    ContextUsageSource, ProviderProjectionBudget, SessionTurnContentBlock, SessionTurnEvent,
+    SessionTurnMessage, SessionTurnPreflight, StructuredJsonAttemptRequest, StructuredJsonCaller,
+    ToolSpec, FILE_EDIT_AUTHORITY_COMPACTION_NOTICE,
 };
 use crate::config::SessionCompactionConfig;
 use crate::prompt::PromptRegistry;
@@ -280,12 +282,16 @@ impl DelegationPreflightCompactor {
             return None;
         }
         let anchor = provider_messages.first()?.clone();
-        let compact_messages = project_turn_messages_tool_results(
-            provider_messages
-                .get(compact_start_index..compact_end_index)?
-                .to_vec(),
-            self.compaction.tool_result_raw_max_chars,
-        );
+        let compact_source = provider_messages
+            .get(compact_start_index..compact_end_index)?
+            .to_vec();
+        let compact_messages_with_large_tool_results_omitted =
+            project_compaction_input_tool_results(
+                compact_source.clone(),
+                self.compaction.tool_result_raw_max_chars,
+            );
+        let compact_messages_with_tool_results_omitted =
+            omit_turn_messages_tool_results(compact_source.clone());
         let tail = project_turn_messages_tool_results(
             provider_messages.get(ranges.tail_start_index..)?.to_vec(),
             self.compaction.tool_result_raw_max_chars,
@@ -294,7 +300,9 @@ impl DelegationPreflightCompactor {
             compact_start_index,
             compact_end_index,
             anchor,
-            compact_messages,
+            compact_messages: compact_source,
+            compact_messages_with_large_tool_results_omitted,
+            compact_messages_with_tool_results_omitted,
             tail,
         })
     }
@@ -415,7 +423,7 @@ impl DelegationPreflightCompactor {
                 },
             )
             .context("渲染 subagents_compaction prompt 失败")?;
-        let payload = DelegationCompactionPayload {
+        let mut payload = DelegationCompactionPayload {
             subagent_id: self.metadata.id.to_string(),
             parent_session_id: self.metadata.parent_session_id.to_string(),
             title: self.metadata.title.clone(),
@@ -429,14 +437,57 @@ impl DelegationPreflightCompactor {
             transcript: plan.compact_messages.clone(),
             summary_max_chars: self.compaction.summary_max_chars,
         };
-        let user_text = serde_json::to_string_pretty(&payload)?;
+        let mut user_text = serde_json::to_string_pretty(&payload)?;
+        let mut provider_messages = vec![SessionTurnMessage::user_text(user_text.clone())];
+        if let Err(full_error) = ensure_compaction_request_within_context_window(
+            &system_prompt,
+            &provider_messages,
+            self.context_window,
+            self.json_caller.max_tokens(),
+        ) {
+            payload.transcript = plan
+                .compact_messages_with_large_tool_results_omitted
+                .clone();
+            user_text = serde_json::to_string_pretty(&payload)?;
+            provider_messages = vec![SessionTurnMessage::user_text(user_text.clone())];
+            if let Err(large_omission_error) = ensure_compaction_request_within_context_window(
+                &system_prompt,
+                &provider_messages,
+                self.context_window,
+                self.json_caller.max_tokens(),
+            ) {
+                payload.transcript = plan.compact_messages_with_tool_results_omitted.clone();
+                user_text = serde_json::to_string_pretty(&payload)?;
+                provider_messages = vec![SessionTurnMessage::user_text(user_text)];
+                ensure_compaction_request_within_context_window(
+                    &system_prompt,
+                    &provider_messages,
+                    self.context_window,
+                    self.json_caller.max_tokens(),
+                )
+                .with_context(|| {
+                    format!(
+                        "subagent compaction summary request remains over budget after omitting all tool results; full input error: {full_error:#}; large-tool-result omission error: {large_omission_error:#}"
+                    )
+                })?;
+            }
+        }
         let value = self
             .json_caller
-            .generate_json_validated_with_retry_notice(
-                system_prompt,
-                vec![SessionTurnMessage::user_text(user_text)],
+            .generate_json_validated_with_guarded_attempts(
+                StructuredJsonAttemptRequest::compaction(system_prompt, provider_messages),
                 |value| parse_summary(value, self.compaction.summary_max_chars),
                 |_, _, _| {},
+                |_| std::future::ready(()),
+                |system_prompt, attempt_messages| {
+                    ensure_compaction_request_within_context_window(
+                        system_prompt,
+                        attempt_messages,
+                        self.context_window,
+                        self.json_caller.max_tokens(),
+                    )
+                    .context("subagent compaction summary provider attempt exceeds context window")
+                },
             )
             .await?;
         Ok(value)
@@ -516,6 +567,8 @@ struct CompactionPlan {
     compact_end_index: usize,
     anchor: SessionTurnMessage,
     compact_messages: Vec<SessionTurnMessage>,
+    compact_messages_with_large_tool_results_omitted: Vec<SessionTurnMessage>,
+    compact_messages_with_tool_results_omitted: Vec<SessionTurnMessage>,
     tail: Vec<SessionTurnMessage>,
 }
 
@@ -777,7 +830,44 @@ mod tests {
         metadata: DelegationMetadata,
         progress: DelegationProgressSink,
         provider: Arc<JsonProvider>,
+        mut config: SessionCompactionConfig,
+    ) -> DelegationPreflightCompactor {
+        // Summary 请求 guard 会计入完整 JSON 和输出预留；同步放大测试窗口并缩放
+        // ratio，保持这些 planner 测试原有的 100/200/300 token 绝对阈值。
+        const TEST_CONTEXT_SCALE: f64 = 8.0;
+        config.auto_compact_ctx_ratio /= TEST_CONTEXT_SCALE;
+        config.tail_target_ctx_ratio /= TEST_CONTEXT_SCALE;
+        config.tail_hard_ctx_ratio /= TEST_CONTEXT_SCALE;
+        compactor_with_limits(metadata, progress, provider, config, 512, 8_000)
+    }
+
+    fn compactor_with_limits(
+        metadata: DelegationMetadata,
+        progress: DelegationProgressSink,
+        provider: Arc<JsonProvider>,
         config: SessionCompactionConfig,
+        max_tokens: u32,
+        context_window: usize,
+    ) -> DelegationPreflightCompactor {
+        compactor_with_limits_and_retries(
+            metadata,
+            progress,
+            provider,
+            config,
+            max_tokens,
+            context_window,
+            0,
+        )
+    }
+
+    fn compactor_with_limits_and_retries(
+        metadata: DelegationMetadata,
+        progress: DelegationProgressSink,
+        provider: Arc<JsonProvider>,
+        config: SessionCompactionConfig,
+        max_tokens: u32,
+        context_window: usize,
+        retry_count: u32,
     ) -> DelegationPreflightCompactor {
         DelegationPreflightCompactor::new(
             metadata,
@@ -785,14 +875,14 @@ mod tests {
             Arc::new(PromptRegistry::bundled().expect("bundled prompts")),
             Arc::new(StructuredJsonCaller::new(
                 provider,
-                512,
-                0,
+                max_tokens,
+                retry_count,
                 Duration::ZERO,
                 Duration::ZERO,
             )),
             Vec::new(),
             config,
-            1000,
+            context_window,
         )
     }
 
@@ -808,7 +898,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn projection_replaces_large_tool_results_in_compact_range_and_tail() {
+    async fn plan_keeps_full_summary_input_and_projects_large_tool_results_for_fallback_and_tail() {
         let (_dir, _store, metadata, progress) = started_delegation().await;
         let provider = Arc::new(JsonProvider::new(vec![json_response(
             "summary keeps large tool facts without raw output",
@@ -825,14 +915,185 @@ mod tests {
             .expect("projection plan");
 
         let compact_text = message_text(&plan.compact_messages);
-        assert!(compact_text.contains("large tool_result omitted"));
-        assert!(compact_text.contains("original_chars="));
-        assert!(!compact_text.contains("COMPACT_RANGE_RAW_TOOL_RESULT"));
+        assert!(compact_text.contains("COMPACT_RANGE_RAW_TOOL_RESULT"));
+        let fallback_text = message_text(&plan.compact_messages_with_large_tool_results_omitted);
+        assert!(fallback_text.contains("tool_result omitted from compaction summary input"));
+        assert!(fallback_text.contains("original_chars="));
+        assert!(!fallback_text.contains("COMPACT_RANGE_RAW_TOOL_RESULT"));
 
         let projected_text = message_text(&plan.projected_messages("summary"));
         assert!(projected_text.contains("large tool_result omitted"));
         assert!(!projected_text.contains("TAIL_RAW_TOOL_RESULT"));
         assert!(projected_text.contains("recent assistant note"));
+    }
+
+    #[tokio::test]
+    async fn summary_request_omits_only_large_tool_results_when_full_input_is_over_budget() {
+        let (_dir, _store, metadata, progress) = started_delegation().await;
+        let provider = Arc::new(JsonProvider::new(vec![json_response("bounded summary")]));
+        let compactor = compactor_with_limits(
+            metadata,
+            progress,
+            Arc::clone(&provider),
+            compacting_config(),
+            256,
+            4_000,
+        );
+        let compact_source = vec![
+            tool_result_message(
+                "toolu_large",
+                &format!("RAW_DELEGATION_SUMMARY_{}", "X".repeat(40_000)),
+            ),
+            tool_result_message("toolu_small", "SMALL_DELEGATION_SUMMARY"),
+        ];
+        let plan =
+            CompactionPlan {
+                compact_start_index: 1,
+                compact_end_index: 3,
+                anchor: SessionTurnMessage::user_text("objective anchor"),
+                compact_messages: compact_source.clone(),
+                compact_messages_with_large_tool_results_omitted:
+                    project_compaction_input_tool_results(compact_source.clone(), 128),
+                compact_messages_with_tool_results_omitted: omit_turn_messages_tool_results(
+                    compact_source,
+                ),
+                tail: Vec::new(),
+            };
+
+        let summary = compactor
+            .generate_summary(&plan)
+            .await
+            .expect("large-only omission summary");
+
+        assert_eq!(summary, "bounded summary");
+        let requests = provider.requests().await;
+        assert_eq!(requests.len(), 1);
+        let payload = message_text(&requests[0].messages);
+        assert!(payload.contains("tool_result omitted from compaction summary input"));
+        assert!(!payload.contains("RAW_DELEGATION_SUMMARY"));
+        assert!(payload.contains("SMALL_DELEGATION_SUMMARY"));
+    }
+
+    #[tokio::test]
+    async fn summary_request_omits_all_tool_results_when_large_only_projection_is_over_budget() {
+        let (_dir, _store, metadata, progress) = started_delegation().await;
+        let provider = Arc::new(JsonProvider::new(vec![json_response("bounded summary")]));
+        let compactor = compactor_with_limits(
+            metadata,
+            progress,
+            Arc::clone(&provider),
+            compacting_config(),
+            256,
+            4_000,
+        );
+        let raw_tool_result = format!("RAW_DELEGATION_SUMMARY_{}", "X".repeat(40_000));
+        let compact_source = vec![tool_result_message("toolu_summary", &raw_tool_result)];
+        let plan = CompactionPlan {
+            compact_start_index: 1,
+            compact_end_index: 2,
+            anchor: SessionTurnMessage::user_text("objective anchor"),
+            compact_messages: compact_source.clone(),
+            compact_messages_with_large_tool_results_omitted: compact_source.clone(),
+            compact_messages_with_tool_results_omitted: omit_turn_messages_tool_results(
+                compact_source,
+            ),
+            tail: Vec::new(),
+        };
+
+        let summary = compactor
+            .generate_summary(&plan)
+            .await
+            .expect("fallback summary");
+
+        assert_eq!(summary, "bounded summary");
+        let requests = provider.requests().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].retry_count_override, Some(0));
+        let payload = message_text(&requests[0].messages);
+        assert!(payload.contains("tool_result omitted from compaction summary input"));
+        assert!(!payload.contains("RAW_DELEGATION_SUMMARY"));
+    }
+
+    #[tokio::test]
+    async fn summary_request_fails_locally_when_output_reserve_fills_context_window() {
+        let (_dir, _store, metadata, progress) = started_delegation().await;
+        let provider = Arc::new(JsonProvider::new(Vec::new()));
+        let compactor = compactor_with_limits(
+            metadata,
+            progress,
+            Arc::clone(&provider),
+            compacting_config(),
+            256,
+            256,
+        );
+        let plan = CompactionPlan {
+            compact_start_index: 1,
+            compact_end_index: 2,
+            anchor: SessionTurnMessage::user_text("objective anchor"),
+            compact_messages: vec![SessionTurnMessage::assistant_text("plain summary input")],
+            compact_messages_with_large_tool_results_omitted: vec![
+                SessionTurnMessage::assistant_text("plain summary input"),
+            ],
+            compact_messages_with_tool_results_omitted: vec![SessionTurnMessage::assistant_text(
+                "plain summary input",
+            )],
+            tail: Vec::new(),
+        };
+
+        let error = compactor
+            .generate_summary(&plan)
+            .await
+            .expect_err("summary payload cannot fit beside max output reserve");
+
+        assert!(error
+            .to_string()
+            .contains("remains over budget after omitting all tool results"));
+        assert!(provider.requests().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn summary_request_rechecks_budget_before_json_retry() {
+        let (_dir, _store, metadata, progress) = started_delegation().await;
+        let invalid = Ok(ProviderResponse {
+            assistant_message: SessionTurnMessage::assistant_text("界".repeat(4_000)),
+            stop: ProviderStop::Done,
+        });
+        let provider = Arc::new(JsonProvider::new(vec![
+            invalid,
+            json_response("must not be requested"),
+        ]));
+        let compactor = compactor_with_limits_and_retries(
+            metadata,
+            progress,
+            Arc::clone(&provider),
+            compacting_config(),
+            256,
+            1_500,
+            1,
+        );
+        let plan = CompactionPlan {
+            compact_start_index: 1,
+            compact_end_index: 2,
+            anchor: SessionTurnMessage::user_text("objective anchor"),
+            compact_messages: vec![SessionTurnMessage::assistant_text("plain summary input")],
+            compact_messages_with_large_tool_results_omitted: vec![
+                SessionTurnMessage::assistant_text("plain summary input"),
+            ],
+            compact_messages_with_tool_results_omitted: vec![SessionTurnMessage::assistant_text(
+                "plain summary input",
+            )],
+            tail: Vec::new(),
+        };
+
+        let error = compactor
+            .generate_summary(&plan)
+            .await
+            .expect_err("retry correction should exceed the local compaction budget");
+
+        assert!(error
+            .to_string()
+            .contains("provider attempt exceeds context window"));
+        assert_eq!(provider.requests().await.len(), 1);
     }
 
     #[tokio::test]
@@ -937,7 +1198,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preflight_uses_projection_but_transcript_keeps_raw_tool_output() {
+    async fn preflight_uses_full_summary_input_but_projected_tail_and_transcript_keeps_raw() {
         let (_dir, store, metadata, progress) = started_delegation().await;
         let provider = Arc::new(JsonProvider::new(vec![json_response(
             "summary records compact and tail tool facts",
@@ -970,13 +1231,12 @@ mod tests {
         compactor
             .before_provider_request(&mut system_prompt, &mut provider_messages, &mut |_| {})
             .await
-            .expect("compact with projected large tool outputs");
+            .expect("compact with full summary input and projected tail");
 
         let requests = provider.requests().await;
         assert_eq!(requests.len(), 1);
         let compaction_payload = message_text(&requests[0].messages);
-        assert!(compaction_payload.contains("large tool_result omitted"));
-        assert!(!compaction_payload.contains("COMPACT_RANGE_RAW_TOOL_RESULT"));
+        assert!(compaction_payload.contains("COMPACT_RANGE_RAW_TOOL_RESULT"));
 
         let projected_history = message_text(&provider_messages);
         assert!(projected_history.contains("large tool_result omitted"));

@@ -5,7 +5,10 @@
 
 use serde::Serialize;
 
-use super::{estimate_session_turn_messages_tokens, SessionTurnContentBlock, SessionTurnMessage};
+use super::{
+    estimate_provider_request_context_tokens, estimate_session_turn_messages_tokens,
+    SessionTurnContentBlock, SessionTurnMessage,
+};
 
 const STABLE_HASH_OFFSET: u64 = 0xcbf29ce484222325;
 const STABLE_HASH_PRIME: u64 = 0x100000001b3;
@@ -27,13 +30,26 @@ pub struct MessageRange {
 }
 
 pub fn project_turn_message_tool_results(
+    message: SessionTurnMessage,
+    tool_result_raw_max_chars: usize,
+) -> SessionTurnMessage {
+    project_turn_message_tool_results_with(
+        message,
+        tool_result_raw_max_chars,
+        large_tool_result_omission_text,
+    )
+}
+
+fn project_turn_message_tool_results_with(
     mut message: SessionTurnMessage,
     tool_result_raw_max_chars: usize,
+    omission_text: fn(usize) -> String,
 ) -> SessionTurnMessage {
     for block in &mut message.content {
         if let SessionTurnContentBlock::ToolResult { content, .. } = block {
-            if content.chars().count() > tool_result_raw_max_chars {
-                *content = large_tool_result_omission_text(content.chars().count());
+            let original_chars = content.chars().count();
+            if original_chars > tool_result_raw_max_chars {
+                *content = omission_text(original_chars);
             }
         }
     }
@@ -48,6 +64,63 @@ pub fn project_turn_messages_tool_results(
         .into_iter()
         .map(|message| project_turn_message_tool_results(message, tool_result_raw_max_chars))
         .collect()
+}
+
+pub(crate) fn project_compaction_input_tool_results(
+    messages: impl IntoIterator<Item = SessionTurnMessage>,
+    tool_result_raw_max_chars: usize,
+) -> Vec<SessionTurnMessage> {
+    messages
+        .into_iter()
+        .map(|message| {
+            project_turn_message_tool_results_with(
+                message,
+                tool_result_raw_max_chars,
+                compaction_input_tool_result_omission_text,
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn omit_turn_messages_tool_results(
+    messages: impl IntoIterator<Item = SessionTurnMessage>,
+) -> Vec<SessionTurnMessage> {
+    messages
+        .into_iter()
+        .map(|mut message| {
+            for block in &mut message.content {
+                if let SessionTurnContentBlock::ToolResult { content, .. } = block {
+                    *content = compaction_input_tool_result_omission_text(content.chars().count());
+                }
+            }
+            message
+        })
+        .collect()
+}
+
+pub(crate) fn ensure_compaction_request_within_context_window(
+    system_prompt: &str,
+    messages: &[SessionTurnMessage],
+    context_window: usize,
+    max_tokens: u32,
+) -> anyhow::Result<()> {
+    let input_tokens =
+        estimate_provider_request_context_tokens(system_prompt, messages, &[]).used_tokens;
+    let output_tokens = usize::try_from(max_tokens).unwrap_or(usize::MAX);
+    let total_tokens = input_tokens.saturating_add(output_tokens);
+    if total_tokens > context_window {
+        anyhow::bail!(
+            "compaction summary request exceeds context window: estimated input tokens={input_tokens}, reserved output tokens={output_tokens}, total tokens={total_tokens}, context window={context_window}"
+        );
+    }
+    Ok(())
+}
+
+fn compaction_input_tool_result_omission_text(original_chars: usize) -> String {
+    format!(
+        "[tool_result omitted from compaction summary input; original_chars={original_chars}. \
+Exact output is unavailable in this request.]"
+    )
 }
 
 pub fn large_tool_result_omission_text(original_chars: usize) -> String {
@@ -190,5 +263,95 @@ fn stable_hash_update(hash: &mut u64, bytes: &[u8]) {
     for byte in bytes {
         *hash ^= u64::from(*byte);
         *hash = hash.wrapping_mul(STABLE_HASH_PRIME);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool_result(content: &str) -> SessionTurnMessage {
+        SessionTurnMessage {
+            role: "user".into(),
+            content: vec![SessionTurnContentBlock::ToolResult {
+                tool_use_id: "toolu_1".into(),
+                content: content.into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn omission_projection_replaces_even_small_tool_results() {
+        let projected = omit_turn_messages_tool_results(vec![tool_result("short output")]);
+
+        let serialized = serde_json::to_string(&projected).expect("serialize projection");
+        assert!(serialized.contains("tool_result omitted from compaction summary input"));
+        assert!(serialized.contains("original_chars=12"));
+        assert!(!serialized.contains("short output"));
+    }
+
+    #[test]
+    fn compaction_input_projection_omits_only_results_above_limit() {
+        let projected = project_compaction_input_tool_results(
+            vec![tool_result("short"), tool_result("long output")],
+            5,
+        );
+
+        let serialized = serde_json::to_string(&projected).expect("serialize projection");
+        assert!(serialized.contains("short"));
+        assert!(serialized.contains("tool_result omitted from compaction summary input"));
+        assert!(serialized.contains("original_chars=11"));
+        assert!(!serialized.contains("long output"));
+        assert!(!serialized.contains("raw compact tail"));
+    }
+
+    #[test]
+    fn compaction_request_budget_reserves_max_output_tokens() {
+        let messages = vec![SessionTurnMessage::user_text("A".repeat(20))];
+        let estimated_input =
+            estimate_provider_request_context_tokens("system", &messages, &[]).used_tokens;
+
+        ensure_compaction_request_within_context_window(
+            "system",
+            &messages,
+            estimated_input + 40,
+            40,
+        )
+        .expect("estimated input plus output reserve should fit exactly");
+        let error = ensure_compaction_request_within_context_window(
+            "system",
+            &messages,
+            estimated_input + 39,
+            40,
+        )
+        .expect_err("output reserve should push request over the window");
+
+        assert!(error.to_string().contains("reserved output tokens=40"));
+        assert!(error.to_string().contains("estimated input tokens="));
+    }
+
+    #[test]
+    fn compaction_request_budget_uses_shared_chars_per_token_estimate() {
+        let messages = vec![SessionTurnMessage::user_text("你好世界".repeat(100))];
+        let estimated_input =
+            estimate_provider_request_context_tokens("system", &messages, &[]).used_tokens;
+
+        ensure_compaction_request_within_context_window("system", &messages, estimated_input, 0)
+            .expect("exact estimate should fit");
+        ensure_compaction_request_within_context_window(
+            "system",
+            &messages,
+            estimated_input - 1,
+            0,
+        )
+        .expect_err("one token below the shared estimate should fail");
+    }
+
+    #[test]
+    fn compaction_request_budget_does_not_count_ascii_bytes_as_tokens() {
+        let messages = vec![SessionTurnMessage::user_text("A".repeat(200_000))];
+
+        ensure_compaction_request_within_context_window("system", &messages, 200_000, 65_536)
+            .expect("ordinary long ASCII compaction input should remain usable");
     }
 }

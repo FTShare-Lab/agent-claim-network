@@ -22,11 +22,12 @@ use super::user_shell::{
     format_user_shell_command_record, run_user_shell_command as execute_user_shell_command,
 };
 use crate::api::{
-    estimate_session_turn_messages_tokens, AgentTurnLoop, ContextUsageSnapshot, ContextUsageSource,
-    InboxInternalizeKind, InternalizeRequest, MemoryReviewLoop, SessionAttachment,
-    SessionCompactionOutcome, SessionTurn, SessionTurnEvent, SessionTurnEventRecorder,
-    SessionTurnInterrupted, SessionTurnMessage, SessionTurnPreflight, SessionTurnRequest,
-    StructuredJsonCaller, ToolBoundaryControl, TurnMessage,
+    ensure_compaction_request_within_context_window, estimate_session_turn_messages_tokens,
+    AgentTurnLoop, ContextUsageSnapshot, ContextUsageSource, InboxInternalizeKind,
+    InternalizeRequest, MemoryReviewLoop, SessionAttachment, SessionCompactionOutcome, SessionTurn,
+    SessionTurnEvent, SessionTurnEventRecorder, SessionTurnInterrupted, SessionTurnMessage,
+    SessionTurnPreflight, SessionTurnRequest, StructuredJsonAttemptRequest, StructuredJsonCaller,
+    ToolBoundaryControl, TurnMessage,
 };
 use crate::claim::{AgentId, Claim, ClaimId, DisputeId, SessionId, SourceId, TraceId};
 use crate::config::{
@@ -133,6 +134,68 @@ pub struct SessionEngine {
     attachment: AttachmentConfig,
     mcp_manager: Option<Arc<McpConnectionManager>>,
     subagent_max_concurrent: usize,
+}
+
+/// 运行时直接 abort 会跳过 turn 的正常收束路径；此 guard 只回滚本轮新增或扩展的
+/// 文件读取许可，不尝试回滚真实文件、进程或网络副作用。
+struct FileReadStateCheckpointOnDrop {
+    turn_loop: Arc<AgentTurnLoop>,
+    session_id: SessionId,
+    turn_id: String,
+    armed: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("session turn 已写入 canonical transcript，但提交后清理失败: {source}")]
+struct SessionTurnCommittedPostCommitError {
+    #[source]
+    source: anyhow::Error,
+}
+
+impl FileReadStateCheckpointOnDrop {
+    fn new(turn_loop: Arc<AgentTurnLoop>, session_id: SessionId, turn_id: String) -> Self {
+        Self {
+            turn_loop,
+            session_id,
+            turn_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FileReadStateCheckpointOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            log::warn!(
+                target: "agent",
+                "turn {} dropped without Tokio runtime; file read state checkpoint cannot roll back",
+                self.turn_id
+            );
+            return;
+        };
+        let turn_loop = Arc::clone(&self.turn_loop);
+        let session_id = self.session_id.clone();
+        let turn_id = self.turn_id.clone();
+        runtime.spawn(async move {
+            if let Err(error) = turn_loop
+                .rollback_file_read_state_checkpoint(&session_id, &turn_id)
+                .await
+            {
+                log::warn!(
+                    target: "agent",
+                    "turn {turn_id} drop 后回滚 file read state checkpoint 失败: {error}"
+                );
+                turn_loop.clear_parent_file_read_state(&session_id).await;
+            }
+        });
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -251,12 +314,16 @@ struct ActiveTurnPlan {
     summary_end_segment: usize,
     cursor: ActiveTurnCompactionCursor,
     transcript: Vec<TurnMessage>,
+    transcript_with_large_tool_results_omitted: Vec<TurnMessage>,
+    transcript_with_tool_results_omitted: Vec<TurnMessage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreflightCompactionPlan {
     ranges: CompactionRanges,
     committed_transcript: Option<Vec<TurnMessage>>,
+    committed_transcript_with_large_tool_results_omitted: Option<Vec<TurnMessage>>,
+    committed_transcript_with_tool_results_omitted: Option<Vec<TurnMessage>>,
     active_turn: Option<ActiveTurnPlan>,
     prior_active_turn_summary: Option<String>,
     prior_active_turn_cursor: Option<ActiveTurnCompactionCursor>,
@@ -349,10 +416,10 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
         };
         *system_prompt = projection.system_prompt;
         *provider_messages = projection.messages;
-        // compact 已替换旧正文；不追踪逐 block 可见性，直接保守撤销该 session 的许可。
+        // compact 已替换 parent 的旧正文；child 上下文未变化，不能撤销其独立许可。
         self.engine
             .turn_loop
-            .clear_file_read_state(&self.session.metadata.id)
+            .clear_parent_file_read_state(&self.session.metadata.id)
             .await;
         self.active_start_index = projection.active_start_index;
         self.delegation_projection_inserted = false;
@@ -553,11 +620,15 @@ struct CompactionSummaryInputs<'a> {
     committed_end_index: Option<usize>,
     prior_committed_summary: Option<&'a str>,
     committed_transcript: Option<&'a [TurnMessage]>,
+    committed_transcript_with_large_tool_results_omitted: Option<&'a [TurnMessage]>,
+    committed_transcript_with_tool_results_omitted: Option<&'a [TurnMessage]>,
     prior_active_turn_summary: Option<&'a str>,
     active_turn_user_anchor: Option<&'a SessionTurnMessage>,
     active_turn_start_segment: Option<usize>,
     active_turn_end_segment: Option<usize>,
     active_turn_transcript: Option<&'a [TurnMessage]>,
+    active_turn_transcript_with_large_tool_results_omitted: Option<&'a [TurnMessage]>,
+    active_turn_transcript_with_tool_results_omitted: Option<&'a [TurnMessage]>,
     summary_max_chars: usize,
 }
 
@@ -1795,6 +1866,18 @@ impl SessionEngine {
         let (turn_id, recovery_context, mut journal_emitter, journal_writer) = self
             .start_turn_journal(session, &user_text, &skill_instructions)
             .await?;
+        let checkpoint_result = self
+            .turn_loop
+            .begin_file_read_state_checkpoint(&session.metadata.id, &turn_id)
+            .await
+            .context("建立本轮 file read state checkpoint 失败");
+        let mut checkpoint_guard = checkpoint_result.as_ref().ok().map(|_| {
+            FileReadStateCheckpointOnDrop::new(
+                Arc::clone(&self.turn_loop),
+                session.metadata.id.clone(),
+                turn_id.clone(),
+            )
+        });
         let tool_boundary_control = turn_control
             .as_ref()
             .map(SessionTurnControlReceiver::tool_boundary_control);
@@ -1818,7 +1901,8 @@ impl SessionEngine {
             sink: journal_emitter.sink(),
             assistant_delta_flusher: journal_emitter.assistant_delta_flusher(),
         };
-        let result = {
+        let result = async {
+            checkpoint_result?;
             let mut turn_emit = |event| match event {
                 SessionTurnEvent::Warning { message } => {
                     emit(SessionEvent::Warning { message });
@@ -1972,15 +2056,16 @@ impl SessionEngine {
                 }
                 Err(e) => Err(e),
             }
-        };
+        }
+        .await;
         let turn_interrupted = result
             .as_ref()
             .err()
             .is_some_and(|e| e.downcast_ref::<SessionTurnInterrupted>().is_some());
-        let messages_committed_metadata_error = result
+        let canonical_messages_committed_error = result
             .as_ref()
             .err()
-            .is_some_and(is_messages_committed_metadata_update_failed);
+            .is_some_and(is_canonical_messages_committed_error);
         let interrupted_status = if turn_interrupted {
             tool_boundary_interrupt_status
                 .as_ref()
@@ -1989,7 +2074,7 @@ impl SessionEngine {
         } else {
             TurnJournalStatus::Failed
         };
-        let journal_status = if result.is_ok() || messages_committed_metadata_error {
+        let journal_status = if result.is_ok() || canonical_messages_committed_error {
             TurnJournalStatus::Committed
         } else if turn_interrupted {
             interrupted_status
@@ -2005,6 +2090,31 @@ impl SessionEngine {
             journal_status,
         )
         .await;
+        if let Some(checkpoint_guard) = checkpoint_guard.as_mut() {
+            let checkpoint_finalize = if journal_status == TurnJournalStatus::Committed {
+                self.turn_loop
+                    .commit_file_read_state_checkpoint(&session.metadata.id, &turn_id)
+                    .await
+            } else {
+                self.turn_loop
+                    .rollback_file_read_state_checkpoint(&session.metadata.id, &turn_id)
+                    .await
+            };
+            if let Err(e) = checkpoint_finalize {
+                log::warn!(
+                    target: "agent",
+                    "收束 file read state checkpoint 失败，保守清空 session 许可 \
+                     (session={}, turn={}, status={}): {e:#}",
+                    session.metadata.id,
+                    turn_id,
+                    journal_status.as_str(),
+                );
+                self.turn_loop
+                    .clear_parent_file_read_state(&session.metadata.id)
+                    .await;
+            }
+            checkpoint_guard.disarm();
+        }
         if journal_status != TurnJournalStatus::Committed {
             if let Err(e) = self.clear_active_compaction(session).await {
                 log::warn!(
@@ -2523,7 +2633,9 @@ impl SessionEngine {
         } else {
             self.clear_active_context_usage_anchor(&metadata.id);
         }
-        self.clear_active_compaction(session).await?;
+        self.clear_active_compaction(session)
+            .await
+            .map_err(|source| SessionTurnCommittedPostCommitError { source })?;
         Ok(CommittedSessionTurn {
             message_count,
             provider_context_usage_observed,
@@ -2898,8 +3010,8 @@ impl SessionEngine {
             metadata.message_count,
             committed_tail_limit,
         );
-        let committed_transcript = if summary_end > summary_start {
-            Some(session_messages_to_turn_transcript(
+        let committed_transcripts = if summary_end > summary_start {
+            Some(session_compaction_transcript_projection(
                 session_messages
                     .get(summary_start..summary_end)
                     .with_context(|| {
@@ -2907,10 +3019,19 @@ impl SessionEngine {
                             "session compact summary 范围越界: [{summary_start}, {summary_end})"
                         )
                     })?,
+                self.compaction.tool_result_raw_max_chars,
             ))
         } else {
             None
         };
+        let committed_transcript = committed_transcripts
+            .as_ref()
+            .map(|projection| projection.full.clone());
+        let committed_transcript_with_large_tool_results_omitted = committed_transcripts
+            .as_ref()
+            .map(|projection| projection.large_tool_results_omitted.clone());
+        let committed_transcript_with_tool_results_omitted =
+            committed_transcripts.map(|projection| projection.tool_results_omitted);
         Ok(PreflightCompactionPlan {
             ranges: CompactionRanges {
                 summary_start_index: summary_start,
@@ -2923,6 +3044,8 @@ impl SessionEngine {
                 },
             },
             committed_transcript,
+            committed_transcript_with_large_tool_results_omitted,
+            committed_transcript_with_tool_results_omitted,
             active_turn,
             prior_active_turn_summary: prior_active_turn
                 .as_ref()
@@ -2979,7 +3102,10 @@ impl SessionEngine {
             active_suffix,
             &segments[summary_start_segment..summary_end_segment],
         );
-        let transcript = turn_messages_to_transcript(summary_messages);
+        let transcript_projection = compaction_transcript_projection(
+            summary_messages.into_iter().cloned().collect(),
+            self.compaction.tool_result_raw_max_chars,
+        );
         let source_hash = active_segments_hash(active_suffix, &segments[..summary_end_segment])?;
         Ok(Some(ActiveTurnPlan {
             summary_start_segment,
@@ -2991,7 +3117,10 @@ impl SessionEngine {
                 safe_until_event_seq: 0,
                 source_hash,
             },
-            transcript,
+            transcript: transcript_projection.full,
+            transcript_with_large_tool_results_omitted: transcript_projection
+                .large_tool_results_omitted,
+            transcript_with_tool_results_omitted: transcript_projection.tool_results_omitted,
         }))
     }
 
@@ -3137,6 +3266,12 @@ impl SessionEngine {
                 .map(|_| plan.ranges.summary_end_index),
             prior_committed_summary: prior_committed_summary.as_deref(),
             committed_transcript: plan.committed_transcript.as_deref(),
+            committed_transcript_with_large_tool_results_omitted: plan
+                .committed_transcript_with_large_tool_results_omitted
+                .as_deref(),
+            committed_transcript_with_tool_results_omitted: plan
+                .committed_transcript_with_tool_results_omitted
+                .as_deref(),
             prior_active_turn_summary: prior_active_summary.as_deref(),
             active_turn_user_anchor: plan
                 .active_turn
@@ -3154,6 +3289,14 @@ impl SessionEngine {
                 .active_turn
                 .as_ref()
                 .map(|active| active.transcript.as_slice()),
+            active_turn_transcript_with_large_tool_results_omitted: plan
+                .active_turn
+                .as_ref()
+                .map(|active| active.transcript_with_large_tool_results_omitted.as_slice()),
+            active_turn_transcript_with_tool_results_omitted: plan
+                .active_turn
+                .as_ref()
+                .map(|active| active.transcript_with_tool_results_omitted.as_slice()),
             summary_max_chars: self.compaction.summary_max_chars,
         };
         let (generated_compaction, prepared_recap) = if plan.committed_transcript.is_some()
@@ -3167,12 +3310,11 @@ impl SessionEngine {
                         plan.ranges.recap_start_index, plan.ranges.recap_end_index
                     )
                 })?;
-            let (summary_result, recap_result) = tokio::join!(
-                self.generate_compaction_summary(session, &summary_inputs, emit),
-                self.prepare_finalize_segment(recap_segment)
-            );
-            let generated_compaction = summary_result?;
-            let prepared_recap = match recap_result {
+            // Summary 先完成本地预算检查；超限时不能并发启动无效的 recap provider 请求。
+            let generated_compaction = self
+                .generate_compaction_summary(session, &summary_inputs, emit)
+                .await?;
+            let prepared_recap = match self.prepare_finalize_segment(recap_segment).await {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     let audit_ids = vec![generated_compaction.audit_id.clone()];
@@ -3498,7 +3640,7 @@ impl SessionEngine {
                 .await;
                 // 手动 compact 已用摘要替换模型可见正文，旧读取许可不能跨该边界继续使用。
                 self.turn_loop
-                    .clear_file_read_state(&session.metadata.id)
+                    .clear_parent_file_read_state(&session.metadata.id)
                     .await;
                 emit(SessionEvent::CompactionCompleted {
                     compacted_until: outcome.state.committed_message_until(),
@@ -3658,8 +3800,10 @@ impl SessionEngine {
                 let (used_claim_ids, prepared_claims, prepared_disputes, summary, audit_ids) =
                     match (has_recap_work, has_summary_work) {
                         (true, true) => {
-                            let summary_transcript =
-                                session_messages_to_turn_transcript(summary_segment);
+                            let summary_transcript = session_compaction_transcript_projection(
+                                summary_segment,
+                                self.compaction.tool_result_raw_max_chars,
+                            );
                             let summary_inputs = CompactionSummaryInputs {
                                 audit: CompactionAuditSummaryContext {
                                     trigger: CompactionAuditTrigger::ManualCheckpoint,
@@ -3671,23 +3815,30 @@ impl SessionEngine {
                                 committed_start_index: Some(ranges.summary_start_index),
                                 committed_end_index: Some(ranges.summary_end_index),
                                 prior_committed_summary: prior_summary.as_deref(),
-                                committed_transcript: Some(&summary_transcript),
+                                committed_transcript: Some(&summary_transcript.full),
+                                committed_transcript_with_large_tool_results_omitted: Some(
+                                    &summary_transcript.large_tool_results_omitted,
+                                ),
+                                committed_transcript_with_tool_results_omitted: Some(
+                                    &summary_transcript.tool_results_omitted,
+                                ),
                                 prior_active_turn_summary: None,
                                 active_turn_user_anchor: None,
                                 active_turn_start_segment: None,
                                 active_turn_end_segment: None,
                                 active_turn_transcript: None,
+                                active_turn_transcript_with_large_tool_results_omitted: None,
+                                active_turn_transcript_with_tool_results_omitted: None,
                                 summary_max_chars: self.compaction.summary_max_chars,
                             };
-                            let (summary_result, recap_result) = tokio::join!(
-                                self.generate_compaction_summary(session, &summary_inputs, emit),
-                                self.prepare_finalize_segment(recap_segment)
-                            );
-                            let generated_compaction = summary_result?;
+                            // Summary 先完成本地预算检查；超限时不能并发启动无效的 recap provider 请求。
+                            let generated_compaction = self
+                                .generate_compaction_summary(session, &summary_inputs, emit)
+                                .await?;
                             generated_audit_ids.push(generated_compaction.audit_id.clone());
                             let compaction = generated_compaction.outcome;
                             let (used_claim_ids, prepared_claims, prepared_disputes) =
-                                audit_try!(recap_result);
+                                audit_try!(self.prepare_finalize_segment(recap_segment).await);
                             let summary = enforce_summary_max_chars(
                                 audit_try!(compaction.committed_summary.with_context(|| {
                                     "compaction summary missing committed_summary"
@@ -3719,8 +3870,10 @@ impl SessionEngine {
                             )
                         }
                         (false, true) => {
-                            let summary_transcript =
-                                session_messages_to_turn_transcript(summary_segment);
+                            let summary_transcript = session_compaction_transcript_projection(
+                                summary_segment,
+                                self.compaction.tool_result_raw_max_chars,
+                            );
                             let summary_inputs = CompactionSummaryInputs {
                                 audit: CompactionAuditSummaryContext {
                                     trigger: CompactionAuditTrigger::ManualCheckpoint,
@@ -3732,12 +3885,20 @@ impl SessionEngine {
                                 committed_start_index: Some(ranges.summary_start_index),
                                 committed_end_index: Some(ranges.summary_end_index),
                                 prior_committed_summary: prior_summary.as_deref(),
-                                committed_transcript: Some(&summary_transcript),
+                                committed_transcript: Some(&summary_transcript.full),
+                                committed_transcript_with_large_tool_results_omitted: Some(
+                                    &summary_transcript.large_tool_results_omitted,
+                                ),
+                                committed_transcript_with_tool_results_omitted: Some(
+                                    &summary_transcript.tool_results_omitted,
+                                ),
                                 prior_active_turn_summary: None,
                                 active_turn_user_anchor: None,
                                 active_turn_start_segment: None,
                                 active_turn_end_segment: None,
                                 active_turn_transcript: None,
+                                active_turn_transcript_with_large_tool_results_omitted: None,
+                                active_turn_transcript_with_tool_results_omitted: None,
                                 summary_max_chars: self.compaction.summary_max_chars,
                             };
                             let generated_compaction = self
@@ -4054,7 +4215,7 @@ impl SessionEngine {
                 }),
             )
             .context("渲染 session_compaction prompt 失败")?;
-        let payload = SessionCompactionPayload {
+        let mut payload = SessionCompactionPayload {
             instruction: COMPACTION_INSTRUCTION,
             agent_id: self.runner.agent_id.as_str(),
             committed_start_index: inputs.committed_start_index,
@@ -4068,7 +4229,45 @@ impl SessionEngine {
             active_turn_transcript: inputs.active_turn_transcript,
             summary_max_chars: inputs.summary_max_chars,
         };
-        let user_text = serde_json::to_string_pretty(&payload)?;
+        let mut user_text = serde_json::to_string_pretty(&payload)?;
+        let mut provider_messages = vec![SessionTurnMessage::user_text(user_text.clone())];
+        if let Err(full_error) = ensure_compaction_request_within_context_window(
+            &system_prompt,
+            &provider_messages,
+            self.context_window,
+            self.json_caller.max_tokens(),
+        ) {
+            payload.committed_transcript =
+                inputs.committed_transcript_with_large_tool_results_omitted;
+            payload.active_turn_transcript =
+                inputs.active_turn_transcript_with_large_tool_results_omitted;
+            user_text = serde_json::to_string_pretty(&payload)?;
+            provider_messages = vec![SessionTurnMessage::user_text(user_text.clone())];
+            if let Err(large_omission_error) = ensure_compaction_request_within_context_window(
+                &system_prompt,
+                &provider_messages,
+                self.context_window,
+                self.json_caller.max_tokens(),
+            ) {
+                payload.committed_transcript =
+                    inputs.committed_transcript_with_tool_results_omitted;
+                payload.active_turn_transcript =
+                    inputs.active_turn_transcript_with_tool_results_omitted;
+                user_text = serde_json::to_string_pretty(&payload)?;
+                provider_messages = vec![SessionTurnMessage::user_text(user_text.clone())];
+                ensure_compaction_request_within_context_window(
+                    &system_prompt,
+                    &provider_messages,
+                    self.context_window,
+                    self.json_caller.max_tokens(),
+                )
+                .with_context(|| {
+                    format!(
+                        "compaction summary request remains over budget after omitting all tool results; full input error: {full_error:#}; large-tool-result omission error: {large_omission_error:#}"
+                    )
+                })?;
+            }
+        }
         let payload_preview = audit_text_preview(&user_text, COMPACTION_AUDIT_PREVIEW_CHARS);
         let audit_id = compaction_audit_id(session, &inputs.audit, &payload_preview.hash);
         self.append_compaction_audit_event(
@@ -4090,9 +4289,8 @@ impl SessionEngine {
         let mut retry_warnings = Vec::new();
         let result = self
             .json_caller
-            .generate_json_validated_with_attempt_notice(
-                system_prompt,
-                vec![SessionTurnMessage::user_text(user_text)],
+            .generate_json_validated_with_guarded_attempts(
+                StructuredJsonAttemptRequest::compaction(system_prompt, provider_messages),
                 |value| parse_compaction_summary_outcome(value, inputs).map_err(anyhow::Error::from),
                 |retry_index, retry_total, e| {
                     let message = format!(
@@ -4121,6 +4319,15 @@ impl SessionEngine {
                     async move {
                         self.append_compaction_audit_event(session, kind).await;
                     }
+                },
+                |system_prompt, attempt_messages| {
+                    ensure_compaction_request_within_context_window(
+                        system_prompt,
+                        attempt_messages,
+                        self.context_window,
+                        self.json_caller.max_tokens(),
+                    )
+                    .context("compaction summary provider attempt exceeds context window")
                 },
             )
             .await;
@@ -4295,11 +4502,13 @@ fn user_text_with_recovery_context(user_text: String, recovery_context: Option<&
     format!("{recovery_context}\n\n<current_user_request>\n{payload}\n</current_user_request>")
 }
 
-fn is_messages_committed_metadata_update_failed(error: &anyhow::Error) -> bool {
+fn is_canonical_messages_committed_error(error: &anyhow::Error) -> bool {
     matches!(
         error.downcast_ref::<SessionStoreError>(),
         Some(SessionStoreError::MessagesCommittedMetadataUpdateFailed { .. })
-    )
+    ) || error
+        .downcast_ref::<SessionTurnCommittedPostCommitError>()
+        .is_some()
 }
 
 fn journal_turn_is_already_canonical(turn: &TurnJournalTurn, messages: &[SessionMessage]) -> bool {

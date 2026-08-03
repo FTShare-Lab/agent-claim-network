@@ -1,6 +1,6 @@
 # TUI File Diff 展示与 file 类工具优化需求设计
 
-> 状态：已实现。本文保留 file 工具写前约束、diff 事件与 TUI 展示决策。
+> 状态：已实现。本文保留 diff 事件与 TUI 展示决策；当前分页读取和分级写入许可统一以 `PRD_file_read_write_capability.md` 为准。
 
 ## 背景
 
@@ -18,7 +18,7 @@
 - streaming 虚线框内不展示 diff；turn 落定进 scrollback 后才展示。
 - 超长修改截断：只展示前 N 行修改（按 changed lines 计数，可配），尾部提示剩余修改行数。
 - resume 会话后，历史消息里的 diff 仍然可见。
-- `file_patch` 精确性优化：多匹配报错附带各匹配行号；新增 `replace_all` 可选参数。
+- `file_patch` 精确性优化：多匹配使用有界歧义错误；`replace_all` 为显式可选参数。
 - 既有文件写入前必须有完整 `file_read` 记录，并检查 stale，避免模型基于旧内容覆盖用户或 formatter 的改动。
 - 本期不新增 `file_delete`；删除继续通过 `code_run` / shell 完成，删除造成的文件变化不展示 file diff。
 
@@ -46,10 +46,10 @@
 ### file_patch 精确性
 
 - 保留当前默认行为：`replace_all = false` 时，`old_content` 必须全局唯一匹配。
-- 多匹配报错信息附带全部匹配起始行号（如"第 12、87、203 行"），提示模型扩块或使用 `replace_all`；本期不对行号列表做数量截断，避免模型只看到前部候选而误判目标位置。
-- 新增可选参数 `replace_all: bool`（默认 false）：true 时替换全部匹配，result 中返回替换处数；diff 采集覆盖全部替换位置。
+- 默认按大小写敏感、逐字节精确、非重叠语义扫描；只保存第一处，发现第二处立即停止并返回固定长度错误，提示扩大文本块并加入目标附近上下文。不得静默选择第一处，也不输出随匹配数量增长的位置列表。
+- `replace_all: bool`（默认 false）：true 时替换全部非重叠精确匹配，result 中返回替换处数；统计使用常量额外内存，不保存位置列表，diff 采集覆盖全部替换位置。
 - 0 匹配行为保持失败，但错误信息应提示先 `file_read` 确认当前内容。
-- 工具 description 与实际 system prompt/tool 使用说明同步补充：read-before-write、唯一匹配约束、多匹配报错行为、`replace_all` 用法。
+- 工具 description 与实际 system prompt/tool 使用说明同步补充：read-before-write、唯一匹配约束、扩大上下文的消歧方式与 `replace_all` 用法。
 
 ### file_write 行为
 
@@ -123,7 +123,7 @@ file_diff_max_changed_lines = 20
 
 - 采集：patch 唯一匹配 / patch replace_all / write overwrite / write append / write prepend / 新建文件，`FileChange` 的 kind、增删统计、截断行数正确；before == after 不生成 diff。
 - 写前校验：已有文件未完整 `file_read` 时拒绝写入；文件 stale 时拒绝写入；新建文件允许无 read state；append / prepend 读旧文件的非 NotFound 错误会失败。
-- `file_patch`：多匹配报错含全部匹配行号；`replace_all = true` 全量替换并返回处数；0 匹配行为不变。
+- `file_patch`：两处及大量重复匹配都返回固定长度歧义错误；`replace_all = true` 全量替换并返回处数；0 匹配行为不变。
 - TUI：turn 进行中虚线框内已完成的 file 工具不出现 diff 行；`TurnCommitted` 落 scrollback 后出现；超限截断提示正确；失败调用不渲染 diff。
 - resume：journal 回放后历史 ToolCell 带 diff。
 
@@ -133,7 +133,7 @@ file_diff_max_changed_lines = 20
 - `+` / `-` 行不仅文字有语义色，整条物理终端行也分别使用淡绿 / 淡红背景；文字末尾后的空白区域、折行续行和极窄终端均不得漏回 surface 背景。
 - streaming 虚线框内始终无 diff。
 - 超长修改按 `file_diff_max_changed_lines` 截断，默认 20 行修改。
-- `file_patch` 多匹配报错可定位，`replace_all` 生效。
+- `file_patch` 多匹配不会误改或产生无界错误，扩大上下文可精确定位，`replace_all` 生效。
 - 已有文件修改必须基于完整 `file_read` 且通过 stale guard。
 
 ## 本阶段不做

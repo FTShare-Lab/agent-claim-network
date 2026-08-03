@@ -19,6 +19,40 @@ impl ToolRegistry {
         self.read_state.clear_session(session_id).await;
     }
 
+    /// 主会话 compact 只撤销 parent scope，不影响仍在运行的 delegation child。
+    pub(crate) async fn clear_parent_file_read_state(&self, session_id: &SessionId) {
+        self.read_state
+            .clear_scope(&ReadStateScope::new(Some(session_id.clone()), None))
+            .await;
+    }
+
+    pub(crate) async fn begin_file_read_state_checkpoint(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+    ) -> Result<(), String> {
+        let scope = self.file_read_state_scope_for_turn(session_id, turn_id);
+        self.read_state.begin_checkpoint(&scope, turn_id).await
+    }
+
+    pub(crate) async fn commit_file_read_state_checkpoint(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+    ) -> Result<(), String> {
+        let scope = self.file_read_state_scope_for_turn(session_id, turn_id);
+        self.read_state.commit_checkpoint(&scope, turn_id).await
+    }
+
+    pub(crate) async fn rollback_file_read_state_checkpoint(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+    ) -> Result<(), String> {
+        let scope = self.file_read_state_scope_for_turn(session_id, turn_id);
+        self.read_state.rollback_checkpoint(&scope, turn_id).await
+    }
+
     /// delegation compact 只撤销该 child 的许可，不影响同 session 的 parent / sibling。
     pub(crate) async fn clear_delegation_file_read_state(
         &self,
@@ -31,6 +65,15 @@ impl ToolRegistry {
                 Some(caller_id.to_owned()),
             ))
             .await;
+    }
+
+    fn file_read_state_scope_for_turn(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+    ) -> ReadStateScope {
+        let caller_id = self.access.delegation_child.then(|| turn_id.to_owned());
+        ReadStateScope::new(Some(session_id.clone()), caller_id)
     }
 
     pub(super) fn file_read_state_scope(
@@ -210,31 +253,24 @@ impl ToolRegistry {
             Err(error) => return Err(ToolError::Io(error)),
         });
         let key = lexical_normalize_path(&write_path);
-        let matches = before
+        let mut match_starts = before
             .match_indices(&args.old_content)
-            .map(|(start, _)| start)
-            .collect::<Vec<_>>();
-        if matches.is_empty() {
+            .map(|(start, _)| start);
+        let Some(match_start) = match_starts.next() else {
             return Ok(ToolExecution::business_failure(json!({
                 "path": args.path,
                 "status": "error",
                 "msg": "未找到匹配的 old_content，请先重新 file_read 确认当前内容。",
             })));
-        }
-        if matches.len() > 1 && !args.replace_all {
-            let line_list = match_start_line_numbers(&before, &args.old_content)
-                .iter()
-                .map(usize::to_string)
-                .collect::<Vec<_>>()
-                .join("、");
+        };
+        if !args.replace_all && match_starts.next().is_some() {
             return Ok(ToolExecution::business_failure(json!({
                 "path": args.path,
                 "status": "error",
-                "msg": format!("找到 {} 处匹配（第 {line_list} 行），old_content 必须全局唯一。请扩大文本块，或在确认全部替换时使用 replace_all=true。", matches.len()),
+                "msg": "old_content 至少匹配两处，必须全局唯一。请扩大文本块并加入目标附近上下文，或在确认全部替换时使用 replace_all=true。",
             })));
         }
 
-        let match_start = matches[0];
         let match_end = match_start.saturating_add(args.old_content.len());
         let suggested = suggested_read_range(&before, match_start, match_end);
         let authority = match self.evaluate_file_read_state(context, &key, &before).await {
@@ -268,7 +304,11 @@ impl ToolRegistry {
             )));
         }
 
-        let replacements = if args.replace_all { matches.len() } else { 1 };
+        let replacements = if args.replace_all {
+            1usize.saturating_add(match_starts.count())
+        } else {
+            1
+        };
         let after = Arc::new(if args.replace_all {
             before.replace(&args.old_content, &args.new_content)
         } else {
@@ -696,24 +736,6 @@ fn stale_write_error(display_path: &str) -> Value {
             "文件 {display_path} 在写入前被其他进程修改，原子写入已拒绝；请重新读取所需区域后再试。"
         ),
     })
-}
-
-/// 线性扫描所有非重叠精确匹配的起始行号，与 `str::replace` 语义一致。
-fn match_start_line_numbers(content: &str, needle: &str) -> Vec<usize> {
-    let mut line = 1usize;
-    let mut scanned_until = 0usize;
-    let mut result = Vec::new();
-    for (start, _) in content.match_indices(needle) {
-        line = line.saturating_add(
-            content[scanned_until..start]
-                .bytes()
-                .filter(|byte| *byte == b'\n')
-                .count(),
-        );
-        result.push(line);
-        scanned_until = start;
-    }
-    result
 }
 
 pub(super) fn ensure_not_memory_path(path: &Path) -> Result<(), ToolError> {

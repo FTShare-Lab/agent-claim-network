@@ -13,7 +13,8 @@ use image::{ImageFormat, ImageReader};
 use serde_json::{json, Value};
 
 use crate::config::{
-    AttachmentConfig, DEFAULT_ATTACHMENT_MAX_FILES_PER_TURN, DEFAULT_ATTACHMENT_MAX_FILE_BYTES,
+    AttachmentConfig, ToolConfig, DEFAULT_ATTACHMENT_MAX_FILES_PER_TURN,
+    DEFAULT_ATTACHMENT_MAX_FILE_BYTES, DEFAULT_FILE_READ_MAX_CHARS,
 };
 
 /// 图片规格化后的最大边长（像素）。协议内部不变量，刻意不暴露为配置。
@@ -26,6 +27,8 @@ pub struct AttachmentLimits {
     pub enabled: bool,
     pub max_file_bytes: u64,
     pub max_files_per_turn: usize,
+    /// 单个 `@` 文本文件可内联到 provider 请求中的最大 Unicode 字符数。
+    pub max_text_chars: usize,
 }
 
 impl Default for AttachmentLimits {
@@ -34,6 +37,7 @@ impl Default for AttachmentLimits {
             enabled: true,
             max_file_bytes: DEFAULT_ATTACHMENT_MAX_FILE_BYTES,
             max_files_per_turn: DEFAULT_ATTACHMENT_MAX_FILES_PER_TURN,
+            max_text_chars: DEFAULT_FILE_READ_MAX_CHARS,
         }
     }
 }
@@ -44,6 +48,19 @@ impl From<&AttachmentConfig> for AttachmentLimits {
             enabled: cfg.enabled,
             max_file_bytes: cfg.max_file_bytes,
             max_files_per_turn: cfg.max_files_per_turn,
+            max_text_chars: DEFAULT_FILE_READ_MAX_CHARS,
+        }
+    }
+}
+
+impl AttachmentLimits {
+    /// 将附件媒体限制与 `file_read` 单页字符限制装配成统一运行时限制。
+    pub fn from_configs(attachment: &AttachmentConfig, tool: &ToolConfig) -> Self {
+        Self {
+            enabled: attachment.enabled,
+            max_file_bytes: attachment.max_file_bytes,
+            max_files_per_turn: attachment.max_files_per_turn,
+            max_text_chars: tool.file_read_max_chars,
         }
     }
 }
@@ -479,6 +496,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn text_attachment_limit_reuses_file_read_max_chars() {
+        let attachment = AttachmentConfig::default();
+        let mut tool = ToolConfig::default();
+        tool.file_read_max_chars = 17;
+
+        let limits = AttachmentLimits::from_configs(&attachment, &tool);
+
+        assert_eq!(limits.max_text_chars, 17);
+    }
+
     #[tokio::test]
     async fn normalize_image_detects_media_type_from_content_not_extension() {
         let media = normalize_image_attachment(tiny_png_bytes(), "fake.jpg")
@@ -514,6 +542,7 @@ mod tests {
             enabled: true,
             max_file_bytes: 1,
             max_files_per_turn: 5,
+            ..AttachmentLimits::default()
         };
         let err = normalize_image_attachment_with_limits(
             wide_png_bytes(IMAGE_MAX_EDGE_PX + 100),
@@ -557,6 +586,7 @@ mod tests {
             enabled: true,
             max_file_bytes: 16,
             max_files_per_turn: 5,
+            ..AttachmentLimits::default()
         };
         assert!(matches!(
             read_attachment(&path, &limits).await,

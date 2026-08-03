@@ -1,6 +1,6 @@
 # PRD：文件分页读取与分级修改许可
 
-> 状态：已完成（2026-07-28）。
+> 状态：已完成（2026-07-31）。
 >
 > 本文只修改文本文件的 `file_read`、`file_patch`、`file_write` 和 `@file` 修改许可。`code_run`、媒体附件、目录附件及其他 agent 状态机不在本期范围内。
 
@@ -17,6 +17,8 @@
 5. 完整 UTF-8 `@file` 正文在首轮 preflight 后仍完整保留于即将发送的模型请求中时，登记等价的完整读取许可。
 6. 所有写入前重新计算内容摘要；文件变化时旧许可立即失效。
 7. compact、resume 等无法继续保证旧正文可见的生命周期事件，直接保守清空对应 scope 的全部许可。
+8. 每个主 turn 和 delegation task 都对本任务引起的 read state 变化建立 checkpoint；任务未提交时只回滚读取状态，已经发生的文件、进程和网络副作用不回滚。
+9. 默认 `file_patch` 的 `old_content` 必须逐字节全局唯一；发现第二处匹配立即用固定长度错误拒绝，不收集全部位置。
 
 本方案不引入 provider 成功回执、`PendingReadEvidence`、`evidence_id`、逐 block sidecar、`visibility_epoch` 或历史消息许可证重建。
 
@@ -143,6 +145,20 @@ FileReadState {
 | compact 成功 | 当前 scope 正文被摘要替换 | 清空对应 scope | 后续编辑重新读取 |
 | resume | 重新打开旧 session | 清空该 session 全部 scope | 不从历史消息重建许可 |
 | 状态超过容量上限 | 范围或条目被淘汰 | 对应状态转为 Missing | 只增加重读，不放宽权限 |
+| 主 turn / delegation task 提交 | 本任务存在活动 checkpoint | 丢弃 before-image，保留本任务状态变化 | 后续可继续使用已建立许可 |
+| 主 turn / delegation task 未提交 | provider、preflight、校验、持久化、cancel、steer 或中断失败 | 恢复本任务前状态 | 不回滚真实工具副作用 |
+
+### 4.5 未提交任务的 checkpoint
+
+`ReadStateStore` 按 `ReadStateScope + turn_id` 保存内部 checkpoint。某个路径在本任务第一次变化时记录 before-image；同一路径后续的读取扩展、写后迁移、stale 删除、CAS 失败、`clear_path` 和容量淘汰不重复复制状态。
+
+- 主 turn 只有 canonical messages 已提交后才提交 checkpoint。消息已落盘但 metadata 修复失败仍按 canonical 已提交处理。
+- delegation child 只有完整任务、transcript 和 completed 状态收束后才提交 checkpoint。
+- 普通工具业务失败不会立即回滚；由整个任务最终是否提交决定。
+- 任务失败、cancel、steer、provider/preflight 错误、工具中断或响应校验失败时恢复 before-image。
+- checkpoint 只管理 `FileReadState`。已经完成的文件写入、命令、HTTP 请求等真实副作用保持不变。
+- 若本任务已经修改文件后失败，旧 read state 恢复的是写前 revision；下一次 file tool 写入会重新计算 SHA-256，并以 `stale: true` 拒绝该旧许可。
+- compact、resume 的清理是生命周期屏障：清理时同时丢弃 checkpoint 中对应 scope 的旧 before-image。屏障后新建立的状态仍可随任务失败撤销，但 compact 前的许可不会被复活。
 
 ## 5. `file_read` 分页行为
 
@@ -258,13 +274,14 @@ parent 与 delegation child 复用同一异步流式实现：
 
 默认 patch 还需执行以下操作级校验：
 
-1. 在全文查找 `old_content`；默认必须恰好匹配一次。
-2. `old_content` 直接涉及的旧行必须已覆盖。
-3. 把已覆盖行临时映射为已知 byte spans，在内存中模拟替换。
-4. 替换后所有受影响结果行必须完全由已知旧 bytes 和 `new_content` 组成。
-5. 删除换行导致已读行与未读相邻行拼接时拒绝，并在 `required_read` 中建议补读相邻行。
+1. 在全文按大小写敏感、逐字节精确语义查找 `old_content`；默认必须恰好匹配一次。
+2. 默认扫描只保留第一处位置；发现第二处非重叠匹配立即停止并返回固定长度歧义错误，提示扩大 `old_content` 并加入目标附近上下文。
+3. `old_content` 直接涉及的旧行必须已覆盖。
+4. 把已覆盖行临时映射为已知 byte spans，在内存中模拟替换。
+5. 替换后所有受影响结果行必须完全由已知旧 bytes 和 `new_content` 组成。
+6. 删除换行导致已读行与未读相邻行拼接时拒绝，并在 `required_read` 中建议补读相邻行。
 
-`replace_all=true` 会修改所有匹配位置，因此仍要求 Complete。
+`replace_all=true` 会修改所有非重叠精确匹配，因此仍要求 Complete。实现只保存首个位置并以迭代计数统计其余匹配，不构造位置列表；不做模糊匹配、缩进或换行归一化。
 
 局部许可只放宽读取范围，不放宽全局唯一匹配、UTF-8、路径保护、revision 或 compare-and-swap 校验。
 
@@ -307,6 +324,7 @@ byte provenance 只在写入事务内临时存在，`ReadStateStore` 仍只保�
 
 - 通过既有附件入口读取普通 UTF-8 文本；
 - 通过附件开关、文件大小、单轮数量和受保护路径校验；
+- 单个文本文件的 Unicode 字符数不超过 `[agent.tool].file_read_max_chars`；多个文本附件分别判断，不设置合计字符预算；
 - 正文是完整原始内容，不是预览、摘录或目录列表；
 - 生成的用户消息确实包含该完整正文。
 
@@ -321,6 +339,8 @@ revision 只基于正文 bytes，不包含 `Attached file:`、`Path:` 等包装�
 - 无效 UTF-8、超限、读取失败、不存在、非普通文件或受保护路径；
 - 用户手写的 `Attached file:` 文本或普通自然语言路径；
 - 被截断、摘要化或只剩引用的附件。
+
+超过 `file_read_max_chars` 的文本附件不作为错误终止本轮：请求中只保留路径、实际字符数和使用 `file_read` 的提示，TUI 显示非致命 warning，不登记任何读取许可。该字符限制不适用于 PDF、磁盘图片或剪贴板图片；这些媒体继续只受既有 5 MiB、数量和格式校验约束。
 
 ### 7.3 生命周期
 
@@ -366,6 +386,7 @@ revision 只基于正文 bytes，不包含 `Attached file:`、`Path:` 等包装�
 - 同路径前序写入业务失败、异常或中断后，后续写入标记 skipped；`no_change` 可以继续。
 - 不同路径的安全工具仍可按现有调度并行。
 - `code_run` 修改不主动更新 read state；下一次 file tool 写入会因 revision 不同拒绝旧许可。
+- 不设置单轮 `file_read` 总字符或 token 预算；单次结果仍由 `file_read_max_chars` 限制。
 
 直接登记 `file_read` 页面的取舍是：同一 assistant 响应如果先执行 read、再执行 write，后者可以使用刚登记的许可。安全性由“返回完整行范围、精确 patch/EOF 分级、内容摘要和原子写入”保证，不再额外证明模型是否在生成该 write 前看过 tool result。
 
@@ -387,6 +408,8 @@ revision 只基于正文 bytes，不包含 `Attached file:`、`Path:` 等包装�
 - 非 Complete 的 `replace_all`、overwrite 和 prepend 拒绝。
 - 有效 EOF 页允许 append；超 EOF 空读、缺失最后一行和 stale revision 拒绝。
 - patch 插入/删除行和 EOF append 后范围迁移正确。
+- 两处及大量重复匹配都以固定长度错误拒绝；扩大 `old_content` 后只修改目标位置。
+- `replace_all=true` 正确替换全部非重叠匹配，且不保存匹配位置列表。
 - 外部并发修改在摘要或 compare-and-swap 阶段被拒绝。
 - 许可失败返回正确 `required_read`。
 
@@ -395,8 +418,12 @@ revision 只基于正文 bytes，不包含 `Attached file:`、`Path:` 等包装�
 - 完整 UTF-8 `@file` 无需 `file_read` 即可执行所有写操作。
 - 附件读取后文件变化，写前摘要拒绝旧许可。
 - 相对路径、绝对路径和符号链接归并。
-- `@目录`、媒体、无效 UTF-8、超限、失败和受保护路径不授权。
+- `@目录`、媒体、无效 UTF-8、失败和受保护路径不授权；文本超出 `file_read_max_chars` 时仅路径降级并显示 warning，同样不授权。
+- 多个文本附件按单文件分别应用 `file_read_max_chars`，不设置单轮合计字符预算；PDF 和图片不应用文本字符限制。
 - compact 和 resume 清理旧许可；delegation compact 只清理对应 child scope。
+- provider 失败、cancel 和 steer 会撤销本任务新建或扩展的 read state，并保留任务前已有状态。
+- 任务已成功写文件后再失败：磁盘内容保留，恢复的旧 revision 在下次 file tool 写入时判为 stale。
+- compact 后任务失败只撤销 compact 后新状态，不复活 compact 前许可。
 - 主会话历史、当前 turn 和 delegation child 的 compacted context 都明确提示旧读取不再授权，并引导按 `required_read` 重建许可。
 - parent 许可不传给 delegation child。
 
@@ -417,7 +444,7 @@ revision 只基于正文 bytes，不包含 `Attached file:`、`Path:` 等包装�
 ## 12. 实施验证
 
 - 版本一致性、格式化、Clippy（warnings denied）和 `cargo check` 通过。
-- 除一个可在最新 main 独立复现的 MCP discovery 既有失败外，1831 个 library 测试、全部 binary/integration 测试和 doc tests 通过。
-- 默认 tmux TUI 冒烟通过，stderr 为空。
-- 同级虚构项目的专项 tmux 流程通过：大文件最小窗口 patch、EOF append、未读修改拒绝和完整 `@file` overwrite 均符合本 PRD，stderr 为空。
-- 独立只读代码审查发现的手动 compact 清理、附件外置误授权和 canonical target 读取顺序问题均已修复并补充回归测试。
+- 1874 个 library 测试通过；一个可在最新 main 独立复现的 MCP discovery 既有失败被单独排除。55 个 binary 测试、6 个 integration 测试和 doc tests 通过。
+- 使用隔离 fake provider 配置运行仓库 tmux 冒烟流程通过，stderr 为空。
+- 超限 `@` 文本专项 tmux 流程通过：TUI 显示非致命 warning 后继续完成任务，请求中只包含路径和实际字符数，不泄露正文；120 列终端下未发现边框、换行或状态栏错位。
+- 独立只读代码审查发现的问题均已修复并补充回归测试，包括 hard abort 回滚、父会话 compact 与 child scope 隔离、canonical 提交边界、delegation terminal 提交边界、summary 本地失败时禁止 recap 请求、Memory tool result 脱敏、transport/parse/shape 共用 retry budget、每次 retry 逐次重算预算，以及 compaction guard 复用统一的 `4 chars/token` 本地粗估。

@@ -93,11 +93,75 @@ impl DelegationExecutionError {
 
 #[async_trait]
 pub trait DelegationExecutor: Send + Sync {
+    /// 在任务执行前建立只属于该 delegation 的运行期 checkpoint。
+    async fn begin_task(
+        &self,
+        _context: &DelegationExecutionContext,
+    ) -> Result<(), DelegationExecutionError> {
+        Ok(())
+    }
+
     async fn execute(
         &self,
         context: DelegationExecutionContext,
         progress: DelegationProgressSink,
     ) -> Result<DelegationExecutionOutcome, DelegationExecutionError>;
+
+    /// 只有 executor 成功且权威 terminal result 已落盘时 `committed=true`。
+    async fn finish_task(
+        &self,
+        _context: &DelegationExecutionContext,
+        _committed: bool,
+    ) -> Result<(), DelegationExecutionError> {
+        Ok(())
+    }
+}
+
+struct DelegationTaskCheckpointOnDrop {
+    executor: Arc<dyn DelegationExecutor>,
+    context: DelegationExecutionContext,
+    armed: bool,
+}
+
+impl DelegationTaskCheckpointOnDrop {
+    fn new(executor: Arc<dyn DelegationExecutor>, context: DelegationExecutionContext) -> Self {
+        Self {
+            executor,
+            context,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DelegationTaskCheckpointOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            log::warn!(
+                target: "delegation_runner",
+                "delegation {} dropped without Tokio runtime; task checkpoint cannot roll back",
+                self.context.metadata.id
+            );
+            return;
+        };
+        let executor = Arc::clone(&self.executor);
+        let context = self.context.clone();
+        runtime.spawn(async move {
+            if let Err(error) = executor.finish_task(&context, false).await {
+                log::warn!(
+                    target: "delegation_runner",
+                    "delegation {} drop 后回滚 task checkpoint 失败: {error}",
+                    context.metadata.id
+                );
+            }
+        });
+    }
 }
 
 #[derive(Clone)]
@@ -651,11 +715,24 @@ impl DelegationRunnerInner {
             metadata,
             initial_steering,
         };
-        let executed = time::timeout(
-            self.config.wall_timeout,
-            self.executor.execute(context, progress),
-        )
-        .await;
+        let (executed, mut task_checkpoint_guard) = match self.executor.begin_task(&context).await {
+            Ok(()) => {
+                let guard = DelegationTaskCheckpointOnDrop::new(
+                    Arc::clone(&self.executor),
+                    context.clone(),
+                );
+                (
+                    time::timeout(
+                        self.config.wall_timeout,
+                        self.executor.execute(context.clone(), progress),
+                    )
+                    .await,
+                    Some(guard),
+                )
+            }
+            Err(error) => (Ok(Err(error)), None),
+        };
+        let execution_succeeded = matches!(&executed, Ok(Ok(_)));
         let now = Utc::now();
         let result = match executed {
             Ok(Ok(outcome)) => DelegationResult {
@@ -686,13 +763,31 @@ impl DelegationRunnerInner {
                 completed_at: now,
             },
         };
-        if let Err(err) = self.store.complete(&id, result).await {
-            log::warn!(
-                target: "delegation_runner",
-                "delegation 完成状态落盘失败 id={id}: {err:#}"
-            );
-        } else {
-            self.activity.publish();
+        let terminal_persisted = match self.store.complete(&id, result).await {
+            Ok(_) => {
+                self.activity.publish();
+                true
+            }
+            Err(err) => {
+                log::warn!(
+                    target: "delegation_runner",
+                    "delegation 完成状态落盘失败 id={id}: {err:#}"
+                );
+                false
+            }
+        };
+        if let Some(guard) = task_checkpoint_guard.as_mut() {
+            if let Err(error) = self
+                .executor
+                .finish_task(&context, execution_succeeded && terminal_persisted)
+                .await
+            {
+                log::warn!(
+                    target: "delegation_runner",
+                    "delegation task checkpoint 收束失败 id={id}: {error}"
+                );
+            }
+            guard.disarm();
         }
     }
 }
@@ -769,6 +864,46 @@ mod tests {
             _progress: DelegationProgressSink,
         ) -> Result<DelegationExecutionOutcome, DelegationExecutionError> {
             panic!("planned delegation panic")
+        }
+    }
+
+    struct LifecycleRecordingExecutor {
+        store: DelegationStore,
+        observations: Arc<std::sync::Mutex<Vec<(bool, DelegationStatus)>>>,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl DelegationExecutor for LifecycleRecordingExecutor {
+        async fn execute(
+            &self,
+            context: DelegationExecutionContext,
+            _progress: DelegationProgressSink,
+        ) -> Result<DelegationExecutionOutcome, DelegationExecutionError> {
+            time::sleep(self.delay).await;
+            Ok(DelegationExecutionOutcome {
+                summary: format!("done {}", context.metadata.id),
+                changed_files: Vec::new(),
+                artifacts: Vec::new(),
+            })
+        }
+
+        async fn finish_task(
+            &self,
+            context: &DelegationExecutionContext,
+            committed: bool,
+        ) -> Result<(), DelegationExecutionError> {
+            let status = self
+                .store
+                .load(&context.metadata.id)
+                .await
+                .map_err(|error| DelegationExecutionError::new(error.to_string()))?
+                .status;
+            self.observations
+                .lock()
+                .expect("lifecycle observations lock")
+                .push((committed, status));
+            Ok(())
         }
     }
 
@@ -997,6 +1132,76 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn runner_finalizes_task_checkpoint_after_terminal_status_is_persisted() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = DelegationStore::new(dir.path().join("sessions/session_aaaaaaaa"));
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner = DelegationRunner::new(
+            store.clone(),
+            Arc::new(LifecycleRecordingExecutor {
+                store,
+                observations: Arc::clone(&observations),
+                delay: Duration::ZERO,
+            }),
+            DelegationRunnerConfig {
+                max_concurrent: 1,
+                wall_timeout: Duration::from_secs(5),
+                wait: DelegationWaitConfig::default(),
+            },
+        )
+        .expect("runner");
+
+        runner
+            .create(request("turn-lifecycle-success"))
+            .await
+            .expect("create");
+        runner.wait_until_idle().await;
+
+        assert_eq!(
+            observations
+                .lock()
+                .expect("lifecycle observations lock")
+                .as_slice(),
+            &[(true, DelegationStatus::Completed)]
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_rolls_back_task_checkpoint_after_timeout_is_persisted() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = DelegationStore::new(dir.path().join("sessions/session_aaaaaaaa"));
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner = DelegationRunner::new(
+            store.clone(),
+            Arc::new(LifecycleRecordingExecutor {
+                store,
+                observations: Arc::clone(&observations),
+                delay: Duration::from_millis(50),
+            }),
+            DelegationRunnerConfig {
+                max_concurrent: 1,
+                wall_timeout: Duration::from_millis(5),
+                wait: DelegationWaitConfig::default(),
+            },
+        )
+        .expect("runner");
+
+        runner
+            .create(request("turn-lifecycle-timeout"))
+            .await
+            .expect("create");
+        runner.wait_until_idle().await;
+
+        assert_eq!(
+            observations
+                .lock()
+                .expect("lifecycle observations lock")
+                .as_slice(),
+            &[(false, DelegationStatus::Failed)]
+        );
     }
 
     #[tokio::test]

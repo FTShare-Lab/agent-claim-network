@@ -107,7 +107,7 @@ agent_id = "agent-a"
 - `tail_target_ctx_ratio`：compact 后 raw tail 的 soft target，占 `[agent.llm].context_window` 的比例，默认 `0.20`，必须大于 `0.0` 且不超过 `1.0`。
 - `tail_hard_ctx_ratio`：compact 后 `raw tail + runtime-only projection` 的 hard limit，占 `[agent.llm].context_window` 的比例，默认 `0.30`，必须大于 `0.0` 且不超过 `1.0`。
 - `tail_previous_real_user_turns`：compact 后尽量保留的最近 previous real user turn 数量，默认 `4`，允许范围 `1..=5`。
-- `tool_result_raw_max_chars`：单个 tool result 允许进入 raw tail 的最大字符数，默认 `4096`。超过后进入 summary，不保留大段 raw preview。
+- `tool_result_raw_max_chars`：单个 tool result 允许进入 raw tail 的最大字符数，默认 `4096`；同时作为 compaction summary 请求的第一档降级阈值。summary 优先使用完整 transcript；完整请求超出 context window 后，先省略超过该阈值的结果，仍超限再省略全部 tool result。该检查复用全局 provider-neutral 的本地 token 粗估，按 Unicode 字符数约 `4 chars/token` 计算 system prompt 和 messages；每次 JSON retry 前都会重新执行。canonical transcript 和 journal 保留原文。
 
 ### `[agent.session.memory_review]`
 
@@ -217,7 +217,7 @@ MCP server 按连接方式分两类：
 
 ### `[agent.tool]`
 
-- `file_read_max_chars`：`file_read` 单页返回的最大字符数，默认 `100000`。达到上限时工具通过 `page.next_start` 指示下一页；同一文件版本的已读范围会累计，不需要修改配置或重启 ACN。局部 patch 只要求目标范围，append 只要求读到 EOF，完整改写才要求分页覆盖全文。
+- `file_read_max_chars`：`file_read` 单页返回、以及单个 `@` 文本文件完整内联的最大字符数，默认 `100000`。`file_read` 达到上限时通过 `page.next_start` 指示下一页；同一文件版本的已读范围会累计，不需要修改配置或重启 ACN。`@` 文本文件超过该上限时只向模型提供路径和字符数，引导其改用 `file_read`，不注入正文也不发放完整读取许可；多个 `@` 文本文件分别计算，不设合计字符上限。局部 patch 只要求目标范围，append 只要求读到 EOF，完整改写才要求分页覆盖全文。
 - `file_diff_max_changed_lines`：`file_write` / `file_patch` 修改成功后采集并在 TUI 历史区展示的 diff 最大**改动行数**（仅统计 +/- 行，上下文行不占额度），超出部分截断并提示剩余改动行数。
 - `max_parallel_tool_calls`：一个 agent 当前 turn 内、连续可并发工具批次的最大活跃调用数，默认 `5`，必须大于 `0`。它不跨 turn、session 或 agent 共享，也不限制 provider 的 fallback 尝试次数。
 - `code_run_max_output_chars`：单次 `code_run` / `write_stdin` 工具中每个 stdout/stderr stream 回传允许的最大输出字符数，默认 `1048576`，最多 `2097152`；pipe 模式两个 stream 各自适用该上限，PTY 只有 stdout。

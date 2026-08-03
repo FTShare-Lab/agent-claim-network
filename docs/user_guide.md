@@ -180,6 +180,8 @@ acn --resume
 - `Ctrl+V`：粘贴剪贴板图片
 - `Ctrl+O`：预览光标所在的附件
 
+单个 `@` 文本文件默认最多完整内联 100,000 个字符，可通过 `[agent.tool].file_read_max_chars` 调整。超过时任务不会失败：TUI 会提示 warning，模型只收到路径和字符数，并可改用 `file_read` 分页读取。PDF 和图片不使用这个字符限制。
+
 `/mcp`、`/ps` 和 `/subagents` 是 live panel；在 turn 进行中也可以打开，关闭后返回原交互状态。
 
 ## 团队连接状态

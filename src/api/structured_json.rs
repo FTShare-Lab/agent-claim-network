@@ -25,6 +25,30 @@ pub struct StructuredJsonCaller {
     retry_max_delay: Duration,
 }
 
+pub(crate) struct StructuredJsonAttemptRequest {
+    system_prompt: String,
+    messages: Vec<SessionTurnMessage>,
+    provider_retry_count_override: Option<u32>,
+}
+
+impl StructuredJsonAttemptRequest {
+    fn standard(system_prompt: String, messages: Vec<SessionTurnMessage>) -> Self {
+        Self {
+            system_prompt,
+            messages,
+            provider_retry_count_override: None,
+        }
+    }
+
+    pub(crate) fn compaction(system_prompt: String, messages: Vec<SessionTurnMessage>) -> Self {
+        Self {
+            system_prompt,
+            messages,
+            provider_retry_count_override: Some(0),
+        }
+    }
+}
+
 /// 单次结构化 JSON provider attempt 的观测信息。
 #[derive(Debug, Clone)]
 pub struct StructuredJsonAttemptReport {
@@ -52,6 +76,10 @@ impl StructuredJsonCaller {
             retry_base_delay,
             retry_max_delay,
         }
+    }
+
+    pub(crate) fn max_tokens(&self) -> u32 {
+        self.max_tokens
     }
 
     /// 请求模型生成 JSON，并在 JSON 解析失败时按配置重试。
@@ -133,9 +161,9 @@ impl StructuredJsonCaller {
         &self,
         system_prompt: String,
         messages: Vec<SessionTurnMessage>,
-        mut validate: V,
-        mut on_retry: F,
-        mut on_attempt: A,
+        validate: V,
+        on_retry: F,
+        on_attempt: A,
     ) -> anyhow::Result<T>
     where
         V: FnMut(Value) -> anyhow::Result<T>,
@@ -143,12 +171,49 @@ impl StructuredJsonCaller {
         A: FnMut(StructuredJsonAttemptReport) -> AFut,
         AFut: std::future::Future<Output = ()>,
     {
+        self.generate_json_validated_with_guarded_attempts(
+            StructuredJsonAttemptRequest::standard(system_prompt, messages),
+            validate,
+            on_retry,
+            on_attempt,
+            |_, _| Ok(()),
+        )
+        .await
+    }
+
+    /// 与普通结构化调用相同，但在每次真实 provider attempt 前检查最终请求。
+    /// compaction 使用它覆盖 retry 追加纠错消息后的预算，其他调用保持原行为。
+    pub(crate) async fn generate_json_validated_with_guarded_attempts<T, V, F, A, AFut, G>(
+        &self,
+        request: StructuredJsonAttemptRequest,
+        mut validate: V,
+        mut on_retry: F,
+        mut on_attempt: A,
+        mut before_attempt: G,
+    ) -> anyhow::Result<T>
+    where
+        V: FnMut(Value) -> anyhow::Result<T>,
+        F: FnMut(u32, u32, &anyhow::Error),
+        A: FnMut(StructuredJsonAttemptReport) -> AFut,
+        AFut: std::future::Future<Output = ()>,
+        G: FnMut(&str, &[SessionTurnMessage]) -> anyhow::Result<()>,
+    {
+        let StructuredJsonAttemptRequest {
+            system_prompt,
+            messages,
+            provider_retry_count_override,
+        } = request;
         let mut attempt = 0;
         let base_messages = messages;
         let mut attempt_messages = base_messages.clone();
         loop {
+            before_attempt(&system_prompt, &attempt_messages)?;
             match self
-                .generate_json_once_observed(system_prompt.clone(), attempt_messages.clone())
+                .generate_json_once_observed(
+                    system_prompt.clone(),
+                    attempt_messages.clone(),
+                    provider_retry_count_override,
+                )
                 .await
             {
                 Ok(parsed) => match validate(parsed.value.clone()) {
@@ -197,7 +262,8 @@ impl StructuredJsonCaller {
                     let retryable = matches!(
                         failure.error,
                         JsonCallError::Parse(_) | JsonCallError::RetryableShape(_)
-                    );
+                    ) || (provider_retry_count_override.is_some()
+                        && matches!(failure.error, JsonCallError::Provider(_)));
                     let will_retry = retryable && attempt < self.retry_count;
                     let raw_text = failure.raw_text.clone();
                     let parsed_json = failure.parsed_json.clone();
@@ -212,6 +278,16 @@ impl StructuredJsonCaller {
                     })
                     .await;
                     match failure.error {
+                        JsonCallError::Provider(error) if will_retry => {
+                            on_retry(attempt + 1, self.retry_count, &error);
+                            // Transport/provider 失败没有模型输出，重试同一份最终请求；
+                            // parse/shape 失败才追加纠错消息。
+                            let delay = self.retry_delay(attempt);
+                            if !delay.is_zero() {
+                                tokio::time::sleep(delay).await;
+                            }
+                            attempt += 1;
+                        }
                         JsonCallError::Provider(error) | JsonCallError::Terminal(error) => {
                             return Err(error);
                         }
@@ -267,6 +343,7 @@ impl StructuredJsonCaller {
         &self,
         system_prompt: String,
         messages: Vec<SessionTurnMessage>,
+        retry_count_override: Option<u32>,
     ) -> Result<JsonCallParsed, JsonCallFailure> {
         let request = ProviderRequest {
             system_prompt,
@@ -274,7 +351,7 @@ impl StructuredJsonCaller {
             tools: Vec::new(),
             max_tokens: self.max_tokens,
             stream: false,
-            retry_count_override: None,
+            retry_count_override,
         };
 
         let mut emit = |_event: ProviderEvent| {};
@@ -544,7 +621,8 @@ mod tests {
 
     use crate::api::{
         ProviderAdapter, ProviderEvent, ProviderRequest, ProviderResponse, ProviderStop,
-        SessionTurnContentBlock, SessionTurnMessage, StructuredJsonCaller,
+        SessionTurnContentBlock, SessionTurnMessage, StructuredJsonAttemptRequest,
+        StructuredJsonCaller,
     };
 
     struct FakeProvider {
@@ -694,6 +772,108 @@ mod tests {
         assert!(retry_text.contains("Previous response preview"));
         assert!(retry_text.contains(r#"quoted "bad" text"#));
         assert!(retry_text.contains("Escape every double quote"));
+    }
+
+    #[tokio::test]
+    async fn guarded_attempts_recheck_retry_messages_before_provider_call() {
+        let provider = Arc::new(FakeProvider::new(vec![
+            text_response("{not json"),
+            text_response(r#"{"ok":true}"#),
+        ]));
+        let caller = caller(provider.clone());
+        let mut checked_message_counts = Vec::new();
+
+        let error = caller
+            .generate_json_validated_with_guarded_attempts(
+                StructuredJsonAttemptRequest::compaction(
+                    "system".into(),
+                    vec![SessionTurnMessage::user_text("payload")],
+                ),
+                Ok,
+                |_, _, _| {},
+                |_| std::future::ready(()),
+                |_, messages| {
+                    checked_message_counts.push(messages.len());
+                    if messages.len() > 1 {
+                        anyhow::bail!("retry request exceeds local budget");
+                    }
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("retry guard should reject the expanded correction request");
+
+        assert!(error
+            .to_string()
+            .contains("retry request exceeds local budget"));
+        assert_eq!(checked_message_counts, vec![1, 2]);
+        assert_eq!(provider.requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn guarded_attempts_share_one_budget_across_transport_and_parse_failures() {
+        let provider = Arc::new(FakeProvider::new(vec![
+            Err(anyhow::anyhow!("transport failed")),
+            text_response("{not json"),
+            text_response(r#"{"ok":true}"#),
+        ]));
+        let caller =
+            StructuredJsonCaller::new(provider.clone(), 512, 2, Duration::ZERO, Duration::ZERO);
+
+        let value = caller
+            .generate_json_validated_with_guarded_attempts(
+                StructuredJsonAttemptRequest::compaction(
+                    "system".into(),
+                    vec![SessionTurnMessage::user_text("payload")],
+                ),
+                Ok,
+                |_, _, _| {},
+                |_| std::future::ready(()),
+                |_, _| Ok(()),
+            )
+            .await
+            .expect("third and final shared-budget attempt should succeed");
+
+        assert_eq!(value, json!({"ok": true}));
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].messages.len(), 1);
+        assert_eq!(requests[1].messages.len(), 1);
+        assert_eq!(requests[2].messages.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|request| request.retry_count_override == Some(0)));
+    }
+
+    #[tokio::test]
+    async fn guarded_transport_retry_preserves_parse_correction_messages() {
+        let provider = Arc::new(FakeProvider::new(vec![
+            text_response("{not json"),
+            Err(anyhow::anyhow!("transport failed")),
+            text_response(r#"{"ok":true}"#),
+        ]));
+        let caller =
+            StructuredJsonCaller::new(provider.clone(), 512, 2, Duration::ZERO, Duration::ZERO);
+
+        caller
+            .generate_json_validated_with_guarded_attempts(
+                StructuredJsonAttemptRequest::compaction(
+                    "system".into(),
+                    vec![SessionTurnMessage::user_text("payload")],
+                ),
+                Ok,
+                |_, _, _| {},
+                |_| std::future::ready(()),
+                |_, _| Ok(()),
+            )
+            .await
+            .expect("transport retry of the correction request should succeed");
+
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].messages.len(), 1);
+        assert_eq!(requests[1].messages.len(), 2);
+        assert_eq!(requests[2].messages, requests[1].messages);
     }
 
     #[tokio::test]

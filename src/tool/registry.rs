@@ -318,7 +318,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "file_patch".into(),
-                description: "Replace exact text in an existing UTF-8 file. By default old_content must match exactly once and only the target plus any affected line boundary must have been returned by file_read for the current file version. Multiple matches report every start line so you can expand the block. replace_all=true intentionally replaces every match and requires complete file coverage. On a read-permission error, follow required_read.".into(),
+                description: "Replace exact text in an existing UTF-8 file. By default old_content must match exactly once and only the target plus any affected line boundary must have been returned by file_read for the current file version. If multiple matches exist, expand old_content with nearby context until it is unique. replace_all=true intentionally replaces every match and requires complete file coverage. On a read-permission error, follow required_read.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {

@@ -332,6 +332,31 @@ async fn file_patch_replaces_unique_block() {
 }
 
 #[tokio::test]
+async fn file_patch_uniqueness_uses_non_overlapping_exact_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("note.txt");
+    tokio::fs::write(&path, "aaa").await.unwrap();
+    let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
+    let session = SessionId::from_str("session_aaaaaaaa").unwrap();
+    let _ = full_file_read(&registry, &session, "note.txt").await;
+
+    let output = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_patch",
+        json!({
+            "path": "note.txt",
+            "old_content": "aa",
+            "new_content": "X",
+        }),
+    )
+    .await;
+
+    assert_eq!(output["status"], "success");
+    assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "Xa");
+}
+
+#[tokio::test]
 async fn file_patch_zero_and_multiple_matches_are_typed_business_failures() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("note.txt");
@@ -340,8 +365,10 @@ async fn file_patch_zero_and_multiple_matches_are_typed_business_failures() {
     let session = SessionId::from_str("session_aaaaaaaa").unwrap();
     let _ = full_file_read(&registry, &session, "note.txt").await;
 
-    for (old_content, expected_message) in [("missing", "未找到匹配"), ("alpha", "找到 2 处匹配")]
-    {
+    for (old_content, expected_message) in [
+        ("missing", "未找到匹配"),
+        ("alpha", "old_content 至少匹配两处"),
+    ] {
         let result = registry
             .dispatch_with_context(
                 "file_patch",
@@ -482,6 +509,88 @@ async fn read_state_is_session_scoped_and_same_session_stays_authorized() {
     assert_eq!(cross_session["status"], "error");
     assert_eq!(same_session["status"], "success");
     assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "from-a\n");
+}
+
+#[tokio::test]
+async fn checkpoint_rollback_keeps_file_write_but_restores_stale_read_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("note.txt");
+    tokio::fs::write(&path, "alpha\nbeta\n").await.unwrap();
+    let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
+    let session = SessionId::from_str("session_aaaaaaaa").unwrap();
+    let context = file_tool_context(&session);
+
+    registry
+        .dispatch_with_context(
+            "file_read",
+            json!({
+                "path": "note.txt",
+                "start": 1,
+                "count": 1,
+                "show_linenos": false,
+            }),
+            context.clone(),
+        )
+        .await
+        .unwrap();
+    registry
+        .begin_file_read_state_checkpoint(&session, "turn_1")
+        .await
+        .unwrap();
+    registry
+        .dispatch_with_context(
+            "file_read",
+            json!({
+                "path": "note.txt",
+                "start": 2,
+                "count": 1,
+                "show_linenos": false,
+            }),
+            context.clone(),
+        )
+        .await
+        .unwrap();
+    let patch = registry
+        .dispatch_with_context(
+            "file_patch",
+            json!({
+                "path": "note.txt",
+                "old_content": "beta",
+                "new_content": "BETA",
+            }),
+            context.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(patch.output["status"], "success");
+
+    registry
+        .rollback_file_read_state_checkpoint(&session, "turn_1")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        tokio::fs::read_to_string(&path).await.unwrap(),
+        "alpha\nBETA\n"
+    );
+    let stale = registry
+        .dispatch_with_context(
+            "file_patch",
+            json!({
+                "path": "note.txt",
+                "old_content": "alpha",
+                "new_content": "ALPHA",
+            }),
+            context,
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.outcome, ToolExecutionOutcome::BusinessFailure);
+    assert_eq!(stale.output["stale"], true);
+    assert_eq!(
+        tokio::fs::read_to_string(path).await.unwrap(),
+        "alpha\nBETA\n"
+    );
 }
 
 #[tokio::test]
@@ -1047,7 +1156,7 @@ async fn utf8_file_read_limit_counts_chars_and_authorizes_write() {
 }
 
 #[tokio::test]
-async fn file_patch_many_matches_reports_every_start_line() {
+async fn file_patch_many_matches_returns_bounded_ambiguity_error() {
     let dir = tempfile::tempdir().unwrap();
     let line_count = 512usize;
     tokio::fs::write(dir.path().join("many.txt"), "needle\n".repeat(line_count))
@@ -1070,15 +1179,12 @@ async fn file_patch_many_matches_reports_every_start_line() {
     .await;
 
     assert_eq!(output["status"], "error");
-    let expected = (1..=line_count)
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>()
-        .join("、");
     let msg = output["msg"].as_str().unwrap();
-    assert!(
-        msg.contains(&format!("第 {expected} 行")),
-        "多匹配错误必须包含全部起始行号: {msg}"
+    assert_eq!(
+        msg,
+        "old_content 至少匹配两处，必须全局唯一。请扩大文本块并加入目标附近上下文，或在确认全部替换时使用 replace_all=true。"
     );
+    assert!(!msg.contains(&line_count.to_string()));
 }
 
 #[tokio::test]
