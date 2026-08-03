@@ -1,13 +1,36 @@
-//! 文件工具、read-before-write 校验与路径级并发控制。
-//!
-//! 实现 file_read/file_write/file_patch，并维护文件读取授权与 diff 采集。
+//! 文件分页读取、分级修改许可与路径级并发控制。
 
 use super::*;
+use crate::tool::file_text::{
+    migrate_edit_coverage, read_text_page, suggested_read_range, CoverageMigration, TextPageRequest,
+};
 
 impl ToolRegistry {
-    /// resume 同一 session 时撤销其旧进程内 file_read 写入许可。
+    pub(crate) async fn file_write_group_key(&self, name: &str, input: &Value) -> Option<PathBuf> {
+        if !matches!(name, "file_patch" | "file_write") {
+            return None;
+        }
+        let raw = input.get("path")?.as_str()?;
+        Some(tool_path_lock_key(&resolve_tool_path(&self.workspace_root, raw)).await)
+    }
+
+    /// resume 同一 session 时撤销其旧进程内文件修改许可。
     pub async fn clear_file_read_state(&self, session_id: &SessionId) {
         self.read_state.clear_session(session_id).await;
+    }
+
+    /// delegation compact 只撤销该 child 的许可，不影响同 session 的 parent / sibling。
+    pub(crate) async fn clear_delegation_file_read_state(
+        &self,
+        session_id: &SessionId,
+        caller_id: &str,
+    ) {
+        self.read_state
+            .clear_scope(&ReadStateScope::new(
+                Some(session_id.clone()),
+                Some(caller_id.to_owned()),
+            ))
+            .await;
     }
 
     pub(super) fn file_read_state_scope(
@@ -23,119 +46,126 @@ impl ToolRegistry {
         Some(ReadStateScope::new(Some(session_id), caller_id))
     }
 
-    pub(super) async fn evaluate_file_read_state(
+    async fn evaluate_file_read_state(
         &self,
         context: &ToolDispatchContext,
         path: &Path,
         content: &str,
-        mtime: Option<std::time::SystemTime>,
     ) -> ReadStateVerdict {
         let Some(scope) = self.file_read_state_scope(context) else {
             return ReadStateVerdict::Missing;
         };
-        self.read_state.evaluate(&scope, path, content, mtime).await
-    }
-
-    pub(super) async fn record_file_read_state(
-        &self,
-        context: &ToolDispatchContext,
-        path: PathBuf,
-        content: String,
-        mtime: Option<std::time::SystemTime>,
-    ) {
-        let Some(scope) = self.file_read_state_scope(context) else {
-            return;
-        };
-        self.read_state.record(&scope, path, content, mtime).await;
-    }
-
-    pub(super) async fn record_file_read_config_truncated_state(
-        &self,
-        context: &ToolDispatchContext,
-        path: PathBuf,
-    ) {
-        let Some(scope) = self.file_read_state_scope(context) else {
-            return;
-        };
         self.read_state
-            .record_config_truncated(&scope, path, self.limits.file_read_max_chars)
-            .await;
+            .evaluate(&scope, path, &ContentRevision::from_text(content))
+            .await
+    }
+
+    async fn activate_file_read_evidence(
+        &self,
+        context: &ToolDispatchContext,
+        evidence: ReadEvidence,
+    ) {
+        let Some(scope) = self.file_read_state_scope(context) else {
+            return;
+        };
+        self.read_state.record(&scope, evidence).await;
+    }
+
+    /// 完整文本附件成功构造进模型用户消息后，登记等价的完整读取许可。
+    pub(crate) async fn record_text_attachment_read(
+        &self,
+        context: &ToolDispatchContext,
+        canonical_path: PathBuf,
+        content: &str,
+    ) {
+        self.activate_file_read_evidence(
+            context,
+            ReadEvidence::complete_text(canonical_path, content),
+        )
+        .await;
+    }
+
+    async fn clear_file_path_state(&self, context: &ToolDispatchContext, path: &Path) {
+        if let Some(scope) = self.file_read_state_scope(context) {
+            self.read_state.clear_path(&scope, path).await;
+        }
     }
 
     pub(super) async fn file_read(
         &self,
         input: Value,
         context: &ToolDispatchContext,
-    ) -> Result<Value, ToolError> {
+    ) -> Result<ToolExecution, ToolError> {
         let args: FileReadArgs =
             serde_json::from_value(input).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+        let start = args.start.unwrap_or(1);
+        let count = args.count.unwrap_or(DEFAULT_FILE_READ_LINES);
+        if start == 0 {
+            return Err(ToolError::InvalidArgs("start 必须大于 0".into()));
+        }
+        if count == 0 {
+            return Err(ToolError::InvalidArgs("count 必须大于 0".into()));
+        }
         let path = resolve_tool_path(&self.workspace_root, &args.path);
         if self.memory_store.is_some() {
             ensure_not_memory_path(&path)?;
         }
-        // 图片 / PDF 走附件公共层：内容校验 + 规格化，媒体放保留键 media，
-        // 由 turn loop 剥离成独立内容块，避免 base64 进入 tool_result 文本。
         match crate::attachment::attachment_kind_for_path(&path) {
             AttachmentKind::Image => {
                 let media =
                     crate::attachment::read_image_attachment(&path, &self.attachment_limits)
                         .await?;
-                return Ok(json!({
+                return Ok(ToolExecution::completed(json!({
                     "path": args.path,
                     "kind": "image",
                     "media_type": media.media_type,
                     "note": "图片内容已作为附件块附加在 tool_result 之后",
                     (FILE_READ_MEDIA_KEY): media.to_json(),
-                }));
+                })));
             }
             AttachmentKind::Pdf => {
                 let media =
                     crate::attachment::read_document_attachment(&path, &self.attachment_limits)
                         .await?;
-                return Ok(json!({
+                return Ok(ToolExecution::completed(json!({
                     "path": args.path,
                     "kind": "pdf",
                     "media_type": media.media_type,
                     "note": "PDF 内容已作为附件块附加在 tool_result 之后",
                     (FILE_READ_MEDIA_KEY): media.to_json(),
-                }));
+                })));
             }
             AttachmentKind::Text => {}
         }
+
         let path_lock = self.path_lock(&path).await?;
         let _guard = path_lock.lock().await;
         let read_path = fs::canonicalize(&path).await?;
-        let (raw, file_truncated) = if self.access.delegation_child {
-            read_text_file_bounded(&read_path, self.limits.file_read_max_chars).await?
-        } else {
-            (tokio::fs::read_to_string(&read_path).await?, false)
-        };
-        let selection = select_lines_with_keyword(
-            &raw,
-            args.start.unwrap_or(1),
-            args.count.unwrap_or(200),
-            args.keyword.as_deref(),
-            args.show_linenos.unwrap_or(true),
-            self.limits.file_read_max_chars,
-        );
-        let truncated = file_truncated || selection.truncated;
-        let is_complete_read = !truncated && args.start.unwrap_or(1) == 1 && args.keyword.is_none();
-        if is_complete_read {
-            let key = lexical_normalize_path(&read_path);
-            let mtime = file_mtime(&read_path).await?;
-            self.record_file_read_state(context, key, raw, mtime).await;
-        } else if file_truncated || selection.max_chars_reached {
-            self.record_file_read_config_truncated_state(
-                context,
-                lexical_normalize_path(&read_path),
-            )
-            .await;
+        if self.memory_store.is_some() {
+            ensure_not_memory_path(&read_path)?;
         }
-        Ok(json!({
-            "path": args.path,
-            "content": selection.content,
-            "truncated": truncated,
-        }))
+        let canonical = lexical_normalize_path(&read_path);
+        let keyword = args
+            .keyword
+            .as_deref()
+            .filter(|keyword| !keyword.trim().is_empty());
+        let result = read_text_page(
+            &read_path,
+            TextPageRequest {
+                display_path: &args.path,
+                canonical_path: canonical,
+                start,
+                count,
+                keyword,
+                show_linenos: args.show_linenos.unwrap_or(true),
+                max_chars: self.limits.file_read_max_chars,
+            },
+        )
+        .await?;
+        if let Some(evidence) = result.evidence {
+            self.activate_file_read_evidence(context, evidence).await;
+        }
+        Ok(ToolExecution::completed(result.output))
     }
 
     pub(super) async fn file_patch(
@@ -167,7 +197,8 @@ impl ToolRegistry {
                 "msg": "file_patch 的目标文件不存在，请先用 file_read 确认路径。",
             })));
         }
-        let before = match fs::read_to_string(&write_path).await {
+        ensure_not_memory_path(&write_path)?;
+        let before = Arc::new(match fs::read_to_string(&write_path).await {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(ToolExecution::business_failure(json!({
@@ -177,27 +208,21 @@ impl ToolRegistry {
                 })));
             }
             Err(error) => return Err(ToolError::Io(error)),
-        };
+        });
         let key = lexical_normalize_path(&write_path);
-        let mtime = file_mtime(&write_path).await?;
-        if let Some(error) = read_state_guard_error(
-            self.evaluate_file_read_state(context, &key, &before, mtime)
-                .await,
-            &args.path,
-        ) {
-            return Ok(ToolExecution::business_failure(error));
-        }
-        let match_lines = match_start_line_numbers(&before, &args.old_content);
-        let count = match_lines.len();
-        if count == 0 {
+        let matches = before
+            .match_indices(&args.old_content)
+            .map(|(start, _)| start)
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
             return Ok(ToolExecution::business_failure(json!({
                 "path": args.path,
                 "status": "error",
                 "msg": "未找到匹配的 old_content，请先重新 file_read 确认当前内容。",
             })));
         }
-        if count > 1 && !args.replace_all {
-            let line_list = match_lines
+        if matches.len() > 1 && !args.replace_all {
+            let line_list = match_start_line_numbers(&before, &args.old_content)
                 .iter()
                 .map(usize::to_string)
                 .collect::<Vec<_>>()
@@ -205,15 +230,88 @@ impl ToolRegistry {
             return Ok(ToolExecution::business_failure(json!({
                 "path": args.path,
                 "status": "error",
-                "msg": format!("找到 {count} 处匹配（第 {line_list} 行），old_content 必须全局唯一。请扩大文本块，或在确认全部替换时使用 replace_all=true。"),
+                "msg": format!("找到 {} 处匹配（第 {line_list} 行），old_content 必须全局唯一。请扩大文本块，或在确认全部替换时使用 replace_all=true。", matches.len()),
             })));
         }
-        let replacements = if args.replace_all { count } else { 1 };
-        let after = if args.replace_all {
+
+        let match_start = matches[0];
+        let match_end = match_start.saturating_add(args.old_content.len());
+        let suggested = suggested_read_range(&before, match_start, match_end);
+        let authority = match self.evaluate_file_read_state(context, &key, &before).await {
+            ReadStateVerdict::Fresh(authority) => authority,
+            ReadStateVerdict::Missing => {
+                return Ok(ToolExecution::business_failure(patch_permission_error(
+                    &args.path,
+                    if args.replace_all {
+                        None
+                    } else {
+                        Some(suggested)
+                    },
+                    false,
+                )));
+            }
+            ReadStateVerdict::Stale => {
+                return Ok(ToolExecution::business_failure(patch_permission_error(
+                    &args.path,
+                    if args.replace_all {
+                        None
+                    } else {
+                        Some(suggested)
+                    },
+                    true,
+                )));
+            }
+        };
+        if args.replace_all && !authority.complete {
+            return Ok(ToolExecution::business_failure(patch_permission_error(
+                &args.path, None, false,
+            )));
+        }
+
+        let replacements = if args.replace_all { matches.len() } else { 1 };
+        let after = Arc::new(if args.replace_all {
             before.replace(&args.old_content, &args.new_content)
         } else {
             before.replacen(&args.old_content, &args.new_content, 1)
+        });
+        let migration = if args.replace_all {
+            CoverageMigration {
+                ranges: LineRange::new(1, read_state::logical_line_count(&after))
+                    .into_iter()
+                    .collect(),
+                complete: true,
+            }
+        } else {
+            match migrate_edit_coverage(
+                &before,
+                &after,
+                &authority,
+                match_start,
+                match_end,
+                args.new_content.len(),
+            ) {
+                Ok(migration) => migration,
+                Err(required) => {
+                    return Ok(ToolExecution::business_failure(patch_permission_error(
+                        &args.path,
+                        Some(required),
+                        false,
+                    )));
+                }
+            }
         };
+        let evidence =
+            ReadEvidence::known_ranges(key.clone(), &after, migration.ranges, migration.complete);
+        ensure_file_commit_not_cancelled(context)?;
+        let change = compute_file_change_async(
+            args.path.clone(),
+            FileChangeKind::Modified,
+            Arc::clone(&before),
+            Arc::clone(&after),
+            self.limits.file_diff_max_changed_lines,
+        )
+        .await;
+        ensure_file_commit_not_cancelled(context)?;
         let written = crate::storage::write_text_atomic_if_unchanged(
             &write_path,
             after.as_bytes(),
@@ -222,13 +320,12 @@ impl ToolRegistry {
         .await
         .map_err(|e| ToolError::Io(e.into_io_error()))?;
         if !written {
+            self.clear_file_path_state(context, &key).await;
             return Ok(ToolExecution::business_failure(stale_write_error(
                 &args.path,
             )));
         }
-        let new_mtime = file_mtime(&write_path).await?;
-        self.record_file_read_state(context, key, after.clone(), new_mtime)
-            .await;
+        self.activate_file_read_evidence(context, evidence).await;
         let mut output = json!({
             "path": args.path,
             "status": "success",
@@ -236,15 +333,7 @@ impl ToolRegistry {
             "replacements": replacements,
         });
         drop(_guard);
-        if let Some(change) = compute_file_change_async(
-            args.path,
-            FileChangeKind::Modified,
-            before,
-            after,
-            self.limits.file_diff_max_changed_lines,
-        )
-        .await
-        {
+        if let Some(change) = change {
             attach_file_change(&mut output, &change);
         }
         Ok(ToolExecution::completed(output))
@@ -257,12 +346,18 @@ impl ToolRegistry {
     ) -> Result<ToolExecution, ToolError> {
         let args: FileWriteArgs =
             serde_json::from_value(input).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+        let mode = args.mode.unwrap_or_else(|| "overwrite".into());
+        if !matches!(mode.as_str(), "overwrite" | "append" | "prepend") {
+            return Err(ToolError::InvalidArgs(format!("未知 mode: {mode}")));
+        }
         let path = resolve_tool_path(&self.workspace_root, &args.path);
         ensure_not_memory_path(&path)?;
         let path_lock = self.path_lock(&path).await?;
         let _guard = path_lock.lock().await;
-        let mode = args.mode.unwrap_or_else(|| "overwrite".into());
         let (write_path, existed) = resolve_write_target(&path).await?;
+        if existed {
+            ensure_not_memory_path(&write_path)?;
+        }
         let before = if existed {
             fs::read_to_string(&write_path).await?
         } else {
@@ -273,22 +368,56 @@ impl ToolRegistry {
         } else {
             tool_path_lock_key(&write_path).await
         };
-        if existed {
-            let mtime = file_mtime(&write_path).await?;
-            if let Some(error) = read_state_guard_error(
-                self.evaluate_file_read_state(context, &key, &before, mtime)
-                    .await,
-                &args.path,
-            ) {
-                return Ok(ToolExecution::business_failure(error));
+        if !existed {
+            ensure_not_memory_path(&key)?;
+        }
+
+        let authority = if existed {
+            match self.evaluate_file_read_state(context, &key, &before).await {
+                ReadStateVerdict::Fresh(authority) => Some(authority),
+                ReadStateVerdict::Missing => {
+                    return Ok(ToolExecution::business_failure(write_permission_error(
+                        &args.path,
+                        &mode,
+                        false,
+                        read_state::logical_line_count(&before),
+                    )));
+                }
+                ReadStateVerdict::Stale => {
+                    return Ok(ToolExecution::business_failure(write_permission_error(
+                        &args.path,
+                        &mode,
+                        true,
+                        read_state::logical_line_count(&before),
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(authority) = &authority {
+            let authorized = match mode.as_str() {
+                "append" => authority.has_eof(),
+                "overwrite" | "prepend" => authority.complete,
+                _ => false,
+            };
+            if !authorized {
+                return Ok(ToolExecution::business_failure(write_permission_error(
+                    &args.path,
+                    &mode,
+                    false,
+                    authority.total_lines,
+                )));
             }
         }
-        let after = match mode.as_str() {
+
+        let before = Arc::new(before);
+        let after = Arc::new(match mode.as_str() {
             "overwrite" => args.content,
             "append" => format!("{before}{}", args.content),
             "prepend" => format!("{}{before}", args.content),
-            other => return Err(ToolError::InvalidArgs(format!("未知 mode: {other}"))),
-        };
+            _ => unreachable!("mode 已校验"),
+        });
         if existed && before == after {
             return Ok(ToolExecution::completed(json!({
                 "path": args.path,
@@ -296,6 +425,59 @@ impl ToolRegistry {
                 "bytes_written": before.len(),
             })));
         }
+        let migration = if let Some(authority) = &authority {
+            if authority.complete || mode != "append" {
+                CoverageMigration {
+                    ranges: LineRange::new(1, read_state::logical_line_count(&after))
+                        .into_iter()
+                        .collect(),
+                    complete: true,
+                }
+            } else {
+                match migrate_edit_coverage(
+                    &before,
+                    &after,
+                    authority,
+                    before.len(),
+                    before.len(),
+                    after.len().saturating_sub(before.len()),
+                ) {
+                    Ok(migration) => migration,
+                    Err(_) => {
+                        self.clear_file_path_state(context, &key).await;
+                        return Ok(ToolExecution::business_failure(write_permission_error(
+                            &args.path,
+                            &mode,
+                            false,
+                            authority.total_lines,
+                        )));
+                    }
+                }
+            }
+        } else {
+            CoverageMigration {
+                ranges: LineRange::new(1, read_state::logical_line_count(&after))
+                    .into_iter()
+                    .collect(),
+                complete: true,
+            }
+        };
+        let evidence =
+            ReadEvidence::known_ranges(key.clone(), &after, migration.ranges, migration.complete);
+        ensure_file_commit_not_cancelled(context)?;
+        let change = compute_file_change_async(
+            args.path.clone(),
+            if existed {
+                FileChangeKind::Modified
+            } else {
+                FileChangeKind::Created
+            },
+            Arc::clone(&before),
+            Arc::clone(&after),
+            self.limits.file_diff_max_changed_lines,
+        )
+        .await;
+        ensure_file_commit_not_cancelled(context)?;
         let written = crate::storage::write_text_atomic_if_unchanged(
             &write_path,
             after.as_bytes(),
@@ -304,32 +486,19 @@ impl ToolRegistry {
         .await
         .map_err(|e| ToolError::Io(e.into_io_error()))?;
         if !written {
+            self.clear_file_path_state(context, &key).await;
             return Ok(ToolExecution::business_failure(stale_write_error(
                 &args.path,
             )));
         }
-        let new_mtime = file_mtime(&write_path).await?;
-        self.record_file_read_state(context, key, after.clone(), new_mtime)
-            .await;
+        self.activate_file_read_evidence(context, evidence).await;
         let mut output = json!({
             "path": args.path,
             "status": "success",
             "bytes_written": after.len(),
         });
         drop(_guard);
-        if let Some(change) = compute_file_change_async(
-            args.path,
-            if existed {
-                FileChangeKind::Modified
-            } else {
-                FileChangeKind::Created
-            },
-            before,
-            after,
-            self.limits.file_diff_max_changed_lines,
-        )
-        .await
-        {
+        if let Some(change) = change {
             attach_file_change(&mut output, &change);
         }
         Ok(ToolExecution::completed(output))
@@ -355,22 +524,33 @@ async fn tool_path_lock_key(path: &Path) -> PathBuf {
     if let Ok(canonical) = tokio::fs::canonicalize(path).await {
         return canonical;
     }
-    let mut current = path.to_path_buf();
-    let mut suffix = Vec::<OsString>::new();
-    while let Some(file_name) = current.file_name().map(|value| value.to_os_string()) {
-        suffix.push(file_name);
-        if !current.pop() {
-            break;
-        }
-        if let Ok(canonical_parent) = tokio::fs::canonicalize(&current).await {
-            let mut resolved = canonical_parent;
-            for component in suffix.iter().rev() {
-                resolved.push(component);
+    let mut resolved = PathBuf::new();
+    let mut unresolved = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::RootDir => resolved.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if unresolved.pop().is_none() {
+                    resolved.pop();
+                }
             }
-            return lexical_normalize_path(&resolved);
+            Component::Normal(part) => {
+                if unresolved.is_empty() {
+                    let candidate = resolved.join(part);
+                    if let Ok(canonical) = tokio::fs::canonicalize(&candidate).await {
+                        // 已存在前缀必须先解析 symlink，再处理后续 `..`。
+                        resolved = canonical;
+                        continue;
+                    }
+                }
+                unresolved.push(part.to_os_string());
+            }
         }
     }
-    lexical_normalize_path(path)
+    resolved.extend(unresolved);
+    resolved
 }
 
 fn lexical_normalize_path(path: &Path) -> PathBuf {
@@ -388,16 +568,11 @@ fn lexical_normalize_path(path: &Path) -> PathBuf {
     out
 }
 
-async fn file_mtime(path: &Path) -> Result<Option<std::time::SystemTime>, ToolError> {
-    let metadata = fs::metadata(path).await?;
-    Ok(metadata.modified().ok())
-}
-
 async fn compute_file_change_async(
     path: String,
     kind: FileChangeKind,
-    before: String,
-    after: String,
+    before: Arc<String>,
+    after: Arc<String>,
     max_changed_lines: usize,
 ) -> Option<FileChange> {
     match tokio::task::spawn_blocking(move || {
@@ -411,6 +586,17 @@ async fn compute_file_change_async(
             None
         }
     }
+}
+
+fn ensure_file_commit_not_cancelled(context: &ToolDispatchContext) -> Result<(), ToolError> {
+    if context
+        .cancellation
+        .as_ref()
+        .is_some_and(|cancellation| cancellation.is_cancelled())
+    {
+        return Err(ToolError::Interrupted);
+    }
+    Ok(())
 }
 
 /// 对已有文件固定 canonical 目标，保留叶子 symlink 本身；新文件保留请求路径。
@@ -433,38 +619,81 @@ async fn resolve_write_target(path: &Path) -> Result<(PathBuf, bool), ToolError>
     }
 }
 
-fn read_state_guard_error(verdict: ReadStateVerdict, display_path: &str) -> Option<Value> {
-    let msg = match verdict {
-        ReadStateVerdict::Fresh => return None,
-        ReadStateVerdict::Missing => format!(
-            "已有文件 {display_path} 必须先在当前 session 中完整 file_read；窗口、搜索或截断读取不授权写入。"
-        ),
-        ReadStateVerdict::Stale => return Some(stale_write_error(display_path)),
-        ReadStateVerdict::ConfigTruncated { max_chars } => {
-            return Some(json!({
-                "path": display_path,
-                "status": "error",
-                "file_read_max_chars": max_chars,
-                "requires_user_config_change": true,
-                "msg": format!(
-                    "文件 {display_path} 的 file_read 被当前 [agent.tool].file_read_max_chars={max_chars} 截断。分页读取只能查看局部内容，因读取不完整不能授予写权限。请告知用户提高 ACN 的 [agent.tool].file_read_max_chars 配置，重启 ACN 后重新完整 file_read 并重试。"
-                ),
-            }));
-        }
+fn patch_permission_error(
+    display_path: &str,
+    required_range: Option<LineRange>,
+    stale: bool,
+) -> Value {
+    let required_read = if let Some(range) = required_range {
+        json!({
+            "kind": "range",
+            "start": range.start,
+            "count": range.end.saturating_sub(range.start).saturating_add(1),
+        })
+    } else {
+        json!({"kind": "complete", "start": 1})
     };
-    Some(json!({
+    let mut output = json!({
         "path": display_path,
         "status": "error",
-        "msg": msg,
-    }))
+        "required_read": required_read,
+        "msg": if stale {
+            format!("文件 {display_path} 在上次读取后已变化；请按 required_read 重新读取后再试。")
+        } else if required_range.is_some() {
+            "file_patch 的目标及必要换行边界尚未完整读取；请按 required_read 补读后再试。"
+                .to_string()
+        } else {
+            format!("file_patch(replace_all=true) 需要先完整读取已有文件 {display_path}。")
+        },
+    });
+    if stale {
+        output["stale"] = json!(true);
+    }
+    output
+}
+
+fn write_permission_error(
+    display_path: &str,
+    mode: &str,
+    stale: bool,
+    total_lines: usize,
+) -> Value {
+    let required_read = if mode == "append" {
+        json!({
+            "kind": "eof",
+            "start": total_lines.max(1),
+        })
+    } else {
+        json!({"kind": "complete", "start": 1})
+    };
+    let requirement = if mode == "append" {
+        "真实文件末尾"
+    } else {
+        "完整文件"
+    };
+    let mut output = json!({
+        "path": display_path,
+        "status": "error",
+        "required_read": required_read,
+        "msg": if stale {
+            format!("文件 {display_path} 在上次读取后已变化；请按 required_read 重新读取{requirement}后再试。")
+        } else {
+            format!("已有文件 {display_path} 的 {mode} 操作需要先读取{requirement}；请按 required_read 读取后再试。")
+        },
+    });
+    if stale {
+        output["stale"] = json!(true);
+    }
+    output
 }
 
 fn stale_write_error(display_path: &str) -> Value {
     json!({
         "path": display_path,
         "status": "error",
+        "stale": true,
         "msg": format!(
-            "文件 {display_path} 在上次 file_read 后已变化，已拒绝写入；请重新完整 file_read 后再试。"
+            "文件 {display_path} 在写入前被其他进程修改，原子写入已拒绝；请重新读取所需区域后再试。"
         ),
     })
 }
@@ -494,94 +723,4 @@ pub(super) fn ensure_not_memory_path(path: &Path) -> Result<(), ToolError> {
         ));
     }
     Ok(())
-}
-
-async fn read_text_file_bounded(
-    path: &Path,
-    max_chars: usize,
-) -> Result<(String, bool), ToolError> {
-    let max_bytes = u64::try_from(bounded_text_byte_limit(max_chars)).unwrap_or(u64::MAX);
-    let mut bytes = Vec::new();
-    let mut reader = fs::File::open(path)
-        .await?
-        .take(max_bytes.saturating_add(1));
-    reader.read_to_end(&mut bytes).await?;
-    let truncated = u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes;
-    if truncated {
-        let limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
-        bytes.truncate(limit.min(bytes.len()));
-        while std::str::from_utf8(&bytes).is_err() {
-            if bytes.pop().is_none() {
-                break;
-            }
-        }
-    }
-    let text = String::from_utf8(bytes)
-        .map_err(|err| ToolError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, err)))?;
-    Ok((text, truncated))
-}
-
-struct FileReadSelection {
-    content: String,
-    truncated: bool,
-    max_chars_reached: bool,
-}
-
-fn select_lines_with_keyword(
-    raw: &str,
-    start: usize,
-    count: usize,
-    keyword: Option<&str>,
-    show_linenos: bool,
-    max_chars: usize,
-) -> FileReadSelection {
-    let lines = raw.lines().collect::<Vec<_>>();
-    let start_idx = start.saturating_sub(1).min(lines.len());
-    let mut window_start = start_idx;
-    if let Some(keyword) = keyword {
-        let keyword = keyword.to_ascii_lowercase();
-        if let Some(found_idx) = lines
-            .iter()
-            .enumerate()
-            .skip(start_idx)
-            .find(|(_, line)| line.to_ascii_lowercase().contains(&keyword))
-            .map(|(idx, _)| idx)
-        {
-            window_start = found_idx.saturating_sub(count / 3);
-        }
-    }
-    let window_end = window_start.saturating_add(count).min(lines.len());
-    let mut content = String::new();
-    let mut content_chars = 0usize;
-    let mut truncated = false;
-    let mut max_chars_reached = false;
-    for (idx, line) in lines[window_start..window_end].iter().enumerate() {
-        let actual_line = window_start + idx + 1;
-        let rendered = if show_linenos {
-            format!("{actual_line}|{line}")
-        } else {
-            (*line).to_string()
-        };
-        let rendered = if content.is_empty() {
-            rendered
-        } else {
-            format!("\n{rendered}")
-        };
-        let rendered_chars = rendered.chars().count();
-        if content_chars.saturating_add(rendered_chars) > max_chars {
-            truncated = true;
-            max_chars_reached = true;
-            break;
-        }
-        content.push_str(&rendered);
-        content_chars = content_chars.saturating_add(rendered_chars);
-    }
-    if window_end < lines.len() {
-        truncated = true;
-    }
-    FileReadSelection {
-        content,
-        truncated,
-        max_chars_reached,
-    }
 }

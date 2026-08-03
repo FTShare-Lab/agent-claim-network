@@ -26,8 +26,42 @@ async fn file_read_reads_relative_file_with_line_numbers() {
 
     assert_eq!(result.outcome, ToolExecutionOutcome::Completed);
     assert_eq!(result.output["path"], "note.txt");
-    assert_eq!(result.output["content"], "2|beta");
+    assert_eq!(result.output["content"], "2|beta\n");
     assert_eq!(result.output["truncated"], false);
+}
+
+#[tokio::test]
+async fn file_read_default_count_does_not_cap_explicit_larger_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let content = (1..=2_501)
+        .map(|line| format!("line-{line}\n"))
+        .collect::<String>();
+    tokio::fs::write(dir.path().join("many.txt"), content)
+        .await
+        .unwrap();
+    let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
+
+    let default_page = registry
+        .dispatch(
+            "file_read",
+            json!({"path": "many.txt", "show_linenos": false}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(default_page.output["page"]["returned_end"], 2_000);
+    assert_eq!(default_page.output["page"]["next_start"], 2_001);
+    assert_eq!(default_page.output["page"]["stop_reason"], "count");
+
+    let explicit_page = registry
+        .dispatch(
+            "file_read",
+            json!({"path": "many.txt", "count": 2_501, "show_linenos": false}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(explicit_page.output["page"]["returned_end"], 2_501);
+    assert_eq!(explicit_page.output["page"]["reaches_eof"], true);
+    assert_eq!(explicit_page.output["page"]["stop_reason"], "eof");
 }
 
 #[tokio::test]
@@ -52,8 +86,38 @@ async fn file_read_supports_keyword_window_without_line_numbers() {
         .unwrap();
 
     assert_eq!(result.output["path"], "note.txt");
-    assert_eq!(result.output["content"], "beta\ncharlie");
+    assert_eq!(result.output["content"], "beta\ncharlie\n");
     assert_eq!(result.output["truncated"], false);
+}
+
+#[tokio::test]
+async fn file_read_treats_blank_keyword_as_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    tokio::fs::write(dir.path().join("note.txt"), "one\ntwo\nthree\nfour\nfive\n")
+        .await
+        .unwrap();
+    let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
+
+    for keyword in ["", " \t "] {
+        let result = registry
+            .dispatch(
+                "file_read",
+                serde_json::json!({
+                    "path": "note.txt",
+                    "start": 3,
+                    "count": 2,
+                    "keyword": keyword,
+                    "show_linenos": false
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.output["content"], "three\nfour\n");
+        assert_eq!(result.output["page"]["returned_start"], 3);
+        assert_eq!(result.output["page"]["returned_end"], 4);
+        assert_eq!(result.output["page"]["keyword_match_line"], Value::Null);
+    }
 }
 
 #[tokio::test]
@@ -69,7 +133,7 @@ async fn file_read_accepts_absolute_path() {
         )
         .await
         .unwrap();
-    assert_eq!(result.output["content"], "1|secret");
+    assert_eq!(result.output["content"], "1|secret\n");
 }
 
 #[tokio::test]
@@ -105,7 +169,7 @@ async fn tilde_home_paths_execute_all_file_tools_and_code_run_cwd() {
         json!({"path": tilde_path, "count": 10_000, "show_linenos": false}),
     )
     .await;
-    assert_eq!(read["content"], "before");
+    assert_eq!(read["content"], "before\n");
     assert_eq!(read["truncated"], false);
 
     let write = dispatch_file_tool(
@@ -171,7 +235,7 @@ async fn other_user_tilde_path_remains_workspace_relative() {
         .await
         .unwrap();
 
-    assert_eq!(result.output["content"], "workspace-owned");
+    assert_eq!(result.output["content"], "workspace-owned\n");
     assert_eq!(result.output["truncated"], false);
 }
 
@@ -200,7 +264,8 @@ async fn shell_syntax_in_file_paths_is_not_expanded() {
             .await
             .unwrap();
         assert_eq!(
-            result.output["content"], expected,
+            result.output["content"],
+            format!("{expected}\n"),
             "{raw_path} must stay literal"
         );
         assert_eq!(result.output["truncated"], false);
@@ -328,6 +393,66 @@ async fn file_write_supports_prepend() {
 }
 
 #[tokio::test]
+async fn cancelled_file_write_does_not_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("note.txt");
+    tokio::fs::write(&path, "before\n").await.unwrap();
+    let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
+    let session = SessionId::from_str("session_aaaaaaaa").unwrap();
+    let _ = full_file_read(&registry, &session, "note.txt").await;
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let error = registry
+        .dispatch_with_context(
+            "file_write",
+            json!({"path": "note.txt", "content": "after\n"}),
+            ToolDispatchContext {
+                current_session_id: Some(session),
+                cancellation: Some(cancellation),
+                ..ToolDispatchContext::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ToolError::Interrupted));
+    assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "before\n");
+}
+
+#[tokio::test]
+async fn cancelled_file_patch_does_not_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("note.txt");
+    tokio::fs::write(&path, "before\n").await.unwrap();
+    let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
+    let session = SessionId::from_str("session_aaaaaaaa").unwrap();
+    let _ = full_file_read(&registry, &session, "note.txt").await;
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let error = registry
+        .dispatch_with_context(
+            "file_patch",
+            json!({
+                "path": "note.txt",
+                "old_content": "before",
+                "new_content": "after",
+            }),
+            ToolDispatchContext {
+                current_session_id: Some(session),
+                cancellation: Some(cancellation),
+                ..ToolDispatchContext::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ToolError::Interrupted));
+    assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "before\n");
+}
+
+#[tokio::test]
 async fn read_state_is_session_scoped_and_same_session_stays_authorized() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("note.txt");
@@ -425,7 +550,7 @@ async fn partial_keyword_and_truncated_reads_do_not_authorize_write() {
             json!({
                 "path": "keyword.txt",
                 "keyword": "beta",
-                "count": 3,
+                "count": 1,
                 "show_linenos": false,
             }),
         ),
@@ -465,14 +590,14 @@ async fn partial_keyword_and_truncated_reads_do_not_authorize_write() {
 }
 
 #[tokio::test]
-async fn config_truncated_read_reports_limit_and_requires_user_config_change_before_write() {
+async fn max_chars_truncation_can_page_and_then_authorize_complete_write() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_tool_config(dir.path());
-    config.file_read_max_chars = 5;
+    config.file_read_max_chars = 4;
     let registry = ToolRegistry::new(&config).unwrap();
     let session = SessionId::from_str("session_aaaaaaaa").unwrap();
     let path = dir.path().join("note.txt");
-    tokio::fs::write(&path, "abcdef\n").await.unwrap();
+    tokio::fs::write(&path, "abc\ndef\n").await.unwrap();
 
     let read = dispatch_file_tool(
         &registry,
@@ -481,6 +606,36 @@ async fn config_truncated_read_reports_limit_and_requires_user_config_change_bef
         json!({"path": "note.txt", "count": 100, "show_linenos": false}),
     )
     .await;
+    let blocked_write = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_write",
+        json!({"path": "note.txt", "content": "changed\n"}),
+    )
+    .await;
+    let local_patch = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_patch",
+        json!({"path": "note.txt", "old_content": "abc", "new_content": "ABC"}),
+    )
+    .await;
+    assert_eq!(read["truncated"], true);
+    assert_eq!(read["page"]["next_start"], 2);
+    assert_eq!(read["page"]["stop_reason"], "max_chars");
+    assert_eq!(blocked_write["status"], "error");
+    assert!(blocked_write.get("requires_user_config_change").is_none());
+    assert_eq!(local_patch["status"], "success");
+
+    let second = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_read",
+        json!({"path": "note.txt", "start": 2, "show_linenos": false}),
+    )
+    .await;
+    assert_eq!(second["content"], "def\n");
+    assert_eq!(second["page"]["reaches_eof"], true);
     let write = dispatch_file_tool(
         &registry,
         &session,
@@ -488,25 +643,231 @@ async fn config_truncated_read_reports_limit_and_requires_user_config_change_bef
         json!({"path": "note.txt", "content": "changed\n"}),
     )
     .await;
+    assert_eq!(write["status"], "success");
+    assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "changed\n");
+}
+
+#[tokio::test]
+async fn paged_reads_merge_out_of_order_but_gap_is_not_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large.txt");
+    let content = (1..=264)
+        .map(|line| format!("line-{line:03}\n"))
+        .collect::<String>();
+    tokio::fs::write(&path, content).await.unwrap();
+    let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
+    let session = SessionId::from_str("session_aaaaaaaa").unwrap();
+
+    let first = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_read",
+        json!({"path": "large.txt", "start": 1, "count": 130, "show_linenos": false}),
+    )
+    .await;
+    let tail = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_read",
+        json!({"path": "large.txt", "start": 201, "count": 64, "show_linenos": false}),
+    )
+    .await;
+    let blocked = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_write",
+        json!({"path": "large.txt", "content": "blocked\n"}),
+    )
+    .await;
+
+    assert_eq!(first["page"]["returned_end"], 130);
+    assert_eq!(first["page"]["next_start"], 131);
+    assert_eq!(tail["page"]["returned_start"], 201);
+    assert_eq!(tail["page"]["reaches_eof"], true);
+    assert_eq!(blocked["status"], "error");
+    assert_eq!(blocked["required_read"]["kind"], "complete");
+
+    let middle = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_read",
+        json!({"path": "large.txt", "start": 131, "count": 70, "show_linenos": false}),
+    )
+    .await;
+    assert_eq!(middle["page"]["returned_end"], 200);
+    let allowed = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_write",
+        json!({"path": "large.txt", "content": "complete\n"}),
+    )
+    .await;
+    assert_eq!(allowed["status"], "success");
+    assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "complete\n");
+}
+
+#[tokio::test]
+async fn unique_patch_needs_only_target_line_and_preserves_partial_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("partial.txt");
+    tokio::fs::write(&path, "unread-before\nTARGET\nunread-after\n")
+        .await
+        .unwrap();
+    let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
+    let session = SessionId::from_str("session_aaaaaaaa").unwrap();
+    let read = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_read",
+        json!({"path": "partial.txt", "start": 2, "count": 1, "show_linenos": false}),
+    )
+    .await;
+    assert_eq!(read["content"], "TARGET\n");
+
     let patch = dispatch_file_tool(
         &registry,
         &session,
         "file_patch",
-        json!({"path": "note.txt", "old_content": "abcdef", "new_content": "changed"}),
+        json!({"path": "partial.txt", "old_content": "TARGET", "new_content": "DONE"}),
+    )
+    .await;
+    assert_eq!(patch["status"], "success");
+    assert_eq!(
+        tokio::fs::read_to_string(&path).await.unwrap(),
+        "unread-before\nDONE\nunread-after\n"
+    );
+
+    let overwrite = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_write",
+        json!({"path": "partial.txt", "content": "must-not-overwrite\n"}),
+    )
+    .await;
+    assert_eq!(overwrite["status"], "error");
+}
+
+#[tokio::test]
+async fn eof_page_authorizes_append_but_not_overwrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tail.txt");
+    tokio::fs::write(&path, "unread\nlast-line").await.unwrap();
+    let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
+    let session = SessionId::from_str("session_aaaaaaaa").unwrap();
+    let tail = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_read",
+        json!({"path": "tail.txt", "start": 2, "count": 1, "show_linenos": false}),
+    )
+    .await;
+    assert_eq!(tail["page"]["reaches_eof"], true);
+    assert_eq!(tail["page"]["ends_with_newline"], false);
+
+    let append = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_write",
+        json!({"path": "tail.txt", "mode": "append", "content": "\n成功审核\n"}),
+    )
+    .await;
+    assert_eq!(append["status"], "success");
+    assert_eq!(
+        tokio::fs::read_to_string(&path).await.unwrap(),
+        "unread\nlast-line\n成功审核\n"
+    );
+
+    let overwrite = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_write",
+        json!({"path": "tail.txt", "content": "blocked\n"}),
+    )
+    .await;
+    assert_eq!(overwrite["status"], "error");
+}
+
+#[tokio::test]
+async fn patch_that_joins_an_unread_neighbor_requires_more_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("boundary.txt");
+    tokio::fs::write(&path, "first\nsecond\n").await.unwrap();
+    let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
+    let session = SessionId::from_str("session_aaaaaaaa").unwrap();
+    let _ = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_read",
+        json!({"path": "boundary.txt", "start": 1, "count": 1, "show_linenos": false}),
     )
     .await;
 
-    assert_eq!(read["truncated"], true);
-    for output in [&write, &patch] {
-        assert_eq!(output["status"], "error");
-        assert_eq!(output["file_read_max_chars"], 5);
-        assert_eq!(output["requires_user_config_change"], true);
-        let message = output["msg"].as_str().unwrap();
-        assert!(message.contains("分页读取只能查看局部内容"));
-        assert!(message.contains("[agent.tool].file_read_max_chars=5"));
-        assert!(message.contains("重启 ACN 后重新完整 file_read 并重试"));
-    }
-    assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "abcdef\n");
+    let rejected = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_patch",
+        json!({"path": "boundary.txt", "old_content": "first\n", "new_content": "first"}),
+    )
+    .await;
+    assert_eq!(rejected["status"], "error");
+    assert_eq!(rejected["required_read"]["kind"], "range");
+    assert_eq!(rejected["required_read"]["start"], 1);
+    assert_eq!(rejected["required_read"]["count"], 2);
+    assert_eq!(
+        tokio::fs::read_to_string(&path).await.unwrap(),
+        "first\nsecond\n"
+    );
+
+    let _ = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_read",
+        json!({"path": "boundary.txt", "start": 2, "count": 1, "show_linenos": false}),
+    )
+    .await;
+    let allowed = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_patch",
+        json!({"path": "boundary.txt", "old_content": "first\n", "new_content": "first"}),
+    )
+    .await;
+    assert_eq!(allowed["status"], "success");
+    assert_eq!(
+        tokio::fs::read_to_string(path).await.unwrap(),
+        "firstsecond\n"
+    );
+}
+
+#[tokio::test]
+async fn replace_all_requires_complete_coverage_even_for_one_match() {
+    let dir = tempfile::tempdir().unwrap();
+    tokio::fs::write(dir.path().join("replace.txt"), "target\nunread\n")
+        .await
+        .unwrap();
+    let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
+    let session = SessionId::from_str("session_aaaaaaaa").unwrap();
+    let _ = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_read",
+        json!({"path": "replace.txt", "count": 1, "show_linenos": false}),
+    )
+    .await;
+    let result = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_patch",
+        json!({
+            "path": "replace.txt",
+            "old_content": "target",
+            "new_content": "done",
+            "replace_all": true
+        }),
+    )
+    .await;
+    assert_eq!(result["status"], "error");
+    assert_eq!(result["required_read"]["kind"], "complete");
 }
 
 #[tokio::test]
@@ -561,8 +922,9 @@ async fn existing_file_write_modes_require_full_read() {
     for (mode, output) in outcomes {
         assert_eq!(
             output["status"], "error",
-            "已有文件的 {mode} 必须先完整 file_read"
+            "已有文件的 {mode} 必须先取得对应读取许可"
         );
+        assert!(output.get("stale").is_none());
     }
 }
 
@@ -791,7 +1153,7 @@ async fn file_patch_rejects_missing_stale_and_noop_targets() {
         json!({"path": "note.txt", "old_content": "absent", "new_content": "new"}),
     )
     .await;
-    tokio::fs::write(&path, "external\n").await.unwrap();
+    tokio::fs::write(&path, "old\nexternal\n").await.unwrap();
     let stale = dispatch_file_tool(
         &registry,
         &session,
@@ -808,7 +1170,11 @@ async fn file_patch_rejects_missing_stale_and_noop_targets() {
         .as_str()
         .is_some_and(|msg| msg.contains("重新 file_read")));
     assert_eq!(stale["status"], "error");
-    assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "external\n");
+    assert_eq!(stale["stale"], true);
+    assert_eq!(
+        tokio::fs::read_to_string(path).await.unwrap(),
+        "old\nexternal\n"
+    );
 }
 
 #[tokio::test]
@@ -874,6 +1240,7 @@ async fn external_change_after_read_is_rejected() {
     .await;
 
     assert_eq!(output["status"], "error");
+    assert_eq!(output["stale"], true);
     assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "external\n");
 }
 
@@ -900,7 +1267,7 @@ async fn missing_session_context_cannot_establish_file_write_authorization() {
         .await
         .unwrap();
 
-    assert_eq!(read.output["content"], "original");
+    assert_eq!(read.output["content"], "original\n");
     assert_eq!(write.output["status"], "error");
     assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "original\n");
 }
@@ -1021,6 +1388,88 @@ async fn file_write_preserves_leaf_symlink_and_updates_target() {
         .file_type()
         .is_symlink());
     assert_eq!(tokio::fs::read_to_string(target).await.unwrap(), "new\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn path_lock_follows_symlink_before_parent_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let target_parent = dir.path().join("target");
+    let linked_dir = target_parent.join("linked");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    tokio::fs::create_dir_all(&linked_dir).await.unwrap();
+    tokio::fs::symlink(&linked_dir, workspace.join("alias"))
+        .await
+        .unwrap();
+    let registry = ToolRegistry::new(&test_tool_config(&workspace)).unwrap();
+
+    let through_symlink = registry
+        .path_lock(&workspace.join("alias/../shared.txt"))
+        .await
+        .unwrap();
+    let canonical_target = registry
+        .path_lock(&target_parent.join("shared.txt"))
+        .await
+        .unwrap();
+
+    assert!(Arc::ptr_eq(&through_symlink, &canonical_target));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn file_write_rejects_new_memory_file_through_symlinked_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let memories = dir.path().join("agent-a/memories");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    tokio::fs::create_dir_all(&memories).await.unwrap();
+    tokio::fs::symlink(&memories, workspace.join("private_alias"))
+        .await
+        .unwrap();
+    let registry = ToolRegistry::new(&test_tool_config(&workspace)).unwrap();
+
+    let error = registry
+        .dispatch(
+            "file_write",
+            json!({"path": "private_alias/MEMORY.md", "content": "bypass"}),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("memory 工具"));
+    assert!(!memories.join("MEMORY.md").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn file_write_rejects_new_memory_files_through_symlink_and_parent_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let memories = dir.path().join("agent-a/memories");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    tokio::fs::create_dir_all(&memories).await.unwrap();
+    tokio::fs::symlink(&memories, workspace.join("private_alias"))
+        .await
+        .unwrap();
+    let registry = ToolRegistry::new(&test_tool_config(&workspace)).unwrap();
+
+    for file_name in ["MEMORY.md", "USER.md"] {
+        let error = registry
+            .dispatch(
+                "file_write",
+                json!({
+                    "path": format!("private_alias/newdir/../{file_name}"),
+                    "content": "bypass",
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("memory 工具"));
+        assert!(!memories.join(file_name).exists());
+    }
+    assert!(!memories.join("newdir").exists());
 }
 
 #[tokio::test]

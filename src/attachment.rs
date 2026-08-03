@@ -165,18 +165,20 @@ pub fn attachment_kind_for_path(path: &Path) -> AttachmentKind {
 }
 
 /// 受保护的 memory 文件（`memories/MEMORY.md` / `memories/USER.md`）只允许
-/// memory 工具访问，附件与 file_read 一律拒绝。判定是词法级的（先消解 `..`）。
+/// memory 工具访问，附件与 file_read 一律拒绝。判定先消解 `..`，固定名称忽略 ASCII 大小写。
 pub fn is_protected_memory_path(path: &Path) -> bool {
     let normalized = normalize_path_lexically(path);
     let is_memory_file = normalized
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "MEMORY.md" || name == "USER.md");
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("MEMORY.md") || name.eq_ignore_ascii_case("USER.md")
+        });
     let under_memories_dir = normalized
         .parent()
         .and_then(|parent| parent.file_name())
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "memories");
+        .is_some_and(|name| name.eq_ignore_ascii_case("memories"));
     is_memory_file && under_memories_dir
 }
 
@@ -622,6 +624,12 @@ mod tests {
         )));
         assert!(is_protected_memory_path(Path::new(
             "agent-a/memories/sub/../USER.md"
+        )));
+        assert!(is_protected_memory_path(Path::new(
+            "agent-a/memories/memory.md"
+        )));
+        assert!(is_protected_memory_path(Path::new(
+            "agent-a/MEMORIES/User.Md"
         )));
         assert!(!is_protected_memory_path(Path::new("agent-a/MEMORY.md")));
 

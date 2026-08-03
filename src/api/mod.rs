@@ -110,6 +110,7 @@ pub use chat_completions::{
     ChatImageUrl, ChatMessage, ChatMessageContent, ChatStreamEvent, ChatStreamOptions, ChatTool,
     ChatToolCall, ChatToolCallFunction,
 };
+pub(crate) use compaction_projection::FILE_EDIT_AUTHORITY_COMPACTION_NOTICE;
 pub use compaction_projection::{
     active_segment_has_large_tool_result, active_segment_messages, active_segments_hash,
     estimated_projected_segment_tokens, large_tool_result_omission_text,

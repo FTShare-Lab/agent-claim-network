@@ -14,6 +14,7 @@ use crate::api::{
     estimate_session_turn_messages_tokens, estimate_text_tokens,
     estimated_projected_segment_tokens, large_tool_result_omission_text,
     project_turn_message_tool_results, provider_safe_segments, SessionTurnMessage,
+    FILE_EDIT_AUTHORITY_COMPACTION_NOTICE,
 };
 pub(super) use crate::api::{active_segment_messages, MessageRange, ProviderProjectionBudget};
 use crate::session::{
@@ -117,6 +118,7 @@ Use it to understand prior constraints, completed work, important tool results, 
 unresolved issues, and pending next steps. Do not restart or repeat steps that \
 this context says are already completed. Only re-call a tool when exact omitted \
 output is genuinely required.\n\n\
+{FILE_EDIT_AUTHORITY_COMPACTION_NOTICE}\n\n\
 ### Earlier Conversation\n\n\
 {committed_summary}\n\
 </compacted_session_context>"
@@ -355,6 +357,7 @@ pub(super) fn active_turn_progress_message(summary: &str) -> SessionTurnMessage 
         "<compacted_current_turn_progress>\n\
 This note summarizes work already completed earlier in the current user turn before context compaction. \
 It is not a new user request.\n\n\
+{FILE_EDIT_AUTHORITY_COMPACTION_NOTICE}\n\n\
 {summary}\n\n\
 Continue the latest user request from this progress state. Do not repeat completed steps unless exact omitted output is required.\n\
 </compacted_current_turn_progress>"

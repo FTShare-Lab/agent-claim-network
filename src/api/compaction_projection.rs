@@ -10,6 +10,8 @@ use super::{estimate_session_turn_messages_tokens, SessionTurnContentBlock, Sess
 const STABLE_HASH_OFFSET: u64 = 0xcbf29ce484222325;
 const STABLE_HASH_PRIME: u64 = 0x100000001b3;
 
+pub(crate) const FILE_EDIT_AUTHORITY_COMPACTION_NOTICE: &str = "File permission boundary: this compaction cleared runtime file-edit authority derived from earlier file_read or @file content, even if a read remains mentioned in this summary or a preserved raw tail. Treat those reads as historical context, not current authorization. Before file_patch or file_write on an existing file, establish fresh authority with file_read and follow required_read.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderProjectionBudget {
     pub tail_token_limit: usize,

@@ -9,6 +9,7 @@ mod concurrency;
 mod delegation;
 pub mod diff;
 mod file;
+mod file_text;
 mod mcp;
 pub mod memory;
 mod process;
@@ -18,7 +19,6 @@ mod session;
 mod web;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::Ordering;
@@ -73,10 +73,14 @@ use process::{
     spawn_pty, ManagedProcess, OutputCursor, ProcessCompletion, ProcessManager, ProcessState,
     PtyInput, PtySpawned, PtyWatcherParts, TerminateRequestResult,
 };
-use read_state::{ReadStateScope, ReadStateStore, ReadStateVerdict};
+use read_state::{
+    ContentRevision, LineRange, ReadAuthority, ReadEvidence, ReadStateScope, ReadStateStore,
+    ReadStateVerdict,
+};
 
 const DEFAULT_LIST_DELEGATIONS_LIMIT: usize = 64;
 const MAX_MCP_DISPATCH_ERROR_CHARS: usize = 16_000;
+const DEFAULT_FILE_READ_LINES: usize = 2_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
@@ -218,6 +222,8 @@ pub struct ToolDispatchContext {
     pub progress_tx: Option<mpsc::UnboundedSender<ToolProgressUpdate>>,
     /// 仅用于支持当前 turn 可中断的长时间工具调用。
     pub cancellation: Option<CancellationToken>,
+    /// 同一 assistant 响应内，阻止在同路径前序写失败后继续假定中间状态。
+    pub(crate) failed_file_write_paths: Option<Arc<Mutex<BTreeSet<PathBuf>>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

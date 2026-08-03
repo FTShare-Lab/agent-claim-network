@@ -217,7 +217,7 @@ MCP server 按连接方式分两类：
 
 ### `[agent.tool]`
 
-- `file_read_max_chars`：`file_read` 等文件读取工具单次返回的最大字符数。已有文件若因该上限截断，分页读取只能浏览局部内容，不会授予写权限；工具会返回当前上限，并提示用户提高 `[agent.tool].file_read_max_chars` 后重启 ACN、重新完整读取再重试。
+- `file_read_max_chars`：`file_read` 单页返回的最大字符数，默认 `100000`。达到上限时工具通过 `page.next_start` 指示下一页；同一文件版本的已读范围会累计，不需要修改配置或重启 ACN。局部 patch 只要求目标范围，append 只要求读到 EOF，完整改写才要求分页覆盖全文。
 - `file_diff_max_changed_lines`：`file_write` / `file_patch` 修改成功后采集并在 TUI 历史区展示的 diff 最大**改动行数**（仅统计 +/- 行，上下文行不占额度），超出部分截断并提示剩余改动行数。
 - `max_parallel_tool_calls`：一个 agent 当前 turn 内、连续可并发工具批次的最大活跃调用数，默认 `5`，必须大于 `0`。它不跨 turn、session 或 agent 共享，也不限制 provider 的 fallback 尝试次数。
 - `code_run_max_output_chars`：单次 `code_run` / `write_stdin` 工具中每个 stdout/stderr stream 回传允许的最大输出字符数，默认 `1048576`，最多 `2097152`；pipe 模式两个 stream 各自适用该上限，PTY 只有 stdout。

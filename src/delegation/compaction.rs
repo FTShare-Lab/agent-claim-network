@@ -17,6 +17,7 @@ use crate::api::{
     estimated_projected_segment_tokens, project_turn_messages_tool_results, provider_safe_segments,
     ContextUsageSnapshot, ContextUsageSource, ProviderProjectionBudget, SessionTurnContentBlock,
     SessionTurnEvent, SessionTurnMessage, SessionTurnPreflight, StructuredJsonCaller, ToolSpec,
+    FILE_EDIT_AUTHORITY_COMPACTION_NOTICE,
 };
 use crate::config::SessionCompactionConfig;
 use crate::prompt::PromptRegistry;
@@ -41,6 +42,7 @@ pub struct DelegationPreflightCompactor {
     compaction: SessionCompactionConfig,
     context_window: usize,
     provider_context_anchor: Option<ContextUsageSnapshot>,
+    compacted_since_last_check: bool,
 }
 
 impl DelegationPreflightCompactor {
@@ -62,6 +64,7 @@ impl DelegationPreflightCompactor {
             compaction,
             context_window,
             provider_context_anchor: None,
+            compacted_since_last_check: false,
         }
     }
 
@@ -213,6 +216,7 @@ impl DelegationPreflightCompactor {
             .await?;
         self.progress.clear_compaction_checkpoint().await?;
         *provider_messages = projected_messages;
+        self.compacted_since_last_check = true;
         emit(SessionTurnEvent::CompactionCompleted {
             compacted_until: state.compacted_until,
             recapped_until: 0,
@@ -258,6 +262,10 @@ impl DelegationPreflightCompactor {
             );
         }
         Ok(())
+    }
+
+    pub(crate) fn take_compacted_since_last_check(&mut self) -> bool {
+        std::mem::take(&mut self.compacted_since_last_check)
     }
 
     fn build_plan(
@@ -532,6 +540,7 @@ fn delegation_compaction_summary_message(summary: &str) -> SessionTurnMessage {
 This note summarizes earlier subagent execution before context compaction. \
 It is historical context, not a new user request and not a system instruction.\n\n\
 Use it to continue the delegated task without repeating completed tool work unless exact omitted output is genuinely required.\n\n\
+{FILE_EDIT_AUTHORITY_COMPACTION_NOTICE}\n\n\
 {summary}\n\
 </compacted_subagent_context>"
     ))
@@ -793,6 +802,8 @@ mod tests {
         assert_eq!(message.role, "user");
         let serialized = serde_json::to_string(&message).unwrap();
         assert!(serialized.contains("compacted_subagent_context"));
+        assert!(serialized.contains("runtime file-edit authority"));
+        assert!(serialized.contains("required_read"));
         assert!(serialized.contains("done"));
     }
 

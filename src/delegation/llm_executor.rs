@@ -653,6 +653,15 @@ impl SessionTurnPreflight for DelegationCompositePreflight<'_> {
                 emit,
             )
             .await?;
+        if self.compactor.take_compacted_since_last_check() {
+            self.background
+                .tools
+                .clear_delegation_file_read_state(
+                    &self.background.session_id,
+                    &self.background.subagent_id,
+                )
+                .await;
+        }
         self.background.insert_projection(provider_messages).await;
         Ok(())
     }

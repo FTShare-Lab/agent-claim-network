@@ -1597,7 +1597,8 @@ async fn preflight_externalizes_skill_and_attachment_only_after_full_projection_
         Vec::new(),
     )]));
     let (mut engine, store) = build_test_engine(&dir, provider);
-    engine.context_window = 2_000;
+    // 给 compact wrapper 留出扩展空间，同时仍保证大 Skill/附件正文必须外置。
+    engine.context_window = 3_000;
     engine.compaction.tail_target_ctx_ratio = 0.10;
     engine.compaction.tail_hard_ctx_ratio = 0.25;
     let mut session = create_test_session(&store, "session_c0ffee11").await;
@@ -1704,7 +1705,8 @@ async fn provider_only_externalization_does_not_change_committed_transcript_or_v
             spec_path,
         }],
     );
-    engine.context_window = 2_000;
+    // 给 compact wrapper 留出扩展空间，同时仍保证大 Skill/附件正文必须外置。
+    engine.context_window = 3_000;
     engine.compaction.auto_compact_ctx_ratio = 0.00001;
     engine.compaction.tail_target_ctx_ratio = 0.10;
     engine.compaction.tail_hard_ctx_ratio = 0.25;
@@ -1759,7 +1761,8 @@ async fn preflight_retries_once_with_half_summary_limit_after_reference_projecti
     let (mut engine, store) = build_test_engine(&dir, provider.clone());
     engine.context_window = 4_000;
     engine.compaction.tail_target_ctx_ratio = 0.10;
-    engine.compaction.tail_hard_ctx_ratio = 0.25;
+    // 首次 4000 字符摘要仍超限，重试后的 2000 字符摘要可连同 wrapper 放入预算。
+    engine.compaction.tail_hard_ctx_ratio = 0.275;
     engine.compaction.summary_max_chars = 4_000;
     let mut session = create_test_session(&store, "session_c0ffee12").await;
     let active_suffix = oversized_active_suffix(
@@ -2431,11 +2434,31 @@ async fn manual_compact_noop_reports_raw_tail_budget_when_new_history_is_preserv
 }
 
 #[tokio::test]
-async fn manual_compact_applied_checkpoint_preserves_recovered_report() {
+async fn manual_compact_applied_checkpoint_preserves_report_and_clears_file_read_state() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(Vec::new()));
-    let (engine, store) = build_test_engine(&dir, provider);
+    let tool_config = ToolConfig {
+        workspace_root: dir.path().to_path_buf(),
+        ..ToolConfig::default()
+    };
+    let tools = Arc::new(ToolRegistry::new(&tool_config).unwrap());
+    let (engine, store) = build_test_engine_with_tools(&dir, provider, Arc::clone(&tools));
     let mut session = create_test_session(&store, "session_face0005").await;
+    tokio::fs::write(dir.path().join("note.txt"), "before\n")
+        .await
+        .unwrap();
+    let tool_context = ToolDispatchContext {
+        current_session_id: Some(session.metadata.id.clone()),
+        ..ToolDispatchContext::default()
+    };
+    tools
+        .dispatch_with_context(
+            "file_read",
+            json!({"path": "note.txt", "show_linenos": false}),
+            tool_context.clone(),
+        )
+        .await
+        .unwrap();
     let now = Utc::now();
     session
         .append_messages(&[
@@ -2519,6 +2542,21 @@ async fn manual_compact_applied_checkpoint_preserves_recovered_report() {
     assert_eq!(outcome.report.new_dispute_ids, vec![applied_dispute_id]);
     assert_eq!(outcome.report.warnings, vec!["upload warning kept"]);
     assert_eq!(outcome.audit_ids, vec!["compact_report"]);
+    let write = tools
+        .dispatch_with_context(
+            "file_write",
+            json!({"path": "note.txt", "content": "after\n"}),
+            tool_context,
+        )
+        .await
+        .unwrap();
+    assert_eq!(write.output["status"], "error");
+    assert_eq!(
+        tokio::fs::read_to_string(dir.path().join("note.txt"))
+            .await
+            .unwrap(),
+        "before\n"
+    );
     let audit_log = tokio::fs::read_to_string(&session.paths.compaction_events_jsonl)
         .await
         .unwrap();
@@ -3950,6 +3988,8 @@ fn provider_projection_preserves_current_anchor_and_omits_large_tool_result_raw(
     assert_eq!(projection.system_prompt, "system");
     assert!(rendered.contains("compacted_session_context"));
     assert!(rendered.contains("Earlier Conversation"));
+    assert!(rendered.contains("runtime file-edit authority"));
+    assert!(rendered.contains("required_read"));
     assert!(rendered.contains("current_date: 2026-06-30 Tuesday"));
     assert!(rendered.contains("continue the long task"));
     assert!(rendered.contains("compacted_current_turn_progress"));
@@ -4016,6 +4056,8 @@ fn provider_projection_injects_active_progress_note_after_compaction() {
     let rendered = serde_json::to_string(&projection.messages).unwrap();
     assert!(rendered.contains("create the file, then verify it once"));
     assert!(rendered.contains("compacted_current_turn_progress"));
+    assert!(rendered.contains("runtime file-edit authority"));
+    assert!(rendered.contains("required_read"));
     assert!(rendered.contains("already been created successfully"));
     assert!(rendered.contains("do not recreate it"));
     assert!(!rendered.contains("CHAR_COUNT=20058"));

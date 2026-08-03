@@ -3,7 +3,7 @@
 //! 本模块承接单轮用户输入后的模型调用、工具执行和 tool_result 回灌。
 //! 它只理解 canonical session message，不关心 Anthropic/OpenAI 等后端协议细节。
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +16,7 @@ use chrono::{DateTime, Local, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time;
 use tokio::time::Instant;
 
@@ -225,6 +225,7 @@ impl AgentTurnLoop {
             .map(|_| None)
             .collect::<Vec<Option<ExecutedToolUse>>>();
         let max_parallel = self.tools.max_parallel_tool_calls();
+        let failed_file_write_paths = Arc::new(Mutex::new(BTreeSet::new()));
         let mut batch_start = 0usize;
 
         while batch_start < tool_uses.len() {
@@ -262,6 +263,7 @@ impl AgentTurnLoop {
                     emit,
                     durable_recorder,
                     &mut executions,
+                    Arc::clone(&failed_file_write_paths),
                 )
                 .await?;
             if matches!(outcome, ToolBatchOutcome::Interrupted) {
@@ -302,6 +304,7 @@ impl AgentTurnLoop {
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
         durable_recorder: &mut Option<&mut dyn SessionTurnEventRecorder>,
         executions: &mut [Option<ExecutedToolUse>],
+        failed_file_write_paths: Arc<Mutex<BTreeSet<std::path::PathBuf>>>,
     ) -> anyhow::Result<ToolBatchOutcome> {
         let batch = &all_tool_uses[batch_start..batch_end];
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
@@ -423,6 +426,7 @@ impl AgentTurnLoop {
                         tool_use_id: Some(tool_use.id.clone()),
                         progress_tx: Some(progress_tx.clone()),
                         cancellation: cancellation.clone(),
+                        failed_file_write_paths: Some(Arc::clone(&failed_file_write_paths)),
                     };
                     let tools = Arc::clone(&self.tools);
                     let execution_name = tool_use.name.clone();
@@ -841,7 +845,7 @@ impl AgentTurnLoop {
             skill_instructions,
         } = request;
         let mut provider_messages = history;
-        let user_message = session_user_message(
+        let (user_message, text_attachment_reads) = session_user_message(
             user_text,
             user_attachments,
             skill_instructions,
@@ -874,6 +878,25 @@ impl AgentTurnLoop {
             // 已收到 steer 或显式取消，就不能再发起一个新的 provider request。
             if tool_boundary_is_cancelled(tool_boundary_control.as_ref()) {
                 return Err(SessionTurnInterrupted.into());
+            }
+            if turn_idx == 0 {
+                let attachment_context = ToolDispatchContext {
+                    current_session_id: current_session_id.clone(),
+                    current_turn_id: current_turn_id.clone(),
+                    ..ToolDispatchContext::default()
+                };
+                for attachment in text_attachment_reads
+                    .iter()
+                    .filter(|attachment| attachment.is_visible_in(&provider_messages))
+                {
+                    self.tools
+                        .record_text_attachment_read(
+                            &attachment_context,
+                            attachment.canonical_path.clone(),
+                            &attachment.content,
+                        )
+                        .await;
+                }
             }
             let mut process_deliveries_for_request = Vec::new();
             let mut process_deliveries_not_in_request = Vec::new();
@@ -1422,7 +1445,7 @@ async fn session_user_message(
     attachments: Vec<SessionAttachment>,
     skill_instructions: Vec<SkillInstructions>,
     limits: &AttachmentLimits,
-) -> anyhow::Result<SessionTurnMessage> {
+) -> anyhow::Result<(SessionTurnMessage, Vec<TextAttachmentRead>)> {
     if !limits.enabled && !attachments.is_empty() {
         anyhow::bail!("附件功能已禁用");
     }
@@ -1445,22 +1468,30 @@ async fn session_user_message(
             .map(SessionTurnContentBlock::skill_instructions),
     );
     blocks.push(SessionTurnContentBlock::text(user_text));
+    let mut text_reads = Vec::<TextAttachmentRead>::new();
     for attachment in attachments {
-        blocks.push(session_attachment_block(attachment, limits).await?);
+        let (block, text_read) = session_attachment_block(attachment, limits).await?;
+        blocks.push(block);
+        if let Some(text_read) = text_read {
+            text_reads.push(text_read);
+        }
     }
-    Ok(SessionTurnMessage::user_content(blocks))
+    Ok((SessionTurnMessage::user_content(blocks), text_reads))
 }
 
 async fn session_attachment_block(
     attachment: SessionAttachment,
     limits: &AttachmentLimits,
-) -> anyhow::Result<SessionTurnContentBlock> {
+) -> anyhow::Result<(SessionTurnContentBlock, Option<TextAttachmentRead>)> {
     match attachment {
         SessionAttachment::LocalImage { path } => {
             let media = crate::attachment::read_image_attachment(&path, limits)
                 .await
                 .context("读取图片附件失败")?;
-            Ok(SessionTurnContentBlock::image(media.media_type, media.data))
+            Ok((
+                SessionTurnContentBlock::image(media.media_type, media.data),
+                None,
+            ))
         }
         SessionAttachment::InlineImage { data, .. } => {
             let bytes = BASE64_STANDARD
@@ -1481,7 +1512,10 @@ async fn session_attachment_block(
             )
             .await
             .context("校验内联图片附件失败")?;
-            Ok(SessionTurnContentBlock::image(media.media_type, media.data))
+            Ok((
+                SessionTurnContentBlock::image(media.media_type, media.data),
+                None,
+            ))
         }
         SessionAttachment::TextFile { path } => read_text_file_block(&path, limits).await,
         SessionAttachment::DocumentFile { path, media_type } => {
@@ -1495,10 +1529,13 @@ async fn session_attachment_block(
             let media = crate::attachment::read_document_attachment(&path, limits)
                 .await
                 .context("读取 PDF 附件失败")?;
-            Ok(SessionTurnContentBlock::document_named(
-                media.media_type,
-                media.data,
-                media.source_name,
+            Ok((
+                SessionTurnContentBlock::document_named(
+                    media.media_type,
+                    media.data,
+                    media.source_name,
+                ),
+                None,
             ))
         }
     }
@@ -1507,18 +1544,52 @@ async fn session_attachment_block(
 async fn read_text_file_block(
     path: &Path,
     limits: &AttachmentLimits,
-) -> anyhow::Result<SessionTurnContentBlock> {
-    let content = crate::attachment::read_text_attachment(path, limits)
+) -> anyhow::Result<(SessionTurnContentBlock, Option<TextAttachmentRead>)> {
+    // 先固定并校验真实目标，再从同一 canonical 路径读取。这样符号链接在读取后
+    // 被切换时，不会让正文来自受保护文件、许可却绑定到另一个目标。
+    let canonical_path = tokio::fs::canonicalize(path)
+        .await
+        .context("解析文本附件真实路径失败")?;
+    if crate::attachment::is_protected_memory_path(&canonical_path) {
+        anyhow::bail!("MEMORY.md / USER.md 必须通过 memory 工具访问");
+    }
+    let content = crate::attachment::read_text_attachment(&canonical_path, limits)
         .await
         .context("读取文本附件失败")?;
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("attachment");
-    Ok(SessionTurnContentBlock::text(format!(
+    let provider_text = format!(
         "Attached file: {name}\nPath: {}\n\n{content}",
         path.display()
-    )))
+    );
+    Ok((
+        SessionTurnContentBlock::text(provider_text.clone()),
+        Some(TextAttachmentRead {
+            canonical_path,
+            content,
+            provider_text,
+        }),
+    ))
+}
+
+#[derive(Debug)]
+struct TextAttachmentRead {
+    canonical_path: std::path::PathBuf,
+    content: String,
+    provider_text: String,
+}
+
+impl TextAttachmentRead {
+    /// preflight 可以压缩或外置附件；只有完整正文仍在即将发送的请求中才登记读取许可。
+    fn is_visible_in(&self, messages: &[SessionTurnMessage]) -> bool {
+        messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(block, SessionTurnContentBlock::Text { text } if text == &self.provider_text)
+            })
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1732,6 +1803,7 @@ async fn emit_forced_abort_interrupts(
                     tool_use_id: Some(tool_use.id.clone()),
                     progress_tx: None,
                     cancellation: None,
+                    failed_file_write_paths: None,
                 })
                 .await
         } else {
@@ -2187,6 +2259,14 @@ mod tests {
         replacement: String,
     }
 
+    struct ClearingFileReadPreflight {
+        tools: Arc<ToolRegistry>,
+        session_id: crate::claim::SessionId,
+        cleared: bool,
+    }
+
+    struct ExternalizingTextAttachmentPreflight;
+
     #[async_trait]
     impl SessionTurnPreflight for ReplaceProcessToolResultPreflight {
         async fn before_provider_request(
@@ -2212,6 +2292,47 @@ mod tests {
                 })
                 .ok_or_else(|| anyhow::anyhow!("missing process tool_result to replace"))?;
             *content = self.replacement.clone();
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SessionTurnPreflight for ClearingFileReadPreflight {
+        async fn before_provider_request(
+            &mut self,
+            _system_prompt: &mut String,
+            _provider_messages: &mut Vec<SessionTurnMessage>,
+            _emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        ) -> anyhow::Result<()> {
+            if !self.cleared {
+                self.tools.clear_file_read_state(&self.session_id).await;
+                self.cleared = true;
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SessionTurnPreflight for ExternalizingTextAttachmentPreflight {
+        async fn before_provider_request(
+            &mut self,
+            _system_prompt: &mut String,
+            provider_messages: &mut Vec<SessionTurnMessage>,
+            _emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        ) -> anyhow::Result<()> {
+            for message in provider_messages {
+                for block in &mut message.content {
+                    if matches!(
+                        block,
+                        SessionTurnContentBlock::Text { text }
+                            if text.starts_with("Attached file: attached.txt\n")
+                    ) {
+                        *block = SessionTurnContentBlock::text(
+                            "<externalized_compaction_asset>read with file_read</externalized_compaction_asset>",
+                        );
+                    }
+                }
+            }
             Ok(())
         }
     }
@@ -3548,6 +3669,410 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("校验内联图片附件失败"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn text_attachment_checks_canonical_memory_target_before_reading() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let memories = dir.path().join("memories");
+        tokio::fs::create_dir(&memories).await.unwrap();
+        let protected = memories.join("MEMORY.md");
+        tokio::fs::write(&protected, "private\n").await.unwrap();
+        tokio::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o000))
+            .await
+            .unwrap();
+        let alias = dir.path().join("attached.txt");
+        tokio::fs::symlink(&protected, &alias).await.unwrap();
+        let provider = Arc::new(FakeProvider::new(Vec::new()));
+        let turn_loop = tool_loop(provider.clone());
+        let mut request = request();
+        request.user_attachments = vec![crate::api::SessionAttachment::TextFile { path: alias }];
+
+        let error = turn_loop
+            .run_session_turn(request, &mut |_| {})
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("MEMORY.md / USER.md 必须通过 memory 工具访问"));
+        assert!(provider.requests.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn complete_text_attachment_authorizes_existing_file_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attached.txt");
+        tokio::fs::write(&path, "before\n").await.unwrap();
+        let tools = Arc::new(
+            ToolRegistry::new(&ToolConfig {
+                workspace_root: dir.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let provider = Arc::new(FakeProvider::new(vec![
+            response(
+                vec![tool_use(
+                    "toolu_write",
+                    "file_write",
+                    json!({"path": "attached.txt", "content": "after\n"}),
+                )],
+                ProviderStop::ToolUse,
+            ),
+            response(
+                vec![SessionTurnContentBlock::text("完成")],
+                ProviderStop::Done,
+            ),
+        ]));
+        let turn_loop = tool_loop_with_tools(provider.clone(), tools);
+        let mut request = request();
+        request.current_session_id = Some("session_aaaaaaaa".parse().unwrap());
+        request.current_turn_id = Some("turn_attachment".into());
+        request.user_attachments =
+            vec![crate::api::SessionAttachment::TextFile { path: path.clone() }];
+
+        let turn = turn_loop
+            .run_session_turn(request, &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "after\n");
+        let result = tool_result_content(&turn.messages[2], "toolu_write");
+        assert_eq!(result["outcome"]["kind"], "completed");
+        let requests = provider.requests.lock().await;
+        assert!(requests[0]
+            .messages
+            .iter()
+            .flat_map(|message| text_blocks(message))
+            .any(|text| text.contains("Attached file: attached.txt") && text.contains("before\n")));
+    }
+
+    #[tokio::test]
+    async fn current_text_attachment_is_registered_after_first_preflight_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attached.txt");
+        tokio::fs::write(&path, "before\n").await.unwrap();
+        let tools = Arc::new(
+            ToolRegistry::new(&ToolConfig {
+                workspace_root: dir.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let provider = Arc::new(FakeProvider::new(vec![
+            response(
+                vec![tool_use(
+                    "toolu_write",
+                    "file_write",
+                    json!({"path": "attached.txt", "content": "after\n"}),
+                )],
+                ProviderStop::ToolUse,
+            ),
+            response(
+                vec![SessionTurnContentBlock::text("完成")],
+                ProviderStop::Done,
+            ),
+        ]));
+        let turn_loop = tool_loop_with_tools(provider, Arc::clone(&tools));
+        let session_id: crate::claim::SessionId = "session_aaaaaaaa".parse().unwrap();
+        let mut request = request();
+        request.current_session_id = Some(session_id.clone());
+        request.current_turn_id = Some("turn_attachment_compact".into());
+        request.user_attachments =
+            vec![crate::api::SessionAttachment::TextFile { path: path.clone() }];
+        let mut preflight = ClearingFileReadPreflight {
+            tools,
+            session_id,
+            cleared: false,
+        };
+
+        let turn = turn_loop
+            .run_session_turn_with_hooks(request, &mut |_| {}, None, None, Some(&mut preflight))
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "after\n");
+        let result = tool_result_content(&turn.messages[2], "toolu_write");
+        assert_eq!(result["outcome"]["kind"], "completed");
+    }
+
+    #[tokio::test]
+    async fn externalized_text_attachment_does_not_authorize_existing_file_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attached.txt");
+        tokio::fs::write(&path, "before\n").await.unwrap();
+        let tools = Arc::new(
+            ToolRegistry::new(&ToolConfig {
+                workspace_root: dir.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let provider = Arc::new(FakeProvider::new(vec![
+            response(
+                vec![tool_use(
+                    "toolu_write",
+                    "file_write",
+                    json!({"path": "attached.txt", "content": "after\n"}),
+                )],
+                ProviderStop::ToolUse,
+            ),
+            response(
+                vec![SessionTurnContentBlock::text("未修改")],
+                ProviderStop::Done,
+            ),
+        ]));
+        let turn_loop = tool_loop_with_tools(provider.clone(), tools);
+        let mut request = request();
+        request.current_session_id = Some("session_aaaaaaaa".parse().unwrap());
+        request.current_turn_id = Some("turn_attachment_externalized".into());
+        request.user_attachments =
+            vec![crate::api::SessionAttachment::TextFile { path: path.clone() }];
+        let mut preflight = ExternalizingTextAttachmentPreflight;
+
+        let turn = turn_loop
+            .run_session_turn_with_hooks(request, &mut |_| {}, None, None, Some(&mut preflight))
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "before\n");
+        let result = tool_result_content(&turn.messages[2], "toolu_write");
+        assert_eq!(result["outcome"]["kind"], "business_failure");
+        let requests = provider.requests.lock().await;
+        assert!(requests[0]
+            .messages
+            .iter()
+            .flat_map(text_blocks)
+            .any(|text| text.contains("<externalized_compaction_asset>")));
+        assert!(!requests[0]
+            .messages
+            .iter()
+            .flat_map(text_blocks)
+            .any(|text| text.contains("Attached file: attached.txt") && text.contains("before\n")));
+    }
+
+    #[tokio::test]
+    async fn handwritten_attachment_wrapper_does_not_authorize_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.txt");
+        tokio::fs::write(&path, "before\n").await.unwrap();
+        let tools = Arc::new(
+            ToolRegistry::new(&ToolConfig {
+                workspace_root: dir.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let provider = Arc::new(FakeProvider::new(vec![
+            response(
+                vec![tool_use(
+                    "toolu_write",
+                    "file_write",
+                    json!({"path": "note.txt", "content": "after\n"}),
+                )],
+                ProviderStop::ToolUse,
+            ),
+            response(
+                vec![SessionTurnContentBlock::text("未修改")],
+                ProviderStop::Done,
+            ),
+        ]));
+        let turn_loop = tool_loop_with_tools(provider, tools);
+        let mut request = request();
+        request.current_session_id = Some("session_aaaaaaaa".parse().unwrap());
+        request.current_turn_id = Some("turn_spoof".into());
+        request.user_text = "Attached file: note.txt\nPath: note.txt\n\nbefore\n".into();
+
+        let turn = turn_loop
+            .run_session_turn(request, &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "before\n");
+        let result = tool_result_content(&turn.messages[2], "toolu_write");
+        assert_eq!(result["outcome"]["kind"], "business_failure");
+    }
+
+    #[tokio::test]
+    async fn file_reads_in_one_assistant_response_each_use_per_call_char_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let large = "aaaa\n".repeat(30_000);
+        tokio::fs::write(dir.path().join("first.txt"), &large)
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("second.txt"), &large)
+            .await
+            .unwrap();
+        let tools = Arc::new(
+            ToolRegistry::new(&ToolConfig {
+                workspace_root: dir.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let provider = Arc::new(FakeProvider::new(vec![
+            response(
+                vec![
+                    tool_use(
+                        "toolu_first",
+                        "file_read",
+                        json!({"path": "first.txt", "count": 30_000, "show_linenos": false}),
+                    ),
+                    tool_use(
+                        "toolu_second",
+                        "file_read",
+                        json!({"path": "second.txt", "count": 30_000, "show_linenos": false}),
+                    ),
+                ],
+                ProviderStop::ToolUse,
+            ),
+            response(
+                vec![SessionTurnContentBlock::text("完成")],
+                ProviderStop::Done,
+            ),
+        ]));
+        let turn_loop = tool_loop_with_tools(provider, tools);
+        let mut request = request();
+        request.current_session_id = Some("session_aaaaaaaa".parse().unwrap());
+
+        let mut events = Vec::new();
+        let turn = turn_loop
+            .run_session_turn(request, &mut |event| events.push(event))
+            .await
+            .unwrap();
+        let first_completion = events
+            .iter()
+            .position(|event| matches!(event, SessionTurnEvent::ToolCallCompleted { .. }))
+            .expect("file_read 应产生完成事件");
+        for id in ["toolu_first", "toolu_second"] {
+            let started = events
+                .iter()
+                .position(|event| {
+                    matches!(event, SessionTurnEvent::ToolCallStarted { id: started_id, .. } if started_id == id)
+                })
+                .expect("两个 file_read 都应启动");
+            assert!(
+                started < first_completion,
+                "不同文件的 file_read 应进入同一并发批次"
+            );
+        }
+        let first = tool_result_content(&turn.messages[2], "toolu_first");
+        let second = tool_result_content(&turn.messages[2], "toolu_second");
+        for result in [first, second] {
+            assert_eq!(
+                result["output"]["content"]
+                    .as_str()
+                    .unwrap()
+                    .chars()
+                    .count(),
+                crate::config::DEFAULT_FILE_READ_MAX_CHARS
+            );
+            assert_eq!(result["output"]["page"]["returned_end"], 20_000);
+            assert_eq!(result["output"]["page"]["stop_reason"], "max_chars");
+        }
+    }
+
+    #[tokio::test]
+    async fn same_response_read_then_local_patch_uses_immediate_read_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.txt");
+        tokio::fs::write(&path, "before\ntarget\nafter\n")
+            .await
+            .unwrap();
+        let tools = Arc::new(
+            ToolRegistry::new(&ToolConfig {
+                workspace_root: dir.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let provider = Arc::new(FakeProvider::new(vec![
+            response(
+                vec![
+                    tool_use(
+                        "toolu_read",
+                        "file_read",
+                        json!({"path": "note.txt", "start": 2, "count": 1, "show_linenos": false}),
+                    ),
+                    tool_use(
+                        "toolu_patch",
+                        "file_patch",
+                        json!({"path": "note.txt", "old_content": "target", "new_content": "done"}),
+                    ),
+                ],
+                ProviderStop::ToolUse,
+            ),
+            response(
+                vec![SessionTurnContentBlock::text("完成")],
+                ProviderStop::Done,
+            ),
+        ]));
+        let turn_loop = tool_loop_with_tools(provider, tools);
+        let mut request = request();
+        request.current_session_id = Some("session_aaaaaaaa".parse().unwrap());
+
+        let turn = turn_loop
+            .run_session_turn(request, &mut |_| {})
+            .await
+            .unwrap();
+        let patch = tool_result_content(&turn.messages[2], "toolu_patch");
+        assert_eq!(patch["outcome"]["kind"], "completed");
+        assert_eq!(
+            tokio::fs::read_to_string(path).await.unwrap(),
+            "before\ndone\nafter\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn later_same_path_write_is_skipped_after_business_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.txt");
+        tokio::fs::write(&path, "original\n").await.unwrap();
+        let tools = Arc::new(
+            ToolRegistry::new(&ToolConfig {
+                workspace_root: dir.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let provider = Arc::new(FakeProvider::new(vec![
+            response(
+                vec![
+                    tool_use(
+                        "toolu_first",
+                        "file_write",
+                        json!({"path": "note.txt", "content": "first\n"}),
+                    ),
+                    tool_use(
+                        "toolu_second",
+                        "file_write",
+                        json!({"path": "note.txt", "content": "second\n"}),
+                    ),
+                ],
+                ProviderStop::ToolUse,
+            ),
+            response(
+                vec![SessionTurnContentBlock::text("未修改")],
+                ProviderStop::Done,
+            ),
+        ]));
+        let turn_loop = tool_loop_with_tools(provider, tools);
+        let mut request = request();
+        request.current_session_id = Some("session_aaaaaaaa".parse().unwrap());
+
+        let turn = turn_loop
+            .run_session_turn(request, &mut |_| {})
+            .await
+            .unwrap();
+        let first = tool_result_content(&turn.messages[2], "toolu_first");
+        let second = tool_result_content(&turn.messages[2], "toolu_second");
+        assert_eq!(first["outcome"]["kind"], "business_failure");
+        assert_eq!(second["output"]["status"], "skipped");
+        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "original\n");
     }
 
     #[tokio::test]

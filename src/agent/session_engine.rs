@@ -349,6 +349,11 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
         };
         *system_prompt = projection.system_prompt;
         *provider_messages = projection.messages;
+        // compact 已替换旧正文；不追踪逐 block 可见性，直接保守撤销该 session 的许可。
+        self.engine
+            .turn_loop
+            .clear_file_read_state(&self.session.metadata.id)
+            .await;
         self.active_start_index = projection.active_start_index;
         self.delegation_projection_inserted = false;
         self.background_projection_insert_index = None;
@@ -1553,7 +1558,7 @@ impl SessionEngine {
         &self,
         session_id: &SessionId,
     ) -> anyhow::Result<SessionHandle> {
-        // read state 是单次运行期安全状态；resume 后必须重新完整 file_read。
+        // read state 是单次运行期安全状态；resume 后必须重新建立所需读取许可。
         self.turn_loop.clear_file_read_state(session_id).await;
         let session = self
             .session_store
@@ -3491,6 +3496,10 @@ impl SessionEngine {
                     outcome.recovered,
                 )
                 .await;
+                // 手动 compact 已用摘要替换模型可见正文，旧读取许可不能跨该边界继续使用。
+                self.turn_loop
+                    .clear_file_read_state(&session.metadata.id)
+                    .await;
                 emit(SessionEvent::CompactionCompleted {
                     compacted_until: outcome.state.committed_message_until(),
                     recapped_until,

@@ -492,6 +492,8 @@ mod tests {
         assert!(out.contains("\"summary\""));
         assert!(out.contains("1234"));
         assert!(out.contains("不要编造"));
+        assert!(out.contains("运行期修改许可"));
+        assert!(out.contains("required_read"));
     }
 
     #[test]
@@ -548,6 +550,8 @@ mod tests {
 
         assert!(out.contains("不超过 1234 个字符"));
         assert!(out.contains("选择性保留"));
+        assert!(out.contains("运行期修改许可"));
+        assert!(out.contains("required_read"));
         assert!(!out.contains("summary_max_chars"));
     }
 }
