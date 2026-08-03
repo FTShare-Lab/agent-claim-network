@@ -3972,6 +3972,67 @@ async fn compaction_summary_prefers_full_tool_results_when_request_fits() {
 }
 
 #[tokio::test]
+async fn compaction_summary_omits_media_from_active_turn_user_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        r#"{"committed_summary":null,"active_turn_summary":"bounded active summary"}"#,
+        Vec::new(),
+    )]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.context_window = 6_000;
+    let session = create_test_session(&store, "session_c0ffee25").await;
+    let active_turn_user_anchor = SessionTurnMessage::user_content(vec![
+        SessionTurnContentBlock::image(
+            "image/png",
+            format!("RAW_ACTIVE_IMAGE_{}", "A".repeat(40_000)),
+        ),
+        SessionTurnContentBlock::document_named(
+            "application/pdf",
+            format!("RAW_ACTIVE_DOCUMENT_{}", "B".repeat(40_000)),
+            "brief.pdf",
+        ),
+    ]);
+    let active_turn_transcript = vec![TurnMessage {
+        role: "assistant".into(),
+        content: "analyzed the attachments".into(),
+    }];
+    let inputs = CompactionSummaryInputs {
+        audit: test_compaction_audit_context(CompactionAuditScope::ActiveTurn),
+        committed_start_index: None,
+        committed_end_index: None,
+        prior_committed_summary: None,
+        committed_transcript: None,
+        committed_transcript_with_large_tool_results_omitted: None,
+        committed_transcript_with_tool_results_omitted: None,
+        prior_active_turn_summary: None,
+        active_turn_user_anchor: Some(&active_turn_user_anchor),
+        active_turn_start_segment: Some(0),
+        active_turn_end_segment: Some(1),
+        active_turn_transcript: Some(&active_turn_transcript),
+        active_turn_transcript_with_large_tool_results_omitted: Some(&active_turn_transcript),
+        active_turn_transcript_with_tool_results_omitted: Some(&active_turn_transcript),
+        summary_max_chars: 6000,
+    };
+
+    engine
+        .generate_compaction_summary(&session, &inputs, &mut |_| {})
+        .await
+        .expect("media-projected active compaction summary");
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 1);
+    let payload = last_user_text(&requests[0]);
+    assert!(payload.contains("image omitted from compaction summary input"));
+    assert!(payload.contains("document omitted from compaction summary input"));
+    assert!(payload.contains("brief.pdf"));
+    assert!(!payload.contains("RAW_ACTIVE_IMAGE"));
+    assert!(!payload.contains("RAW_ACTIVE_DOCUMENT"));
+    let original_anchor = serde_json::to_string(&active_turn_user_anchor).unwrap();
+    assert!(original_anchor.contains("RAW_ACTIVE_IMAGE"));
+    assert!(original_anchor.contains("RAW_ACTIVE_DOCUMENT"));
+}
+
+#[tokio::test]
 async fn compaction_summary_omits_only_large_tool_results_when_full_input_is_over_budget() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(vec![response_step(

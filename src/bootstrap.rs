@@ -43,6 +43,7 @@ use crate::router::{
 use crate::session::SessionStore;
 use crate::session_search::{SessionSearchConfig, SessionSearchService, SessionSearchSummarizer};
 use crate::skill::SkillRegistry;
+use crate::storage::paths;
 use crate::tool::ToolRegistry;
 
 const ROUTER_VECTOR_WORKER_TASK_NAME: &str = "router_vector_worker";
@@ -129,6 +130,9 @@ pub fn build_agent_cli_session_engine_with_mcp(
     ));
     let attachment_limits = AttachmentLimits::from_configs(&cfg.agent.attachment, &cfg.agent.tool);
     let mut base_tool_registry = ToolRegistry::new(&cfg.agent.tool)?
+        .with_file_write_lock_root(paths::base_acn_home_file_write_locks_dir(
+            cfg.storage.base_acn_home(),
+        ))
         .with_process_id_attempts(cfg.agent.session.id_mint_max_attempts())
         .with_process_owner_agent_id(context.agent_id.clone())
         .with_memory_store(context.memory_store.clone())

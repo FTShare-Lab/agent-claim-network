@@ -23,11 +23,11 @@ use super::user_shell::{
 };
 use crate::api::{
     ensure_compaction_request_within_context_window, estimate_session_turn_messages_tokens,
-    AgentTurnLoop, ContextUsageSnapshot, ContextUsageSource, InboxInternalizeKind,
-    InternalizeRequest, MemoryReviewLoop, SessionAttachment, SessionCompactionOutcome, SessionTurn,
-    SessionTurnEvent, SessionTurnEventRecorder, SessionTurnInterrupted, SessionTurnMessage,
-    SessionTurnPreflight, SessionTurnRequest, StructuredJsonAttemptRequest, StructuredJsonCaller,
-    ToolBoundaryControl, TurnMessage,
+    project_compaction_input_media, AgentTurnLoop, ContextUsageSnapshot, ContextUsageSource,
+    InboxInternalizeKind, InternalizeRequest, MemoryReviewLoop, SessionAttachment,
+    SessionCompactionOutcome, SessionTurn, SessionTurnEvent, SessionTurnEventRecorder,
+    SessionTurnInterrupted, SessionTurnMessage, SessionTurnPreflight, SessionTurnRequest,
+    StructuredJsonAttemptRequest, StructuredJsonCaller, ToolBoundaryControl, TurnMessage,
 };
 use crate::claim::{AgentId, Claim, ClaimId, DisputeId, SessionId, SourceId, TraceId};
 use crate::config::{
@@ -4215,6 +4215,10 @@ impl SessionEngine {
                 }),
             )
             .context("渲染 session_compaction prompt 失败")?;
+        let active_turn_user_anchor = inputs
+            .active_turn_user_anchor
+            .cloned()
+            .map(project_compaction_input_media);
         let mut payload = SessionCompactionPayload {
             instruction: COMPACTION_INSTRUCTION,
             agent_id: self.runner.agent_id.as_str(),
@@ -4223,7 +4227,7 @@ impl SessionEngine {
             prior_committed_summary: inputs.prior_committed_summary,
             committed_transcript: inputs.committed_transcript,
             prior_active_turn_summary: inputs.prior_active_turn_summary,
-            active_turn_user_anchor: inputs.active_turn_user_anchor,
+            active_turn_user_anchor: active_turn_user_anchor.as_ref(),
             active_turn_start_segment: inputs.active_turn_start_segment,
             active_turn_end_segment: inputs.active_turn_end_segment,
             active_turn_transcript: inputs.active_turn_transcript,

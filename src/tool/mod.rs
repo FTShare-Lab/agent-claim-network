@@ -374,6 +374,8 @@ pub struct ToolRegistry {
     delegation_host: Option<Arc<DelegationToolHost>>,
     delegation_progress: Option<DelegationProgressSink>,
     path_locks: Arc<StdMutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>>,
+    /// 仅协调共享同一 base ACN home 的 ACN 进程；不阻止普通外部编辑器写入。
+    file_write_lock_root: Option<PathBuf>,
     read_state: Arc<ReadStateStore>,
     process_manager: Arc<ProcessManager>,
     /// 一个 registry 及其 delegation clone 都归属于同一个 ACN agent；把这个身份写进

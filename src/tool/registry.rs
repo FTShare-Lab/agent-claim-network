@@ -67,6 +67,7 @@ impl ToolRegistry {
             delegation_host: None,
             delegation_progress: None,
             path_locks: Arc::new(StdMutex::new(BTreeMap::new())),
+            file_write_lock_root: None,
             read_state: Arc::new(ReadStateStore::default()),
             limits: ToolLimits::from(cfg),
             process_manager: Arc::new(ProcessManager::new(
@@ -105,6 +106,12 @@ impl ToolRegistry {
 
     pub fn with_attachment_limits(mut self, attachment_limits: AttachmentLimits) -> Self {
         self.attachment_limits = attachment_limits;
+        self
+    }
+
+    /// 设置共享 base ACN home 下的文件写锁目录；不改变工作区或工具公开配置。
+    pub(crate) fn with_file_write_lock_root(mut self, lock_root: PathBuf) -> Self {
+        self.file_write_lock_root = Some(lock_root);
         self
     }
 

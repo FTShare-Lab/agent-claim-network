@@ -1,6 +1,6 @@
 //! provider history 压缩投影的通用纯逻辑。
 //!
-//! 本模块只处理 `SessionTurnMessage` 层面的安全切段、tool_result 投影和
+//! 本模块只处理 `SessionTurnMessage` 层面的安全切段、tool_result / summary 媒体投影和
 //! token 估算，不读写 session/delegation，也不理解 recap 或 claim 语义。
 
 use serde::Serialize;
@@ -12,6 +12,7 @@ use super::{
 
 const STABLE_HASH_OFFSET: u64 = 0xcbf29ce484222325;
 const STABLE_HASH_PRIME: u64 = 0x100000001b3;
+const COMPACTION_MEDIA_METADATA_MAX_CHARS: usize = 128;
 
 pub(crate) const FILE_EDIT_AUTHORITY_COMPACTION_NOTICE: &str = "File permission boundary: this compaction cleared runtime file-edit authority derived from earlier file_read or @file content, even if a read remains mentioned in this summary or a preserved raw tail. Treat those reads as historical context, not current authorization. Before file_patch or file_write on an existing file, establish fresh authority with file_read and follow required_read.";
 
@@ -98,6 +99,36 @@ pub(crate) fn omit_turn_messages_tool_results(
         .collect()
 }
 
+pub(crate) fn project_compaction_input_media(
+    mut message: SessionTurnMessage,
+) -> SessionTurnMessage {
+    for block in &mut message.content {
+        let omission = match block {
+            SessionTurnContentBlock::Image { media_type, data } => Some(
+                compaction_input_media_omission_text("image", media_type, None, data.len()),
+            ),
+            SessionTurnContentBlock::Document {
+                media_type,
+                data,
+                filename,
+            } => Some(compaction_input_media_omission_text(
+                "document",
+                media_type,
+                filename.as_deref(),
+                data.len(),
+            )),
+            SessionTurnContentBlock::Text { .. }
+            | SessionTurnContentBlock::SkillInstructions { .. }
+            | SessionTurnContentBlock::ToolUse { .. }
+            | SessionTurnContentBlock::ToolResult { .. } => None,
+        };
+        if let Some(omission) = omission {
+            *block = SessionTurnContentBlock::text(omission);
+        }
+    }
+    message
+}
+
 pub(crate) fn ensure_compaction_request_within_context_window(
     system_prompt: &str,
     messages: &[SessionTurnMessage],
@@ -121,6 +152,31 @@ fn compaction_input_tool_result_omission_text(original_chars: usize) -> String {
         "[tool_result omitted from compaction summary input; original_chars={original_chars}. \
 Exact output is unavailable in this request.]"
     )
+}
+
+fn compaction_input_media_omission_text(
+    kind: &str,
+    media_type: &str,
+    filename: Option<&str>,
+    base64_chars: usize,
+) -> String {
+    let media_type = bounded_media_metadata(media_type);
+    let filename = filename
+        .map(bounded_media_metadata)
+        .map(|filename| format!("; filename={filename}"))
+        .unwrap_or_default();
+    format!(
+        "[{kind} omitted from compaction summary input; media_type={media_type}{filename}; \
+base64_chars={base64_chars}. Exact media is unavailable in this request.]"
+    )
+}
+
+fn bounded_media_metadata(value: &str) -> String {
+    value
+        .chars()
+        .take(COMPACTION_MEDIA_METADATA_MAX_CHARS)
+        .map(|ch| if ch.is_control() { '�' } else { ch })
+        .collect()
 }
 
 pub fn large_tool_result_omission_text(original_chars: usize) -> String {
@@ -303,6 +359,31 @@ mod tests {
         assert!(serialized.contains("original_chars=11"));
         assert!(!serialized.contains("long output"));
         assert!(!serialized.contains("raw compact tail"));
+    }
+
+    #[test]
+    fn compaction_media_projection_replaces_payloads_with_bounded_metadata() {
+        let projected = project_compaction_input_media(SessionTurnMessage::user_content(vec![
+            SessionTurnContentBlock::image("image/png", "IMAGE_BASE64_PAYLOAD"),
+            SessionTurnContentBlock::document_named(
+                "application/pdf",
+                "DOCUMENT_BASE64_PAYLOAD",
+                format!("{}\nignored", "report".repeat(40)),
+            ),
+            SessionTurnContentBlock::text("keep me"),
+        ]));
+
+        let serialized = serde_json::to_string(&projected).expect("serialize projection");
+        assert!(serialized.contains("image omitted from compaction summary input"));
+        assert!(serialized.contains("media_type=image/png"));
+        assert!(serialized.contains("base64_chars=20"));
+        assert!(serialized.contains("document omitted from compaction summary input"));
+        assert!(serialized.contains("media_type=application/pdf"));
+        assert!(serialized.contains("filename="));
+        assert!(!serialized.contains("ignored"));
+        assert!(!serialized.contains("IMAGE_BASE64_PAYLOAD"));
+        assert!(!serialized.contains("DOCUMENT_BASE64_PAYLOAD"));
+        assert!(serialized.contains("keep me"));
     }
 
     #[test]

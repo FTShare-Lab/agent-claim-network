@@ -241,6 +241,8 @@ impl ToolRegistry {
             })));
         }
         ensure_not_memory_path(&write_path)?;
+        let key = lexical_normalize_path(&write_path);
+        let _file_write_lock = self.acquire_file_write_lock(&key, context).await?;
         let before = Arc::new(match fs::read_to_string(&write_path).await {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -252,7 +254,6 @@ impl ToolRegistry {
             }
             Err(error) => return Err(ToolError::Io(error)),
         });
-        let key = lexical_normalize_path(&write_path);
         let mut match_starts = before
             .match_indices(&args.old_content)
             .map(|(start, _)| start);
@@ -398,11 +399,6 @@ impl ToolRegistry {
         if existed {
             ensure_not_memory_path(&write_path)?;
         }
-        let before = if existed {
-            fs::read_to_string(&write_path).await?
-        } else {
-            String::new()
-        };
         let key = if existed {
             lexical_normalize_path(&write_path)
         } else {
@@ -411,6 +407,12 @@ impl ToolRegistry {
         if !existed {
             ensure_not_memory_path(&key)?;
         }
+        let _file_write_lock = self.acquire_file_write_lock(&key, context).await?;
+        let before = if existed {
+            fs::read_to_string(&write_path).await?
+        } else {
+            String::new()
+        };
 
         let authority = if existed {
             match self.evaluate_file_read_state(context, &key, &before).await {
@@ -557,6 +559,44 @@ impl ToolRegistry {
         let lock = Arc::new(Mutex::new(()));
         locks.insert(key, Arc::downgrade(&lock));
         Ok(lock)
+    }
+
+    async fn acquire_file_write_lock(
+        &self,
+        stable_path_key: &Path,
+        context: &ToolDispatchContext,
+    ) -> Result<Option<FileLockGuard>, ToolError> {
+        let Some(lock_root) = self.file_write_lock_root.as_deref() else {
+            return Ok(None);
+        };
+        let lock_path = paths::file_write_lock_path(lock_root, stable_path_key);
+        loop {
+            ensure_file_commit_not_cancelled(context)?;
+            match FileLockGuard::try_lock_exclusive(&lock_path)
+                .await
+                .map_err(|error| {
+                    ToolError::Io(std::io::Error::other(format!(
+                        "获取文件写锁失败 ({}): {error}",
+                        lock_path.display()
+                    )))
+                })? {
+                Some(guard) => {
+                    ensure_file_commit_not_cancelled(context)?;
+                    return Ok(Some(guard));
+                }
+                None => {
+                    let retry = time::sleep(Duration::from_millis(50));
+                    if let Some(cancellation) = context.cancellation.as_ref() {
+                        tokio::select! {
+                            _ = cancellation.cancelled() => return Err(ToolError::Interrupted),
+                            _ = retry => {}
+                        }
+                    } else {
+                        retry.await;
+                    }
+                }
+            }
+        }
     }
 }
 

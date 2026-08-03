@@ -118,7 +118,8 @@ pub use compaction_projection::{
 };
 pub(crate) use compaction_projection::{
     ensure_compaction_request_within_context_window, omit_turn_messages_tool_results,
-    project_compaction_input_tool_results, FILE_EDIT_AUTHORITY_COMPACTION_NOTICE,
+    project_compaction_input_media, project_compaction_input_tool_results,
+    FILE_EDIT_AUTHORITY_COMPACTION_NOTICE,
 };
 pub use embedding::{
     build_embedding_client, ArkMultimodalEmbeddingClient, EmbeddingCacheFingerprint,

@@ -5,7 +5,23 @@
 
 use std::path::{Path, PathBuf};
 
+use ring::digest::{digest, SHA256};
+
 use crate::claim::{AgentId, ClaimId, SessionId};
+
+/// `<base_acn_home>/runtime/file-write-locks/`：协作 ACN 进程共享的文件写锁目录。
+pub fn base_acn_home_file_write_locks_dir(base_acn_home: &Path) -> PathBuf {
+    base_acn_home.join("runtime").join("file-write-locks")
+}
+
+/// 按文件工具使用的稳定路径 key 派生跨进程写锁；锁名不暴露工作区路径。
+pub fn file_write_lock_path(lock_root: &Path, stable_path_key: &Path) -> PathBuf {
+    let hash = hex::encode(digest(
+        &SHA256,
+        stable_path_key.as_os_str().as_encoded_bytes(),
+    ));
+    lock_root.join(format!("{hash}.lock"))
+}
 
 // ---- team store 中心存储（router / maintainer 视角） ----
 
@@ -246,6 +262,20 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::str::FromStr;
+
+    #[test]
+    fn file_write_lock_path_uses_base_runtime_and_hides_workspace_path() {
+        let base = PathBuf::from("/tmp/acn");
+        let root = base_acn_home_file_write_locks_dir(&base);
+        let lock = file_write_lock_path(&root, Path::new("/workspace/private/note.txt"));
+
+        assert_eq!(root, PathBuf::from("/tmp/acn/runtime/file-write-locks"));
+        assert_eq!(lock.parent(), Some(root.as_path()));
+        let name = lock.file_name().unwrap().to_string_lossy();
+        assert_eq!(name.len(), 64 + ".lock".len());
+        assert!(name.ends_with(".lock"));
+        assert!(!name.contains("note"));
+    }
 
     #[test]
     fn team_store_paths_compose_correctly() {

@@ -15,11 +15,12 @@ use serde_json::{json, Value};
 use crate::api::{
     ensure_compaction_request_within_context_window, estimate_provider_request_context_tokens,
     estimate_session_turn_messages_tokens, estimated_projected_segment_tokens,
-    omit_turn_messages_tool_results, project_compaction_input_tool_results,
-    project_turn_messages_tool_results, provider_safe_segments, ContextUsageSnapshot,
-    ContextUsageSource, ProviderProjectionBudget, SessionTurnContentBlock, SessionTurnEvent,
-    SessionTurnMessage, SessionTurnPreflight, StructuredJsonAttemptRequest, StructuredJsonCaller,
-    ToolSpec, FILE_EDIT_AUTHORITY_COMPACTION_NOTICE,
+    omit_turn_messages_tool_results, project_compaction_input_media,
+    project_compaction_input_tool_results, project_turn_messages_tool_results,
+    provider_safe_segments, ContextUsageSnapshot, ContextUsageSource, ProviderProjectionBudget,
+    SessionTurnContentBlock, SessionTurnEvent, SessionTurnMessage, SessionTurnPreflight,
+    StructuredJsonAttemptRequest, StructuredJsonCaller, ToolSpec,
+    FILE_EDIT_AUTHORITY_COMPACTION_NOTICE,
 };
 use crate::config::SessionCompactionConfig;
 use crate::prompt::PromptRegistry;
@@ -284,7 +285,10 @@ impl DelegationPreflightCompactor {
         let anchor = provider_messages.first()?.clone();
         let compact_source = provider_messages
             .get(compact_start_index..compact_end_index)?
-            .to_vec();
+            .iter()
+            .cloned()
+            .map(project_compaction_input_media)
+            .collect::<Vec<_>>();
         let compact_messages_with_large_tool_results_omitted =
             project_compaction_input_tool_results(
                 compact_source.clone(),
@@ -423,6 +427,7 @@ impl DelegationPreflightCompactor {
                 },
             )
             .context("渲染 subagents_compaction prompt 失败")?;
+        let objective_anchor = project_compaction_input_media(plan.anchor.clone());
         let mut payload = DelegationCompactionPayload {
             subagent_id: self.metadata.id.to_string(),
             parent_session_id: self.metadata.parent_session_id.to_string(),
@@ -430,7 +435,7 @@ impl DelegationPreflightCompactor {
             role: self.metadata.role.clone(),
             objective: self.metadata.objective.clone(),
             constraints: self.metadata.constraints.clone(),
-            objective_anchor: plan.anchor.clone(),
+            objective_anchor,
             prior_summary,
             compact_start_index: plan.compact_start_index,
             compact_end_index: plan.compact_end_index,
@@ -925,6 +930,72 @@ mod tests {
         assert!(projected_text.contains("large tool_result omitted"));
         assert!(!projected_text.contains("TAIL_RAW_TOOL_RESULT"));
         assert!(projected_text.contains("recent assistant note"));
+    }
+
+    #[tokio::test]
+    async fn summary_projects_media_but_runtime_projection_keeps_anchor_and_tail() {
+        let (_dir, _store, metadata, progress) = started_delegation().await;
+        let provider = Arc::new(JsonProvider::new(vec![json_response(
+            "bounded media summary",
+        )]));
+        let compactor = compactor_with_limits(
+            metadata,
+            progress,
+            Arc::clone(&provider),
+            compacting_config_with_small_tool_results(),
+            512,
+            40_000,
+        );
+        let mut provider_messages = compactable_messages_with_large_tool_results();
+        provider_messages[0] = SessionTurnMessage::user_content(vec![
+            SessionTurnContentBlock::text("objective anchor"),
+            SessionTurnContentBlock::image(
+                "image/png",
+                format!("RAW_ANCHOR_IMAGE_{}", "A".repeat(100_000)),
+            ),
+        ]);
+        provider_messages[1] = SessionTurnMessage {
+            role: "assistant".into(),
+            content: vec![
+                SessionTurnContentBlock::text("old assistant note before tool"),
+                SessionTurnContentBlock::document_named(
+                    "application/pdf",
+                    format!("RAW_COMPACT_DOCUMENT_{}", "B".repeat(100_000)),
+                    "analysis.pdf",
+                ),
+            ],
+        };
+        provider_messages[6]
+            .content
+            .push(SessionTurnContentBlock::image(
+                "image/webp",
+                format!("RAW_TAIL_IMAGE_{}", "C".repeat(100_000)),
+            ));
+
+        let plan = compactor
+            .build_plan(&provider_messages, 0)
+            .expect("media projection plan");
+        let compact_input = message_text(&plan.compact_messages);
+        assert!(compact_input.contains("document omitted from compaction summary input"));
+        assert!(compact_input.contains("analysis.pdf"));
+        assert!(!compact_input.contains("RAW_COMPACT_DOCUMENT"));
+
+        compactor
+            .generate_summary(&plan)
+            .await
+            .expect("media-projected summary request");
+
+        let requests = provider.requests().await;
+        assert_eq!(requests.len(), 1);
+        let summary_payload = message_text(&requests[0].messages);
+        assert!(summary_payload.contains("image omitted from compaction summary input"));
+        assert!(summary_payload.contains("document omitted from compaction summary input"));
+        assert!(!summary_payload.contains("RAW_ANCHOR_IMAGE"));
+        assert!(!summary_payload.contains("RAW_COMPACT_DOCUMENT"));
+
+        let runtime_projection = message_text(&plan.projected_messages("bounded media summary"));
+        assert!(runtime_projection.contains("RAW_ANCHOR_IMAGE"));
+        assert!(runtime_projection.contains("RAW_TAIL_IMAGE"));
     }
 
     #[tokio::test]

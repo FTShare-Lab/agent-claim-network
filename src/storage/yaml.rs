@@ -119,16 +119,17 @@ pub async fn write_text_atomic(path: &Path, content: &[u8]) -> Result<(), Storag
 /// 原子写纯文本，并在 rename 前执行 best-effort stale guard。
 ///
 /// `expected=None` 表示期望目标不存在。返回 `false` 表示目标在准备临时文件期间
-/// 已被检测到变化，未执行 rename。该校验不是跨进程原子 CAS：最终校验与 rename
-/// 之间仍有不可移植的窄竞态窗口。
+/// 已被检测到变化，未执行 rename。调用方可用跨进程锁串行化协作写入；未使用相同
+/// 锁协议的外部写入仍可能落入最终校验与 rename 之间的窄竞态窗口。
 pub async fn write_text_atomic_if_unchanged(
     path: &Path,
     content: &[u8],
     expected: Option<&[u8]>,
 ) -> Result<bool, StorageError> {
     let preserved_permissions = if expected.is_some() {
-        match tokio::fs::metadata(path).await {
-            Ok(metadata) => Some(metadata.permissions()),
+        match tokio::fs::symlink_metadata(path).await {
+            Ok(metadata) if metadata.file_type().is_file() => Some(metadata.permissions()),
+            Ok(_) => return Ok(false),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(StorageError::io(path, error)),
         }
@@ -190,8 +191,9 @@ async fn target_matches_expected(
             Err(error) => Err(StorageError::io(path, error)),
         };
     };
-    let metadata = match tokio::fs::metadata(path).await {
-        Ok(metadata) => metadata,
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => return Ok(false),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(StorageError::io(path, error)),
     };
@@ -413,5 +415,27 @@ mod tests {
             .unwrap();
 
         assert!(!matches, "内容未变但 mode 变化也必须触发 stale guard");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checked_atomic_write_rejects_target_replaced_by_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.txt");
+        let replacement = dir.path().join("replacement.txt");
+        tokio::fs::write(&replacement, b"old").await.unwrap();
+        tokio::fs::symlink(&replacement, &path).await.unwrap();
+
+        let written = write_text_atomic_if_unchanged(&path, b"new", Some(b"old"))
+            .await
+            .unwrap();
+
+        assert!(!written);
+        assert!(tokio::fs::symlink_metadata(&path)
+            .await
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(tokio::fs::read(replacement).await.unwrap(), b"old");
     }
 }

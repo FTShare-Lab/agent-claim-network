@@ -1449,6 +1449,190 @@ async fn concurrent_appends_do_not_lose_updates() {
 }
 
 #[tokio::test]
+async fn independent_registries_share_file_write_lock_and_reject_stale_second_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let base_acn_home = dir.path().join("acn");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let path = workspace.join("note.txt");
+    tokio::fs::write(&path, "base\n").await.unwrap();
+    let lock_root = paths::base_acn_home_file_write_locks_dir(&base_acn_home);
+    let first_registry = Arc::new(
+        ToolRegistry::new(&test_tool_config(&workspace))
+            .unwrap()
+            .with_file_write_lock_root(lock_root.clone()),
+    );
+    let second_registry = Arc::new(
+        ToolRegistry::new(&test_tool_config(&workspace))
+            .unwrap()
+            .with_file_write_lock_root(lock_root.clone()),
+    );
+    let first_session = SessionId::from_str("session_aaaaaaaa").unwrap();
+    let second_session = SessionId::from_str("session_bbbbbbbb").unwrap();
+    let _ = full_file_read(&first_registry, &first_session, "note.txt").await;
+    let _ = full_file_read(&second_registry, &second_session, "note.txt").await;
+
+    let stable_key = tokio::fs::canonicalize(&path).await.unwrap();
+    let lock_path = paths::file_write_lock_path(&lock_root, &stable_key);
+    let blocker = FileLockGuard::lock_exclusive(&lock_path).await.unwrap();
+    let start = Arc::new(tokio::sync::Barrier::new(3));
+    let spawn_write = |registry: Arc<ToolRegistry>, session: SessionId, content: &'static str| {
+        let start = Arc::clone(&start);
+        tokio::spawn(async move {
+            start.wait().await;
+            dispatch_file_tool(
+                &registry,
+                &session,
+                "file_write",
+                json!({"path": "note.txt", "content": content}),
+            )
+            .await
+        })
+    };
+    let first = spawn_write(first_registry, first_session, "first\n");
+    let second = spawn_write(second_registry, second_session, "second\n");
+    start.wait().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!first.is_finished());
+    assert!(!second.is_finished());
+    drop(blocker);
+
+    let first = tokio::time::timeout(Duration::from_secs(2), first)
+        .await
+        .unwrap()
+        .unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(2), second)
+        .await
+        .unwrap()
+        .unwrap();
+    let successes = [&first, &second]
+        .into_iter()
+        .filter(|output| output["status"] == "success")
+        .count();
+    assert_eq!(successes, 1);
+    assert!(first["status"] == "error" || second["status"] == "error");
+    let content = tokio::fs::read_to_string(path).await.unwrap();
+    assert!(content == "first\n" || content == "second\n");
+    assert!(lock_path.is_file(), "lock 文件不得在释放时删除");
+}
+
+#[tokio::test]
+async fn independent_registries_share_file_write_lock_for_concurrent_create() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let lock_root = paths::base_acn_home_file_write_locks_dir(&dir.path().join("acn"));
+    let first_registry = Arc::new(
+        ToolRegistry::new(&test_tool_config(&workspace))
+            .unwrap()
+            .with_file_write_lock_root(lock_root.clone()),
+    );
+    let second_registry = Arc::new(
+        ToolRegistry::new(&test_tool_config(&workspace))
+            .unwrap()
+            .with_file_write_lock_root(lock_root.clone()),
+    );
+    let path = workspace.join("created.txt");
+    let stable_key = tokio::fs::canonicalize(&workspace)
+        .await
+        .unwrap()
+        .join("created.txt");
+    let lock_path = paths::file_write_lock_path(&lock_root, &stable_key);
+    let blocker = FileLockGuard::lock_exclusive(&lock_path).await.unwrap();
+    let start = Arc::new(tokio::sync::Barrier::new(3));
+    let spawn_create =
+        |registry: Arc<ToolRegistry>, session: &'static str, content: &'static str| {
+            let start = Arc::clone(&start);
+            tokio::spawn(async move {
+                start.wait().await;
+                dispatch_file_tool(
+                    &registry,
+                    &SessionId::from_str(session).unwrap(),
+                    "file_write",
+                    json!({"path": "created.txt", "content": content}),
+                )
+                .await
+            })
+        };
+    let first = spawn_create(first_registry, "session_aaaaaaaa", "first\n");
+    let second = spawn_create(second_registry, "session_bbbbbbbb", "second\n");
+    start.wait().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!first.is_finished());
+    assert!(!second.is_finished());
+    drop(blocker);
+
+    let first = tokio::time::timeout(Duration::from_secs(2), first)
+        .await
+        .unwrap()
+        .unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(2), second)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        [&first, &second]
+            .into_iter()
+            .filter(|output| output["status"] == "success")
+            .count(),
+        1
+    );
+    assert!(first["status"] == "error" || second["status"] == "error");
+    let content = tokio::fs::read_to_string(path).await.unwrap();
+    assert!(content == "first\n" || content == "second\n");
+}
+
+#[tokio::test]
+async fn waiting_for_file_write_lock_respects_cancellation() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let base_acn_home = dir.path().join("acn");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let path = workspace.join("note.txt");
+    tokio::fs::write(&path, "base\n").await.unwrap();
+    let lock_root = paths::base_acn_home_file_write_locks_dir(&base_acn_home);
+    let registry = Arc::new(
+        ToolRegistry::new(&test_tool_config(&workspace))
+            .unwrap()
+            .with_file_write_lock_root(lock_root.clone()),
+    );
+    let session = SessionId::from_str("session_aaaaaaaa").unwrap();
+    let _ = full_file_read(&registry, &session, "note.txt").await;
+    let stable_key = tokio::fs::canonicalize(&path).await.unwrap();
+    let lock_path = paths::file_write_lock_path(&lock_root, &stable_key);
+    let blocker = FileLockGuard::lock_exclusive(&lock_path).await.unwrap();
+    let cancellation = CancellationToken::new();
+    let task = {
+        let registry = Arc::clone(&registry);
+        let cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            registry
+                .dispatch_with_context(
+                    "file_write",
+                    json!({"path": "note.txt", "content": "changed\n"}),
+                    ToolDispatchContext {
+                        current_session_id: Some(session),
+                        cancellation: Some(cancellation),
+                        ..ToolDispatchContext::default()
+                    },
+                )
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!task.is_finished());
+    cancellation.cancel();
+
+    let result = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, Err(ToolError::Interrupted)));
+    assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "base\n");
+    drop(blocker);
+}
+
+#[tokio::test]
 async fn path_lock_registry_prunes_unused_paths() {
     let dir = tempfile::tempdir().unwrap();
     let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
