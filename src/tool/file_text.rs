@@ -28,6 +28,11 @@ pub(super) struct TextPageResult {
     pub(super) evidence: Option<ReadEvidence>,
 }
 
+pub(super) enum TextPageOutcome {
+    Page(TextPageResult),
+    LineTooLong { line: usize },
+}
+
 #[derive(Debug)]
 struct ScannedLine {
     number: usize,
@@ -106,9 +111,9 @@ impl PageCollector {
             return;
         }
         if line.number < self.start {
-            if line.text.is_some() {
-                self.push_before(line);
-            }
+            // 超长行也必须占据 keyword 前置窗口中的真实位置；否则前后两段
+            // 完整文本可能被拼成一个并不存在的连续读取范围。
+            self.push_before(line);
             return;
         }
         let Some(text) = line.text.as_deref() else {
@@ -167,7 +172,7 @@ impl PageCollector {
     }
 
     fn push_selected(&mut self, line: ScannedLine) {
-        if self.selected.len() >= self.count {
+        if self.selected.len() >= self.count || self.selection_limited {
             return;
         }
         let bytes = scanned_line_bytes(&line);
@@ -232,18 +237,20 @@ fn invalid_utf8(error: std::str::Utf8Error) -> ToolError {
 pub(super) async fn read_text_page(
     path: &Path,
     request: TextPageRequest<'_>,
-) -> Result<TextPageResult, ToolError> {
+) -> Result<TextPageOutcome, ToolError> {
     let scan = scan_text_file(path, &request).await?;
+    if let Some(line) = scan.blocking_long_line {
+        return Ok(TextPageOutcome::LineTooLong { line });
+    }
     let mut content = String::new();
     let mut returned_start = None;
-    let mut returned_end = None;
+    let mut returned_end = None::<usize>;
     let mut stop_reason = None::<&'static str>;
     let mut content_chars = 0usize;
 
     for line in &scan.selected {
         let Some(text) = line.text.as_deref() else {
-            stop_reason = Some("single_line_too_long");
-            break;
+            return Ok(TextPageOutcome::LineTooLong { line: line.number });
         };
         let rendered = if request.show_linenos {
             format!("{}|{text}", line.number)
@@ -251,14 +258,19 @@ pub(super) async fn read_text_page(
             text.to_string()
         };
         let rendered_chars = rendered.chars().count();
+        if rendered_chars > request.max_chars {
+            return Ok(TextPageOutcome::LineTooLong { line: line.number });
+        }
         let next_chars = content_chars.saturating_add(rendered_chars);
         if next_chars > request.max_chars {
-            stop_reason = Some(if content.is_empty() {
-                "single_line_too_long"
-            } else {
-                "max_chars"
-            });
+            stop_reason = Some("max_chars");
             break;
+        }
+        if let Some(previous) = returned_end {
+            let expected = previous.saturating_add(1);
+            if line.number != expected {
+                return Ok(TextPageOutcome::LineTooLong { line: expected });
+            }
         }
         returned_start.get_or_insert(line.number);
         returned_end = Some(line.number);
@@ -267,28 +279,18 @@ pub(super) async fn read_text_page(
     }
 
     if stop_reason.is_none() && returned_end.is_none() {
-        stop_reason = if let Some(line) = scan.blocking_long_line {
-            if line >= request.start {
-                Some("single_line_too_long")
+        stop_reason =
+            if request.start > scan.total_lines && !(scan.total_lines == 0 && request.start == 1) {
+                Some("start_after_eof")
+            } else if request.keyword.is_some() && scan.keyword_match_line.is_none() {
+                Some("keyword_not_found")
             } else {
-                None
-            }
-        } else if request.start > scan.total_lines && !(scan.total_lines == 0 && request.start == 1)
-        {
-            Some("start_after_eof")
-        } else if request.keyword.is_some() && scan.keyword_match_line.is_none() {
-            Some("keyword_not_found")
-        } else {
-            Some("eof")
-        };
+                Some("eof")
+            };
     }
 
     if stop_reason.is_none() && scan.selection_limited {
-        stop_reason = Some(if returned_end.is_some() {
-            "max_chars"
-        } else {
-            "single_line_too_long"
-        });
+        stop_reason = Some("max_chars");
     }
 
     let reaches_eof = returned_end == Some(scan.total_lines)
@@ -302,9 +304,6 @@ pub(super) async fn read_text_page(
     let stop_reason = stop_reason.unwrap_or("eof");
     let next_start = match stop_reason {
         "keyword_not_found" | "start_after_eof" | "eof" => None,
-        "single_line_too_long" if returned_end.is_none() => scan
-            .blocking_long_line
-            .or_else(|| scan.selected.first().map(|line| line.number)),
         _ => returned_end
             .map(|line| line.saturating_add(1))
             .or(Some(request.start)),
@@ -345,7 +344,7 @@ pub(super) async fn read_text_page(
         None
     };
 
-    Ok(TextPageResult { output, evidence })
+    Ok(TextPageOutcome::Page(TextPageResult { output, evidence }))
 }
 
 async fn scan_text_file(
@@ -666,6 +665,15 @@ fn expand_required_range(range: LineRange, total_lines: usize) -> LineRange {
 mod tests {
     use super::*;
 
+    fn expect_page(outcome: TextPageOutcome) -> TextPageResult {
+        match outcome {
+            TextPageOutcome::Page(page) => page,
+            TextPageOutcome::LineTooLong { line } => {
+                panic!("测试页不应在第 {line} 行触发超长行失败")
+            }
+        }
+    }
+
     #[tokio::test]
     async fn page_preserves_crlf_and_reports_eof() {
         let dir = tempfile::tempdir().expect("创建临时目录");
@@ -673,20 +681,22 @@ mod tests {
         tokio::fs::write(&path, b"one\r\ntwo\r\n")
             .await
             .expect("写入测试文件");
-        let result = read_text_page(
-            &path,
-            TextPageRequest {
-                display_path: "sample.txt",
-                canonical_path: path.clone(),
-                start: 1,
-                count: 2,
-                keyword: None,
-                show_linenos: false,
-                max_chars: 100,
-            },
-        )
-        .await
-        .expect("读取成功");
+        let result = expect_page(
+            read_text_page(
+                &path,
+                TextPageRequest {
+                    display_path: "sample.txt",
+                    canonical_path: path.clone(),
+                    start: 1,
+                    count: 2,
+                    keyword: None,
+                    show_linenos: false,
+                    max_chars: 100,
+                },
+            )
+            .await
+            .expect("读取成功"),
+        );
         assert_eq!(result.output["content"], "one\r\ntwo\r\n");
         assert_eq!(result.output["page"]["total_lines"], 2);
         assert_eq!(result.output["page"]["reaches_eof"], true);
@@ -701,58 +711,64 @@ mod tests {
         tokio::fs::write(&path, b"one\ntwo\n")
             .await
             .expect("写入测试文件");
-        let keyword = read_text_page(
-            &path,
-            TextPageRequest {
-                display_path: "sample.txt",
-                canonical_path: path.clone(),
-                start: 1,
-                count: 2,
-                keyword: Some("absent"),
-                show_linenos: false,
-                max_chars: 100,
-            },
-        )
-        .await
-        .expect("读取成功");
+        let keyword = expect_page(
+            read_text_page(
+                &path,
+                TextPageRequest {
+                    display_path: "sample.txt",
+                    canonical_path: path.clone(),
+                    start: 1,
+                    count: 2,
+                    keyword: Some("absent"),
+                    show_linenos: false,
+                    max_chars: 100,
+                },
+            )
+            .await
+            .expect("读取成功"),
+        );
         assert_eq!(keyword.output["content"], "");
         assert_eq!(keyword.output["page"]["stop_reason"], "keyword_not_found");
         assert!(keyword.evidence.is_none());
 
-        let keyword_after_eof = read_text_page(
-            &path,
-            TextPageRequest {
-                display_path: "sample.txt",
-                canonical_path: path.clone(),
-                start: 3,
-                count: 1,
-                keyword: Some("absent"),
-                show_linenos: false,
-                max_chars: 100,
-            },
-        )
-        .await
-        .expect("读取成功");
+        let keyword_after_eof = expect_page(
+            read_text_page(
+                &path,
+                TextPageRequest {
+                    display_path: "sample.txt",
+                    canonical_path: path.clone(),
+                    start: 3,
+                    count: 1,
+                    keyword: Some("absent"),
+                    show_linenos: false,
+                    max_chars: 100,
+                },
+            )
+            .await
+            .expect("读取成功"),
+        );
         assert_eq!(
             keyword_after_eof.output["page"]["stop_reason"],
             "start_after_eof"
         );
         assert!(keyword_after_eof.evidence.is_none());
 
-        let after_eof = read_text_page(
-            &path,
-            TextPageRequest {
-                display_path: "sample.txt",
-                canonical_path: path.clone(),
-                start: 3,
-                count: 1,
-                keyword: None,
-                show_linenos: false,
-                max_chars: 100,
-            },
-        )
-        .await
-        .expect("读取成功");
+        let after_eof = expect_page(
+            read_text_page(
+                &path,
+                TextPageRequest {
+                    display_path: "sample.txt",
+                    canonical_path: path.clone(),
+                    start: 3,
+                    count: 1,
+                    keyword: None,
+                    show_linenos: false,
+                    max_chars: 100,
+                },
+            )
+            .await
+            .expect("读取成功"),
+        );
         assert_eq!(after_eof.output["page"]["stop_reason"], "start_after_eof");
         assert_eq!(after_eof.output["truncated"], false);
         assert!(after_eof.evidence.is_none());
@@ -763,38 +779,42 @@ mod tests {
         let dir = tempfile::tempdir().expect("创建临时目录");
         let path = dir.path().join("empty.txt");
         tokio::fs::write(&path, b"").await.expect("写入测试文件");
-        let first = read_text_page(
-            &path,
-            TextPageRequest {
-                display_path: "empty.txt",
-                canonical_path: path.clone(),
-                start: 1,
-                count: 1,
-                keyword: None,
-                show_linenos: false,
-                max_chars: 100,
-            },
-        )
-        .await
-        .expect("读取成功");
+        let first = expect_page(
+            read_text_page(
+                &path,
+                TextPageRequest {
+                    display_path: "empty.txt",
+                    canonical_path: path.clone(),
+                    start: 1,
+                    count: 1,
+                    keyword: None,
+                    show_linenos: false,
+                    max_chars: 100,
+                },
+            )
+            .await
+            .expect("读取成功"),
+        );
         assert_eq!(first.output["page"]["total_lines"], 0);
         assert_eq!(first.output["page"]["reaches_eof"], true);
         assert!(first.evidence.expect("空文件完整证据").complete);
 
-        let after = read_text_page(
-            &path,
-            TextPageRequest {
-                display_path: "empty.txt",
-                canonical_path: path.clone(),
-                start: 2,
-                count: 1,
-                keyword: None,
-                show_linenos: false,
-                max_chars: 100,
-            },
-        )
-        .await
-        .expect("读取成功");
+        let after = expect_page(
+            read_text_page(
+                &path,
+                TextPageRequest {
+                    display_path: "empty.txt",
+                    canonical_path: path.clone(),
+                    start: 2,
+                    count: 1,
+                    keyword: None,
+                    show_linenos: false,
+                    max_chars: 100,
+                },
+            )
+            .await
+            .expect("读取成功"),
+        );
         assert_eq!(after.output["page"]["stop_reason"], "start_after_eof");
         assert!(after.evidence.is_none());
     }

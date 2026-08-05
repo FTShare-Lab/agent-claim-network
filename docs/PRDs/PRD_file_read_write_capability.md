@@ -193,7 +193,7 @@ FileReadState {
 - `ends_with_newline`：仅在 `reaches_eof=true` 时返回布尔值，否则为 `null`。
 - `keyword_match_line`：keyword 实际命中行；未命中为 `null`。
 - `keyword` 省略、为空字符串或仅含空白时均视为未提供，不进入 keyword 窗口模式。
-- `stop_reason`：`eof`、`count`、`max_chars`、`single_line_too_long`、`keyword_not_found` 或 `start_after_eof`。
+- `stop_reason`：`eof`、`count`、`max_chars`、`keyword_not_found` 或 `start_after_eof`。
 - `truncated`：EOF 前仍有内容因请求窗口或字符上限没有返回时为 `true`。
 
 固定边界：
@@ -205,7 +205,6 @@ FileReadState {
 | `start` 超过 EOF | `false` | `false` | `null` | `start_after_eof` |
 | keyword 无命中 | `false` | `false` | `null` | `keyword_not_found` |
 | count 或字符上限在 EOF 前停止 | `true` | `false` | 第一条未返回行 | 对应限制 |
-| 当前单行超过字符上限 | `true` | `false` | 当前行 | `single_line_too_long` |
 
 搜索无命中返回空正文，不再静默退化为普通窗口。
 
@@ -219,7 +218,7 @@ FileReadState {
 - 2,000 行只是在未传 `count` 时使用的默认值；显式 `count` 只要求正整数，可以大于 2,000。
 - 单次实际返回只受 `file_read_max_chars` 字符硬上限约束，不设置同一 assistant 响应内多个 `file_read` 共享的 token 预算。
 - 只返回完整逻辑行，不返回半行。
-- 单行本身超过字符上限时返回空正文和 `single_line_too_long`，提示使用 `code_run` 处理异常长行。
+- 普通分页的请求窗口，或 keyword 定位时必须检查的行及最终保留的前后文中，若有单行无法完整返回，则整次 `file_read` 返回显式业务失败（包含 `path`、`status=error`、`line` 和引导使用 `code_run` 的 `msg`），不生成任何读取证据或修改许可；窗口外的超长行不影响当前分页。
 - `file_read_max_chars` 只限制本页，不再形成要求改配置并重启的永久阻塞状态。
 
 ### 5.3 流式扫描和行语义

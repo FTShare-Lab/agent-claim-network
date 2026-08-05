@@ -91,6 +91,122 @@ async fn file_read_supports_keyword_window_without_line_numbers() {
 }
 
 #[tokio::test]
+async fn keyword_window_long_line_gap_is_business_failure_and_does_not_authorize_overwrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("note.txt");
+    let original = format!("a\n{}\nneedle\n", "x".repeat(512));
+    tokio::fs::write(&path, &original).await.unwrap();
+    let mut config = test_tool_config(dir.path());
+    config.file_read_max_chars = 32;
+    let registry = ToolRegistry::new(&config).unwrap();
+    let session = SessionId::from_str("session_aaaaaaaa").unwrap();
+
+    let read = registry
+        .dispatch_with_context(
+            "file_read",
+            json!({
+                "path": "note.txt",
+                "start": 3,
+                "count": 3,
+                "keyword": "needle",
+                "show_linenos": false,
+            }),
+            file_tool_context(&session),
+        )
+        .await
+        .unwrap();
+    let write = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_write",
+        json!({"path": "note.txt", "content": "changed\n"}),
+    )
+    .await;
+
+    assert_eq!(read.outcome, ToolExecutionOutcome::BusinessFailure);
+    assert_eq!(read.output["path"], "note.txt");
+    assert_eq!(read.output["status"], "error");
+    assert_eq!(read.output["line"], 2);
+    assert!(read.output["msg"]
+        .as_str()
+        .is_some_and(|message| message.contains("code_run")));
+    assert_eq!(write["status"], "error");
+    assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), original);
+}
+
+#[tokio::test]
+async fn requested_page_long_line_is_business_failure_and_does_not_authorize_overwrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("note.txt");
+    let original = format!("{}\ntail\n", "x".repeat(512));
+    tokio::fs::write(&path, &original).await.unwrap();
+    let mut config = test_tool_config(dir.path());
+    config.file_read_max_chars = 32;
+    let registry = ToolRegistry::new(&config).unwrap();
+    let session = SessionId::from_str("session_aaaaaaaa").unwrap();
+
+    let read = registry
+        .dispatch_with_context(
+            "file_read",
+            json!({"path": "note.txt", "count": 1, "show_linenos": false}),
+            file_tool_context(&session),
+        )
+        .await
+        .unwrap();
+    let write = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_write",
+        json!({"path": "note.txt", "content": "changed\n"}),
+    )
+    .await;
+
+    assert_eq!(read.outcome, ToolExecutionOutcome::BusinessFailure);
+    assert_eq!(read.output["line"], 1);
+    assert!(read.output["msg"]
+        .as_str()
+        .is_some_and(|message| message.contains("code_run")));
+    assert_eq!(write["status"], "error");
+    assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), original);
+}
+
+#[tokio::test]
+async fn long_line_outside_requested_window_does_not_fail_safe_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("note.txt");
+    tokio::fs::write(&path, format!("head\n{}\ntail\n", "x".repeat(512)))
+        .await
+        .unwrap();
+    let mut config = test_tool_config(dir.path());
+    config.file_read_max_chars = 32;
+    let registry = ToolRegistry::new(&config).unwrap();
+    let session = SessionId::from_str("session_aaaaaaaa").unwrap();
+
+    let read = registry
+        .dispatch_with_context(
+            "file_read",
+            json!({"path": "note.txt", "count": 1, "show_linenos": false}),
+            file_tool_context(&session),
+        )
+        .await
+        .unwrap();
+    let write = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_write",
+        json!({"path": "note.txt", "content": "changed\n"}),
+    )
+    .await;
+
+    assert_eq!(read.outcome, ToolExecutionOutcome::Completed);
+    assert_eq!(read.output["content"], "head\n");
+    assert_eq!(read.output["page"]["returned_start"], 1);
+    assert_eq!(read.output["page"]["returned_end"], 1);
+    assert_eq!(read.output["page"]["stop_reason"], "count");
+    assert_eq!(write["status"], "error");
+}
+
+#[tokio::test]
 async fn file_read_treats_blank_keyword_as_absent() {
     let dir = tempfile::tempdir().unwrap();
     tokio::fs::write(dir.path().join("note.txt"), "one\ntwo\nthree\nfour\nfive\n")

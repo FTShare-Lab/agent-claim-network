@@ -959,7 +959,7 @@ async fn delegation_child_web_request_can_access_localhost() {
 }
 
 #[tokio::test]
-async fn delegation_child_file_read_still_returns_bounded_tool_output() {
+async fn delegation_child_file_read_long_line_returns_bounded_business_failure() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("large.txt");
     tokio::fs::write(&path, "a".repeat(16_000)).await.unwrap();
@@ -972,9 +972,11 @@ async fn delegation_child_file_read_still_returns_bounded_tool_output() {
         .await
         .unwrap();
 
-    assert_eq!(output.output["truncated"], true);
-    assert!(
-        output.output["content"].as_str().unwrap().chars().count()
-            <= config.file_read_max_chars + 3
-    );
+    assert_eq!(output.outcome, ToolExecutionOutcome::BusinessFailure);
+    assert_eq!(output.output["status"], "error");
+    assert_eq!(output.output["line"], 1);
+    assert!(output.output["msg"]
+        .as_str()
+        .is_some_and(|message| message.contains("code_run")));
+    assert!(output.output.to_string().chars().count() <= config.file_read_max_chars * 2);
 }

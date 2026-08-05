@@ -36,6 +36,12 @@ const PROMPT_SUBAGENTS_COMPACTION: &str = "subagents_compaction";
 const DELEGATION_COMPACTION_SCHEMA_VERSION: u8 = 1;
 const DEFAULT_COMPACTION_REASON: &str = "provider context reached subagent auto compact threshold";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProviderContextUsageAnchor {
+    provider_message_count: usize,
+    used_tokens: usize,
+}
+
 pub struct DelegationPreflightCompactor {
     metadata: DelegationMetadata,
     progress: DelegationProgressSink,
@@ -44,7 +50,7 @@ pub struct DelegationPreflightCompactor {
     tool_specs: Vec<ToolSpec>,
     compaction: SessionCompactionConfig,
     context_window: usize,
-    provider_context_anchor: Option<ContextUsageSnapshot>,
+    provider_context_anchor: Option<ProviderContextUsageAnchor>,
     compacted_since_last_check: bool,
 }
 
@@ -71,6 +77,30 @@ impl DelegationPreflightCompactor {
         }
     }
 
+    fn trigger_context_tokens(
+        &self,
+        system_prompt: &str,
+        provider_messages: &[SessionTurnMessage],
+    ) -> usize {
+        let full_estimate = estimate_provider_request_context_tokens(
+            system_prompt,
+            provider_messages,
+            &self.tool_specs,
+        )
+        .used_tokens;
+        self.provider_context_anchor
+            .filter(|anchor| anchor.provider_message_count <= provider_messages.len())
+            .map(|anchor| {
+                anchor
+                    .used_tokens
+                    .saturating_add(estimate_session_turn_messages_tokens(
+                        &provider_messages[anchor.provider_message_count..],
+                    ))
+                    .max(full_estimate)
+            })
+            .unwrap_or(full_estimate)
+    }
+
     async fn maybe_compact(
         &mut self,
         system_prompt: &str,
@@ -83,16 +113,8 @@ impl DelegationPreflightCompactor {
         else {
             return Ok(());
         };
-        let estimate = estimate_provider_request_context_tokens(
-            system_prompt,
-            provider_messages,
-            &self.tool_specs,
-        );
         let trigger_tokens = self
-            .provider_context_anchor
-            .filter(|usage| usage.source == ContextUsageSource::Provider)
-            .map(|usage| usage.used_tokens)
-            .unwrap_or(estimate.used_tokens)
+            .trigger_context_tokens(system_prompt, provider_messages)
             .saturating_add(runtime_projection_tokens);
         if trigger_tokens < trigger_threshold {
             return Ok(());
@@ -540,10 +562,15 @@ impl SessionTurnPreflight for DelegationPreflightCompactor {
 
     fn observe_provider_context_usage(
         &mut self,
-        _provider_message_count: usize,
+        provider_message_count: usize,
         usage: ContextUsageSnapshot,
     ) {
-        self.provider_context_anchor = Some(usage);
+        if usage.source == ContextUsageSource::Provider {
+            self.provider_context_anchor = Some(ProviderContextUsageAnchor {
+                provider_message_count,
+                used_tokens: usage.used_tokens,
+            });
+        }
     }
 
     fn clear_provider_context_usage(&mut self) {
@@ -903,6 +930,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trigger_context_tokens_adds_messages_after_provider_anchor() {
+        let (_dir, _store, metadata, progress) = started_delegation().await;
+        let provider = Arc::new(JsonProvider::new(Vec::new()));
+        let mut compactor = compactor(metadata, progress, provider);
+        let provider_messages = vec![
+            SessionTurnMessage::user_text("request"),
+            SessionTurnMessage::assistant_text("calling tool"),
+            tool_result_message("toolu_1", "tool output added after provider response"),
+        ];
+        compactor.observe_provider_context_usage(
+            2,
+            ContextUsageSnapshot {
+                used_tokens: 1_200,
+                source: ContextUsageSource::Provider,
+            },
+        );
+        let full_estimate = estimate_provider_request_context_tokens(
+            "system",
+            &provider_messages,
+            &compactor.tool_specs,
+        )
+        .used_tokens;
+        let expected = 1_200usize
+            .saturating_add(estimate_session_turn_messages_tokens(
+                &provider_messages[2..],
+            ))
+            .max(full_estimate);
+
+        assert_eq!(
+            compactor.trigger_context_tokens("system", &provider_messages),
+            expected
+        );
+
+        compactor.observe_provider_context_usage(
+            provider_messages.len(),
+            ContextUsageSnapshot {
+                used_tokens: 1,
+                source: ContextUsageSource::Estimate,
+            },
+        );
+        assert_eq!(
+            compactor.trigger_context_tokens("system", &provider_messages),
+            expected,
+            "local estimates must not replace the provider anchor"
+        );
+
+        compactor.observe_provider_context_usage(
+            provider_messages.len().saturating_add(1),
+            ContextUsageSnapshot {
+                used_tokens: usize::MAX,
+                source: ContextUsageSource::Provider,
+            },
+        );
+        assert_eq!(
+            compactor.trigger_context_tokens("system", &provider_messages),
+            full_estimate,
+            "an out-of-range provider anchor must fall back to the full local estimate"
+        );
+    }
+
+    #[tokio::test]
     async fn plan_keeps_full_summary_input_and_projects_large_tool_results_for_fallback_and_tail() {
         let (_dir, _store, metadata, progress) = started_delegation().await;
         let provider = Arc::new(JsonProvider::new(vec![json_response(
@@ -1245,6 +1333,63 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| matches!(event, SessionTurnEvent::CompactionCompleted { .. })));
+    }
+
+    #[tokio::test]
+    async fn provider_anchor_suffix_tool_result_triggers_compaction_before_hard_guard() {
+        let (_dir, store, metadata, progress) = started_delegation().await;
+        let provider = Arc::new(JsonProvider::new(vec![json_response("bounded summary")]));
+        let mut compactor = compactor_with_limits(
+            metadata.clone(),
+            progress,
+            Arc::clone(&provider),
+            compacting_config_with_small_tool_results(),
+            512,
+            8_000,
+        );
+        let mut provider_messages = compactable_messages_with_large_tool_results();
+        let provider_message_count = provider_messages.len().saturating_sub(1);
+        provider_messages[provider_message_count] = tool_result_message(
+            "toolu_tail",
+            &format!("ANCHOR_SUFFIX_RAW_TOOL_RESULT_{}", "Z".repeat(40_000)),
+        );
+        compactor.observe_provider_context_usage(
+            provider_message_count,
+            ContextUsageSnapshot {
+                used_tokens: 700,
+                source: ContextUsageSource::Provider,
+            },
+        );
+        let mut events = Vec::new();
+
+        compactor
+            .before_provider_request_with_runtime_reserve(
+                "stable subagent system prompt",
+                &mut provider_messages,
+                0,
+                &mut |event| events.push(event),
+            )
+            .await
+            .expect("large tool result after provider anchor should compact before hard guard");
+
+        assert_eq!(provider.requests().await.len(), 1);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, SessionTurnEvent::CompactionStarted { .. })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, SessionTurnEvent::CompactionCompleted { .. })));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, SessionTurnEvent::CompactionFailed { .. })));
+        assert!(store
+            .read_compaction_state(&metadata.id)
+            .await
+            .expect("read compaction state")
+            .is_some());
+        let projected = message_text(&provider_messages);
+        assert!(projected.contains("<compacted_subagent_context>"));
+        assert!(!projected.contains("ANCHOR_SUFFIX_RAW_TOOL_RESULT"));
     }
 
     #[tokio::test]

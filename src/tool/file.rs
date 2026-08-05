@@ -2,7 +2,8 @@
 
 use super::*;
 use crate::tool::file_text::{
-    migrate_edit_coverage, read_text_page, suggested_read_range, CoverageMigration, TextPageRequest,
+    migrate_edit_coverage, read_text_page, suggested_read_range, CoverageMigration,
+    TextPageOutcome, TextPageRequest,
 };
 
 impl ToolRegistry {
@@ -205,10 +206,22 @@ impl ToolRegistry {
             },
         )
         .await?;
-        if let Some(evidence) = result.evidence {
-            self.activate_file_read_evidence(context, evidence).await;
+        match result {
+            TextPageOutcome::Page(result) => {
+                if let Some(evidence) = result.evidence {
+                    self.activate_file_read_evidence(context, evidence).await;
+                }
+                Ok(ToolExecution::completed(result.output))
+            }
+            TextPageOutcome::LineTooLong { line } => Ok(ToolExecution::business_failure(json!({
+                "path": args.path,
+                "status": "error",
+                "line": line,
+                "msg": format!(
+                    "第 {line} 行无法在本次 file_read 单行上限内完整返回，因而无法安全生成读取证据或修改许可；请改用 code_run 定向读取该行。"
+                ),
+            }))),
         }
-        Ok(ToolExecution::completed(result.output))
     }
 
     pub(super) async fn file_patch(
