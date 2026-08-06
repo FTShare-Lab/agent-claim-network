@@ -82,6 +82,10 @@ impl StructuredJsonCaller {
         self.max_tokens
     }
 
+    pub(crate) fn max_attempts(&self) -> u32 {
+        self.retry_count.saturating_add(1)
+    }
+
     /// 请求模型生成 JSON，并在 JSON 解析失败时按配置重试。
     pub async fn generate_json(
         &self,

@@ -257,6 +257,9 @@ pub enum SessionTurnEvent {
         updated_claim_ids: Vec<ClaimId>,
         new_dispute_ids: Vec<DisputeId>,
     },
+    CompactionSkipped {
+        warning: String,
+    },
     CompactionFailed {
         error: String,
     },

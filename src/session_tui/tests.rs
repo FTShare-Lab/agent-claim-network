@@ -2675,6 +2675,148 @@ fn compaction_progress_is_visible() {
 }
 
 #[test]
+fn repeated_compaction_failures_render_actionable_messages_without_generic_prefixes() {
+    let mut manual = super::TuiState::new();
+    let manual_message =
+        "Compaction failed repeatedly. You can run /compact to try again or start a new session.";
+    manual.apply_event(SessionEvent::CompactionFailed {
+        error: manual_message.into(),
+    });
+    assert!(manual.transcript_text().contains(manual_message));
+    assert!(!manual
+        .transcript_text()
+        .contains("Compaction failed: Compaction failed repeatedly."));
+
+    let mut automatic = super::TuiState::new();
+    automatic.begin_pending_turn("continue".into());
+    let automatic_message = "Context compaction failed: the generated summary exceeded 40,000 characters after 2 attempts. Run /compact to retry.";
+    automatic.fail_running_turn(automatic_message);
+    assert!(automatic.transcript_text().contains(automatic_message));
+    assert!(!automatic
+        .transcript_text()
+        .contains("Turn failed: Context compaction failed:"));
+}
+
+#[test]
+fn manual_compaction_warning_and_error_keep_single_gaps_across_scrollback() {
+    let mut state = super::TuiState::new();
+    state.push_command_echo("/compact".into());
+
+    let command = state.scrollback_lines(120);
+    let mut rendered = lines_plain_text(&command.lines);
+    state.mark_scrollback_flushed(command.entry_count);
+
+    state.apply_event(SessionEvent::Warning {
+        message: "compaction summary JSON invalid, retrying (1/1): summary too long".into(),
+    });
+    let warning = state.scrollback_lines(120);
+    rendered.extend(lines_plain_text(&warning.lines));
+    state.mark_scrollback_flushed(warning.entry_count);
+
+    state.apply_event(SessionEvent::CompactionFailed {
+        error:
+            "Compaction failed repeatedly. You can run /compact to try again or start a new session."
+                .into(),
+    });
+    rendered.extend(lines_plain_text(&state.scrollback_lines(120).lines));
+
+    let command_index = rendered
+        .iter()
+        .position(|line| line.contains("› /compact"))
+        .expect("compact command echo");
+    let warning_index = rendered
+        .iter()
+        .position(|line| line.contains("Warning: compaction summary JSON invalid"))
+        .expect("compaction retry warning");
+    let error_index = rendered
+        .iter()
+        .position(|line| line.contains("Error Compaction failed repeatedly"))
+        .expect("compaction failure");
+
+    assert_eq!(
+        blank_lines_between(&rendered, command_index, warning_index),
+        1
+    );
+    assert_eq!(
+        blank_lines_between(&rendered, warning_index, error_index),
+        1
+    );
+}
+
+#[test]
+fn automatic_compaction_warning_keeps_gap_before_assistant_across_scrollback() {
+    let mut state = super::TuiState::new();
+    state.begin_pending_turn("请继续".into());
+
+    let user = state.scrollback_lines(120);
+    let mut rendered = lines_plain_text(&user.lines);
+    state.mark_scrollback_flushed(user.entry_count);
+
+    state.apply_event(SessionEvent::Warning {
+        message: "Automatic compaction failed after 2 attempts; continuing with full history."
+            .into(),
+    });
+
+    let warning_frame = lines_plain_text(&super::inline_live_lines_with_width(&state, 120));
+    assert!(warning_frame
+        .iter()
+        .any(|line| line.contains("Warning: Automatic compaction failed after 2 attempts")));
+
+    state.apply_event(SessionEvent::AssistantMessageCompleted {
+        text: "RAW_FALLBACK_OK".into(),
+    });
+
+    let live = lines_plain_text(&super::inline_live_lines_with_width(&state, 120));
+    assert!(live
+        .iter()
+        .any(|line| line.contains("Warning: Automatic compaction failed after 2 attempts")));
+    assert!(live.iter().any(|line| line.contains("RAW_FALLBACK_OK")));
+
+    let timeline = lines_plain_text(&state.active_assistant_lines(120));
+    let timeline_warning_index = timeline
+        .iter()
+        .position(|line| line.contains("Warning: Automatic compaction failed after 2 attempts"))
+        .expect("timeline automatic compaction warning");
+    let timeline_assistant_index = timeline
+        .iter()
+        .position(|line| line.contains("RAW_FALLBACK_OK"))
+        .expect("timeline Assistant response");
+    assert_eq!(
+        blank_lines_between(&timeline, timeline_warning_index, timeline_assistant_index),
+        1,
+        "streaming Assistant 必须与 live Warning 保持一行间隔"
+    );
+
+    state.apply_event(SessionEvent::TurnCommitted { message_count: 2 });
+    rendered.extend(lines_plain_text(&state.scrollback_lines(120).lines));
+
+    let warning_index = rendered
+        .iter()
+        .position(|line| line.contains("Automatic compaction failed after 2 attempts"))
+        .expect("automatic compaction warning");
+    let assistant_index = rendered
+        .iter()
+        .position(|line| line.contains("RAW_FALLBACK_OK"))
+        .expect("assistant response");
+
+    assert_eq!(
+        blank_lines_between(&rendered, warning_index, assistant_index),
+        1
+    );
+    assert_eq!(
+        rendered
+            .iter()
+            .filter(|line| line.contains("Warning: Automatic compaction failed after 2 attempts"))
+            .count(),
+        1,
+        "提交后 Warning 只能写入一次 scrollback"
+    );
+    assert!(!rendered
+        .iter()
+        .any(|line| line.contains("No context was discarded.")));
+}
+
+#[test]
 fn assistant_completed_replaces_streaming_delta_line() {
     let mut state = super::TuiState::new();
     state.apply_event(SessionEvent::AssistantTextDelta { text: "hel".into() });

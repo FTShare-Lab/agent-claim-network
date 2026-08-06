@@ -345,6 +345,7 @@ impl ProviderAdapter for AnthropicProviderAdapter {
                 | SessionTurnEvent::Warning { .. }
                 | SessionTurnEvent::CompactionStarted { .. }
                 | SessionTurnEvent::CompactionCompleted { .. }
+                | SessionTurnEvent::CompactionSkipped { .. }
                 | SessionTurnEvent::CompactionFailed { .. }
                 | SessionTurnEvent::ToolCallStarted { .. }
                 | SessionTurnEvent::ToolCallSkipped { .. }

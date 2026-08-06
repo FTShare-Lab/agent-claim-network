@@ -1824,11 +1824,23 @@ async fn preflight_retries_once_with_half_summary_limit_after_reference_projecti
             &format!(r#"{{"committed_summary": null, "active_turn_summary": "{retry_summary}"}}"#),
             Vec::new(),
         ),
+        response_step(
+            r#"{"committed_summary": null, "active_turn_summary": "bounded retry summary"}"#,
+            Vec::new(),
+        ),
     ]));
     let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.json_caller = Arc::new(StructuredJsonCaller::new(
+        provider.clone(),
+        1024,
+        1,
+        Duration::ZERO,
+        Duration::ZERO,
+    ));
     engine.context_window = 40_000;
     engine.compaction.tail_target_ctx_ratio = 0.01;
-    // 首次 4000 字符摘要仍超限，重试后的 2000 字符摘要可连同 wrapper 放入预算。
+    // 首次 4000 字符摘要仍超投影预算；半长请求先收到 4000 字符的非法输出，
+    // 随后通过结构化语义 repair 得到可提交摘要。
     engine.compaction.tail_hard_ctx_ratio = 0.0275;
     engine.compaction.summary_max_chars = 4_000;
     let mut session = create_test_session(&store, "session_c0ffee12").await;
@@ -1856,18 +1868,287 @@ async fn preflight_retries_once_with_half_summary_limit_after_reference_projecti
         .unwrap();
 
     let requests = provider.requests().await;
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     assert!(last_user_text(&requests[0]).contains(r#""summary_max_chars": 4000"#));
     assert!(last_user_text(&requests[1]).contains(r#""summary_max_chars": 2000"#));
+    assert!(last_user_text(&requests[2]).contains("exceeds summary_max_chars"));
     let rendered = serde_json::to_string(&projection.messages).unwrap();
     assert!(rendered.contains("<externalized_compaction_asset>"));
     assert!(!rendered.contains(&"A".repeat(100)));
-    assert!(rendered.contains(&"B".repeat(100)));
-    assert!(!rendered.contains(&"B".repeat(2_100)));
+    assert!(!rendered.contains(&"B".repeat(100)));
+    assert!(rendered.contains("bounded retry summary"));
     let audit = tokio::fs::read_to_string(&session.paths.compaction_events_jsonl)
         .await
         .unwrap();
     assert_eq!(audit.matches(r#""kind":"started""#).count(), 2);
+}
+
+#[tokio::test]
+async fn auto_compaction_failure_continues_with_raw_history_when_request_still_fits() {
+    let dir = tempfile::tempdir().unwrap();
+    let overlong = "X".repeat(11);
+    let response = format!(
+        r#"{{"committed_summary":{summary},"active_turn_summary":null}}"#,
+        summary = serde_json::to_string(&overlong).unwrap()
+    );
+    let provider = Arc::new(RecordingProvider::new(vec![
+        response_step(&response, Vec::new()),
+        response_step(&response, Vec::new()),
+        response_step("continued with full history", Vec::new()),
+    ]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.context_window = 20_000;
+    engine.compaction.auto_compact_ctx_ratio = 0.00001;
+    engine.compaction.tail_target_ctx_ratio = 0.015;
+    engine.compaction.tail_hard_ctx_ratio = 0.0225;
+    engine.compaction.tail_previous_real_user_turns = 1;
+    engine.compaction.summary_max_chars = 10;
+    engine.json_caller = Arc::new(StructuredJsonCaller::new(
+        provider.clone(),
+        1024,
+        1,
+        Duration::ZERO,
+        Duration::ZERO,
+    ));
+    let mut session = create_test_session(&store, "session_c0ffee30").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "old request ".repeat(120)),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "old answer ".repeat(120)),
+            NewSessionMessage::text(SessionMessageRole::User, "latest request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "latest answer"),
+        ])
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+
+    engine
+        .run_turn(&mut session, "continue safely", |event| events.push(event))
+        .await
+        .expect("raw request still fits and should continue");
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 3);
+    let final_request = serde_json::to_string(&requests[2].messages).unwrap();
+    assert!(final_request.contains("old request"));
+    assert!(final_request.contains("continue safely"));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::Warning { message }
+            if message == "Automatic compaction failed after 2 attempts; continuing with full history."
+    )));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, SessionEvent::CompactionFailed { .. })));
+    let metadata = session.read_metadata().await.unwrap();
+    assert_eq!(metadata.recapped_until, 0);
+    assert!(metadata.compaction.is_none());
+    assert!(session
+        .read_compaction_checkpoint()
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn auto_compaction_provider_failure_continues_with_raw_history_when_request_still_fits() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        error_step("summary provider unavailable", Vec::new()),
+        response_step("continued after provider failure", Vec::new()),
+    ]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.context_window = 20_000;
+    engine.compaction.auto_compact_ctx_ratio = 0.00001;
+    engine.compaction.tail_target_ctx_ratio = 0.015;
+    engine.compaction.tail_hard_ctx_ratio = 0.0225;
+    engine.compaction.tail_previous_real_user_turns = 1;
+    let mut session = create_test_session(&store, "session_c0ffee32").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "old request ".repeat(120)),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "old answer ".repeat(120)),
+            NewSessionMessage::text(SessionMessageRole::User, "latest request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "latest answer"),
+        ])
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+
+    engine
+        .run_turn(&mut session, "continue after outage", |event| {
+            events.push(event)
+        })
+        .await
+        .expect("a recoverable compaction provider failure should not abort a safe raw request");
+
+    assert_eq!(provider.requests().await.len(), 2);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::Warning { message }
+            if message.contains("continuing with full history")
+                && message.contains("summary provider unavailable")
+    )));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, SessionEvent::CompactionFailed { .. })));
+    let metadata = session.read_metadata().await.unwrap();
+    assert_eq!(metadata.recapped_until, 0);
+    assert!(metadata.compaction.is_none());
+}
+
+#[tokio::test]
+async fn auto_compaction_projection_failure_continues_raw_when_full_request_still_fits() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        response_step(
+            r#"{"committed_summary":"short summary","active_turn_summary":null}"#,
+            Vec::new(),
+        ),
+        response_step(
+            r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
+            Vec::new(),
+        ),
+        response_step(
+            r#"{"committed_summary":"tiny","active_turn_summary":null}"#,
+            Vec::new(),
+        ),
+        response_step("continued after hard-tail failure", Vec::new()),
+    ]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.context_window = 20_000;
+    engine.compaction.auto_compact_ctx_ratio = 0.00001;
+    engine.compaction.tail_target_ctx_ratio = 0.005;
+    engine.compaction.tail_hard_ctx_ratio = 0.01;
+    engine.compaction.tail_previous_real_user_turns = 1;
+    let mut session = create_test_session(&store, "session_c0ffee33").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "old request ".repeat(120)),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "old answer ".repeat(120)),
+            NewSessionMessage::text(SessionMessageRole::User, "latest request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "latest answer"),
+        ])
+        .await
+        .unwrap();
+    let current_request = "mandatory current plain text ".repeat(100);
+    let mut events = Vec::new();
+
+    engine
+        .run_turn(&mut session, current_request.clone(), |event| {
+            events.push(event)
+        })
+        .await
+        .expect("the full raw request fits even though the compact hard-tail projection does not");
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 4);
+    let final_request = serde_json::to_string(&requests[3].messages).unwrap();
+    assert!(final_request.contains("old request"));
+    assert!(final_request.contains(&current_request));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::Warning { message }
+            if message.contains("continuing with full history")
+                && message.contains("mandatory context")
+    )));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, SessionEvent::CompactionFailed { .. })));
+    let metadata = session.read_metadata().await.unwrap();
+    assert_eq!(metadata.recapped_until, 0);
+    assert!(metadata.compaction.is_none());
+    assert!(session
+        .read_compaction_checkpoint()
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn auto_compaction_failure_blocks_when_raw_request_with_output_reserve_does_not_fit() {
+    let dir = tempfile::tempdir().unwrap();
+    let overlong = "X".repeat(11);
+    let response = format!(
+        r#"{{"committed_summary":{summary},"active_turn_summary":null}}"#,
+        summary = serde_json::to_string(&overlong).unwrap()
+    );
+    let provider = Arc::new(RecordingProvider::new(vec![
+        response_step(&response, Vec::new()),
+        response_step(&response, Vec::new()),
+    ]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.context_window = 6_000;
+    engine.compaction.auto_compact_ctx_ratio = 0.00001;
+    engine.compaction.tail_target_ctx_ratio = 0.05;
+    engine.compaction.tail_hard_ctx_ratio = 0.10;
+    engine.compaction.tail_previous_real_user_turns = 1;
+    engine.compaction.tool_result_raw_max_chars = 64;
+    engine.compaction.summary_max_chars = 10;
+    engine.json_caller = Arc::new(StructuredJsonCaller::new(
+        provider.clone(),
+        1024,
+        1,
+        Duration::ZERO,
+        Duration::ZERO,
+    ));
+    let mut session = create_test_session(&store, "session_c0ffee31").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "old tool task"),
+            NewSessionMessage::new(
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::tool_use(
+                    "toolu_large_history",
+                    "code_run",
+                    json!({"command": "produce output"}),
+                )],
+            ),
+            NewSessionMessage::new(
+                SessionMessageRole::User,
+                vec![SessionContentBlock::tool_result(
+                    "toolu_large_history",
+                    &"large raw tool output ".repeat(2_000),
+                )],
+            ),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "old tool task complete"),
+            NewSessionMessage::text(SessionMessageRole::User, "latest request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "latest answer"),
+        ])
+        .await
+        .unwrap();
+    let original_message_count = session.read_messages().await.unwrap().len();
+    let mut events = Vec::new();
+
+    let error = engine
+        .run_turn(&mut session, "continue but preserve everything", |event| {
+            events.push(event)
+        })
+        .await
+        .expect_err("raw request plus output reserve exceeds the context window");
+
+    assert_eq!(
+        error.to_string(),
+        "Context compaction failed: the generated summary exceeded 10 characters after 2 attempts. Run /compact to retry."
+    );
+    assert_eq!(provider.requests().await.len(), 2);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::TurnFailed { error }
+            if error == "Context compaction failed: the generated summary exceeded 10 characters after 2 attempts. Run /compact to retry."
+    )));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, SessionEvent::CompactionFailed { .. })));
+    let metadata = session.read_metadata().await.unwrap();
+    assert_eq!(metadata.message_count, original_message_count);
+    assert_eq!(metadata.recapped_until, 0);
+    assert!(metadata.compaction.is_none());
+    assert!(session
+        .read_compaction_checkpoint()
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -2967,6 +3248,72 @@ async fn manual_compact_post_summary_failure_writes_failed_audit() {
         .unwrap();
     assert!(audit_log.contains(r#""kind":"started""#));
     assert!(audit_log.contains(r#""kind":"model_attempt""#));
+    assert!(audit_log.contains(r#""kind":"failed""#));
+    assert!(!audit_log.contains(r#""kind":"completed""#));
+}
+
+#[tokio::test]
+async fn manual_compact_exhausts_overlong_summary_repairs_without_advancing_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let overlong = "X".repeat(11);
+    let response = format!(
+        r#"{{"committed_summary":{summary},"active_turn_summary":null}}"#,
+        summary = serde_json::to_string(&overlong).unwrap()
+    );
+    let provider = Arc::new(RecordingProvider::new(vec![
+        response_step(&response, Vec::new()),
+        response_step(&response, Vec::new()),
+    ]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.context_window = 20_000;
+    engine.compaction.tail_target_ctx_ratio = 0.015;
+    engine.compaction.tail_hard_ctx_ratio = 0.0225;
+    engine.compaction.tail_previous_real_user_turns = 1;
+    engine.compaction.summary_max_chars = 10;
+    engine.json_caller = Arc::new(StructuredJsonCaller::new(
+        provider.clone(),
+        1024,
+        1,
+        Duration::ZERO,
+        Duration::ZERO,
+    ));
+    let mut session = create_test_session(&store, "session_face0010").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "old request ".repeat(120)),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "old answer ".repeat(120)),
+            NewSessionMessage::text(SessionMessageRole::User, "latest request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "latest answer"),
+        ])
+        .await
+        .unwrap();
+    let original_message_count = session.read_messages().await.unwrap().len();
+    let mut events = Vec::new();
+
+    engine
+        .compact_session_checkpoint(&mut session, |event| events.push(event))
+        .await
+        .expect_err("two overlong summaries must fail manual compaction");
+
+    assert_eq!(provider.requests().await.len(), 2);
+    let metadata = session.read_metadata().await.unwrap();
+    assert_eq!(metadata.message_count, original_message_count);
+    assert_eq!(metadata.recapped_until, 0);
+    assert!(metadata.compaction.is_none());
+    assert!(session
+        .read_compaction_checkpoint()
+        .await
+        .unwrap()
+        .is_none());
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::CompactionFailed { error }
+            if error == "Compaction failed repeatedly. You can run /compact to try again or start a new session."
+    )));
+    let audit_log = tokio::fs::read_to_string(&session.paths.compaction_events_jsonl)
+        .await
+        .unwrap();
+    assert_eq!(audit_log.matches(r#""kind":"model_attempt""#).count(), 2);
     assert!(audit_log.contains(r#""kind":"failed""#));
     assert!(!audit_log.contains(r#""kind":"completed""#));
 }
@@ -4374,6 +4721,40 @@ fn parse_compaction_summary_outcome_requires_committed_and_active_shape() {
     assert!(err
         .to_string()
         .contains("active_turn_summary must not be empty"));
+}
+
+#[test]
+fn parse_compaction_summary_outcome_rejects_summary_over_character_limit() {
+    let transcript = vec![TurnMessage {
+        role: "user".into(),
+        content: "old request".into(),
+    }];
+    let inputs = CompactionSummaryInputs {
+        audit: test_compaction_audit_context(CompactionAuditScope::Committed),
+        committed_start_index: Some(0),
+        committed_end_index: Some(1),
+        prior_committed_summary: None,
+        committed_transcript: Some(&transcript),
+        committed_transcript_with_large_tool_results_omitted: Some(&transcript),
+        committed_transcript_with_tool_results_omitted: Some(&transcript),
+        prior_active_turn_summary: None,
+        active_turn_user_anchor: None,
+        active_turn_start_segment: None,
+        active_turn_end_segment: None,
+        active_turn_transcript: None,
+        active_turn_transcript_with_large_tool_results_omitted: None,
+        active_turn_transcript_with_tool_results_omitted: None,
+        summary_max_chars: 4,
+    };
+
+    let error = parse_compaction_summary_outcome(
+        json!({"committed_summary": "五个字符啊", "active_turn_summary": null}),
+        &inputs,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("actual_chars=5"));
+    assert!(error.to_string().contains("max_chars=4"));
 }
 
 #[test]

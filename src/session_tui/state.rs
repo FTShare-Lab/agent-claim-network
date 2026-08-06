@@ -236,7 +236,7 @@ impl SessionTuiState {
                 }
             }
             SessionEvent::Warning { message } => {
-                self.push_system(format!("Warning: {message}"));
+                self.transcript.push_warning(format!("Warning: {message}"));
             }
             SessionEvent::ContextUsageUpdated { used_tokens } => {
                 if self.status != SessionRuntimeStatus::Compacting {
@@ -461,7 +461,7 @@ impl SessionTuiState {
             SessionEvent::CompactionFailed { error } => {
                 self.status = SessionRuntimeStatus::Error;
                 self.transcript.set_activity(None);
-                self.push_error(format!("Compaction failed: {error}"));
+                self.push_error(compaction_failure_message(error));
             }
             SessionEvent::InboxStarted => {
                 self.transcript
@@ -1438,7 +1438,7 @@ impl SessionTuiState {
             self.restore_queued_inputs_to_composer();
         }
         self.transcript
-            .push_turn_error(format!("Turn failed: {}", error.into()));
+            .push_turn_error(turn_failure_message(error.into()));
     }
 
     #[cfg(test)]
@@ -1721,6 +1721,22 @@ impl SessionTuiState {
 
     pub(super) fn mark_start_separator_flushed(&mut self) {
         self.start_separator_flushed = true;
+    }
+}
+
+fn compaction_failure_message(error: String) -> String {
+    if error.starts_with("Compaction failed repeatedly.") {
+        error
+    } else {
+        format!("Compaction failed: {error}")
+    }
+}
+
+fn turn_failure_message(error: String) -> String {
+    if error.starts_with("Context compaction failed:") {
+        error
+    } else {
+        format!("Turn failed: {error}")
     }
 }
 

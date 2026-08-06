@@ -184,7 +184,10 @@ impl DelegationPreflightCompactor {
                         },
                     })
                     .await?;
-                let _ = self.progress.clear_compaction_checkpoint().await;
+                self.progress
+                    .clear_compaction_checkpoint()
+                    .await
+                    .context("清理失败的 subagent compaction checkpoint 失败")?;
                 emit(SessionTurnEvent::CompactionFailed {
                     error: error_text.clone(),
                 });
@@ -209,7 +212,10 @@ impl DelegationPreflightCompactor {
                     },
                 })
                 .await?;
-            let _ = self.progress.clear_compaction_checkpoint().await;
+            self.progress
+                .clear_compaction_checkpoint()
+                .await
+                .context("清理超预算的 subagent compaction checkpoint 失败")?;
             emit(SessionTurnEvent::CompactionFailed {
                 error: error_text.clone(),
             });
@@ -641,11 +647,13 @@ fn parse_summary(value: Value, summary_max_chars: usize) -> anyhow::Result<Strin
     if summary.is_empty() {
         anyhow::bail!("subagents compaction summary 不能为空");
     }
-    let mut out = String::new();
-    for ch in summary.chars().take(summary_max_chars) {
-        out.push(ch);
+    let actual_chars = summary.chars().count();
+    if actual_chars > summary_max_chars {
+        anyhow::bail!(
+            "subagents compaction summary exceeds summary_max_chars: actual_chars={actual_chars}, max_chars={summary_max_chars}"
+        );
     }
-    Ok(out)
+    Ok(summary.to_string())
 }
 
 fn auto_compact_threshold(context_window: usize, ratio: f64) -> Option<usize> {
@@ -927,6 +935,71 @@ mod tests {
         assert!(serialized.contains("runtime file-edit authority"));
         assert!(serialized.contains("required_read"));
         assert!(serialized.contains("done"));
+    }
+
+    #[test]
+    fn parse_summary_rejects_overlong_output_instead_of_truncating() {
+        let error = parse_summary(json!({"summary": "五个字符啊"}), 4).unwrap_err();
+
+        assert!(error.to_string().contains("actual_chars=5"));
+        assert!(error.to_string().contains("max_chars=4"));
+    }
+
+    #[tokio::test]
+    async fn overlong_summary_repairs_exhaust_without_advancing_subagent_cursor() {
+        let (_dir, store, metadata, progress) = started_delegation().await;
+        let provider = Arc::new(JsonProvider::new(vec![
+            json_response("five!"),
+            json_response("still too long"),
+        ]));
+        let mut config = compacting_config();
+        config.summary_max_chars = 4;
+        let mut compactor = compactor_with_limits_and_retries(
+            metadata.clone(),
+            progress,
+            Arc::clone(&provider),
+            config,
+            512,
+            8_000,
+            1,
+        );
+        compactor.observe_provider_context_usage(
+            6,
+            ContextUsageSnapshot {
+                used_tokens: 1_000,
+                source: ContextUsageSource::Provider,
+            },
+        );
+        let mut provider_messages = compactable_messages();
+        let original_messages = provider_messages.clone();
+        let mut events = Vec::new();
+
+        compactor
+            .before_provider_request(
+                &mut "stable subagent system prompt".to_string(),
+                &mut provider_messages,
+                &mut |event| events.push(event),
+            )
+            .await
+            .expect("below the hard threshold the subagent should keep raw history");
+
+        assert_eq!(provider.requests().await.len(), 2);
+        assert_eq!(provider_messages, original_messages);
+        assert!(store
+            .read_compaction_state(&metadata.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!store
+            .delegation_dir(&metadata.id)
+            .join("compaction_checkpoint.json")
+            .exists());
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, SessionTurnEvent::CompactionFailed { .. })));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, SessionTurnEvent::CompactionCompleted { .. })));
     }
 
     #[tokio::test]

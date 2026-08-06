@@ -164,10 +164,17 @@ impl TranscriptState {
             .or(self.active_assistant)
             .unwrap_or(self.flushed_until);
         let mut chunks = Vec::new();
-        for entry in self.history.iter().skip(start) {
+        for (index, entry) in self.history.iter().enumerate().skip(start) {
             match entry {
                 HistoryEntry::Assistant(_) if has_active_turn => {
-                    chunks.push(ActiveTimelineChunk::Assistant(entry.display_lines(width)))
+                    let mut lines = entry.display_lines(width);
+                    if needs_blank_before_entry(&self.history, index) {
+                        lines.insert(0, Line::default());
+                    }
+                    chunks.push(ActiveTimelineChunk::Assistant(lines))
+                }
+                HistoryEntry::Status(_) if has_active_turn => {
+                    chunks.push(fixed_timeline_chunk(entry.display_lines(width), width))
                 }
                 HistoryEntry::Tool(_) if has_active_turn => {
                     chunks.push(fixed_timeline_chunk(entry.live_status_lines(width), width))
@@ -221,6 +228,15 @@ impl TranscriptState {
         self.history.push(HistoryEntry::Status(StatusCell {
             text: message.into(),
             leading_gap_after_flushed_user: false,
+        }));
+    }
+
+    pub(super) fn push_warning(&mut self, message: impl Into<String>) {
+        let leading_gap_after_flushed_user = self.active_user.is_none()
+            && matches!(self.history.last(), Some(HistoryEntry::User(_)));
+        self.history.push(HistoryEntry::Status(StatusCell {
+            text: message.into(),
+            leading_gap_after_flushed_user,
         }));
     }
 
@@ -534,6 +550,13 @@ fn needs_blank_before_entry(history: &[HistoryEntry], index: usize) -> bool {
                     leading_gap_after_flushed_user: true,
                     ..
                 }))
+            )
+        )
+        || matches!(
+            (history.get(index.saturating_sub(1)), history.get(index)),
+            (
+                Some(HistoryEntry::Status(_)),
+                Some(HistoryEntry::Assistant(_) | HistoryEntry::Error(_))
             )
         )
         || matches!(

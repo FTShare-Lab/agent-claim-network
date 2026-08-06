@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde::{de::Error as _, Serialize};
+use serde::Serialize;
 
 use super::context::AgentContext;
 use super::inbox::InboxJsonGenerator;
@@ -395,7 +395,7 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
             return Ok(());
         }
         let projected_base_system_prompt = system_prompt.clone();
-        let Some(projection) = self
+        let projection = match self
             .engine
             .compact_provider_preflight(
                 self.session,
@@ -409,10 +409,31 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
                 },
                 emit,
             )
-            .await?
-        else {
-            self.insert_background_projection(provider_messages).await;
-            return Ok(());
+            .await
+        {
+            Ok(Some(projection)) => projection,
+            Ok(None) => {
+                self.insert_background_projection(provider_messages).await;
+                return Ok(());
+            }
+            Err(error) => {
+                let Some(recoverable) =
+                    error.downcast_ref::<RecoverableCompactionPreparationError>()
+                else {
+                    return Err(error);
+                };
+                if self.raw_request_with_output_fits_context(trigger_tokens) {
+                    let warning = recoverable.continuation_warning();
+                    self.engine
+                        .append_session_event_log(self.session, "WARN", &warning)
+                        .await;
+                    emit(SessionTurnEvent::CompactionSkipped { warning });
+                    self.insert_background_projection(provider_messages).await;
+                    return Ok(());
+                }
+                let message = recoverable.blocking_message();
+                return Err(error.context(message));
+            }
         };
         *system_prompt = projection.system_prompt;
         *provider_messages = projection.messages;
@@ -539,6 +560,12 @@ impl PreflightCompactor<'_> {
 }
 
 impl PreflightCompactor<'_> {
+    fn raw_request_with_output_fits_context(&self, input_tokens: usize) -> bool {
+        let output_tokens =
+            usize::try_from(self.engine.turn_loop.max_tokens()).unwrap_or(usize::MAX);
+        input_tokens.saturating_add(output_tokens) <= self.engine.context_window
+    }
+
     fn trigger_context_tokens(
         &self,
         system_prompt: &str,
@@ -660,6 +687,100 @@ struct CompactionAuditSummaryContext<'a> {
 struct GeneratedCompactionSummary {
     outcome: SessionCompactionOutcome,
     audit_id: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{field} exceeds summary_max_chars: actual_chars={actual_chars}, max_chars={max_chars}")]
+struct CompactionSummaryTooLong {
+    field: &'static str,
+    actual_chars: usize,
+    max_chars: usize,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Compacted provider projection still exceeds hard tail budget: estimated raw tail tokens={raw_tail_tokens}, runtime projection tokens={runtime_projection_tokens}, combined tail tokens={projected_tokens}, hard tail budget={hard_limit}."
+)]
+struct CompactionProjectionTooLarge {
+    raw_tail_tokens: usize,
+    runtime_projection_tokens: usize,
+    projected_tokens: usize,
+    hard_limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RecoverableCompactionPreparationKind {
+    SummaryTooLong { max_chars: usize, attempts: u32 },
+    Other,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{source:#}")]
+pub(super) struct RecoverableCompactionPreparationError {
+    pub(super) kind: RecoverableCompactionPreparationKind,
+    #[source]
+    source: anyhow::Error,
+}
+
+impl RecoverableCompactionPreparationError {
+    fn from_summary_call(source: anyhow::Error, attempts: u32) -> Self {
+        let kind = source
+            .downcast_ref::<CompactionSummaryTooLong>()
+            .map(
+                |error| RecoverableCompactionPreparationKind::SummaryTooLong {
+                    max_chars: error.max_chars,
+                    attempts,
+                },
+            )
+            .unwrap_or(RecoverableCompactionPreparationKind::Other);
+        Self { kind, source }
+    }
+
+    pub(super) fn other(source: anyhow::Error) -> Self {
+        Self {
+            kind: RecoverableCompactionPreparationKind::Other,
+            source,
+        }
+    }
+
+    fn from_projection_failure(source: anyhow::Error) -> anyhow::Error {
+        if source
+            .downcast_ref::<CompactionProjectionTooLarge>()
+            .is_some()
+        {
+            Self::other(source).into()
+        } else {
+            source
+        }
+    }
+
+    fn blocking_message(&self) -> String {
+        match self.kind {
+            RecoverableCompactionPreparationKind::SummaryTooLong {
+                max_chars,
+                attempts,
+            } => format!(
+                "Context compaction failed: the generated summary exceeded {} characters after {attempts} attempts. Run /compact to retry.",
+                format_count(max_chars),
+            ),
+            RecoverableCompactionPreparationKind::Other => format!(
+                "Context compaction failed: {:#}. Run /compact to retry.",
+                self.source
+            ),
+        }
+    }
+
+    fn continuation_warning(&self) -> String {
+        match self.kind {
+            RecoverableCompactionPreparationKind::SummaryTooLong { attempts, .. } => format!(
+                "Automatic compaction failed after {attempts} attempts; continuing with full history."
+            ),
+            RecoverableCompactionPreparationKind::Other => format!(
+                "Automatic compaction failed; continuing with full history. Details: {:#}",
+                self.source
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1200,9 +1321,13 @@ impl SessionEngine {
         let raw_tail_tokens = estimate_session_turn_messages_tokens(&projection.messages);
         let projected_tokens = raw_tail_tokens.saturating_add(runtime_projection_tokens);
         if hard_limit == 0 || projected_tokens > hard_limit {
-            anyhow::bail!(
-                "Compacted provider projection still exceeds hard tail budget: estimated raw tail tokens={raw_tail_tokens}, runtime projection tokens={runtime_projection_tokens}, combined tail tokens={projected_tokens}, hard tail budget={hard_limit}."
-            );
+            return Err(CompactionProjectionTooLarge {
+                raw_tail_tokens,
+                runtime_projection_tokens,
+                projected_tokens,
+                hard_limit,
+            }
+            .into());
         }
         Ok(())
     }
@@ -1939,6 +2064,12 @@ impl SessionEngine {
                         updated_claim_ids,
                         new_dispute_ids,
                     });
+                    emit(SessionEvent::StatusChanged {
+                        status: SessionRuntimeStatus::Running,
+                    });
+                }
+                SessionTurnEvent::CompactionSkipped { warning } => {
+                    emit(SessionEvent::Warning { message: warning });
                     emit(SessionEvent::StatusChanged {
                         status: SessionRuntimeStatus::Running,
                     });
@@ -2853,7 +2984,8 @@ impl SessionEngine {
                         turn_id,
                         None,
                     )
-                    .await?
+                    .await
+                    .map_err(RecoverableCompactionPreparationError::from_projection_failure)?
                 };
                 self.clear_active_context_usage_anchor(&session.metadata.id);
                 return Ok(Some(projection));
@@ -2887,9 +3019,13 @@ impl SessionEngine {
         {
             Ok(outcome) => outcome,
             Err(e) => {
-                emit(SessionTurnEvent::CompactionFailed {
-                    error: e.to_string(),
-                });
+                if e.downcast_ref::<RecoverableCompactionPreparationError>()
+                    .is_none()
+                {
+                    emit(SessionTurnEvent::CompactionFailed {
+                        error: e.to_string(),
+                    });
+                }
                 return Err(e);
             }
         };
@@ -3173,19 +3309,19 @@ impl SessionEngine {
             plan.committed_transcript.is_some(),
             outcome.committed_summary,
         ) {
-            (true, Some(summary)) => non_empty_summary(
-                enforce_summary_max_chars(summary, summary_max_chars),
-                "committed_summary",
-            )?,
+            (true, Some(summary)) => {
+                validate_compaction_summary_text(summary, "committed_summary", summary_max_chars)?
+            }
             (true, None) => anyhow::bail!("compaction summary missing committed_summary"),
             (false, summary) => summary
                 .or_else(|| prior_committed_summary.map(ToOwned::to_owned))
                 .unwrap_or_default(),
         };
         let active_turn_summary = match (plan.active_turn.as_ref(), outcome.active_turn_summary) {
-            (Some(_), Some(summary)) => Some(non_empty_summary(
-                enforce_summary_max_chars(summary, summary_max_chars),
+            (Some(_), Some(summary)) => Some(validate_compaction_summary_text(
+                summary,
                 "active_turn_summary",
+                summary_max_chars,
             )?),
             (Some(_), None) => anyhow::bail!("compaction summary missing active_turn_summary"),
             (None, summary) => summary.or_else(|| prior_active_summary.map(ToOwned::to_owned)),
@@ -3378,7 +3514,11 @@ impl SessionEngine {
                 .await
             {
                 Ok(projection) => projection,
-                Err(first_projection_error) => {
+                Err(first_projection_error)
+                    if first_projection_error
+                        .downcast_ref::<CompactionProjectionTooLarge>()
+                        .is_some() =>
+                {
                     let retry_summary_max_chars = self
                         .compaction
                         .summary_max_chars
@@ -3433,12 +3573,17 @@ impl SessionEngine {
                         )
                         .await
                         .map_err(|error| {
-                            anyhow::anyhow!(
+                            let details = format!(
                                 "Compaction could not fit the mandatory context after externalizing reusable Skill/attachment blocks and retrying with a half-size summary. Split the current plain-text request or start a new session, then retry. Details: {error:#}"
-                            )
-                        });
+                            );
+                            error.context(details)
+                        })
+                        .map_err(
+                            RecoverableCompactionPreparationError::from_projection_failure,
+                        );
                     audit_try!(final_projection)
                 }
+                Err(error) => return self.fail_compaction_audit(session, &audit_ids, error).await,
             }
         };
 
@@ -3541,7 +3686,16 @@ impl SessionEngine {
             }
             Ok(ManualCompactionOutcome::Noop(reason)) => Ok(SessionCompactionResult::Noop(reason)),
             Err(e) => {
-                let error = e.to_string();
+                let error = match e
+                    .downcast_ref::<RecoverableCompactionPreparationError>()
+                    .map(|error| error.kind)
+                {
+                    Some(RecoverableCompactionPreparationKind::SummaryTooLong { .. }) => {
+                        "Compaction failed repeatedly. You can run /compact to try again or start a new session."
+                            .to_string()
+                    }
+                    _ => e.to_string(),
+                };
                 emit(SessionEvent::StatusChanged {
                     status: SessionRuntimeStatus::Error,
                 });
@@ -3839,17 +3993,18 @@ impl SessionEngine {
                             let compaction = generated_compaction.outcome;
                             let (used_claim_ids, prepared_claims, prepared_disputes) =
                                 audit_try!(self.prepare_finalize_segment(recap_segment).await);
-                            let summary = enforce_summary_max_chars(
+                            let summary = audit_try!(validate_compaction_summary_text(
                                 audit_try!(compaction.committed_summary.with_context(|| {
                                     "compaction summary missing committed_summary"
                                 })),
+                                "committed_summary",
                                 self.compaction.summary_max_chars,
-                            );
+                            ));
                             (
                                 used_claim_ids,
                                 prepared_claims,
                                 prepared_disputes,
-                                audit_try!(non_empty_summary(summary, "committed_summary")),
+                                summary,
                                 vec![generated_compaction.audit_id],
                             )
                         }
@@ -3906,17 +4061,18 @@ impl SessionEngine {
                                 .await?;
                             generated_audit_ids.push(generated_compaction.audit_id.clone());
                             let compaction = generated_compaction.outcome;
-                            let summary = enforce_summary_max_chars(
+                            let summary = audit_try!(validate_compaction_summary_text(
                                 audit_try!(compaction.committed_summary.with_context(|| {
                                     "compaction summary missing committed_summary"
                                 })),
+                                "committed_summary",
                                 self.compaction.summary_max_chars,
-                            );
+                            ));
                             (
                                 Vec::new(),
                                 Vec::new(),
                                 Vec::new(),
-                                audit_try!(non_empty_summary(summary, "committed_summary")),
+                                summary,
                                 vec![generated_compaction.audit_id],
                             )
                         }
@@ -4259,7 +4415,7 @@ impl SessionEngine {
                     inputs.active_turn_transcript_with_tool_results_omitted;
                 user_text = serde_json::to_string_pretty(&payload)?;
                 provider_messages = vec![SessionTurnMessage::user_text(user_text.clone())];
-                ensure_compaction_request_within_context_window(
+                let final_budget = ensure_compaction_request_within_context_window(
                     &system_prompt,
                     &provider_messages,
                     self.context_window,
@@ -4269,7 +4425,10 @@ impl SessionEngine {
                     format!(
                         "compaction summary request remains over budget after omitting all tool results; full input error: {full_error:#}; large-tool-result omission error: {large_omission_error:#}"
                     )
-                })?;
+                });
+                if let Err(source) = final_budget {
+                    return Err(RecoverableCompactionPreparationError::other(source).into());
+                }
             }
         }
         let payload_preview = audit_text_preview(&user_text, COMPACTION_AUDIT_PREVIEW_CHARS);
@@ -4295,7 +4454,7 @@ impl SessionEngine {
             .json_caller
             .generate_json_validated_with_guarded_attempts(
                 StructuredJsonAttemptRequest::compaction(system_prompt, provider_messages),
-                |value| parse_compaction_summary_outcome(value, inputs).map_err(anyhow::Error::from),
+                |value| parse_compaction_summary_outcome(value, inputs),
                 |retry_index, retry_total, e| {
                     let message = format!(
                         "compaction summary JSON invalid, retrying ({retry_index}/{retry_total}): {e:#}"
@@ -4344,7 +4503,11 @@ impl SessionEngine {
             Err(error) => {
                 self.append_compaction_audit_failed(session, audit_id, error.to_string())
                     .await;
-                Err(error)
+                Err(RecoverableCompactionPreparationError::from_summary_call(
+                    error,
+                    self.json_caller.max_attempts(),
+                )
+                .into())
             }
         }
     }
@@ -4364,25 +4527,20 @@ fn compaction_noop_reason(
 fn parse_compaction_summary_outcome(
     value: serde_json::Value,
     inputs: &CompactionSummaryInputs<'_>,
-) -> serde_json::Result<SessionCompactionOutcome> {
-    let object = value.as_object().ok_or_else(|| {
-        serde_json::Error::custom("compaction summary response must be a JSON object")
-    })?;
+) -> anyhow::Result<SessionCompactionOutcome> {
+    let object = value
+        .as_object()
+        .context("compaction summary response must be a JSON object")?;
     if !object.contains_key("committed_summary") {
-        return Err(serde_json::Error::custom(
-            "committed_summary key must be present",
-        ));
+        anyhow::bail!("committed_summary key must be present");
     }
     if !object.contains_key("active_turn_summary") {
-        return Err(serde_json::Error::custom(
-            "active_turn_summary key must be present",
-        ));
+        anyhow::bail!("active_turn_summary key must be present");
     }
-    let outcome: SessionCompactionOutcome = serde_json::from_value(value)?;
+    let outcome: SessionCompactionOutcome =
+        serde_json::from_value(value).context("compaction summary response shape invalid")?;
     if inputs.committed_transcript.is_some() && outcome.committed_summary.is_none() {
-        return Err(serde_json::Error::custom(
-            "committed_summary must be a string when committed_transcript is present",
-        ));
+        anyhow::bail!("committed_summary must be a string when committed_transcript is present");
     }
     if inputs.committed_transcript.is_some()
         && outcome
@@ -4390,19 +4548,15 @@ fn parse_compaction_summary_outcome(
             .as_deref()
             .is_some_and(|summary| summary.trim().is_empty())
     {
-        return Err(serde_json::Error::custom(
-            "committed_summary must not be empty when committed_transcript is present",
-        ));
+        anyhow::bail!("committed_summary must not be empty when committed_transcript is present");
     }
     if inputs.committed_transcript.is_none() && outcome.committed_summary.is_some() {
-        return Err(serde_json::Error::custom(
-            "committed_summary must be null when committed_transcript is null",
-        ));
+        anyhow::bail!("committed_summary must be null when committed_transcript is null");
     }
     if inputs.active_turn_transcript.is_some() && outcome.active_turn_summary.is_none() {
-        return Err(serde_json::Error::custom(
-            "active_turn_summary must be a string when active_turn_transcript is present",
-        ));
+        anyhow::bail!(
+            "active_turn_summary must be a string when active_turn_transcript is present"
+        );
     }
     if inputs.active_turn_transcript.is_some()
         && outcome
@@ -4410,14 +4564,22 @@ fn parse_compaction_summary_outcome(
             .as_deref()
             .is_some_and(|summary| summary.trim().is_empty())
     {
-        return Err(serde_json::Error::custom(
-            "active_turn_summary must not be empty when active_turn_transcript is present",
-        ));
+        anyhow::bail!(
+            "active_turn_summary must not be empty when active_turn_transcript is present"
+        );
     }
     if inputs.active_turn_transcript.is_none() && outcome.active_turn_summary.is_some() {
-        return Err(serde_json::Error::custom(
-            "active_turn_summary must be null when active_turn_transcript is null",
-        ));
+        anyhow::bail!("active_turn_summary must be null when active_turn_transcript is null");
+    }
+    if let Some(summary) = outcome.committed_summary.as_deref() {
+        validate_compaction_summary_chars(summary, "committed_summary", inputs.summary_max_chars)?;
+    }
+    if let Some(summary) = outcome.active_turn_summary.as_deref() {
+        validate_compaction_summary_chars(
+            summary,
+            "active_turn_summary",
+            inputs.summary_max_chars,
+        )?;
     }
     Ok(outcome)
 }
@@ -4723,11 +4885,31 @@ fn checkpoint_trace_id(
     ))
 }
 
-fn enforce_summary_max_chars(summary: String, summary_max_chars: usize) -> String {
-    if summary.chars().count() <= summary_max_chars {
-        return summary;
+fn validate_compaction_summary_chars(
+    summary: &str,
+    field: &'static str,
+    summary_max_chars: usize,
+) -> anyhow::Result<()> {
+    let actual_chars = summary.chars().count();
+    if actual_chars > summary_max_chars {
+        return Err(CompactionSummaryTooLong {
+            field,
+            actual_chars,
+            max_chars: summary_max_chars,
+        }
+        .into());
     }
-    summary.chars().take(summary_max_chars).collect()
+    Ok(())
+}
+
+fn validate_compaction_summary_text(
+    summary: String,
+    field: &'static str,
+    summary_max_chars: usize,
+) -> anyhow::Result<String> {
+    non_empty_summary(summary.clone(), field)?;
+    validate_compaction_summary_chars(&summary, field, summary_max_chars)?;
+    Ok(summary)
 }
 
 fn non_empty_summary(summary: String, field: &str) -> anyhow::Result<String> {
@@ -4735,6 +4917,18 @@ fn non_empty_summary(summary: String, field: &str) -> anyhow::Result<String> {
         anyhow::bail!("{field} must not be empty");
     }
     Ok(summary)
+}
+
+fn format_count(value: usize) -> String {
+    let digits = value.to_string();
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            formatted.push(',');
+        }
+        formatted.push(ch);
+    }
+    formatted
 }
 
 fn validate_compaction_checkpoint_segments(

@@ -150,6 +150,10 @@ impl AgentTurnLoop {
         Arc::clone(&self.tools)
     }
 
+    pub(crate) fn max_tokens(&self) -> u32 {
+        self.max_tokens
+    }
+
     pub fn with_attachment_limits(mut self, limits: AttachmentLimits) -> Self {
         self.attachment_limits = limits;
         self

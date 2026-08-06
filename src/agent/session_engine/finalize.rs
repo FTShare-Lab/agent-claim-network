@@ -23,9 +23,9 @@ use super::events::emit_warnings;
 use super::transcript::{session_messages_to_turn_transcript, session_trace_text};
 use super::{
     checkpoint_trace_id, hash_session_segment, merge_finalize_reports,
-    report_from_finalize_checkpoint, validate_finalize_checkpoint_segment, SessionEngine,
-    SessionEvent, SessionFinalizeReport, SessionRecapPayload, SessionRuntimeStatus,
-    PROMPT_SESSION_RECAP, RECAP_INSTRUCTION,
+    report_from_finalize_checkpoint, validate_finalize_checkpoint_segment,
+    RecoverableCompactionPreparationError, SessionEngine, SessionEvent, SessionFinalizeReport,
+    SessionRecapPayload, SessionRuntimeStatus, PROMPT_SESSION_RECAP, RECAP_INSTRUCTION,
 };
 
 impl SessionEngine {
@@ -276,10 +276,15 @@ impl SessionEngine {
                     );
                     last_err = Some(e);
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    return Err(RecoverableCompactionPreparationError::other(e).into());
+                }
             }
         }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("finalize_session retry loop 未返回结果")))
+        Err(RecoverableCompactionPreparationError::other(
+            last_err.unwrap_or_else(|| anyhow::anyhow!("finalize_session retry loop 未返回结果")),
+        )
+        .into())
     }
 
     async fn generate_recap_json(
@@ -297,6 +302,7 @@ impl SessionEngine {
                 vec![SessionTurnMessage::user_text(user_text)],
             )
             .await
+            .map_err(|source| RecoverableCompactionPreparationError::other(source).into())
     }
 
     async fn finalize_message_segment_checkpointed(
