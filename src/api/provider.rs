@@ -10,8 +10,30 @@ use std::time::Duration;
 
 use crate::api::{SessionTurnContentBlock, SessionTurnMessage};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderHistoryMediaPolicy {
+    Placeholder,
+    Preserve,
+}
+
+/// 当前 adapter 可原样回放的 provider 私有历史协议。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderReplayProtocol {
+    OpenAiResponses,
+}
+
 #[async_trait]
 pub trait ProviderAdapter: Send + Sync {
+    /// 已落盘、尚未 compact 的历史附件如何进入主 session provider context。
+    fn history_media_policy(&self) -> ProviderHistoryMediaPolicy {
+        ProviderHistoryMediaPolicy::Placeholder
+    }
+
+    /// 只允许同协议 replay 进入 provider 请求与其 token/compaction 预算。
+    fn history_replay_protocol(&self) -> Option<ProviderReplayProtocol> {
+        None
+    }
+
     /// 是否在 provider 调用前先发本地粗估 ctx。
     fn emit_preflight_context_estimate(&self) -> bool {
         true

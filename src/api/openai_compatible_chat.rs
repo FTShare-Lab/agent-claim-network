@@ -499,6 +499,7 @@ fn assistant_turn_message(
     }
     Ok(SessionTurnMessage {
         role: "assistant".into(),
+        provider_replay: None,
         content,
     })
 }
@@ -552,6 +553,7 @@ mod tests {
     fn canonical_tool_use_maps_to_chat_tool_call() {
         let messages = session_turn_messages_to_chat(vec![SessionTurnMessage {
             role: "assistant".into(),
+            provider_replay: None,
             content: vec![
                 SessionTurnContentBlock::text("先查"),
                 SessionTurnContentBlock::ToolUse {
@@ -572,6 +574,7 @@ mod tests {
     fn canonical_tool_result_maps_to_chat_tool_message() {
         let messages = session_turn_messages_to_chat(vec![SessionTurnMessage {
             role: "user".into(),
+            provider_replay: None,
             content: vec![SessionTurnContentBlock::ToolResult {
                 tool_use_id: "call_1".into(),
                 content: r#"{"ok":true}"#.into(),
@@ -586,6 +589,7 @@ mod tests {
     fn mixed_tool_result_and_media_splits_into_tool_then_user_message() {
         let messages = session_turn_messages_to_chat(vec![SessionTurnMessage {
             role: "user".into(),
+            provider_replay: None,
             content: vec![
                 SessionTurnContentBlock::ToolResult {
                     tool_use_id: "call_1".into(),
@@ -611,6 +615,7 @@ mod tests {
     fn user_image_block_maps_to_image_url_data_url() {
         let messages = session_turn_messages_to_chat(vec![SessionTurnMessage {
             role: "user".into(),
+            provider_replay: None,
             content: vec![
                 SessionTurnContentBlock::text("看这张图"),
                 SessionTurnContentBlock::image("image/png", "QUJD"),
@@ -635,6 +640,7 @@ mod tests {
     fn user_document_block_maps_to_file_part_with_filename() {
         let messages = session_turn_messages_to_chat(vec![SessionTurnMessage {
             role: "user".into(),
+            provider_replay: None,
             content: vec![SessionTurnContentBlock::document_named(
                 "application/pdf",
                 "QUJD",
@@ -663,6 +669,27 @@ mod tests {
             messages[0].content,
             Some(ChatMessageContent::Text("你好".into()))
         );
+    }
+
+    #[test]
+    fn responses_replay_is_ignored_when_projecting_to_chat() {
+        let messages = session_turn_messages_to_chat(vec![SessionTurnMessage::assistant_text(
+            "canonical text",
+        )
+        .with_provider_replay(crate::api::ProviderReplayState::OpenAiResponses {
+            items: vec![json!({
+                "type":"reasoning","encrypted_content":"opaque-chat-must-ignore"
+            })],
+        })])
+        .unwrap();
+
+        assert_eq!(
+            messages[0].content,
+            Some(ChatMessageContent::Text("canonical text".into()))
+        );
+        assert!(!serde_json::to_string(&messages)
+            .unwrap()
+            .contains("opaque-chat-must-ignore"));
     }
 
     #[test]

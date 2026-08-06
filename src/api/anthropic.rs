@@ -516,6 +516,7 @@ fn assistant_turn_message(turn: &ContinuedAssistantTurn) -> SessionTurnMessage {
     };
     SessionTurnMessage {
         role: "assistant".into(),
+        provider_replay: None,
         content,
     }
 }
@@ -810,6 +811,22 @@ mod tests {
                 "source": {"type": "base64", "media_type": "application/pdf", "data": "QUJD"}
             })
         );
+    }
+
+    #[test]
+    fn responses_replay_is_ignored_when_projecting_to_anthropic() {
+        let messages = session_turn_messages_to_api(vec![SessionTurnMessage::assistant_text(
+            "canonical text",
+        )
+        .with_provider_replay(crate::api::ProviderReplayState::OpenAiResponses {
+            items: vec![json!({
+                "type":"reasoning","encrypted_content":"opaque-anthropic-must-ignore"
+            })],
+        })]);
+
+        let body = serde_json::to_string(&messages).unwrap();
+        assert!(body.contains("canonical text"));
+        assert!(!body.contains("opaque-anthropic-must-ignore"));
     }
 
     #[test]

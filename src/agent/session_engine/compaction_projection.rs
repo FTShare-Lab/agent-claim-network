@@ -12,11 +12,13 @@ use std::collections::HashSet;
 use crate::api::{
     active_segment_has_large_tool_result as shared_active_segment_has_large_tool_result,
     active_segments_hash as shared_active_segments_hash, estimate_json_tokens,
-    estimate_session_turn_messages_tokens, estimate_text_tokens,
+    estimate_provider_replay_tokens, estimate_session_turn_messages_tokens, estimate_text_tokens,
     estimated_projected_segment_tokens, large_tool_result_omission_text,
-    omit_turn_messages_tool_results, project_compaction_input_tool_results,
-    project_turn_message_tool_results, provider_safe_segments, SessionTurnContentBlock,
-    SessionTurnMessage, TurnMessage, FILE_EDIT_AUTHORITY_COMPACTION_NOTICE,
+    omit_turn_messages_tool_results, project_compaction_input_media,
+    project_compaction_input_tool_results, project_turn_message_tool_results,
+    provider_safe_segments, ProviderHistoryMediaPolicy, ProviderReplayProtocol,
+    ProviderReplayState, SessionTurnContentBlock, SessionTurnMessage, TurnMessage,
+    FILE_EDIT_AUTHORITY_COMPACTION_NOTICE,
 };
 pub(super) use crate::api::{active_segment_messages, MessageRange, ProviderProjectionBudget};
 use crate::session::{
@@ -25,8 +27,9 @@ use crate::session::{
 };
 
 use super::transcript::{
-    flatten_session_content_lossy, is_real_user_turn, session_message_to_turn_message,
-    session_messages_to_turn_messages, turn_messages_to_transcript,
+    flatten_session_content_lossy, is_real_user_turn, session_message_to_provider_turn_message,
+    session_message_to_turn_message, session_messages_to_provider_turn_messages,
+    turn_messages_to_transcript,
 };
 use super::MEDIA_BLOCK_ESTIMATED_TOKENS;
 
@@ -61,7 +64,12 @@ pub(super) fn compaction_transcript_projection(
     messages: Vec<SessionTurnMessage>,
     tool_result_raw_max_chars: usize,
 ) -> CompactionTranscriptProjection {
-    let messages = redact_memory_tool_messages(messages);
+    let messages = redact_memory_tool_messages(
+        messages
+            .into_iter()
+            .map(project_compaction_input_media)
+            .collect(),
+    );
     let large_tool_results_omitted =
         project_compaction_input_tool_results(messages.clone(), tool_result_raw_max_chars);
     let tool_results_omitted = omit_turn_messages_tool_results(messages.clone());
@@ -120,6 +128,10 @@ pub(super) fn session_compaction_transcript_projection(
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "compaction 投影需显式携带既有预算边界与 provider 媒体/replay 策略"
+)]
 pub(super) fn compacted_context_for_turn(
     system_prompt: &str,
     metadata: &crate::session::SessionMetadata,
@@ -128,18 +140,20 @@ pub(super) fn compacted_context_for_turn(
     tail_hard_token_limit: usize,
     tail_previous_real_user_turns: usize,
     tool_result_raw_max_chars: usize,
+    media_policy: ProviderHistoryMediaPolicy,
+    replay_protocol: Option<ProviderReplayProtocol>,
 ) -> anyhow::Result<(String, Vec<SessionTurnMessage>)> {
     let Some(compaction) = metadata.compaction.as_ref() else {
         return Ok((
             system_prompt.to_string(),
-            session_messages_to_turn_messages(messages),
+            session_messages_to_provider_turn_messages(messages, media_policy, replay_protocol),
         ));
     };
     let committed_message_until = compaction.committed_message_until();
     if committed_message_until == 0 && compaction.committed_summary().trim().is_empty() {
         return Ok((
             system_prompt.to_string(),
-            session_messages_to_turn_messages(messages),
+            session_messages_to_provider_turn_messages(messages, media_policy, replay_protocol),
         ));
     }
     let committed_summary_message =
@@ -149,7 +163,12 @@ pub(super) fn compacted_context_for_turn(
         .skip(committed_message_until)
         .cloned()
         .map(|message| {
-            session_message_to_turn_message_projected(message, tool_result_raw_max_chars)
+            session_message_to_provider_turn_message_projected(
+                message,
+                tool_result_raw_max_chars,
+                media_policy,
+                replay_protocol,
+            )
         })
         .collect::<Vec<_>>();
     let mandatory_tokens = estimate_session_turn_messages_tokens(&committed_suffix).saturating_add(
@@ -324,6 +343,10 @@ pub(super) fn active_cursor_matches_suffix(
         .is_ok_and(|hash| hash == cursor.source_hash)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "provider 投影需显式携带既有预算边界与媒体/replay 协议策略"
+)]
 pub(super) fn project_provider_context(
     base_system_prompt: &str,
     compaction: &SessionCompactionState,
@@ -331,6 +354,8 @@ pub(super) fn project_provider_context(
     active_suffix: Vec<SessionTurnMessage>,
     active_context: ActiveProjectionContext<'_>,
     budget: ProviderProjectionBudget,
+    media_policy: ProviderHistoryMediaPolicy,
+    replay_protocol: Option<ProviderReplayProtocol>,
 ) -> ProviderProjection {
     let committed_message_until = compaction.committed_message_until();
     let active_cursor = current_active_turn_cursor(compaction, active_context)
@@ -352,7 +377,12 @@ pub(super) fn project_provider_context(
         .skip(committed_message_until)
         .cloned()
         .map(|message| {
-            session_message_to_turn_message_projected(message, budget.tool_result_raw_max_chars)
+            session_message_to_provider_turn_message_projected(
+                message,
+                budget.tool_result_raw_max_chars,
+                media_policy,
+                replay_protocol,
+            )
         })
         .collect::<Vec<_>>();
     let active_projection = project_active_suffix(
@@ -442,6 +472,18 @@ pub(super) fn session_message_to_turn_message_projected(
 ) -> SessionTurnMessage {
     project_turn_message_tool_results(
         session_message_to_turn_message(message),
+        tool_result_raw_max_chars,
+    )
+}
+
+pub(super) fn session_message_to_provider_turn_message_projected(
+    message: SessionMessage,
+    tool_result_raw_max_chars: usize,
+    media_policy: ProviderHistoryMediaPolicy,
+    replay_protocol: Option<ProviderReplayProtocol>,
+) -> SessionTurnMessage {
+    project_turn_message_tool_results(
+        session_message_to_provider_turn_message(message, media_policy, replay_protocol),
         tool_result_raw_max_chars,
     )
 }
@@ -584,37 +626,53 @@ pub(super) fn compaction_tail_token_limit(context_window: usize, ctx_ratio: f64)
 pub(super) fn estimated_session_message_tokens_projected<'a>(
     messages: impl IntoIterator<Item = &'a SessionMessage>,
     tool_result_raw_max_chars: Option<usize>,
+    replay_protocol: Option<ProviderReplayProtocol>,
 ) -> usize {
-    let mut total_tokens = 0;
+    let mut total_tokens = 0usize;
     for message in messages {
-        total_tokens += estimate_text_tokens(&message.role.to_string());
+        let mut canonical_tokens = 0usize;
         for block in &message.content {
             match block {
                 SessionContentBlock::Text { text } => {
-                    total_tokens += estimate_text_tokens(text);
+                    canonical_tokens = canonical_tokens.saturating_add(estimate_text_tokens(text));
                 }
                 SessionContentBlock::SkillInstructions { instruction } => {
-                    total_tokens +=
-                        estimate_text_tokens(&crate::skill::render_skill_instructions(instruction));
+                    canonical_tokens = canonical_tokens.saturating_add(estimate_text_tokens(
+                        &crate::skill::render_skill_instructions(instruction),
+                    ));
                 }
                 SessionContentBlock::Image { .. } | SessionContentBlock::Document { .. } => {
-                    total_tokens += MEDIA_BLOCK_ESTIMATED_TOKENS;
+                    canonical_tokens =
+                        canonical_tokens.saturating_add(MEDIA_BLOCK_ESTIMATED_TOKENS);
                 }
                 SessionContentBlock::ToolUse { name, input, .. } => {
-                    total_tokens += estimate_text_tokens(name);
-                    total_tokens += estimate_json_tokens(input);
+                    canonical_tokens = canonical_tokens
+                        .saturating_add(estimate_text_tokens(name))
+                        .saturating_add(estimate_json_tokens(input));
                 }
                 SessionContentBlock::ToolResult { content, .. } => {
                     let chars = content.chars().count();
                     if tool_result_raw_max_chars.is_some_and(|limit| chars > limit) {
-                        total_tokens +=
-                            estimate_text_tokens(&large_tool_result_omission_text(chars));
+                        canonical_tokens = canonical_tokens.saturating_add(estimate_text_tokens(
+                            &large_tool_result_omission_text(chars),
+                        ));
                     } else {
-                        total_tokens += estimate_text_tokens(content);
+                        canonical_tokens =
+                            canonical_tokens.saturating_add(estimate_text_tokens(content));
                     }
                 }
             }
         }
+        let replay_tokens = match (replay_protocol, message.provider_replay.as_ref()) {
+            (
+                Some(ProviderReplayProtocol::OpenAiResponses),
+                Some(replay @ ProviderReplayState::OpenAiResponses { .. }),
+            ) => estimate_provider_replay_tokens(replay),
+            _ => 0,
+        };
+        total_tokens = total_tokens
+            .saturating_add(estimate_text_tokens(&message.role.to_string()))
+            .saturating_add(canonical_tokens.max(replay_tokens));
     }
     total_tokens
 }
@@ -626,6 +684,7 @@ pub(super) fn select_compaction_summary_end_index(
     tail_token_limit: usize,
     tail_previous_real_user_turns: usize,
     tool_result_raw_max_chars: usize,
+    replay_protocol: Option<ProviderReplayProtocol>,
 ) -> usize {
     if summary_start >= end {
         return summary_start;
@@ -648,12 +707,14 @@ pub(super) fn select_compaction_summary_end_index(
         let tail_tokens = estimated_session_message_tokens_projected(
             messages[tail_start..end].iter(),
             Some(tool_result_raw_max_chars),
+            replay_protocol,
         );
         if tail_tokens <= tail_token_limit {
             if tail_start == summary_start {
                 let raw_tail_tokens = estimated_session_message_tokens_projected(
                     messages[tail_start..end].iter(),
                     None,
+                    replay_protocol,
                 );
                 if raw_tail_tokens > tail_token_limit {
                     continue;

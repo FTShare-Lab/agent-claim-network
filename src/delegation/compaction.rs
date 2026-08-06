@@ -16,11 +16,11 @@ use crate::api::{
     ensure_compaction_request_within_context_window, estimate_provider_request_context_tokens,
     estimate_session_turn_messages_tokens, estimated_projected_segment_tokens,
     omit_turn_messages_tool_results, project_compaction_input_media,
-    project_compaction_input_tool_results, project_turn_messages_tool_results,
-    provider_safe_segments, ContextUsageSnapshot, ContextUsageSource, ProviderProjectionBudget,
-    SessionTurnContentBlock, SessionTurnEvent, SessionTurnMessage, SessionTurnPreflight,
-    StructuredJsonAttemptRequest, StructuredJsonCaller, ToolSpec,
-    FILE_EDIT_AUTHORITY_COMPACTION_NOTICE,
+    project_compaction_input_tool_results, project_turn_message_for_safe_transcript,
+    project_turn_messages_tool_results, provider_safe_segments, ContextUsageSnapshot,
+    ContextUsageSource, ProviderProjectionBudget, SessionTurnContentBlock, SessionTurnEvent,
+    SessionTurnMessage, SessionTurnPreflight, StructuredJsonAttemptRequest, StructuredJsonCaller,
+    ToolSpec, FILE_EDIT_AUTHORITY_COMPACTION_NOTICE,
 };
 use crate::config::SessionCompactionConfig;
 use crate::prompt::PromptRegistry;
@@ -678,7 +678,10 @@ pub fn transcript_entry_for_message(
 ) -> DelegationTranscriptEntry {
     DelegationTranscriptEntry {
         at: Utc::now(),
-        kind: DelegationTranscriptKind::Message { source, message },
+        kind: DelegationTranscriptKind::Message {
+            source,
+            message: project_turn_message_for_safe_transcript(message),
+        },
     }
 }
 
@@ -708,7 +711,8 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::api::{
-        ProviderAdapter, ProviderEvent, ProviderRequest, ProviderResponse, ProviderStop,
+        ProviderAdapter, ProviderEvent, ProviderReplayState, ProviderRequest, ProviderResponse,
+        ProviderStop,
     };
     use crate::claim::{AgentId, SessionId};
     use crate::delegation::{
@@ -822,6 +826,7 @@ mod tests {
     fn tool_use_message(id: &str, name: &str) -> SessionTurnMessage {
         SessionTurnMessage {
             role: "assistant".into(),
+            provider_replay: None,
             content: vec![SessionTurnContentBlock::ToolUse {
                 id: id.into(),
                 name: name.into(),
@@ -833,6 +838,7 @@ mod tests {
     fn tool_result_message(id: &str, payload: &str) -> SessionTurnMessage {
         SessionTurnMessage {
             role: "user".into(),
+            provider_replay: None,
             content: vec![SessionTurnContentBlock::ToolResult {
                 tool_use_id: id.into(),
                 content: serde_json::json!({"ok": true, "output": payload}).to_string(),
@@ -943,6 +949,60 @@ mod tests {
 
         assert!(error.to_string().contains("actual_chars=5"));
         assert!(error.to_string().contains("max_chars=4"));
+    }
+
+    #[test]
+    fn delegation_transcript_message_drops_replay_and_raw_media() {
+        let message = SessionTurnMessage::assistant_text("visible answer").with_provider_replay(
+            ProviderReplayState::OpenAiResponses {
+                items: vec![json!({
+                    "type": "reasoning",
+                    "encrypted_content": "TRANSCRIPT_REPLAY"
+                })],
+            },
+        );
+        let mut message = message;
+        message.content.push(SessionTurnContentBlock::image(
+            "image/png",
+            "TRANSCRIPT_IMAGE",
+        ));
+
+        let entry =
+            transcript_entry_for_message(DelegationTranscriptMessageSource::Assistant, message);
+        let rendered = serde_json::to_string(&entry).unwrap();
+
+        assert!(!rendered.contains("TRANSCRIPT_REPLAY"));
+        assert!(!rendered.contains("TRANSCRIPT_IMAGE"));
+        assert!(rendered.contains("image attachment media_type=image/png"));
+    }
+
+    #[tokio::test]
+    async fn compaction_summary_projection_drops_replay_and_raw_media() {
+        let (_dir, _store, metadata, progress) = started_delegation().await;
+        let provider = Arc::new(JsonProvider::new(Vec::new()));
+        let compactor = compactor(metadata, progress, provider);
+        let mut provider_messages = compactable_messages();
+        provider_messages[1].provider_replay = Some(ProviderReplayState::OpenAiResponses {
+            items: vec![json!({
+                "type": "reasoning",
+                "encrypted_content": "COMPACTION_REPLAY"
+            })],
+        });
+        provider_messages[1]
+            .content
+            .push(SessionTurnContentBlock::image(
+                "image/png",
+                "COMPACTION_IMAGE",
+            ));
+
+        let plan = compactor
+            .build_plan(&provider_messages, 0)
+            .expect("projection plan");
+        let compact_text = message_text(&plan.compact_messages);
+
+        assert!(!compact_text.contains("COMPACTION_REPLAY"));
+        assert!(!compact_text.contains("COMPACTION_IMAGE"));
+        assert!(compact_text.contains("image omitted from compaction summary input"));
     }
 
     #[tokio::test]
@@ -1125,6 +1185,7 @@ mod tests {
                     "analysis.pdf",
                 ),
             ],
+            provider_replay: None,
         };
         provider_messages[6]
             .content

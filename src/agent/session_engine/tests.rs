@@ -24,16 +24,18 @@ use super::{
     auto_compact_should_trigger, auto_compact_trigger_threshold_tokens,
     auto_compact_trigger_tokens, compacted_committed_summary_message, compacted_context_for_turn,
     compaction_tail_token_limit, compaction_transcript_projection, delegation_summary_projection,
-    estimate_compacted_committed_summary_message_tokens, finish_cancelled_turn_journal,
+    estimate_compacted_committed_summary_message_tokens,
+    estimated_session_message_tokens_projected, finish_cancelled_turn_journal,
     hash_session_segment, is_canonical_messages_committed_error, parse_compaction_summary_outcome,
     project_provider_context, select_compaction_summary_end_index,
-    session_compaction_transcript_projection, session_messages_to_turn_messages,
-    session_messages_to_turn_transcript, spawn_turn_control_journal_forwarder,
-    ActiveProjectionContext, CompactionAuditScope, CompactionAuditSummaryContext,
-    CompactionAuditTrigger, CompactionRanges, CompactionSummaryInputs, ManualCompactionOutcome,
-    PreflightCompactionRequest, PreflightCompactor, ProviderContextUsageAnchor,
-    ProviderProjectionBudget, SessionCompactionNoopReason, SessionCompactionResult, SessionEngine,
-    SessionEvent, SessionTurnCommittedPostCommitError, TurnJournalEmitter, TurnJournalSink,
+    session_compaction_transcript_projection, session_messages_to_provider_turn_messages,
+    session_messages_to_turn_messages, session_messages_to_turn_transcript,
+    spawn_turn_control_journal_forwarder, ActiveProjectionContext, CompactionAuditScope,
+    CompactionAuditSummaryContext, CompactionAuditTrigger, CompactionRanges,
+    CompactionSummaryInputs, ManualCompactionOutcome, PreflightCompactionRequest,
+    PreflightCompactor, ProviderContextUsageAnchor, ProviderProjectionBudget,
+    SessionCompactionNoopReason, SessionCompactionResult, SessionEngine, SessionEvent,
+    SessionTurnCommittedPostCommitError, TurnJournalEmitter, TurnJournalSink,
     COMPACTION_CHECKPOINT_SCHEMA_VERSION, DELEGATION_PROJECTION_MAX_CHARS,
     DELEGATION_PROJECTION_MAX_ITEMS, MEDIA_BLOCK_ESTIMATED_TOKENS,
 };
@@ -44,7 +46,8 @@ use crate::agent::{
 use crate::api::{
     estimate_session_turn_messages_tokens, estimate_text_tokens, AgentTurnLoop,
     CompletedSessionTurnMessage, ContextUsageSnapshot, ContextUsageSource, InboxInternalizeKind,
-    InternalizeRequest, MemoryReviewLoop, ProviderAdapter, ProviderEvent, ProviderRequest,
+    InternalizeRequest, MemoryReviewLoop, ProviderAdapter, ProviderEvent,
+    ProviderHistoryMediaPolicy, ProviderReplayProtocol, ProviderReplayState, ProviderRequest,
     ProviderResponse, ProviderStop, SessionAttachment, SessionTurnContentBlock, SessionTurnEvent,
     SessionTurnMessage, SessionTurnPreflight, StructuredJsonCaller, ToolCallSkipReason,
     TurnMessage,
@@ -240,6 +243,7 @@ impl ProviderAdapter for BlockingAfterFileReadProvider {
                         name: "file_read".into(),
                         input: json!({"path": "note.txt", "show_linenos": false}),
                     }],
+                    provider_replay: None,
                 },
                 stop: ProviderStop::ToolUse,
             }),
@@ -367,6 +371,7 @@ fn tool_use_step(id: &str, name: &str, input: serde_json::Value) -> ProviderStep
                     name: name.into(),
                     input,
                 }],
+                provider_replay: None,
             },
             stop: ProviderStop::ToolUse,
         },
@@ -941,6 +946,7 @@ fn test_message(
         content,
         created_at: Utc::now(),
         model: "test-model".into(),
+        provider_replay: None,
     }
 }
 
@@ -1231,6 +1237,7 @@ async fn preflight_active_compaction_runs_before_next_provider_request_and_clear
             response: ProviderResponse {
                 assistant_message: SessionTurnMessage {
                     role: "assistant".into(),
+                    provider_replay: None,
                     content: vec![
                         SessionTurnContentBlock::text("I will write a note."),
                         SessionTurnContentBlock::ToolUse {
@@ -1254,9 +1261,24 @@ async fn preflight_active_compaction_runs_before_next_provider_request_and_clear
     engine.compaction.auto_compact_ctx_ratio = 0.00001;
     engine.compaction.tail_target_ctx_ratio = 0.00001;
     let mut session = create_test_session(&store, "session_c0ffee01").await;
+    let image_path = dir.path().join("active-anchor.png");
+    let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2));
+    let mut image_bytes = Vec::new();
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut image_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    tokio::fs::write(&image_path, image_bytes).await.unwrap();
 
     engine
-        .run_turn(&mut session, "please do a long active turn", |_| {})
+        .run_turn_with_attachments(
+            &mut session,
+            "please do a long active turn",
+            vec![SessionAttachment::LocalImage { path: image_path }],
+            |_| {},
+        )
         .await
         .unwrap();
 
@@ -1273,9 +1295,21 @@ async fn preflight_active_compaction_runs_before_next_provider_request_and_clear
     let compaction_request = serde_json::to_string(&requests[1].messages).unwrap();
     assert!(compaction_request.contains("active_turn_user_anchor"));
     assert!(compaction_request.contains("please do a long active turn"));
+    let raw_image = requests[0]
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .find_map(|block| match block {
+            SessionTurnContentBlock::Image { data, .. } => Some(data.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!compaction_request.contains(&raw_image));
+    assert!(compaction_request.contains("image attachment media_type=image/png"));
     assert_eq!(requests[2].system_prompt, "system prompt");
     let final_request = serde_json::to_string(&requests[2].messages).unwrap();
     assert!(final_request.contains("please do a long active turn"));
+    assert!(final_request.contains(&raw_image));
     assert!(final_request.contains("compacted_current_turn_progress"));
     assert!(final_request.contains("The assistant wrote a working note"));
     assert!(!final_request.contains("remember active compact"));
@@ -1307,6 +1341,7 @@ async fn active_turn_compaction_persists_provider_context_high_watermark() {
             response: ProviderResponse {
                 assistant_message: SessionTurnMessage {
                     role: "assistant".into(),
+                    provider_replay: None,
                     content: vec![SessionTurnContentBlock::ToolUse {
                         id: "toolu_1".into(),
                         name: "working_note".into(),
@@ -1362,6 +1397,7 @@ async fn final_provider_request_without_usage_clears_partial_context_anchor() {
             response: ProviderResponse {
                 assistant_message: SessionTurnMessage {
                     role: "assistant".into(),
+                    provider_replay: None,
                     content: vec![SessionTurnContentBlock::ToolUse {
                         id: "toolu_1".into(),
                         name: "working_note".into(),
@@ -1412,6 +1448,7 @@ async fn preflight_active_compaction_preserves_prior_summary_across_multiple_com
             response: ProviderResponse {
                 assistant_message: SessionTurnMessage {
                     role: "assistant".into(),
+                    provider_replay: None,
                     content: vec![SessionTurnContentBlock::ToolUse {
                         id: "toolu_1".into(),
                         name: "working_note".into(),
@@ -1430,6 +1467,7 @@ async fn preflight_active_compaction_preserves_prior_summary_across_multiple_com
             response: ProviderResponse {
                 assistant_message: SessionTurnMessage {
                     role: "assistant".into(),
+                    provider_replay: None,
                     content: vec![SessionTurnContentBlock::ToolUse {
                         id: "toolu_2".into(),
                         name: "working_note".into(),
@@ -1521,6 +1559,7 @@ async fn failed_turn_clears_active_compaction_state() {
             response: ProviderResponse {
                 assistant_message: SessionTurnMessage {
                     role: "assistant".into(),
+                    provider_replay: None,
                     content: vec![SessionTurnContentBlock::ToolUse {
                         id: "toolu_1".into(),
                         name: "working_note".into(),
@@ -1639,6 +1678,7 @@ fn oversized_active_suffix(
         SessionTurnMessage::user_content(content),
         SessionTurnMessage {
             role: "assistant".into(),
+            provider_replay: None,
             content: vec![SessionTurnContentBlock::ToolUse {
                 id: "toolu_large".into(),
                 name: "working_note".into(),
@@ -1647,6 +1687,7 @@ fn oversized_active_suffix(
         },
         SessionTurnMessage {
             role: "user".into(),
+            provider_replay: None,
             content: vec![SessionTurnContentBlock::ToolResult {
                 tool_use_id: "toolu_large".into(),
                 content: "large tool output ".repeat(1_000),
@@ -1738,6 +1779,7 @@ async fn provider_only_externalization_does_not_change_committed_transcript_or_v
             response: ProviderResponse {
                 assistant_message: SessionTurnMessage {
                     role: "assistant".into(),
+                    provider_replay: None,
                     content: vec![SessionTurnContentBlock::ToolUse {
                         id: "toolu_externalize".into(),
                         name: "working_note".into(),
@@ -2108,7 +2150,7 @@ async fn auto_compaction_failure_blocks_when_raw_request_with_output_reserve_doe
                 SessionMessageRole::User,
                 vec![SessionContentBlock::tool_result(
                     "toolu_large_history",
-                    &"large raw tool output ".repeat(2_000),
+                    "large raw tool output ".repeat(2_000),
                 )],
             ),
             NewSessionMessage::text(SessionMessageRole::Assistant, "old tool task complete"),
@@ -2616,6 +2658,7 @@ async fn fallback_tool_use_cancel_before_dispatch_writes_skipped_journal_without
             response: ProviderResponse {
                 assistant_message: SessionTurnMessage {
                     role: "assistant".into(),
+                    provider_replay: None,
                     content: vec![SessionTurnContentBlock::ToolUse {
                         id: "toolu_fallback".into(),
                         name: "working_note".into(),
@@ -2707,6 +2750,7 @@ async fn tool_use_steer_before_dispatch_is_recorded_as_interrupted_skip() {
             response: ProviderResponse {
                 assistant_message: SessionTurnMessage {
                     role: "assistant".into(),
+                    provider_replay: None,
                     content: vec![SessionTurnContentBlock::ToolUse {
                         id: "toolu_steer".into(),
                         name: "working_note".into(),
@@ -3480,6 +3524,7 @@ async fn pre_provider_interrupt_writes_interrupted_journal_without_canonical_mes
             response: ProviderResponse {
                 assistant_message: SessionTurnMessage {
                     role: "assistant".into(),
+                    provider_replay: None,
                     content: vec![SessionTurnContentBlock::ToolUse {
                         id: "toolu_1".into(),
                         name: "working_note".into(),
@@ -3538,6 +3583,7 @@ async fn pre_provider_cancel_writes_cancelled_journal_without_canonical_messages
         response: ProviderResponse {
             assistant_message: SessionTurnMessage {
                 role: "assistant".into(),
+                provider_replay: None,
                 content: vec![SessionTurnContentBlock::ToolUse {
                     id: "toolu_1".into(),
                     name: "working_note".into(),
@@ -4283,6 +4329,7 @@ async fn compaction_summary_prefers_full_tool_results_when_request_fits() {
                 tool_use_id: "toolu_summary".into(),
                 content: raw_marker,
             }],
+            provider_replay: None,
         }],
         engine.compaction.tool_result_raw_max_chars,
     );
@@ -4398,6 +4445,7 @@ async fn compaction_summary_omits_only_large_tool_results_when_full_input_is_ove
                     tool_use_id: "toolu_large".into(),
                     content: format!("LARGE_SUMMARY_TOOL_RESULT_{}", "X".repeat(40_000)),
                 }],
+                provider_replay: None,
             },
             SessionTurnMessage {
                 role: "user".into(),
@@ -4405,6 +4453,7 @@ async fn compaction_summary_omits_only_large_tool_results_when_full_input_is_ove
                     tool_use_id: "toolu_small".into(),
                     content: "SMALL_SUMMARY_TOOL_RESULT".into(),
                 }],
+                provider_replay: None,
             },
         ],
         engine.compaction.tool_result_raw_max_chars,
@@ -4461,6 +4510,7 @@ async fn compaction_summary_falls_back_to_omitting_all_tool_results_before_provi
                 tool_use_id: "toolu_summary".into(),
                 content: raw_marker.clone(),
             }],
+            provider_replay: None,
         }],
         engine.compaction.tool_result_raw_max_chars,
     );
@@ -4851,8 +4901,15 @@ fn compaction_tail_keeps_recent_three_real_user_turns_with_tool_results() {
         ),
     ];
 
-    let tail_start =
-        select_compaction_summary_end_index(&messages, 0, messages.len(), usize::MAX, 3, 4096);
+    let tail_start = select_compaction_summary_end_index(
+        &messages,
+        0,
+        messages.len(),
+        usize::MAX,
+        3,
+        4096,
+        None,
+    );
 
     assert_eq!(tail_start, 2);
 }
@@ -4904,8 +4961,15 @@ fn compaction_tail_ignores_shell_command_user_records() {
         ),
     ];
 
-    let tail_start =
-        select_compaction_summary_end_index(&messages, 0, messages.len(), usize::MAX, 3, 4096);
+    let tail_start = select_compaction_summary_end_index(
+        &messages,
+        0,
+        messages.len(),
+        usize::MAX,
+        3,
+        4096,
+        None,
+    );
 
     assert_eq!(tail_start, 2);
 }
@@ -4927,8 +4991,15 @@ fn compaction_tail_default_can_keep_four_previous_real_user_turns() {
         })
         .collect::<Vec<_>>();
 
-    let tail_start =
-        select_compaction_summary_end_index(&messages, 0, messages.len(), usize::MAX, 4, 4096);
+    let tail_start = select_compaction_summary_end_index(
+        &messages,
+        0,
+        messages.len(),
+        usize::MAX,
+        4,
+        4096,
+        None,
+    );
 
     assert_eq!(tail_start, 2);
 }
@@ -4986,6 +5057,7 @@ fn compaction_tail_budget_estimates_large_tool_results_after_projection() {
         projected_tail_tokens,
         1,
         128,
+        None,
     );
 
     assert_eq!(tail_start, 2);
@@ -5061,6 +5133,7 @@ fn compaction_tail_does_not_noop_when_full_raw_tail_exceeds_budget() {
         projected_all_tokens,
         4,
         128,
+        None,
     );
 
     assert_eq!(tail_start, 4);
@@ -5074,6 +5147,7 @@ fn active_segments_do_not_cut_open_tool_use() {
         ),
         SessionTurnMessage {
             role: "assistant".into(),
+            provider_replay: None,
             content: vec![SessionTurnContentBlock::ToolUse {
                 id: "toolu_1".into(),
                 name: "file_read".into(),
@@ -5087,6 +5161,7 @@ fn active_segments_do_not_cut_open_tool_use() {
     let mut closed = active;
     closed.push(SessionTurnMessage {
         role: "user".into(),
+        provider_replay: None,
         content: vec![SessionTurnContentBlock::ToolResult {
             tool_use_id: "toolu_1".into(),
             content: "tool output".into(),
@@ -5105,6 +5180,7 @@ fn provider_projection_preserves_current_anchor_and_omits_large_tool_result_raw(
             SessionTurnMessage::assistant_text("earlier progress that is now summarized"),
             SessionTurnMessage {
                 role: "assistant".into(),
+                provider_replay: None,
                 content: vec![SessionTurnContentBlock::ToolUse {
                     id: "toolu_1".into(),
                     name: "code_run".into(),
@@ -5113,6 +5189,7 @@ fn provider_projection_preserves_current_anchor_and_omits_large_tool_result_raw(
             },
             SessionTurnMessage {
                 role: "user".into(),
+                provider_replay: None,
                 content: vec![SessionTurnContentBlock::ToolResult {
                     tool_use_id: "toolu_1".into(),
                     content: "A".repeat(128),
@@ -5147,6 +5224,8 @@ fn provider_projection_preserves_current_anchor_and_omits_large_tool_result_raw(
             tail_previous_real_user_turns: 4,
             tool_result_raw_max_chars: 16,
         },
+        ProviderHistoryMediaPolicy::Placeholder,
+        None,
     );
     let rendered = serde_json::to_string(&projection.messages).unwrap();
 
@@ -5169,6 +5248,7 @@ fn provider_projection_injects_active_progress_note_after_compaction() {
         SessionTurnMessage::user_text("create the file, then verify it once"),
         SessionTurnMessage {
             role: "assistant".into(),
+            provider_replay: None,
             content: vec![SessionTurnContentBlock::ToolUse {
                 id: "toolu_1".into(),
                 name: "code_run".into(),
@@ -5177,6 +5257,7 @@ fn provider_projection_injects_active_progress_note_after_compaction() {
         },
         SessionTurnMessage {
             role: "user".into(),
+            provider_replay: None,
             content: vec![SessionTurnContentBlock::ToolResult {
                 tool_use_id: "toolu_1".into(),
                 content: "CHAR_COUNT=20058\nLINE_COUNT=252\n".into(),
@@ -5213,6 +5294,8 @@ fn provider_projection_injects_active_progress_note_after_compaction() {
             tail_previous_real_user_turns: 4,
             tool_result_raw_max_chars: 4096,
         },
+        ProviderHistoryMediaPolicy::Placeholder,
+        None,
     );
 
     assert_eq!(projection.messages.len(), 2);
@@ -5237,6 +5320,7 @@ fn provider_projection_skips_active_segments_covered_by_cursor() {
         ),
         SessionTurnMessage {
             role: "assistant".into(),
+            provider_replay: None,
             content: vec![SessionTurnContentBlock::ToolUse {
                 id: "toolu_1".into(),
                 name: "file_read".into(),
@@ -5245,6 +5329,7 @@ fn provider_projection_skips_active_segments_covered_by_cursor() {
         },
         SessionTurnMessage {
             role: "user".into(),
+            provider_replay: None,
             content: vec![SessionTurnContentBlock::ToolResult {
                 tool_use_id: "toolu_1".into(),
                 content: "old output".into(),
@@ -5279,6 +5364,8 @@ fn provider_projection_skips_active_segments_covered_by_cursor() {
             tail_previous_real_user_turns: 4,
             tool_result_raw_max_chars: 4096,
         },
+        ProviderHistoryMediaPolicy::Placeholder,
+        None,
     );
     let rendered = serde_json::to_string(&projection.messages).unwrap();
 
@@ -5327,6 +5414,8 @@ fn provider_projection_ignores_active_summary_when_cursor_hash_mismatches() {
             tail_previous_real_user_turns: 4,
             tool_result_raw_max_chars: 4096,
         },
+        ProviderHistoryMediaPolicy::Placeholder,
+        None,
     );
     let rendered = serde_json::to_string(&projection.messages).unwrap();
 
@@ -5383,6 +5472,8 @@ async fn committed_compacted_context_projects_large_tool_results() {
         usize::MAX,
         4,
         128,
+        ProviderHistoryMediaPolicy::Placeholder,
+        None,
     )
     .unwrap();
     let rendered = serde_json::to_string(&history).unwrap();
@@ -5443,6 +5534,8 @@ async fn committed_compacted_context_preserves_recent_user_and_turn_end_answer()
         usize::MAX,
         1,
         128,
+        ProviderHistoryMediaPolicy::Placeholder,
+        None,
     )
     .unwrap();
     let rendered = serde_json::to_string(&history).unwrap();
@@ -5500,6 +5593,8 @@ fn provider_projection_prunes_committed_preserves_to_respect_global_hard_budget(
             tail_previous_real_user_turns: 1,
             tool_result_raw_max_chars: 4096,
         },
+        ProviderHistoryMediaPolicy::Placeholder,
+        None,
     );
     let rendered = serde_json::to_string(&projection.messages).unwrap();
 
@@ -6260,6 +6355,7 @@ async fn preflight_does_not_apply_compacted_tail_limit_before_auto_compaction() 
         SessionTurnMessage::user_text("continue the current task"),
         SessionTurnMessage {
             role: "assistant".into(),
+            provider_replay: None,
             content: vec![SessionTurnContentBlock::ToolUse {
                 id: "toolu_large".into(),
                 name: "code_run".into(),
@@ -6268,6 +6364,7 @@ async fn preflight_does_not_apply_compacted_tail_limit_before_auto_compaction() 
         },
         SessionTurnMessage {
             role: "user".into(),
+            provider_replay: None,
             content: vec![SessionTurnContentBlock::ToolResult {
                 tool_use_id: "toolu_large".into(),
                 content: "A".repeat(245_000),
@@ -6354,6 +6451,7 @@ async fn active_compaction_plan_uses_runtime_reserved_soft_budget() {
         vec![
             SessionTurnMessage {
                 role: "assistant".into(),
+                provider_replay: None,
                 content: vec![SessionTurnContentBlock::ToolUse {
                     id: format!("toolu_{id}"),
                     name: "code_run".into(),
@@ -6362,6 +6460,7 @@ async fn active_compaction_plan_uses_runtime_reserved_soft_budget() {
             },
             SessionTurnMessage {
                 role: "user".into(),
+                provider_replay: None,
                 content: vec![SessionTurnContentBlock::ToolResult {
                     tool_use_id: format!("toolu_{id}"),
                     content: fill.to_string().repeat(120),
@@ -6415,6 +6514,7 @@ fn active_compaction_keeps_delegation_management_io() {
     let messages = vec![
         SessionTurnMessage {
             role: "assistant".into(),
+            provider_replay: None,
             content: vec![SessionTurnContentBlock::ToolUse {
                 id: "toolu_deleg".into(),
                 name: "create_subagent".into(),
@@ -6426,6 +6526,7 @@ fn active_compaction_keeps_delegation_management_io() {
         },
         SessionTurnMessage {
             role: "user".into(),
+            provider_replay: None,
             content: vec![SessionTurnContentBlock::ToolResult {
                 tool_use_id: "toolu_deleg".into(),
                 content: json!({
@@ -6535,6 +6636,7 @@ async fn preflight_trigger_uses_in_turn_provider_context_anchor() {
         SessionTurnMessage::assistant_text("calling tool"),
         SessionTurnMessage {
             role: "user".into(),
+            provider_replay: None,
             content: vec![SessionTurnContentBlock::ToolResult {
                 tool_use_id: "tool_1".into(),
                 content: "tool output".into(),
@@ -6662,6 +6764,7 @@ async fn active_compaction_plan_preserves_latest_assistant_progress_raw() {
         SessionTurnMessage::user_text("current request"),
         SessionTurnMessage {
             role: "assistant".into(),
+            provider_replay: None,
             content: vec![SessionTurnContentBlock::ToolUse {
                 id: "toolu_1".into(),
                 name: "file_read".into(),
@@ -6670,6 +6773,7 @@ async fn active_compaction_plan_preserves_latest_assistant_progress_raw() {
         },
         SessionTurnMessage {
             role: "user".into(),
+            provider_replay: None,
             content: vec![SessionTurnContentBlock::ToolResult {
                 tool_use_id: "toolu_1".into(),
                 content: "A".repeat(1_024),
@@ -6851,4 +6955,322 @@ fn post_commit_cleanup_error_keeps_canonical_commit_classification() {
     assert!(!is_canonical_messages_committed_error(&anyhow::anyhow!(
         "provider failed before commit"
     )));
+}
+
+#[test]
+fn responses_history_preserves_uncompacted_media_and_replay() {
+    let mut assistant = test_message(
+        1,
+        SessionMessageRole::Assistant,
+        vec![SessionContentBlock::text("done")],
+    );
+    let replay_items = vec![json!({
+        "type": "reasoning",
+        "id": "rs_1",
+        "encrypted_content": "opaque-value",
+        "future_field": 7
+    })];
+    assistant.provider_replay = Some(ProviderReplayState::OpenAiResponses {
+        items: replay_items.clone(),
+    });
+    let messages = vec![
+        test_message(
+            0,
+            SessionMessageRole::User,
+            vec![
+                SessionContentBlock::image("image/png", "IMAGE_BASE64"),
+                SessionContentBlock::Document {
+                    media_type: "application/pdf".into(),
+                    data: "PDF_BASE64".into(),
+                    filename: Some("brief.pdf".into()),
+                },
+            ],
+        ),
+        assistant,
+    ];
+
+    let history = session_messages_to_provider_turn_messages(
+        messages,
+        ProviderHistoryMediaPolicy::Preserve,
+        Some(ProviderReplayProtocol::OpenAiResponses),
+    );
+
+    assert!(matches!(
+        history[0].content[0],
+        SessionTurnContentBlock::Image { .. }
+    ));
+    assert!(matches!(
+        history[0].content[1],
+        SessionTurnContentBlock::Document { .. }
+    ));
+    assert_eq!(
+        history[1].provider_replay,
+        Some(ProviderReplayState::OpenAiResponses {
+            items: replay_items
+        })
+    );
+}
+
+#[test]
+fn cross_protocol_history_drops_replay_before_budgeting_without_rewriting_session() {
+    let mut assistant = test_message(
+        1,
+        SessionMessageRole::Assistant,
+        vec![SessionContentBlock::text("visible answer")],
+    );
+    assistant.provider_replay = Some(ProviderReplayState::OpenAiResponses {
+        items: vec![json!({
+            "type": "reasoning",
+            "encrypted_content": "R".repeat(40_000)
+        })],
+    });
+
+    let canonical_history = session_messages_to_provider_turn_messages(
+        vec![assistant.clone()],
+        ProviderHistoryMediaPolicy::Placeholder,
+        None,
+    );
+    let responses_history = session_messages_to_provider_turn_messages(
+        vec![assistant.clone()],
+        ProviderHistoryMediaPolicy::Preserve,
+        Some(ProviderReplayProtocol::OpenAiResponses),
+    );
+
+    assert_eq!(canonical_history[0].provider_replay, None);
+    assert!(responses_history[0].provider_replay.is_some());
+    assert!(assistant.provider_replay.is_some());
+    assert!(
+        estimate_session_turn_messages_tokens(&responses_history)
+            > estimate_session_turn_messages_tokens(&canonical_history)
+    );
+
+    let persisted_messages = vec![
+        test_message(
+            0,
+            SessionMessageRole::User,
+            vec![SessionContentBlock::text("first request")],
+        ),
+        assistant.clone(),
+        test_message(
+            2,
+            SessionMessageRole::User,
+            vec![SessionContentBlock::text("latest request")],
+        ),
+        test_message(
+            3,
+            SessionMessageRole::Assistant,
+            vec![SessionContentBlock::text("latest answer")],
+        ),
+    ];
+    let canonical_tail_tokens =
+        estimated_session_message_tokens_projected(persisted_messages.iter(), None, None);
+    let responses_tail_tokens = estimated_session_message_tokens_projected(
+        persisted_messages.iter(),
+        None,
+        Some(ProviderReplayProtocol::OpenAiResponses),
+    );
+    assert!(responses_tail_tokens > canonical_tail_tokens);
+    assert_eq!(
+        select_compaction_summary_end_index(
+            &persisted_messages,
+            0,
+            persisted_messages.len(),
+            canonical_tail_tokens,
+            2,
+            4096,
+            None,
+        ),
+        0
+    );
+    assert_eq!(
+        select_compaction_summary_end_index(
+            &persisted_messages,
+            0,
+            persisted_messages.len(),
+            canonical_tail_tokens,
+            2,
+            4096,
+            Some(ProviderReplayProtocol::OpenAiResponses),
+        ),
+        2
+    );
+    assert!(assistant.provider_replay.is_some());
+}
+
+#[test]
+fn transcript_projection_drops_provider_replay() {
+    let mut message = test_message(
+        0,
+        SessionMessageRole::Assistant,
+        vec![SessionContentBlock::text("visible answer")],
+    );
+    message.provider_replay = Some(ProviderReplayState::OpenAiResponses {
+        items: vec![json!({
+            "type": "reasoning",
+            "encrypted_content": "must-not-leak"
+        })],
+    });
+
+    let history = session_messages_to_turn_messages(vec![message.clone()]);
+    let transcript = session_messages_to_turn_transcript(&[message]);
+
+    assert_eq!(history[0].provider_replay, None);
+    assert_eq!(transcript[0].content, "visible answer");
+    assert!(!transcript[0].content.contains("must-not-leak"));
+}
+
+#[test]
+fn compacted_prefix_drops_media_and_replay_while_suffix_preserves_them() {
+    let mut prefix_assistant = test_message(
+        1,
+        SessionMessageRole::Assistant,
+        vec![SessionContentBlock::text("old answer")],
+    );
+    prefix_assistant.provider_replay = Some(ProviderReplayState::OpenAiResponses {
+        items: vec![json!({"type":"reasoning","encrypted_content":"old-replay"})],
+    });
+    let mut suffix_assistant = test_message(
+        3,
+        SessionMessageRole::Assistant,
+        vec![SessionContentBlock::text("new answer")],
+    );
+    suffix_assistant.provider_replay = Some(ProviderReplayState::OpenAiResponses {
+        items: vec![json!({"type":"reasoning","encrypted_content":"new-replay"})],
+    });
+    let messages = vec![
+        test_message(
+            0,
+            SessionMessageRole::User,
+            vec![SessionContentBlock::image("image/png", "OLD_IMAGE")],
+        ),
+        prefix_assistant,
+        test_message(
+            2,
+            SessionMessageRole::User,
+            vec![SessionContentBlock::image("image/png", "NEW_IMAGE")],
+        ),
+        suffix_assistant,
+    ];
+    let state = SessionCompactionState::from_committed_summary(
+        2,
+        "old media turn summarized".into(),
+        Utc::now(),
+    );
+
+    let projection = project_provider_context(
+        "system",
+        &state,
+        &messages,
+        Vec::new(),
+        ActiveProjectionContext {
+            turn_id: "turn_1",
+            base_message_count: messages.len(),
+        },
+        ProviderProjectionBudget {
+            tail_token_limit: usize::MAX,
+            tail_hard_token_limit: usize::MAX,
+            tail_previous_real_user_turns: 0,
+            tool_result_raw_max_chars: 4096,
+        },
+        ProviderHistoryMediaPolicy::Preserve,
+        Some(ProviderReplayProtocol::OpenAiResponses),
+    );
+    let rendered = serde_json::to_string(&projection.messages).unwrap();
+
+    assert!(rendered.contains("old media turn summarized"));
+    assert!(!rendered.contains("OLD_IMAGE"));
+    assert!(!rendered.contains("old-replay"));
+    assert!(rendered.contains("NEW_IMAGE"));
+    assert!(rendered.contains("new-replay"));
+
+    let canonical_projection = project_provider_context(
+        "system",
+        &state,
+        &messages,
+        Vec::new(),
+        ActiveProjectionContext {
+            turn_id: "turn_2",
+            base_message_count: messages.len(),
+        },
+        ProviderProjectionBudget {
+            tail_token_limit: usize::MAX,
+            tail_hard_token_limit: usize::MAX,
+            tail_previous_real_user_turns: 0,
+            tool_result_raw_max_chars: 4096,
+        },
+        ProviderHistoryMediaPolicy::Placeholder,
+        None,
+    );
+    let canonical_rendered = serde_json::to_string(&canonical_projection.messages).unwrap();
+    assert!(!canonical_rendered.contains("new-replay"));
+    assert!(!canonical_rendered.contains("NEW_IMAGE"));
+    assert!(canonical_rendered.contains("image attachment media_type=image/png"));
+}
+
+#[test]
+fn active_compaction_hash_includes_provider_replay() {
+    let active = |encrypted_content: &str| {
+        vec![
+            SessionTurnMessage::user_text("run tool"),
+            SessionTurnMessage {
+                role: "assistant".into(),
+                provider_replay: Some(ProviderReplayState::OpenAiResponses {
+                    items: vec![json!({
+                        "type": "reasoning",
+                        "encrypted_content": encrypted_content
+                    })],
+                }),
+                content: vec![SessionTurnContentBlock::ToolUse {
+                    id: "call_1".into(),
+                    name: "file_read".into(),
+                    input: json!({"path":"README.md"}),
+                }],
+            },
+            SessionTurnMessage {
+                role: "user".into(),
+                provider_replay: None,
+                content: vec![SessionTurnContentBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: "done".into(),
+                }],
+            },
+        ]
+    };
+    let first = active("first");
+    let second = active("second");
+    let segments = active_provider_safe_segments(&first);
+
+    assert_ne!(
+        active_segments_hash(&first, &segments).unwrap(),
+        active_segments_hash(&second, &segments).unwrap()
+    );
+}
+
+#[test]
+fn persisted_compaction_estimate_counts_provider_replay() {
+    let canonical = test_message(
+        0,
+        SessionMessageRole::Assistant,
+        vec![SessionContentBlock::text("visible answer")],
+    );
+    let mut replay = canonical.clone();
+    replay.provider_replay = Some(ProviderReplayState::OpenAiResponses {
+        items: vec![json!({
+            "type": "reasoning",
+            "encrypted_content": "R".repeat(4_000)
+        })],
+    });
+
+    let canonical_tokens = estimated_session_message_tokens_projected(
+        [&canonical],
+        None,
+        Some(ProviderReplayProtocol::OpenAiResponses),
+    );
+    let replay_tokens = estimated_session_message_tokens_projected(
+        [&replay],
+        None,
+        Some(ProviderReplayProtocol::OpenAiResponses),
+    );
+
+    assert!(replay_tokens > canonical_tokens);
 }

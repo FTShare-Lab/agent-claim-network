@@ -78,10 +78,10 @@ agent_id = "agent-a"
 
 ### `[agent.llm]`
 
-- `provider`：agent 主对话 LLM provider。当前支持 `anthropic`、`openai_compatible_chat`。
-- `endpoint`：与所选 provider 兼容的 LLM HTTP 地址，必须是绝对 HTTP(S) URL。可以填写服务 base URL，也可以填写完整请求 URL；OpenAI-compatible 的常见 base URL 形如 `https://llm.example.com/v1`，Anthropic-compatible 的常见 base URL 形如 `https://llm.example.com`。
+- `provider`：agent 主对话 LLM provider。当前支持 `anthropic`、`openai_compatible_chat`、`openai_compatible_responses`。Chat 与 Responses 是彼此独立的 wire protocol，ACN 不在两者之间自动降级。
+- `endpoint`：与所选 provider 兼容的 LLM HTTP 地址，必须是绝对 HTTP(S) URL。可以填写服务 base URL，也可以填写完整请求 URL；OpenAI-compatible 的常见 base URL 形如 `https://llm.example.com/v1`，Anthropic-compatible 的常见 base URL 形如 `https://llm.example.com`。根 URL 会分别补全为 `/v1/chat/completions`、`/v1/responses` 或 `/v1/messages`；已有路径的 base URL 会追加相应末段，完整请求 URL 保持不变。
 - `model`：模型名，以配置文件为准。
-- `reasoning_effort`：控制 agent 主 LLM 的推理强度，可选值为 `none`、`low`、`medium`、`high`、`xhigh`、`max`，未配置时默认 `none`。未配置或设为 `none` 时不发送推理强度参数；其余值在 `provider = "openai_compatible_chat"` 时作为顶层 `reasoning_effort` 发送，在 `provider = "anthropic"` 时作为 `output_config.effort` 发送。ACN 不判断上游或具体模型是否支持该值，不支持时保留上游原始报错。该配置不改变 thinking / `reasoning_content` 的解析或历史回传行为。
+- `reasoning_effort`：控制 agent 主 LLM 的推理强度，可选值为 `none`、`low`、`medium`、`high`、`xhigh`、`max`，未配置时默认 `none`。未配置或设为 `none` 时不发送推理强度参数。
 - `api_key_env`：读取 agent LLM API key 的环境变量名，默认空字符串；真实 provider 必须填写。
 - `max_tokens`：单次模型响应的最大输出 token 数，默认 `65536`。
 - `context_window`：模型上下文窗口 token 数，默认 `200000`，必须大于 0。用于 TUI ctx 总量展示以及自动压缩阈值计算。

@@ -78,6 +78,7 @@ TUI 退出非空 session 时，可将 finalize job 交给独立 supervisor。Sup
 
 - Anthropic Messages
 - OpenAI-compatible Chat Completions
+- OpenAI-compatible Responses（HTTP SSE/JSON，`store = false`）
 
 普通 turn、compact、finalize recap、inbox 内化和 memory review 共享 provider-neutral DTO，但使用各自的 prompt 和工具权限。
 

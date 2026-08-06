@@ -318,11 +318,24 @@ pub enum SessionTurnEvent {
     },
 }
 
-/// Anthropic Messages API 对齐的 session message。
+/// provider 私有、只用于同协议历史重放的完整状态。
+///
+/// 该状态不参与 transcript、Memory 或跨协议语义投影；未知 item 字段通过
+/// `serde_json::Value` 原样保存，避免协议适配层丢失 reasoning 等连续性信息。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "protocol", rename_all = "snake_case")]
+pub enum ProviderReplayState {
+    #[serde(rename = "openai_responses")]
+    OpenAiResponses { items: Vec<Value> },
+}
+
+/// provider-neutral session message。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTurnMessage {
     pub role: String,
     pub content: Vec<SessionTurnContentBlock>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_replay: Option<ProviderReplayState>,
 }
 
 impl SessionTurnMessage {
@@ -330,6 +343,7 @@ impl SessionTurnMessage {
         Self {
             role: "user".into(),
             content: vec![SessionTurnContentBlock::text(text)],
+            provider_replay: None,
         }
     }
 
@@ -337,6 +351,7 @@ impl SessionTurnMessage {
         Self {
             role: "user".into(),
             content,
+            provider_replay: None,
         }
     }
 
@@ -344,7 +359,18 @@ impl SessionTurnMessage {
         Self {
             role: "assistant".into(),
             content: vec![SessionTurnContentBlock::text(text)],
+            provider_replay: None,
         }
+    }
+
+    pub fn with_provider_replay(mut self, provider_replay: ProviderReplayState) -> Self {
+        self.provider_replay = Some(provider_replay);
+        self
+    }
+
+    pub fn without_provider_replay(mut self) -> Self {
+        self.provider_replay = None;
+        self
     }
 }
 

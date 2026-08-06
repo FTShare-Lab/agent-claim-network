@@ -23,11 +23,12 @@ use super::user_shell::{
 };
 use crate::api::{
     ensure_compaction_request_within_context_window, estimate_session_turn_messages_tokens,
-    project_compaction_input_media, AgentTurnLoop, ContextUsageSnapshot, ContextUsageSource,
-    InboxInternalizeKind, InternalizeRequest, MemoryReviewLoop, SessionAttachment,
-    SessionCompactionOutcome, SessionTurn, SessionTurnEvent, SessionTurnEventRecorder,
-    SessionTurnInterrupted, SessionTurnMessage, SessionTurnPreflight, SessionTurnRequest,
-    StructuredJsonAttemptRequest, StructuredJsonCaller, ToolBoundaryControl, TurnMessage,
+    project_compaction_input_media, project_turn_message_for_safe_transcript, AgentTurnLoop,
+    ContextUsageSnapshot, ContextUsageSource, InboxInternalizeKind, InternalizeRequest,
+    MemoryReviewLoop, SessionAttachment, SessionCompactionOutcome, SessionTurn, SessionTurnEvent,
+    SessionTurnEventRecorder, SessionTurnInterrupted, SessionTurnMessage, SessionTurnPreflight,
+    SessionTurnRequest, StructuredJsonAttemptRequest, StructuredJsonCaller, ToolBoundaryControl,
+    TurnMessage,
 };
 use crate::claim::{AgentId, Claim, ClaimId, DisputeId, SessionId, SourceId, TraceId};
 use crate::config::{
@@ -1193,7 +1194,11 @@ impl SessionEngine {
     fn estimated_message_tokens<'a>(
         messages: impl IntoIterator<Item = &'a SessionMessage>,
     ) -> usize {
-        estimated_session_message_tokens_projected(messages, None)
+        estimated_session_message_tokens_projected(
+            messages,
+            None,
+            Some(crate::api::ProviderReplayProtocol::OpenAiResponses),
+        )
     }
 
     #[cfg(test)]
@@ -1201,7 +1206,11 @@ impl SessionEngine {
         messages: impl IntoIterator<Item = &'a SessionMessage>,
         tool_result_raw_max_chars: usize,
     ) -> usize {
-        estimated_session_message_tokens_projected(messages, Some(tool_result_raw_max_chars))
+        estimated_session_message_tokens_projected(
+            messages,
+            Some(tool_result_raw_max_chars),
+            Some(crate::api::ProviderReplayProtocol::OpenAiResponses),
+        )
     }
 
     fn compaction_summary_end_index(
@@ -1232,6 +1241,7 @@ impl SessionEngine {
             tail_token_limit,
             self.compaction.tail_previous_real_user_turns,
             self.compaction.tool_result_raw_max_chars,
+            self.turn_loop.history_replay_protocol(),
         )
     }
 
@@ -1348,6 +1358,8 @@ impl SessionEngine {
             active_suffix.to_vec(),
             active_context,
             budget,
+            self.turn_loop.history_media_policy(),
+            self.turn_loop.history_replay_protocol(),
         )
     }
 
@@ -1360,8 +1372,12 @@ impl SessionEngine {
         audit_id: Option<&str>,
     ) -> anyhow::Result<ProviderProjection> {
         let raw_tail_tokens_before = estimate_session_turn_messages_tokens(&projection.messages);
-        let externalized =
-            externalize_heavy_user_blocks(projection, &session.paths.compaction_assets_dir).await;
+        let externalized = externalize_heavy_user_blocks(
+            projection,
+            &session.paths.compaction_assets_dir,
+            self.turn_loop.history_media_policy(),
+        )
+        .await;
         let raw_tail_tokens_after =
             estimate_session_turn_messages_tokens(&externalized.projection.messages);
         if let Some(audit_id) = audit_id {
@@ -2653,6 +2669,8 @@ impl SessionEngine {
             self.compaction_hard_tail_token_limit(),
             self.compaction.tail_previous_real_user_turns,
             self.compaction.tool_result_raw_max_chars,
+            self.turn_loop.history_media_policy(),
+            self.turn_loop.history_replay_protocol(),
         )?;
         let active_start_index = history.len();
         let turn_id_for_tools = request.turn_id.clone();
@@ -2835,6 +2853,8 @@ impl SessionEngine {
             self.compaction_hard_tail_token_limit(),
             self.compaction.tail_previous_real_user_turns,
             self.compaction.tool_result_raw_max_chars,
+            self.turn_loop.history_media_policy(),
+            self.turn_loop.history_replay_protocol(),
         )?;
         if let Some(projection) = delegation_summary_projection(&session.paths.dir).await? {
             history.push(SessionTurnMessage::user_text(projection));
@@ -3063,6 +3083,8 @@ impl SessionEngine {
                 active_suffix,
                 active_context,
                 projection_budget,
+                self.turn_loop.history_media_policy(),
+                self.turn_loop.history_replay_protocol(),
             )
         });
         log::info!(
@@ -3384,6 +3406,12 @@ impl SessionEngine {
             plan.committed_transcript.is_some(),
             plan.active_turn.is_some(),
         );
+        let active_turn_user_anchor = plan
+            .active_turn
+            .as_ref()
+            .and_then(|_| active_suffix.first())
+            .cloned()
+            .map(project_turn_message_for_safe_transcript);
         let summary_inputs = CompactionSummaryInputs {
             audit: CompactionAuditSummaryContext {
                 trigger: CompactionAuditTrigger::AutoPreflight,
@@ -3409,10 +3437,7 @@ impl SessionEngine {
                 .committed_transcript_with_tool_results_omitted
                 .as_deref(),
             prior_active_turn_summary: prior_active_summary.as_deref(),
-            active_turn_user_anchor: plan
-                .active_turn
-                .as_ref()
-                .and_then(|_| active_suffix.first()),
+            active_turn_user_anchor: active_turn_user_anchor.as_ref(),
             active_turn_start_segment: plan
                 .active_turn
                 .as_ref()

@@ -102,6 +102,7 @@ impl MemoryReviewLoop {
             }
             messages.push(SessionTurnMessage {
                 role: "user".into(),
+                provider_replay: None,
                 content: tool_results,
             });
         }
@@ -258,6 +259,7 @@ mod tests {
                 ProviderResponse {
                     assistant_message: SessionTurnMessage {
                         role: "assistant".into(),
+                        provider_replay: None,
                         content: vec![SessionTurnContentBlock::ToolUse {
                             id: "toolu_file_1".into(),
                             name: "file_read".into(),

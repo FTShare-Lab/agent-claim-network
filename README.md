@@ -56,7 +56,7 @@
 - `/exit` 后复盘进后台，终端马上归还
 - 子代理可并行干活：创建、等待、插话、看进度都在 TUI 里
 - 支持 MCP（stdio / Streamable HTTP，进程内共享连接）和 Skill（`/技能名` 显式注入）
-- 主对话支持 Anthropic 与 OpenAI-compatible；流式中断会自动改走非流式重试
+- 主对话支持 Anthropic Messages、OpenAI-compatible Chat Completions 与 Responses；流式中断会自动改走同协议非流式重试
 
 更详细的交互说明见 [使用指南](docs/user_guide.md)。
 
@@ -149,6 +149,22 @@ api_key_env = "ACN_LLM_API_KEY"
 ```
 
 `reasoning_effort` 会按协议字段发出去；ACN 不检查模型是否真支持。
+
+</details>
+
+<details>
+<summary><b>改用 Responses 协议</b></summary>
+
+```toml
+[agent.llm]
+provider = "openai_compatible_responses"
+endpoint = "https://your-llm-endpoint/v1"
+model = "your-model"
+reasoning_effort = "none"                # none | low | medium | high | xhigh | max
+api_key_env = "ACN_LLM_API_KEY"
+```
+
+Responses provider 使用 HTTP SSE/JSON 和本地 `store = false` 会话状态。非 `none` 的 `reasoning_effort` 会作为 `reasoning.effort` 发送；返回的 reasoning item 会保存在私有 session 中并在后续 Responses 请求原样回传，但当前 TUI 不展示 Reasoning。该 provider 不会在失败时自动切换到 Chat Completions。
 
 </details>
 

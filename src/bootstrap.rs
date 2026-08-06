@@ -23,8 +23,8 @@ use crate::agent::{
 };
 use crate::api::{
     build_embedding_client, AgentTurnLoop, AnthropicProviderAdapter, MemoryReviewLoop,
-    OpenAiCompatibleChatProviderAdapter, ProviderAdapter, StructuredJsonCaller,
-    MEMORY_REVIEW_MAX_TOOL_LOOP_TURNS,
+    OpenAiCompatibleChatProviderAdapter, OpenAiCompatibleResponsesProviderAdapter, ProviderAdapter,
+    StructuredJsonCaller, MEMORY_REVIEW_MAX_TOOL_LOOP_TURNS,
 };
 use crate::attachment::AttachmentLimits;
 use crate::claim::AgentId;
@@ -285,6 +285,24 @@ pub(crate) fn build_provider_adapter(cfg: &Config) -> anyhow::Result<Arc<dyn Pro
                 .with_context(|| missing_loaded_api_key_message(chat))?;
             Ok(Arc::new(
                 OpenAiCompatibleChatProviderAdapter::new(
+                    key,
+                    chat.endpoint.clone(),
+                    chat.model.clone(),
+                    Duration::from_secs(chat.timeout_secs),
+                    chat.retry_count,
+                    Duration::from_millis(chat.retry_base_delay_ms),
+                    Duration::from_millis(chat.retry_max_delay_ms),
+                )?
+                .with_reasoning_effort(chat.reasoning_effort),
+            ))
+        }
+        LlmProvider::OpenAiCompatibleResponses => {
+            let key = chat
+                .api_key
+                .clone()
+                .with_context(|| missing_loaded_api_key_message(chat))?;
+            Ok(Arc::new(
+                OpenAiCompatibleResponsesProviderAdapter::new(
                     key,
                     chat.endpoint.clone(),
                     chat.model.clone(),
@@ -733,6 +751,29 @@ mod tests {
     }
 
     #[test]
+    fn openai_compatible_responses_provider_builds_http_cli_session_engine() {
+        let team = tempfile::tempdir().unwrap();
+        let hosts = tempfile::tempdir().unwrap();
+        let prompts = tempfile::tempdir().unwrap();
+        write_session_prompts(prompts.path());
+        let mut c = cfg(
+            team.path().to_path_buf(),
+            hosts.path().to_path_buf(),
+            prompts.path().to_path_buf(),
+        );
+        c.agent.llm.provider = LlmProvider::OpenAiCompatibleResponses;
+        c.agent.llm.api_key_env = "EXAMPLE_LLM_API_KEY".into();
+        c.agent.llm.api_key = Some("test-key".into());
+        c.agent.llm.endpoint = "http://127.0.0.1:1/v1".into();
+        c.agent.llm.model = "test-responses-model".into();
+
+        let upstream = c.resolve_upstream(None).unwrap();
+        let engine = build_agent_cli_session_engine(&c, &upstream);
+
+        assert!(engine.is_ok());
+    }
+
+    #[test]
     fn provider_rejects_invalid_endpoint_at_build() {
         let team = tempfile::tempdir().unwrap();
         let hosts = tempfile::tempdir().unwrap();
@@ -750,6 +791,7 @@ mod tests {
                 LlmProvider::OpenAiCompatibleChat,
                 "Chat Completions endpoint",
             ),
+            (LlmProvider::OpenAiCompatibleResponses, "Responses endpoint"),
         ] {
             c.agent.llm.provider = provider;
             c.agent.llm.endpoint = "llm.example.com/v1".into();

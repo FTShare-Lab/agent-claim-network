@@ -816,6 +816,8 @@ pub enum LlmProvider {
     Anthropic,
     #[serde(rename = "openai_compatible_chat")]
     OpenAiCompatibleChat,
+    #[serde(rename = "openai_compatible_responses")]
+    OpenAiCompatibleResponses,
 }
 
 /// router retrieval 的开关与 top-N 参数。
@@ -3078,6 +3080,21 @@ router_endpoint = "http://127.0.0.1:8061"
     }
 
     #[test]
+    fn openai_compatible_responses_provider_is_accepted() {
+        let raw = minimal_config_without_optional_defaults().replace(
+            r#"provider = "anthropic""#,
+            r#"provider = "openai_compatible_responses""#,
+        );
+
+        let cfg = parse_and_validate(&raw).unwrap();
+
+        assert_eq!(
+            cfg.agent.llm.provider,
+            LlmProvider::OpenAiCompatibleResponses
+        );
+    }
+
+    #[test]
     fn reasoning_effort_accepts_supported_values_and_rejects_unknown_value() {
         for (raw, expected) in [
             ("none", ReasoningEffort::None),
@@ -3603,6 +3620,18 @@ acn_key_env = "DEMO_ACN_AUTH_KEY""#,
             .replace(
                 r#"api_key_env = "PATH""#,
                 r#"api_key_env = "EXAMPLE_LLM_API_KEY""#,
+            )
+    }
+
+    fn openai_compatible_responses_config_raw() -> String {
+        openai_compatible_chat_config_raw()
+            .replace(
+                r#"provider = "openai_compatible_chat""#,
+                r#"provider = "openai_compatible_responses""#,
+            )
+            .replace(
+                r#"model = "example-chat-model""#,
+                r#"model = "example-responses-model""#,
             )
     }
 
@@ -4153,6 +4182,22 @@ router_endpoint = "http://router.example"
         let cfg = Config::load(&path).unwrap();
 
         assert_eq!(cfg.agent.llm.provider, LlmProvider::OpenAiCompatibleChat);
+        assert_eq!(cfg.agent.llm.api_key_env, "EXAMPLE_LLM_API_KEY");
+        assert_eq!(cfg.agent.llm.api_key.as_deref(), Some("example-key"));
+    }
+
+    #[test]
+    fn openai_compatible_responses_provider_reads_configured_api_key_env() {
+        let env = EnvGuard::clean(LLM_ENV_KEYS);
+        env.set("EXAMPLE_LLM_API_KEY", "example-key");
+        let (_dir, path) = write_config(&openai_compatible_responses_config_raw());
+
+        let cfg = Config::load(&path).unwrap();
+
+        assert_eq!(
+            cfg.agent.llm.provider,
+            LlmProvider::OpenAiCompatibleResponses
+        );
         assert_eq!(cfg.agent.llm.api_key_env, "EXAMPLE_LLM_API_KEY");
         assert_eq!(cfg.agent.llm.api_key.as_deref(), Some("example-key"));
     }

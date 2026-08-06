@@ -252,6 +252,7 @@ mod tests {
             ],
             created_at: Utc::now(),
             model: "test-model".into(),
+            provider_replay: None,
         };
         let text = searchable_texts_for_messages(&[message]).remove(0);
         assert!(text.contains("[image attachment media_type=image/png"));
@@ -270,6 +271,7 @@ mod tests {
             ],
             created_at: Utc::now(),
             model: "test-model".into(),
+            provider_replay: None,
         };
         let text = searchable_texts_for_messages(&[message]).remove(0);
         assert!(text.contains("hello"));
@@ -289,6 +291,7 @@ mod tests {
                 )],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 1,
@@ -296,6 +299,7 @@ mod tests {
                 content: vec![SessionContentBlock::tool_result("toolu_1", "docker clue")],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
         ];
 
@@ -317,6 +321,7 @@ mod tests {
                 )],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 1,
@@ -324,6 +329,7 @@ mod tests {
                 content: vec![SessionContentBlock::tool_result("toolu_1", "long output")],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
         ];
         let tool_names = tool_name_map(&messages);
@@ -346,6 +352,7 @@ mod tests {
                 content: vec![SessionContentBlock::text("   ")],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 1,
@@ -353,6 +360,7 @@ mod tests {
                 content: vec![SessionContentBlock::text("useful preview")],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
         ];
 
@@ -372,6 +380,7 @@ mod tests {
                 ],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 1,
@@ -379,6 +388,7 @@ mod tests {
                 content: vec![SessionContentBlock::text("real user preview")],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
         ];
 

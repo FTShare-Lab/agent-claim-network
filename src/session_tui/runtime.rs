@@ -1120,6 +1120,7 @@ mod tests {
             content: vec![SessionContentBlock::text("old session")],
             created_at: Utc::now(),
             model: "test-model".into(),
+            provider_replay: None,
         }];
 
         assert_eq!(
@@ -1149,6 +1150,7 @@ mod tests {
                 ],
                 created_at: now,
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 1,
@@ -1156,6 +1158,7 @@ mod tests {
                 content: vec![SessionContentBlock::text("已检查")],
                 created_at: now,
                 model: "test-model".into(),
+                provider_replay: None,
             },
         ];
         let journal_read = TurnJournalRead {
@@ -1223,6 +1226,7 @@ mod tests {
             ],
             created_at: now,
             model: "test-model".into(),
+            provider_replay: None,
         };
         let assistant = |index| SessionMessage {
             index,
@@ -1230,6 +1234,7 @@ mod tests {
             content: vec![SessionContentBlock::text("完成")],
             created_at: now,
             model: "test-model".into(),
+            provider_replay: None,
         };
         let messages = vec![
             user(0, "first"),
@@ -1334,6 +1339,7 @@ mod tests {
                 content: vec![SessionContentBlock::text(stored_text)],
                 created_at: now,
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 1,
@@ -1341,6 +1347,7 @@ mod tests {
                 content: vec![SessionContentBlock::text("已检查目录")],
                 created_at: now,
                 model: "test-model".into(),
+                provider_replay: None,
             },
         ];
         let journal_read = TurnJournalRead {
@@ -1403,6 +1410,7 @@ mod tests {
             content: vec![SessionContentBlock::text(text)],
             created_at: now,
             model: "test-model".into(),
+            provider_replay: None,
         };
         let messages = vec![
             message(0, SessionMessageRole::User, "仅存在于 canonical 的请求"),
@@ -1502,6 +1510,7 @@ mod tests {
                 content: vec![SessionContentBlock::text(request.clone())],
                 created_at: now,
                 model: "test-model".into(),
+                provider_replay: None,
             });
             messages.push(SessionMessage {
                 index: message_index.saturating_add(1),
@@ -1509,6 +1518,7 @@ mod tests {
                 content: vec![SessionContentBlock::text(response.clone())],
                 created_at: now,
                 model: "test-model".into(),
+                provider_replay: None,
             });
 
             let turn_id = format!("turn_{turn_number}");
@@ -1571,6 +1581,7 @@ mod tests {
                 content: vec![SessionContentBlock::text("request")],
                 created_at: now,
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 1,
@@ -1578,6 +1589,7 @@ mod tests {
                 content: vec![SessionContentBlock::text("partial response")],
                 created_at: now,
                 model: "test-model".into(),
+                provider_replay: None,
             },
         ];
         let journal_read = TurnJournalRead {
@@ -1909,6 +1921,7 @@ mod tests {
             content: vec![SessionContentBlock::text(text)],
             created_at: now,
             model: "test-model".into(),
+            provider_replay: None,
         };
         let messages = vec![
             message(0, SessionMessageRole::User, "first"),

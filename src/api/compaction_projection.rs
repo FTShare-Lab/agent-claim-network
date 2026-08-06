@@ -102,6 +102,7 @@ pub(crate) fn omit_turn_messages_tool_results(
 pub(crate) fn project_compaction_input_media(
     mut message: SessionTurnMessage,
 ) -> SessionTurnMessage {
+    message.provider_replay = None;
     for block in &mut message.content {
         let omission = match block {
             SessionTurnContentBlock::Image { media_type, data } => Some(
@@ -176,6 +177,59 @@ fn bounded_media_metadata(value: &str) -> String {
         .chars()
         .take(COMPACTION_MEDIA_METADATA_MAX_CHARS)
         .map(|ch| if ch.is_control() { '�' } else { ch })
+        .collect()
+}
+
+/// 把 provider message 投影为可进入摘要、审计和可读 transcript 的 canonical 形态。
+/// provider replay 只服务同协议请求；媒体在这些派生路径中只保留不可逆占位信息。
+pub fn project_turn_message_for_safe_transcript(
+    mut message: SessionTurnMessage,
+) -> SessionTurnMessage {
+    message.provider_replay = None;
+    message.content = message
+        .content
+        .into_iter()
+        .map(|block| match block {
+            SessionTurnContentBlock::Image { media_type, data } => {
+                let media_type = bounded_media_metadata(&media_type);
+                SessionTurnContentBlock::text(format!(
+                    "[image attachment media_type={media_type} base64_bytes={}]",
+                    data.len()
+                ))
+            }
+            SessionTurnContentBlock::Document {
+                media_type,
+                data,
+                filename,
+            } => {
+                let media_type = bounded_media_metadata(&media_type);
+                let text = match filename {
+                    Some(filename) => {
+                        let filename = bounded_media_metadata(&filename);
+                        format!(
+                            "[document attachment media_type={media_type} filename={filename} base64_bytes={}]",
+                            data.len()
+                        )
+                    }
+                    None => format!(
+                        "[document attachment media_type={media_type} base64_bytes={}]",
+                        data.len()
+                    ),
+                };
+                SessionTurnContentBlock::text(text)
+            }
+            other => other,
+        })
+        .collect();
+    message
+}
+
+pub fn project_turn_messages_for_safe_transcript(
+    messages: impl IntoIterator<Item = SessionTurnMessage>,
+) -> Vec<SessionTurnMessage> {
+    messages
+        .into_iter()
+        .map(project_turn_message_for_safe_transcript)
         .collect()
 }
 
@@ -324,7 +378,10 @@ fn stable_hash_update(hash: &mut u64, bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
+    use crate::api::ProviderReplayState;
 
     fn tool_result(content: &str) -> SessionTurnMessage {
         SessionTurnMessage {
@@ -333,6 +390,7 @@ mod tests {
                 tool_use_id: "toolu_1".into(),
                 content: content.into(),
             }],
+            provider_replay: None,
         }
     }
 
@@ -363,17 +421,26 @@ mod tests {
 
     #[test]
     fn compaction_media_projection_replaces_payloads_with_bounded_metadata() {
-        let projected = project_compaction_input_media(SessionTurnMessage::user_content(vec![
-            SessionTurnContentBlock::image("image/png", "IMAGE_BASE64_PAYLOAD"),
-            SessionTurnContentBlock::document_named(
-                "application/pdf",
-                "DOCUMENT_BASE64_PAYLOAD",
-                format!("{}\nignored", "report".repeat(40)),
-            ),
-            SessionTurnContentBlock::text("keep me"),
-        ]));
+        let projected = project_compaction_input_media(
+            SessionTurnMessage::user_content(vec![
+                SessionTurnContentBlock::image("image/png", "IMAGE_BASE64_PAYLOAD"),
+                SessionTurnContentBlock::document_named(
+                    "application/pdf",
+                    "DOCUMENT_BASE64_PAYLOAD",
+                    format!("{}\nignored", "report".repeat(40)),
+                ),
+                SessionTurnContentBlock::text("keep me"),
+            ])
+            .with_provider_replay(ProviderReplayState::OpenAiResponses {
+                items: vec![json!({
+                    "type": "reasoning",
+                    "encrypted_content": "REPLAY_PAYLOAD"
+                })],
+            }),
+        );
 
         let serialized = serde_json::to_string(&projected).expect("serialize projection");
+        assert_eq!(projected.provider_replay, None);
         assert!(serialized.contains("image omitted from compaction summary input"));
         assert!(serialized.contains("media_type=image/png"));
         assert!(serialized.contains("base64_chars=20"));
@@ -383,6 +450,7 @@ mod tests {
         assert!(!serialized.contains("ignored"));
         assert!(!serialized.contains("IMAGE_BASE64_PAYLOAD"));
         assert!(!serialized.contains("DOCUMENT_BASE64_PAYLOAD"));
+        assert!(!serialized.contains("REPLAY_PAYLOAD"));
         assert!(serialized.contains("keep me"));
     }
 
@@ -434,5 +502,31 @@ mod tests {
 
         ensure_compaction_request_within_context_window("system", &messages, 200_000, 65_536)
             .expect("ordinary long ASCII compaction input should remain usable");
+    }
+
+    #[test]
+    fn safe_transcript_projection_drops_replay_and_raw_media() {
+        let message = SessionTurnMessage::user_content(vec![
+            SessionTurnContentBlock::text("inspect attachments"),
+            SessionTurnContentBlock::image("image/png", "RAW_IMAGE"),
+            SessionTurnContentBlock::Document {
+                media_type: "application/pdf".into(),
+                data: "RAW_PDF".into(),
+                filename: Some("brief.pdf".into()),
+            },
+        ])
+        .with_provider_replay(ProviderReplayState::OpenAiResponses {
+            items: vec![json!({"type":"reasoning","encrypted_content":"RAW_REPLAY"})],
+        });
+
+        let projected = project_turn_message_for_safe_transcript(message);
+        let rendered = serde_json::to_string(&projected).unwrap();
+
+        assert_eq!(projected.provider_replay, None);
+        assert!(!rendered.contains("RAW_IMAGE"));
+        assert!(!rendered.contains("RAW_PDF"));
+        assert!(!rendered.contains("RAW_REPLAY"));
+        assert!(rendered.contains("image attachment media_type=image/png"));
+        assert!(rendered.contains("filename=brief.pdf"));
     }
 }

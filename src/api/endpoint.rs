@@ -5,6 +5,7 @@ use reqwest::Url;
 #[derive(Debug, Clone, Copy)]
 pub(super) enum LlmEndpointKind {
     OpenAiChatCompletions,
+    OpenAiResponses,
     AnthropicMessages,
 }
 
@@ -48,6 +49,9 @@ pub(super) fn resolve_llm_endpoint(
         LlmEndpointKind::OpenAiChatCompletions if path.ends_with("/chat/completions") => &[][..],
         LlmEndpointKind::OpenAiChatCompletions if path == "/" => &["v1", "chat", "completions"][..],
         LlmEndpointKind::OpenAiChatCompletions => &["chat", "completions"][..],
+        LlmEndpointKind::OpenAiResponses if path.ends_with("/responses") => &[][..],
+        LlmEndpointKind::OpenAiResponses if path == "/" => &["v1", "responses"][..],
+        LlmEndpointKind::OpenAiResponses => &["responses"][..],
         LlmEndpointKind::AnthropicMessages if path.ends_with("/v1/messages") => &[][..],
         LlmEndpointKind::AnthropicMessages if path.ends_with("/v1") => &["messages"][..],
         LlmEndpointKind::AnthropicMessages => &["v1", "messages"][..],
@@ -158,6 +162,42 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(
                 resolve_llm_endpoint(input, LlmEndpointKind::AnthropicMessages).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn resolves_openai_responses_endpoint() {
+        let cases = [
+            (
+                "https://llm.example.com",
+                "https://llm.example.com/v1/responses",
+            ),
+            (
+                "https://llm.example.com/v1",
+                "https://llm.example.com/v1/responses",
+            ),
+            (
+                "https://llm.example.com/proxy/v2/",
+                "https://llm.example.com/proxy/v2/responses",
+            ),
+            (
+                "https://llm.example.com/v1/responses/",
+                "https://llm.example.com/v1/responses",
+            ),
+            (
+                "https://llm.example.com/v1/responses?api-version=2026-01-01",
+                "https://llm.example.com/v1/responses?api-version=2026-01-01",
+            ),
+            (
+                "https://llm.example.com?api-version=2026-01-01",
+                "https://llm.example.com/v1/responses?api-version=2026-01-01",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                resolve_llm_endpoint(input, LlmEndpointKind::OpenAiResponses).unwrap(),
                 expected
             );
         }

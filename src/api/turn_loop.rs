@@ -22,10 +22,10 @@ use tokio::time::Instant;
 
 use crate::api::{
     estimate_provider_request_context_tokens, CompletedSessionTurnMessage, ContextUsageSnapshot,
-    ProviderAdapter, ProviderEvent, ProviderRequest, ProviderResponse, ProviderStop,
-    SessionAttachment, SessionTurn, SessionTurnContentBlock, SessionTurnEvent,
-    SessionTurnInterrupted, SessionTurnMessage, SessionTurnRequest, ToolBoundaryControl,
-    ToolCallSkipReason, ToolExecutionOutcome,
+    ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy, ProviderReplayProtocol,
+    ProviderRequest, ProviderResponse, ProviderStop, SessionAttachment, SessionTurn,
+    SessionTurnContentBlock, SessionTurnEvent, SessionTurnInterrupted, SessionTurnMessage,
+    SessionTurnRequest, ToolBoundaryControl, ToolCallSkipReason, ToolExecutionOutcome,
 };
 use crate::attachment::{AttachmentKind, AttachmentLimits, NormalizedMedia, FILE_READ_MEDIA_KEY};
 use crate::claim::SessionId;
@@ -152,6 +152,14 @@ impl AgentTurnLoop {
 
     pub(crate) fn max_tokens(&self) -> u32 {
         self.max_tokens
+    }
+
+    pub(crate) fn history_media_policy(&self) -> ProviderHistoryMediaPolicy {
+        self.provider.history_media_policy()
+    }
+
+    pub(crate) fn history_replay_protocol(&self) -> Option<ProviderReplayProtocol> {
+        self.provider.history_replay_protocol()
     }
 
     pub fn with_attachment_limits(mut self, limits: AttachmentLimits) -> Self {
@@ -1076,11 +1084,13 @@ impl AgentTurnLoop {
             tool_results.extend(media_blocks);
             let tool_result_message = SessionTurnMessage {
                 role: "user".into(),
+                provider_replay: None,
                 content: tool_results,
             };
             canonical_tool_results.extend(canonical_media_blocks);
             let canonical_tool_result_message = SessionTurnMessage {
                 role: "user".into(),
+                provider_replay: None,
                 content: canonical_tool_results,
             };
             provider_messages.push(tool_result_message.clone());
@@ -2858,6 +2868,7 @@ mod tests {
         ProviderResponse {
             assistant_message: SessionTurnMessage {
                 role: "assistant".into(),
+                provider_replay: None,
                 content,
             },
             stop,
@@ -2977,6 +2988,7 @@ mod tests {
     fn delegation_tool_use_inputs_are_preserved_for_canonical_transcript() {
         let message = SessionTurnMessage {
             role: "assistant".into(),
+            provider_replay: None,
             content: vec![tool_use(
                 "toolu_1",
                 "create_subagent",
@@ -4687,6 +4699,7 @@ mod tests {
             SessionTurnMessage::user_text("before tool"),
             SessionTurnMessage {
                 role: "user".into(),
+                provider_replay: None,
                 content: vec![SessionTurnContentBlock::ToolResult {
                     tool_use_id: "toolu_1".into(),
                     content: "tool output".into(),

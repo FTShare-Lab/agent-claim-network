@@ -16,8 +16,10 @@ mod endpoint;
 mod llm_http;
 mod memory_review_loop;
 mod openai_compatible_chat;
+mod openai_compatible_responses;
 mod placeholder;
 mod provider;
+mod responses;
 mod structured_json;
 mod token_estimate;
 mod tool_boundary;
@@ -113,8 +115,9 @@ pub use chat_completions::{
 pub use compaction_projection::{
     active_segment_has_large_tool_result, active_segment_messages, active_segments_hash,
     estimated_projected_segment_tokens, large_tool_result_omission_text,
-    project_turn_message_tool_results, project_turn_messages_tool_results, provider_safe_segments,
-    MessageRange, ProviderProjectionBudget,
+    project_turn_message_for_safe_transcript, project_turn_message_tool_results,
+    project_turn_messages_for_safe_transcript, project_turn_messages_tool_results,
+    provider_safe_segments, MessageRange, ProviderProjectionBudget,
 };
 pub(crate) use compaction_projection::{
     ensure_compaction_request_within_context_window, omit_turn_messages_tool_results,
@@ -127,25 +130,34 @@ pub use embedding::{
 };
 pub use memory_review_loop::{MemoryReviewLoop, MEMORY_REVIEW_MAX_TOOL_LOOP_TURNS};
 pub use openai_compatible_chat::{OpenAiCompatibleChatError, OpenAiCompatibleChatProviderAdapter};
+pub use openai_compatible_responses::{
+    OpenAiCompatibleResponsesError, OpenAiCompatibleResponsesProviderAdapter,
+};
 pub use placeholder::{resolve_placeholders, PlaceholderError};
 pub use provider::{
     assistant_text_from_message, context_usage_from_anthropic_committed_usage,
     context_usage_from_anthropic_input_usage, context_usage_from_openai_usage,
-    ContextUsageSnapshot, ContextUsageSource, ProviderAdapter, ProviderEvent, ProviderRequest,
-    ProviderResponse, ProviderStop, ToolSpec,
+    ContextUsageSnapshot, ContextUsageSource, ProviderAdapter, ProviderEvent,
+    ProviderHistoryMediaPolicy, ProviderReplayProtocol, ProviderRequest, ProviderResponse,
+    ProviderStop, ToolSpec,
+};
+pub use responses::{
+    ReducedResponses, ResponsesClient, ResponsesError, ResponsesFunctionCall, ResponsesReasoning,
+    ResponsesRequest, ResponsesStreamEvent, ResponsesTerminal, ResponsesTool,
 };
 pub(crate) use structured_json::StructuredJsonAttemptRequest;
 pub use structured_json::{StructuredJsonAttemptReport, StructuredJsonCaller};
 pub use token_estimate::{
-    estimate_json_tokens, estimate_provider_request_context_tokens,
-    estimate_session_turn_messages_tokens, estimate_text_tokens,
+    estimate_json_tokens, estimate_provider_replay_tokens,
+    estimate_provider_request_context_tokens, estimate_session_turn_messages_tokens,
+    estimate_text_tokens,
 };
 pub(crate) use tool_boundary::ToolBoundaryControl;
 pub use turn_loop::{AgentTurnLoop, SessionTurnEventRecorder, SessionTurnPreflight};
 pub use types::{
     AvailableSkill, ClaimDraft, CompletedSessionTurnMessage, DisputeDraft, InboxInternalizeKind,
-    InternalizeOutcome, InternalizeRequest, MemoryReviewRequest, RecapOutcome, SessionAttachment,
-    SessionCompactionOutcome, SessionCompactionRequest, SessionRecapRequest,
+    InternalizeOutcome, InternalizeRequest, MemoryReviewRequest, ProviderReplayState, RecapOutcome,
+    SessionAttachment, SessionCompactionOutcome, SessionCompactionRequest, SessionRecapRequest,
     SessionSearchSummaryOutcome, SessionSearchSummaryRequest, SessionTurn, SessionTurnContentBlock,
     SessionTurnEvent, SessionTurnInterrupted, SessionTurnMessage, SessionTurnRequest,
     ToolCallSkipReason, ToolExecutionOutcome, TurnMessage,

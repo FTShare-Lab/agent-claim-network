@@ -56,7 +56,7 @@ Router and Maintainer are separate executables included in this repository and c
 - Move post-session review to the background after `/exit`, returning the terminal immediately
 - Run subagents in parallel, with creation, waiting, steering, and progress inspection available in the TUI
 - Support MCP (stdio / Streamable HTTP, with in-process shared connections) and Skills (explicitly injected with `/skill-name`)
-- Support Anthropic and OpenAI-compatible providers for the main conversation; interrupted streaming automatically retries in non-streaming mode
+- Support Anthropic Messages, OpenAI-compatible Chat Completions, and Responses for the main conversation; interrupted streaming automatically retries in non-streaming mode within the same protocol
 
 See the [User Guide](docs/user_guide.md) for detailed interaction behavior.
 
@@ -151,6 +151,22 @@ api_key_env = "ACN_LLM_API_KEY"
 ```
 
 `reasoning_effort` is sent using the corresponding protocol field. ACN does not check whether the selected model supports it.
+
+</details>
+
+<details>
+<summary><b>Use the Responses protocol</b></summary>
+
+```toml
+[agent.llm]
+provider = "openai_compatible_responses"
+endpoint = "https://your-llm-endpoint/v1"
+model = "your-model"
+reasoning_effort = "none"                # none | low | medium | high | xhigh | max
+api_key_env = "ACN_LLM_API_KEY"
+```
+
+The Responses provider uses HTTP SSE/JSON and local conversation state with `store = false`. A non-`none` `reasoning_effort` is sent as `reasoning.effort`. Returned reasoning items are stored in the private session and replayed unchanged in later Responses requests, but Reasoning is not displayed in the TUI yet. This provider does not automatically fall back to Chat Completions when the Responses protocol is rejected.
 
 </details>
 

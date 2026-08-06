@@ -499,8 +499,10 @@ mod tests {
     #[test]
     fn text_attachment_limit_reuses_file_read_max_chars() {
         let attachment = AttachmentConfig::default();
-        let mut tool = ToolConfig::default();
-        tool.file_read_max_chars = 17;
+        let tool = ToolConfig {
+            file_read_max_chars: 17,
+            ..ToolConfig::default()
+        };
 
         let limits = AttachmentLimits::from_configs(&attachment, &tool);
 

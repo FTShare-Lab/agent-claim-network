@@ -677,6 +677,7 @@ mod tests {
         Ok(ProviderResponse {
             assistant_message: SessionTurnMessage {
                 role: "assistant".into(),
+                provider_replay: None,
                 content,
             },
             stop,
@@ -687,6 +688,7 @@ mod tests {
         Ok(ProviderResponse {
             assistant_message: SessionTurnMessage {
                 role: role.into(),
+                provider_replay: None,
                 content: vec![SessionTurnContentBlock::text(text)],
             },
             stop: ProviderStop::Done,

@@ -10,7 +10,7 @@ use base64::Engine as _;
 use ring::digest::{digest, SHA256};
 use serde::Serialize;
 
-use crate::api::SessionTurnContentBlock;
+use crate::api::{ProviderHistoryMediaPolicy, SessionTurnContentBlock};
 use crate::session::{CompactionAssetKind, CompactionAssetReference};
 use crate::skill::render_skill_instructions;
 use crate::storage::write_text_atomic;
@@ -36,6 +36,7 @@ struct ProviderAssetReference<'a> {
 pub(super) async fn externalize_heavy_user_blocks(
     mut projection: ProviderProjection,
     assets_dir: &Path,
+    media_policy: ProviderHistoryMediaPolicy,
 ) -> ExternalizedProviderProjection {
     let mut assets = Vec::new();
     let mut retained_block_count = 0usize;
@@ -68,19 +69,25 @@ pub(super) async fn externalize_heavy_user_blocks(
                         })
                     }
                 }
-                SessionTurnContentBlock::Image { media_type, data } => {
-                    decode_media_candidate(CompactionAssetKind::Image, media_type, data, None)
-                }
+                SessionTurnContentBlock::Image { media_type, data } => match media_policy {
+                    ProviderHistoryMediaPolicy::Placeholder => {
+                        decode_media_candidate(CompactionAssetKind::Image, media_type, data, None)
+                    }
+                    ProviderHistoryMediaPolicy::Preserve => None,
+                },
                 SessionTurnContentBlock::Document {
                     media_type,
                     data,
                     filename,
-                } => decode_media_candidate(
-                    CompactionAssetKind::Document,
-                    media_type,
-                    data,
-                    filename.clone(),
-                ),
+                } => match media_policy {
+                    ProviderHistoryMediaPolicy::Placeholder => decode_media_candidate(
+                        CompactionAssetKind::Document,
+                        media_type,
+                        data,
+                        filename.clone(),
+                    ),
+                    ProviderHistoryMediaPolicy::Preserve => None,
+                },
                 SessionTurnContentBlock::ToolUse { .. }
                 | SessionTurnContentBlock::ToolResult { .. } => None,
             };
@@ -238,7 +245,12 @@ mod tests {
             active_start_index: 0,
         };
 
-        let result = externalize_heavy_user_blocks(projection, dir.path()).await;
+        let result = externalize_heavy_user_blocks(
+            projection,
+            dir.path(),
+            ProviderHistoryMediaPolicy::Placeholder,
+        )
+        .await;
 
         assert_eq!(result.assets.len(), 4);
         assert_eq!(result.retained_block_count, 0);
@@ -273,7 +285,12 @@ mod tests {
             active_start_index: 0,
         };
 
-        let result = externalize_heavy_user_blocks(projection, dir.path()).await;
+        let result = externalize_heavy_user_blocks(
+            projection,
+            dir.path(),
+            ProviderHistoryMediaPolicy::Placeholder,
+        )
+        .await;
 
         assert!(result.assets.is_empty());
         assert!(matches!(
@@ -297,13 +314,59 @@ mod tests {
             active_start_index: 0,
         };
 
-        let result = externalize_heavy_user_blocks(projection, &unusable_dir).await;
+        let result = externalize_heavy_user_blocks(
+            projection,
+            &unusable_dir,
+            ProviderHistoryMediaPolicy::Placeholder,
+        )
+        .await;
 
         assert!(result.assets.is_empty());
         assert_eq!(result.retained_block_count, 1);
         assert!(matches!(
             &result.projection.messages[0].content[1],
             SessionTurnContentBlock::Text { text } if text == attachment
+        ));
+    }
+
+    #[tokio::test]
+    async fn preserve_policy_keeps_media_while_externalizing_other_heavy_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let image_data = BASE64_STANDARD.encode(b"fake-png");
+        let document_data = BASE64_STANDARD.encode(b"%PDF-fake");
+        let projection = ProviderProjection {
+            system_prompt: String::new(),
+            messages: vec![SessionTurnMessage::user_content(vec![
+                SessionTurnContentBlock::text("original prompt"),
+                SessionTurnContentBlock::text(
+                    "Attached file: notes.txt\nPath: /tmp/notes.txt\n\nlarge attachment",
+                ),
+                SessionTurnContentBlock::image("image/png", image_data.clone()),
+                SessionTurnContentBlock::document("application/pdf", document_data.clone()),
+            ])],
+            active_start_index: 0,
+        };
+
+        let result = externalize_heavy_user_blocks(
+            projection,
+            dir.path(),
+            ProviderHistoryMediaPolicy::Preserve,
+        )
+        .await;
+
+        assert_eq!(result.assets.len(), 1);
+        assert!(matches!(
+            &result.projection.messages[0].content[1],
+            SessionTurnContentBlock::Text { text }
+                if text.contains("<externalized_compaction_asset>")
+        ));
+        assert!(matches!(
+            &result.projection.messages[0].content[2],
+            SessionTurnContentBlock::Image { data, .. } if data == &image_data
+        ));
+        assert!(matches!(
+            &result.projection.messages[0].content[3],
+            SessionTurnContentBlock::Document { data, .. } if data == &document_data
         ));
     }
 }

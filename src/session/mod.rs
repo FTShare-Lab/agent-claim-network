@@ -17,7 +17,7 @@ use serde_json::Value;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-use crate::api::{CompletedSessionTurnMessage, SessionTurnContentBlock};
+use crate::api::{CompletedSessionTurnMessage, ProviderReplayState, SessionTurnContentBlock};
 use crate::claim::{AgentId, Claim, ClaimId, Dispute, DisputeId, SessionId, TraceId};
 use crate::skill::SkillInstructions;
 use crate::storage::{
@@ -413,6 +413,8 @@ pub struct SessionMessage {
     pub created_at: DateTime<Utc>,
     #[serde(default = "default_session_model")]
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_replay: Option<ProviderReplayState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -576,6 +578,7 @@ pub struct NewSessionMessage {
     pub content: Vec<SessionContentBlock>,
     pub created_at: DateTime<Utc>,
     pub model: String,
+    pub provider_replay: Option<ProviderReplayState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -631,6 +634,7 @@ impl NewSessionMessage {
             content,
             created_at: Utc::now(),
             model: default_session_model(),
+            provider_replay: None,
         }
     }
 
@@ -656,6 +660,7 @@ impl NewSessionMessage {
             content,
             created_at: Utc::now(),
             model: model.into(),
+            provider_replay: None,
         }
     }
 
@@ -678,7 +683,13 @@ impl NewSessionMessage {
             content,
             created_at,
             model: model.into(),
+            provider_replay: None,
         }
+    }
+
+    pub fn with_provider_replay(mut self, provider_replay: ProviderReplayState) -> Self {
+        self.provider_replay = Some(provider_replay);
+        self
     }
 }
 
@@ -1525,6 +1536,7 @@ impl SessionHandle {
                 content: message.content.clone(),
                 created_at: message.created_at,
                 model: message.model.clone(),
+                provider_replay: message.provider_replay.clone(),
             };
             jsonl.push_str(&serde_json::to_string(&stored)?);
             jsonl.push('\n');
@@ -1607,7 +1619,7 @@ impl SessionHandle {
         let model = model.as_ref();
         for message in messages {
             let role = SessionMessageRole::try_from(message.message.role.as_str())?;
-            next.push(NewSessionMessage::with_created_at_and_model(
+            let mut next_message = NewSessionMessage::with_created_at_and_model(
                 role,
                 message
                     .message
@@ -1618,7 +1630,9 @@ impl SessionHandle {
                     .collect(),
                 message.completed_at,
                 model,
-            ));
+            );
+            next_message.provider_replay = message.message.provider_replay.clone();
+            next.push(next_message);
         }
         self.append_messages(&next).await
     }
@@ -1954,6 +1968,61 @@ frontier:
             .unwrap();
         assert!(raw.contains(r#""created_at":"2026-06-17T09:33:03.718103Z""#));
         assert!(raw.contains(r#""created_at":"2026-06-17T09:33:05.123456Z""#));
+    }
+
+    #[tokio::test]
+    async fn provider_replay_round_trips_with_unknown_item_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let agent = agent_id("agent-a");
+        let mut handle = store
+            .create_with_id_factory(&agent, "system", || session_id("session_aaaaaaab"), 1)
+            .await
+            .unwrap();
+        let items = vec![serde_json::json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "encrypted_content": "opaque-value",
+            "vendor_extension": {"future": true}
+        })];
+        let message = crate::api::SessionTurnMessage::assistant_text("done").with_provider_replay(
+            ProviderReplayState::OpenAiResponses {
+                items: items.clone(),
+            },
+        );
+
+        handle
+            .append_session_turn_messages(
+                &[CompletedSessionTurnMessage::new(message, Utc::now())],
+                "test-model",
+            )
+            .await
+            .unwrap();
+
+        let stored = handle.read_messages().await.unwrap();
+        assert_eq!(
+            stored[0].provider_replay,
+            Some(ProviderReplayState::OpenAiResponses {
+                items: items.clone()
+            })
+        );
+        let raw = tokio::fs::read_to_string(&handle.paths.messages_jsonl)
+            .await
+            .unwrap();
+        assert!(raw.contains(r#""protocol":"openai_responses""#));
+        assert!(raw.contains(r#""vendor_extension""#));
+    }
+
+    #[test]
+    fn legacy_session_message_without_provider_replay_stays_readable() {
+        let legacy = r#"{"index":0,"role":"assistant","content":[{"type":"text","text":"done"}],"created_at":"2026-06-17T09:33:05Z","model":"test-model"}"#;
+
+        let message: SessionMessage = serde_json::from_str(legacy).unwrap();
+
+        assert_eq!(message.provider_replay, None);
+        assert!(!serde_json::to_string(&message)
+            .unwrap()
+            .contains("provider_replay"));
     }
 
     #[tokio::test]
@@ -3136,6 +3205,7 @@ frontier:
                 content: vec![SessionContentBlock::text("real user")],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 1,
@@ -3143,6 +3213,7 @@ frontier:
                 content: vec![SessionContentBlock::tool_result("toolu_1", "tool output")],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
         ];
 
@@ -3161,6 +3232,7 @@ frontier:
                 content: vec![SessionContentBlock::text("real user")],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 1,
@@ -3170,6 +3242,7 @@ frontier:
                 )],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
         ];
 
@@ -3188,6 +3261,7 @@ frontier:
                 content: vec![SessionContentBlock::text("first")],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 1,
@@ -3195,6 +3269,7 @@ frontier:
                 content: vec![SessionContentBlock::text("assistant")],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 2,
@@ -3202,6 +3277,7 @@ frontier:
                 content: vec![SessionContentBlock::tool_result("toolu_1", "tool output")],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 3,
@@ -3209,6 +3285,7 @@ frontier:
                 content: vec![SessionContentBlock::text("second")],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
         ];
 
@@ -3224,6 +3301,7 @@ frontier:
                 content: vec![SessionContentBlock::text("first")],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 1,
@@ -3233,6 +3311,7 @@ frontier:
                 )],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 2,
@@ -3240,6 +3319,7 @@ frontier:
                 content: vec![SessionContentBlock::text("second")],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
         ];
 
@@ -3256,6 +3336,7 @@ frontier:
                 content: vec![SessionContentBlock::text(format!("user {i}"))],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             });
             messages.push(SessionMessage {
                 index: i * 2 + 1,
@@ -3263,6 +3344,7 @@ frontier:
                 content: vec![SessionContentBlock::text(format!("assistant {i}"))],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             });
         }
 
@@ -3323,6 +3405,7 @@ frontier:
             ],
             created_at: Utc::now(),
             model: "test-model".into(),
+            provider_replay: None,
         }];
 
         let turns = extract_last_n_turns(&messages, 1);
@@ -3340,6 +3423,7 @@ frontier:
             )],
             created_at: Utc::now(),
             model: "test-model".into(),
+            provider_replay: None,
         }];
 
         let turns = extract_last_n_turns(&messages, 1);
@@ -3360,6 +3444,7 @@ frontier:
             )],
             created_at: Utc::now(),
             model: "test-model".into(),
+            provider_replay: None,
         }];
 
         assert_eq!(
@@ -3381,6 +3466,7 @@ frontier:
             )],
             created_at: Utc::now(),
             model: "test-model".into(),
+            provider_replay: None,
         }];
 
         assert_eq!(
@@ -3398,6 +3484,7 @@ frontier:
                 content: vec![SessionContentBlock::text("first")],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 1,
@@ -3405,6 +3492,7 @@ frontier:
                 content: vec![SessionContentBlock::text("answer first")],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 2,
@@ -3414,6 +3502,7 @@ frontier:
                 )],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 3,
@@ -3421,6 +3510,7 @@ frontier:
                 content: vec![SessionContentBlock::text("second")],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
         ];
 

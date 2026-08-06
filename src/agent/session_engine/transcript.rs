@@ -6,7 +6,10 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::api::{SessionTurnContentBlock, SessionTurnMessage, TurnMessage};
+use crate::api::{
+    ProviderHistoryMediaPolicy, ProviderReplayProtocol, ProviderReplayState,
+    SessionTurnContentBlock, SessionTurnMessage, TurnMessage,
+};
 use crate::session::{SessionContentBlock, SessionMessage, SessionMessageRole};
 
 use super::compaction_projection::validate_session_compaction_state;
@@ -146,6 +149,7 @@ pub(super) fn session_text_from_blocks(blocks: &[SessionContentBlock]) -> String
         .join("\n")
 }
 
+#[cfg(test)]
 pub(super) fn session_messages_to_turn_messages(
     messages: Vec<SessionMessage>,
 ) -> Vec<SessionTurnMessage> {
@@ -156,45 +160,108 @@ pub(super) fn session_messages_to_turn_messages(
 }
 
 pub(super) fn session_message_to_turn_message(message: SessionMessage) -> SessionTurnMessage {
+    session_message_to_turn_message_with_policy(
+        message,
+        ProviderHistoryMediaPolicy::Placeholder,
+        None,
+    )
+}
+
+pub(super) fn session_messages_to_provider_turn_messages(
+    messages: Vec<SessionMessage>,
+    media_policy: ProviderHistoryMediaPolicy,
+    replay_protocol: Option<ProviderReplayProtocol>,
+) -> Vec<SessionTurnMessage> {
+    messages
+        .into_iter()
+        .map(|message| {
+            session_message_to_turn_message_with_policy(message, media_policy, replay_protocol)
+        })
+        .collect()
+}
+
+pub(super) fn session_message_to_provider_turn_message(
+    message: SessionMessage,
+    media_policy: ProviderHistoryMediaPolicy,
+    replay_protocol: Option<ProviderReplayProtocol>,
+) -> SessionTurnMessage {
+    session_message_to_turn_message_with_policy(message, media_policy, replay_protocol)
+}
+
+fn session_message_to_turn_message_with_policy(
+    message: SessionMessage,
+    media_policy: ProviderHistoryMediaPolicy,
+    replay_protocol: Option<ProviderReplayProtocol>,
+) -> SessionTurnMessage {
+    let provider_replay = replay_for_protocol(message.provider_replay, replay_protocol);
     SessionTurnMessage {
         role: message.role.to_string(),
         content: message
             .content
             .into_iter()
-            .map(session_block_to_turn)
+            .map(|block| session_block_to_turn_with_policy(block, media_policy))
             .collect(),
+        provider_replay,
     }
 }
 
-pub(super) fn session_block_to_turn(block: SessionContentBlock) -> SessionTurnContentBlock {
+fn replay_for_protocol(
+    replay: Option<ProviderReplayState>,
+    protocol: Option<ProviderReplayProtocol>,
+) -> Option<ProviderReplayState> {
+    match (protocol, replay) {
+        (
+            Some(ProviderReplayProtocol::OpenAiResponses),
+            replay @ Some(ProviderReplayState::OpenAiResponses { .. }),
+        ) => replay,
+        _ => None,
+    }
+}
+
+fn session_block_to_turn_with_policy(
+    block: SessionContentBlock,
+    media_policy: ProviderHistoryMediaPolicy,
+) -> SessionTurnContentBlock {
     match block {
         SessionContentBlock::Text { text } => SessionTurnContentBlock::Text { text },
         SessionContentBlock::SkillInstructions { instruction } => {
             SessionTurnContentBlock::SkillInstructions { instruction }
         }
-        SessionContentBlock::Image { media_type, data } => SessionTurnContentBlock::Text {
-            text: format!(
-                "[image attachment media_type={media_type} base64_bytes={}]",
-                data.len()
-            ),
+        SessionContentBlock::Image { media_type, data } => match media_policy {
+            ProviderHistoryMediaPolicy::Placeholder => SessionTurnContentBlock::Text {
+                text: format!(
+                    "[image attachment media_type={media_type} base64_bytes={}]",
+                    data.len()
+                ),
+            },
+            ProviderHistoryMediaPolicy::Preserve => {
+                SessionTurnContentBlock::Image { media_type, data }
+            }
         },
         SessionContentBlock::Document {
             media_type,
             data,
             filename,
-        } => {
-            let text = match filename {
-                Some(filename) => format!(
-                    "[document attachment media_type={media_type} filename={filename} base64_bytes={}]",
-                    data.len()
-                ),
-                None => format!(
-                    "[document attachment media_type={media_type} base64_bytes={}]",
-                    data.len()
-                ),
-            };
-            SessionTurnContentBlock::Text { text }
-        }
+        } => match media_policy {
+            ProviderHistoryMediaPolicy::Placeholder => {
+                let text = match filename {
+                    Some(filename) => format!(
+                        "[document attachment media_type={media_type} filename={filename} base64_bytes={}]",
+                        data.len()
+                    ),
+                    None => format!(
+                        "[document attachment media_type={media_type} base64_bytes={}]",
+                        data.len()
+                    ),
+                };
+                SessionTurnContentBlock::Text { text }
+            }
+            ProviderHistoryMediaPolicy::Preserve => SessionTurnContentBlock::Document {
+                media_type,
+                data,
+                filename,
+            },
+        },
         SessionContentBlock::ToolUse { id, name, input } => {
             SessionTurnContentBlock::ToolUse { id, name, input }
         }

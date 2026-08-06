@@ -1117,6 +1117,7 @@ artifacts:
                 CompletedSessionTurnMessage::new(
                     SessionTurnMessage {
                         role: "assistant".into(),
+                        provider_replay: None,
                         content: vec![
                             SessionTurnContentBlock::ToolUse {
                                 id: "toolu_write".into(),
@@ -1148,6 +1149,7 @@ artifacts:
                 CompletedSessionTurnMessage::new(
                     SessionTurnMessage {
                         role: "user".into(),
+                        provider_replay: None,
                         content: vec![
                             SessionTurnContentBlock::ToolResult {
                                 tool_use_id: "toolu_write".into(),
@@ -1212,6 +1214,7 @@ artifacts:
                 CompletedSessionTurnMessage::new(
                     SessionTurnMessage {
                         role: "assistant".into(),
+                        provider_replay: None,
                         content: vec![SessionTurnContentBlock::ToolUse {
                             id: "toolu_write".into(),
                             name: "file_write".into(),
@@ -1226,6 +1229,7 @@ artifacts:
                 CompletedSessionTurnMessage::new(
                     SessionTurnMessage {
                         role: "user".into(),
+                        provider_replay: None,
                         content: vec![SessionTurnContentBlock::ToolResult {
                             tool_use_id: "toolu_write".into(),
                             content: json!({
@@ -1269,6 +1273,7 @@ artifacts:
                 CompletedSessionTurnMessage::new(
                     SessionTurnMessage {
                         role: "assistant".into(),
+                        provider_replay: None,
                         content: vec![
                             SessionTurnContentBlock::ToolUse {
                                 id: "toolu_no_change".into(),
@@ -1287,6 +1292,7 @@ artifacts:
                 CompletedSessionTurnMessage::new(
                     SessionTurnMessage {
                         role: "user".into(),
+                        provider_replay: None,
                         content: vec![
                             SessionTurnContentBlock::ToolResult {
                                 tool_use_id: "toolu_no_change".into(),

@@ -50,12 +50,14 @@ api_key_env = "ACN_LLM_API_KEY"
 
 | 字段 | 含义 |
 | --- | --- |
-| `provider` | 请求协议，目前支持 `openai_compatible_chat` 和 `anthropic`；它不是厂商名。 |
+| `provider` | 请求协议，目前支持 `openai_compatible_chat`、`openai_compatible_responses` 和 `anthropic`。 |
 | `endpoint` | 与所选协议兼容的 base URL 或完整请求 URL。OpenAI-compatible 的常见 base URL 形如 `https://llm.example.com/v1`，Anthropic-compatible 的常见 base URL 形如 `https://llm.example.com`。 |
 | `model` | 该服务实际接受的模型 ID。 |
 | `api_key_env` | 保存这个 LLM API key 的环境变量名，不是 key 本身。 |
 
 `provider`、`endpoint` 和 `model` 必须属于同一个兼容服务。`endpoint` 必须是绝对 HTTP(S) URL；`model` 不能为空。
+
+ACN 使用 HTTP SSE streaming，并在既有流式恢复路径中改发同协议 JSON non-streaming；不会自动切换成 Chat Completions。Responses 会话固定使用 `store = false`：未 compact 的本地历史、工具调用和协议 replay 共同构成下一次请求；历史图片/PDF 会继续作为真实附件发送。返回的 reasoning item 会保存在当前 Agent 的私有 session 并原样回传，但当前 TUI 不展示 Reasoning。
 
 `agent_id` 只能使用小写字母、数字、`_` 和 `-`，在团队内应保持唯一。它还决定本地数据目录，开始使用后不要随意修改。
 
