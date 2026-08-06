@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 use crate::agent::SessionRuntimeStatus;
 use crate::api::SessionAttachment;
@@ -721,9 +722,12 @@ impl BottomPane {
         width: u16,
     ) -> Vec<Line<'static>> {
         if self.finalize_failed {
-            return vec![Line::styled(
+            let hint_style = Style::default().fg(Color::DarkGray);
+            return vec![session_hint_line(
+                session_id,
                 "Finalize failed · Ctrl+C quit",
-                Style::default().fg(Color::DarkGray),
+                hint_style,
+                width,
             )];
         }
         let input_enabled = input_accepts_text(status);
@@ -884,50 +888,40 @@ impl BottomPane {
         width: u16,
     ) -> Line<'static> {
         let hint_style = Style::default().fg(Color::DarkGray);
-        if self.finalize_failed {
-            return Line::styled("Finalize failed · Ctrl+C quit", hint_style);
-        }
-        if self.slash_menu_visible() {
-            return Line::styled("↑↓ select · Tab/Enter complete", hint_style);
-        }
-        if self.at_path_menu_visible() {
-            return Line::styled("↑↓ select · Tab/Enter complete · Esc close", hint_style);
-        }
         let inline_slash_hint_visible = self.inline_slash_hint().is_some();
-        let mut hint = match status {
-            SessionRuntimeStatus::Open | SessionRuntimeStatus::Error
-                if running_task_label.is_none() =>
-            {
-                if width < 48 {
-                    Line::styled("type /", hint_style)
-                } else if session_id.is_some() && width >= 72 {
-                    full_hint_line(session_id, hint_style)
-                } else {
-                    Line::styled("type / for commands · Enter sends", hint_style)
+        let body_width = hint_body_width(width, session_id);
+        let mut hint = if self.finalize_failed {
+            "Finalize failed · Ctrl+C quit".to_string()
+        } else if self.slash_menu_visible() {
+            "↑↓ select · Tab/Enter complete".to_string()
+        } else if self.at_path_menu_visible() {
+            "↑↓ select · Tab/Enter complete · Esc close".to_string()
+        } else {
+            match status {
+                SessionRuntimeStatus::Open | SessionRuntimeStatus::Error
+                    if running_task_label.is_none() =>
+                {
+                    if body_width < 48 {
+                        "type /".to_string()
+                    } else {
+                        "type / for commands · Enter sends".to_string()
+                    }
                 }
+                SessionRuntimeStatus::Running => running_hint_for_width(body_width).to_string(),
+                _ => self.hint_body(status, running_task_label, queued_count),
             }
-            _ => Line::styled(
-                if matches!(status, SessionRuntimeStatus::Running) {
-                    running_hint_for_width(width).to_string()
-                } else {
-                    self.hint(status, running_task_label, queued_count, session_id)
-                },
-                hint_style,
-            ),
         };
         if inline_slash_hint_visible {
-            hint.spans
-                .push(Span::styled(" · Tab completes", hint_style));
+            hint.push_str(" · Tab completes");
         }
-        hint
+        session_hint_line(session_id, &hint, hint_style, width)
     }
 
-    pub(super) fn hint(
+    fn hint_body(
         &self,
         status: SessionRuntimeStatus,
         running_task_label: Option<&str>,
         queued_count: usize,
-        session_id: Option<&str>,
     ) -> String {
         if self.finalize_failed {
             return "Finalize failed · Ctrl+C quit".into();
@@ -943,10 +937,7 @@ impl BottomPane {
                 )
             }
             SessionRuntimeStatus::Open | SessionRuntimeStatus::Error => {
-                match session_id.filter(|id| !id.is_empty()) {
-                    Some(session_id) => format!("{session_id} type / for commands · Enter sends"),
-                    None => "type / for commands · Enter sends".into(),
-                }
+                "type / for commands · Enter sends".into()
             }
             SessionRuntimeStatus::Running => {
                 "Enter queues · Ctrl+Enter steers · Esc recalls queue/cancels · Ctrl+C cancels"
@@ -960,11 +951,23 @@ impl BottomPane {
                 format!("input will be queued · queued={queued_count}")
             }
             SessionRuntimeStatus::Compacting => "input will be queued".into(),
-            SessionRuntimeStatus::Finalizing => match session_id.filter(|id| !id.is_empty()) {
-                Some(session_id) => format!("finalizing {session_id}..."),
-                None => "finalizing session...".into(),
-            },
+            SessionRuntimeStatus::Finalizing => "finalizing session...".into(),
             SessionRuntimeStatus::Closed => "session closed".into(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn hint(
+        &self,
+        status: SessionRuntimeStatus,
+        running_task_label: Option<&str>,
+        queued_count: usize,
+        session_id: Option<&str>,
+    ) -> String {
+        let hint = self.hint_body(status, running_task_label, queued_count);
+        match session_id.filter(|id| !id.is_empty()) {
+            Some(session_id) => format!("{session_id} {hint}"),
+            None => hint,
         }
     }
 
@@ -1138,17 +1141,38 @@ fn running_hint_for_width(width: u16) -> &'static str {
     }
 }
 
-fn full_hint_line(session_id: Option<&str>, hint_style: Style) -> Line<'static> {
-    match session_id.filter(|id| !id.is_empty()) {
-        Some(session_id) => Line::from(vec![
-            Span::styled(
-                session_id.to_string(),
-                hint_style.add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" type / for commands · Enter sends".to_string(), hint_style),
-        ]),
-        None => Line::styled("type / for commands · Enter sends", hint_style),
+fn hint_body_width(width: u16, session_id: Option<&str>) -> u16 {
+    let Some(session_id) = session_id.filter(|id| !id.is_empty()) else {
+        return width;
+    };
+    let prefix_width = UnicodeWidthStr::width(session_id).saturating_add(1);
+    width.saturating_sub(u16::try_from(prefix_width).unwrap_or(u16::MAX))
+}
+
+fn session_hint_line(
+    session_id: Option<&str>,
+    hint: &str,
+    hint_style: Style,
+    width: u16,
+) -> Line<'static> {
+    let width = usize::from(width);
+    let Some(session_id) = session_id.filter(|id| !id.is_empty()) else {
+        return Line::styled(truncate_to_width(hint, width), hint_style);
+    };
+    let visible_session_id = truncate_to_width(session_id, width);
+    let session_width = UnicodeWidthStr::width(visible_session_id.as_str());
+    let mut spans = vec![Span::styled(
+        visible_session_id,
+        hint_style.add_modifier(Modifier::BOLD),
+    )];
+    let remaining = width.saturating_sub(session_width);
+    if remaining > 0 && !hint.is_empty() {
+        spans.push(Span::styled(
+            truncate_to_width(&format!(" {hint}"), remaining),
+            hint_style,
+        ));
     }
+    Line::from(spans)
 }
 
 fn queued_preview_text(preview: &PendingInputPreview) -> String {

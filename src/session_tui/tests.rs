@@ -1497,7 +1497,7 @@ fn narrow_live_region_uses_compact_footer_text() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>();
 
-    assert!(lines.iter().any(|line| line == "type /"));
+    assert!(lines.iter().any(|line| line == "session_1234abcd type /"));
     assert!(lines.iter().any(|line| line == "open"));
     assert!(!lines.iter().any(|line| line.contains("Shift+Enter")));
     assert!(!lines.iter().any(|line| line.contains("tok --")));
@@ -1554,24 +1554,79 @@ fn open_footer_prefixes_bold_session_id_when_available() {
 #[test]
 fn running_footer_explains_queue_steer_and_cancel_keys() {
     let mut state = super::TuiState::new();
+    state.apply_event(SessionEvent::SessionStarted {
+        session_id: SessionId::from_str("session_1234abcd").unwrap(),
+        agent_id: AgentId::new("agent-a").unwrap(),
+    });
     state.begin_pending_turn("active".into());
 
     assert_eq!(
         super::composer_hint(&state),
-        "Enter queues · Ctrl+Enter steers · Esc recalls queue/cancels · Ctrl+C cancels"
+        "session_1234abcd Enter queues · Ctrl+Enter steers · Esc recalls queue/cancels · Ctrl+C cancels"
     );
 }
 
 #[test]
 fn running_footer_uses_shorter_esc_hint_on_narrow_width() {
     let mut state = super::TuiState::new();
+    state.apply_event(SessionEvent::SessionStarted {
+        session_id: SessionId::from_str("session_1234abcd").unwrap(),
+        agent_id: AgentId::new("agent-a").unwrap(),
+    });
     state.begin_pending_turn("active".into());
 
     let lines = super::composer_lines_with_width(&state, 48);
     let footer = lines.last().expect("Footer should render");
 
+    assert!(footer.to_string().starts_with("session_1234abcd "));
     assert!(footer.to_string().contains("Esc recalls"));
     assert!(footer.width() <= 48);
+}
+
+#[test]
+fn session_id_prefixes_footer_in_every_runtime_status() {
+    let mut state = super::TuiState::new();
+    state.apply_event(SessionEvent::SessionStarted {
+        session_id: SessionId::from_str("session_1234abcd").unwrap(),
+        agent_id: AgentId::new("agent-a").unwrap(),
+    });
+
+    for status in [
+        SessionRuntimeStatus::Initializing,
+        SessionRuntimeStatus::Open,
+        SessionRuntimeStatus::Error,
+        SessionRuntimeStatus::Running,
+        SessionRuntimeStatus::SyncingInbox,
+        SessionRuntimeStatus::Compacting,
+        SessionRuntimeStatus::Finalizing,
+        SessionRuntimeStatus::Closed,
+    ] {
+        state.status = status;
+        let lines = super::composer_lines_with_width(&state, 120);
+        let footer = lines.last().expect("Footer should render");
+        assert!(
+            footer.to_string().starts_with("session_1234abcd "),
+            "{status:?} footer should retain session id: {}",
+            footer
+        );
+        assert_eq!(footer.spans[0].content.as_ref(), "session_1234abcd");
+        assert!(footer.spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(footer.width() <= 120);
+    }
+
+    state.status = SessionRuntimeStatus::Compacting;
+    let compacting = super::composer_lines_with_width(&state, 120);
+    assert_eq!(
+        compacting.last().map(ToString::to_string).as_deref(),
+        Some("session_1234abcd input will be queued")
+    );
+
+    state.mark_finalize_failed();
+    let finalize_failed = super::composer_lines_with_width(&state, 120);
+    assert_eq!(
+        finalize_failed.last().map(ToString::to_string).as_deref(),
+        Some("session_1234abcd Finalize failed · Ctrl+C quit")
+    );
 }
 
 #[test]

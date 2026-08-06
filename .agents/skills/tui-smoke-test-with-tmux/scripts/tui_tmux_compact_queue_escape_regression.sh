@@ -112,6 +112,10 @@ tui_start
 trap cleanup EXIT
 
 wait_capture "initial" "type / for commands.*Enter sends" "TUI open state"
+tui_assert_contains \
+  "initial" \
+  "session_[0-9a-f]{8} type / for commands.*Enter sends" \
+  "open footer did not retain the session id"
 
 # manual compact 至少保留最近三轮；先制造足够的 committed history，确保进入真实压缩。
 for turn in $(seq 1 5); do
@@ -121,6 +125,10 @@ for turn in $(seq 1 5); do
     "history_${turn}_running" \
     "Working · Streaming response" \
     "history turn $turn running state"
+  tui_assert_contains \
+    "history_${turn}_running" \
+    "session_[0-9a-f]{8} Enter queues" \
+    "running footer did not retain the session id"
   wait_capture "history_$turn" "┌ Idle" "history turn $turn completion"
   tui_assert_contains "history_$turn" "$prompt" "history turn $turn user input was absent"
   tui_assert_contains \
@@ -131,6 +139,10 @@ done
 
 send_prompt "/compact"
 wait_capture "compacting" "Compacting · Session history" "manual compact running state"
+tui_assert_contains \
+  "compacting" \
+  "session_[0-9a-f]{8} input will be queued" \
+  "compacting footer did not retain the session id"
 
 send_prompt "first queued"
 send_prompt "second queued"
