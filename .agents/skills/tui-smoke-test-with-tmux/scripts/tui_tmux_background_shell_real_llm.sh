@@ -68,7 +68,7 @@ text, home_count = re.subn(
 )
 text, provider_count = re.subn(
     r'(?ms)(^\[agent\.llm\]\n.*?^provider\s*=\s*)"[^"]*"',
-    r'\1"openai_compatible_chat"',
+    r'\1"openai_chat"',
     text,
     count=1,
 )

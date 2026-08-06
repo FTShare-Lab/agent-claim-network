@@ -54,7 +54,7 @@ if count != 1:
     raise SystemExit("expected exactly one storage.acn_home in config.toml")
 text, count = re.subn(
     r'(?ms)(^\[agent\.llm\]\n.*?^provider\s*=\s*)"[^"]*"',
-    r'\1"openai_compatible_chat"',
+    r'\1"openai_chat"',
     text,
     count=1,
 )

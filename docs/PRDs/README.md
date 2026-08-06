@@ -4,7 +4,7 @@
 
 ## Session 与恢复
 
-- [OpenAI-compatible Responses API 支持](PRD_openai_responses.md)
+- [OpenAI Responses API 支持](PRD_openai_responses.md)
 - [Provider Request 前统一压缩](PRD_compact_in_turn.md)
 - [Turn Journal 与 Mid-Turn 恢复](PRD_turn2message.md)
 - [流式失败回退非流式重试](PRD_retry_non_streaming.md)

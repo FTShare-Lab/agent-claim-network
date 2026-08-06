@@ -278,7 +278,7 @@ pub(crate) fn build_provider_adapter(cfg: &Config) -> anyhow::Result<Arc<dyn Pro
                 .with_reasoning_effort(chat.reasoning_effort),
             ))
         }
-        LlmProvider::OpenAiCompatibleChat => {
+        LlmProvider::OpenAiChat => {
             let key = chat
                 .api_key
                 .clone()
@@ -296,7 +296,7 @@ pub(crate) fn build_provider_adapter(cfg: &Config) -> anyhow::Result<Arc<dyn Pro
                 .with_reasoning_effort(chat.reasoning_effort),
             ))
         }
-        LlmProvider::OpenAiCompatibleResponses => {
+        LlmProvider::OpenAiResponses => {
             let key = chat
                 .api_key
                 .clone()
@@ -728,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_compatible_chat_provider_builds_http_cli_session_engine() {
+    fn openai_chat_provider_builds_http_cli_session_engine() {
         let team = tempfile::tempdir().unwrap();
         let hosts = tempfile::tempdir().unwrap();
         let prompts = tempfile::tempdir().unwrap();
@@ -738,7 +738,7 @@ mod tests {
             hosts.path().to_path_buf(),
             prompts.path().to_path_buf(),
         );
-        c.agent.llm.provider = LlmProvider::OpenAiCompatibleChat;
+        c.agent.llm.provider = LlmProvider::OpenAiChat;
         c.agent.llm.api_key_env = "EXAMPLE_LLM_API_KEY".into();
         c.agent.llm.api_key = Some("test-key".into());
         c.agent.llm.endpoint = "http://127.0.0.1:1".into();
@@ -751,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_compatible_responses_provider_builds_http_cli_session_engine() {
+    fn openai_responses_provider_builds_http_cli_session_engine() {
         let team = tempfile::tempdir().unwrap();
         let hosts = tempfile::tempdir().unwrap();
         let prompts = tempfile::tempdir().unwrap();
@@ -761,7 +761,7 @@ mod tests {
             hosts.path().to_path_buf(),
             prompts.path().to_path_buf(),
         );
-        c.agent.llm.provider = LlmProvider::OpenAiCompatibleResponses;
+        c.agent.llm.provider = LlmProvider::OpenAiResponses;
         c.agent.llm.api_key_env = "EXAMPLE_LLM_API_KEY".into();
         c.agent.llm.api_key = Some("test-key".into());
         c.agent.llm.endpoint = "http://127.0.0.1:1/v1".into();
@@ -787,11 +787,8 @@ mod tests {
 
         for (provider, expected_error) in [
             (LlmProvider::Anthropic, "Anthropic Messages endpoint"),
-            (
-                LlmProvider::OpenAiCompatibleChat,
-                "Chat Completions endpoint",
-            ),
-            (LlmProvider::OpenAiCompatibleResponses, "Responses endpoint"),
+            (LlmProvider::OpenAiChat, "Chat Completions endpoint"),
+            (LlmProvider::OpenAiResponses, "Responses endpoint"),
         ] {
             c.agent.llm.provider = provider;
             c.agent.llm.endpoint = "llm.example.com/v1".into();

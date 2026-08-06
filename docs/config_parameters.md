@@ -78,7 +78,7 @@ agent_id = "agent-a"
 
 ### `[agent.llm]`
 
-- `provider`：agent 主对话 LLM provider。当前支持 `anthropic`、`openai_compatible_chat`、`openai_compatible_responses`。Chat 与 Responses 是彼此独立的 wire protocol，ACN 不在两者之间自动降级。
+- `provider`：agent 主对话 LLM provider。当前支持 `anthropic`、`openai_chat`、`openai_responses`。Chat 与 Responses 是彼此独立的 wire protocol，ACN 不在两者之间自动降级。
 - `endpoint`：与所选 provider 兼容的 LLM HTTP 地址，必须是绝对 HTTP(S) URL。可以填写服务 base URL，也可以填写完整请求 URL；OpenAI-compatible 的常见 base URL 形如 `https://llm.example.com/v1`，Anthropic-compatible 的常见 base URL 形如 `https://llm.example.com`。根 URL 会分别补全为 `/v1/chat/completions`、`/v1/responses` 或 `/v1/messages`；已有路径的 base URL 会追加相应末段，完整请求 URL 保持不变。
 - `model`：模型名，以配置文件为准。
 - `reasoning_effort`：控制 agent 主 LLM 的推理强度，可选值为 `none`、`low`、`medium`、`high`、`xhigh`、`max`，未配置时默认 `none`。未配置或设为 `none` 时不发送推理强度参数。
@@ -297,15 +297,17 @@ background-shell 其余时序、容量和 PTY 参数是 `config.rs` 内部默认
 
 ### `[router.rerank]`
 
-- `provider`：候选 Claim 的重排方式。`heuristic` 使用本地启发式规则；`openai_compatible_chat` 把查询和候选 Claim 交给通用 Chat 模型排序，不要求使用专用 rerank 模型。
-- `endpoint`：`openai_compatible_chat` 使用的 Chat Completions 服务地址，必须是绝对 HTTP(S) URL。可以填写常见的 base URL（例如 `https://llm.example.com/v1`），也可以填写完整的 Chat Completions 请求 URL。
-- `model`：执行重排任务的 Chat 模型名。
-- `api_key_env`：读取该 Chat Completions 服务 API key 的环境变量名。
+- `provider`：候选 Claim 的重排方式。`heuristic` 使用本地启发式规则；`openai_chat` 使用 Chat Completions；`openai_responses` 使用 Responses。两种远端协议都把 query 和候选 Claim 交给通用模型排序，不要求使用专用 rerank 模型。
+- `endpoint`：远端重排服务地址，必须是绝对 HTTP(S) URL。可以填写 host root、常见的 `/v1` base URL 或完整的 `/v1/chat/completions`、`/v1/responses` 请求 URL；ACN 按所选 provider 补全缺失路径，不在两种协议间自动切换。
+- `model`：执行重排任务的模型名。
+- `api_key_env`：读取远端重排服务 API key 的环境变量名。
 - `timeout_secs`：单次 rerank 请求超时秒数。
-- `max_tokens`：Chat 模型返回排序结果时的最大输出 token 数。
+- `max_tokens`：模型返回排序结果时的最大输出 token 数；`openai_chat` 映射为 `max_tokens`，`openai_responses` 映射为 `max_output_tokens`。
 - `retry_count`：rerank 请求首次失败后的额外重试次数。
 - `retry_base_delay_ms`：rerank 请求重试退避基础间隔毫秒数。
 - `retry_max_delay_ms`：rerank 请求重试退避上限毫秒数。
+
+`openai_responses` rerank 固定使用 non-streaming、`store = false` 的单轮请求，不发送 `reasoning` 字段，也不保存或回传上游 reasoning。Responses 未完成、输出不是合法排序 JSON 或最终请求失败时，Router 沿用现有 lexical/vector 排序降级。
 
 ### `[maintainer.sweep]`
 
@@ -376,5 +378,5 @@ Maintainer 启动时会自动 ensure `router-service` 内部 key：hash 写在 `
 ### Router / Maintainer 侧环境变量
 
 - `[router.embedding].api_key_env`：真实 embedding 路径必需，配置为要读取的 embedding API key 环境变量名。
-- `[router.rerank].api_key_env`：`provider = "openai_compatible_chat"` 时必需，配置为要读取的 Chat Completions 服务 API key 环境变量名。
+- `[router.rerank].api_key_env`：`provider = "openai_chat"` 或 `provider = "openai_responses"` 时必需，配置为要读取的远端重排服务 API key 环境变量名。
 - `[maintainer.auth.admin].password_env`：启用 maintainer 管理台管理员鉴权时必需，配置为要读取的 Basic Auth 密码环境变量名。

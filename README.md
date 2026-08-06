@@ -118,7 +118,7 @@ maintainer_endpoint = ""         # 都留空 = 单人模式
 router_endpoint = ""
 
 [agent.llm]
-provider = "openai_compatible_chat"
+provider = "openai_chat"
 endpoint = "https://your-llm-endpoint/v1"
 model = "your-model"
 api_key_env = "ACN_LLM_API_KEY"  # 环境变量名
@@ -157,7 +157,7 @@ api_key_env = "ACN_LLM_API_KEY"
 
 ```toml
 [agent.llm]
-provider = "openai_compatible_responses"
+provider = "openai_responses"
 endpoint = "https://your-llm-endpoint/v1"
 model = "your-model"
 reasoning_effort = "none"                # none | low | medium | high | xhigh | max

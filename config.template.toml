@@ -32,7 +32,7 @@ model = "text-embedding-3-small"
 api_key_env = "EMBEDDING_API_KEY"
 
 [router.rerank]
-provider = "openai_compatible_chat"
+provider = "openai_chat"
 endpoint = "https://api.openai.com/v1/chat/completions"
 model = "gpt-5.6-luna"
 api_key_env = "OPENAI_API_KEY"
@@ -50,7 +50,7 @@ password_env = "ACN_MAINTAINER_ADMIN_PASSWORD"
 enabled = false
 
 [agent.llm]
-provider = "openai_compatible_chat"
+provider = "openai_chat"
 endpoint = ""
 model = ""
 reasoning_effort = "none"

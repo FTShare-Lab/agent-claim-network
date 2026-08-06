@@ -1,10 +1,10 @@
-# OpenAI-compatible Responses API 支持
+# OpenAI Responses API 支持
 
-> 状态：已完成（2026-08-04，15A 于 2026-08-06 修订）；阶段 0–7 与整体验收全部通过。本文定义 HTTP JSON/SSE Responses 协议、provider replay、session 恢复、多媒体历史与验收边界；WebSocket 和统一 Reasoning 展示不在本期范围内。
+> 状态：已完成（2026-08-06；Agent Responses 主链路、15A 修订、provider 公开名称收敛与 Router Responses rerank 增补均已验收）。本文定义 HTTP JSON/SSE Responses 协议、provider replay、session 恢复、多媒体历史与验收边界；WebSocket 和统一 Reasoning 展示不在本期范围内。
 
 ## 1. 背景
 
-ACN 当前主对话 provider 支持 `openai_compatible_chat` 与 `anthropic`。两种 adapter 都接入统一的 provider-neutral turn loop：首次请求使用 streaming；若已经向 TUI 发出部分 assistant 文本后流式失败，则使用同一份 provider request 进入既有非流式 fallback；只有完整响应通过校验后才会执行工具和提交 canonical session。
+ACN 当前主对话 provider 支持 `openai_chat` 与 `anthropic`。两种 adapter 都接入统一的 provider-neutral turn loop：首次请求使用 streaming；若已经向 TUI 发出部分 assistant 文本后流式失败，则使用同一份 provider request 进入既有非流式 fallback；只有完整响应通过校验后才会执行工具和提交 canonical session。
 
 OpenAI Responses API 与 Chat Completions 不是同一套响应字段的简单改名。Responses 使用有类型的 input/output item，包括：
 
@@ -16,7 +16,7 @@ OpenAI Responses API 与 Chat Completions 不是同一套响应字段的简单�
 
 在 `store = false` 的本地状态模式下，下一次请求需要携带仍在有效上下文中的历史 input，以及上一次响应返回的完整可回放 output items。若只把 `output_text` 和 tool call 投影成 ACN 现有 canonical content，会丢失 reasoning、phase 和未来未知 item，导致工具回环、resume 或后续 Reasoning 展示无法保持协议连续性。
 
-本需求新增独立的 `openai_compatible_responses` adapter，在不改变现有 Chat/Anthropic 行为的前提下，让 Responses 的 HTTP streaming、HTTP non-streaming、工具循环、session resume、compaction 与历史多媒体形成一条完整链路。
+本需求新增独立的 `openai_responses` adapter，在不改变现有 Chat/Anthropic 行为的前提下，让 Responses 的 HTTP streaming、HTTP non-streaming、工具循环、session resume、compaction 与历史多媒体形成一条完整链路。
 
 相关官方协议说明：
 
@@ -27,7 +27,7 @@ OpenAI Responses API 与 Chat Completions 不是同一套响应字段的简单�
 
 ## 2. 目标
 
-1. 新增独立的 `openai_compatible_responses` provider，不复用或隐式切换到 Chat Completions wire protocol。
+1. 新增独立的 `openai_responses` provider，不复用或隐式切换到 Chat Completions wire protocol。
 2. 同时支持 `/v1/responses` 的 SSE streaming 与 JSON non-streaming。
 3. 复用现有 provider-neutral turn loop、工具执行、max-token continuation、非流式 fallback、TUI 文本事件和 canonical commit gate。
 4. 使用 `store = false`，由 ACN 本地 session 保存并回放 Responses 所需的协议私有 items。
@@ -57,13 +57,13 @@ OpenAI Responses API 与 Chat Completions 不是同一套响应字段的简单�
 
 ```toml
 [agent.llm]
-provider = "openai_compatible_responses"
+provider = "openai_responses"
 endpoint = "https://llm.example.com/v1"
 model = "example-model"
 api_key_env = "LLM_API_KEY"
 ```
 
-- `openai_compatible_responses` 是独立 adapter，不在 `openai_compatible_chat` 内增加 `api_mode`。
+- `openai_responses` 是独立 adapter，不在 `openai_chat` 内增加 `api_mode`。
 - endpoint resolver 沿用现有完整 URL/base URL 兼容规则，并为 base URL 补充 `/responses`。
 - provider 名表示选择 ACN adapter；replay 中的 protocol tag 表示落盘数据所遵循的 wire protocol，两者不是厂商身份。
 
@@ -174,7 +174,7 @@ enum ProviderReplayState {
 
 ### 4.11 Compatible endpoint 边界（12A）
 
-- `openai_compatible_responses` 要求 endpoint 实现 Responses 基本协议。
+- `openai_responses` 要求 endpoint 实现 Responses 基本协议。
 - 不因 400/404 自动改发 Chat Completions。
 - 不猜测删除 `store`、`reasoning`、`instructions` 或其他字段后重试。
 - 不增加厂商名分支或一组未经真实接口验证的兼容开关。
@@ -187,6 +187,18 @@ enum ProviderReplayState {
 14A：顶层 `status = completed` 时，可消费的 `message`/`function_call` 若显式携带 item `status`，必须也是 `completed`；显式 `incomplete`/`in_progress` 视为协议终态冲突并拒绝提交或执行工具。兼容实现省略 item `status` 时继续接受。选项包括忽略 item status、强制所有实现必须提供 status 或“有则校验”；选择“有则校验”，因为它能阻止半截工具调用，同时不破坏已验证的兼容 endpoint。
 
 15A：SSE 以索引连续、无重复且结构合法的 `response.output_item.done` 作为完整 output 与 replay 的唯一权威；terminal event 只提供顶层 status、usage 等终态元数据，不读取或校验 terminal `response.output` 与 done items 的数量、身份或字段一致性。done 中的 reasoning、message 与 function call 按原始顺序保留和处理；terminal output 省略 item、额外列出 item 或使用不同可选字段形状均不改变结果，未经过合法 done event 的 terminal tool item 不执行。选项包括 terminal 与 done 完全相等、terminal 为 done 子集或完全不比较；选择第三项，因为单一权威能兼容 terminal envelope 的表示差异，并确保只有明确完成的 done item 能进入 replay 或触发工具。重复/不连续/结构非法的 done event、terminal event 与顶层 status 冲突、显式未完成的可消费 item，以及 terminal event 前 EOF 仍按协议错误处理。
+
+### 4.13 Provider 公开名称与 Router Responses rerank（R1A–R7A，R3B）
+
+- Agent 主对话公开 provider 名称收敛为 `anthropic`、`openai_chat`、`openai_responses`。旧名称只作为代码中的隐藏解析 alias，不在用户文档和配置模板中说明；内部 adapter 模块和类型名称不做无收益的机械重命名。
+- Router rerank 公开 provider 名称为 `heuristic`、`openai_chat`、`openai_responses`，旧名称同样只作为隐藏解析 alias。Router embedding 不属于 Chat/Responses 协议，本增补不改变 embedding provider。
+- Router Responses rerank 固定使用 non-streaming JSON 请求，不建立 SSE、TUI delta 或 non-streaming fallback；它没有用户可见的增量输出消费者。
+- `[router.rerank]` 不新增 `reasoning_effort`。请求不发送 `reasoning` 字段；上游即使返回 reasoning item，Router 也只消费最终 `output_text`，不展示、不落盘、不回传。
+- Router Responses rerank 固定 `store = false`，不使用 `previous_response_id`，不同 query 之间不共享 response state。
+- 排序输出继续使用现有 prompt 与宽容 JSON parser，不要求 endpoint 支持 Responses Structured Outputs。合法对象形态为 `{"claim_ids":["..."]}`；现有 JSON 数组、代码围栏、未知 ID 过滤、重复 ID 去重与遗漏候选追加语义保持不变。
+- 复用现有 `[router.rerank].max_tokens`：Chat 映射为 `max_tokens`，Responses 映射为 `max_output_tokens`。Responses 仅接受 `status = completed` 且存在合法排序 JSON 的结果；`incomplete`、`max_output_tokens`、非法 JSON、HTTP/认证/超时错误沿用现有 retry 后降级到 lexical/vector 顺序，不做 continuation。
+- Responses endpoint 沿用现有 resolver，接受 host root、`/v1` base URL 或完整 `/v1/responses` URL。默认 rerank provider 仍为 `openai_chat`；选择 `openai_responses` 时由用户同时配置匹配的 endpoint 和 model，不自动替换。
+- 本增补不修改 Agent session schema、provider replay、TUI 展示或旧 session 数据。`provider_replay.protocol = "openai_responses"` 已是稳定 wire-protocol tag，不随配置名称收敛而变化。
 
 ## 5. 请求、响应与状态归一
 
@@ -360,7 +372,7 @@ SessionMessage.provider_replay
 
 实施：
 
-1. 新增 `openai_compatible_responses` adapter，接入 provider abstraction。
+1. 新增 `openai_responses` adapter，接入 provider abstraction。
 2. 更新 config enum/校验、bootstrap、endpoint resolver、API module exports 与配置文档。
 3. 实现 canonical input、raw replay、tool specs、assistant output 的双向映射。
 4. 接入现有 context usage、ToolUse/ToolResult、并发工具、max-token continuation 和 streaming fallback。
@@ -395,7 +407,7 @@ SessionMessage.provider_replay
 
 场景 A：直接 Responses streaming。
 
-1. 使用 `openai_compatible_responses` 启动 ACN TUI。
+1. 使用 `openai_responses` 启动 ACN TUI。
 2. 发送稳定的文本请求，确认文本逐步出现、最终完成且 stderr 为空。
 3. 检查 canonical assistant text 与 provider replay 同时落盘，TUI 不展示 raw reasoning。
 
@@ -474,6 +486,43 @@ review 处理规则：
 
 阶段验收：完整 verify、默认 TUI smoke、真实 LLM 定向 smoke、全量 review 和必要的 re-review 全部通过；工作树只包含本需求范围内的代码、测试和文档。
 
+### 阶段 8：Provider 名称收敛与 Router Responses rerank 增补
+
+实施：
+
+1. 将 Agent 和 Router 的公开协议名收敛为 `openai_chat`、`openai_responses`，用 serde alias 隐藏兼容旧配置值；用户文档和模板只使用新名称。
+2. 为 Router rerank 增加独立的 Responses one-shot 实现，复用低层 JSON client、endpoint resolver、timeout/retry 与错误脱敏，不接入 Agent session adapter。
+3. 固化 non-streaming、`store = false`、无 `reasoning` 字段、无工具、无状态 replay、现有 max-token 映射和失败降级边界。
+4. 增加配置 alias/canonical serialization、请求快照、reasoning 忽略、未完成终态、非法输出与 Router fallback 回归。
+5. 更新稳定文档和真实验收配置，执行完整 Rust 验证、真实 Router Responses 调用以及模块级/全量 review。
+
+阶段验收：
+
+- 新名称可以启动 Agent 和 Router；旧名称仍可读取但不在用户文档出现。
+- fake server 观察到 Router 请求 `stream = false`、`store = false`、没有 `reasoning`、`max_output_tokens` 来自现有 `max_tokens`。
+- 上游返回 reasoning item 不进入任何持久化或用户输出；只使用完成 response 的排序 JSON。
+- Responses 请求失败、未完成或输出非法时，Router 使用既有 lexical/vector 顺序并留下 retrieval debug fallback 事实。
+- 真实 Responses rerank 至少完成一次有多个候选的成功排序，且没有 session/TUI schema 变化。
+- 完整验证与 re-review 后不存在未处理的现实 P0/P1。
+
+### 阶段 9：跟进主线后的集成复验
+
+实施：
+
+1. 将本分支两个提交 rebase 到最新 `origin/main`，保留主线新增的 compaction context-window、工具结果分级降载、文件权限清理与 TUI session ID 行为，再叠加 Responses replay/media 投影。
+2. provider adapter 显式声明自己能够回放的私有 replay protocol；只有同协议 replay 才进入当前请求投影、token 估算和 compaction 预算。跨协议继续使用 canonical content，且不修改落盘 JSONL，之后切回 Responses 时仍可恢复原始 replay。
+3. 将 Responses `message.content[].type = "refusal"` 归一为可见 assistant 文本；JSON 与 SSE 共用同一终态结果，SSE 同时转发 `response.refusal.delta`。
+4. 对 rebase 冲突域、上述两条协议边界和 Router Responses rerank 重新执行定向测试、完整验证、真实 LLM TUI 与独立只读复审。
+
+阶段验收：
+
+- rebase 后仍只有两个原有语义提交，提交顺序不变，分支相对最新 `origin/main` 仅 ahead 2。
+- Responses 历史在 Responses provider 下继续计算并回传 replay；在 Chat/Anthropic 下不发送也不计入预算，session 原始 replay 不被删除。
+- refusal-only 的 JSON/SSE 完成响应能够显示、落盘并提交 turn，不触发空响应错误；SSE refusal delta 可实时显示。
+- 主线 compaction hardening 与 Responses prefix/suffix、媒体和 replay 边界的组合测试通过。
+- 真实 TUI 新 session 完成 Agent Responses streaming、`consult_router` 与 Router Responses rerank，fallback 为 0，stderr 为空。
+- 修复独立 reviewer 提出的现实 P1 后再次复审，最终没有未处理的现实 P0/P1。
+
 ## 8. 模块级改动范围
 
 预计新增或修改：
@@ -528,6 +577,7 @@ review 处理规则：
 ## 11. 当前完成状态
 
 - 产品与协议决策：已拍板。
+- 阶段 8：已完成。Agent 与 Router 公开 provider 名称已收敛为 `openai_chat`、`openai_responses`，旧名称仅保留为隐藏解析 alias；Router Responses rerank 已按 R1A、R2A、R3B、R4A、R5A、R6A、R7A 接入既有构造、retry 与 fallback 边界。
 - PRD：已建立并作为本次实现与验收基线；实现期新增的 13A–15A 均为既有语义下的协议安全边界，没有修改 1A–12A/8B。
 - 阶段 0–4：已完成；provider replay、Responses JSON/SSE、adapter/config、工具/fallback/continuation、session/compaction/media 与稳定文档均已落地。
 - 阶段 5：真实 LLM TUI 场景 A–E 全部通过。实际观察覆盖文本 streaming 与下一轮历史、真实 function call/tool output 回环、未 compact 历史图片在下一轮与正常退出/resume 后继续可见、首个可见 delta 后断流并按同一 Responses 协议 non-streaming fallback、低 max-token 下的多请求 continuation 与后续历史。TUI stderr 均为空；结构断言与脱敏 capture 仅保存在忽略的 `target/`。
@@ -535,4 +585,8 @@ review 处理规则：
 - 阶段 7：`cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets --all-features`、`cargo check --all-targets --all-features` 全部通过；完整测试结果为 1920 个库测试以及全部二进制/集成测试通过。项目默认 tmux `/help` → `/exit` smoke 通过且无残留测试进程。按本 PRD约定未运行版本一致性脚本。
 - 15A 修订回归：重新通过格式、Clippy、1920 个库测试、全部二进制/集成测试与 check；真实 LLM TUI 依次覆盖短文本、同会话 replay、40 行长文本和 `file_read` 工具回环，共观察到 24 个 streaming delta、4 个成功 turn、1 组完整 tool use/result，未出现 non-streaming fallback，TUI stderr 为空。该兼容 endpoint 未按本次低 `max_output_tokens` 配置返回 incomplete，因此 continuation 仍由自动化测试覆盖，不把长输出误报为真实 continuation 验收。
 - 最终全量 review：独立 reviewer 覆盖相对 `origin/main` 的 30 个已跟踪修改文件与 6 个新增文件，并复跑 44 个 Responses 定向测试和完整测试集；结论为“未发现 P0/P1 级别缺陷”。没有遗留 finding。
+- 阶段 8 自动化验收：Router rerank 7 个定向测试、配置 90 个定向测试和 Agent provider bootstrap 2 个定向测试通过；fake server 已断言 non-streaming、`store = false`、省略 `reasoning`、`max_tokens` 到 `max_output_tokens` 的映射，以及 completed/未完成/非法 JSON 边界。完整验证重新通过 `cargo fmt --all -- --check`、全 targets/features Clippy、1927 个库测试及全部二进制/集成测试、全 targets/features check；按约定未执行版本一致性脚本。
+- 阶段 8 真实验收：先用真实 Responses rerank 对 3 个候选完成直接查询，`rerank_fallback = false`；随后在全新 TUI `session_1fe0903a` 中由 Agent Responses 发起一次 `consult_router`，Router Responses 对 4 个候选完成重排，工具结果回灌后 Agent 完成回答。共观察到 10 个 streaming delta、1 个 committed turn、0 次 non-streaming fallback、0 个非 committed turn，TUI stderr 为 0 字节；标准 `/help` → `/exit` tmux smoke 同样通过且 stderr 为空，所有测试进程均已清理。
+- 阶段 8 针对性 review：本地审查与 `code-review` 技能要求的独立只读审查均覆盖 provider alias/canonical serialization、Router one-shot 请求、终态解析与失败降级；两遍结论均为无现实 P0/P1，因此无需修复轮或二次复审，没有遗留 finding。
+- 阶段 9：两个语义提交已按 9A rebase 到 `origin/main`，保留主线新增的 compaction context-window、工具结果分级降载、文件权限清理与 TUI session ID 行为。冲突解决后补齐同协议 replay 的请求投影、token 估算以及自动/手工 compact 尾部选择，跨协议不会因未发送的 Responses replay 过度推进 `committed_message_until`；同时补齐 JSON/SSE refusal 可见文本。完整验证通过 `cargo fmt --all -- --check`、全 targets/features Clippy、2021 个库测试、全部二进制/集成测试和全 targets/features check；按约定未运行版本一致性脚本。最终真实 LLM TUI 使用全新 `session_602693cd`，观察到 14 个 streaming delta、1 个 committed turn、1 组 `consult_router` tool use/result、0 次 non-streaming fallback、0 个非 committed turn，TUI stderr 为 0 字节，Responses replay 正常落盘，所有测试进程均已清理。首轮独立审查发现 refusal-only 丢失和跨协议 replay 预算两项现实 P1；首次复审进一步发现 compact committed-tail 选择仍未按协议过滤；全部修复并回归后，最终独立只读复审覆盖 checkpoint 恢复、跨协议持久化、媒体/工具结果/文件权限与 Router 降级路径，结论为“未发现 P0/P1”，没有遗留 finding。
 - TUI：未新增或修改用户可见渲染语义；Responses 文本、工具与 fallback 继续复用既有 Text/Tool/activity 展示，reasoning 仍只保存和回传、不展示。

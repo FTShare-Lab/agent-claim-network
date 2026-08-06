@@ -635,12 +635,14 @@ impl Default for EmbeddingConfig {
 pub enum RerankProvider {
     #[serde(rename = "heuristic")]
     Heuristic,
-    #[serde(rename = "openai_compatible_chat")]
-    OpenAiCompatibleChat,
+    #[serde(rename = "openai_chat", alias = "openai_compatible_chat")]
+    OpenAiChat,
+    #[serde(rename = "openai_responses", alias = "openai_compatible_responses")]
+    OpenAiResponses,
 }
 
 fn default_rerank_provider() -> RerankProvider {
-    RerankProvider::OpenAiCompatibleChat
+    RerankProvider::OpenAiChat
 }
 
 fn default_rerank_endpoint() -> String {
@@ -814,10 +816,10 @@ pub enum ReasoningEffort {
 pub enum LlmProvider {
     #[serde(rename = "anthropic")]
     Anthropic,
-    #[serde(rename = "openai_compatible_chat")]
-    OpenAiCompatibleChat,
-    #[serde(rename = "openai_compatible_responses")]
-    OpenAiCompatibleResponses,
+    #[serde(rename = "openai_chat", alias = "openai_compatible_chat")]
+    OpenAiChat,
+    #[serde(rename = "openai_responses", alias = "openai_compatible_responses")]
+    OpenAiResponses,
 }
 
 /// router retrieval 的开关与 top-N 参数。
@@ -3080,17 +3082,93 @@ router_endpoint = "http://127.0.0.1:8061"
     }
 
     #[test]
-    fn openai_compatible_responses_provider_is_accepted() {
+    fn openai_responses_provider_is_accepted() {
         let raw = minimal_config_without_optional_defaults().replace(
             r#"provider = "anthropic""#,
-            r#"provider = "openai_compatible_responses""#,
+            r#"provider = "openai_responses""#,
         );
 
         let cfg = parse_and_validate(&raw).unwrap();
 
-        assert_eq!(
-            cfg.agent.llm.provider,
-            LlmProvider::OpenAiCompatibleResponses
+        assert_eq!(cfg.agent.llm.provider, LlmProvider::OpenAiResponses);
+    }
+
+    #[test]
+    fn legacy_agent_provider_names_are_accepted_as_hidden_aliases() {
+        for (legacy, expected) in [
+            ("openai_compatible_chat", LlmProvider::OpenAiChat),
+            ("openai_compatible_responses", LlmProvider::OpenAiResponses),
+        ] {
+            let raw = minimal_config_without_optional_defaults().replace(
+                r#"provider = "anthropic""#,
+                &format!(r#"provider = "{legacy}""#),
+            );
+
+            let cfg = parse_and_validate(&raw).unwrap();
+
+            assert_eq!(cfg.agent.llm.provider, expected);
+        }
+    }
+
+    #[test]
+    fn agent_provider_names_serialize_canonically() {
+        #[derive(Serialize)]
+        struct ProviderConfig {
+            provider: LlmProvider,
+        }
+
+        for (provider, canonical) in [
+            (LlmProvider::Anthropic, "anthropic"),
+            (LlmProvider::OpenAiChat, "openai_chat"),
+            (LlmProvider::OpenAiResponses, "openai_responses"),
+        ] {
+            let serialized = toml::to_string(&ProviderConfig { provider }).unwrap();
+            assert!(serialized.contains(&format!(r#"provider = "{canonical}""#)));
+        }
+    }
+
+    #[test]
+    fn router_rerank_provider_names_and_hidden_aliases_are_accepted() {
+        #[derive(Deserialize, Serialize)]
+        struct ProviderConfig {
+            provider: RerankProvider,
+        }
+
+        for (raw, expected, canonical) in [
+            ("heuristic", RerankProvider::Heuristic, "heuristic"),
+            ("openai_chat", RerankProvider::OpenAiChat, "openai_chat"),
+            (
+                "openai_responses",
+                RerankProvider::OpenAiResponses,
+                "openai_responses",
+            ),
+            (
+                "openai_compatible_chat",
+                RerankProvider::OpenAiChat,
+                "openai_chat",
+            ),
+            (
+                "openai_compatible_responses",
+                RerankProvider::OpenAiResponses,
+                "openai_responses",
+            ),
+        ] {
+            let parsed: ProviderConfig = toml::from_str(&format!(r#"provider = "{raw}""#)).unwrap();
+            assert_eq!(parsed.provider, expected);
+            assert!(toml::to_string(&parsed)
+                .unwrap()
+                .contains(&format!(r#"provider = "{canonical}""#)));
+        }
+    }
+
+    #[test]
+    fn router_rerank_rejects_reasoning_effort_parameter() {
+        expect_parse_err_contains(
+            format!(
+                "{}\n[router.rerank]\nreasoning_effort = \"low\"\n",
+                minimal_config_without_optional_defaults()
+            ),
+            "unknown field `reasoning_effort`",
         );
     }
 
@@ -3607,12 +3685,9 @@ acn_key_env = "DEMO_ACN_AUTH_KEY""#,
         );
     }
 
-    fn openai_compatible_chat_config_raw() -> String {
+    fn openai_chat_config_raw() -> String {
         minimal_config_without_optional_defaults()
-            .replace(
-                r#"provider = "anthropic""#,
-                r#"provider = "openai_compatible_chat""#,
-            )
+            .replace(r#"provider = "anthropic""#, r#"provider = "openai_chat""#)
             .replace(
                 r#"model = "example-anthropic-model""#,
                 r#"model = "example-chat-model""#,
@@ -3623,11 +3698,11 @@ acn_key_env = "DEMO_ACN_AUTH_KEY""#,
             )
     }
 
-    fn openai_compatible_responses_config_raw() -> String {
-        openai_compatible_chat_config_raw()
+    fn openai_responses_config_raw() -> String {
+        openai_chat_config_raw()
             .replace(
-                r#"provider = "openai_compatible_chat""#,
-                r#"provider = "openai_compatible_responses""#,
+                r#"provider = "openai_chat""#,
+                r#"provider = "openai_responses""#,
             )
             .replace(
                 r#"model = "example-chat-model""#,
@@ -4145,7 +4220,7 @@ router_endpoint = "http://router.example"
     #[test]
     fn supervisor_control_existing_config_does_not_create_storage_dirs() {
         let _env = EnvGuard::clean(LLM_ENV_KEYS);
-        let (dir, path) = write_config(&openai_compatible_chat_config_raw());
+        let (dir, path) = write_config(&openai_chat_config_raw());
         let acn_home = dir.path().join("acn");
 
         let (cfg, used_path) = Config::load_or_init_for_supervisor_control(Some(&path)).unwrap();
@@ -4160,8 +4235,8 @@ router_endpoint = "http://router.example"
     #[test]
     fn update_config_prefers_explicit_path_and_does_not_require_llm_key_or_create_dirs() {
         let env = EnvGuard::clean(CONFIG_BOOTSTRAP_ENV_KEYS);
-        let (_env_dir, env_path) = write_config(&openai_compatible_chat_config_raw());
-        let (explicit_dir, explicit_path) = write_config(&openai_compatible_chat_config_raw());
+        let (_env_dir, env_path) = write_config(&openai_chat_config_raw());
+        let (explicit_dir, explicit_path) = write_config(&openai_chat_config_raw());
         env.set("ACN_CONFIG", env_path.to_str().unwrap());
         let acn_home = explicit_dir.path().join("acn");
 
@@ -4174,30 +4249,27 @@ router_endpoint = "http://router.example"
     }
 
     #[test]
-    fn openai_compatible_chat_provider_reads_configured_api_key_env() {
+    fn openai_chat_provider_reads_configured_api_key_env() {
         let env = EnvGuard::clean(LLM_ENV_KEYS);
         env.set("EXAMPLE_LLM_API_KEY", "example-key");
-        let (_dir, path) = write_config(&openai_compatible_chat_config_raw());
+        let (_dir, path) = write_config(&openai_chat_config_raw());
 
         let cfg = Config::load(&path).unwrap();
 
-        assert_eq!(cfg.agent.llm.provider, LlmProvider::OpenAiCompatibleChat);
+        assert_eq!(cfg.agent.llm.provider, LlmProvider::OpenAiChat);
         assert_eq!(cfg.agent.llm.api_key_env, "EXAMPLE_LLM_API_KEY");
         assert_eq!(cfg.agent.llm.api_key.as_deref(), Some("example-key"));
     }
 
     #[test]
-    fn openai_compatible_responses_provider_reads_configured_api_key_env() {
+    fn openai_responses_provider_reads_configured_api_key_env() {
         let env = EnvGuard::clean(LLM_ENV_KEYS);
         env.set("EXAMPLE_LLM_API_KEY", "example-key");
-        let (_dir, path) = write_config(&openai_compatible_responses_config_raw());
+        let (_dir, path) = write_config(&openai_responses_config_raw());
 
         let cfg = Config::load(&path).unwrap();
 
-        assert_eq!(
-            cfg.agent.llm.provider,
-            LlmProvider::OpenAiCompatibleResponses
-        );
+        assert_eq!(cfg.agent.llm.provider, LlmProvider::OpenAiResponses);
         assert_eq!(cfg.agent.llm.api_key_env, "EXAMPLE_LLM_API_KEY");
         assert_eq!(cfg.agent.llm.api_key.as_deref(), Some("example-key"));
     }
@@ -4224,11 +4296,11 @@ router_endpoint = "http://router.example"
     }
 
     #[test]
-    fn openai_compatible_chat_provider_ignores_global_llm_api_key() {
+    fn openai_chat_provider_ignores_global_llm_api_key() {
         let env = EnvGuard::clean(LLM_ENV_KEYS);
         env.set("EXAMPLE_LLM_API_KEY", "example-key");
         env.set("LLM_API_KEY", "llm-key");
-        let (_dir, path) = write_config(&openai_compatible_chat_config_raw());
+        let (_dir, path) = write_config(&openai_chat_config_raw());
 
         let cfg = Config::load(&path).unwrap();
 
@@ -4236,11 +4308,11 @@ router_endpoint = "http://router.example"
     }
 
     #[test]
-    fn openai_compatible_chat_provider_ignores_global_llm_endpoint() {
+    fn openai_chat_provider_ignores_global_llm_endpoint() {
         let env = EnvGuard::clean(LLM_ENV_KEYS);
         env.set("EXAMPLE_LLM_API_KEY", "example-key");
         env.set("LLM_ENDPOINT", "https://llm.example");
-        let raw = openai_compatible_chat_config_raw().replace(
+        let raw = openai_chat_config_raw().replace(
             r#"endpoint = "https://api.anthropic.com""#,
             r#"endpoint = "https://chat.example.com/v1/chat/completions""#,
         );
@@ -4255,10 +4327,10 @@ router_endpoint = "http://router.example"
     }
 
     #[test]
-    fn openai_compatible_chat_provider_keeps_config_endpoint_without_llm_endpoint() {
+    fn openai_chat_provider_keeps_config_endpoint_without_llm_endpoint() {
         let env = EnvGuard::clean(LLM_ENV_KEYS);
         env.set("EXAMPLE_LLM_API_KEY", "example-key");
-        let raw = openai_compatible_chat_config_raw().replace(
+        let raw = openai_chat_config_raw().replace(
             r#"endpoint = "https://api.anthropic.com""#,
             r#"endpoint = "https://chat.example.com/v1/chat/completions""#,
         );
@@ -4634,11 +4706,11 @@ workspace_root = ".""#,
     }
 
     #[test]
-    fn openai_compatible_chat_provider_ignores_model_name_env() {
+    fn openai_chat_provider_ignores_model_name_env() {
         let env = EnvGuard::clean(LLM_ENV_KEYS);
         env.set("EXAMPLE_LLM_API_KEY", "example-key");
         env.set("MODEL_NAME", "ignored-model");
-        let (_dir, path) = write_config(&openai_compatible_chat_config_raw());
+        let (_dir, path) = write_config(&openai_chat_config_raw());
 
         let cfg = Config::load(&path).unwrap();
 
@@ -4646,9 +4718,9 @@ workspace_root = ".""#,
     }
 
     #[test]
-    fn openai_compatible_chat_provider_without_key_mentions_configured_api_key_env() {
+    fn openai_chat_provider_without_key_mentions_configured_api_key_env() {
         let _env = EnvGuard::clean(LLM_ENV_KEYS);
-        let (_dir, path) = write_config(&openai_compatible_chat_config_raw());
+        let (_dir, path) = write_config(&openai_chat_config_raw());
 
         let err = Config::load(&path).unwrap_err();
         let err = err.to_string();
@@ -4661,12 +4733,12 @@ workspace_root = ".""#,
     #[test]
     fn supervisor_control_load_does_not_require_agent_llm_api_key() {
         let _env = EnvGuard::clean(LLM_ENV_KEYS);
-        let (_dir, path) = write_config(&openai_compatible_chat_config_raw());
+        let (_dir, path) = write_config(&openai_chat_config_raw());
 
         let (cfg, used_path) = Config::load_or_init_for_supervisor_control(Some(&path)).unwrap();
 
         assert_eq!(used_path, path);
-        assert_eq!(cfg.agent.llm.provider, LlmProvider::OpenAiCompatibleChat);
+        assert_eq!(cfg.agent.llm.provider, LlmProvider::OpenAiChat);
         assert_eq!(cfg.agent.llm.api_key_env, "EXAMPLE_LLM_API_KEY");
         assert_eq!(cfg.agent.llm.api_key, None);
         assert_eq!(
@@ -4678,7 +4750,7 @@ workspace_root = ".""#,
     #[test]
     fn real_provider_requires_configured_api_key_env_name() {
         let _env = EnvGuard::clean(LLM_ENV_KEYS);
-        let raw = openai_compatible_chat_config_raw().replace(
+        let raw = openai_chat_config_raw().replace(
             r#"api_key_env = "EXAMPLE_LLM_API_KEY""#,
             r#"api_key_env = """#,
         );
@@ -5121,6 +5193,7 @@ service_name = "agent_claim_network"
         assert!(!cfg.router.embedding.model.is_empty());
         assert!(!cfg.router.embedding.api_key_env.is_empty());
         assert!(cfg.router.embedding.max_concurrency > 0);
+        assert_eq!(cfg.router.rerank.provider, RerankProvider::OpenAiChat);
         assert!(!cfg.router.rerank.model.is_empty());
         assert!(!cfg.router.rerank.api_key_env.is_empty());
     }

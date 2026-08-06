@@ -50,7 +50,7 @@ text, acn_home_count = re.subn(
 )
 text, provider_count = re.subn(
     r'(?m)^provider = "anthropic"$',
-    'provider = "openai_compatible_chat"',
+    'provider = "openai_chat"',
     text,
     count=1,
 )
@@ -787,7 +787,7 @@ main() {
     source export_env.sh
   fi
   require_env ACN_LLM_API_KEY
-  append_summary "- real LLM provider: openai_compatible_chat"
+  append_summary "- real LLM provider: openai_chat"
   append_summary "- repeats: happy=$REAL_LLM_HAPPY_REPEATS boundary=$REAL_LLM_BOUNDARY_REPEATS lock=$REAL_LLM_LOCK_REPEATS diff=$REAL_LLM_DIFF_REPEATS"
   TUI_BUILD_COMMAND="${TUI_BUILD_COMMAND:-cargo build --quiet --bin acn}"
 
