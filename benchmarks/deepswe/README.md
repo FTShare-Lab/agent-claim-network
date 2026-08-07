@@ -31,6 +31,7 @@ A / B_empty 容器中不存在该文件。
 ## 常用命令
 
 ```sh
+sh benchmarks/deepswe/docker/build-acn-eval-amd64.sh
 acn-deepswe validate-config /absolute/tasks/<task> /absolute/checked
 acn-deepswe freeze-dataset /absolute/tasks /absolute/dataset.json --seed 17
 acn-deepswe plan /absolute/dataset.json /absolute/run --seed 99
@@ -38,6 +39,14 @@ acn-deepswe append-freeze-barrier /absolute/host-events.jsonl attempt-1 barrier-
 acn-deepswe freeze-claims /absolute/host-events.jsonl attempt-1 /absolute/claims.json
 acn-deepswe scan-sentinels /absolute/run --sentinel <sentinel>
 ```
+
+`build-acn-eval-amd64.sh` 支持 Darwin / Linux 的 arm64 与 x86_64 宿主。脚本会读取宿主
+kernel 与 CPU 架构，并从 Docker daemon 获取实际 Linux 容器架构，据此选择原生 builder；
+最终产物固定为 Linux x86_64 ELF。缺少 Docker、平台不受支持或产物架构不符时会直接失败。
+脚本默认从 DaoCloud 拉取 `ubuntu:24.04` 和 `debian:bookworm-slim`，校验平台后重新打回
+官方 tag，供 Pier 的 Squid builder 和 ACN builder 使用。可通过
+`--mirror-prefix <registry-prefix>` 或 `ACN_DOCKER_MIRROR_PREFIX` 更换镜像源；能直连
+Docker Hub 时传 `--direct`。
 
 `validate-config` 做 fail-closed 网络转换：只有 `agent.network_mode` 与
 `verifier.network_mode` 均为 `"no-network"` 时才生成 Pier 兼容副本，并对两个环境写入
