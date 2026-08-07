@@ -24,6 +24,10 @@ path = "src/bin/router.rs"
 name = "acn-maintainer"
 path = "src/bin/maintainer.rs"
 
+[[bin]]
+name = "acn_eval"
+path = "src/bin/acn_eval.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
