@@ -592,7 +592,11 @@ class Task1HostRunner:
             execution.artifacts.normalized_task_dir / "task.toml"
         )
         return {
-            "pier_task_matches_attempt": pier.task_name == attempt.task_id,
+            "pier_task_matches_attempt": _pier_task_matches_attempt(
+                execution.artifacts.normalized_task_dir / "task.toml",
+                attempt.task_id,
+                pier.task_name,
+            ),
             "pier_task_checksum_matches_a": task_checksum_matches_a,
             "pier_trial_uri_unique": trial_uri_unique,
             "pier_trial_directory_unique": trial_directory_unique,
@@ -806,6 +810,28 @@ def _task_network_disabled(task_toml: Path) -> tuple[bool, bool]:
         isinstance(environment, dict) and environment.get("allow_internet") is False,
         isinstance(verifier_environment, dict)
         and verifier_environment.get("allow_internet") is False,
+    )
+
+
+def _pier_task_matches_attempt(
+    task_toml: Path, attempt_task_id: str, pier_task_name: str
+) -> bool:
+    """同时核验稳定 task_id 与 Pier 写入的 namespaced task.name。"""
+    try:
+        raw = tomllib.loads(task_toml.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    task = raw.get("task")
+    metadata = raw.get("metadata")
+    if not isinstance(task, dict) or not isinstance(metadata, dict):
+        return False
+    expected_task_name = task.get("name")
+    configured_task_id = metadata.get("task_id")
+    return (
+        isinstance(expected_task_name, str)
+        and isinstance(configured_task_id, str)
+        and configured_task_id == attempt_task_id
+        and pier_task_name == expected_task_name
     )
 
 

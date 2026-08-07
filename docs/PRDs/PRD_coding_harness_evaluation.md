@@ -1,6 +1,6 @@
 # PRD: ACN DeepSWE 评测打样
 
-> 状态：已实现 Pre-smoke 评测基础设施；Smoke 与 Full 的实际执行仍需按本文冻结配置后另行启动。
+> 状态：已实现 Pre-smoke 评测基础设施；Smoke 与 Full 的实际执行按冻结配置单独启动并保留 provenance。
 
 ## 结论
 
@@ -104,12 +104,17 @@ ACN 不要求伪装成 `mini-swe-agent`，其原生文件、命令和 router 工
 | 工具 | 三组工具 schema、权限、并发上限和输出截断相同；除 router 返回内容外不得因组别变化 |
 | 人工交互 | 关闭 `ask_user` 和 TUI user shell；一次性提交任务，agent 自主结束 |
 | Subagent | 首期关闭，避免引入额外模型实例和未计量的共享状态 |
-| 超时 / 资源 | agent 5400 秒，verifier 1800 秒；2 CPU / 8 GiB / 20 GiB / 0 GPU |
-| step / cost limit | 不设置早于 5400 秒 timeout 的停止线；若实现要求正数上限，设为不会在 Smoke 中触发的固定值 |
+| 超时 / 资源 | 官方对齐组：agent 5400 秒、verifier 1800 秒；扩展预算组：agent 7200 秒、verifier 1800 秒；均为 2 CPU / 8 GiB / 20 GiB / 0 GPU |
+| step / cost limit | 不设置早于所属 agent timeout 的停止线；若实现要求正数上限，设为不会在 Smoke 中触发的固定值 |
 | verifier | 与 agent 分离；只应用最终 patch，在 pristine 容器中离线判卷 |
 
 网络必须由 runner/sandbox 强制执行，不能只在 prompt 中要求模型“不要联网”。模型 broker
 记录每条请求；白名单外请求写入审计日志并拒绝。
+
+扩展预算组只用于诊断模型在官方 90 分钟墙钟外的完成行为，不与官方榜单或官方对齐组混算。它通过
+独立配置把 `agent_seconds` 设为 7200；该值同时驱动 Pier 的 `override_timeout_sec`、ACN 单次
+请求 timeout 与 attempt 自有 deadline，后者固定预留 30 秒收尾。配置、hash 与 timeout 均写入
+每次运行的 provenance。
 
 ### 3.3 Claim 可见性矩阵
 
