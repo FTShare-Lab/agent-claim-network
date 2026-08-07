@@ -1,6 +1,6 @@
 """Pier `BaseAgent` 适配：上传 ACN 产物、声明出网域名、执行单个 attempt。
 
-模型 key 由宿主环境注入容器进程环境，出网由宿主的域名 allowlist 限死，
+模型 key 只经一次性受限文件进入容器，出网由宿主的域名 allowlist 限死，
 适配层不自建代理。
 """
 
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +37,7 @@ CONTAINER_ROOT = "/opt/acn-eval"
 CONTAINER_ATTEMPT_CONFIG = f"{CONTAINER_ROOT}/attempt.toml"
 CONTAINER_ACN_CONFIG = f"{CONTAINER_ROOT}/acn.toml"
 CONTAINER_CLAIM_BUNDLE = f"{CONTAINER_ROOT}/claims.json"
+CONTAINER_MODEL_KEY_FILE = f"{CONTAINER_ROOT}/model-key"
 CONTAINER_SKILL_PATH = "/logs/agent/runtime/skills/coding-benchmark"
 
 
@@ -105,19 +107,27 @@ class AcnPierAdapter:
             uploads.append(Upload(claim_bundle, CONTAINER_CLAIM_BUNDLE))
         return SetupPlan(tuple(uploads), frozen_asset.content_hash)
 
-    def container_process_env(self, proxy_env: dict[str, str] | None) -> dict[str, str]:
-        """把 Pier 的代理变量与模型 key 合并；宿主侧 key 绝不能透传。"""
+    def read_model_key(self) -> str:
+        """读取仅供本次容器 setup 使用的模型 key，拒绝不能安全写入文件的值。"""
         key = os.environ.get(self.host_model_key_env)
         if not key:
             raise ValueError(f"宿主环境缺少模型 key: {self.host_model_key_env}")
+        if any(char in key for char in ("\x00", "\r", "\n")):
+            raise ValueError("模型 key 不能包含空字节或换行")
+        return key
+
+    def container_process_env(self, proxy_env: dict[str, str] | None) -> dict[str, str]:
+        """仅保留 Pier 代理变量；模型 key 不得进入 docker compose 的 argv。"""
         environment = dict(proxy_env or {})
         environment.pop(self.host_model_key_env, None)
         environment.pop(self.container_model_key_env, None)
-        environment[self.container_model_key_env] = key
         return environment
 
     def build_run_command(self) -> str:
         return (
+            "set -eu; "
+            f"export {self.container_model_key_env}=\"$(cat {CONTAINER_MODEL_KEY_FILE})\"; "
+            f"rm -f {CONTAINER_MODEL_KEY_FILE}; "
             f"cd /app && exec {CONTAINER_ROOT}/acn_eval --config {CONTAINER_ATTEMPT_CONFIG}"
             " > /logs/agent/acn_eval.stdout 2> /logs/agent/acn_eval.stderr"
         )
@@ -210,6 +220,7 @@ class AcnEvalPierAgent(BaseAgent):
         return NetworkAllowlist(domains=domains)
 
     async def setup(self, environment: BaseEnvironment) -> None:
+        model_key = self.adapter.read_model_key()
         created = await environment.exec(
             f"mkdir -p {CONTAINER_ROOT} /logs/agent/runtime/skills /logs/agent/evaluation",
             user="root",
@@ -229,8 +240,13 @@ class AcnEvalPierAgent(BaseAgent):
                 await environment.upload_dir(upload.local_path, upload.remote_path)
             else:
                 await environment.upload_file(upload.local_path, upload.remote_path)
+        key_path = _write_ephemeral_model_key(model_key)
+        try:
+            await environment.upload_file(key_path, CONTAINER_MODEL_KEY_FILE)
+        finally:
+            key_path.unlink(missing_ok=True)
         permissions = await environment.exec(
-            f"chmod 0755 {CONTAINER_ROOT}/acn_eval",
+            f"chmod 0755 {CONTAINER_ROOT}/acn_eval && chmod 0600 {CONTAINER_MODEL_KEY_FILE}",
             user="root",
             timeout_sec=30,
         )
@@ -252,3 +268,16 @@ class AcnEvalPierAgent(BaseAgent):
             env=self.adapter.container_post_run_env(environment.agent_process_env(None)),
         )
         context.metadata = {"acn_eval_exit_code": result.return_code}
+
+
+def _write_ephemeral_model_key(key: str) -> Path:
+    """写入仅供 Pier upload_file 消费的 0600 临时文件，调用者必须立即删除。"""
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix="acn-eval-model-key-",
+        delete=False,
+    ) as handle:
+        handle.write(key)
+        handle.write("\n")
+        return Path(handle.name)
