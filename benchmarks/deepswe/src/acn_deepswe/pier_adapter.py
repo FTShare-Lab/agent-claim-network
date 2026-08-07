@@ -106,11 +106,15 @@ class AcnPierAdapter:
         return SetupPlan(tuple(uploads), frozen_asset.content_hash)
 
     def container_process_env(self, proxy_env: dict[str, str] | None) -> dict[str, str]:
-        """把 Pier 的 Squid 代理变量与模型 key 合并成容器进程环境。"""
+        """把 Pier 的代理变量与模型 key 合并；宿主侧 key 绝不能透传。"""
         key = os.environ.get(self.host_model_key_env)
         if not key:
             raise ValueError(f"宿主环境缺少模型 key: {self.host_model_key_env}")
-        return {**(proxy_env or {}), self.container_model_key_env: key}
+        environment = dict(proxy_env or {})
+        environment.pop(self.host_model_key_env, None)
+        environment.pop(self.container_model_key_env, None)
+        environment[self.container_model_key_env] = key
+        return environment
 
     def build_run_command(self) -> str:
         return (
