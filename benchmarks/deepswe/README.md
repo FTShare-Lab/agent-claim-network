@@ -33,7 +33,7 @@ A / B_empty 容器中不存在该文件。
 ```sh
 sh benchmarks/deepswe/docker/build-acn-eval-amd64.sh
 acn-deepswe validate-config /absolute/tasks/<task> /absolute/checked
-acn-deepswe freeze-dataset /absolute/tasks /absolute/dataset.json --seed 17
+acn-deepswe freeze-dataset /absolute/tasks /absolute/dataset.json --seed 17 --sample-size 5
 acn-deepswe plan /absolute/dataset.json /absolute/run --seed 99
 acn-deepswe append-freeze-barrier /absolute/host-events.jsonl attempt-1 barrier-1
 acn-deepswe freeze-claims /absolute/host-events.jsonl attempt-1 /absolute/claims.json
@@ -47,6 +47,9 @@ kernel 与 CPU 架构，并从 Docker daemon 获取实际 Linux 容器架构，�
 官方 tag，供 Pier 的 Squid builder 和 ACN builder 使用。可通过
 `--mirror-prefix <registry-prefix>` 或 `ACN_DOCKER_MIRROR_PREFIX` 更换镜像源；能直连
 Docker Hub 时传 `--direct`。
+
+`freeze-dataset` 默认抽取 5 题，适用于 Pre-smoke；Smoke 固定抽 30 题时传
+`--sample-size 30`。抽样始终基于稳定排序、固定 seed 的无放回选择，并在执行前写入 manifest。
 
 `validate-config` 做 fail-closed 网络转换：只有 `agent.network_mode` 与
 `verifier.network_mode` 均为 `"no-network"` 时才生成 Pier 兼容副本，并对两个环境写入

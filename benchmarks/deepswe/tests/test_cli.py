@@ -22,12 +22,26 @@ class CliTests(unittest.TestCase):
             (task / "task.toml").write_text(TASK)
             self.assertEqual(main(["validate-config", str(task), str(root / "checked")]), 0)
             tasks = root / "tasks"
-            for index in range(5):
+            for index in range(6):
                 candidate = tasks / f"task-{index}"
                 candidate.mkdir(parents=True)
                 (candidate / "task.toml").write_text(TASK)
             manifest = root / "freeze.json"
-            self.assertEqual(main(["freeze-dataset", str(tasks), str(manifest), "--seed", "8"]), 0)
+            self.assertEqual(
+                main(
+                    [
+                        "freeze-dataset",
+                        str(tasks),
+                        str(manifest),
+                        "--seed",
+                        "8",
+                        "--sample-size",
+                        "6",
+                    ]
+                ),
+                0,
+            )
+            self.assertEqual(len(json.loads(manifest.read_text())["task_ids"]), 6)
             self.assertEqual(main(["plan", str(manifest), str(root / "plan"), "--seed", "5"]), 0)
             self.assertTrue((root / "plan" / "attempt-plan.json").is_file())
             ledger = root / "host-events.jsonl"

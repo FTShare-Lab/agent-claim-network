@@ -22,10 +22,16 @@ def main(argv: list[str] | None = None) -> int:
     validate = subparsers.add_parser("validate-config", help="检查并生成 Pier 兼容的离线 task.toml")
     validate.add_argument("task", type=Path)
     validate.add_argument("output_directory", type=Path)
-    freeze = subparsers.add_parser("freeze-dataset", help="冻结五个任务的无放回样本")
+    freeze = subparsers.add_parser("freeze-dataset", help="冻结指定数量任务的无放回样本")
     freeze.add_argument("tasks_root", type=Path)
     freeze.add_argument("manifest", type=Path)
     freeze.add_argument("--seed", type=int, required=True)
+    freeze.add_argument(
+        "--sample-size",
+        type=int,
+        default=5,
+        help="冻结任务数，默认 5（Pre-smoke）；Smoke 可设为 30",
+    )
     plan = subparsers.add_parser("plan", help="从冻结 manifest 构建 A/B 尝试计划")
     plan.add_argument("manifest", type=Path)
     plan.add_argument("output_root", type=Path)
@@ -67,7 +73,12 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         elif args.command == "freeze-dataset":
-            result = freeze_dataset(args.tasks_root.resolve(), args.manifest.resolve(), args.seed)
+            result = freeze_dataset(
+                args.tasks_root.resolve(),
+                args.manifest.resolve(),
+                args.seed,
+                sample_size=args.sample_size,
+            )
             print(
                 json.dumps(
                     {"manifest_path": str(args.manifest.resolve()), **result.to_dict()},

@@ -56,6 +56,19 @@ class DatasetAndPlanTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(DatasetFreezeError):
                 FrozenDatasetManifest.from_dict({**manifest, field: value})
 
+    def test_freeze_rejects_non_positive_sample_size(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tasks"
+            task = root / "task-a"
+            task.mkdir(parents=True)
+            (task / "task.toml").write_text(TASK)
+
+            for sample_size in (0, -1):
+                with self.subTest(sample_size=sample_size), self.assertRaisesRegex(
+                    DatasetFreezeError, "正整数"
+                ):
+                    freeze_dataset(root, Path(directory) / "freeze.json", seed=17, sample_size=sample_size)
+
     def test_checked_in_manifests_parse_and_build_attempt_plans(self) -> None:
         manifests = (
             "presmoke-v1.json",
