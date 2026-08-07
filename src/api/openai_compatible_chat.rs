@@ -10,17 +10,19 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::chat_completions::{
-    ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
-    ChatCompletionsClient, ChatCompletionsError, ChatContentPart, ChatFinishReason, ChatMessage,
-    ChatMessageContent, ChatStreamEvent, ChatStreamOptions, ChatTool, ChatToolCall,
+    is_stream_failure, ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest,
+    ChatCompletionResponse, ChatCompletionsClient, ChatCompletionsError, ChatContentPart,
+    ChatFinishReason, ChatMessage, ChatMessageContent, ChatStreamEvent, ChatStreamOptions,
+    ChatTool, ChatToolCall,
 };
 use super::context_usage_from_openai_usage;
 use super::continuation::{
     append_with_overlap_dedupe, CONTINUATION_TRIGGER, MAX_CONTINUATION_TURNS,
 };
 use super::provider::{
-    ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy, ProviderRequest, ProviderResponse,
-    ProviderStop, ToolSpec,
+    ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy, ProviderNoConsumableOutput,
+    ProviderRequest, ProviderResponse, ProviderStop, ProviderStreamFailure,
+    ProviderTerminalFailure, ToolSpec,
 };
 use super::redact_media_error_body;
 use super::types::{SessionTurnContentBlock, SessionTurnMessage};
@@ -32,6 +34,10 @@ pub enum OpenAiCompatibleChatError {
     Client(#[from] ChatCompletionsError),
     #[error("Chat Completions 输出不符合预期: {reason}; raw={raw}")]
     OutputShape { reason: String, raw: String },
+    #[error("Chat Completions 没有可消费输出: {reason}")]
+    NoConsumableOutput { reason: String },
+    #[error("Chat Completions 返回确定性终态: {reason}")]
+    TerminalFailure { reason: String },
     #[error(
         "当前模型可能不支持图片 / PDF 附件输入，请确认模型多模态能力或移除附件后重试。上游原始错误: {source}"
     )]
@@ -224,18 +230,33 @@ impl ProviderAdapter for OpenAiCompatibleChatProviderAdapter {
             .await
         {
             Ok(turn) => turn,
-            Err(error) => return Err(wrap_media_rejection(error, request_has_media).into()),
+            Err(error) => {
+                if request.stream && chat_adapter_stream_failure(&error) {
+                    return Err(ProviderStreamFailure::new(error.to_string()).into());
+                }
+                if let OpenAiCompatibleChatError::TerminalFailure { reason } = &error {
+                    return Err(ProviderTerminalFailure::new(reason.clone()).into());
+                }
+                return Err(wrap_media_rejection(error, request_has_media).into());
+            }
         };
         if !turn.merged_text.trim().is_empty() {
             emit(ProviderEvent::AssistantMessageCompleted {
                 text: turn.merged_text.clone(),
             });
         }
-        Ok(ProviderResponse {
-            stop: provider_stop_from_turn(&turn),
-            assistant_message: assistant_turn_message(turn)?,
-        })
+        match provider_response_from_turn(turn) {
+            Ok(response) => Ok(response),
+            Err(OpenAiCompatibleChatError::NoConsumableOutput { reason }) => {
+                Err(ProviderNoConsumableOutput::new(reason).into())
+            }
+            Err(error) => Err(error.into()),
+        }
     }
+}
+
+fn chat_adapter_stream_failure(error: &OpenAiCompatibleChatError) -> bool {
+    matches!(error, OpenAiCompatibleChatError::Client(error) if is_stream_failure(error))
 }
 
 struct ContinuedChatTurn {
@@ -450,6 +471,31 @@ fn provider_stop_from_turn(turn: &ContinuedChatTurn) -> ProviderStop {
     }
 }
 
+fn provider_response_from_turn(
+    turn: ContinuedChatTurn,
+) -> Result<ProviderResponse, OpenAiCompatibleChatError> {
+    let stop = provider_stop_from_turn(&turn);
+    let assistant_message = assistant_turn_message(turn)?;
+    let has_tool_use = assistant_message
+        .content
+        .iter()
+        .any(|block| matches!(block, SessionTurnContentBlock::ToolUse { .. }));
+    if stop == ProviderStop::ToolUse && !has_tool_use {
+        return Err(OpenAiCompatibleChatError::NoConsumableOutput {
+            reason: "Chat 工具终态没有完整 tool call".into(),
+        });
+    }
+    if stop == ProviderStop::Done && assistant_message.content.is_empty() {
+        return Err(OpenAiCompatibleChatError::NoConsumableOutput {
+            reason: "Chat 响应没有可消费的 text 或 tool call".into(),
+        });
+    }
+    Ok(ProviderResponse {
+        stop,
+        assistant_message,
+    })
+}
+
 fn reject_unsupported_finish_reason(
     finish_reason: &ChatFinishReason,
 ) -> Result<(), OpenAiCompatibleChatError> {
@@ -458,13 +504,11 @@ fn reject_unsupported_finish_reason(
         | ChatFinishReason::ToolCalls
         | ChatFinishReason::Length
         | ChatFinishReason::FunctionCall => Ok(()),
-        ChatFinishReason::ContentFilter => Err(OpenAiCompatibleChatError::OutputShape {
+        ChatFinishReason::ContentFilter => Err(OpenAiCompatibleChatError::TerminalFailure {
             reason: "finish_reason=content_filter，拒绝把被过滤输出当作完整 assistant 回合".into(),
-            raw: String::new(),
         }),
-        ChatFinishReason::Other => Err(OpenAiCompatibleChatError::OutputShape {
+        ChatFinishReason::Other => Err(OpenAiCompatibleChatError::TerminalFailure {
             reason: "未知 finish_reason，拒绝静默当作 Done".into(),
-            raw: String::new(),
         }),
     }
 }
@@ -786,7 +830,87 @@ mod tests {
     fn content_filter_finish_reason_is_rejected() {
         let err = reject_unsupported_finish_reason(&ChatFinishReason::ContentFilter).unwrap_err();
 
+        assert!(matches!(
+            err,
+            OpenAiCompatibleChatError::TerminalFailure { .. }
+        ));
         assert!(err.to_string().contains("content_filter"));
+    }
+
+    #[test]
+    fn chat_stream_failure_is_exposed_to_provider_turn_loop() {
+        let error = OpenAiCompatibleChatError::Client(ChatCompletionsError::StreamFailure {
+            reason: "missing finish reason".into(),
+            raw: String::new(),
+        });
+
+        assert!(chat_adapter_stream_failure(&error));
+        assert!(!chat_adapter_stream_failure(
+            &OpenAiCompatibleChatError::OutputShape {
+                reason: "non-stream shape".into(),
+                raw: String::new(),
+            }
+        ));
+    }
+
+    #[test]
+    fn completed_empty_chat_turn_has_no_consumable_content() {
+        let turn = ContinuedChatTurn {
+            message: ChatCompletionMessage {
+                role: Some("assistant".into()),
+                content: None,
+                tool_calls: Vec::new(),
+            },
+            finish_reason: Some(ChatFinishReason::Stop),
+            merged_text: String::new(),
+        };
+
+        let error = provider_response_from_turn(turn).unwrap_err();
+
+        assert!(matches!(
+            error,
+            OpenAiCompatibleChatError::NoConsumableOutput { .. }
+        ));
+    }
+
+    #[test]
+    fn empty_chat_tool_terminal_has_no_consumable_content() {
+        let turn = ContinuedChatTurn {
+            message: ChatCompletionMessage {
+                role: Some("assistant".into()),
+                content: None,
+                tool_calls: Vec::new(),
+            },
+            finish_reason: Some(ChatFinishReason::ToolCalls),
+            merged_text: String::new(),
+        };
+
+        let error = provider_response_from_turn(turn).unwrap_err();
+
+        assert!(matches!(
+            error,
+            OpenAiCompatibleChatError::NoConsumableOutput { .. }
+        ));
+    }
+
+    #[test]
+    fn text_only_chat_tool_terminal_has_no_consumable_content() {
+        let turn = ContinuedChatTurn {
+            message: ChatCompletionMessage {
+                role: Some("assistant".into()),
+                content: Some("我来查询".into()),
+                tool_calls: Vec::new(),
+            },
+            finish_reason: Some(ChatFinishReason::ToolCalls),
+            merged_text: "我来查询".into(),
+        };
+
+        let error = provider_response_from_turn(turn).unwrap_err();
+
+        assert!(matches!(
+            error,
+            OpenAiCompatibleChatError::NoConsumableOutput { .. }
+        ));
     }
 
     #[test]

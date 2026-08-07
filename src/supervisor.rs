@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use rand::RngCore;
+use ring::digest::{Context as DigestContext, SHA256};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -28,14 +29,77 @@ use crate::config::DEFAULT_SUPERVISOR_NOTIFICATION_TIMEOUT_MS;
 #[cfg(any(target_os = "macos", test))]
 use crate::config::SUPERVISOR_NOTIFICATION_ICON_FILE_NAME;
 use crate::config::{
-    default_id_mint_max_attempts, DEFAULT_SUPERVISOR_IDLE_TIMEOUT_SECS,
+    default_id_mint_max_attempts, Config, ResolvedUpstream, DEFAULT_SUPERVISOR_IDLE_TIMEOUT_SECS,
     DEFAULT_SUPERVISOR_IPC_TIMEOUT_MS, DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS,
     DEFAULT_SUPERVISOR_LOCK_TIMEOUT_MS, DEFAULT_SUPERVISOR_STARTUP_TIMEOUT_MS,
     DEFAULT_SUPERVISOR_STOP_WAIT_TIMEOUT_MS, DEFAULT_SUPERVISOR_UPDATE_SHUTDOWN_TIMEOUT_MS,
 };
+use crate::session::{SessionMetadata, SessionPaths, SessionStatus};
 #[cfg(target_os = "macos")]
 use crate::storage::write_text_atomic;
 use crate::storage::{mint_unique_id_in_dir, paths, read_yaml, write_yaml_atomic, FileLockGuard};
+
+const SUPERVISOR_RUNTIME_FINGERPRINT_SCHEMA: u32 = 1;
+const SUPERVISOR_STOPPING_MESSAGE: &str = "supervisor 正在停止，拒绝新 finalize job";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupervisorRuntimeFingerprint {
+    pub schema: u32,
+    pub digest: String,
+}
+
+impl SupervisorRuntimeFingerprint {
+    fn short(&self) -> &str {
+        self.digest.get(..12).unwrap_or(self.digest.as_str())
+    }
+}
+
+/// 对 finalize supervisor 实际使用的配置快照生成不含明文凭据的稳定身份。
+pub fn runtime_fingerprint(
+    cfg: &Config,
+    upstream: &ResolvedUpstream,
+) -> anyhow::Result<SupervisorRuntimeFingerprint> {
+    let serialized = serde_json::to_vec(cfg).context("序列化 supervisor 配置快照失败")?;
+    Ok(runtime_fingerprint_from_parts(
+        &serialized,
+        &upstream.name,
+        cfg.agent.llm.api_key.as_deref(),
+        upstream.acn_key.as_deref(),
+    ))
+}
+
+fn runtime_fingerprint_from_parts(
+    serialized_config: &[u8],
+    upstream_name: &str,
+    llm_key: Option<&str>,
+    upstream_key: Option<&str>,
+) -> SupervisorRuntimeFingerprint {
+    let mut digest = DigestContext::new(&SHA256);
+    update_fingerprint_part(&mut digest, b"acn-supervisor-runtime-v1");
+    update_fingerprint_part(&mut digest, serialized_config);
+    update_fingerprint_part(&mut digest, upstream_name.as_bytes());
+    update_optional_fingerprint_part(&mut digest, llm_key.map(str::as_bytes));
+    update_optional_fingerprint_part(&mut digest, upstream_key.map(str::as_bytes));
+    SupervisorRuntimeFingerprint {
+        schema: SUPERVISOR_RUNTIME_FINGERPRINT_SCHEMA,
+        digest: hex::encode(digest.finish().as_ref()),
+    }
+}
+
+fn update_fingerprint_part(digest: &mut DigestContext, value: &[u8]) {
+    digest.update(&u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    digest.update(value);
+}
+
+fn update_optional_fingerprint_part(digest: &mut DigestContext, value: Option<&[u8]>) {
+    match value {
+        Some(value) => {
+            digest.update(&[1]);
+            update_fingerprint_part(digest, value);
+        }
+        None => digest.update(&[0]),
+    }
+}
 
 #[cfg(target_os = "macos")]
 use rusttype::{point, Font, Scale};
@@ -45,8 +109,8 @@ pub struct SupervisorLaunchConfig {
     pub agent_home: PathBuf,
     pub config_path: PathBuf,
     pub upstream: Option<String>,
-    pub cd: Option<PathBuf>,
     pub notify_on_finalize_completion: bool,
+    pub runtime_fingerprint: SupervisorRuntimeFingerprint,
 }
 
 impl SupervisorLaunchConfig {
@@ -54,15 +118,15 @@ impl SupervisorLaunchConfig {
         agent_home: PathBuf,
         config_path: PathBuf,
         upstream: Option<String>,
-        cd: Option<PathBuf>,
         notify_on_finalize_completion: bool,
+        runtime_fingerprint: SupervisorRuntimeFingerprint,
     ) -> Self {
         Self {
             agent_home,
             config_path,
             upstream,
-            cd,
             notify_on_finalize_completion,
+            runtime_fingerprint,
         }
     }
 
@@ -73,23 +137,29 @@ impl SupervisorLaunchConfig {
 
 #[derive(Debug, Clone)]
 pub struct SupervisorPaths {
+    agent_home: PathBuf,
     supervisor_dir: PathBuf,
     jobs_dir: PathBuf,
     socket_path: PathBuf,
     pid_path: PathBuf,
     process_lock_path: PathBuf,
+    transition_lock_path: PathBuf,
     log_path: PathBuf,
+    launch_log_path: PathBuf,
 }
 
 impl SupervisorPaths {
     pub fn new(agent_home: &Path) -> Self {
         let supervisor_dir = paths::agent_home_supervisor_dir(agent_home);
         Self {
+            agent_home: agent_home.to_path_buf(),
             jobs_dir: paths::agent_home_supervisor_jobs_dir(agent_home),
             socket_path: supervisor_socket_path(agent_home),
             pid_path: paths::agent_home_supervisor_pid_path(agent_home),
             process_lock_path: paths::agent_home_supervisor_launch_lock_path(agent_home),
+            transition_lock_path: paths::agent_home_supervisor_transition_lock_path(agent_home),
             log_path: supervisor_dir.join("supervisor.log"),
+            launch_log_path: supervisor_dir.join("supervisor-launch.log"),
             supervisor_dir,
         }
     }
@@ -107,6 +177,7 @@ pub struct SupervisorStatusSnapshot {
     pub pid: Option<u32>,
     pub started_at: Option<DateTime<Utc>>,
     pub build: Option<BuildIdentity>,
+    pub runtime_fingerprint: Option<SupervisorRuntimeFingerprint>,
     pub queue: SupervisorQueueSummary,
     pub current_job: Option<SupervisorJobView>,
     pub socket_path: PathBuf,
@@ -139,7 +210,23 @@ pub struct SupervisorJobView {
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
     pub attempts: u32,
+    pub manual_retries: u32,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "by", rename_all = "snake_case")]
+pub enum SupervisorRetryTarget {
+    Session { session_id: SessionId },
+    Job { job_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupervisorRetryReport {
+    pub session_id: SessionId,
+    pub job_id: String,
+    pub previous_attempts: u32,
+    pub manual_retries: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,7 +245,19 @@ pub enum VerifiedSupervisorState {
 
 /// shutdown 后持有 supervisor 生命周期锁，避免旧实例在 replacement 准备完成前被重新拉起。
 pub struct SupervisorShutdownGuard {
+    _transition_lock: FileLockGuard,
     _process_lock: FileLockGuard,
+}
+
+impl SupervisorShutdownGuard {
+    fn release_process_lock(self) -> FileLockGuard {
+        let Self {
+            _transition_lock,
+            _process_lock,
+        } = self;
+        drop(_process_lock);
+        _transition_lock
+    }
 }
 
 #[derive(Clone)]
@@ -168,6 +267,7 @@ struct SupervisorSharedState {
     stop_requested: CancellationToken,
     last_activity: Arc<AtomicU64>,
     started_at: DateTime<Utc>,
+    runtime_fingerprint: SupervisorRuntimeFingerprint,
     stopping: Arc<AtomicBool>,
     lifecycle_gate: Arc<Mutex<()>>,
 }
@@ -186,6 +286,14 @@ enum SupervisorRequest {
         )]
         notify_on_completion: bool,
     },
+    RetryFinalize {
+        target: SupervisorRetryTarget,
+        #[serde(
+            default = "default_notify_on_completion",
+            skip_serializing_if = "is_true"
+        )]
+        notify_on_completion: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,9 +305,17 @@ enum SupervisorResponse {
         started_at: DateTime<Utc>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         build: Option<BuildIdentity>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime_fingerprint: Option<SupervisorRuntimeFingerprint>,
     },
     Enqueued {
         job_id: String,
+    },
+    Retried {
+        session_id: SessionId,
+        job_id: String,
+        previous_attempts: u32,
+        manual_retries: u32,
     },
     Stopping,
     Error {
@@ -241,6 +357,8 @@ struct SupervisorJob {
     kind: SupervisorJobKind,
     status: SupervisorJobStatus,
     attempts: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    manual_retries: u32,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -264,70 +382,147 @@ fn is_true(value: &bool) -> bool {
     *value
 }
 
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 pub async fn ensure_supervisor_running(config: &SupervisorLaunchConfig) -> anyhow::Result<()> {
     ensure_supervisor_running_with(config, spawn_supervisor_process).await
 }
 
-async fn ensure_supervisor_running_with(
+async fn ensure_supervisor_running_with<F, Fut>(
     config: &SupervisorLaunchConfig,
-    spawn: impl Fn(&SupervisorLaunchConfig) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
+    spawn: F,
+) -> anyhow::Result<()>
+where
+    F: Fn(SupervisorLaunchConfig) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
     let paths = config.paths();
-    match supervisor_build_identity(&paths).await {
-        Ok(build) if supervisor_build_matches_current(build.as_ref()) => return Ok(()),
-        Ok(previous_build) => {
-            log::info!(
-                target: "supervisor",
-                "接管旧 supervisor: previous={previous_build:?}, current={:?}",
-                BuildIdentity::current()
-            );
-            let expected = preflight_supervisor_shutdown(&config.agent_home).await?;
-            let guard = shutdown_verified_supervisor(&config.agent_home, expected).await?;
-            spawn(config)?;
-            drop(guard);
-            return wait_for_current_supervisor(&paths).await;
+    if let Ok((build, fingerprint)) = supervisor_runtime_identity(&paths).await {
+        if supervisor_runtime_matches(config, build.as_ref(), fingerprint.as_ref()) {
+            return Ok(());
         }
-        Err(_) => {}
     }
 
-    {
-        let _guard = FileLockGuard::lock_exclusive_timeout(
-            &paths.process_lock_path,
-            Duration::from_millis(DEFAULT_SUPERVISOR_LOCK_TIMEOUT_MS),
-        )
-        .await?;
-        match supervisor_build_identity(&paths).await {
-            Ok(build) if supervisor_build_matches_current(build.as_ref()) => return Ok(()),
-            Ok(build) => {
-                anyhow::bail!(
-                    "supervisor 在未持有生命周期锁时响应了 IPC，拒绝覆盖: build={build:?}"
-                );
-            }
-            Err(_) => {}
+    let transition_guard = FileLockGuard::lock_exclusive_timeout(
+        &paths.transition_lock_path,
+        Duration::from_millis(DEFAULT_SUPERVISOR_STARTUP_TIMEOUT_MS),
+    )
+    .await?;
+    match supervisor_runtime_identity(&paths).await {
+        Ok((build, fingerprint))
+            if supervisor_runtime_matches(config, build.as_ref(), fingerprint.as_ref()) =>
+        {
+            Ok(())
         }
-        remove_stale_socket(&paths.socket_path).await;
-        spawn(config)?;
+        Ok((previous_build, previous_fingerprint)) => {
+            log::info!(
+                target: "supervisor",
+                "接管旧 supervisor: previous_build={previous_build:?}, previous_runtime={}, current_build={:?}, current_runtime={}",
+                previous_fingerprint
+                    .as_ref()
+                    .map(SupervisorRuntimeFingerprint::short)
+                    .unwrap_or("legacy"),
+                BuildIdentity::current(),
+                config.runtime_fingerprint.short()
+            );
+            let expected = preflight_supervisor_shutdown(&config.agent_home).await?;
+            request_graceful_takeover_stop(&paths).await;
+            let guard = shutdown_verified_supervisor_with_transition_lock(
+                &config.agent_home,
+                expected,
+                transition_guard,
+            )
+            .await?;
+            spawn(config.clone()).await?;
+            let transition_guard = guard.release_process_lock();
+            let ready = wait_for_current_supervisor(&paths, &config.runtime_fingerprint).await;
+            drop(transition_guard);
+            ready
+        }
+        Err(_) => {
+            let process_guard = FileLockGuard::lock_exclusive_timeout(
+                &paths.process_lock_path,
+                Duration::from_millis(DEFAULT_SUPERVISOR_LOCK_TIMEOUT_MS),
+            )
+            .await?;
+            match supervisor_runtime_identity(&paths).await {
+                    Ok((build, fingerprint))
+                        if supervisor_runtime_matches(
+                            config,
+                            build.as_ref(),
+                            fingerprint.as_ref(),
+                        ) => return Ok(()),
+                    Ok((build, fingerprint)) => anyhow::bail!(
+                        "supervisor 在持有进程锁时响应了 IPC，拒绝覆盖: build={build:?}, runtime={fingerprint:?}"
+                    ),
+                    Err(_) => {}
+                }
+            remove_stale_socket(&paths.socket_path).await;
+            spawn(config.clone()).await?;
+            drop(process_guard);
+            let ready = wait_for_current_supervisor(&paths, &config.runtime_fingerprint).await;
+            drop(transition_guard);
+            ready
+        }
     }
-    wait_for_current_supervisor(&paths).await
 }
 
 pub async fn enqueue_finalize(
     config: &SupervisorLaunchConfig,
     session_id: SessionId,
 ) -> anyhow::Result<String> {
+    let request = SupervisorRequest::EnqueueFinalize {
+        session_id,
+        notify_on_completion: config.notify_on_finalize_completion,
+    };
+    match send_request(&config.paths(), request.clone()).await {
+        Ok(SupervisorResponse::Enqueued { job_id }) => return Ok(job_id),
+        Ok(SupervisorResponse::Error { message }) if message == SUPERVISOR_STOPPING_MESSAGE => {
+            let _ = wait_for_supervisor_shutdown(&config.paths()).await;
+        }
+        Ok(SupervisorResponse::Error { message }) => anyhow::bail!(message),
+        Ok(other) => anyhow::bail!("supervisor 返回了非 enqueue 响应: {other:?}"),
+        Err(error) if ipc_error_indicates_unavailable(&error) => {}
+        Err(error) => return Err(error.context("请求 supervisor enqueue 失败")),
+    }
+
+    ensure_supervisor_running(config).await?;
+    match send_request(&config.paths(), request).await? {
+        SupervisorResponse::Enqueued { job_id } => Ok(job_id),
+        SupervisorResponse::Error { message } => anyhow::bail!(message),
+        other => anyhow::bail!("supervisor 返回了非 enqueue 响应: {other:?}"),
+    }
+}
+
+pub async fn retry_finalize(
+    config: &SupervisorLaunchConfig,
+    target: SupervisorRetryTarget,
+) -> anyhow::Result<SupervisorRetryReport> {
     ensure_supervisor_running(config).await?;
     match send_request(
         &config.paths(),
-        SupervisorRequest::EnqueueFinalize {
-            session_id,
+        SupervisorRequest::RetryFinalize {
+            target,
             notify_on_completion: config.notify_on_finalize_completion,
         },
     )
     .await?
     {
-        SupervisorResponse::Enqueued { job_id } => Ok(job_id),
+        SupervisorResponse::Retried {
+            session_id,
+            job_id,
+            previous_attempts,
+            manual_retries,
+        } => Ok(SupervisorRetryReport {
+            session_id,
+            job_id,
+            previous_attempts,
+            manual_retries,
+        }),
         SupervisorResponse::Error { message } => anyhow::bail!(message),
-        other => anyhow::bail!("supervisor 返回了非 enqueue 响应: {other:?}"),
+        other => anyhow::bail!("supervisor 返回了非 retry 响应: {other:?}"),
     }
 }
 
@@ -346,7 +541,7 @@ pub async fn supervisor_status(agent_home: &Path) -> anyhow::Result<SupervisorSt
         })
         .map(job_to_view);
 
-    let (runtime_state, pid, started_at, build) = match send_request(
+    let (runtime_state, pid, started_at, build, runtime_fingerprint) = match send_request(
         &paths,
         SupervisorRequest::Status,
     )
@@ -356,17 +551,20 @@ pub async fn supervisor_status(agent_home: &Path) -> anyhow::Result<SupervisorSt
             pid,
             started_at,
             build,
+            runtime_fingerprint,
         }) => (
             SupervisorRuntimeState::Running,
             Some(pid),
             Some(started_at),
             build,
+            runtime_fingerprint,
         ),
         Ok(SupervisorResponse::Error { message }) => anyhow::bail!(message),
         Ok(other) => anyhow::bail!("supervisor 返回了非 status 响应: {other:?}"),
         Err(err) if ipc_error_indicates_unavailable(&err) => (
             SupervisorRuntimeState::Stopped,
             read_pid_file(&paths).await?,
+            None,
             None,
             None,
         ),
@@ -379,6 +577,7 @@ pub async fn supervisor_status(agent_home: &Path) -> anyhow::Result<SupervisorSt
                         ipc_error: format!("{err:#}"),
                     },
                     pid,
+                    None,
                     None,
                     None,
                 )
@@ -397,6 +596,7 @@ pub async fn supervisor_status(agent_home: &Path) -> anyhow::Result<SupervisorSt
         pid,
         started_at,
         build,
+        runtime_fingerprint,
         queue,
         current_job,
         socket_path: paths.socket_path,
@@ -459,6 +659,21 @@ pub async fn shutdown_verified_supervisor(
     expected: VerifiedSupervisorState,
 ) -> anyhow::Result<SupervisorShutdownGuard> {
     let paths = SupervisorPaths::new(agent_home);
+    let transition_lock = FileLockGuard::lock_exclusive_timeout(
+        &paths.transition_lock_path,
+        Duration::from_millis(DEFAULT_SUPERVISOR_STARTUP_TIMEOUT_MS),
+    )
+    .await
+    .context("获取 supervisor 接管锁失败")?;
+    shutdown_verified_supervisor_with_transition_lock(agent_home, expected, transition_lock).await
+}
+
+async fn shutdown_verified_supervisor_with_transition_lock(
+    agent_home: &Path,
+    expected: VerifiedSupervisorState,
+    transition_lock: FileLockGuard,
+) -> anyhow::Result<SupervisorShutdownGuard> {
+    let paths = SupervisorPaths::new(agent_home);
     let current = preflight_supervisor_shutdown(agent_home).await?;
     match (expected, current) {
         (
@@ -485,6 +700,7 @@ pub async fn shutdown_verified_supervisor(
     .context("等待 supervisor 进程锁释放失败")?;
     cleanup_runtime_files(&paths).await;
     Ok(SupervisorShutdownGuard {
+        _transition_lock: transition_lock,
         _process_lock: process_lock,
     })
 }
@@ -549,7 +765,28 @@ pub async fn stop_supervisor(agent_home: &Path) -> anyhow::Result<SupervisorStop
     }
 }
 
-pub async fn run_supervisor(engine: SessionEngine, agent_home: PathBuf) -> anyhow::Result<()> {
+async fn request_graceful_takeover_stop(paths: &SupervisorPaths) {
+    match send_request(paths, SupervisorRequest::Stop).await {
+        Ok(SupervisorResponse::Stopping) => {
+            let _ = wait_for_supervisor_shutdown(paths).await;
+        }
+        Ok(SupervisorResponse::Error { message }) => {
+            log::warn!(target: "supervisor", "旧 supervisor 拒绝 graceful takeover: {message}");
+        }
+        Ok(other) => {
+            log::warn!(target: "supervisor", "旧 supervisor 返回了非 stop 响应: {other:?}");
+        }
+        Err(error) => {
+            log::debug!(target: "supervisor", "旧 supervisor graceful takeover 不可用，将执行验证接管: {error:#}");
+        }
+    }
+}
+
+pub async fn run_supervisor(
+    engine: SessionEngine,
+    agent_home: PathBuf,
+    runtime_fingerprint: SupervisorRuntimeFingerprint,
+) -> anyhow::Result<()> {
     let paths = SupervisorPaths::new(&agent_home);
     let agent_id = engine.agent_id().clone();
     let started_at = Utc::now();
@@ -568,6 +805,7 @@ pub async fn run_supervisor(engine: SessionEngine, agent_home: PathBuf) -> anyho
 
     let listener = UnixListener::bind(&paths.socket_path)
         .with_context(|| format!("绑定 supervisor UDS: {}", paths.socket_path.display()))?;
+    set_socket_owner_only(&paths.socket_path).await?;
     write_pid_file(&paths).await?;
     reset_stale_running_jobs(&paths).await?;
     append_supervisor_log(&paths, "supervisor started").await;
@@ -585,6 +823,7 @@ pub async fn run_supervisor(engine: SessionEngine, agent_home: PathBuf) -> anyho
         stop_requested: cancel.clone(),
         last_activity: last_activity.clone(),
         started_at,
+        runtime_fingerprint,
         stopping: stopping.clone(),
         lifecycle_gate,
     };
@@ -609,17 +848,8 @@ pub async fn run_supervisor(engine: SessionEngine, agent_home: PathBuf) -> anyho
             _ = cancel.cancelled() => break,
             _ = sleep(Duration::from_secs(5)) => {}
         }
-        if running_job.load(Ordering::Relaxed) {
-            continue;
-        }
-        if has_queued_jobs(&paths).await.unwrap_or(true) {
-            continue;
-        }
-        let elapsed = now_millis().saturating_sub(last_activity.load(Ordering::Relaxed));
-        if elapsed >= millis_u64(idle_timeout) {
+        if begin_idle_shutdown_if_due(&paths, &shared_state, &running_job, idle_timeout).await {
             append_supervisor_log(&paths, "supervisor idle timeout reached").await;
-            stopping.store(true, Ordering::Release);
-            cancel.cancel();
             break;
         }
     }
@@ -634,6 +864,29 @@ pub async fn run_supervisor(engine: SessionEngine, agent_home: PathBuf) -> anyho
     cleanup_runtime_files(&paths).await;
     append_supervisor_log(&paths, "supervisor stopped").await;
     Ok(())
+}
+
+async fn begin_idle_shutdown_if_due(
+    paths: &SupervisorPaths,
+    shared: &SupervisorSharedState,
+    running_job: &AtomicBool,
+    idle_timeout: Duration,
+) -> bool {
+    let _guard = shared.lifecycle_gate.lock().await;
+    if shared.stopping.load(Ordering::Acquire)
+        || shared.stop_requested.is_cancelled()
+        || running_job.load(Ordering::Relaxed)
+        || has_queued_jobs(paths).await.unwrap_or(true)
+    {
+        return false;
+    }
+    let elapsed = now_millis().saturating_sub(shared.last_activity.load(Ordering::Relaxed));
+    if elapsed < millis_u64(idle_timeout) {
+        return false;
+    }
+    shared.stopping.store(true, Ordering::Release);
+    shared.stop_requested.cancel();
+    true
 }
 
 async fn accept_loop(
@@ -672,6 +925,7 @@ async fn handle_client(
     paths: &SupervisorPaths,
     shared: &SupervisorSharedState,
 ) -> anyhow::Result<()> {
+    validate_supervisor_peer(&stream)?;
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
     let mut should_stop = false;
@@ -682,6 +936,7 @@ async fn handle_client(
                 pid: std::process::id(),
                 started_at: shared.started_at,
                 build: Some(BuildIdentity::current()),
+                runtime_fingerprint: Some(shared.runtime_fingerprint.clone()),
             },
             Ok(SupervisorRequest::Stop) => {
                 let _guard = shared.lifecycle_gate.lock().await;
@@ -697,18 +952,53 @@ async fn handle_client(
                 let _guard = shared.lifecycle_gate.lock().await;
                 if shared.stopping.load(Ordering::Acquire) || shared.stop_requested.is_cancelled() {
                     SupervisorResponse::Error {
-                        message: "supervisor 正在停止，拒绝新 finalize job".into(),
+                        message: SUPERVISOR_STOPPING_MESSAGE.into(),
                     }
                 } else {
-                    let job = create_finalize_job(
+                    match enqueue_finalize_job(
                         paths,
                         &shared.agent_id,
                         session_id,
                         notify_on_completion,
                     )
-                    .await?;
-                    let _ = shared.notify_tx.send(());
-                    SupervisorResponse::Enqueued { job_id: job.id }
+                    .await
+                    {
+                        Ok(job) => {
+                            let _ = shared.notify_tx.send(());
+                            SupervisorResponse::Enqueued { job_id: job.id }
+                        }
+                        Err(error) => SupervisorResponse::Error {
+                            message: format!("{error:#}"),
+                        },
+                    }
+                }
+            }
+            Ok(SupervisorRequest::RetryFinalize {
+                target,
+                notify_on_completion,
+            }) => {
+                let _guard = shared.lifecycle_gate.lock().await;
+                if shared.stopping.load(Ordering::Acquire) || shared.stop_requested.is_cancelled() {
+                    SupervisorResponse::Error {
+                        message: SUPERVISOR_STOPPING_MESSAGE.into(),
+                    }
+                } else {
+                    match retry_finalize_job(paths, &shared.agent_id, target, notify_on_completion)
+                        .await
+                    {
+                        Ok(report) => {
+                            let _ = shared.notify_tx.send(());
+                            SupervisorResponse::Retried {
+                                session_id: report.session_id,
+                                job_id: report.job_id,
+                                previous_attempts: report.previous_attempts,
+                                manual_retries: report.manual_retries,
+                            }
+                        }
+                        Err(error) => SupervisorResponse::Error {
+                            message: format!("{error:#}"),
+                        },
+                    }
                 }
             }
             Err(err) => SupervisorResponse::Error {
@@ -863,17 +1153,228 @@ async fn run_job(
     Ok(())
 }
 
+async fn enqueue_finalize_job(
+    paths: &SupervisorPaths,
+    agent_id: &AgentId,
+    session_id: SessionId,
+    notify_on_completion: bool,
+) -> anyhow::Result<SupervisorJob> {
+    let jobs = read_jobs(paths).await?;
+    let matching = jobs
+        .iter()
+        .filter(|job| finalize_job_session_id(job) == &session_id)
+        .collect::<Vec<_>>();
+    if matching.len() > 1 {
+        anyhow::bail!(session_job_invariant_error(&session_id, &matching));
+    }
+    if let Some(job) = matching.first() {
+        validate_job_agent(job, agent_id)?;
+        if job.status == SupervisorJobStatus::Failed {
+            anyhow::bail!(
+                "session {session_id} 的 finalize job {} 已失败；请使用 `acn supervisor retry {session_id}`",
+                job.id
+            );
+        }
+        return Ok((**job).clone());
+    }
+
+    validate_finalizing_session(paths, agent_id, &session_id).await?;
+    create_finalize_job(paths, agent_id, session_id, notify_on_completion).await
+}
+
+async fn retry_finalize_job(
+    paths: &SupervisorPaths,
+    agent_id: &AgentId,
+    target: SupervisorRetryTarget,
+    notify_on_completion: bool,
+) -> anyhow::Result<SupervisorRetryReport> {
+    let jobs = read_jobs(paths).await?;
+    let (session_id, existing_job) = match target {
+        SupervisorRetryTarget::Session { session_id } => {
+            let matching = jobs
+                .iter()
+                .filter(|job| finalize_job_session_id(job) == &session_id)
+                .collect::<Vec<_>>();
+            if matching.len() > 1 {
+                anyhow::bail!(session_job_invariant_error(&session_id, &matching));
+            }
+            (session_id, matching.first().map(|job| (**job).clone()))
+        }
+        SupervisorRetryTarget::Job { job_id } => {
+            let job = jobs
+                .iter()
+                .find(|job| job.id == job_id)
+                .with_context(|| format!("未找到 supervisor job {job_id}"))?;
+            let session_id = finalize_job_session_id(job).clone();
+            let matching = jobs
+                .iter()
+                .filter(|candidate| finalize_job_session_id(candidate) == &session_id)
+                .collect::<Vec<_>>();
+            if matching.len() > 1 {
+                anyhow::bail!(session_job_invariant_error(&session_id, &matching));
+            }
+            (session_id, Some(job.clone()))
+        }
+    };
+
+    validate_finalizing_session(paths, agent_id, &session_id).await?;
+    let Some(mut job) = existing_job else {
+        let job =
+            create_recovery_finalize_job(paths, agent_id, session_id.clone(), notify_on_completion)
+                .await?;
+        append_supervisor_log(
+            paths,
+            format!(
+                "manual retry created orphan finalize job {} session={} manual_retries={}",
+                job.id, session_id, job.manual_retries
+            ),
+        )
+        .await;
+        return Ok(SupervisorRetryReport {
+            session_id,
+            job_id: job.id,
+            previous_attempts: 0,
+            manual_retries: job.manual_retries,
+        });
+    };
+
+    validate_job_agent(&job, agent_id)?;
+    match job.status {
+        SupervisorJobStatus::Failed => {}
+        SupervisorJobStatus::Queued | SupervisorJobStatus::Running => anyhow::bail!(
+            "session {session_id} 的 finalize job {} 当前为 {}，无需 retry",
+            job.id,
+            job.status.as_str()
+        ),
+        SupervisorJobStatus::Succeeded => anyhow::bail!(
+            "session {session_id} 的 finalize job {} 已成功，不能 retry",
+            job.id
+        ),
+    }
+
+    let previous_attempts = job.attempts;
+    let previous_error = job.last_error.clone().unwrap_or_else(|| "-".into());
+    job.status = SupervisorJobStatus::Queued;
+    job.attempts = 0;
+    job.manual_retries = job.manual_retries.saturating_add(1);
+    job.updated_at = Utc::now();
+    job.started_at = None;
+    job.finished_at = None;
+    write_job(paths, &job).await?;
+    append_supervisor_log(
+        paths,
+        format!(
+            "manual retry queued finalize job {} session={} previous_attempts={} manual_retries={} previous_error={}",
+            job.id, session_id, previous_attempts, job.manual_retries, previous_error
+        ),
+    )
+    .await;
+    Ok(SupervisorRetryReport {
+        session_id,
+        job_id: job.id,
+        previous_attempts,
+        manual_retries: job.manual_retries,
+    })
+}
+
+async fn validate_finalizing_session(
+    paths: &SupervisorPaths,
+    agent_id: &AgentId,
+    session_id: &SessionId,
+) -> anyhow::Result<SessionMetadata> {
+    let session_paths = SessionPaths::new(&paths.agent_home, session_id);
+    let metadata = read_yaml::<SessionMetadata>(&session_paths.session_yaml)
+        .await
+        .with_context(|| format!("读取 session {session_id} metadata 失败"))?;
+    if metadata.id != *session_id {
+        anyhow::bail!(
+            "session metadata id {} 与请求的 {session_id} 不一致",
+            metadata.id
+        );
+    }
+    if metadata.agent_id != *agent_id {
+        anyhow::bail!(
+            "session {session_id} 属于 agent {}，不是当前 agent {agent_id}",
+            metadata.agent_id
+        );
+    }
+    if metadata.status != SessionStatus::Finalizing
+        || metadata.finalized_at.is_some()
+        || metadata.closed_at.is_some()
+    {
+        anyhow::bail!(
+            "session {session_id} 当前状态为 {:?}，只有未完成的 Finalizing session 可以 retry",
+            metadata.status
+        );
+    }
+    Ok(metadata)
+}
+
+fn validate_job_agent(job: &SupervisorJob, agent_id: &AgentId) -> anyhow::Result<()> {
+    if let Some(job_agent_id) = &job.agent_id {
+        if job_agent_id != agent_id {
+            anyhow::bail!(
+                "supervisor job {} 属于 agent {job_agent_id}，不是当前 agent {agent_id}",
+                job.id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn session_job_invariant_error(session_id: &SessionId, jobs: &[&SupervisorJob]) -> String {
+    let mut ids = jobs.iter().map(|job| job.id.as_str()).collect::<Vec<_>>();
+    ids.sort_unstable();
+    format!(
+        "session {session_id} 存在多个 finalize job，违反唯一性约束: {}",
+        ids.join(", ")
+    )
+}
+
+fn finalize_job_session_id(job: &SupervisorJob) -> &SessionId {
+    match &job.kind {
+        SupervisorJobKind::Finalize { session_id } => session_id,
+    }
+}
+
 async fn create_finalize_job(
     paths: &SupervisorPaths,
     agent_id: &AgentId,
     session_id: SessionId,
     notify_on_completion: bool,
 ) -> anyhow::Result<SupervisorJob> {
-    create_finalize_job_with_id_factory(
+    create_finalize_job_record(
         paths,
         agent_id,
         session_id,
-        notify_on_completion,
+        FinalizeJobInitialState {
+            notify_on_completion,
+            manual_retries: 0,
+            last_error: None,
+        },
+        next_job_id,
+        default_id_mint_max_attempts(),
+    )
+    .await
+}
+
+async fn create_recovery_finalize_job(
+    paths: &SupervisorPaths,
+    agent_id: &AgentId,
+    session_id: SessionId,
+    notify_on_completion: bool,
+) -> anyhow::Result<SupervisorJob> {
+    create_finalize_job_record(
+        paths,
+        agent_id,
+        session_id,
+        FinalizeJobInitialState {
+            notify_on_completion,
+            manual_retries: 1,
+            last_error: Some(
+                "manual retry recovered Finalizing session without a supervisor job".into(),
+            ),
+        },
         next_job_id,
         default_id_mint_max_attempts(),
     )
@@ -881,11 +1382,44 @@ async fn create_finalize_job(
 }
 
 /// 原子申领 job ID 后写入初始记录，避免首次持久化覆盖同 ID 的既有 job。
+#[cfg(test)]
 async fn create_finalize_job_with_id_factory<F>(
     paths: &SupervisorPaths,
     agent_id: &AgentId,
     session_id: SessionId,
     notify_on_completion: bool,
+    id_factory: F,
+    max_id_attempts: usize,
+) -> anyhow::Result<SupervisorJob>
+where
+    F: FnMut() -> String,
+{
+    create_finalize_job_record(
+        paths,
+        agent_id,
+        session_id,
+        FinalizeJobInitialState {
+            notify_on_completion,
+            manual_retries: 0,
+            last_error: None,
+        },
+        id_factory,
+        max_id_attempts,
+    )
+    .await
+}
+
+struct FinalizeJobInitialState {
+    notify_on_completion: bool,
+    manual_retries: u32,
+    last_error: Option<String>,
+}
+
+async fn create_finalize_job_record<F>(
+    paths: &SupervisorPaths,
+    agent_id: &AgentId,
+    session_id: SessionId,
+    initial: FinalizeJobInitialState,
     id_factory: F,
     max_id_attempts: usize,
 ) -> anyhow::Result<SupervisorJob>
@@ -905,12 +1439,13 @@ where
         kind: SupervisorJobKind::Finalize { session_id },
         status: SupervisorJobStatus::Queued,
         attempts: 0,
+        manual_retries: initial.manual_retries,
         created_at: now,
         updated_at: now,
         started_at: None,
         finished_at: None,
-        last_error: None,
-        notify_on_completion,
+        last_error: initial.last_error,
+        notify_on_completion: initial.notify_on_completion,
     };
     write_reserved_job(paths, &job).await?;
     Ok(job)
@@ -1021,6 +1556,7 @@ fn job_to_view(job: &SupervisorJob) -> SupervisorJobView {
         started_at: job.started_at,
         finished_at: job.finished_at,
         attempts: job.attempts,
+        manual_retries: job.manual_retries,
         last_error: job.last_error.clone(),
     }
 }
@@ -1131,6 +1667,7 @@ async fn send_request_inner(
                 paths.socket_path.display()
             )
         })?;
+    validate_supervisor_peer(&stream)?;
     let (read_half, mut write_half) = stream.into_split();
     let mut line = serde_json::to_vec(&request)?;
     line.push(b'\n');
@@ -1141,6 +1678,28 @@ async fn send_request_inner(
         .await?
         .context("supervisor 关闭连接且未返回响应")?;
     Ok(serde_json::from_str(&line)?)
+}
+
+fn validate_supervisor_peer(stream: &UnixStream) -> anyhow::Result<()> {
+    let peer_uid = stream
+        .peer_cred()
+        .context("读取 supervisor IPC 对端身份失败")?
+        .uid();
+    // SAFETY: geteuid 无参数且只读取当前进程的有效用户 ID。
+    let current_uid = unsafe { libc::geteuid() };
+    validate_supervisor_peer_uid(peer_uid, current_uid)
+}
+
+fn validate_supervisor_peer_uid(
+    peer_uid: libc::uid_t,
+    current_uid: libc::uid_t,
+) -> anyhow::Result<()> {
+    if peer_uid != current_uid {
+        anyhow::bail!(
+            "拒绝不同用户的 supervisor IPC 对端: peer_uid={peer_uid}, current_uid={current_uid}"
+        );
+    }
+    Ok(())
 }
 
 fn ipc_error_indicates_unavailable(err: &anyhow::Error) -> bool {
@@ -1191,39 +1750,59 @@ fn process_probe_from_kill_result(result: i32, raw_os_error: Option<i32>) -> Pro
     }
 }
 
-fn spawn_supervisor_process(config: &SupervisorLaunchConfig) -> anyhow::Result<()> {
+async fn spawn_supervisor_process(config: SupervisorLaunchConfig) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("定位当前 acn 可执行文件失败")?;
-    let mut command = std::process::Command::new(exe);
+    let paths = config.paths();
+    fs::create_dir_all(&paths.supervisor_dir).await?;
+    let launch_log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.launch_log_path)
+        .await
+        .with_context(|| {
+            format!(
+                "打开 supervisor launch log 失败: {}",
+                paths.launch_log_path.display()
+            )
+        })?
+        .into_std()
+        .await;
+    let mut command = tokio::process::Command::new(exe);
     command
         .arg("supervisor")
         .arg("run")
         .arg("--config")
         .arg(&config.config_path)
+        .arg("--runtime-fingerprint")
+        .arg(&config.runtime_fingerprint.digest)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::from(launch_log));
     if let Some(upstream) = &config.upstream {
         command.arg("--upstream").arg(upstream);
-    }
-    if let Some(cd) = &config.cd {
-        command.arg("--cd").arg(cd);
     }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        command.process_group(0);
+        command.as_std_mut().process_group(0);
     }
     command.spawn().context("启动 acn supervisor 失败")?;
     Ok(())
 }
 
-async fn wait_for_current_supervisor(paths: &SupervisorPaths) -> anyhow::Result<()> {
+async fn wait_for_current_supervisor(
+    paths: &SupervisorPaths,
+    expected_fingerprint: &SupervisorRuntimeFingerprint,
+) -> anyhow::Result<()> {
     let timeout = Duration::from_millis(DEFAULT_SUPERVISOR_STARTUP_TIMEOUT_MS);
     let deadline = Instant::now() + timeout;
     loop {
-        if supervisor_build_identity(paths)
+        if supervisor_runtime_identity(paths)
             .await
-            .is_ok_and(|build| build.is_some_and(|build| build.matches_current()))
+            .is_ok_and(|(build, fingerprint)| {
+                build.is_some_and(|build| build.matches_current())
+                    && fingerprint.as_ref() == Some(expected_fingerprint)
+            })
         {
             return Ok(());
         }
@@ -1238,17 +1817,26 @@ fn supervisor_startup_timeout_error(timeout: Duration) -> anyhow::Error {
     anyhow::anyhow!("supervisor 在 {} 秒内未就绪", timeout.as_secs())
 }
 
-async fn supervisor_build_identity(
+async fn supervisor_runtime_identity(
     paths: &SupervisorPaths,
-) -> anyhow::Result<Option<BuildIdentity>> {
+) -> anyhow::Result<(Option<BuildIdentity>, Option<SupervisorRuntimeFingerprint>)> {
     match send_request(paths, SupervisorRequest::Status).await? {
-        SupervisorResponse::Status { build, .. } => Ok(build),
+        SupervisorResponse::Status {
+            build,
+            runtime_fingerprint,
+            ..
+        } => Ok((build, runtime_fingerprint)),
         other => anyhow::bail!("unexpected supervisor status response: {other:?}"),
     }
 }
 
-fn supervisor_build_matches_current(build: Option<&BuildIdentity>) -> bool {
+fn supervisor_runtime_matches(
+    config: &SupervisorLaunchConfig,
+    build: Option<&BuildIdentity>,
+    fingerprint: Option<&SupervisorRuntimeFingerprint>,
+) -> bool {
     build.is_some_and(BuildIdentity::matches_current)
+        && fingerprint == Some(&config.runtime_fingerprint)
 }
 
 fn next_job_id() -> String {
@@ -1284,6 +1872,14 @@ async fn remove_stale_socket(path: &Path) {
             );
         }
     }
+}
+
+async fn set_socket_owner_only(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .with_context(|| format!("设置 supervisor UDS 权限失败: {}", path.display()))
 }
 
 async fn cleanup_runtime_files(paths: &SupervisorPaths) {
@@ -1839,9 +2435,7 @@ fn truncate_notification(value: &str) -> String {
 }
 
 fn job_session_id(job: &SupervisorJob) -> String {
-    match &job.kind {
-        SupervisorJobKind::Finalize { session_id } => session_id.to_string(),
-    }
+    finalize_job_session_id(job).to_string()
 }
 
 fn now_millis() -> u64 {
@@ -1875,6 +2469,72 @@ mod tests {
     const UPDATE_HOLDER_AGENT_HOME_ENV: &str = "ACN_TEST_UPDATE_HOLDER_AGENT_HOME";
     const TAKEOVER_HOLDER_AGENT_HOME_ENV: &str = "ACN_TEST_TAKEOVER_HOLDER_AGENT_HOME";
     const TAKEOVER_HOLDER_BUILD_ENV: &str = "ACN_TEST_TAKEOVER_HOLDER_BUILD";
+    const CONCURRENT_TAKEOVER_HOLDER_AGENT_HOME_ENV: &str =
+        "ACN_TEST_CONCURRENT_TAKEOVER_HOLDER_AGENT_HOME";
+    const CONCURRENT_TAKEOVER_HOLDER_BUILD_ENV: &str = "ACN_TEST_CONCURRENT_TAKEOVER_HOLDER_BUILD";
+    const ENQUEUE_HOLDER_AGENT_HOME_ENV: &str = "ACN_TEST_ENQUEUE_HOLDER_AGENT_HOME";
+
+    fn test_runtime_fingerprint(label: &str) -> SupervisorRuntimeFingerprint {
+        SupervisorRuntimeFingerprint {
+            schema: SUPERVISOR_RUNTIME_FINGERPRINT_SCHEMA,
+            digest: hex::encode(ring::digest::digest(&SHA256, label.as_bytes()).as_ref()),
+        }
+    }
+
+    fn test_launch_config(
+        agent_home: PathBuf,
+        runtime_fingerprint: SupervisorRuntimeFingerprint,
+    ) -> SupervisorLaunchConfig {
+        SupervisorLaunchConfig::new(
+            agent_home.clone(),
+            agent_home.join("config.toml"),
+            None,
+            true,
+            runtime_fingerprint,
+        )
+    }
+
+    #[test]
+    fn runtime_fingerprint_covers_config_upstream_and_credentials() {
+        let baseline = runtime_fingerprint_from_parts(
+            br#"{"model":"model-a"}"#,
+            "default",
+            Some("llm-key-a"),
+            Some("team-key-a"),
+        );
+
+        for changed in [
+            runtime_fingerprint_from_parts(
+                br#"{"model":"model-b"}"#,
+                "default",
+                Some("llm-key-a"),
+                Some("team-key-a"),
+            ),
+            runtime_fingerprint_from_parts(
+                br#"{"model":"model-a"}"#,
+                "other",
+                Some("llm-key-a"),
+                Some("team-key-a"),
+            ),
+            runtime_fingerprint_from_parts(
+                br#"{"model":"model-a"}"#,
+                "default",
+                Some("llm-key-b"),
+                Some("team-key-a"),
+            ),
+            runtime_fingerprint_from_parts(
+                br#"{"model":"model-a"}"#,
+                "default",
+                Some("llm-key-a"),
+                Some("team-key-b"),
+            ),
+        ] {
+            assert_ne!(baseline, changed);
+        }
+        assert_eq!(baseline.digest.len(), 64);
+        assert!(!baseline.digest.contains("llm-key-a"));
+        assert!(!baseline.digest.contains("team-key-a"));
+    }
 
     fn queued_finalize_job(id: &str, session_id: SessionId) -> SupervisorJob {
         let now = Utc::now();
@@ -1884,6 +2544,7 @@ mod tests {
             kind: SupervisorJobKind::Finalize { session_id },
             status: SupervisorJobStatus::Queued,
             attempts: 0,
+            manual_retries: 0,
             created_at: now,
             updated_at: now,
             started_at: None,
@@ -1891,6 +2552,35 @@ mod tests {
             last_error: None,
             notify_on_completion: true,
         }
+    }
+
+    async fn write_test_session(
+        paths: &SupervisorPaths,
+        agent_id: &AgentId,
+        session_id: &SessionId,
+        status: SessionStatus,
+    ) -> anyhow::Result<()> {
+        let session_paths = SessionPaths::new(&paths.agent_home, session_id);
+        fs::create_dir_all(&session_paths.dir).await?;
+        let now = Utc::now();
+        let terminal_at = (status == SessionStatus::Closed).then_some(now);
+        let metadata = SessionMetadata {
+            id: session_id.clone(),
+            agent_id: agent_id.clone(),
+            status,
+            created_at: now,
+            updated_at: now,
+            closed_at: terminal_at,
+            source: "tui".into(),
+            model: "test-model".into(),
+            system_prompt_path: "system_prompt.md".into(),
+            message_count: 0,
+            finalized_at: terminal_at,
+            recapped_until: 0,
+            compaction: None,
+        };
+        write_yaml_atomic(&session_paths.session_yaml, &metadata).await?;
+        Ok(())
     }
 
     #[test]
@@ -1906,6 +2596,41 @@ mod tests {
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with("acn-supervisor-")));
+    }
+
+    #[tokio::test]
+    async fn supervisor_socket_permissions_are_owner_only() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("supervisor.sock");
+        let _listener = UnixListener::bind(&path)?;
+
+        set_socket_owner_only(&path).await?;
+
+        let mode = fs::metadata(&path).await?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn supervisor_peer_accepts_same_effective_uid() -> anyhow::Result<()> {
+        let (stream, _peer) = UnixStream::pair()?;
+
+        validate_supervisor_peer(&stream)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn supervisor_peer_rejects_different_uid() {
+        let error = validate_supervisor_peer_uid(1001, 1000)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("拒绝不同用户的 supervisor IPC 对端"));
+        assert!(error.contains("peer_uid=1001"));
+        assert!(error.contains("current_uid=1000"));
     }
 
     #[test]
@@ -1967,6 +2692,30 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_request_round_trips_retry_finalize_targets() {
+        for request in [
+            SupervisorRequest::RetryFinalize {
+                target: SupervisorRetryTarget::Session {
+                    session_id: "session_1234abcd".parse().unwrap(),
+                },
+                notify_on_completion: true,
+            },
+            SupervisorRequest::RetryFinalize {
+                target: SupervisorRetryTarget::Job {
+                    job_id: "job_123_abcdef01".into(),
+                },
+                notify_on_completion: false,
+            },
+        ] {
+            let json = serde_json::to_string(&request).unwrap();
+            assert_eq!(
+                serde_json::from_str::<SupervisorRequest>(&json).unwrap(),
+                request
+            );
+        }
+    }
+
+    #[test]
     fn supervisor_request_round_trips_status_and_stop() {
         let status = serde_json::to_string(&SupervisorRequest::Status).unwrap();
         let stop = serde_json::to_string(&SupervisorRequest::Stop).unwrap();
@@ -2001,15 +2750,33 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_build_match_requires_current_version_and_commit() {
-        assert!(supervisor_build_matches_current(Some(
-            &BuildIdentity::current()
-        )));
-        assert!(!supervisor_build_matches_current(None));
-        assert!(!supervisor_build_matches_current(Some(&BuildIdentity {
-            version: env!("CARGO_PKG_VERSION").into(),
-            commit: "previous".into(),
-        })));
+    fn supervisor_runtime_match_requires_current_build_and_fingerprint() {
+        let fingerprint = test_runtime_fingerprint("current");
+        let launch = test_launch_config(PathBuf::from("/tmp/agent-a"), fingerprint.clone());
+
+        assert!(supervisor_runtime_matches(
+            &launch,
+            Some(&BuildIdentity::current()),
+            Some(&fingerprint)
+        ));
+        assert!(!supervisor_runtime_matches(
+            &launch,
+            Some(&BuildIdentity::current()),
+            Some(&test_runtime_fingerprint("previous"))
+        ));
+        assert!(!supervisor_runtime_matches(
+            &launch,
+            None,
+            Some(&fingerprint)
+        ));
+        assert!(!supervisor_runtime_matches(
+            &launch,
+            Some(&BuildIdentity {
+                version: env!("CARGO_PKG_VERSION").into(),
+                commit: "previous".into(),
+            }),
+            Some(&fingerprint)
+        ));
     }
 
     #[test]
@@ -2181,6 +2948,7 @@ mod tests {
                 pid: std::process::id(),
                 started_at: Utc::now(),
                 build: None,
+                runtime_fingerprint: None,
             };
             let mut bytes = serde_json::to_vec(&response).unwrap();
             bytes.push(b'\n');
@@ -2219,7 +2987,7 @@ mod tests {
     #[tokio::test]
     async fn update_shutdown_kills_verified_supervisor_subprocess() -> anyhow::Result<()> {
         if let Some(agent_home) = std::env::var_os(UPDATE_HOLDER_AGENT_HOME_ENV) {
-            return run_test_supervisor_holder(PathBuf::from(agent_home), None).await;
+            return run_test_supervisor_holder(PathBuf::from(agent_home), None, None).await;
         }
 
         let dir = tempfile::tempdir()?;
@@ -2261,21 +3029,33 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn ensure_supervisor_replaces_legacy_build_and_waits_for_current_build(
+    async fn ensure_supervisor_replaces_stale_runtime_and_waits_for_current_identity(
     ) -> anyhow::Result<()> {
         if let Some(agent_home) = std::env::var_os(TAKEOVER_HOLDER_AGENT_HOME_ENV) {
-            let build = match std::env::var(TAKEOVER_HOLDER_BUILD_ENV).as_deref() {
-                Ok("current") => Some(BuildIdentity::current()),
-                Ok("legacy") => None,
-                other => anyhow::bail!("无效 takeover holder build: {other:?}"),
-            };
-            return run_test_supervisor_holder(PathBuf::from(agent_home), build).await;
+            let (build, runtime_fingerprint) =
+                match std::env::var(TAKEOVER_HOLDER_BUILD_ENV).as_deref() {
+                    Ok("current") => (
+                        Some(BuildIdentity::current()),
+                        Some(test_runtime_fingerprint("replacement")),
+                    ),
+                    Ok("stale") => (
+                        Some(BuildIdentity::current()),
+                        Some(test_runtime_fingerprint("stale")),
+                    ),
+                    other => anyhow::bail!("无效 takeover holder build: {other:?}"),
+                };
+            return run_test_supervisor_holder(
+                PathBuf::from(agent_home),
+                build,
+                runtime_fingerprint,
+            )
+            .await;
         }
 
         let dir = tempfile::tempdir()?;
         let executable = std::env::current_exe()?;
         let test_name =
-            "supervisor::tests::ensure_supervisor_replaces_legacy_build_and_waits_for_current_build";
+            "supervisor::tests::ensure_supervisor_replaces_stale_runtime_and_waits_for_current_identity";
         let spawn_holder = |build: &str| -> anyhow::Result<tokio::process::Child> {
             tokio::process::Command::new(&executable)
                 .arg("--exact")
@@ -2290,38 +3070,40 @@ mod tests {
                 .context("启动测试 supervisor holder 失败")
         };
 
-        let mut legacy = spawn_holder("legacy")?;
+        let mut stale = spawn_holder("stale")?;
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match preflight_supervisor_shutdown(dir.path()).await {
                 Ok(VerifiedSupervisorState::Running { .. }) => break,
                 result if Instant::now() >= deadline => {
-                    let _ = legacy.kill().await;
-                    anyhow::bail!("legacy supervisor holder 未就绪: {result:?}");
+                    let _ = stale.kill().await;
+                    anyhow::bail!("stale supervisor holder 未就绪: {result:?}");
                 }
                 _ => sleep(Duration::from_millis(25)).await,
             }
         }
 
-        let launch = SupervisorLaunchConfig::new(
-            dir.path().to_path_buf(),
-            dir.path().join("config.toml"),
-            None,
-            None,
-            true,
-        );
+        let runtime_fingerprint = test_runtime_fingerprint("replacement");
+        let launch = test_launch_config(dir.path().to_path_buf(), runtime_fingerprint.clone());
         let (replacement_tx, replacement_rx) = std::sync::mpsc::channel();
         ensure_supervisor_running_with(&launch, |_| {
-            let replacement = spawn_holder("current")?;
-            replacement_tx
-                .send(replacement)
-                .map_err(|_| anyhow::anyhow!("记录 replacement supervisor 失败"))
+            std::future::ready((|| -> anyhow::Result<()> {
+                let replacement = spawn_holder("current")?;
+                replacement_tx
+                    .send(replacement)
+                    .map_err(|_| anyhow::anyhow!("记录 replacement supervisor 失败"))
+            })())
         })
         .await?;
 
         let status = supervisor_status(dir.path()).await?;
         assert_eq!(status.runtime_state, SupervisorRuntimeState::Running);
         assert_eq!(status.build, Some(BuildIdentity::current()));
+        assert_eq!(status.runtime_fingerprint, Some(runtime_fingerprint));
+        ensure_supervisor_running_with(&launch, |_| async {
+            anyhow::bail!("相同运行身份不应重复拉起 supervisor")
+        })
+        .await?;
         let replacement_state = preflight_supervisor_shutdown(dir.path()).await?;
         let guard = shutdown_verified_supervisor(dir.path(), replacement_state).await?;
         drop(guard);
@@ -2329,11 +3111,193 @@ mod tests {
         let mut replacement = replacement_rx
             .recv()
             .context("未收到 replacement supervisor child")?;
-        let legacy_status = tokio::time::timeout(Duration::from_secs(2), legacy.wait()).await??;
+        let stale_status = tokio::time::timeout(Duration::from_secs(2), stale.wait()).await??;
         let replacement_status =
             tokio::time::timeout(Duration::from_secs(2), replacement.wait()).await??;
-        assert!(!legacy_status.success());
+        assert!(!stale_status.success());
         assert!(!replacement_status.success());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_ensure_rechecks_identity_inside_transition_lock() -> anyhow::Result<()> {
+        if let Some(agent_home) = std::env::var_os(CONCURRENT_TAKEOVER_HOLDER_AGENT_HOME_ENV) {
+            let runtime_fingerprint =
+                match std::env::var(CONCURRENT_TAKEOVER_HOLDER_BUILD_ENV).as_deref() {
+                    Ok("replacement") => test_runtime_fingerprint("replacement"),
+                    Ok("stale") => test_runtime_fingerprint("stale"),
+                    other => anyhow::bail!("无效 concurrent takeover holder build: {other:?}"),
+                };
+            return run_test_supervisor_holder(
+                PathBuf::from(agent_home),
+                Some(BuildIdentity::current()),
+                Some(runtime_fingerprint),
+            )
+            .await;
+        }
+
+        let dir = tempfile::tempdir()?;
+        let executable = std::env::current_exe()?;
+        let test_name =
+            "supervisor::tests::concurrent_ensure_rechecks_identity_inside_transition_lock";
+        let spawn_holder = |build: &str| -> anyhow::Result<tokio::process::Child> {
+            tokio::process::Command::new(&executable)
+                .arg("--exact")
+                .arg(test_name)
+                .arg("--nocapture")
+                .env(CONCURRENT_TAKEOVER_HOLDER_AGENT_HOME_ENV, dir.path())
+                .env(CONCURRENT_TAKEOVER_HOLDER_BUILD_ENV, build)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .context("启动 concurrent takeover 测试 holder 失败")
+        };
+
+        let mut stale = spawn_holder("stale")?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match supervisor_runtime_identity(&SupervisorPaths::new(dir.path())).await {
+                Ok(_) => break,
+                result if Instant::now() >= deadline => {
+                    let _ = stale.kill().await;
+                    anyhow::bail!("concurrent stale supervisor holder 未就绪: {result:?}");
+                }
+                _ => sleep(Duration::from_millis(25)).await,
+            }
+        }
+
+        let paths = SupervisorPaths::new(dir.path());
+        let transition_blocker = FileLockGuard::lock_exclusive_timeout(
+            &paths.transition_lock_path,
+            Duration::from_secs(1),
+        )
+        .await?;
+        let launch = test_launch_config(
+            dir.path().to_path_buf(),
+            test_runtime_fingerprint("replacement"),
+        );
+        let spawn_calls = Arc::new(AtomicU64::new(0));
+        let (replacement_tx, replacement_rx) = std::sync::mpsc::channel();
+        let spawn_ensure = || {
+            let launch = launch.clone();
+            let executable = executable.clone();
+            let agent_home = dir.path().to_path_buf();
+            let spawn_calls = spawn_calls.clone();
+            let replacement_tx = replacement_tx.clone();
+            tokio::spawn(async move {
+                ensure_supervisor_running_with(&launch, move |_| {
+                    let result = (|| -> anyhow::Result<()> {
+                        if spawn_calls.fetch_add(1, Ordering::SeqCst) != 0 {
+                            anyhow::bail!("并发 ensure 不应重复拉起 replacement supervisor");
+                        }
+                        let replacement = tokio::process::Command::new(&executable)
+                            .arg("--exact")
+                            .arg(test_name)
+                            .arg("--nocapture")
+                            .env(CONCURRENT_TAKEOVER_HOLDER_AGENT_HOME_ENV, &agent_home)
+                            .env(CONCURRENT_TAKEOVER_HOLDER_BUILD_ENV, "replacement")
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::inherit())
+                            .spawn()
+                            .context("启动 concurrent replacement supervisor 失败")?;
+                        replacement_tx
+                            .send(replacement)
+                            .map_err(|_| anyhow::anyhow!("记录 concurrent replacement 失败"))
+                    })();
+                    std::future::ready(result)
+                })
+                .await
+            })
+        };
+        let first = spawn_ensure();
+        let second = spawn_ensure();
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(spawn_calls.load(Ordering::SeqCst), 0);
+        drop(transition_blocker);
+
+        first.await??;
+        second.await??;
+        assert_eq!(spawn_calls.load(Ordering::SeqCst), 1);
+        let status = supervisor_status(dir.path()).await?;
+        assert_eq!(
+            status.runtime_fingerprint,
+            Some(test_runtime_fingerprint("replacement"))
+        );
+
+        let state = preflight_supervisor_shutdown(dir.path()).await?;
+        let guard = shutdown_verified_supervisor(dir.path(), state).await?;
+        drop(guard);
+        let mut replacement = replacement_rx
+            .try_recv()
+            .context("未收到 concurrent replacement supervisor child")?;
+        let stale_status = tokio::time::timeout(Duration::from_secs(2), stale.wait()).await??;
+        let replacement_status =
+            tokio::time::timeout(Duration::from_secs(2), replacement.wait()).await??;
+        assert!(!stale_status.success());
+        assert!(!replacement_status.success());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn enqueue_uses_healthy_mismatched_runtime_without_takeover() -> anyhow::Result<()> {
+        if let Some(agent_home) = std::env::var_os(ENQUEUE_HOLDER_AGENT_HOME_ENV) {
+            return run_test_supervisor_holder(
+                PathBuf::from(agent_home),
+                Some(BuildIdentity::current()),
+                Some(test_runtime_fingerprint("active")),
+            )
+            .await;
+        }
+
+        let dir = tempfile::tempdir()?;
+        let executable = std::env::current_exe()?;
+        let mut active = tokio::process::Command::new(executable)
+            .arg("--exact")
+            .arg("supervisor::tests::enqueue_uses_healthy_mismatched_runtime_without_takeover")
+            .arg("--nocapture")
+            .env(ENQUEUE_HOLDER_AGENT_HOME_ENV, dir.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .context("启动 enqueue 测试 supervisor holder 失败")?;
+        let active_pid = active.id().context("enqueue 测试 holder 缺少 PID")?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match preflight_supervisor_shutdown(dir.path()).await {
+                Ok(VerifiedSupervisorState::Running { .. }) => break,
+                result if Instant::now() >= deadline => {
+                    let _ = active.kill().await;
+                    anyhow::bail!("enqueue 测试 supervisor holder 未就绪: {result:?}");
+                }
+                _ => sleep(Duration::from_millis(25)).await,
+            }
+        }
+
+        let stale_launch = test_launch_config(
+            dir.path().to_path_buf(),
+            test_runtime_fingerprint("stale-caller"),
+        );
+        let job_id = enqueue_finalize(&stale_launch, "session_1234abcd".parse()?).await?;
+
+        assert_eq!(job_id, "job_test_holder");
+        assert_eq!(active.id(), Some(active_pid));
+        assert!(active.try_wait()?.is_none());
+        let status = supervisor_status(dir.path()).await?;
+        assert_eq!(
+            status.runtime_fingerprint,
+            Some(test_runtime_fingerprint("active"))
+        );
+
+        let state = preflight_supervisor_shutdown(dir.path()).await?;
+        let guard = shutdown_verified_supervisor(dir.path(), state).await?;
+        drop(guard);
+        let exit = tokio::time::timeout(Duration::from_secs(2), active.wait()).await??;
+        assert!(!exit.success());
         Ok(())
     }
 
@@ -2341,6 +3305,7 @@ mod tests {
     async fn run_test_supervisor_holder(
         agent_home: PathBuf,
         build: Option<BuildIdentity>,
+        runtime_fingerprint: Option<SupervisorRuntimeFingerprint>,
     ) -> anyhow::Result<()> {
         let paths = SupervisorPaths::new(&agent_home);
         fs::create_dir_all(&paths.supervisor_dir)
@@ -2371,9 +3336,13 @@ mod tests {
                     pid: std::process::id(),
                     started_at: Utc::now(),
                     build: build.clone(),
+                    runtime_fingerprint: runtime_fingerprint.clone(),
+                },
+                Ok(SupervisorRequest::EnqueueFinalize { .. }) => SupervisorResponse::Enqueued {
+                    job_id: "job_test_holder".into(),
                 },
                 _ => SupervisorResponse::Error {
-                    message: "test holder only supports status".into(),
+                    message: "test holder only supports status and enqueue".into(),
                 },
             };
             let mut bytes = serde_json::to_vec(&response)?;
@@ -2396,6 +3365,7 @@ mod tests {
             stop_requested: cancel,
             last_activity: Arc::new(AtomicU64::new(now_millis())),
             started_at: Utc::now(),
+            runtime_fingerprint: test_runtime_fingerprint("current"),
             stopping: Arc::new(AtomicBool::new(true)),
             lifecycle_gate: Arc::new(Mutex::new(())),
         };
@@ -2430,6 +3400,309 @@ mod tests {
             }
         );
         assert!(!paths.jobs_dir.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn idle_shutdown_rechecks_queue_after_waiting_for_enqueue_gate() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        let (notify_tx, _notify_rx) = mpsc::unbounded_channel();
+        let shared = SupervisorSharedState {
+            agent_id: agent_id.clone(),
+            notify_tx,
+            stop_requested: CancellationToken::new(),
+            last_activity: Arc::new(AtomicU64::new(0)),
+            started_at: Utc::now(),
+            runtime_fingerprint: test_runtime_fingerprint("current"),
+            stopping: Arc::new(AtomicBool::new(false)),
+            lifecycle_gate: Arc::new(Mutex::new(())),
+        };
+        let running_job = Arc::new(AtomicBool::new(false));
+        let enqueue_guard = shared.lifecycle_gate.lock().await;
+        let shutdown = {
+            let paths = paths.clone();
+            let shared = shared.clone();
+            let running_job = running_job.clone();
+            tokio::spawn(async move {
+                begin_idle_shutdown_if_due(&paths, &shared, &running_job, Duration::from_millis(1))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+
+        let job = enqueue_finalize_job(&paths, &agent_id, session_id, true).await?;
+        drop(enqueue_guard);
+
+        assert!(!shutdown.await?);
+        assert!(!shared.stopping.load(Ordering::Acquire));
+        assert!(!shared.stop_requested.is_cancelled());
+        assert_eq!(
+            next_queued_job(&paths).await?.map(|job| job.id),
+            Some(job.id)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enqueue_finalize_is_idempotent_per_session() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+
+        let first = enqueue_finalize_job(&paths, &agent_id, session_id.clone(), true).await?;
+        let second = enqueue_finalize_job(&paths, &agent_id, session_id, false).await?;
+
+        assert_eq!(first.id, second.id);
+        assert!(second.notify_on_completion);
+        assert_eq!(read_jobs(&paths).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enqueue_finalize_rejects_failed_job_with_retry_hint() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        let mut job = create_finalize_job(&paths, &agent_id, session_id.clone(), true).await?;
+        job.status = SupervisorJobStatus::Failed;
+        job.attempts = DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS;
+        write_job(&paths, &job).await?;
+
+        let error = enqueue_finalize_job(&paths, &agent_id, session_id.clone(), true)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains(&job.id));
+        assert!(error.contains(&format!("acn supervisor retry {session_id}")));
+        assert_eq!(read_jobs(&paths).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_failed_job_resets_attempt_budget_and_preserves_history() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        let mut job = create_finalize_job(&paths, &agent_id, session_id.clone(), false).await?;
+        job.status = SupervisorJobStatus::Failed;
+        job.attempts = DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS;
+        job.manual_retries = 2;
+        job.started_at = Some(Utc::now());
+        job.finished_at = Some(Utc::now());
+        job.last_error = Some("provider unavailable".into());
+        write_job(&paths, &job).await?;
+
+        let report = retry_finalize_job(
+            &paths,
+            &agent_id,
+            SupervisorRetryTarget::Session {
+                session_id: session_id.clone(),
+            },
+            true,
+        )
+        .await?;
+        let stored = read_yaml::<SupervisorJob>(&job_path(&paths, &job.id)).await?;
+
+        assert_eq!(report.session_id, session_id);
+        assert_eq!(report.job_id, job.id);
+        assert_eq!(
+            report.previous_attempts,
+            DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS
+        );
+        assert_eq!(report.manual_retries, 3);
+        assert_eq!(stored.status, SupervisorJobStatus::Queued);
+        assert_eq!(stored.attempts, 0);
+        assert_eq!(stored.manual_retries, 3);
+        assert_eq!(stored.started_at, None);
+        assert_eq!(stored.finished_at, None);
+        assert_eq!(stored.last_error.as_deref(), Some("provider unavailable"));
+        assert!(!stored.notify_on_completion);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_by_job_id_resolves_the_same_session_and_job() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        let mut job = create_finalize_job(&paths, &agent_id, session_id.clone(), true).await?;
+        job.status = SupervisorJobStatus::Failed;
+        job.attempts = 4;
+        job.last_error = Some("failed".into());
+        write_job(&paths, &job).await?;
+
+        let report = retry_finalize_job(
+            &paths,
+            &agent_id,
+            SupervisorRetryTarget::Job {
+                job_id: job.id.clone(),
+            },
+            true,
+        )
+        .await?;
+
+        assert_eq!(report.session_id, session_id);
+        assert_eq!(report.job_id, job.id);
+        assert_eq!(report.previous_attempts, 4);
+        assert_eq!(report.manual_retries, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_session_recovers_finalizing_session_without_a_job() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+
+        let report = retry_finalize_job(
+            &paths,
+            &agent_id,
+            SupervisorRetryTarget::Session {
+                session_id: session_id.clone(),
+            },
+            false,
+        )
+        .await?;
+        let jobs = read_jobs(&paths).await?;
+
+        assert_eq!(report.session_id, session_id);
+        assert_eq!(report.previous_attempts, 0);
+        assert_eq!(report.manual_retries, 1);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, report.job_id);
+        assert_eq!(jobs[0].status, SupervisorJobStatus::Queued);
+        assert_eq!(jobs[0].manual_retries, 1);
+        assert!(!jobs[0].notify_on_completion);
+        assert!(jobs[0].last_error.as_deref().is_some_and(|message| {
+            message.contains("recovered Finalizing session without a supervisor job")
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_job_id_cannot_recover_session_without_a_job() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+
+        let error = retry_finalize_job(
+            &paths,
+            &agent_id,
+            SupervisorRetryTarget::Job {
+                job_id: "job_missing".into(),
+            },
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("未找到 supervisor job job_missing"));
+        assert!(read_jobs(&paths).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_rejects_non_finalizing_sessions_and_non_failed_jobs() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id = "session_1234abcd".parse()?;
+
+        for status in [SessionStatus::Open, SessionStatus::Closed] {
+            write_test_session(&paths, &agent_id, &session_id, status).await?;
+            let error = retry_finalize_job(
+                &paths,
+                &agent_id,
+                SupervisorRetryTarget::Session {
+                    session_id: session_id.clone(),
+                },
+                true,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("只有未完成的 Finalizing session 可以 retry"));
+        }
+
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        let mut job = create_finalize_job(&paths, &agent_id, session_id.clone(), true).await?;
+        for status in [
+            SupervisorJobStatus::Queued,
+            SupervisorJobStatus::Running,
+            SupervisorJobStatus::Succeeded,
+        ] {
+            job.status = status.clone();
+            write_job(&paths, &job).await?;
+            let error = retry_finalize_job(
+                &paths,
+                &agent_id,
+                SupervisorRetryTarget::Session {
+                    session_id: session_id.clone(),
+                },
+                true,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(match status {
+                SupervisorJobStatus::Succeeded => "不能 retry",
+                _ => "无需 retry",
+            }));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_session_jobs_are_reported_as_invariant_corruption() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        let first = queued_finalize_job("job_first", session_id.clone());
+        let second = queued_finalize_job("job_second", session_id.clone());
+        write_yaml_atomic(&job_path(&paths, &first.id), &first).await?;
+        write_yaml_atomic(&job_path(&paths, &second.id), &second).await?;
+
+        let enqueue_error = enqueue_finalize_job(&paths, &agent_id, session_id.clone(), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        let retry_error = retry_finalize_job(
+            &paths,
+            &agent_id,
+            SupervisorRetryTarget::Job {
+                job_id: first.id.clone(),
+            },
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        for error in [enqueue_error, retry_error] {
+            assert!(error.contains("违反唯一性约束"));
+            assert!(error.contains("job_first"));
+            assert!(error.contains("job_second"));
+        }
         Ok(())
     }
 
@@ -2527,6 +3800,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_running_job_is_requeued_without_refunding_attempt() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let mut running = queued_finalize_job("job_running", "session_11111111".parse()?);
+        running.status = SupervisorJobStatus::Running;
+        running.attempts = 2;
+        running.started_at = Some(Utc::now());
+        let mut failed = queued_finalize_job("job_failed", "session_22222222".parse()?);
+        failed.status = SupervisorJobStatus::Failed;
+        failed.attempts = DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS;
+        failed.finished_at = Some(Utc::now());
+        write_yaml_atomic(&job_path(&paths, &running.id), &running).await?;
+        write_yaml_atomic(&job_path(&paths, &failed.id), &failed).await?;
+
+        reset_stale_running_jobs(&paths).await?;
+
+        let recovered = read_yaml::<SupervisorJob>(&job_path(&paths, &running.id)).await?;
+        assert_eq!(recovered.status, SupervisorJobStatus::Queued);
+        assert_eq!(recovered.attempts, 2);
+        assert_eq!(
+            recovered.last_error.as_deref(),
+            Some("recovered stale running job after supervisor start")
+        );
+        let terminal = read_yaml::<SupervisorJob>(&job_path(&paths, &failed.id)).await?;
+        assert_eq!(terminal, failed);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn write_job_overwrites_matching_existing_job() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let paths = SupervisorPaths::new(dir.path());
@@ -2577,6 +3879,7 @@ updated_at: "2026-06-25T00:00:00Z"
 
         assert_eq!(job.agent_id, None);
         assert!(job.notify_on_completion);
+        assert_eq!(job.manual_retries, 0);
         assert_eq!(job_session_id(&job), "session_1234abcd");
     }
 
@@ -2591,6 +3894,7 @@ updated_at: "2026-06-25T00:00:00Z"
             },
             status: SupervisorJobStatus::Running,
             attempts: 2,
+            manual_retries: 1,
             created_at: now,
             updated_at: now,
             started_at: Some(now),
@@ -2605,6 +3909,7 @@ updated_at: "2026-06-25T00:00:00Z"
         assert_eq!(view.session_id.as_str(), "session_1234abcd");
         assert_eq!(view.status, "running");
         assert_eq!(view.attempts, 2);
+        assert_eq!(view.manual_retries, 1);
         assert_eq!(view.last_error.as_deref(), Some("retrying"));
     }
 
@@ -2620,6 +3925,7 @@ updated_at: "2026-06-25T00:00:00Z"
                 },
                 status: SupervisorJobStatus::Queued,
                 attempts: 0,
+                manual_retries: 0,
                 created_at: now,
                 updated_at: now,
                 started_at: None,
@@ -2635,6 +3941,7 @@ updated_at: "2026-06-25T00:00:00Z"
                 },
                 status: SupervisorJobStatus::Failed,
                 attempts: 3,
+                manual_retries: 0,
                 created_at: now,
                 updated_at: now,
                 started_at: Some(now),

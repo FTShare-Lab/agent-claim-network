@@ -23,6 +23,13 @@
 11. executor 初版全局串行，job metadata 保留 agent/session/upstream 维度，方便后续扩展。
 12. 通知内容参考当前 TUI finalize 完成时打印的 trace/claim/dispute 摘要，改写为系统通知文案。
 13. supervisor idle timeout 不进 `config.toml`，但必须集中放在 `src/config.rs` 的代码常量中。
+14. 同一 agent 运行目录只允许一个活动 supervisor。构建或运行环境指纹变化时安全接管旧实例；运行环境指纹覆盖有效配置、upstream 和 finalize 所需凭据摘要，不包含工具工作区或 Web 工具凭据。
+15. 接管后由新运行环境继续 `queued` 和中断的 `running` job；中断的 `running` job 保留已计入的执行次数，终态 job 不自动重跑。
+16. TUI 启动阶段负责运行环境接管；退出 enqueue 优先投递给当前健康 supervisor，防止较早启动的 TUI 用缓存指纹反向接管新实例。
+17. 一个 session 在持久化队列中至多有一个 finalize job；重复 enqueue 返回同一个非失败 job，发现多个 job 时按不变量损坏拒绝处理。
+18. `acn supervisor retry <session_id|job_id>` 只重试唯一的失败 job：复用原 job，保留失败记录并将 attempts 清零，记录 `manual_retries`，获得新的完整自动尝试预算。`queued`、`running`、`succeeded` 均拒绝 retry。
+19. session ID 是 retry 的首选入口；当 `Finalizing` session 因崩溃没有任何 job 时，session ID retry 创建其首个恢复 job。job ID 只精确定位已有 job。两种入口解析成功后的输出均包含 session ID 和 job ID。
+20. retry 使用本次命令的 `--config` / `--upstream` 并先确保对应指纹的 supervisor 已接管；`--cd` 仅属于交互式 TUI，所有 supervisor 命令均不支持。
 
 ## 用户体验
 
@@ -95,6 +102,9 @@ supervisor 启动失败时：
 - [x] 已有 supervisor 时，只连接不重复启动。
 - [x] supervisor 崩溃后，下一次 ensure 可以清理 stale socket 并重启。
 - [x] queued/running stale finalize job 可恢复执行。
+- [x] 构建或运行环境变化后安全接管旧 supervisor，且不阻塞 TUI 启动。
+- [x] enqueue 强制一个 session 对应一个 finalize job，并能报告既有重复记录。
+- [x] 失败 job 可按 session ID 或 job ID 手动 retry；孤儿 `Finalizing` session 可按 session ID 恢复。
 
 ### Phase 3: TUI exit 接入和通知
 

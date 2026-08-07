@@ -277,6 +277,7 @@ acn mcp remove my-server
 ```bash
 acn supervisor status
 acn supervisor jobs
+acn supervisor retry <session_id>
 ```
 
 停止 supervisor：
@@ -285,7 +286,9 @@ acn supervisor jobs
 acn supervisor stop
 ```
 
-使用自定义 `--config` 或 `--upstream` 启动时，查询 supervisor 也应传相同参数。
+使用自定义 `--config` 或 `--upstream` 启动时，管理 supervisor 也应传相同参数。
+
+失败的 finalize 可按 session ID 重试，也可使用 `jobs` 显示的 job ID；若 session 已进入 `Finalizing` 但尚未创建 job，也可用 session ID 恢复。配置、相关凭据或 ACN 版本变化后，下次启动对应 upstream 时会自动接管旧 supervisor 并继续未完成任务。supervisor 连续空闲 5 分钟后会自行退出。
 
 ## 会话维护与更新
 

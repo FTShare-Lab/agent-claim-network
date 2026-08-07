@@ -29,6 +29,8 @@ pub enum ResponsesError {
     InvalidEndpoint(String),
     #[error("Responses 输出不符合预期: {reason}")]
     OutputShape { reason: String },
+    #[error("Responses streaming 响应损坏或未完整结束: {reason}")]
+    StreamFailure { reason: String },
     #[error("Responses upstream failed: {message}")]
     Failed { message: String },
     #[error("Responses 返回未完成终态: {reason}")]
@@ -237,8 +239,11 @@ impl ResponsesClient {
         let mut decoder = ResponsesSseDecoder::default();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|error| self.http_error(error, LlmHttpPhase::ReadStreamBody))?;
+            let chunk = chunk.map_err(|error| ResponsesError::StreamFailure {
+                reason: self
+                    .http_error(error, LlmHttpPhase::ReadStreamBody)
+                    .to_string(),
+            })?;
             decoder.push_chunk(&chunk, emit)?;
         }
         decoder.finish(emit)
@@ -276,6 +281,7 @@ fn is_retryable(error: &ResponsesError) -> bool {
     match error {
         ResponsesError::Http(error) => error.is_retryable(),
         ResponsesError::Status { status, .. } => *status == 429 || *status >= 500,
+        ResponsesError::StreamFailure { .. } => true,
         ResponsesError::Auth(_)
         | ResponsesError::ResponseJson(_)
         | ResponsesError::InvalidEndpoint(_)
@@ -283,6 +289,10 @@ fn is_retryable(error: &ResponsesError) -> bool {
         | ResponsesError::Failed { .. }
         | ResponsesError::Incomplete { .. } => false,
     }
+}
+
+pub(crate) fn is_stream_failure(error: &ResponsesError) -> bool {
+    matches!(error, ResponsesError::StreamFailure { .. })
 }
 
 fn compute_backoff(attempt: u32, base: Duration, max: Duration) -> Duration {
@@ -409,6 +419,38 @@ mod tests {
         );
         let (endpoint, requests) =
             spawn_status_sequence(vec![(500, "temporary".into()), (200, success)]).await;
+        let client = ResponsesClient::new(
+            endpoint,
+            "test-key".into(),
+            Duration::from_secs(5),
+            1,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        let response = client.send(&request(true), &mut |_| {}).await.unwrap();
+
+        assert_eq!(response.output_text, "ok");
+        assert_eq!(requests.await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn client_retries_malformed_sse_json_before_visible_text() {
+        let item = json!({
+            "type":"message","role":"assistant","status":"completed",
+            "content":[{"type":"output_text","text":"ok"}]
+        });
+        let success = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({"type":"response.output_item.done","output_index":0,"item":item}),
+            json!({"type":"response.completed","response":{"status":"completed","output":[item]}})
+        );
+        let (endpoint, requests) = spawn_status_sequence(vec![
+            (200, "data: {broken-json}\n\n".into()),
+            (200, success),
+        ])
+        .await;
         let client = ResponsesClient::new(
             endpoint,
             "test-key".into(),

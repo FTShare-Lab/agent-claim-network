@@ -59,17 +59,25 @@ impl ResponsesStreamAccumulator {
         if data.trim() == "[DONE]" {
             return Ok(());
         }
-        let event: Value = serde_json::from_str(data)?;
+        let event: Value =
+            serde_json::from_str(data).map_err(|error| ResponsesError::StreamFailure {
+                reason: format!("SSE data JSON 解析失败: {error}"),
+            })?;
         let kind = event.get("type").and_then(Value::as_str).ok_or_else(|| {
-            ResponsesError::OutputShape {
+            ResponsesError::StreamFailure {
                 reason: "SSE event 缺少 type".into(),
             }
         })?;
+        if self.terminal_response.is_some() {
+            return Err(ResponsesError::StreamFailure {
+                reason: format!("Responses terminal event 后仍收到 {kind}"),
+            });
+        }
         match kind {
             "response.created" | "response.output_item.added" | "response.in_progress" => {}
             "response.output_text.delta" | "response.refusal.delta" => {
                 let delta = event.get("delta").and_then(Value::as_str).ok_or_else(|| {
-                    ResponsesError::OutputShape {
+                    ResponsesError::StreamFailure {
                         reason: format!("{kind} 缺少 delta"),
                     }
                 })?;
@@ -84,25 +92,25 @@ impl ResponsesStreamAccumulator {
                     .get("output_index")
                     .and_then(Value::as_u64)
                     .and_then(|index| usize::try_from(index).ok())
-                    .ok_or_else(|| ResponsesError::OutputShape {
+                    .ok_or_else(|| ResponsesError::StreamFailure {
                         reason: "response.output_item.done 缺少合法 output_index".into(),
                     })?;
                 let item = event
                     .get("item")
                     .filter(|item| item.is_object())
                     .cloned()
-                    .ok_or_else(|| ResponsesError::OutputShape {
+                    .ok_or_else(|| ResponsesError::StreamFailure {
                         reason: "response.output_item.done 缺少 item object".into(),
                     })?;
                 if self.output_items.insert(index, item).is_some() {
-                    return Err(ResponsesError::OutputShape {
+                    return Err(ResponsesError::StreamFailure {
                         reason: format!("response.output_item.done output_index={index} 重复"),
                     });
                 }
             }
             "response.completed" | "response.incomplete" => {
                 if self.terminal_response.is_some() {
-                    return Err(ResponsesError::OutputShape {
+                    return Err(ResponsesError::StreamFailure {
                         reason: "Responses SSE 收到重复 terminal event".into(),
                     });
                 }
@@ -116,7 +124,7 @@ impl ResponsesStreamAccumulator {
                         .get("response")
                         .filter(|response| response.is_object())
                         .cloned()
-                        .ok_or_else(|| ResponsesError::OutputShape {
+                        .ok_or_else(|| ResponsesError::StreamFailure {
                             reason: format!("{kind} 缺少 response object"),
                         })?,
                 );
@@ -143,28 +151,28 @@ impl ResponsesStreamAccumulator {
     fn finish(self) -> Result<Value, ResponsesError> {
         let mut response = self
             .terminal_response
-            .ok_or_else(|| ResponsesError::OutputShape {
+            .ok_or_else(|| ResponsesError::StreamFailure {
                 reason: "Responses SSE 在 terminal event 前结束".into(),
             })?;
         let response_object =
             response
                 .as_object_mut()
-                .ok_or_else(|| ResponsesError::OutputShape {
+                .ok_or_else(|| ResponsesError::StreamFailure {
                     reason: "Responses terminal response 不是 object".into(),
                 })?;
         let actual_status = response_object
             .get("status")
             .and_then(Value::as_str)
-            .ok_or_else(|| ResponsesError::OutputShape {
+            .ok_or_else(|| ResponsesError::StreamFailure {
                 reason: "Responses terminal response 缺少 status".into(),
             })?;
-        let expected_status = self
-            .terminal_status
-            .ok_or_else(|| ResponsesError::OutputShape {
-                reason: "Responses SSE 缺少 terminal status".into(),
-            })?;
+        let expected_status =
+            self.terminal_status
+                .ok_or_else(|| ResponsesError::StreamFailure {
+                    reason: "Responses SSE 缺少 terminal status".into(),
+                })?;
         if actual_status != expected_status {
-            return Err(ResponsesError::OutputShape {
+            return Err(ResponsesError::StreamFailure {
                 reason: format!(
                     "Responses terminal event/status 不一致: event={expected_status}, response={actual_status}"
                 ),
@@ -174,7 +182,7 @@ impl ResponsesStreamAccumulator {
         let mut output = Vec::with_capacity(self.output_items.len());
         for (index, item) in self.output_items {
             if index != expected_index {
-                return Err(ResponsesError::OutputShape {
+                return Err(ResponsesError::StreamFailure {
                     reason: format!(
                         "Responses SSE output_index 不连续: 期望 {expected_index}，实际 {index}"
                     ),
@@ -211,7 +219,7 @@ fn drain_sse_frames(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
 }
 
 fn sse_frame_data(frame: &[u8]) -> Result<Option<String>, ResponsesError> {
-    let text = std::str::from_utf8(frame).map_err(|error| ResponsesError::OutputShape {
+    let text = std::str::from_utf8(frame).map_err(|error| ResponsesError::StreamFailure {
         reason: format!("Responses SSE frame 不是 UTF-8: {error}"),
     })?;
     let data = text
@@ -247,6 +255,13 @@ mod tests {
 
     fn sse_event(value: Value) -> String {
         format!("event: {}\ndata: {}\n\n", value["type"], value)
+    }
+
+    #[test]
+    fn invalid_utf8_sse_frame_is_stream_failure() {
+        let error = sse_frame_data(b"data: \xff").unwrap_err();
+
+        assert!(matches!(error, ResponsesError::StreamFailure { .. }));
     }
 
     #[test]
@@ -347,6 +362,34 @@ mod tests {
         let error = decoder.finish(&mut |_| {}).unwrap_err();
 
         assert!(error.to_string().contains("terminal event"));
+    }
+
+    #[test]
+    fn decoder_rejects_tool_item_after_terminal_event() {
+        let body = [
+            sse_event(json!({
+                "type":"response.completed",
+                "response":{"status":"completed","output":[]}
+            })),
+            sse_event(json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{
+                    "type":"function_call",
+                    "call_id":"call_late",
+                    "name":"file_write",
+                    "arguments":"{}"
+                }
+            })),
+        ]
+        .concat();
+        let mut decoder = ResponsesSseDecoder::default();
+
+        let error = decoder
+            .push_chunk(body.as_bytes(), &mut |_| {})
+            .unwrap_err();
+
+        assert!(matches!(error, ResponsesError::StreamFailure { .. }));
     }
 
     #[test]

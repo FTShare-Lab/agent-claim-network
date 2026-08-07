@@ -21,7 +21,7 @@ use tokio::time;
 use tokio::time::Instant;
 
 use super::continuation::{append_with_overlap_dedupe, CONTINUATION_TRIGGER};
-use super::provider::ProviderTerminalFailure;
+use super::provider::{ProviderNoConsumableOutput, ProviderStreamFailure, ProviderTerminalFailure};
 use crate::api::{
     estimate_provider_request_context_tokens, CompletedSessionTurnMessage, ContextUsageSnapshot,
     ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy, ProviderReplayIdentity,
@@ -1305,13 +1305,20 @@ impl AgentTurnLoop {
                 recovered_with_non_streaming: false,
             }),
             Err(error)
-                if !emitted_assistant_text
-                    || error.downcast_ref::<ProviderTerminalFailure>().is_some()
+                if error.downcast_ref::<ProviderTerminalFailure>().is_some()
                     || error.downcast_ref::<SessionTurnInterrupted>().is_some() =>
             {
                 Err(error)
             }
-            Err(mut previous_error) => {
+            Err(mut previous_error)
+                if emitted_assistant_text
+                    || previous_error
+                        .downcast_ref::<ProviderStreamFailure>()
+                        .is_some()
+                    || previous_error
+                        .downcast_ref::<ProviderNoConsumableOutput>()
+                        .is_some() =>
+            {
                 for attempt in 1..=NON_STREAMING_FALLBACK_MAX_ATTEMPTS {
                     // 上一轮失败的 durable 写入期间可能收到 cancel；此时不应虚构下一次已开始。
                     if provider_interrupt.is_some_and(CancellationToken::is_cancelled) {
@@ -1419,6 +1426,7 @@ impl AgentTurnLoop {
                     NON_STREAMING_FALLBACK_MAX_ATTEMPTS
                 ))
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -1428,13 +1436,23 @@ impl AgentTurnLoop {
         emit: &mut (dyn FnMut(ProviderEvent) + Send),
         provider_interrupt: Option<&CancellationToken>,
     ) -> anyhow::Result<ProviderResponse> {
+        let request_is_streaming = request.stream;
         let request_timeout = self.provider.request_timeout();
         let provider_send = self.provider.send(request, emit);
         let provider_call = async {
             match request_timeout {
-                Some(timeout) => time::timeout(timeout, provider_send).await.map_err(|_| {
-                    anyhow::anyhow!("LLM provider call timeout after {}ms", timeout.as_millis())
-                })?,
+                Some(timeout) => match time::timeout(timeout, provider_send).await {
+                    Ok(result) => result,
+                    Err(_) if request_is_streaming => Err(ProviderStreamFailure::new(format!(
+                        "LLM provider streaming call timeout after {}ms",
+                        timeout.as_millis()
+                    ))
+                    .into()),
+                    Err(_) => Err(anyhow::anyhow!(
+                        "LLM provider call timeout after {}ms",
+                        timeout.as_millis()
+                    )),
+                },
                 None => provider_send.await,
             }
         };
@@ -2486,7 +2504,10 @@ mod tests {
     use tokio::sync::{oneshot, watch, Mutex, Notify, Semaphore};
     use tokio::time::{sleep, timeout, Duration};
 
-    use super::{assistant_message_text, ProviderTerminalFailure, CONTINUATION_TRIGGER};
+    use super::{
+        assistant_message_text, ProviderNoConsumableOutput, ProviderStreamFailure,
+        ProviderTerminalFailure, CONTINUATION_TRIGGER,
+    };
     use crate::agent::fs::LocalFsMemoryStore;
     use crate::api::{
         estimate_provider_request_context_tokens, AgentTurnLoop, ContextUsageSource,
@@ -2523,6 +2544,19 @@ mod tests {
 
     struct FallbackTerminalFailureProvider {
         requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    struct ZeroTextRecoverableProvider {
+        requests: Mutex<Vec<ProviderRequest>>,
+        failure_kind: ZeroTextFailureKind,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ZeroTextFailureKind {
+        StreamFailure,
+        NoConsumableOutput,
+        Ordinary,
+        Timeout,
     }
 
     struct ReplaceProcessToolResultPreflight {
@@ -2700,6 +2734,48 @@ mod tests {
                 return Err(anyhow::anyhow!("stream transport failed"));
             }
             Err(ProviderTerminalFailure::new("provider refused request").into())
+        }
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for ZeroTextRecoverableProvider {
+        fn request_timeout(&self) -> Option<Duration> {
+            matches!(self.failure_kind, ZeroTextFailureKind::Timeout)
+                .then_some(Duration::from_millis(1))
+        }
+
+        async fn send(
+            &self,
+            request: ProviderRequest,
+            _emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        ) -> anyhow::Result<ProviderResponse> {
+            let is_streaming = request.stream;
+            self.requests.lock().await.push(request);
+            if !is_streaming {
+                return Ok(response(
+                    vec![SessionTurnContentBlock::text("fallback complete")],
+                    ProviderStop::Done,
+                ));
+            }
+            match self.failure_kind {
+                ZeroTextFailureKind::StreamFailure => {
+                    Err(ProviderStreamFailure::new("stream ended before terminal event").into())
+                }
+                ZeroTextFailureKind::NoConsumableOutput => Err(ProviderNoConsumableOutput::new(
+                    "provider returned no consumable output",
+                )
+                .into()),
+                ZeroTextFailureKind::Ordinary => {
+                    Err(anyhow::anyhow!("ordinary zero-text provider error"))
+                }
+                ZeroTextFailureKind::Timeout => {
+                    sleep(Duration::from_secs(60)).await;
+                    Ok(response(
+                        vec![SessionTurnContentBlock::text("late streaming response")],
+                        ProviderStop::Done,
+                    ))
+                }
+            }
         }
     }
 
@@ -3514,6 +3590,107 @@ mod tests {
             event,
             SessionTurnEvent::AssistantMessageCompleted { text }
                 if text == "complete replacement"
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_text_stream_failure_falls_back_to_non_streaming() {
+        let provider = Arc::new(ZeroTextRecoverableProvider {
+            requests: Mutex::new(Vec::new()),
+            failure_kind: ZeroTextFailureKind::StreamFailure,
+        });
+        let turn_loop = tool_loop(provider.clone());
+        let mut events = Vec::new();
+
+        let turn = turn_loop
+            .run_session_turn(request(), &mut |event| events.push(event))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            turn.messages[1],
+            SessionTurnMessage::assistant_text("fallback complete")
+        );
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].stream);
+        assert!(!requests[1].stream);
+        drop(requests);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::NonStreamingFallbackSucceeded { attempt: 1, .. }
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_text_stream_timeout_falls_back_to_non_streaming() {
+        let provider = Arc::new(ZeroTextRecoverableProvider {
+            requests: Mutex::new(Vec::new()),
+            failure_kind: ZeroTextFailureKind::Timeout,
+        });
+        let turn_loop = tool_loop(provider.clone());
+
+        let turn = turn_loop
+            .run_session_turn(request(), &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(
+            turn.messages[1],
+            SessionTurnMessage::assistant_text("fallback complete")
+        );
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].stream);
+        assert!(!requests[1].stream);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_consumable_output_falls_back_without_visible_text() {
+        let provider = Arc::new(ZeroTextRecoverableProvider {
+            requests: Mutex::new(Vec::new()),
+            failure_kind: ZeroTextFailureKind::NoConsumableOutput,
+        });
+        let turn_loop = tool_loop(provider.clone());
+
+        let turn = turn_loop
+            .run_session_turn(request(), &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(
+            turn.messages[1],
+            SessionTurnMessage::assistant_text("fallback complete")
+        );
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].stream);
+        assert!(!requests[1].stream);
+    }
+
+    #[tokio::test]
+    async fn ordinary_zero_text_error_does_not_enter_fallback() {
+        let provider = Arc::new(ZeroTextRecoverableProvider {
+            requests: Mutex::new(Vec::new()),
+            failure_kind: ZeroTextFailureKind::Ordinary,
+        });
+        let turn_loop = tool_loop(provider.clone());
+        let mut events = Vec::new();
+
+        let error = turn_loop
+            .run_session_turn(request(), &mut |event| events.push(event))
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("ordinary zero-text provider error"));
+        assert_eq!(provider.requests.lock().await.len(), 1);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
+                | SessionTurnEvent::NonStreamingFallbackAttemptFailed { .. }
+                | SessionTurnEvent::NonStreamingFallbackSucceeded { .. }
         )));
     }
 

@@ -13,14 +13,14 @@ use super::continuation::{
     append_with_overlap_dedupe, CONTINUATION_TRIGGER, MAX_CONTINUATION_TURNS,
 };
 use super::provider::{
-    ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy, ProviderReplayIdentity,
-    ProviderReplayProtocol, ProviderRequest, ProviderResponse, ProviderStop,
-    ProviderTerminalFailure, ToolSpec,
+    ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy, ProviderNoConsumableOutput,
+    ProviderReplayIdentity, ProviderReplayProtocol, ProviderRequest, ProviderResponse,
+    ProviderStop, ProviderStreamFailure, ProviderTerminalFailure, ToolSpec,
 };
 use super::redact_media_error_body;
 use super::responses::{
-    ResponsesClient, ResponsesError, ResponsesReasoning, ResponsesRequest, ResponsesStreamEvent,
-    ResponsesTerminal, ResponsesTool,
+    is_stream_failure, ResponsesClient, ResponsesError, ResponsesReasoning, ResponsesRequest,
+    ResponsesStreamEvent, ResponsesTerminal, ResponsesTool,
 };
 use super::types::{ProviderReplayState, SessionTurnContentBlock, SessionTurnMessage};
 use crate::config::ReasoningEffort;
@@ -35,6 +35,8 @@ pub enum OpenAiCompatibleResponsesError {
     Client(#[from] ResponsesError),
     #[error("Responses 输出不符合预期: {reason}")]
     OutputShape { reason: String },
+    #[error("Responses 没有可消费输出: {reason}")]
+    NoConsumableOutput { reason: String },
     #[error(
         "当前模型可能不支持图片 / PDF 附件输入，请确认模型多模态能力或移除附件后重试。上游原始错误: {source}"
     )]
@@ -229,6 +231,9 @@ impl ProviderAdapter for OpenAiCompatibleResponsesProviderAdapter {
         {
             Ok(turn) => turn,
             Err(error) => {
+                if request.stream && responses_adapter_stream_failure(&error) {
+                    return Err(ProviderStreamFailure::new(error.to_string()).into());
+                }
                 let error = wrap_media_rejection(error, request_has_media);
                 if matches!(
                     &error,
@@ -240,7 +245,13 @@ impl ProviderAdapter for OpenAiCompatibleResponsesProviderAdapter {
                 return Err(error.into());
             }
         };
-        let response = provider_response_from_turn(turn, &self.model)?;
+        let response = match provider_response_from_turn(turn, &self.model) {
+            Ok(response) => response,
+            Err(OpenAiCompatibleResponsesError::NoConsumableOutput { reason }) => {
+                return Err(ProviderNoConsumableOutput::new(reason).into());
+            }
+            Err(error) => return Err(error.into()),
+        };
         if let Some(text) =
             response
                 .assistant_message
@@ -255,6 +266,10 @@ impl ProviderAdapter for OpenAiCompatibleResponsesProviderAdapter {
         }
         Ok(response)
     }
+}
+
+fn responses_adapter_stream_failure(error: &OpenAiCompatibleResponsesError) -> bool {
+    matches!(error, OpenAiCompatibleResponsesError::Client(error) if is_stream_failure(error))
 }
 
 struct ResponsesInput {
@@ -453,8 +468,15 @@ fn provider_response_from_turn(
     }
     if content.is_empty() {
         let item_types = replay_item_types(&turn.replay_items);
+        if turn.terminal == ResponsesTerminal::Completed {
+            return Err(OpenAiCompatibleResponsesError::NoConsumableOutput {
+                reason: format!(
+                    "Responses 响应没有可消费的 output_text 或 function_call；output item types={item_types}"
+                ),
+            });
+        }
         return Err(output_shape(format!(
-            "响应没有可消费的 output_text 或 function_call；output item types={item_types}"
+            "Responses token-limit 响应没有可继续的 output_text 或 function_call；output item types={item_types}"
         )));
     }
     let stop = match turn.terminal {
@@ -809,6 +831,41 @@ mod tests {
         assert_eq!(max.stop, ProviderStop::MaxTokens);
     }
 
+    #[test]
+    fn responses_stream_failure_is_exposed_to_provider_turn_loop() {
+        let error = OpenAiCompatibleResponsesError::Client(ResponsesError::StreamFailure {
+            reason: "missing terminal event".into(),
+        });
+
+        assert!(responses_adapter_stream_failure(&error));
+        assert!(!responses_adapter_stream_failure(
+            &OpenAiCompatibleResponsesError::OutputShape {
+                reason: "non-stream shape".into(),
+            }
+        ));
+    }
+
+    #[test]
+    fn completed_reasoning_only_response_is_recoverable_empty_output() {
+        let error = provider_response_from_turn(
+            ContinuedResponsesTurn {
+                merged_text: String::new(),
+                replay_items: vec![json!({
+                    "type":"reasoning","id":"rs_1","encrypted_content":"opaque"
+                })],
+                function_calls: Vec::new(),
+                terminal: ResponsesTerminal::Completed,
+            },
+            "test-model",
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OpenAiCompatibleResponsesError::NoConsumableOutput { .. }
+        ));
+    }
+
     #[tokio::test]
     async fn max_token_continuation_replays_every_round_and_internal_input() {
         let first_output = json!({
@@ -1152,6 +1209,235 @@ mod tests {
             event,
             crate::api::SessionTurnEvent::NonStreamingFallbackSucceeded { .. }
         )));
+    }
+
+    #[tokio::test]
+    async fn zero_text_reasoning_stream_without_terminal_falls_back_to_json() {
+        let failed_reasoning = json!({
+            "type":"reasoning","id":"rs_failed","encrypted_content":"must-not-persist"
+        });
+        let final_item = json!({
+            "type":"message","id":"msg_ok","role":"assistant","status":"completed",
+            "content":[{"type":"output_text","text":"fallback answer"}]
+        });
+        let (endpoint, requests) = spawn_mixed_sequence(vec![
+            (
+                "text/event-stream",
+                format!(
+                    "data: {}\n\n",
+                    json!({
+                        "type":"response.output_item.done",
+                        "output_index":0,
+                        "item":failed_reasoning
+                    })
+                ),
+            ),
+            (
+                "application/json",
+                json!({"status":"completed","output":[final_item.clone()] }).to_string(),
+            ),
+        ])
+        .await;
+        let adapter = Arc::new(
+            OpenAiCompatibleResponsesProviderAdapter::new(
+                "test-key".into(),
+                endpoint,
+                "test-model".into(),
+                Duration::from_secs(5),
+                0,
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .unwrap(),
+        );
+        let tools = Arc::new(ToolRegistry::new(&ToolConfig::default()).unwrap());
+        let turn_loop = AgentTurnLoop::new(adapter, tools, 128);
+        let mut events = Vec::new();
+
+        let turn = turn_loop
+            .run_session_turn(
+                SessionTurnRequest {
+                    current_session_id: None,
+                    current_turn_id: None,
+                    system_prompt: "system".into(),
+                    history: Vec::new(),
+                    user_text: "hello".into(),
+                    user_attachments: Vec::new(),
+                    skill_instructions: Vec::new(),
+                },
+                &mut |event| events.push(event),
+            )
+            .await
+            .unwrap();
+        let requests = requests.await.unwrap();
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["stream"], true);
+        assert_eq!(requests[1]["stream"], false);
+        let assistant = turn
+            .messages
+            .iter()
+            .find(|message| message.role == "assistant")
+            .unwrap();
+        assert!(matches!(
+            &assistant.content[0],
+            SessionTurnContentBlock::Text { text } if text == "fallback answer"
+        ));
+        let replay = serde_json::to_string(&assistant.provider_replay).unwrap();
+        assert!(!replay.contains("must-not-persist"));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::api::SessionTurnEvent::NonStreamingFallbackSucceeded { attempt: 1, .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn completed_reasoning_only_stream_falls_back_without_persisting_reasoning() {
+        let failed_reasoning = json!({
+            "type":"reasoning","id":"rs_empty","encrypted_content":"must-not-persist"
+        });
+        let final_item = json!({
+            "type":"message","id":"msg_ok","role":"assistant","status":"completed",
+            "content":[{"type":"output_text","text":"fallback answer"}]
+        });
+        let (endpoint, requests) = spawn_mixed_sequence(vec![
+            ("text/event-stream", sse_response(&[failed_reasoning], None)),
+            (
+                "application/json",
+                json!({"status":"completed","output":[final_item] }).to_string(),
+            ),
+        ])
+        .await;
+        let adapter = Arc::new(
+            OpenAiCompatibleResponsesProviderAdapter::new(
+                "test-key".into(),
+                endpoint,
+                "test-model".into(),
+                Duration::from_secs(5),
+                0,
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .unwrap(),
+        );
+        let tools = Arc::new(ToolRegistry::new(&ToolConfig::default()).unwrap());
+        let turn_loop = AgentTurnLoop::new(adapter, tools, 128);
+
+        let turn = turn_loop
+            .run_session_turn(
+                SessionTurnRequest {
+                    current_session_id: None,
+                    current_turn_id: None,
+                    system_prompt: "system".into(),
+                    history: Vec::new(),
+                    user_text: "hello".into(),
+                    user_attachments: Vec::new(),
+                    skill_instructions: Vec::new(),
+                },
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        let requests = requests.await.unwrap();
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["stream"], true);
+        assert_eq!(requests[1]["stream"], false);
+        let assistant = turn
+            .messages
+            .iter()
+            .find(|message| message.role == "assistant")
+            .unwrap();
+        assert!(!serde_json::to_string(&assistant.message.provider_replay)
+            .unwrap()
+            .contains("must-not-persist"));
+    }
+
+    #[tokio::test]
+    async fn zero_text_incomplete_tool_stream_never_executes_draft() {
+        let failed_tool = json!({
+            "type":"function_call","id":"fc_failed","call_id":"call_failed",
+            "name":"file_write",
+            "arguments":"{\"path\":\"must-not-exist.txt\",\"content\":\"unsafe\"}",
+            "status":"completed"
+        });
+        let final_item = json!({
+            "type":"message","id":"msg_ok","role":"assistant","status":"completed",
+            "content":[{"type":"output_text","text":"safe fallback"}]
+        });
+        let (endpoint, requests) = spawn_mixed_sequence(vec![
+            (
+                "text/event-stream",
+                format!(
+                    "data: {}\n\n",
+                    json!({
+                        "type":"response.output_item.done",
+                        "output_index":0,
+                        "item":failed_tool
+                    })
+                ),
+            ),
+            (
+                "application/json",
+                json!({"status":"completed","output":[final_item] }).to_string(),
+            ),
+        ])
+        .await;
+        let adapter = Arc::new(
+            OpenAiCompatibleResponsesProviderAdapter::new(
+                "test-key".into(),
+                endpoint,
+                "test-model".into(),
+                Duration::from_secs(5),
+                0,
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .unwrap(),
+        );
+        let workspace = tempfile::tempdir().unwrap();
+        let tools = Arc::new(
+            ToolRegistry::new(&ToolConfig {
+                workspace_root: workspace.path().to_path_buf(),
+                ..ToolConfig::default()
+            })
+            .unwrap(),
+        );
+        let turn_loop = AgentTurnLoop::new(adapter, tools, 128);
+        let mut events = Vec::new();
+
+        let turn = turn_loop
+            .run_session_turn(
+                SessionTurnRequest {
+                    current_session_id: None,
+                    current_turn_id: None,
+                    system_prompt: "system".into(),
+                    history: Vec::new(),
+                    user_text: "hello".into(),
+                    user_attachments: Vec::new(),
+                    skill_instructions: Vec::new(),
+                },
+                &mut |event| events.push(event),
+            )
+            .await
+            .unwrap();
+        let requests = requests.await.unwrap();
+
+        assert_eq!(requests.len(), 2);
+        assert!(!workspace.path().join("must-not-exist.txt").exists());
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            crate::api::SessionTurnEvent::ToolCallStarted { id, .. } if id == "call_failed"
+        )));
+        let assistant = turn
+            .messages
+            .iter()
+            .find(|message| message.role == "assistant")
+            .unwrap();
+        assert!(matches!(
+            &assistant.message.content[0],
+            SessionTurnContentBlock::Text { text } if text == "safe fallback"
+        ));
     }
 
     #[tokio::test]

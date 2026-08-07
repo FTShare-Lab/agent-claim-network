@@ -26,9 +26,9 @@ use super::continuation::{
 use super::endpoint::{resolve_llm_endpoint, LlmEndpointKind};
 use super::llm_http::{read_llm_error_body, LlmHttpError, LlmHttpPhase};
 use super::provider::{
-    ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy, ProviderReplayIdentity,
-    ProviderReplayProtocol, ProviderRequest, ProviderResponse, ProviderStop,
-    ProviderTerminalFailure, ToolSpec,
+    ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy, ProviderNoConsumableOutput,
+    ProviderReplayIdentity, ProviderReplayProtocol, ProviderRequest, ProviderResponse,
+    ProviderStop, ProviderStreamFailure, ProviderTerminalFailure, ToolSpec,
 };
 use super::redact_media_error_body;
 use super::types::{SessionTurnContentBlock, SessionTurnEvent, SessionTurnMessage};
@@ -54,6 +54,12 @@ pub enum AnthropicError {
     InvalidEndpoint(String),
     #[error("LLM 输出不符合预期 schema: {reason}")]
     OutputShape { reason: String, raw: String },
+    #[error("Anthropic streaming 响应损坏或未完整结束: {reason}")]
+    StreamFailure { reason: String, raw: String },
+    #[error("Anthropic 没有可消费输出: {reason}")]
+    NoConsumableOutput { reason: String },
+    #[error("Anthropic streaming 返回确定性错误: {reason}")]
+    TerminalFailure { reason: String },
     #[error("prompt 渲染失败: {0}")]
     Prompt(#[from] PromptError),
     #[error(
@@ -419,7 +425,15 @@ impl ProviderAdapter for AnthropicProviderAdapter {
         };
         let turn = match turn_result {
             Ok(turn) => turn,
-            Err(error) => return Err(wrap_media_rejection(error, request_has_media).into()),
+            Err(error) => {
+                if request.stream && anthropic_adapter_stream_failure(&error) {
+                    return Err(ProviderStreamFailure::new(error.to_string()).into());
+                }
+                if let AnthropicError::TerminalFailure { reason } = &error {
+                    return Err(ProviderTerminalFailure::new(reason.clone()).into());
+                }
+                return Err(wrap_media_rejection(error, request_has_media).into());
+            }
         };
         if !request.stream {
             if let Some(usage) = turn
@@ -438,12 +452,22 @@ impl ProviderAdapter for AnthropicProviderAdapter {
             });
         }
 
-        let assistant_message = assistant_turn_message(&turn, self.client.model.as_str())?;
+        let assistant_message = match assistant_turn_message(&turn, self.client.model.as_str()) {
+            Ok(message) => message,
+            Err(AnthropicError::NoConsumableOutput { reason }) => {
+                return Err(ProviderNoConsumableOutput::new(reason).into());
+            }
+            Err(error) => return Err(error.into()),
+        };
         Ok(ProviderResponse {
             stop,
             assistant_message,
         })
     }
+}
+
+fn anthropic_adapter_stream_failure(error: &AnthropicError) -> bool {
+    matches!(error, AnthropicError::StreamFailure { .. })
 }
 
 impl AnthropicProviderAdapter {
@@ -593,6 +617,14 @@ fn assistant_turn_message(
     } else {
         assistant_content_blocks_without_thinking(turn)
     };
+    let has_tool_use = content
+        .iter()
+        .any(|block| matches!(block, SessionTurnContentBlock::ToolUse { .. }));
+    if turn.final_stop_reason == "tool_use" && !has_tool_use {
+        return Err(AnthropicError::NoConsumableOutput {
+            reason: "Anthropic tool_use 终态没有完整 tool_use block".into(),
+        });
+    }
     if content.is_empty() {
         if turn.final_stop_reason == "model_context_window_exceeded" {
             return Ok(SessionTurnMessage {
@@ -611,12 +643,19 @@ fn assistant_turn_message(
                     Some("thinking") | Some("redacted_thinking")
                 )
             });
+        let reason = if only_reasoning {
+            "Anthropic 响应仅包含 thinking/redacted_thinking，没有可消费的 text 或 tool_use".into()
+        } else {
+            "Anthropic 响应没有可消费的 text 或 tool_use".into()
+        };
+        if matches!(
+            turn.final_stop_reason.as_str(),
+            "end_turn" | "stop_sequence" | "tool_use"
+        ) {
+            return Err(AnthropicError::NoConsumableOutput { reason });
+        }
         return Err(AnthropicError::OutputShape {
-            reason: if only_reasoning {
-                "响应仅包含 thinking/redacted_thinking，没有可消费的 text 或 tool_use".into()
-            } else {
-                "响应没有可消费的 text 或 tool_use".into()
-            },
+            reason,
             raw: String::new(),
         });
     }
@@ -901,12 +940,32 @@ fn is_retryable(e: &AnthropicError) -> bool {
     match e {
         AnthropicError::Http(error) => error.is_retryable(),
         AnthropicError::Status { status, .. } => *status == 429 || *status >= 500,
-        AnthropicError::ResponseJson(_) | AnthropicError::OutputShape { .. } => true,
+        AnthropicError::ResponseJson(_)
+        | AnthropicError::OutputShape { .. }
+        | AnthropicError::StreamFailure { .. } => true,
         AnthropicError::Auth(_)
         | AnthropicError::InvalidEndpoint(_)
-        | AnthropicError::Prompt(_) => false,
+        | AnthropicError::Prompt(_)
+        | AnthropicError::TerminalFailure { .. }
+        | AnthropicError::NoConsumableOutput { .. } => false,
         // 多模态拒收是确定性 4xx，重试无意义
         AnthropicError::MediaRejected { .. } => false,
+    }
+}
+
+fn is_stream_retryable(error: &AnthropicError) -> bool {
+    match error {
+        AnthropicError::Http(error) => error.is_retryable(),
+        AnthropicError::Status { status, .. } => *status == 429 || *status >= 500,
+        AnthropicError::StreamFailure { .. } => true,
+        AnthropicError::Auth(_)
+        | AnthropicError::ResponseJson(_)
+        | AnthropicError::InvalidEndpoint(_)
+        | AnthropicError::OutputShape { .. }
+        | AnthropicError::NoConsumableOutput { .. }
+        | AnthropicError::TerminalFailure { .. }
+        | AnthropicError::Prompt(_)
+        | AnthropicError::MediaRejected { .. } => false,
     }
 }
 
@@ -1184,9 +1243,56 @@ mod tests {
 
         let error = assistant_turn_message(&turn, "test-model").unwrap_err();
 
+        assert!(matches!(error, AnthropicError::NoConsumableOutput { .. }));
         assert!(error.to_string().contains("仅包含 thinking"));
         assert!(!error.to_string().contains(secret));
         assert!(!error.to_string().contains("opaque-signature"));
+    }
+
+    #[test]
+    fn anthropic_empty_tool_terminal_has_no_consumable_content() {
+        let turn = ContinuedAssistantTurn {
+            final_response: json!({}),
+            final_blocks: Vec::new(),
+            final_stop_reason: "tool_use".into(),
+            merged_text: String::new(),
+            replay_messages: Vec::new(),
+        };
+
+        let error = assistant_turn_message(&turn, "test-model").unwrap_err();
+
+        assert!(matches!(error, AnthropicError::NoConsumableOutput { .. }));
+    }
+
+    #[test]
+    fn anthropic_text_only_tool_terminal_has_no_consumable_content() {
+        let turn = ContinuedAssistantTurn {
+            final_response: json!({}),
+            final_blocks: vec![json!({"type":"text","text":"我来查询"})],
+            final_stop_reason: "tool_use".into(),
+            merged_text: "我来查询".into(),
+            replay_messages: Vec::new(),
+        };
+
+        let error = assistant_turn_message(&turn, "test-model").unwrap_err();
+
+        assert!(matches!(error, AnthropicError::NoConsumableOutput { .. }));
+    }
+
+    #[test]
+    fn anthropic_stream_failure_is_exposed_to_provider_turn_loop() {
+        assert!(anthropic_adapter_stream_failure(
+            &AnthropicError::StreamFailure {
+                reason: "missing message_stop".into(),
+                raw: String::new(),
+            }
+        ));
+        assert!(!anthropic_adapter_stream_failure(
+            &AnthropicError::OutputShape {
+                reason: "non-stream shape".into(),
+                raw: String::new(),
+            }
+        ));
     }
 
     #[test]

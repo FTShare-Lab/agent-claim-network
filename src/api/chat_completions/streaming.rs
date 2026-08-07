@@ -18,7 +18,7 @@ pub(super) fn drain_sse_frames(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
 }
 
 pub(super) fn sse_frame_data(frame: &[u8]) -> Result<Option<String>, ChatCompletionsError> {
-    let text = std::str::from_utf8(frame).map_err(|e| ChatCompletionsError::OutputShape {
+    let text = std::str::from_utf8(frame).map_err(|e| ChatCompletionsError::StreamFailure {
         reason: format!("SSE frame 不是 UTF-8: {e}"),
         raw: String::from_utf8_lossy(frame).to_string(),
     })?;
@@ -66,8 +66,18 @@ impl ChatStreamAccumulator {
         if data.trim() == "[DONE]" {
             return Ok(());
         }
-        let frame = serde_json::from_str::<ChatStreamFrame>(data)
-            .map_err(ChatCompletionsError::ResponseJson)?;
+        let frame = serde_json::from_str::<ChatStreamFrame>(data).map_err(|error| {
+            ChatCompletionsError::StreamFailure {
+                reason: format!("SSE data JSON 解析失败: {error}"),
+                raw: data.to_string(),
+            }
+        })?;
+        if self.finish_reason.is_some() && !frame.choices.is_empty() {
+            return Err(ChatCompletionsError::StreamFailure {
+                reason: "finish_reason 后仍收到 choice delta".into(),
+                raw: data.to_string(),
+            });
+        }
         if let Some(usage) = frame.usage {
             self.usage = Some(usage);
         }
@@ -112,7 +122,7 @@ impl ChatStreamAccumulator {
     pub(super) fn finish(self) -> Result<ChatCompletionResponse, ChatCompletionsError> {
         let finish_reason =
             self.finish_reason
-                .ok_or_else(|| ChatCompletionsError::OutputShape {
+                .ok_or_else(|| ChatCompletionsError::StreamFailure {
                     reason: "stream 在明确 finish_reason 前结束".into(),
                     raw: String::new(),
                 })?;
@@ -123,7 +133,7 @@ impl ChatStreamAccumulator {
             let draft =
                 self.tool_calls
                     .get(&index)
-                    .ok_or_else(|| ChatCompletionsError::OutputShape {
+                    .ok_or_else(|| ChatCompletionsError::StreamFailure {
                         reason: format!("stream tool_call index={index} 缺少 draft"),
                         raw: String::new(),
                     })?;
@@ -162,14 +172,14 @@ impl ToolCallDraft {
         let id = self
             .id
             .clone()
-            .ok_or_else(|| ChatCompletionsError::OutputShape {
+            .ok_or_else(|| ChatCompletionsError::StreamFailure {
                 reason: format!("stream tool_call index={index} 缺少 id"),
                 raw: String::new(),
             })?;
         let name = self
             .name
             .clone()
-            .ok_or_else(|| ChatCompletionsError::OutputShape {
+            .ok_or_else(|| ChatCompletionsError::StreamFailure {
                 reason: format!("stream tool_call index={index} 缺少 function.name"),
                 raw: String::new(),
             })?;
@@ -208,6 +218,13 @@ mod tests {
         assert_eq!(frames[0], b"data: {\"a\":1}");
         assert_eq!(frames[1], b"data: {\"b\":2}");
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn invalid_utf8_sse_frame_is_stream_failure() {
+        let error = sse_frame_data(b"data: \xff").unwrap_err();
+
+        assert!(matches!(error, ChatCompletionsError::StreamFailure { .. }));
     }
 
     #[test]
@@ -301,6 +318,26 @@ mod tests {
 
         assert_eq!(response.choices[0].message.content, None);
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn stream_rejects_tool_delta_after_finish_reason() {
+        let mut accumulator = ChatStreamAccumulator::default();
+        accumulator
+            .apply_frame(
+                r#"{"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}"#,
+                &mut |_| {},
+            )
+            .unwrap();
+
+        let error = accumulator
+            .apply_frame(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_late","type":"function","function":{"name":"file_write","arguments":"{}"}}]}}]}"#,
+                &mut |_| {},
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, ChatCompletionsError::StreamFailure { .. }));
     }
 
     #[test]
