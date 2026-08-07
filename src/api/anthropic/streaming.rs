@@ -12,8 +12,8 @@ use super::protocol::{
     has_tool_use_block, ApiMessage, ContinuedAssistantTurn, CreateMessageRequest,
 };
 use super::{
-    compute_backoff, is_retryable, AnthropicError, AnthropicMessagesClient, CONTINUATION_TRIGGER,
-    MAX_CONTINUATION_TURNS,
+    compute_backoff, is_stream_retryable, AnthropicError, AnthropicMessagesClient,
+    CONTINUATION_TRIGGER, MAX_CONTINUATION_TURNS,
 };
 use crate::api::continuation::append_with_overlap_dedupe;
 use crate::api::llm_http::{read_llm_error_body, LlmHttpPhase};
@@ -178,15 +178,24 @@ impl AnthropicMessagesClient {
         let mut builder = StreamingAssistantTurn::default();
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|error| self.http_error(error, LlmHttpPhase::ReadStreamBody))?;
+            let chunk = chunk.map_err(|error| AnthropicError::StreamFailure {
+                reason: self
+                    .http_error(error, LlmHttpPhase::ReadStreamBody)
+                    .to_string(),
+                raw: String::new(),
+            })?;
             sse_buffer.extend_from_slice(&chunk);
             for frame in drain_sse_frames(&mut sse_buffer) {
                 if let Some(data) = sse_frame_data(&frame)? {
                     if data.trim() == "[DONE]" {
                         continue;
                     }
-                    let event = serde_json::from_str::<Value>(&data)?;
+                    let event = serde_json::from_str::<Value>(&data).map_err(|error| {
+                        AnthropicError::StreamFailure {
+                            reason: format!("SSE data JSON 解析失败: {error}"),
+                            raw: String::new(),
+                        }
+                    })?;
                     builder.apply_event(&event, emit)?;
                 }
             }
@@ -194,7 +203,12 @@ impl AnthropicMessagesClient {
         if !sse_buffer.is_empty() {
             if let Some(data) = sse_frame_data(&sse_buffer)? {
                 if data.trim() != "[DONE]" {
-                    let event = serde_json::from_str::<Value>(&data)?;
+                    let event = serde_json::from_str::<Value>(&data).map_err(|error| {
+                        AnthropicError::StreamFailure {
+                            reason: format!("SSE data JSON 解析失败: {error}"),
+                            raw: String::new(),
+                        }
+                    })?;
                     builder.apply_event(&event, emit)?;
                 }
             }
@@ -224,7 +238,7 @@ impl AnthropicMessagesClient {
                 Ok(turn) => return Ok(turn),
                 Err(e)
                     if !replay_blocking_event_emitted
-                        && is_retryable(&e)
+                        && is_stream_retryable(&e)
                         && attempt < retry_count =>
                 {
                     let backoff =
@@ -280,7 +294,7 @@ impl StreamingAssistantTurn {
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
     ) -> Result<(), AnthropicError> {
         if self.saw_message_stop {
-            return Err(AnthropicError::OutputShape {
+            return Err(AnthropicError::StreamFailure {
                 reason: "message_stop 后仍收到 stream event".into(),
                 raw: event.to_string(),
             });
@@ -288,7 +302,7 @@ impl StreamingAssistantTurn {
         match event.get("type").and_then(Value::as_str) {
             Some("message_start") => {
                 if self.saw_message_start {
-                    return Err(AnthropicError::OutputShape {
+                    return Err(AnthropicError::StreamFailure {
                         reason: "重复的 message_start".into(),
                         raw: event.to_string(),
                     });
@@ -308,7 +322,7 @@ impl StreamingAssistantTurn {
             Some("content_block_start") => {
                 let index = sse_index(event)?;
                 let block = event.get("content_block").cloned().ok_or_else(|| {
-                    AnthropicError::OutputShape {
+                    AnthropicError::StreamFailure {
                         reason: "content_block_start 缺少 content_block".into(),
                         raw: event.to_string(),
                     }
@@ -319,7 +333,7 @@ impl StreamingAssistantTurn {
                 let index = sse_index(event)?;
                 let delta = event
                     .get("delta")
-                    .ok_or_else(|| AnthropicError::OutputShape {
+                    .ok_or_else(|| AnthropicError::StreamFailure {
                         reason: "content_block_delta 缺少 delta".into(),
                         raw: event.to_string(),
                     })?;
@@ -343,7 +357,7 @@ impl StreamingAssistantTurn {
             }
             Some("message_stop") => {
                 if !self.saw_message_start {
-                    return Err(AnthropicError::OutputShape {
+                    return Err(AnthropicError::StreamFailure {
                         reason: "message_stop 早于 message_start".into(),
                         raw: event.to_string(),
                     });
@@ -359,13 +373,12 @@ impl StreamingAssistantTurn {
             }
             Some("ping") => {}
             Some("error") => {
-                return Err(AnthropicError::OutputShape {
+                return Err(AnthropicError::TerminalFailure {
                     reason: "Anthropic stream 返回 error event".into(),
-                    raw: event.to_string(),
                 });
             }
             other => {
-                return Err(AnthropicError::OutputShape {
+                return Err(AnthropicError::StreamFailure {
                     reason: format!("未知 Anthropic stream event: {other:?}"),
                     raw: event.to_string(),
                 });
@@ -382,7 +395,7 @@ impl StreamingAssistantTurn {
     ) -> Result<(), AnthropicError> {
         let block = self.block_mut(index)?;
         if block.finished {
-            return Err(AnthropicError::OutputShape {
+            return Err(AnthropicError::StreamFailure {
                 reason: format!("stream delta 引用了已结束的 content block: {index}"),
                 raw: delta.to_string(),
             });
@@ -417,7 +430,7 @@ impl StreamingAssistantTurn {
                 append_json_string_field(&mut block.value, "signature", signature);
             }
             other => {
-                return Err(AnthropicError::OutputShape {
+                return Err(AnthropicError::StreamFailure {
                     reason: format!("未知 content_block_delta type: {other:?}"),
                     raw: delta.to_string(),
                 });
@@ -429,7 +442,7 @@ impl StreamingAssistantTurn {
     fn finish_block(&mut self, index: usize) -> Result<(), AnthropicError> {
         let block = self.block_mut(index)?;
         if block.finished {
-            return Err(AnthropicError::OutputShape {
+            return Err(AnthropicError::StreamFailure {
                 reason: format!("重复的 content_block_stop: {index}"),
                 raw: String::new(),
             });
@@ -438,7 +451,7 @@ impl StreamingAssistantTurn {
             && !block.input_json.trim().is_empty()
         {
             let input = serde_json::from_str::<Value>(&block.input_json).map_err(|e| {
-                AnthropicError::OutputShape {
+                AnthropicError::StreamFailure {
                     reason: format!("tool_use input_json_delta 解析失败: {e}"),
                     raw: block.input_json.clone(),
                 }
@@ -453,25 +466,25 @@ impl StreamingAssistantTurn {
 
     fn finish(self) -> Result<ContinuedAssistantTurn, AnthropicError> {
         if !self.saw_message_stop {
-            return Err(AnthropicError::OutputShape {
+            return Err(AnthropicError::StreamFailure {
                 reason: "stream closed before message_stop".into(),
                 raw: String::new(),
             });
         }
         if !self.saw_message_start {
-            return Err(AnthropicError::OutputShape {
+            return Err(AnthropicError::StreamFailure {
                 reason: "stream 缺少 message_start".into(),
                 raw: String::new(),
             });
         }
         if self.blocks.iter().flatten().any(|block| !block.finished) {
-            return Err(AnthropicError::OutputShape {
+            return Err(AnthropicError::StreamFailure {
                 reason: "message_stop 前存在未结束的 content block".into(),
                 raw: String::new(),
             });
         }
         let stop_reason = super::validated_anthropic_stop_reason(self.stop_reason.as_deref())
-            .map_err(|_| AnthropicError::OutputShape {
+            .map_err(|_| AnthropicError::StreamFailure {
                 reason: "stream 缺少有效 stop_reason".into(),
                 raw: String::new(),
             })?;
@@ -481,7 +494,7 @@ impl StreamingAssistantTurn {
             .map(|block| {
                 block
                     .map(|block| block.value)
-                    .ok_or_else(|| AnthropicError::OutputShape {
+                    .ok_or_else(|| AnthropicError::StreamFailure {
                         reason: "stream content block index 不连续".into(),
                         raw: String::new(),
                     })
@@ -503,7 +516,7 @@ impl StreamingAssistantTurn {
     fn start_block(&mut self, index: usize, block: Value) -> Result<(), AnthropicError> {
         let expected = self.blocks.len();
         if index != expected {
-            return Err(AnthropicError::OutputShape {
+            return Err(AnthropicError::StreamFailure {
                 reason: format!(
                     "stream content_block_start index 不连续: expected={expected}, actual={index}"
                 ),
@@ -522,7 +535,7 @@ impl StreamingAssistantTurn {
         self.blocks
             .get_mut(index)
             .and_then(Option::as_mut)
-            .ok_or_else(|| AnthropicError::OutputShape {
+            .ok_or_else(|| AnthropicError::StreamFailure {
                 reason: format!("stream delta 引用了未开始的 content block: {index}"),
                 raw: String::new(),
             })
@@ -539,7 +552,7 @@ fn require_stream_block_type(
     if actual_block_type == Some(expected_block_type) {
         return Ok(());
     }
-    Err(AnthropicError::OutputShape {
+    Err(AnthropicError::StreamFailure {
         reason: format!(
             "stream {delta_type} 与 content block 类型不匹配: index={index}, expected={expected_block_type}, actual={actual_block_type:?}"
         ),
@@ -555,7 +568,7 @@ fn required_stream_delta_string<'a>(
     delta
         .get(field)
         .and_then(Value::as_str)
-        .ok_or_else(|| AnthropicError::OutputShape {
+        .ok_or_else(|| AnthropicError::StreamFailure {
             reason: format!("stream {delta_type} 缺少字符串字段 {field}"),
             raw: String::new(),
         })
@@ -587,15 +600,13 @@ fn append_json_string_field(value: &mut Value, field: &str, suffix: &str) {
 }
 
 fn sse_index(event: &Value) -> Result<usize, AnthropicError> {
-    let raw =
-        event
-            .get("index")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| AnthropicError::OutputShape {
-                reason: "stream event 缺少 index".into(),
-                raw: event.to_string(),
-            })?;
-    usize::try_from(raw).map_err(|_| AnthropicError::OutputShape {
+    let raw = event.get("index").and_then(Value::as_u64).ok_or_else(|| {
+        AnthropicError::StreamFailure {
+            reason: "stream event 缺少 index".into(),
+            raw: event.to_string(),
+        }
+    })?;
+    usize::try_from(raw).map_err(|_| AnthropicError::StreamFailure {
         reason: "stream event index 超出 usize 范围".into(),
         raw: event.to_string(),
     })
@@ -624,7 +635,7 @@ fn find_sse_frame_separator(buffer: &[u8]) -> Option<(usize, usize)> {
 }
 
 fn sse_frame_data(frame: &[u8]) -> Result<Option<String>, AnthropicError> {
-    let frame = std::str::from_utf8(frame).map_err(|e| AnthropicError::OutputShape {
+    let frame = std::str::from_utf8(frame).map_err(|e| AnthropicError::StreamFailure {
         reason: format!("SSE frame 不是合法 UTF-8: {e}"),
         raw: String::new(),
     })?;
@@ -669,6 +680,29 @@ mod tests {
 
         assert!(error.to_string().contains("index 不连续"));
         assert!(turn.blocks.is_empty());
+    }
+
+    #[test]
+    fn invalid_utf8_sse_frame_is_stream_failure() {
+        let error = sse_frame_data(b"data: \xff").unwrap_err();
+
+        assert!(matches!(error, AnthropicError::StreamFailure { .. }));
+    }
+
+    #[test]
+    fn explicit_error_event_is_not_misclassified_as_broken_stream() {
+        let mut turn = StreamingAssistantTurn::default();
+        let error = turn
+            .apply_event(
+                &json!({
+                    "type":"error",
+                    "error":{"type":"invalid_request_error","message":"invalid request"}
+                }),
+                &mut |_| {},
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, AnthropicError::TerminalFailure { .. }));
     }
 
     #[test]

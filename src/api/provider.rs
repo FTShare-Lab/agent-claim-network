@@ -111,6 +111,42 @@ pub(crate) struct ProviderTerminalFailure {
     message: String,
 }
 
+/// Streaming response 已损坏或未完整结束，可以安全放弃本次 attempt 并换路径重放。
+///
+/// 该标记只能由 streaming client 在完成边界产生；普通 non-streaming schema 错误
+/// 不能借此进入 provider-neutral fallback。
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct ProviderStreamFailure {
+    message: String,
+}
+
+impl ProviderStreamFailure {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// Provider 正常结束，但没有 ACN 可以提交的非空文本或完整工具调用。
+///
+/// 该结果没有产生 provider replay 或工具副作用，允许直接切换 non-streaming 重试；
+/// 显式拒绝、token limit 和上下文窗口恢复不能映射为此类型。
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct ProviderNoConsumableOutput {
+    message: String,
+}
+
+impl ProviderNoConsumableOutput {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
 impl ProviderTerminalFailure {
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
