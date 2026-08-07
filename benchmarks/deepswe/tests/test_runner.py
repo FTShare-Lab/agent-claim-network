@@ -20,6 +20,7 @@ from acn_deepswe.host_runner import (
     Task1ExecutionConfig,
     Task1HostRunner,
     TaskExecutionError,
+    _pier_task_matches_attempt,
     attempt_deadline_secs,
     build_acn_config,
     build_attempt_toml,
@@ -36,9 +37,18 @@ from acn_deepswe.sentinel import SentinelLeakError, scan_for_sentinel_leaks
 
 UPSTREAM = "https://upstream.invalid"
 DATASET = FrozenDatasetManifest(1, "random.sample_without_replacement_v1", 7, "a" * 64, ("task-1",))
-TASK_TOML = (
-    "[environment]\nallow_internet = false\n[verifier.environment]\nallow_internet = false\n"
-)
+TASK_TOML = """[task]
+name = "datacurve/task-1"
+
+[metadata]
+task_id = "task-1"
+
+[environment]
+allow_internet = false
+
+[verifier.environment]
+allow_internet = false
+"""
 
 
 class ConfigGenerationTests(unittest.TestCase):
@@ -196,6 +206,21 @@ class DryRunTests(unittest.TestCase):
             )
             steps = Task1HostRunner(crossbalanced, Path(directory) / "jobs").run_task1()
         self.assertEqual([step.phase for step in steps], ["A", "freeze", "B_claim", "B_empty"])
+
+
+class IsolationTests(unittest.TestCase):
+    def test_pier_task_identity_requires_both_task_name_and_stable_task_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            task_toml = Path(directory) / "task.toml"
+            task_toml.write_text(TASK_TOML, encoding="utf-8")
+
+            self.assertTrue(
+                _pier_task_matches_attempt(task_toml, "task-1", "datacurve/task-1")
+            )
+            self.assertFalse(_pier_task_matches_attempt(task_toml, "task-1", "task-1"))
+            self.assertFalse(
+                _pier_task_matches_attempt(task_toml, "another-task", "datacurve/task-1")
+            )
 
 
 class RealExecutionTests(unittest.TestCase):
@@ -660,7 +685,7 @@ def _write_fake_trial(
     (trial / "result.json").write_text(
         json.dumps(
             {
-                "task_name": attempt.task_id,
+                "task_name": f"datacurve/{attempt.task_id}",
                 "trial_name": attempt.attempt_id,
                 "trial_uri": trial.resolve().as_uri(),
                 "task_checksum": "checksum",

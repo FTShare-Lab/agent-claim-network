@@ -190,6 +190,7 @@ class AcnEvalPierAgentTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             acn_eval, attempt, acn_config, skill, claim_bundle = _artifacts(root, "A")
             agent = AcnEvalPierAgent(
+                logs_dir=root / "logs",
                 acn_eval=str(acn_eval),
                 attempt_config=str(attempt),
                 acn_config=str(acn_config),

@@ -121,6 +121,9 @@ Pier 固定 `force_build=false`，使用冻结 `task.toml` 指向的官方预构
 推理强度配置，示例使用 `high`。`resources` 必须记录 `cpus`、
 `memory_mb`、`storage_mb`、`max_tokens`、`context_window`；`timeouts` 必须记录
 `agent_seconds`、`deadline_reserve_seconds`，`llm_retry` 必须记录三项重试参数。
+官方 task 的 agent timeout 为 5400 秒；若本地诊断需要把 `agent_seconds` 提高到 7200 秒，结果必须
+标记为扩展预算，不能与官方 90 分钟口径直接比较。该值会同时覆盖 Pier 墙钟、ACN 请求 timeout 与
+attempt deadline（扣除 `deadline_reserve_seconds`）。
 
 `manifests/luna-smoke-v1.json` 从 DeepSWE v1.1 官方 trial artifact 中冻结
 `gpt-5-6-luna / mini_swe_agent_gpt_5_6_luna_max` 的两个极端历史 cohort：5 题在四次
