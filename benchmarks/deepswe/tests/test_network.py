@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import unittest
 from pathlib import Path
 
@@ -10,8 +11,10 @@ from acn_deepswe.network import (
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 FROZEN_MANIFEST = REPO_ROOT / "benchmarks/deepswe/manifests/presmoke-v1.json"
-DEEPSWE_TASKS = Path("/private/tmp/acn-eval-deep-swe/tasks")
-FROZEN_NORMALIZED = REPO_ROOT / "target/deepswe-runs/presmoke-20260726/normalized"
+FROZEN_TASKS_DIR_ENV = "ACN_DEEPSWE_FROZEN_TASKS_DIR"
+FROZEN_NORMALIZED_DIR_ENV = "ACN_DEEPSWE_FROZEN_NORMALIZED_DIR"
+FROZEN_TASKS_DIR = os.environ.get(FROZEN_TASKS_DIR_ENV)
+FROZEN_NORMALIZED_DIR = os.environ.get(FROZEN_NORMALIZED_DIR_ENV)
 
 OFFLINE_TASK = """\
 schema_version = "1.3"
@@ -64,15 +67,22 @@ class NetworkNormalizationTests(unittest.TestCase):
             normalize_task_toml("not = [toml")
 
     @unittest.skipUnless(
-        DEEPSWE_TASKS.is_dir() and FROZEN_NORMALIZED.is_dir(),
-        "冻结 DeepSWE checkout 或 normalized 产物不可用",
+        FROZEN_TASKS_DIR
+        and FROZEN_NORMALIZED_DIR
+        and Path(FROZEN_TASKS_DIR).is_dir()
+        and Path(FROZEN_NORMALIZED_DIR).is_dir(),
+        f"需设置 {FROZEN_TASKS_DIR_ENV} 与 {FROZEN_NORMALIZED_DIR_ENV} 指向冻结产物",
     )
     def test_reproduces_every_frozen_normalized_task_byte_for_byte(self) -> None:
+        assert FROZEN_TASKS_DIR is not None
+        assert FROZEN_NORMALIZED_DIR is not None
+        frozen_tasks = Path(FROZEN_TASKS_DIR)
+        frozen_normalized = Path(FROZEN_NORMALIZED_DIR)
         frozen = json.loads(FROZEN_MANIFEST.read_text(encoding="utf-8"))
         for task_id, expected in frozen["task_toml_hashes"].items():
             with self.subTest(task_id=task_id):
-                source = (DEEPSWE_TASKS / task_id / "task.toml").read_bytes()
+                source = (frozen_tasks / task_id / "task.toml").read_bytes()
                 rendered = normalize_task_toml(source.decode("utf-8")).encode("utf-8")
                 self.assertEqual(hashlib.sha256(source).hexdigest(), expected["source"])
                 self.assertEqual(hashlib.sha256(rendered).hexdigest(), expected["normalized"])
-                self.assertEqual(rendered, (FROZEN_NORMALIZED / task_id / "task.toml").read_bytes())
+                self.assertEqual(rendered, (frozen_normalized / task_id / "task.toml").read_bytes())

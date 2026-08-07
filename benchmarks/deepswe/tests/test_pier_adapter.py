@@ -49,12 +49,12 @@ def _artifacts(root: Path, variant: str) -> tuple[Path, Path, Path, Path, Path]:
 
 class UpstreamHostTests(unittest.TestCase):
     def test_extracts_bare_host_for_squid_allowlist(self) -> None:
-        self.assertEqual(upstream_host("https://llm-proxy.ftai.chat"), "llm-proxy.ftai.chat")
-        self.assertEqual(upstream_host("https://Llm-Proxy.ftai.chat/v1/"), "llm-proxy.ftai.chat")
-        self.assertEqual(upstream_host("http://host.internal:8080/v1"), "host.internal")
+        self.assertEqual(upstream_host("https://model-gateway.example"), "model-gateway.example")
+        self.assertEqual(upstream_host("https://Model-Gateway.example/v1/"), "model-gateway.example")
+        self.assertEqual(upstream_host("http://gateway.example:8080/v1"), "gateway.example")
 
     def test_rejects_unparseable_base_url(self) -> None:
-        for value in ("", "llm-proxy.ftai.chat", "ftp://host/v1"):
+        for value in ("", "model-gateway.example", "ftp://host/v1"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 upstream_host(value)
 
@@ -87,7 +87,11 @@ class AcnPierAdapterTests(unittest.TestCase):
             _adapter().build_commit_command("task; rm -rf /")
 
     def test_container_env_merges_squid_proxy_with_model_key(self) -> None:
-        proxy = {"HTTP_PROXY": "http://agent:token@pier-egress-proxy:8080"}
+        proxy = {
+            "HTTP_PROXY": "http://agent:token@pier-egress-proxy:8080",
+            HOST_KEY_ENV: "must-not-reach-container",
+            CONTAINER_KEY_ENV: "must-not-override-host-key",
+        }
         os.environ[HOST_KEY_ENV] = "upstream-secret"
         try:
             env = _adapter().container_process_env(proxy)
