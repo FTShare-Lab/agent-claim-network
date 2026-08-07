@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from .claim_freeze import append_freeze_barrier, freeze_claim_bundle
-from .dataset import FrozenDatasetManifest, freeze_dataset
+from .dataset import FrozenDatasetManifest, freeze_dataset, freeze_execution_dataset
 from .network import normalize_task_network
 from .plan import AttemptPlan, build_attempt_plan
 from .provenance import EvaluationProvenance
@@ -32,6 +32,16 @@ def main(argv: list[str] | None = None) -> int:
         default=5,
         help="冻结任务数，默认 5（Pre-smoke）；Smoke 可设为 30",
     )
+    freeze_execution = subparsers.add_parser(
+        "freeze-execution-dataset", help="冻结可执行任务集并生成离线规范化副本"
+    )
+    freeze_execution.add_argument("tasks_root", type=Path)
+    freeze_execution.add_argument("manifest", type=Path)
+    freeze_execution.add_argument("normalized_root", type=Path)
+    freeze_execution.add_argument("--deepswe-checkout", type=Path, required=True)
+    freeze_execution.add_argument("--pier-checkout", type=Path, required=True)
+    freeze_execution.add_argument("--seed", type=int, required=True)
+    freeze_execution.add_argument("--sample-size", type=int, default=5)
     plan = subparsers.add_parser("plan", help="从冻结 manifest 构建 A/B 尝试计划")
     plan.add_argument("manifest", type=Path)
     plan.add_argument("output_root", type=Path)
@@ -82,6 +92,26 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 json.dumps(
                     {"manifest_path": str(args.manifest.resolve()), **result.to_dict()},
+                    ensure_ascii=False,
+                )
+            )
+        elif args.command == "freeze-execution-dataset":
+            result = freeze_execution_dataset(
+                args.tasks_root.resolve(),
+                args.manifest.resolve(),
+                args.normalized_root.resolve(),
+                args.deepswe_checkout.resolve(),
+                args.pier_checkout.resolve(),
+                args.seed,
+                sample_size=args.sample_size,
+            )
+            print(
+                json.dumps(
+                    {
+                        "manifest_path": str(args.manifest.resolve()),
+                        "normalized_root": str(args.normalized_root.resolve()),
+                        **result.to_dict(),
+                    },
                     ensure_ascii=False,
                 )
             )

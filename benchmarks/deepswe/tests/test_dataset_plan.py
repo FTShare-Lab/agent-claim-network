@@ -1,11 +1,17 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
-from acn_deepswe.dataset import DatasetFreezeError, FrozenDatasetManifest, freeze_dataset
+from acn_deepswe.dataset import (
+    DatasetFreezeError,
+    FrozenDatasetManifest,
+    freeze_dataset,
+    freeze_execution_dataset,
+)
 from acn_deepswe.plan import build_attempt_plan
-from acn_deepswe.provenance import TASK_DIRECTORY_HASH_ALGORITHM
+from acn_deepswe.provenance import TASK_DIRECTORY_HASH_ALGORITHM, sha256_directory_tree
 
 TASK = """
 [agent]
@@ -69,6 +75,66 @@ class DatasetAndPlanTests(unittest.TestCase):
                 ):
                     freeze_dataset(root, Path(directory) / "freeze.json", seed=17, sample_size=sample_size)
 
+    def test_execution_freeze_records_revisions_hashes_and_normalized_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            deepswe = root / "deep-swe"
+            tasks = deepswe / "tasks"
+            for index in range(6):
+                task = tasks / f"task-{index}"
+                task.mkdir(parents=True)
+                (task / "task.toml").write_text(TASK)
+                (task / "instruction.md").write_text(f"task-{index}")
+                (task / "environment").mkdir()
+                (task / "tests").mkdir()
+            pier = root / "pier"
+            pier.mkdir()
+            (pier / "README.md").write_text("fixture")
+            _commit_checkout(deepswe)
+            _commit_checkout(pier)
+
+            manifest_path = root / "frozen.json"
+            normalized = root / "normalized"
+            manifest = freeze_execution_dataset(
+                tasks,
+                manifest_path,
+                normalized,
+                deepswe,
+                pier,
+                seed=17,
+                sample_size=6,
+            )
+            stored = json.loads(manifest_path.read_text())
+
+            self.assertEqual(len(manifest.task_ids), 6)
+            self.assertEqual(stored["task_directory_hash_algorithm"], TASK_DIRECTORY_HASH_ALGORITHM)
+            self.assertEqual(stored["deepswe_revision"], _revision(deepswe))
+            self.assertEqual(stored["pier_revision"], _revision(pier))
+            for task_id in manifest.task_ids:
+                source = tasks / task_id
+                normalized_task = normalized / task_id
+                self.assertTrue(normalized_task.is_dir())
+                self.assertIn("allow_internet = false", (normalized_task / "task.toml").read_text())
+                self.assertEqual(
+                    stored["task_directory_hashes"][task_id]["source"],
+                    sha256_directory_tree(source),
+                )
+                self.assertEqual(
+                    stored["task_directory_hashes"][task_id]["normalized"],
+                    sha256_directory_tree(normalized_task),
+                )
+
+            with self.assertRaisesRegex(DatasetFreezeError, "拒绝覆盖"):
+                freeze_execution_dataset(
+                    tasks,
+                    root / "another.json",
+                    normalized,
+                    deepswe,
+                    pier,
+                    seed=17,
+                    sample_size=6,
+                )
+
     def test_checked_in_manifests_parse_and_build_attempt_plans(self) -> None:
         manifests = (
             "presmoke-v1.json",
@@ -85,3 +151,34 @@ class DatasetAndPlanTests(unittest.TestCase):
                     raw["task_directory_hash_algorithm"], TASK_DIRECTORY_HASH_ALGORITHM
                 )
                 self.assertEqual(len(plan.attempts), len(manifest.task_ids) * 3)
+
+
+def _commit_checkout(checkout: Path) -> None:
+    subprocess.run(["git", "init", str(checkout)], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(checkout), "add", "."], check=True, capture_output=True, text=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(checkout),
+            "-c",
+            "user.name=Benchmark",
+            "-c",
+            "user.email=benchmark@example.test",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _revision(checkout: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
