@@ -27,8 +27,8 @@ pub use runner::{
 };
 pub use session_engine::{
     SessionCompactionNoopReason, SessionCompactionResult, SessionEngine, SessionEngineOptions,
-    SessionEvent, SessionFinalizeReport, SessionRuntimeStatus, SessionStartReport,
-    SessionTurnControl, SessionTurnControlReceiver,
+    SessionEvent, SessionFinalizeReport, SessionRuntimeProfile, SessionRuntimeStatus,
+    SessionStartReport, SessionTurnControl, SessionTurnControlReceiver,
 };
 pub use traits::{InboxReader, LocalClaimStore, MemoryStore, ReportedDisputeClaimSetStore};
 pub use user_shell::{UserShellCommandOutput, UserShellCommandStatus};

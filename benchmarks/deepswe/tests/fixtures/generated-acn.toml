@@ -1,0 +1,42 @@
+upstream = "eval"
+[upstreams.eval]
+agent_id = "evaluation"
+acn_key_env = ""
+maintainer_endpoint = "http://127.0.0.1:1"
+router_endpoint = "http://127.0.0.1:1"
+[storage]
+acn_home = "/logs/agent/runtime"
+[clients.router]
+query_timeout_secs = 1
+[clients.http]
+timeout_secs = 30
+retry_count = 0
+retry_base_delay_ms = 1
+retry_max_delay_ms = 1
+[agent.llm]
+provider = "openai_compatible_chat"
+endpoint = "https://upstream.invalid/v1"
+model = "fixture-model"
+reasoning_effort = "max"
+api_key_env = "ACN_EVAL_MODEL_KEY"
+max_tokens = 1024
+context_window = 8192
+timeout_secs = 300
+retry_count = 3
+retry_base_delay_ms = 1000
+retry_max_delay_ms = 30000
+[agent.session]
+id_mint_max_retries = 3
+notify_on_finalize_completion = false
+[agent.session.compaction]
+auto_compact_ctx_ratio = 0.25
+[agent.tool]
+file_read_max_chars = 20000
+file_diff_max_changed_lines = 20
+max_parallel_tool_calls = 1
+code_run_max_output_chars = 20000
+[agent.attachment]
+enabled = false
+clipboard_image_enabled = false
+max_file_bytes = 5242880
+max_files_per_turn = 1

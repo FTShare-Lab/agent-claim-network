@@ -294,6 +294,7 @@ impl DelegationPreflightCompactor {
             recapped_until: 0,
             new_claim_ids: Vec::new(),
             updated_claim_ids: Vec::new(),
+            used_claim_ids: Vec::new(),
             new_dispute_ids: Vec::new(),
         });
         self.provider_context_anchor = None;

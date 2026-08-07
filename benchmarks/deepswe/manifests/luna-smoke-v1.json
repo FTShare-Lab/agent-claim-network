@@ -1,0 +1,212 @@
+{
+  "algorithm": "official_v1.1_luna_max_extreme_cohorts_v1",
+  "task_directory_hash_algorithm": "sha256_directory_tree_v2",
+  "candidates_hash": "6aaf118901a061528c4d456efcd9b016b406a336ca9d69baabb40bf6791c7b1f",
+  "deepswe_revision": "e016041a6ccf8da29906afc9a3f5a8df940a1f78",
+  "historical_results": {
+    "artifact_etag": "db2b0f87cc945ee32c4f9f75501be81f",
+    "artifact_sha256": "7844056bade4cee4a2c2964c9582bf7eb1344735a28695cae7d419055656417a",
+    "artifact_url": "https://deepswe.datacurve.ai/artifacts/v1.1/trials.json",
+    "candidate_canonicalization": "UTF-8 TSV sorted by task_id: <task_id>\\t<passes_across_four_rollouts>\\n",
+    "candidate_count": 52,
+    "config": "mini_swe_agent_gpt_5_6_luna_max",
+    "easy_definition": "exactly four included full DeepSWE rollouts and all four passed",
+    "hard_definition": "exactly four included full DeepSWE rollouts and none passed",
+    "harness": "mini-swe-agent",
+    "model": "gpt-5-6-luna",
+    "reasoning_effort": "max",
+    "selected_tasks": {
+      "abs-module-cache-flags": {
+        "cohort": "easy",
+        "historical_cache_tokens": 28002816,
+        "historical_input_tokens": 30094812,
+        "historical_output_tokens": 231105,
+        "historical_passes": 4,
+        "historical_rollouts": 4,
+        "historical_steps": 310
+      },
+      "abs-stepped-slices": {
+        "cohort": "easy",
+        "historical_cache_tokens": 19528704,
+        "historical_input_tokens": 21501865,
+        "historical_output_tokens": 173851,
+        "historical_passes": 4,
+        "historical_rollouts": 4,
+        "historical_steps": 223
+      },
+      "actionlint-action-pinning-lint": {
+        "cohort": "easy",
+        "historical_cache_tokens": 38086144,
+        "historical_input_tokens": 40840704,
+        "historical_output_tokens": 239853,
+        "historical_passes": 4,
+        "historical_rollouts": 4,
+        "historical_steps": 332
+      },
+      "anko-default-function-arguments": {
+        "cohort": "easy",
+        "historical_cache_tokens": 47867392,
+        "historical_input_tokens": 50674549,
+        "historical_output_tokens": 289478,
+        "historical_passes": 4,
+        "historical_rollouts": 4,
+        "historical_steps": 400
+      },
+      "anko-typed-variable-bindings": {
+        "cohort": "easy",
+        "historical_cache_tokens": 24938496,
+        "historical_input_tokens": 27339929,
+        "historical_output_tokens": 203158,
+        "historical_passes": 4,
+        "historical_rollouts": 4,
+        "historical_steps": 237
+      },
+      "bandit-structured-nosec-directives": {
+        "cohort": "hard",
+        "historical_cache_tokens": 37727744,
+        "historical_input_tokens": 40335163,
+        "historical_output_tokens": 324392,
+        "historical_passes": 0,
+        "historical_rollouts": 4,
+        "historical_steps": 365
+      },
+      "clack-async-autocomplete-options": {
+        "cohort": "hard",
+        "historical_cache_tokens": 42235392,
+        "historical_input_tokens": 45336407,
+        "historical_output_tokens": 323910,
+        "historical_passes": 0,
+        "historical_rollouts": 4,
+        "historical_steps": 300
+      },
+      "gql-incremental-graphql-delivery": {
+        "cohort": "hard",
+        "historical_cache_tokens": 68957696,
+        "historical_input_tokens": 72572569,
+        "historical_output_tokens": 299200,
+        "historical_passes": 0,
+        "historical_rollouts": 4,
+        "historical_steps": 481
+      },
+      "happy-dom-deterministic-intersectionobserver": {
+        "cohort": "hard",
+        "historical_cache_tokens": 40479744,
+        "historical_input_tokens": 43900348,
+        "historical_output_tokens": 253295,
+        "historical_passes": 0,
+        "historical_rollouts": 4,
+        "historical_steps": 314
+      },
+      "helm-array-merge-strategies": {
+        "cohort": "hard",
+        "historical_cache_tokens": 97055232,
+        "historical_input_tokens": 100869947,
+        "historical_output_tokens": 347016,
+        "historical_passes": 0,
+        "historical_rollouts": 4,
+        "historical_steps": 645
+      }
+    },
+    "source": "deep-swe",
+    "task_selection": "lexicographically first five tasks from each extreme cohort; easy gate task placed first"
+  },
+  "pier_revision": "fefa7475a32bb05271abdea378e8083c83eb5c35",
+  "schema_version": 1,
+  "seed": 20260727,
+  "task_ids": [
+    "abs-module-cache-flags",
+    "bandit-structured-nosec-directives",
+    "abs-stepped-slices",
+    "actionlint-action-pinning-lint",
+    "anko-default-function-arguments",
+    "clack-async-autocomplete-options",
+    "anko-typed-variable-bindings",
+    "gql-incremental-graphql-delivery",
+    "happy-dom-deterministic-intersectionobserver",
+    "helm-array-merge-strategies"
+  ],
+  "task_directory_hashes": {
+    "abs-module-cache-flags": {
+      "normalized": "6bd878796028eee67e5bbd17e227d8a871a1692e2f8f1f7b2e276eda32de8e64",
+      "source": "4583d4680c522c020893b3ce2f05d1b0e971055d4d2ddf1186900dc3cbada6af"
+    },
+    "abs-stepped-slices": {
+      "normalized": "b72360a30ca32df14a8f7fa19083b5d0c95fe7f899bb959ed23c14dac89f667a",
+      "source": "9deb8d11681dbb806da02fefde1441c3b37e5d980c5506a616d4da10d16d4165"
+    },
+    "actionlint-action-pinning-lint": {
+      "normalized": "5074170788c12ba9ff0662a968e6f32b926b12feb5370d1e60423731619817c8",
+      "source": "e9278f8835007e923ec30f5d0aa6549c2c3688215e98e6e1fb040625f1ef72e1"
+    },
+    "anko-default-function-arguments": {
+      "normalized": "a710a0cb86e6af31e57e2c226e17a71a0bc6bd4a05b9b4f2af2c3f5e5bde786c",
+      "source": "d85499a970d845cb853efca0ef8e82ba3d83080a992bda76248a9d4738ce6739"
+    },
+    "anko-typed-variable-bindings": {
+      "normalized": "58c4643202c64871af47c6bd0d8b80b4bd2a3260395d844177f4a618d0c0c8f9",
+      "source": "6f2b3ae4db2438d5db2a17521b0c0d88b1ace2d2cc96096d022a94b16c7e8e80"
+    },
+    "bandit-structured-nosec-directives": {
+      "normalized": "998c06760b07fa84948f881c011c1cd91d01df2b085c4fb6d5c20ff708a1134e",
+      "source": "ead13aca0c3b606c2c6e8b0cbc34a2795de3cfb5bd387540a55985a2f8ab058c"
+    },
+    "clack-async-autocomplete-options": {
+      "normalized": "a54375fe033536ecaa3177814e5c8927e1d9570614bcc9753a1eed7cf93cd14c",
+      "source": "bb2a58b06696ec9b4d88869eb7537a4c1b94e4b93597f84a7720bf78d0e85a93"
+    },
+    "gql-incremental-graphql-delivery": {
+      "normalized": "2a58fd68690d7ef9c825cc6a5812b14fabeb1242d90710a7c9244b4a93e1be51",
+      "source": "02aff5e1219e79847291f3ef664f3b51c3d0f08bcb63deb71a9ac2a7b8ab194a"
+    },
+    "happy-dom-deterministic-intersectionobserver": {
+      "normalized": "dd382d8a5b073bffe49ced3ab536199e2f3abda927494622bf01df2ada5b2306",
+      "source": "05cd04ec24cb7a1c30aad5a7e868cb94ae1233a05bfe4e8d532ff9d989d4a020"
+    },
+    "helm-array-merge-strategies": {
+      "normalized": "dad5d1ebdab9f23ec6553cb80bc5a4aea151fa16c690f5b95a08294b96eb810d",
+      "source": "525f3634db1613249647941d65274f7b570c37f4bf771934e81583758c0a1e9f"
+    }
+  },
+  "task_toml_hashes": {
+    "abs-module-cache-flags": {
+      "normalized": "7f19719fd1cb3a0c290c77295e9bfa7159afa9368ccfd55de47822890f5e428c",
+      "source": "b01eede5d4d0373be9a46f528faa7f6d93f32ac2b724cee6ca727e4df2add880"
+    },
+    "abs-stepped-slices": {
+      "normalized": "164665750455835219875d18297efbef49151e21570f85963fc556d2ea377e48",
+      "source": "c84c11c21195cceeb1ddee614d20cbf36f626186a88958787286151726915827"
+    },
+    "actionlint-action-pinning-lint": {
+      "normalized": "9f022ca903e5e9d533deb1dcb28e8c64353cbae03c5c5f0fae29c6e872a07ea6",
+      "source": "93c710fc7257ee09688b45c17598226b77894c07831ef657c445832717af6f2c"
+    },
+    "anko-default-function-arguments": {
+      "normalized": "b36936cbd347f7eb22951704c6b09f5526c5c3065abcbe418394ed9ae3e04251",
+      "source": "58ff6ad2e51752fb4ad06afa52c1ccc2901c09ce5acee26d7612107f45a2eab1"
+    },
+    "anko-typed-variable-bindings": {
+      "normalized": "c7ab879fb6f23a48a9d6ca403f1ca7d69d28c1d2c721af2bbb9154dcf58d703e",
+      "source": "1d03cb21f5cbb03ac601438f8e6afbea316088721e23436acd600a4c3a1987c7"
+    },
+    "bandit-structured-nosec-directives": {
+      "normalized": "b0384371f2e2a62b971e41e75a35073b061bdf4b1bd47800dc127ff5b04bb53a",
+      "source": "c4aa3679bb98005d081b16ec6dfef8e2c866479982cbdb12c68c5137937bbb3c"
+    },
+    "clack-async-autocomplete-options": {
+      "normalized": "f3b09df6a4c16f15fbfc4d26e13b75dc38718f7881c7275008a40d4017825aa0",
+      "source": "4ecc3dae39b39212bab6d02044568bf75c67c7fd35c1aea905f72093e37b6470"
+    },
+    "gql-incremental-graphql-delivery": {
+      "normalized": "1b751cb99b2d31ed1bf8ff987a3495b86718065eac0eb9e8b10681f838aaf85b",
+      "source": "f11dec63ded5611bfab958ce76eca74b7c981f03fe6111b3e29dfc98c40e7df0"
+    },
+    "happy-dom-deterministic-intersectionobserver": {
+      "normalized": "68ff7591e159984194719a429d3afd4b90a4f9ef52d8e739b16401f2f02747e7",
+      "source": "0ffbde1114a9300e9d585e7f151dd1fe31e98c3e6f56b76276e5b055db48255c"
+    },
+    "helm-array-merge-strategies": {
+      "normalized": "5b8c63602327d9e301d9562076973e26ba071a7dbdcd2a0559c6ab5f83cc23c2",
+      "source": "6b2ca9f52a7794cc218728a8f8af2402b7e0d46a7396c4ac79fca04e9a9f15bd"
+    }
+  }
+}

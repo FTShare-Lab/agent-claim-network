@@ -78,6 +78,7 @@ impl ToolRegistry {
             )),
             process_owner_agent_id: "unknown-agent".into(),
             attachment_limits: AttachmentLimits::default(),
+            evaluation_secret_env: None,
         })
     }
 
@@ -157,6 +158,17 @@ impl ToolRegistry {
 
     pub fn for_memory_review(mut self) -> Self {
         self.access = ToolAccessProfile::memory_review();
+        self.delegation_host = None;
+        self.delegation_progress = None;
+        self
+    }
+
+    pub fn for_evaluation(mut self, secret_env: String) -> Self {
+        self.access = ToolAccessProfile::evaluation();
+        self.evaluation_secret_env = Some(secret_env);
+        self.memory_store = None;
+        self.session_search = None;
+        self.mcp_manager = None;
         self.delegation_host = None;
         self.delegation_progress = None;
         self

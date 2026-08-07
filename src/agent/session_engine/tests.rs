@@ -866,6 +866,7 @@ fn build_test_engine_with_team_mode(
                 ..Default::default()
             },
             subagent_max_concurrent: 7,
+            runtime_profile: super::super::session_engine::SessionRuntimeProfile::Interactive,
         },
     )
     .with_session_metadata("test", "test-model");

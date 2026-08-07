@@ -1,0 +1,1 @@
+{"schema_version":1,"attempt_id":"attempt-1","seq":1,"event_type":"finalize_completed","timestamp_utc":"2026-07-26T00:00:00Z","payload":{"new_claim_ids":["claim-1"],"updated_claim_ids":[]}}

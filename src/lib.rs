@@ -21,6 +21,7 @@ pub mod build_info;
 pub mod claim;
 pub mod config;
 pub mod delegation;
+pub mod evaluation;
 pub mod maintainer;
 pub mod mcp;
 pub mod memory;

@@ -54,6 +54,7 @@ pub(super) struct ChatStreamAccumulator {
     tool_calls: FxHashMap<usize, ToolCallDraft>,
     finish_reason: Option<ChatFinishReason>,
     usage: Option<Value>,
+    model: Option<String>,
 }
 
 impl ChatStreamAccumulator {
@@ -69,6 +70,9 @@ impl ChatStreamAccumulator {
             .map_err(ChatCompletionsError::ResponseJson)?;
         if let Some(usage) = frame.usage {
             self.usage = Some(usage);
+        }
+        if let Some(model) = frame.model {
+            self.model = Some(model);
         }
         for choice in frame.choices {
             if let Some(reason) = choice.finish_reason {
@@ -140,6 +144,7 @@ impl ChatStreamAccumulator {
                 finish_reason: Some(finish_reason),
             }],
             usage: self.usage,
+            model: self.model,
         })
     }
 }
@@ -256,6 +261,22 @@ mod tests {
             vec![ChatStreamEvent::ContentDelta {
                 text: "你好".into()
             }]
+        );
+    }
+
+    #[test]
+    fn stream_response_retains_reported_model() {
+        let mut accumulator = ChatStreamAccumulator::default();
+        accumulator
+            .apply_frame(
+                r#"{"model":"actual-model","choices":[{"delta":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+                &mut |_event| {},
+            )
+            .unwrap();
+
+        assert_eq!(
+            accumulator.finish().unwrap().model.as_deref(),
+            Some("actual-model")
         );
     }
 

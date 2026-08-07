@@ -13,6 +13,7 @@ mod compaction_projection;
 mod continuation;
 mod embedding;
 mod endpoint;
+pub(crate) mod evaluation_usage;
 mod llm_http;
 mod memory_review_loop;
 mod openai_compatible_chat;
@@ -129,6 +130,9 @@ pub(crate) use compaction_projection::{
 pub use embedding::{
     build_embedding_client, ArkMultimodalEmbeddingClient, EmbeddingCacheFingerprint,
     EmbeddingClient, OpenAiCompatibleEmbeddingClient,
+};
+pub use evaluation_usage::{
+    with_evaluation_usage_recording, EvaluationUsage, EvaluationUsageRecorder,
 };
 pub use memory_review_loop::{MemoryReviewLoop, MEMORY_REVIEW_MAX_TOOL_LOOP_TURNS};
 pub use openai_compatible_chat::{OpenAiCompatibleChatError, OpenAiCompatibleChatProviderAdapter};

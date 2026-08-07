@@ -30,12 +30,14 @@ pub(super) fn preflight_session_event_to_turn_event(
             recapped_until,
             new_claim_ids,
             updated_claim_ids,
+            used_claim_ids,
             new_dispute_ids,
         } => Some(SessionTurnEvent::CompactionCompleted {
             compacted_until,
             recapped_until,
             new_claim_ids,
             updated_claim_ids,
+            used_claim_ids,
             new_dispute_ids,
         }),
         SessionEvent::CompactionFailed { error } => {
@@ -193,6 +195,7 @@ pub enum SessionEvent {
         recapped_until: usize,
         new_claim_ids: Vec<ClaimId>,
         updated_claim_ids: Vec<ClaimId>,
+        used_claim_ids: Vec<ClaimId>,
         new_dispute_ids: Vec<DisputeId>,
     },
     CompactionFailed {

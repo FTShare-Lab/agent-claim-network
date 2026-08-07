@@ -204,6 +204,8 @@ pub struct ChatCompletionResponse {
     pub choices: Vec<ChatCompletionChoice>,
     #[serde(default)]
     pub usage: Option<Value>,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -241,6 +243,8 @@ pub(super) struct ChatStreamFrame {
     pub choices: Vec<ChatStreamChoice>,
     #[serde(default)]
     pub usage: Option<Value>,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

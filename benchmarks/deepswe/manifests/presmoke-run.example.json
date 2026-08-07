@@ -1,0 +1,33 @@
+{
+  "frozen_manifest": "/absolute/path/to/agent_claim_network/benchmarks/deepswe/manifests/presmoke-v1.json",
+  "attempt_plan": "/absolute/path/to/agent_claim_network/target/deepswe-runs/presmoke-20260726/attempt-plan.json",
+  "deepswe_checkout": "/absolute/path/to/DeepSWE",
+  "source_tasks_root": "/absolute/path/to/DeepSWE/tasks",
+  "pier_checkout": "/absolute/path/to/pier",
+  "pier_executable": "/absolute/path/to/pier/.venv/bin/pier",
+  "acn_eval": "/absolute/path/to/acn_eval",
+  "frozen_skill": "/absolute/path/to/agent_claim_network/benchmarks/deepswe/assets/coding-benchmark",
+  "normalized_root": "/absolute/path/to/agent_claim_network/target/deepswe-runs/presmoke-20260726/normalized",
+  "output_dir": "/absolute/path/to/agent_claim_network/target/deepswe-runs/presmoke-20260726/host-output",
+  "model": "gpt-5.6-luna",
+  "response_model": "gpt-5.6-luna",
+  "reasoning_effort": "high",
+  "acn_revision": "replace-with-HEAD-or-HEAD+evaluation-worktree",
+  "task_workers": 1,
+  "resources": {
+    "cpus": 2,
+    "memory_mb": 8192,
+    "storage_mb": 20480,
+    "max_tokens": 65536,
+    "context_window": 131072
+  },
+  "timeouts": {
+    "agent_seconds": 5400,
+    "deadline_reserve_seconds": 30
+  },
+  "llm_retry": {
+    "retry_count": 3,
+    "retry_base_delay_ms": 1000,
+    "retry_max_delay_ms": 30000
+  }
+}

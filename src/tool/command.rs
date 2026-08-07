@@ -393,6 +393,7 @@ impl ToolRegistry {
                 ));
             }
         }
+        removed_environment.extend(self.evaluation_secret_env.iter().cloned());
         let owner = self.process_owner(context);
         let process = if args.tty {
             let pty_program = program.clone();
@@ -483,8 +484,8 @@ impl ToolRegistry {
         } else {
             let mut cmd = Command::new(&program);
             cmd.args(&command_args).current_dir(&cwd);
-            if self.access.delegation_child {
-                cmd.env_remove("ACN_DELEGATION_ID");
+            for key in &removed_environment {
+                cmd.env_remove(key);
             }
             for (key, value) in &environment {
                 if key != "ACN_DELEGATION_ID" {
