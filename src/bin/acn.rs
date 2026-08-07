@@ -23,7 +23,7 @@ use agent_claim_network::session::{
 };
 use agent_claim_network::session_tui::{self, StartupResume};
 use agent_claim_network::storage::{paths, read_yaml, FileLockGuard};
-use agent_claim_network::supervisor::{self, SupervisorLaunchConfig};
+use agent_claim_network::supervisor::{self, SupervisorLaunchConfig, SupervisorRetryTarget};
 use agent_claim_network::update::{
     self, UpdateOptions, DEFAULT_UPDATE_BRANCH, DEFAULT_UPDATE_REPOSITORY_URL,
 };
@@ -55,17 +55,19 @@ async fn main() -> anyhow::Result<()> {
     let cli = parse_cli_from(raw_args)?;
     let (mut cfg, cfg_path) = Config::load_or_init_for_agent(cli.config.as_deref())
         .with_context(|| format!("加载 config: {:?}", cli.config))?;
-    cfg.set_tool_workspace_root(resolve_workspace_root(cli.cd.as_deref())?);
+    let workspace_root = resolve_workspace_root(cli.cd.as_deref())?;
+    cfg.set_tool_workspace_root(workspace_root.clone());
     let upstream = cfg
         .resolve_upstream(cli.upstream.as_deref())
         .context("解析 upstream 失败")?;
     activate_acn_upstream_runtime(&mut cfg, &upstream, "激活 upstream 本地目录失败")?;
+    let runtime_fingerprint = supervisor::runtime_fingerprint(&cfg, &upstream)?;
     let supervisor_launch = SupervisorLaunchConfig::new(
         cfg.agent_home(&upstream.agent_id),
         cfg_path,
         Some(upstream.name.clone()),
-        cli.cd.clone(),
         cfg.agent.session.notify_on_finalize_completion,
+        runtime_fingerprint,
     );
     let cleanup_housekeeping = session_tui::SessionCleanupHousekeepingConfig {
         agent_id: upstream.agent_id.clone(),
@@ -82,16 +84,16 @@ async fn main() -> anyhow::Result<()> {
         eprint!("{message}");
         return Ok(());
     }
+    let mcp_manager = bootstrap::build_refreshed_mcp_manager(&cfg).await;
+    let engine =
+        bootstrap::build_agent_cli_session_engine_with_mcp(&cfg, &upstream, Some(mcp_manager))?
+            .with_fork_memory_review(cli.fork_review);
     if let Err(error) = supervisor::ensure_supervisor_running(&supervisor_launch).await {
         log::warn!(
             target: "acn",
             "finalize supervisor 启动或接管失败，本次会话继续运行: {error:#}"
         );
     }
-    let mcp_manager = bootstrap::build_refreshed_mcp_manager(&cfg).await;
-    let engine =
-        bootstrap::build_agent_cli_session_engine_with_mcp(&cfg, &upstream, Some(mcp_manager))?
-            .with_fork_memory_review(cli.fork_review);
     session_tui::run_session_tui_with_resume_and_cleanup(
         engine,
         cfg.agent.session.id_mint_max_attempts(),
@@ -1423,8 +1425,10 @@ fn push_session_cleanup_row<T: AsRef<str>>(text: &mut String, row: &[T; 5], widt
 
 async fn run_supervisor_cli(args: Vec<String>) -> anyhow::Result<()> {
     let cli = parse_supervisor_cli_from(args)?;
-    let (mut cfg, _cfg_path) = match cli.command {
-        SupervisorCommand::Run => Config::load_or_init_for_agent(cli.config.as_deref()),
+    let (mut cfg, cfg_path) = match cli.command {
+        SupervisorCommand::Run | SupervisorCommand::Retry => {
+            Config::load_or_init_for_agent(cli.config.as_deref())
+        }
         SupervisorCommand::Status | SupervisorCommand::Jobs { .. } | SupervisorCommand::Stop => {
             Config::load_or_init_for_supervisor_control(cli.config.as_deref())
         }
@@ -1433,7 +1437,10 @@ async fn run_supervisor_cli(args: Vec<String>) -> anyhow::Result<()> {
     let upstream = cfg
         .resolve_upstream(cli.upstream.as_deref())
         .context("解析 supervisor upstream 失败")?;
-    let agent_home = if cli.command == SupervisorCommand::Run {
+    let agent_home = if matches!(
+        cli.command,
+        SupervisorCommand::Run | SupervisorCommand::Retry
+    ) {
         activate_acn_upstream_runtime(
             &mut cfg,
             &upstream,
@@ -1445,10 +1452,41 @@ async fn run_supervisor_cli(args: Vec<String>) -> anyhow::Result<()> {
     };
     match cli.command {
         SupervisorCommand::Run => {
-            cfg.set_tool_workspace_root(resolve_workspace_root(cli.cd.as_deref())?);
+            // finalize 不调用 agent 工具；给复用的 SessionEngine 一个稳定、中性的工作目录。
+            cfg.set_tool_workspace_root(agent_home.clone());
+            let runtime_fingerprint = supervisor::runtime_fingerprint(&cfg, &upstream)?;
+            if let Some(expected) = cli.expected_runtime_fingerprint.as_deref() {
+                if expected != runtime_fingerprint.digest {
+                    anyhow::bail!(
+                        "supervisor 配置在拉起期间发生变化: expected={}, actual={}",
+                        short_fingerprint(expected),
+                        short_fingerprint(&runtime_fingerprint.digest)
+                    );
+                }
+            }
             let engine = bootstrap::build_agent_cli_session_engine(&cfg, &upstream)?
                 .with_fork_memory_review(false);
-            supervisor::run_supervisor(engine, agent_home).await
+            supervisor::run_supervisor(engine, agent_home, runtime_fingerprint).await
+        }
+        SupervisorCommand::Retry => {
+            let target = cli
+                .retry_target
+                .context("acn supervisor retry 缺少 session_id 或 job_id")?;
+            // 先完成与子进程相同的 engine 构造校验，避免无效新配置先接管并停掉旧实例。
+            cfg.set_tool_workspace_root(agent_home.clone());
+            let _engine_preflight = bootstrap::build_agent_cli_session_engine(&cfg, &upstream)?
+                .with_fork_memory_review(false);
+            let runtime_fingerprint = supervisor::runtime_fingerprint(&cfg, &upstream)?;
+            let launch = SupervisorLaunchConfig::new(
+                agent_home,
+                cfg_path,
+                Some(upstream.name.clone()),
+                cfg.agent.session.notify_on_finalize_completion,
+                runtime_fingerprint,
+            );
+            let report = supervisor::retry_finalize(&launch, target).await?;
+            print!("{}", supervisor_retry_report_text(&report));
+            Ok(())
         }
         SupervisorCommand::Status => {
             let status = supervisor::supervisor_status(&agent_home).await?;
@@ -1524,7 +1562,7 @@ fn acn_usage() -> &'static str {
   acn [options]
   acn update [--url <git-url>] [--branch <branch>] [--config <path>]
   acn session cleanup [--apply] [options]
-  acn supervisor <status|jobs|stop> [options]
+  acn supervisor <status|jobs|retry|stop> [options]
   acn mcp <list|get|add|remove|enable|disable|status> [options]
 
 启动 ACN 交互式 TUI session。普通用户通常只需要运行 `acn`；后台 finalize supervisor 会自动启动，无需手动管理。
@@ -1551,6 +1589,7 @@ Session 维护命令:
 Supervisor 排障命令:
   acn supervisor status       查看后台 supervisor 是否在运行、PID、uptime 和队列概况
   acn supervisor jobs [-l n]  查看最近 finalize job；默认 5 条，-l 0 显示全部
+  acn supervisor retry <id>   按 session_id（推荐）或 job_id 重试失败的 finalize
   acn supervisor stop         优雅停止后台 supervisor
 
 MCP 配置命令:
@@ -1570,7 +1609,8 @@ struct SupervisorCli {
     command: SupervisorCommand,
     config: Option<PathBuf>,
     upstream: Option<String>,
-    cd: Option<PathBuf>,
+    retry_target: Option<SupervisorRetryTarget>,
+    expected_runtime_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1578,6 +1618,7 @@ enum SupervisorCommand {
     Run,
     Status,
     Jobs { limit: usize },
+    Retry,
     Stop,
 }
 
@@ -1596,6 +1637,7 @@ where
         Some("jobs") => SupervisorCommand::Jobs {
             limit: DEFAULT_SUPERVISOR_JOBS_LIMIT,
         },
+        Some("retry") => SupervisorCommand::Retry,
         Some("stop") => SupervisorCommand::Stop,
         Some("-h" | "--help") => {
             eprintln!("{}", supervisor_usage());
@@ -1610,14 +1652,22 @@ where
     }
     let mut config = None;
     let mut upstream = None;
-    let mut cd = None;
+    let mut retry_target = None;
+    let mut expected_runtime_fingerprint = None;
     let mut jobs_limit_override = None;
     let mut args = args.into_iter().skip(3);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" => config = Some(PathBuf::from(args.next().context("--config 后缺少路径")?)),
             "--upstream" => upstream = Some(args.next().context("--upstream 后缺少名称")?),
-            "--cd" | "-C" => cd = Some(PathBuf::from(args.next().context("--cd 后缺少目录参数")?)),
+            "--runtime-fingerprint" if command == SupervisorCommand::Run => {
+                let value = args.next().context("--runtime-fingerprint 后缺少摘要")?;
+                validate_runtime_fingerprint_arg(&value)?;
+                expected_runtime_fingerprint = Some(value);
+            }
+            "--runtime-fingerprint" => {
+                anyhow::bail!("--runtime-fingerprint 仅支持 acn supervisor run")
+            }
             "-l" | "--limit" if matches!(command, SupervisorCommand::Jobs { .. }) => {
                 let raw = args.next().context("-l 后缺少数量")?;
                 jobs_limit_override = Some(
@@ -1630,6 +1680,12 @@ where
                 eprintln!("{}", supervisor_usage());
                 std::process::exit(0);
             }
+            other if command == SupervisorCommand::Retry && !other.starts_with('-') => {
+                if retry_target.is_some() {
+                    anyhow::bail!("acn supervisor retry 只接受一个 session_id 或 job_id");
+                }
+                retry_target = Some(parse_supervisor_retry_target(other)?);
+            }
             other => anyhow::bail!("未知 supervisor 参数: {other}"),
         }
     }
@@ -1637,27 +1693,66 @@ where
         (SupervisorCommand::Jobs { .. }, Some(limit)) => SupervisorCommand::Jobs { limit },
         (command, _) => command,
     };
+    if command == SupervisorCommand::Retry && retry_target.is_none() {
+        anyhow::bail!("acn supervisor retry 缺少 session_id 或 job_id");
+    }
     Ok(SupervisorCli {
         command,
         config,
         upstream,
-        cd,
+        retry_target,
+        expected_runtime_fingerprint,
     })
+}
+
+fn parse_supervisor_retry_target(value: &str) -> anyhow::Result<SupervisorRetryTarget> {
+    if value.starts_with(SessionId::PREFIX) {
+        let session_id = value
+            .parse::<SessionId>()
+            .with_context(|| format!("无效的 supervisor retry session_id: {value}"))?;
+        return Ok(SupervisorRetryTarget::Session { session_id });
+    }
+    if value.strip_prefix("job_").is_some_and(|suffix| {
+        !suffix.is_empty()
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    }) {
+        return Ok(SupervisorRetryTarget::Job {
+            job_id: value.to_string(),
+        });
+    }
+    anyhow::bail!("supervisor retry id 必须是有效的 session_id 或 job_id，实际: {value}")
+}
+
+fn validate_runtime_fingerprint_arg(value: &str) -> anyhow::Result<()> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(());
+    }
+    anyhow::bail!("--runtime-fingerprint 必须是 64 位小写十六进制摘要")
+}
+
+fn short_fingerprint(value: &str) -> &str {
+    value.get(..12).unwrap_or(value)
 }
 
 fn supervisor_usage() -> &'static str {
     "用法:
   acn supervisor status [options]
   acn supervisor jobs [options]
+  acn supervisor retry <session_id|job_id> [options]
   acn supervisor stop [options]
   acn supervisor run [options]
 
-管理 ACN finalize supervisor。普通用户无需手动启动；`run` 是 ACN 自动拉起的后台内部命令，开发和排障时主要使用 status/jobs/stop。
+管理 ACN finalize supervisor。普通用户无需手动启动；`run` 是 ACN 自动拉起的后台内部命令，开发和排障时主要使用 status/jobs/retry/stop。
 
 选项:
   --config <path>      指定 config.toml；应与启动 TUI 时使用的配置一致
   --upstream <name>    选择 [upstreams.<name>]；应与要排查的 agent upstream 一致
-  --cd <dir>, -C <dir> 仅 run 使用，指定后台 finalize 的工具工作目录
   -l <n>, --limit <n>  仅 jobs 使用，默认 5；0 表示显示全部
   -h, --help           显示帮助
 "
@@ -1696,6 +1791,14 @@ fn supervisor_status_text(
         Some(build) => text.push_str(&format!("build: {} ({})\n", build.version, build.commit)),
         None => text.push_str("build: -\n"),
     }
+    match &status.runtime_fingerprint {
+        Some(fingerprint) => text.push_str(&format!(
+            "runtime: v{}:{}\n",
+            fingerprint.schema,
+            short_fingerprint(&fingerprint.digest)
+        )),
+        None => text.push_str("runtime: -\n"),
+    }
     text.push_str(&format!("agent_id: {agent_id}\n"));
     text.push_str(&format!("agent_home: {}\n", agent_home.display()));
     text.push_str(&format!("socket: {}\n", status.socket_path.display()));
@@ -1727,7 +1830,7 @@ fn supervisor_status_text(
             supervisor::SupervisorRuntimeState::Stuck { .. } => "stuck_current",
         };
         text.push_str(&format!(
-            "{}: {} agent_id={} session_id={} attempts={} started_at={}",
+            "{}: {} agent_id={} session_id={} attempts={} manual_retries={} started_at={}",
             label,
             job.id,
             job.agent_id
@@ -1736,6 +1839,7 @@ fn supervisor_status_text(
                 .unwrap_or_else(|| "-".to_string()),
             job.session_id,
             job.attempts,
+            job.manual_retries,
             format_optional_time(job.started_at.as_ref())
         ));
         text.push('\n');
@@ -1755,6 +1859,7 @@ fn supervisor_jobs_text(jobs: &[supervisor::SupervisorJobView], limit: usize) ->
         "started_at",
         "finished_at",
         "attempts",
+        "manual_retries",
         "last_error",
     ];
     let visible_jobs = recent_supervisor_jobs(jobs, limit);
@@ -1775,6 +1880,7 @@ fn supervisor_jobs_text(jobs: &[supervisor::SupervisorJobView], limit: usize) ->
                 format_optional_time(job.started_at.as_ref()),
                 format_optional_time(job.finished_at.as_ref()),
                 job.attempts.to_string(),
+                job.manual_retries.to_string(),
                 clean_table_field(job.last_error.as_deref().unwrap_or("-")),
             ]
         })
@@ -1803,7 +1909,7 @@ fn recent_supervisor_jobs(
     jobs[start..].iter().rev().collect()
 }
 
-fn supervisor_jobs_column_widths(header: &[&str; 9], rows: &[[String; 9]]) -> [usize; 9] {
+fn supervisor_jobs_column_widths(header: &[&str; 10], rows: &[[String; 10]]) -> [usize; 10] {
     let mut widths = header.map(UnicodeWidthStr::width);
     for row in rows {
         for (index, cell) in row.iter().enumerate() {
@@ -1813,7 +1919,7 @@ fn supervisor_jobs_column_widths(header: &[&str; 9], rows: &[[String; 9]]) -> [u
     widths
 }
 
-fn push_supervisor_jobs_row<T: AsRef<str>>(text: &mut String, row: &[T; 9], widths: &[usize; 9]) {
+fn push_supervisor_jobs_row<T: AsRef<str>>(text: &mut String, row: &[T; 10], widths: &[usize; 10]) {
     for (index, cell) in row.iter().enumerate() {
         if index > 0 {
             text.push_str("  ");
@@ -1846,6 +1952,13 @@ fn supervisor_stop_report_text(report: &supervisor::SupervisorStopReport) -> Str
         text.push_str(&format!("pid: {pid}\n"));
     }
     text
+}
+
+fn supervisor_retry_report_text(report: &supervisor::SupervisorRetryReport) -> String {
+    format!(
+        "finalize retry queued\nsession_id: {}\njob_id: {}\nattempts: {} -> 0\nmanual_retries: {}\n",
+        report.session_id, report.job_id, report.previous_attempts, report.manual_retries
+    )
 }
 
 fn format_uptime(started_at: Option<&DateTime<Utc>>) -> String {
@@ -2407,6 +2520,7 @@ api_key_env = "UNUSED_TEST_LLM_KEY"
         assert!(usage.contains("acn session cleanup --apply"));
         assert!(usage.contains("acn supervisor status"));
         assert!(usage.contains("acn supervisor jobs"));
+        assert!(usage.contains("acn supervisor retry"));
         assert!(usage.contains("acn supervisor stop"));
         assert!(usage.contains("acn mcp list"));
         assert!(usage.contains("acn mcp list [--upstream <name>]"));
@@ -3124,8 +3238,8 @@ retry_max_delay_ms = 5000
             "config.toml",
             "--upstream",
             "agent_hub",
-            "--cd",
-            ".",
+            "--runtime-fingerprint",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ])
         .unwrap();
 
@@ -3135,7 +3249,102 @@ retry_max_delay_ms = 5000
             Some(std::path::Path::new("config.toml"))
         );
         assert_eq!(cli.upstream.as_deref(), Some("agent_hub"));
-        assert_eq!(cli.cd.as_deref(), Some(std::path::Path::new(".")));
+        assert_eq!(cli.retry_target, None);
+        assert_eq!(
+            cli.expected_runtime_fingerprint.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+    }
+
+    #[test]
+    fn parse_supervisor_cli_accepts_retry_session_or_job_with_config() {
+        let session = super::parse_supervisor_cli_from([
+            "acn",
+            "supervisor",
+            "retry",
+            "--config",
+            "config.toml",
+            "session_1234abcd",
+            "--upstream",
+            "agent_hub",
+        ])
+        .unwrap();
+        let job =
+            super::parse_supervisor_cli_from(["acn", "supervisor", "retry", "job_123_abcdef01"])
+                .unwrap();
+
+        assert_eq!(session.command, super::SupervisorCommand::Retry);
+        assert_eq!(
+            session.retry_target,
+            Some(
+                agent_claim_network::supervisor::SupervisorRetryTarget::Session {
+                    session_id: "session_1234abcd".parse().unwrap(),
+                }
+            )
+        );
+        assert_eq!(
+            session.config.as_deref(),
+            Some(std::path::Path::new("config.toml"))
+        );
+        assert_eq!(session.upstream.as_deref(), Some("agent_hub"));
+        assert_eq!(
+            job.retry_target,
+            Some(
+                agent_claim_network::supervisor::SupervisorRetryTarget::Job {
+                    job_id: "job_123_abcdef01".to_string(),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn parse_supervisor_cli_rejects_missing_invalid_extra_retry_target_and_cd() {
+        let missing = super::parse_supervisor_cli_from(["acn", "supervisor", "retry"]).unwrap_err();
+        let invalid =
+            super::parse_supervisor_cli_from(["acn", "supervisor", "retry", "session_bad"])
+                .unwrap_err();
+        let extra = super::parse_supervisor_cli_from([
+            "acn",
+            "supervisor",
+            "retry",
+            "session_1234abcd",
+            "job_123",
+        ])
+        .unwrap_err();
+        let cd = super::parse_supervisor_cli_from(["acn", "supervisor", "run", "--cd", "."])
+            .unwrap_err();
+
+        assert!(missing.to_string().contains("缺少 session_id 或 job_id"));
+        assert!(invalid
+            .to_string()
+            .contains("无效的 supervisor retry session_id"));
+        assert!(extra.to_string().contains("只接受一个"));
+        assert!(cd.to_string().contains("未知 supervisor 参数: --cd"));
+    }
+
+    #[test]
+    fn parse_supervisor_cli_rejects_invalid_or_management_runtime_fingerprint() {
+        let invalid = super::parse_supervisor_cli_from([
+            "acn",
+            "supervisor",
+            "run",
+            "--runtime-fingerprint",
+            "not-a-digest",
+        ])
+        .unwrap_err()
+        .to_string();
+        let status = super::parse_supervisor_cli_from([
+            "acn",
+            "supervisor",
+            "status",
+            "--runtime-fingerprint",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])
+        .unwrap_err()
+        .to_string();
+
+        assert!(invalid.contains("64 位小写十六进制"));
+        assert!(status.contains("仅支持 acn supervisor run"));
     }
 
     #[test]
@@ -3191,6 +3400,7 @@ retry_max_delay_ms = 5000
             pid: Some(42),
             started_at: None,
             build: None,
+            runtime_fingerprint: None,
             queue: SupervisorQueueSummary {
                 total: 1,
                 queued: 0,
@@ -3207,6 +3417,7 @@ retry_max_delay_ms = 5000
                 started_at: Some(now),
                 finished_at: None,
                 attempts: 2,
+                manual_retries: 1,
                 last_error: None,
             }),
             socket_path: "/tmp/acn.sock".into(),
@@ -3232,6 +3443,7 @@ retry_max_delay_ms = 5000
             pid: Some(42),
             started_at: None,
             build: None,
+            runtime_fingerprint: None,
             queue: SupervisorQueueSummary {
                 total: 1,
                 queued: 0,
@@ -3248,6 +3460,7 @@ retry_max_delay_ms = 5000
                 started_at: Some(now),
                 finished_at: None,
                 attempts: 2,
+                manual_retries: 1,
                 last_error: None,
             }),
             socket_path: "/tmp/acn.sock".into(),
@@ -3279,6 +3492,7 @@ retry_max_delay_ms = 5000
             started_at: Some(now),
             finished_at: Some(now),
             attempts: 3,
+            manual_retries: 2,
             last_error: Some("bad\tline\nagain".to_string()),
         }];
 
@@ -3309,6 +3523,7 @@ retry_max_delay_ms = 5000
                 started_at: None,
                 finished_at: None,
                 attempts: 1,
+                manual_retries: 0,
                 last_error: None,
             })
             .collect::<Vec<_>>();
@@ -3342,6 +3557,7 @@ retry_max_delay_ms = 5000
                 started_at: None,
                 finished_at: None,
                 attempts: 1,
+                manual_retries: 0,
                 last_error: None,
             })
             .collect::<Vec<_>>();
@@ -3369,6 +3585,25 @@ retry_max_delay_ms = 5000
 
         assert!(text.contains("supervisor still shutting down"));
         assert!(!text.contains("current job"));
+    }
+
+    #[test]
+    fn supervisor_retry_output_is_identical_after_session_or_job_resolution() {
+        let report = agent_claim_network::supervisor::SupervisorRetryReport {
+            session_id: "session_1234abcd".parse().unwrap(),
+            job_id: "job_123_abcdef01".to_string(),
+            previous_attempts: 5,
+            manual_retries: 2,
+        };
+
+        let from_session = super::supervisor_retry_report_text(&report);
+        let from_job = super::supervisor_retry_report_text(&report);
+
+        assert_eq!(from_session, from_job);
+        assert!(from_session.contains("session_id: session_1234abcd"));
+        assert!(from_session.contains("job_id: job_123_abcdef01"));
+        assert!(from_session.contains("attempts: 5 -> 0"));
+        assert!(from_session.contains("manual_retries: 2"));
     }
 
     #[test]

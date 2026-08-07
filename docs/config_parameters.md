@@ -104,6 +104,8 @@ agent_id = "agent-a"
 - `notify_on_finalize_completion`：后台 supervisor finalize 完成后是否发送系统通知。默认 `true`；设为 `false` 后成功和失败都只写 job/session 日志，不弹系统通知。
 - `cleanup_retention_days`：旧 Closed sessions 的保留天数，默认 `30`，最大 `36500`。自动后台清理按该值判断，`0` 表示禁用自动后台清理；手动 `acn session cleanup` 不受此禁用影响，配置为 `0` 时仍按默认 30 天判断，配置为非 0 时按配置值判断。
 
+ACN 会用有效配置、选中的 upstream 和 finalize 所需凭据摘要生成 supervisor 运行环境指纹。相关内容变化后，下次启动会接管旧 supervisor；该行为无需配置额外参数，凭据明文不会写入指纹或状态输出。工具工作目录不参与指纹，`--cd` 只属于交互式 agent，所有 `acn supervisor` 子命令均不接受该参数。
+
 ### `[agent.session.compaction]`
 
 - `summary_max_chars`：session 历史压缩 summary 最大字符数，默认 `40000`。
