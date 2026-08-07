@@ -1,5 +1,7 @@
 # PRD: ACN DeepSWE 评测打样
 
+> 状态：已实现 Pre-smoke 评测基础设施；Smoke 与 Full 的实际执行仍需按本文冻结配置后另行启动。
+
 ## 结论
 
 首期**不复跑 Claude Code、Codex、Cursor CLI、OpenCode**。这些产品已有公开 DeepSWE 数据，
