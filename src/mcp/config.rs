@@ -6,10 +6,11 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::storage::{write_text_atomic, StorageError};
+use crate::storage::{write_text_atomic, FileLockGuard, StorageError};
 
 pub const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 120;
@@ -124,6 +125,8 @@ pub enum McpConfigError {
     InvalidOAuthClientId { name: String },
     #[error("MCP server '{name}' 的 {field} 仅适用于 streamable_http")]
     HttpOnlyField { name: String, field: &'static str },
+    #[error("无法获取 MCP 配置写锁 ({path:?}): {message}")]
+    WriteLock { path: PathBuf, message: String },
     #[error(transparent)]
     Storage(#[from] StorageError),
 }
@@ -312,6 +315,41 @@ pub async fn write_mcp_json_config_atomic(
     json.push('\n');
     write_text_atomic(path, json.as_bytes()).await?;
     Ok(())
+}
+
+/// 获取 `.mcp.json` 的跨进程写锁。所有 read-modify-write 调用方必须在读取前持有。
+pub async fn lock_mcp_json_config(path: &Path) -> Result<FileLockGuard, McpConfigError> {
+    let lock_path = mcp_json_config_lock_path(path);
+    FileLockGuard::lock_exclusive(&lock_path)
+        .await
+        .map_err(|error| config_write_lock_error(lock_path, error))
+}
+
+/// 在有限时间内获取 `.mcp.json` 的跨进程写锁，供必须可退出的长驻进程使用。
+pub async fn lock_mcp_json_config_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<FileLockGuard, McpConfigError> {
+    let lock_path = mcp_json_config_lock_path(path);
+    FileLockGuard::lock_exclusive_timeout(&lock_path, timeout)
+        .await
+        .map_err(|error| config_write_lock_error(lock_path, error))
+}
+
+fn config_write_lock_error(path: PathBuf, error: anyhow::Error) -> McpConfigError {
+    McpConfigError::WriteLock {
+        path,
+        message: error.to_string(),
+    }
+}
+
+fn mcp_json_config_lock_path(path: &Path) -> PathBuf {
+    let mut file_name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new(".mcp.json"))
+        .to_os_string();
+    file_name.push(".lock");
+    path.with_file_name(file_name)
 }
 
 pub fn validate_server_name(name: &str) -> Result<(), McpConfigError> {

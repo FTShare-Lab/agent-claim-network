@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use agent_claim_network::bootstrap;
 use agent_claim_network::build_info;
@@ -11,8 +12,8 @@ use agent_claim_network::config::{
     resolve_workspace_root, Config, ResolvedUpstream, DEFAULT_SESSION_CLEANUP_RETENTION_DAYS,
 };
 use agent_claim_network::mcp::config::{
-    read_mcp_json_config, validate_server_name, write_mcp_json_config_atomic, McpJsonConfig,
-    McpOAuthCredentialsStore, McpServerConfig, McpTransportKind,
+    lock_mcp_json_config, read_mcp_json_config, validate_server_name, write_mcp_json_config_atomic,
+    McpJsonConfig, McpOAuthCredentialsStore, McpServerConfig, McpTransportKind,
 };
 use agent_claim_network::mcp::connection_manager::{
     McpConnectionManager, McpRuntimeState, McpServerStatus,
@@ -90,10 +91,18 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let mcp_manager = bootstrap::build_refreshed_mcp_manager(&cfg).await;
-    let engine =
-        bootstrap::build_agent_cli_session_engine_with_mcp(&cfg, &upstream, Some(mcp_manager))?
-            .with_fork_memory_review(cli.fork_review);
-    session_tui::run_session_tui_with_resume_and_cleanup(
+    let engine = match bootstrap::build_agent_cli_session_engine_with_mcp(
+        &cfg,
+        &upstream,
+        Some(Arc::clone(&mcp_manager)),
+    ) {
+        Ok(engine) => engine.with_fork_memory_review(cli.fork_review),
+        Err(error) => {
+            mcp_manager.shutdown().await;
+            return Err(error);
+        }
+    };
+    let tui_result = session_tui::run_session_tui_with_resume_and_cleanup(
         engine,
         cfg.agent.session.id_mint_max_attempts(),
         cli.resume,
@@ -101,7 +110,9 @@ async fn main() -> anyhow::Result<()> {
         Some(supervisor_launch),
         Some(cleanup_housekeeping),
     )
-    .await?;
+    .await;
+    mcp_manager.shutdown().await;
+    tui_result?;
     Ok(())
 }
 
@@ -562,29 +573,56 @@ async fn execute_mcp_command(path: &Path, command: McpCommand) -> anyhow::Result
         }
         McpCommand::AddJson { name, server } => add_mcp_server(path, name, server).await,
         McpCommand::Remove { name } => {
-            let mut cfg = read_mcp_json_config(path).await?;
+            let cfg = read_mcp_json_config(path).await?;
             let server = cfg
                 .servers
                 .get(&name)
                 .with_context(|| format!("MCP server 不存在: {name}"))?
                 .clone();
             let clear_oauth = server.transport_kind(&name)? == McpTransportKind::StreamableHttp;
-            cfg.servers.remove(&name);
-            write_mcp_json_config_atomic(path, &cfg).await?;
+            let mut credential_lease = if clear_oauth {
+                Some(oauth::prepare_credentials_for_remove(path, &name, &server).await?)
+            } else {
+                None
+            };
+            let remove_result = async {
+                let _config_guard = lock_mcp_json_config(path).await?;
+                let mut current = read_mcp_json_config(path).await?;
+                if current.servers.get(&name) != Some(&server) {
+                    anyhow::bail!(
+                        "MCP server '{name}' 的配置在 remove 等待期间已删除或变更；请重试"
+                    );
+                }
+                current.servers.remove(&name);
+                write_mcp_json_config_atomic(path, &current).await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = remove_result {
+                if let Some(credential_lease) = credential_lease.take() {
+                    if let Err(cleanup_error) = credential_lease.cancel().await {
+                        log::warn!(
+                            "MCP server '{name}' remove 未落盘，回滚 OAuth cleanup record 失败: {cleanup_error}"
+                        );
+                    }
+                }
+                return Err(error);
+            }
             let mut output = format!("removed MCP server '{name}'\n");
-            if clear_oauth {
-                if let Err(error) = oauth::logout(path, &name, &server).await {
+            if let Some(credential_lease) = credential_lease {
+                if let Err(error) = credential_lease.finish().await {
                     log::warn!(
                         "MCP server '{name}' 配置已删除，但本地 OAuth 凭据清理失败: {error}"
                     );
                     output.push_str(&format!(
-                        "warning: MCP server '{name}' 配置已删除，但本地 OAuth 凭据清理失败：{error}\n"
+                        "warning: MCP server '{name}' 配置已删除，但本地 OAuth 凭据清理失败；可在凭据存储恢复后重试 `acn mcp logout {name}`：{error}\n"
                     ));
                 }
             }
             Ok(output)
         }
         McpCommand::Enable { name } => {
+            let _config_guard = lock_mcp_json_config(path).await?;
             let mut cfg = read_mcp_json_config(path).await?;
             let server = cfg
                 .servers
@@ -595,6 +633,7 @@ async fn execute_mcp_command(path: &Path, command: McpCommand) -> anyhow::Result
             Ok(format!("enabled MCP server '{name}'\n"))
         }
         McpCommand::Disable { name } => {
+            let _config_guard = lock_mcp_json_config(path).await?;
             let mut cfg = read_mcp_json_config(path).await?;
             let server = cfg
                 .servers
@@ -615,23 +654,29 @@ async fn execute_mcp_command(path: &Path, command: McpCommand) -> anyhow::Result
         }
         McpCommand::Logout { name } => {
             let cfg = read_mcp_json_config(path).await?;
-            let server = cfg
-                .servers
-                .get(&name)
-                .with_context(|| format!("MCP server 不存在: {name}"))?;
-            oauth::logout(path, &name, server).await?;
+            let retried_pending_cleanup = oauth::retry_pending_logout(path, &name).await?;
+            if let Some(server) = cfg.servers.get(&name) {
+                oauth::logout(path, &name, server).await?;
+            } else if !retried_pending_cleanup {
+                anyhow::bail!("MCP server 不存在: {name}");
+            }
             Ok(format!("logged out of MCP server '{name}'\n"))
         }
         McpCommand::Status { name } => {
             let workspace_root = std::env::current_dir().context("读取当前工作目录失败")?;
             let manager = McpConnectionManager::new(path.to_path_buf(), workspace_root, None);
-            if let Some(name) = &name {
-                manager.reconnect_server(name).await?;
-            } else {
-                manager.refresh_all().await?;
+            let status_result = async {
+                if let Some(name) = &name {
+                    manager.reconnect_server(name).await?;
+                } else {
+                    manager.refresh_all().await?;
+                }
+                let snapshot = manager.snapshot().await;
+                mcp_status_text(path, &snapshot, name.as_deref())
             }
-            let snapshot = manager.snapshot().await;
-            mcp_status_text(path, &snapshot, name.as_deref())
+            .await;
+            manager.shutdown().await;
+            status_result
         }
     }
 }
@@ -642,9 +687,15 @@ async fn add_mcp_server(
     server: McpServerConfig,
 ) -> anyhow::Result<String> {
     validate_server_name(&name)?;
+    let _config_guard = lock_mcp_json_config(path).await?;
     let mut cfg = read_mcp_json_config(path).await?;
     if cfg.servers.contains_key(&name) {
         anyhow::bail!("MCP server 已存在: {name}；请先 remove 后再 add");
+    }
+    if oauth::has_pending_cleanup(path, &name).await? {
+        anyhow::bail!(
+            "MCP server '{name}' 仍有待清理的本地 OAuth 凭据；请先执行 `acn mcp logout {name}`"
+        );
     }
     cfg.servers.insert(name.clone(), server);
     write_mcp_json_config_atomic(path, &cfg).await?;
@@ -3177,7 +3228,7 @@ retry_max_delay_ms = 5000
     }
 
     #[tokio::test]
-    async fn mcp_remove_deletes_config_when_oauth_credential_cleanup_fails() {
+    async fn mcp_remove_deletes_config_and_keeps_failed_oauth_cleanup_retryable() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".mcp.json");
         let mut server = agent_claim_network::mcp::config::McpServerConfig::streamable_http(
@@ -3210,6 +3261,103 @@ retry_max_delay_ms = 5000
             .await
             .unwrap();
         assert!(cfg.servers.is_empty());
+
+        let blocked_add = super::execute_mcp_command(
+            &path,
+            super::McpCommand::AddJson {
+                name: "remote".to_string(),
+                server: agent_claim_network::mcp::config::McpServerConfig::stdio(
+                    "server".to_string(),
+                    Vec::new(),
+                    std::collections::BTreeMap::new(),
+                    Vec::new(),
+                ),
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(blocked_add.contains("仍有待清理"));
+
+        tokio::fs::remove_file(dir.path().join(".mcp-oauth"))
+            .await
+            .unwrap();
+        let retry = super::execute_mcp_command(
+            &path,
+            super::McpCommand::Logout {
+                name: "remote".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(retry.contains("logged out of MCP server 'remote'"));
+        let retry_again = super::execute_mcp_command(
+            &path,
+            super::McpCommand::Logout {
+                name: "remote".to_string(),
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(retry_again.contains("MCP server 不存在: remote"));
+    }
+
+    #[tokio::test]
+    async fn mcp_remove_preserves_config_written_while_waiting_for_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        let mut remote = agent_claim_network::mcp::config::McpServerConfig::streamable_http(
+            "https://example.test/mcp".to_string(),
+            None,
+        );
+        remote.oauth_credentials_store =
+            Some(agent_claim_network::mcp::config::McpOAuthCredentialsStore::File);
+        let mut cfg = agent_claim_network::mcp::config::McpJsonConfig::default();
+        cfg.servers.insert("remote".to_string(), remote.clone());
+        agent_claim_network::mcp::config::write_mcp_json_config_atomic(&path, &cfg)
+            .await
+            .unwrap();
+
+        let credential_blocker = agent_claim_network::mcp::oauth::prepare_credentials_for_remove(
+            &path, "remote", &remote,
+        )
+        .await
+        .unwrap();
+        let remove_path = path.clone();
+        let remove = tokio::spawn(async move {
+            super::execute_mcp_command(
+                &remove_path,
+                super::McpCommand::Remove {
+                    name: "remote".to_string(),
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        super::execute_mcp_command(
+            &path,
+            super::McpCommand::AddJson {
+                name: "other".to_string(),
+                server: agent_claim_network::mcp::config::McpServerConfig::stdio(
+                    "server".to_string(),
+                    Vec::new(),
+                    std::collections::BTreeMap::new(),
+                    Vec::new(),
+                ),
+            },
+        )
+        .await
+        .unwrap();
+        credential_blocker.finish().await.unwrap();
+        remove.await.unwrap().unwrap();
+
+        let cfg = agent_claim_network::mcp::config::read_mcp_json_config(&path)
+            .await
+            .unwrap();
+        assert!(!cfg.servers.contains_key("remote"));
+        assert!(cfg.servers.contains_key("other"));
     }
 
     #[tokio::test]

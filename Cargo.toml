@@ -50,6 +50,8 @@ reqwest = { version = "0.12", default-features = false, features = [
     "stream",
     "system-proxy",
 ] }
+# rmcp 3 使用独立的 reqwest 0.13；显式统一 system-proxy，避免 OAuth 绕过系统代理。
+reqwest_013 = { package = "reqwest", version = "0.13", default-features = false, features = ["system-proxy"] }
 sse-stream = "0.2.3"
 axum = "0.8"
 rmcp = { version = "=3.0.1", default-features = false, features = [

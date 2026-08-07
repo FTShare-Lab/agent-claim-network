@@ -164,6 +164,8 @@ acn mcp logout linear
 
 OAuth 凭据按 selected upstream、server name 与 URL 隔离。默认写入系统 keyring；`oauth_credentials_store = "file"` 时写入 selected upstream runtime 的 `.mcp-oauth/` 私有目录，供没有 Secret Service / D-Bus 的 headless Linux 使用。`logout` 只删除本地凭据，不请求远端 token revocation。当前不支持 client secret、CIMD 与 device flow。
 
+运行时找不到凭据记录时按未登录连接；凭据库不可用、refresh 要求重新授权或已加载身份被删除时必须 fail closed，不得把 OAuth-managed 请求降级为匿名请求。
+
 登录失败要区分 discovery / DCR、PKCE、callback state、RFC 9207 issuer 和 token endpoint 阶段；CLI 输出可行动的分类原因，但不直接透传可能包含 URL、响应 body 或凭据的底层错误文本。
 
 ### 删除 server
@@ -172,7 +174,7 @@ OAuth 凭据按 selected upstream、server name 与 URL 隔离。默认写入系
 acn mcp remove pal
 ```
 
-先删除 selected upstream runtime 下的 server 配置，再尽力删除该 server 的本地 OAuth 凭据。凭据库不可用时命令返回成功并显示 warning，明确说明配置已删除、凭据清理失败；不能因为 keyring / D-Bus 故障阻止配置删除。
+先写入不含 token 的私有待清理记录并锁定该 server 的凭据变更，再删除 selected upstream runtime 下的 server 配置，最后尽力删除本地 OAuth 凭据。凭据库不可用时命令返回成功并显示 warning，明确说明配置已删除、凭据清理失败；不能因为 keyring / D-Bus 故障阻止配置删除。待清理记录会保留凭据 backend 与不可逆 account hash，因此配置不存在时仍可执行同名 `acn mcp logout <name>` 重试；清理完成前不允许重新添加同名 server。
 
 ### 启用 / 禁用 server
 
@@ -929,7 +931,7 @@ MCP tool cell：
           → server 选择 2025-03-26 → 后续按 2025-03-26 通信
 ```
 
-连接新 server 时，ACN 先请求 `server/discover`；当前新协议使用 `2026-07-28`。连接旧 server 时，只有对方明确返回“不支持 `server/discover`”，SDK 才自动退回传统的 `initialize` 流程。旧 server 会在初始化响应中选定实际版本，ACN 随后按该版本发送 `tools/list`、`tools/call` 和 progress 消息；新协议专属字段不会发给旧 server。
+连接新 server 时，ACN 先请求 `server/discover`；当前新协议使用 `2026-07-28`。连接旧 server 时，对方返回 JSON-RPC `Method not found`，或在尚无 session 时以 HTTP `400` / `404` 和非 JSON-RPC body 拒绝 discovery，ACN 会退回传统的 `initialize` 流程；其他认证、限流、服务端和网络错误不会触发协议降级。旧 server 会在初始化响应中选定实际版本，ACN 随后按该版本发送 `tools/list`、`tools/call` 和 progress 消息；新协议专属字段不会发给旧 server。
 
 如果双方没有共同版本，ACN 应明确报协议不兼容，而不是尝试发送可能被误解的数据。
 
