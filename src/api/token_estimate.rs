@@ -57,7 +57,11 @@ fn estimate_session_turn_message_tokens(message: &SessionTurnMessage) -> usize {
 
 pub fn estimate_provider_replay_tokens(replay: &ProviderReplayState) -> usize {
     match replay {
-        ProviderReplayState::OpenAiResponses { items } => items
+        ProviderReplayState::OpenAiResponses { items, .. } => items
+            .iter()
+            .map(estimate_json_tokens)
+            .fold(0usize, usize::saturating_add),
+        ProviderReplayState::AnthropicMessages { messages, .. } => messages
             .iter()
             .map(estimate_json_tokens)
             .fold(0usize, usize::saturating_add),
@@ -129,6 +133,7 @@ mod tests {
         let replay = canonical
             .clone()
             .with_provider_replay(ProviderReplayState::OpenAiResponses {
+                model: Some("test-model".into()),
                 items: vec![json!({
                     "type": "reasoning",
                     "encrypted_content": "R".repeat(4_000)
@@ -143,5 +148,29 @@ mod tests {
         assert!(combined_tokens >= replay_tokens);
         assert!(combined_tokens > canonical_tokens);
         assert!(combined_tokens < replay_tokens.saturating_add(canonical_tokens));
+    }
+
+    #[test]
+    fn local_context_estimate_counts_anthropic_private_messages() {
+        let canonical = SessionTurnMessage::assistant_text("visible answer");
+        let replay =
+            canonical
+                .clone()
+                .with_provider_replay(ProviderReplayState::AnthropicMessages {
+                    model: "test-model".into(),
+                    messages: vec![json!({
+                        "role":"assistant",
+                        "content":[{
+                            "type":"thinking",
+                            "thinking":"R".repeat(4_000),
+                            "signature":"opaque"
+                        }]
+                    })],
+                });
+
+        assert!(
+            estimate_session_turn_messages_tokens(&[replay])
+                > estimate_session_turn_messages_tokens(&[canonical])
+        );
     }
 }

@@ -719,6 +719,14 @@ impl SessionTurnPreflight for DelegationCompositePreflight<'_> {
         Ok(())
     }
 
+    fn request_context_window_recovery(
+        &mut self,
+        assistant_marker: &SessionTurnMessage,
+    ) -> anyhow::Result<()> {
+        self.compactor
+            .request_context_window_recovery(assistant_marker)
+    }
+
     async fn after_provider_response_success(&mut self) -> anyhow::Result<()> {
         self.background.after_provider_response_success().await;
         Ok(())

@@ -114,10 +114,12 @@ pub use chat_completions::{
 };
 pub use compaction_projection::{
     active_segment_has_large_tool_result, active_segment_messages, active_segments_hash,
-    estimated_projected_segment_tokens, large_tool_result_omission_text,
-    project_turn_message_for_safe_transcript, project_turn_message_tool_results,
-    project_turn_messages_for_safe_transcript, project_turn_messages_tool_results,
-    provider_safe_segments, MessageRange, ProviderProjectionBudget,
+    context_recovery_protected_tail_from_marker, context_recovery_protected_tail_segments,
+    context_recovery_tail_marker, estimated_projected_segment_tokens,
+    large_tool_result_omission_text, project_turn_message_for_safe_transcript,
+    project_turn_message_tool_results, project_turn_messages_for_safe_transcript,
+    project_turn_messages_tool_results, provider_safe_segments, MessageRange,
+    ProviderProjectionBudget,
 };
 pub(crate) use compaction_projection::{
     ensure_compaction_request_within_context_window, omit_turn_messages_tool_results,
@@ -138,8 +140,8 @@ pub use provider::{
     assistant_text_from_message, context_usage_from_anthropic_committed_usage,
     context_usage_from_anthropic_input_usage, context_usage_from_openai_usage,
     ContextUsageSnapshot, ContextUsageSource, ProviderAdapter, ProviderEvent,
-    ProviderHistoryMediaPolicy, ProviderReplayProtocol, ProviderRequest, ProviderResponse,
-    ProviderStop, ToolSpec,
+    ProviderHistoryMediaPolicy, ProviderReplayIdentity, ProviderReplayProtocol, ProviderRequest,
+    ProviderResponse, ProviderStop, ToolSpec,
 };
 pub use responses::{
     ReducedResponses, ResponsesClient, ResponsesError, ResponsesFunctionCall, ResponsesReasoning,

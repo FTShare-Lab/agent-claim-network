@@ -57,7 +57,12 @@ api_key_env = "ACN_LLM_API_KEY"
 
 `provider`、`endpoint` 和 `model` 必须属于同一个兼容服务。`endpoint` 必须是绝对 HTTP(S) URL；`model` 不能为空。
 
-ACN 使用 HTTP SSE streaming，并在既有流式恢复路径中改发同协议 JSON non-streaming；不会自动切换成 Chat Completions。Responses 会话固定使用 `store = false`：未 compact 的本地历史、工具调用和协议 replay 共同构成下一次请求；历史图片/PDF 会继续作为真实附件发送。返回的 reasoning item 会保存在当前 Agent 的私有 session 并原样回传，但当前 TUI 不展示 Reasoning。
+ACN 默认使用流式输出；流式失败时可能改用同协议的非流式请求重试，不会自动切换协议。
+
+`openai_responses` 和 `anthropic` 支持在同一模型的连续会话中保存并回传 Reasoning，但 TUI 只显示最终回答；切换协议或模型后会使用新的 Reasoning 上下文。
+
+
+`openai_chat` 不保留厂商扩展的 Reasoning；依赖这类上下文的模型建议使用 `openai_responses` 或 `anthropic`。Anthropic Thinking 的开关与预算配置见 [配置参数](config_parameters.md)。
 
 `agent_id` 只能使用小写字母、数字、`_` 和 `-`，在团队内应保持唯一。它还决定本地数据目录，开始使用后不要随意修改。
 
@@ -112,7 +117,7 @@ acn
 
 ## Agent Upstream 与持久文件
 
-`upstream` 是 Agent 侧的一份运行与团队连接配置：它决定 Agent 身份、Router/Maintainer 地址、团队凭据来源和本地私有数据目录。名称只是本机别名，不是服务端团队 ID；Router 和 Maintainer 共同提供团队服务，但它们自身不选择 upstream。两个 endpoint 都留空时，这份配置对应单人模式。
+`upstream` 是 Agent 侧的一份运行与团队连接配置：它决定 Agent 身份、Router/Maintainer 地址、团队凭据来源和本地私有数据目录。名称只是本机别名，不是服务端团队 ID。两个 endpoint 都留空时，这份配置对应单人模式。
 
 顶层 `upstream` 决定 Agent 默认使用哪组 `[upstreams.<name>]`。也可以在启动时临时选择：
 
@@ -292,9 +297,7 @@ acn session cleanup
 acn session cleanup --apply
 ```
 
-`update` 默认从 `https://github.com/FTShare-Lab/agent-claim-network.git` 更新 Cargo 安装的 `acn`、`acn-router` 和 `acn-maintainer`；`--url` 用于临时改为其他可信的 ACN Git 仓库。不传 `--branch` 时默认拉取 `main` branch。该命令会核对 Cargo 的安装记录，不修改 Homebrew Cellar；Homebrew 安装使用 `brew upgrade acn`。
-
-无论通过 Cargo 还是 Homebrew 替换 binary，新版 ACN 第一次需要 supervisor 时都会比较版本与构建提交。旧版或构建不一致的 supervisor 会在确认 PID 身份后被终止，其持久化 job 由新版 supervisor 恢复；运行中的 finalize 最多消耗一次重试机会。
+`acn update` 用于更新 Cargo 安装，`--url` 可临时指定其他可信仓库；Homebrew 安装请使用 `brew upgrade acn`。升级后 ACN 会自动更新后台 supervisor，并继续处理待完成任务。
 
 `session cleanup` 默认只预览；加 `--apply` 才会删除符合保留期与状态条件的旧 session。
 

@@ -275,7 +275,11 @@ pub(crate) fn build_provider_adapter(cfg: &Config) -> anyhow::Result<Arc<dyn Pro
                     Duration::from_millis(chat.retry_base_delay_ms),
                     Duration::from_millis(chat.retry_max_delay_ms),
                 )?
-                .with_reasoning_effort(chat.reasoning_effort),
+                .with_reasoning_effort(chat.reasoning_effort)
+                .with_thinking(
+                    chat.anthropic_thinking,
+                    chat.anthropic_thinking_budget_tokens,
+                ),
             ))
         }
         LlmProvider::OpenAiChat => {
@@ -645,6 +649,8 @@ mod tests {
                     endpoint: "http://127.0.0.1:1".into(),
                     model: "test-model".into(),
                     reasoning_effort: crate::config::ReasoningEffort::None,
+                    anthropic_thinking: crate::config::AnthropicThinking::Auto,
+                    anthropic_thinking_budget_tokens: None,
                     api_key_env: "ANTHROPIC_API_KEY".into(),
                     max_tokens: 1024,
                     context_window: crate::config::DEFAULT_LLM_CONTEXT_WINDOW,

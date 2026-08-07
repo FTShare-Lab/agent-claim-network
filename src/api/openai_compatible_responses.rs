@@ -13,8 +13,9 @@ use super::continuation::{
     append_with_overlap_dedupe, CONTINUATION_TRIGGER, MAX_CONTINUATION_TURNS,
 };
 use super::provider::{
-    ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy, ProviderReplayProtocol,
-    ProviderRequest, ProviderResponse, ProviderStop, ToolSpec,
+    ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy, ProviderReplayIdentity,
+    ProviderReplayProtocol, ProviderRequest, ProviderResponse, ProviderStop,
+    ProviderTerminalFailure, ToolSpec,
 };
 use super::redact_media_error_body;
 use super::responses::{
@@ -99,6 +100,7 @@ impl OpenAiCompatibleResponsesProviderAdapter {
             max_output_tokens: max_tokens,
             stream,
             store: false,
+            include: Some(vec!["reasoning.encrypted_content".into()]),
             reasoning: reasoning_effort_name(self.reasoning_effort).map(|effort| {
                 ResponsesReasoning {
                     effort: effort.to_string(),
@@ -188,8 +190,11 @@ impl ProviderAdapter for OpenAiCompatibleResponsesProviderAdapter {
         ProviderHistoryMediaPolicy::Preserve
     }
 
-    fn history_replay_protocol(&self) -> Option<ProviderReplayProtocol> {
-        Some(ProviderReplayProtocol::OpenAiResponses)
+    fn history_replay_identity(&self) -> Option<ProviderReplayIdentity> {
+        Some(ProviderReplayIdentity {
+            protocol: ProviderReplayProtocol::OpenAiResponses,
+            model: self.model.clone(),
+        })
     }
 
     fn emit_preflight_context_estimate(&self) -> bool {
@@ -208,7 +213,7 @@ impl ProviderAdapter for OpenAiCompatibleResponsesProviderAdapter {
         let retry_count = request
             .retry_count_override
             .unwrap_or(self.client.retry_count());
-        let input = session_turn_messages_to_responses(request.messages)?;
+        let input = session_turn_messages_to_responses(request.messages, &self.model)?;
         let request_has_media = input.has_media;
         let turn = match self
             .send_with_continuation(
@@ -223,9 +228,19 @@ impl ProviderAdapter for OpenAiCompatibleResponsesProviderAdapter {
             .await
         {
             Ok(turn) => turn,
-            Err(error) => return Err(wrap_media_rejection(error, request_has_media).into()),
+            Err(error) => {
+                let error = wrap_media_rejection(error, request_has_media);
+                if matches!(
+                    &error,
+                    OpenAiCompatibleResponsesError::Client(ResponsesError::Failed { .. })
+                        | OpenAiCompatibleResponsesError::Client(ResponsesError::Incomplete { .. })
+                ) {
+                    return Err(ProviderTerminalFailure::new(error.to_string()).into());
+                }
+                return Err(error.into());
+            }
         };
-        let response = provider_response_from_turn(turn)?;
+        let response = provider_response_from_turn(turn, &self.model)?;
         if let Some(text) =
             response
                 .assistant_message
@@ -256,15 +271,20 @@ struct ContinuedResponsesTurn {
 
 fn session_turn_messages_to_responses(
     messages: Vec<SessionTurnMessage>,
+    model: &str,
 ) -> Result<ResponsesInput, OpenAiCompatibleResponsesError> {
     let mut items = Vec::new();
     let mut has_media = false;
     for message in messages {
-        if let Some(ProviderReplayState::OpenAiResponses { items: replay }) =
-            message.provider_replay
+        if let Some(ProviderReplayState::OpenAiResponses {
+            model: Some(replay_model),
+            items: replay,
+        }) = message.provider_replay
         {
-            items.extend(replay);
-            continue;
+            if replay_model == model {
+                items.extend(replay);
+                continue;
+            }
         }
         match message.role.as_str() {
             "user" => push_user_items(&mut items, message.content, &mut has_media)?,
@@ -418,6 +438,7 @@ fn tool_specs_to_responses(tools: Vec<ToolSpec>) -> Vec<ResponsesTool> {
 
 fn provider_response_from_turn(
     turn: ContinuedResponsesTurn,
+    model: &str,
 ) -> Result<ProviderResponse, OpenAiCompatibleResponsesError> {
     let mut content = Vec::new();
     if !turn.merged_text.trim().is_empty() {
@@ -446,6 +467,7 @@ fn provider_response_from_turn(
             role: "assistant".into(),
             content,
             provider_replay: Some(ProviderReplayState::OpenAiResponses {
+                model: Some(model.to_string()),
                 items: turn.replay_items,
             }),
         },
@@ -554,37 +576,74 @@ mod tests {
     }
 
     #[test]
+    fn history_media_policy_preserves_uncompacted_images_and_documents() {
+        assert_eq!(
+            adapter_with_reasoning_effort(ReasoningEffort::None).history_media_policy(),
+            ProviderHistoryMediaPolicy::Preserve
+        );
+    }
+
+    #[test]
     fn matching_replay_wins_over_canonical_projection() {
         let raw = json!({
             "type":"reasoning","id":"rs_1","encrypted_content":"opaque","future":true
         });
-        let input = session_turn_messages_to_responses(vec![SessionTurnMessage {
-            role: "assistant".into(),
-            content: vec![SessionTurnContentBlock::text("不要重复")],
-            provider_replay: Some(ProviderReplayState::OpenAiResponses {
-                items: vec![raw.clone()],
-            }),
-        }])
+        let input = session_turn_messages_to_responses(
+            vec![SessionTurnMessage {
+                role: "assistant".into(),
+                content: vec![SessionTurnContentBlock::text("不要重复")],
+                provider_replay: Some(ProviderReplayState::OpenAiResponses {
+                    model: Some("test-model".into()),
+                    items: vec![raw.clone()],
+                }),
+            }],
+            "test-model",
+        )
         .unwrap();
 
         assert_eq!(input.items, vec![raw]);
     }
 
     #[test]
+    fn unbound_or_wrong_model_replay_falls_back_to_canonical_projection() {
+        for replay_model in [None, Some("other-model".to_string())] {
+            let input = session_turn_messages_to_responses(
+                vec![SessionTurnMessage {
+                    role: "assistant".into(),
+                    content: vec![SessionTurnContentBlock::text("canonical")],
+                    provider_replay: Some(ProviderReplayState::OpenAiResponses {
+                        model: replay_model,
+                        items: vec![json!({"type":"reasoning", "private":true})],
+                    }),
+                }],
+                "test-model",
+            )
+            .unwrap();
+
+            assert_eq!(input.items.len(), 1);
+            assert_eq!(input.items[0]["role"], "assistant");
+            assert_eq!(input.items[0]["content"][0]["text"], "canonical");
+        }
+    }
+
+    #[test]
     fn canonical_media_and_tool_results_map_to_responses_items() {
-        let input = session_turn_messages_to_responses(vec![SessionTurnMessage {
-            role: "user".into(),
-            provider_replay: None,
-            content: vec![
-                SessionTurnContentBlock::ToolResult {
-                    tool_use_id: "call_1".into(),
-                    content: "ok".into(),
-                },
-                SessionTurnContentBlock::text("看附件"),
-                SessionTurnContentBlock::image("image/png", "QUJD"),
-                SessionTurnContentBlock::document_named("application/pdf", "REVG", "brief.pdf"),
-            ],
-        }])
+        let input = session_turn_messages_to_responses(
+            vec![SessionTurnMessage {
+                role: "user".into(),
+                provider_replay: None,
+                content: vec![
+                    SessionTurnContentBlock::ToolResult {
+                        tool_use_id: "call_1".into(),
+                        content: "ok".into(),
+                    },
+                    SessionTurnContentBlock::text("看附件"),
+                    SessionTurnContentBlock::image("image/png", "QUJD"),
+                    SessionTurnContentBlock::document_named("application/pdf", "REVG", "brief.pdf"),
+                ],
+            }],
+            "test-model",
+        )
         .unwrap();
 
         assert!(input.has_media);
@@ -605,19 +664,22 @@ mod tests {
 
     #[test]
     fn canonical_assistant_text_and_tool_use_preserve_source_order() {
-        let input = session_turn_messages_to_responses(vec![SessionTurnMessage {
-            role: "assistant".into(),
-            provider_replay: None,
-            content: vec![
-                SessionTurnContentBlock::text("先查"),
-                SessionTurnContentBlock::ToolUse {
-                    id: "call_1".into(),
-                    name: "file_read".into(),
-                    input: json!({"path":"a.txt"}),
-                },
-                SessionTurnContentBlock::text("再说"),
-            ],
-        }])
+        let input = session_turn_messages_to_responses(
+            vec![SessionTurnMessage {
+                role: "assistant".into(),
+                provider_replay: None,
+                content: vec![
+                    SessionTurnContentBlock::text("先查"),
+                    SessionTurnContentBlock::ToolUse {
+                        id: "call_1".into(),
+                        name: "file_read".into(),
+                        input: json!({"path":"a.txt"}),
+                    },
+                    SessionTurnContentBlock::text("再说"),
+                ],
+            }],
+            "test-model",
+        )
         .unwrap();
 
         assert_eq!(input.items[0]["type"], "message");
@@ -643,6 +705,7 @@ mod tests {
         let value = serde_json::to_value(request).unwrap();
 
         assert_eq!(value["store"], false);
+        assert_eq!(value["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(value["stream"], true);
         assert_eq!(value["max_output_tokens"], 123);
         assert_eq!(value["reasoning"]["effort"], "high");
@@ -677,13 +740,14 @@ mod tests {
             terminal: ResponsesTerminal::Completed,
         };
 
-        let response = provider_response_from_turn(turn).unwrap();
+        let response = provider_response_from_turn(turn, "test-model").unwrap();
 
         assert_eq!(response.stop, ProviderStop::ToolUse);
         assert_eq!(response.assistant_message.content.len(), 2);
         assert_eq!(
             response.assistant_message.provider_replay,
             Some(ProviderReplayState::OpenAiResponses {
+                model: Some("test-model".into()),
                 items: vec![reasoning]
             })
         );
@@ -692,12 +756,15 @@ mod tests {
     #[test]
     fn unknown_only_success_is_rejected_without_dumping_raw_payload() {
         let secret = "A".repeat(400);
-        let error = provider_response_from_turn(ContinuedResponsesTurn {
-            merged_text: String::new(),
-            replay_items: vec![json!({"type":"output_image","data":secret})],
-            function_calls: Vec::new(),
-            terminal: ResponsesTerminal::Completed,
-        })
+        let error = provider_response_from_turn(
+            ContinuedResponsesTurn {
+                merged_text: String::new(),
+                replay_items: vec![json!({"type":"output_image","data":secret})],
+                function_calls: Vec::new(),
+                terminal: ResponsesTerminal::Completed,
+            },
+            "test-model",
+        )
         .unwrap_err();
 
         let display = error.to_string();
@@ -729,12 +796,15 @@ mod tests {
 
     #[test]
     fn terminal_stop_mapping_prefers_max_tokens_and_tools() {
-        let max = provider_response_from_turn(ContinuedResponsesTurn {
-            merged_text: "partial".into(),
-            replay_items: vec![json!({"type":"message"})],
-            function_calls: Vec::new(),
-            terminal: ResponsesTerminal::MaxOutputTokens,
-        })
+        let max = provider_response_from_turn(
+            ContinuedResponsesTurn {
+                merged_text: "partial".into(),
+                replay_items: vec![json!({"type":"message"})],
+                function_calls: Vec::new(),
+                terminal: ResponsesTerminal::MaxOutputTokens,
+            },
+            "test-model",
+        )
         .unwrap();
         assert_eq!(max.stop, ProviderStop::MaxTokens);
     }
@@ -799,7 +869,7 @@ mod tests {
             &response.assistant_message.content[0],
             SessionTurnContentBlock::Text { text } if text == "hello world"
         ));
-        let Some(ProviderReplayState::OpenAiResponses { items }) =
+        let Some(ProviderReplayState::OpenAiResponses { items, .. }) =
             response.assistant_message.provider_replay
         else {
             panic!("Responses assistant 应保存 replay")
@@ -812,6 +882,14 @@ mod tests {
         assert_eq!(items[3], second_output);
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0]["store"], false);
+        assert_eq!(
+            requests[0]["include"],
+            json!(["reasoning.encrypted_content"])
+        );
+        assert_eq!(
+            requests[1]["include"],
+            json!(["reasoning.encrypted_content"])
+        );
         assert_eq!(requests[1]["input"].as_array().unwrap().len(), 3);
         assert_eq!(requests[1]["input"][1], first_output);
         assert_eq!(
@@ -895,6 +973,9 @@ mod tests {
             })
         }));
         assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|request| { request["include"] == json!(["reasoning.encrypted_content"]) }));
         let second_input = requests[1]["input"].as_array().unwrap();
         let output_positions = second_input
             .iter()
@@ -986,6 +1067,7 @@ mod tests {
         assert_eq!(
             assistant.provider_replay,
             Some(ProviderReplayState::OpenAiResponses {
+                model: Some("test-model".into()),
                 items: vec![done_message]
             })
         );
@@ -1059,6 +1141,7 @@ mod tests {
         assert_eq!(
             assistant.provider_replay,
             Some(ProviderReplayState::OpenAiResponses {
+                model: Some("test-model".into()),
                 items: vec![final_item]
             })
         );
@@ -1069,6 +1152,126 @@ mod tests {
             event,
             crate::api::SessionTurnEvent::NonStreamingFallbackSucceeded { .. }
         )));
+    }
+
+    #[tokio::test]
+    async fn deterministic_failed_stream_does_not_fallback_after_text_delta() {
+        let body = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({"type":"response.output_text.delta","delta":"partial"}),
+            json!({
+                "type":"response.failed",
+                "response":{"error":{"message":"deterministic failure"}}
+            })
+        );
+        let (endpoint, requests) = spawn_raw_sequence(vec![body]).await;
+        let adapter = Arc::new(
+            OpenAiCompatibleResponsesProviderAdapter::new(
+                "test-key".into(),
+                endpoint,
+                "test-model".into(),
+                Duration::from_secs(5),
+                0,
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .unwrap(),
+        );
+        let tools = Arc::new(ToolRegistry::new(&ToolConfig::default()).unwrap());
+        let turn_loop = AgentTurnLoop::new(adapter, tools, 128);
+        let mut events = Vec::new();
+
+        let error = turn_loop
+            .run_session_turn(
+                SessionTurnRequest {
+                    current_session_id: None,
+                    current_turn_id: None,
+                    system_prompt: "system".into(),
+                    history: Vec::new(),
+                    user_text: "hello".into(),
+                    user_attachments: Vec::new(),
+                    skill_instructions: Vec::new(),
+                },
+                &mut |event| events.push(event),
+            )
+            .await
+            .unwrap_err();
+        let requests = requests.await.unwrap();
+
+        assert_eq!(requests.len(), 1);
+        assert!(error.to_string().contains("deterministic failure"));
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            crate::api::SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn deterministic_incomplete_fallback_stops_remaining_attempts() {
+        let (endpoint, requests) = spawn_mixed_sequence(vec![
+            (
+                "text/event-stream",
+                format!(
+                    "data: {}\n\n",
+                    json!({"type":"response.output_text.delta","delta":"partial"})
+                ),
+            ),
+            (
+                "application/json",
+                json!({
+                    "status":"incomplete",
+                    "incomplete_details":{"reason":"content_filter"},
+                    "output":[]
+                })
+                .to_string(),
+            ),
+        ])
+        .await;
+        let adapter = Arc::new(
+            OpenAiCompatibleResponsesProviderAdapter::new(
+                "test-key".into(),
+                endpoint,
+                "test-model".into(),
+                Duration::from_secs(5),
+                0,
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .unwrap(),
+        );
+        let tools = Arc::new(ToolRegistry::new(&ToolConfig::default()).unwrap());
+        let turn_loop = AgentTurnLoop::new(adapter, tools, 128);
+        let mut events = Vec::new();
+
+        let error = turn_loop
+            .run_session_turn(
+                SessionTurnRequest {
+                    current_session_id: None,
+                    current_turn_id: None,
+                    system_prompt: "system".into(),
+                    history: Vec::new(),
+                    user_text: "hello".into(),
+                    user_attachments: Vec::new(),
+                    skill_instructions: Vec::new(),
+                },
+                &mut |event| events.push(event),
+            )
+            .await
+            .unwrap_err();
+        let requests = requests.await.unwrap();
+
+        assert_eq!(requests.len(), 2);
+        assert!(error.to_string().contains("content_filter"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    crate::api::SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
+                ))
+                .count(),
+            1
+        );
     }
 
     async fn spawn_json_sequence(

@@ -22,10 +22,11 @@ use super::user_shell::{
     format_user_shell_command_record, run_user_shell_command as execute_user_shell_command,
 };
 use crate::api::{
-    ensure_compaction_request_within_context_window, estimate_session_turn_messages_tokens,
-    project_compaction_input_media, project_turn_message_for_safe_transcript, AgentTurnLoop,
-    ContextUsageSnapshot, ContextUsageSource, InboxInternalizeKind, InternalizeRequest,
-    MemoryReviewLoop, SessionAttachment, SessionCompactionOutcome, SessionTurn, SessionTurnEvent,
+    context_recovery_protected_tail_from_marker, ensure_compaction_request_within_context_window,
+    estimate_session_turn_messages_tokens, project_compaction_input_media,
+    project_turn_message_for_safe_transcript, AgentTurnLoop, ContextUsageSnapshot,
+    ContextUsageSource, InboxInternalizeKind, InternalizeRequest, MemoryReviewLoop,
+    SessionAttachment, SessionCompactionOutcome, SessionTurn, SessionTurnEvent,
     SessionTurnEventRecorder, SessionTurnInterrupted, SessionTurnMessage, SessionTurnPreflight,
     SessionTurnRequest, StructuredJsonAttemptRequest, StructuredJsonCaller, ToolBoundaryControl,
     TurnMessage,
@@ -300,6 +301,7 @@ struct PreflightCompactionRequest<'a> {
     base_message_count: usize,
     active_projection_compacted: bool,
     runtime_projection_tokens: usize,
+    protected_active_tail_segments: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -331,6 +333,7 @@ struct PreflightCompactionPlan {
     turn_id: String,
     base_message_count: usize,
     runtime_budget: PreflightRuntimeProjectionBudget,
+    protected_active_tail_segments: usize,
 }
 
 struct PreflightCompactor<'a> {
@@ -347,6 +350,8 @@ struct PreflightCompactor<'a> {
     background_projection: Option<String>,
     background_projection_insert_index: Option<usize>,
     background_completion_delivery_ids: Vec<crate::tool::ProcessCompletionDeliveryReceipt>,
+    context_window_recovery_requested: bool,
+    context_window_recovery_tail_marker: Option<SessionTurnMessage>,
 }
 
 #[async_trait]
@@ -357,6 +362,7 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
         provider_messages: &mut Vec<SessionTurnMessage>,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
     ) -> anyhow::Result<()> {
+        let forced_context_recovery = std::mem::take(&mut self.context_window_recovery_requested);
         self.remove_background_projection(provider_messages);
         self.engine
             .turn_loop
@@ -386,16 +392,33 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
         );
         if trigger_threshold == 0 {
             self.insert_background_projection(provider_messages).await;
+            if forced_context_recovery {
+                anyhow::bail!("模型上下文已满，但自动压缩已关闭。请启用自动压缩或新建会话。");
+            }
             return Ok(());
         }
         let trigger_tokens = self
             .trigger_context_tokens(system_prompt, provider_messages)
             .saturating_add(self.background_projection_tokens());
-        if !auto_compact_should_trigger(trigger_tokens, trigger_threshold) {
+        if !forced_context_recovery
+            && !auto_compact_should_trigger(trigger_tokens, trigger_threshold)
+        {
             self.insert_background_projection(provider_messages).await;
             return Ok(());
         }
         let projected_base_system_prompt = system_prompt.clone();
+        let segments = active_provider_safe_segments(&active_suffix);
+        let protected_active_tail_segments = match self.context_window_recovery_tail_marker.as_ref()
+        {
+            Some(marker) => {
+                context_recovery_protected_tail_from_marker(&active_suffix, &segments, marker)
+                    .context("上下文续写状态异常，无法自动恢复")?
+            }
+            None => 0,
+        };
+        if forced_context_recovery && protected_active_tail_segments == 0 {
+            anyhow::bail!("上下文续写状态异常，无法自动恢复");
+        }
         let projection = match self
             .engine
             .compact_provider_preflight(
@@ -407,6 +430,7 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
                     base_message_count: self.base_message_count,
                     active_projection_compacted: self.active_projection_compacted,
                     runtime_projection_tokens: self.runtime_projection_tokens(),
+                    protected_active_tail_segments,
                 },
                 emit,
             )
@@ -415,9 +439,15 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
             Ok(Some(projection)) => projection,
             Ok(None) => {
                 self.insert_background_projection(provider_messages).await;
+                if forced_context_recovery {
+                    anyhow::bail!("模型上下文已满，但没有可安全压缩的历史。请简化任务后重试。");
+                }
                 return Ok(());
             }
             Err(error) => {
+                if forced_context_recovery {
+                    return Err(error.context("模型上下文已满，自动压缩失败。请重试或新建会话。"));
+                }
                 let Some(recoverable) =
                     error.downcast_ref::<RecoverableCompactionPreparationError>()
                 else {
@@ -452,6 +482,32 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
         self.provider_context_anchor = None;
         self.engine
             .clear_active_context_usage_anchor(&self.session.metadata.id);
+        if forced_context_recovery {
+            let projected_tokens = self
+                .engine
+                .turn_loop
+                .estimate_context_tokens(system_prompt, provider_messages);
+            if projected_tokens >= trigger_tokens {
+                log::warn!(
+                    target: "agent",
+                    "context recovery compaction 未缩小请求：压缩前估算 {trigger_tokens} tokens，压缩后估算 {projected_tokens} tokens"
+                );
+                anyhow::bail!("自动压缩未能释放上下文空间。请简化任务或新建会话。");
+            }
+        }
+        Ok(())
+    }
+
+    fn request_context_window_recovery(
+        &mut self,
+        assistant_marker: &SessionTurnMessage,
+    ) -> anyhow::Result<()> {
+        if self.engine.compaction.auto_compact_ctx_ratio == 0.0 {
+            anyhow::bail!("模型上下文已满，但自动压缩已关闭。请启用自动压缩或新建会话。");
+        }
+        self.context_window_recovery_tail_marker
+            .get_or_insert_with(|| assistant_marker.clone());
+        self.context_window_recovery_requested = true;
         Ok(())
     }
 
@@ -1197,7 +1253,10 @@ impl SessionEngine {
         estimated_session_message_tokens_projected(
             messages,
             None,
-            Some(crate::api::ProviderReplayProtocol::OpenAiResponses),
+            Some(crate::api::ProviderReplayIdentity {
+                protocol: crate::api::ProviderReplayProtocol::OpenAiResponses,
+                model: "test-model".into(),
+            }),
         )
     }
 
@@ -1209,7 +1268,10 @@ impl SessionEngine {
         estimated_session_message_tokens_projected(
             messages,
             Some(tool_result_raw_max_chars),
-            Some(crate::api::ProviderReplayProtocol::OpenAiResponses),
+            Some(crate::api::ProviderReplayIdentity {
+                protocol: crate::api::ProviderReplayProtocol::OpenAiResponses,
+                model: "test-model".into(),
+            }),
         )
     }
 
@@ -1241,7 +1303,7 @@ impl SessionEngine {
             tail_token_limit,
             self.compaction.tail_previous_real_user_turns,
             self.compaction.tool_result_raw_max_chars,
-            self.turn_loop.history_replay_protocol(),
+            self.turn_loop.history_replay_identity(),
         )
     }
 
@@ -1342,6 +1404,10 @@ impl SessionEngine {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "preflight provider 投影需显式携带 session、active turn、预算与受保护恢复边界"
+    )]
     fn preflight_projection(
         &self,
         base_system_prompt: &str,
@@ -1350,6 +1416,7 @@ impl SessionEngine {
         active_suffix: &[SessionTurnMessage],
         active_context: ActiveProjectionContext<'_>,
         budget: ProviderProjectionBudget,
+        protected_active_tail_segments: usize,
     ) -> ProviderProjection {
         project_provider_context(
             base_system_prompt,
@@ -1359,7 +1426,8 @@ impl SessionEngine {
             active_context,
             budget,
             self.turn_loop.history_media_policy(),
-            self.turn_loop.history_replay_protocol(),
+            self.turn_loop.history_replay_identity(),
+            protected_active_tail_segments,
         )
     }
 
@@ -2670,7 +2738,7 @@ impl SessionEngine {
             self.compaction.tail_previous_real_user_turns,
             self.compaction.tool_result_raw_max_chars,
             self.turn_loop.history_media_policy(),
-            self.turn_loop.history_replay_protocol(),
+            self.turn_loop.history_replay_identity(),
         )?;
         let active_start_index = history.len();
         let turn_id_for_tools = request.turn_id.clone();
@@ -2688,6 +2756,8 @@ impl SessionEngine {
             background_projection: None,
             background_projection_insert_index: None,
             background_completion_delivery_ids: Vec::new(),
+            context_window_recovery_requested: false,
+            context_window_recovery_tail_marker: None,
         };
         let turn = self
             .turn_loop
@@ -2854,7 +2924,7 @@ impl SessionEngine {
             self.compaction.tail_previous_real_user_turns,
             self.compaction.tool_result_raw_max_chars,
             self.turn_loop.history_media_policy(),
-            self.turn_loop.history_replay_protocol(),
+            self.turn_loop.history_replay_identity(),
         )?;
         if let Some(projection) = delegation_summary_projection(&session.paths.dir).await? {
             history.push(SessionTurnMessage::user_text(projection));
@@ -2934,6 +3004,7 @@ impl SessionEngine {
             base_message_count,
             active_projection_compacted,
             runtime_projection_tokens,
+            protected_active_tail_segments,
         } = request;
         let runtime_budget = self.preflight_runtime_projection_budget(runtime_projection_tokens);
         let projection_budget = runtime_budget.provider_projection;
@@ -2977,6 +3048,7 @@ impl SessionEngine {
             active_context,
             active_projection_compacted,
             runtime_budget,
+            protected_active_tail_segments,
         )?;
         if plan.committed_transcript.is_none() && plan.active_turn.is_none() {
             if let Some(state) = recovered_state {
@@ -2987,6 +3059,7 @@ impl SessionEngine {
                     &active_suffix,
                     active_context,
                     projection_budget,
+                    protected_active_tail_segments,
                 );
                 let projection = if self
                     .ensure_provider_projection_within_hard_budget(
@@ -3084,7 +3157,8 @@ impl SessionEngine {
                 active_context,
                 projection_budget,
                 self.turn_loop.history_media_policy(),
-                self.turn_loop.history_replay_protocol(),
+                self.turn_loop.history_replay_identity(),
+                protected_active_tail_segments,
             )
         });
         log::info!(
@@ -3101,6 +3175,10 @@ impl SessionEngine {
         Ok(Some(projection))
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "preflight 规划需显式携带 session、active turn、runtime budget 与受保护尾段边界"
+    )]
     fn build_preflight_compaction_plan(
         &self,
         metadata: &crate::session::SessionMetadata,
@@ -3109,6 +3187,7 @@ impl SessionEngine {
         active_context: ActiveProjectionContext<'_>,
         active_projection_compacted: bool,
         runtime_budget: PreflightRuntimeProjectionBudget,
+        protected_active_tail_segments: usize,
     ) -> anyhow::Result<PreflightCompactionPlan> {
         let projection_budget = runtime_budget.provider_projection;
 
@@ -3118,6 +3197,7 @@ impl SessionEngine {
             active_context.turn_id,
             active_context.base_message_count,
             projection_budget.tail_token_limit,
+            protected_active_tail_segments,
         )?;
         let prior_active_turn = matching_active_turn_compaction(
             metadata,
@@ -3143,7 +3223,9 @@ impl SessionEngine {
             prior_active_turn
                 .as_ref()
                 .map(|prior| prior.summary.as_str()),
-        );
+            protected_active_tail_segments,
+        )
+        .messages;
         let summary_start = metadata
             .compaction
             .as_ref()
@@ -3212,6 +3294,7 @@ impl SessionEngine {
             turn_id: active_context.turn_id.to_string(),
             base_message_count: active_context.base_message_count,
             runtime_budget,
+            protected_active_tail_segments,
         })
     }
 
@@ -3222,11 +3305,13 @@ impl SessionEngine {
         turn_id: &str,
         base_message_count: usize,
         tail_token_limit: usize,
+        protected_tail_segments: usize,
     ) -> anyhow::Result<Option<ActiveTurnPlan>> {
         let segments = active_provider_safe_segments(active_suffix);
         if segments.is_empty() {
             return Ok(None);
         }
+        let compactable_segments = segments.len().saturating_sub(protected_tail_segments);
         let current_coverage = metadata
             .compaction
             .as_ref()
@@ -3243,15 +3328,22 @@ impl SessionEngine {
             })
             .map(|cursor| cursor.compacted_until_segment)
             .unwrap_or(0);
-        if current_coverage >= segments.len() {
+        if current_coverage >= compactable_segments {
             return Ok(None);
         }
+        let protected_tail_tokens = if protected_tail_segments > 0 {
+            let protected_start = segments[compactable_segments].start;
+            estimate_session_turn_messages_tokens(&active_suffix[protected_start..])
+        } else {
+            0
+        };
         let summary_start_segment = current_coverage;
         let summary_end_segment = self.active_summary_end_segment(
             active_suffix,
-            &segments,
+            &segments[..compactable_segments],
             current_coverage,
             tail_token_limit,
+            protected_tail_tokens,
         );
         if summary_end_segment <= summary_start_segment {
             return Ok(None);
@@ -3288,12 +3380,15 @@ impl SessionEngine {
         segments: &[MessageRange],
         current_coverage: usize,
         tail_token_limit: usize,
+        protected_tail_tokens: usize,
     ) -> usize {
         let anchor_tokens = active_suffix
             .first()
             .map(|message| estimate_session_turn_messages_tokens(std::slice::from_ref(message)))
             .unwrap_or(0);
-        let mut remaining_raw_tail_budget = tail_token_limit.saturating_sub(anchor_tokens);
+        let mut remaining_raw_tail_budget = tail_token_limit
+            .saturating_sub(anchor_tokens)
+            .saturating_sub(protected_tail_tokens);
         let mut preserve_start = segments.len();
         for segment_index in (current_coverage..segments.len()).rev() {
             let segment = &segments[segment_index];
@@ -3518,6 +3613,7 @@ impl SessionEngine {
             active_suffix,
             active_context,
             projection_budget,
+            plan.protected_active_tail_segments,
         );
         let preflight_projection = if self
             .ensure_provider_projection_within_hard_budget(
@@ -3587,6 +3683,7 @@ impl SessionEngine {
                         active_suffix,
                         active_context,
                         projection_budget,
+                        plan.protected_active_tail_segments,
                     );
                     let final_projection = self
                         .externalize_and_validate_preflight_projection(

@@ -26,11 +26,13 @@ use super::continuation::{
 use super::endpoint::{resolve_llm_endpoint, LlmEndpointKind};
 use super::llm_http::{read_llm_error_body, LlmHttpError, LlmHttpPhase};
 use super::provider::{
-    ProviderAdapter, ProviderEvent, ProviderRequest, ProviderResponse, ProviderStop, ToolSpec,
+    ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy, ProviderReplayIdentity,
+    ProviderReplayProtocol, ProviderRequest, ProviderResponse, ProviderStop,
+    ProviderTerminalFailure, ToolSpec,
 };
 use super::redact_media_error_body;
 use super::types::{SessionTurnContentBlock, SessionTurnEvent, SessionTurnMessage};
-use crate::config::ReasoningEffort;
+use crate::config::{AnthropicThinking, ReasoningEffort};
 use crate::prompt::PromptError;
 
 mod protocol;
@@ -38,7 +40,7 @@ mod streaming;
 
 use protocol::*;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum AnthropicError {
     #[error("{0}")]
     Http(#[from] LlmHttpError),
@@ -50,7 +52,7 @@ pub enum AnthropicError {
     ResponseJson(#[from] serde_json::Error),
     #[error("Anthropic Messages endpoint 配置无效: {0}")]
     InvalidEndpoint(String),
-    #[error("LLM 输出不符合预期 schema: {reason}; raw={raw}")]
+    #[error("LLM 输出不符合预期 schema: {reason}")]
     OutputShape { reason: String, raw: String },
     #[error("prompt 渲染失败: {0}")]
     Prompt(#[from] PromptError),
@@ -63,6 +65,13 @@ pub enum AnthropicError {
     },
 }
 
+impl std::fmt::Debug for AnthropicError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // anyhow / test debug 链也只能看到已脱敏的 Display，不能展开 raw replay。
+        std::fmt::Display::fmt(self, formatter)
+    }
+}
+
 pub struct AnthropicMessagesClient {
     http: reqwest::Client,
     api_key: Arc<String>,
@@ -73,6 +82,8 @@ pub struct AnthropicMessagesClient {
     retry_max_delay: Duration,
     timeout: Duration,
     reasoning_effort: ReasoningEffort,
+    thinking: AnthropicThinking,
+    thinking_budget_tokens: Option<u32>,
 }
 
 pub struct AnthropicProviderAdapter {
@@ -114,6 +125,8 @@ impl AnthropicMessagesClient {
             retry_max_delay,
             timeout,
             reasoning_effort: ReasoningEffort::None,
+            thinking: AnthropicThinking::Auto,
+            thinking_budget_tokens: None,
         })
     }
 
@@ -135,6 +148,21 @@ impl AnthropicMessagesClient {
                     effort: self.reasoning_effort,
                 },
             ),
+            thinking: match self.thinking {
+                AnthropicThinking::Auto => None,
+                AnthropicThinking::Enabled => Some(ApiThinkingConfig {
+                    kind: "enabled".into(),
+                    budget_tokens: self.thinking_budget_tokens,
+                }),
+                AnthropicThinking::Adaptive => Some(ApiThinkingConfig {
+                    kind: "adaptive".into(),
+                    budget_tokens: None,
+                }),
+                AnthropicThinking::Disabled => Some(ApiThinkingConfig {
+                    kind: "disabled".into(),
+                    budget_tokens: None,
+                }),
+            },
             tools,
             stream,
         }
@@ -193,13 +221,13 @@ impl AnthropicMessagesClient {
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             let body = read_llm_error_body(resp, self.timeout).await;
-            return Err(AnthropicError::Auth(body));
+            return Err(AnthropicError::Auth(redact_anthropic_error_body(&body)));
         }
         if !status.is_success() {
             let body = read_llm_error_body(resp, self.timeout).await;
             return Err(AnthropicError::Status {
                 status: status.as_u16(),
-                body,
+                body: redact_anthropic_error_body(&body),
             });
         }
 
@@ -240,6 +268,7 @@ impl AnthropicMessagesClient {
         let mut last_response: Option<Value> = None;
         let mut last_blocks = Vec::new();
         let mut last_stop_reason = String::from("end_turn");
+        let mut replay_messages = Vec::new();
 
         for round in 0..=MAX_CONTINUATION_TURNS {
             let body = self.request_for(system, messages.clone(), tools.clone(), max_tokens, None);
@@ -250,12 +279,14 @@ impl AnthropicMessagesClient {
                     raw: response.to_string(),
                 })?;
             let stop_reason = required_anthropic_stop_reason(&response)?;
-            messages.push(ApiMessage {
-                role: "assistant".into(),
-                content: ApiContent::Blocks(assistant_blocks.clone()),
+            let assistant_replay = json!({
+                "role": "assistant",
+                "content": assistant_blocks.clone(),
             });
-            if let Some(text) = extract_text_block(&response) {
-                append_with_overlap_dedupe(&mut merged_text, text);
+            messages.push(ApiMessage::raw(assistant_replay.clone()));
+            replay_messages.push(assistant_replay);
+            if let Some(text) = extract_text_blocks(&response) {
+                append_with_overlap_dedupe(&mut merged_text, &text);
             }
             last_stop_reason = stop_reason.clone();
             last_blocks = assistant_blocks;
@@ -281,10 +312,9 @@ impl AnthropicMessagesClient {
             if round == MAX_CONTINUATION_TURNS {
                 break;
             }
-            messages.push(ApiMessage {
-                role: "user".into(),
-                content: ApiContent::Text(CONTINUATION_TRIGGER.into()),
-            });
+            let continuation = json!({"role": "user", "content": CONTINUATION_TRIGGER});
+            messages.push(ApiMessage::raw(continuation.clone()));
+            replay_messages.push(continuation);
         }
 
         let final_response = last_response.ok_or_else(|| AnthropicError::OutputShape {
@@ -296,12 +326,24 @@ impl AnthropicMessagesClient {
             final_blocks: last_blocks,
             final_stop_reason: last_stop_reason,
             merged_text,
+            replay_messages,
         })
     }
 }
 
 #[async_trait]
 impl ProviderAdapter for AnthropicProviderAdapter {
+    fn history_media_policy(&self) -> ProviderHistoryMediaPolicy {
+        ProviderHistoryMediaPolicy::Preserve
+    }
+
+    fn history_replay_identity(&self) -> Option<ProviderReplayIdentity> {
+        Some(ProviderReplayIdentity {
+            protocol: ProviderReplayProtocol::AnthropicMessages,
+            model: self.client.model.as_str().to_owned(),
+        })
+    }
+
     fn emit_preflight_context_estimate(&self) -> bool {
         false
     }
@@ -327,7 +369,8 @@ impl ProviderAdapter for AnthropicProviderAdapter {
                 )
             })
         });
-        let mut api_messages = session_turn_messages_to_api(request.messages);
+        let mut api_messages =
+            session_turn_messages_to_api(request.messages, self.client.model.as_str());
         let api_tools = tool_specs_to_api(request.tools);
 
         let turn_result = if request.stream {
@@ -388,15 +431,17 @@ impl ProviderAdapter for AnthropicProviderAdapter {
             }
         }
 
+        let stop = provider_stop_from_turn(&turn)?;
         if !turn.merged_text.trim().is_empty() {
             emit(ProviderEvent::AssistantMessageCompleted {
                 text: turn.merged_text.clone(),
             });
         }
 
+        let assistant_message = assistant_turn_message(&turn, self.client.model.as_str())?;
         Ok(ProviderResponse {
-            stop: provider_stop_from_turn(&turn),
-            assistant_message: assistant_turn_message(&turn),
+            stop,
+            assistant_message,
         })
     }
 }
@@ -432,24 +477,44 @@ impl AnthropicProviderAdapter {
         self.client.reasoning_effort = reasoning_effort;
         self
     }
+
+    /// 设置 Anthropic Messages 的显式 thinking 请求配置。
+    pub fn with_thinking(
+        mut self,
+        thinking: AnthropicThinking,
+        budget_tokens: Option<u32>,
+    ) -> Self {
+        self.client.thinking = thinking;
+        self.client.thinking_budget_tokens = budget_tokens;
+        self
+    }
 }
 
-fn session_turn_messages_to_api(messages: Vec<SessionTurnMessage>) -> Vec<ApiMessage> {
+fn session_turn_messages_to_api(messages: Vec<SessionTurnMessage>, model: &str) -> Vec<ApiMessage> {
     messages
         .into_iter()
-        .filter_map(|message| {
+        .flat_map(|message| {
+            if let Some(crate::api::ProviderReplayState::AnthropicMessages {
+                model: replay_model,
+                messages,
+            }) = message.provider_replay
+            {
+                if replay_model == model {
+                    return messages
+                        .into_iter()
+                        .map(ApiMessage::raw)
+                        .collect::<Vec<_>>();
+                }
+            }
             let content = message
                 .content
                 .into_iter()
                 .filter_map(session_turn_block_to_api)
                 .collect::<Vec<_>>();
             if content.is_empty() {
-                None
+                Vec::new()
             } else {
-                Some(ApiMessage {
-                    role: message.role,
-                    content: ApiContent::Blocks(content),
-                })
+                vec![ApiMessage::structured(message.role, content)]
             }
         })
         .collect()
@@ -507,39 +572,97 @@ fn tool_specs_to_api(tools: Vec<ToolSpec>) -> Option<Vec<ApiToolDefinition>> {
     )
 }
 
-fn assistant_turn_message(turn: &ContinuedAssistantTurn) -> SessionTurnMessage {
-    let content = if !has_tool_use_block(&turn.final_blocks) && !turn.merged_text.trim().is_empty()
-    {
+fn assistant_turn_message(
+    turn: &ContinuedAssistantTurn,
+    model: &str,
+) -> Result<SessionTurnMessage, AnthropicError> {
+    let content = if has_tool_use_block(&turn.final_blocks) {
+        let mut content = Vec::new();
+        if !turn.merged_text.trim().is_empty() {
+            content.push(SessionTurnContentBlock::text(turn.merged_text.clone()));
+        }
+        content.extend(
+            turn.final_blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+                .filter_map(|block| api_block_to_session_turn_block(block).ok()),
+        );
+        content
+    } else if !turn.merged_text.trim().is_empty() {
         vec![SessionTurnContentBlock::text(turn.merged_text.clone())]
     } else {
         assistant_content_blocks_without_thinking(turn)
     };
-    SessionTurnMessage {
-        role: "assistant".into(),
-        provider_replay: None,
-        content,
+    if content.is_empty() {
+        if turn.final_stop_reason == "model_context_window_exceeded" {
+            return Ok(SessionTurnMessage {
+                role: "assistant".into(),
+                provider_replay: Some(crate::api::ProviderReplayState::AnthropicMessages {
+                    model: model.to_string(),
+                    messages: turn.replay_messages.clone(),
+                }),
+                content,
+            });
+        }
+        let only_reasoning = !turn.final_blocks.is_empty()
+            && turn.final_blocks.iter().all(|block| {
+                matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some("thinking") | Some("redacted_thinking")
+                )
+            });
+        return Err(AnthropicError::OutputShape {
+            reason: if only_reasoning {
+                "响应仅包含 thinking/redacted_thinking，没有可消费的 text 或 tool_use".into()
+            } else {
+                "响应没有可消费的 text 或 tool_use".into()
+            },
+            raw: String::new(),
+        });
     }
+    Ok(SessionTurnMessage {
+        role: "assistant".into(),
+        provider_replay: Some(crate::api::ProviderReplayState::AnthropicMessages {
+            model: model.to_string(),
+            messages: turn.replay_messages.clone(),
+        }),
+        content,
+    })
 }
 
-fn provider_stop_from_turn(turn: &ContinuedAssistantTurn) -> ProviderStop {
-    if turn.final_stop_reason == "max_tokens" {
-        ProviderStop::MaxTokens
-    } else if turn.final_stop_reason == "tool_use" {
-        ProviderStop::ToolUse
-    } else {
-        ProviderStop::Done
+fn provider_stop_from_turn(
+    turn: &ContinuedAssistantTurn,
+) -> Result<ProviderStop, ProviderTerminalFailure> {
+    match turn.final_stop_reason.as_str() {
+        "max_tokens" if has_tool_use_block(&turn.final_blocks) => {
+            // 完整 tool_use 后协议要求紧跟 tool_result；不能先插内部 continuation。
+            Ok(ProviderStop::ToolUse)
+        }
+        "max_tokens" => Ok(ProviderStop::MaxTokens),
+        "tool_use" => Ok(ProviderStop::ToolUse),
+        "end_turn" | "stop_sequence" => Ok(ProviderStop::Done),
+        "model_context_window_exceeded" => Ok(ProviderStop::ContextWindowExceeded),
+        "pause_turn" => Err(ProviderTerminalFailure::new(
+            "Anthropic 响应要求暂停并继续 server tool turn，当前 ACN 不支持该终态",
+        )),
+        "refusal" => Err(ProviderTerminalFailure::new("Anthropic 模型拒绝了本次请求")),
+        _ => Err(ProviderTerminalFailure::new(
+            "Anthropic 返回不支持的 stop_reason",
+        )),
     }
 }
 
 fn required_anthropic_stop_reason(response: &Value) -> Result<String, AnthropicError> {
-    response
-        .get("stop_reason")
-        .and_then(Value::as_str)
+    validated_anthropic_stop_reason(response.get("stop_reason").and_then(Value::as_str))
+}
+
+fn validated_anthropic_stop_reason(reason: Option<&str>) -> Result<String, AnthropicError> {
+    reason
         .filter(|reason| !reason.trim().is_empty())
         .map(ToOwned::to_owned)
         .ok_or_else(|| AnthropicError::OutputShape {
             reason: "缺少有效 stop_reason".into(),
-            raw: response.to_string(),
+            raw: String::new(),
         })
 }
 
@@ -550,10 +673,20 @@ fn assistant_content_blocks_without_thinking(
     for block in &turn.final_blocks {
         match block.get("type").and_then(Value::as_str) {
             Some("thinking") | Some("redacted_thinking") => continue,
-            _ => match api_block_to_session_turn_block(block) {
-                Ok(block) => content.push(block),
-                Err(_) => return vec![SessionTurnContentBlock::text(turn.merged_text.clone())],
-            },
+            Some("text")
+                if block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.trim().is_empty()) =>
+            {
+                continue;
+            }
+            Some("text") | Some("tool_use") => {
+                if let Ok(block) = api_block_to_session_turn_block(block) {
+                    content.push(block);
+                }
+            }
+            _ => continue,
         }
     }
     if content.is_empty() && !turn.merged_text.trim().is_empty() {
@@ -669,6 +802,101 @@ fn wrap_media_rejection(error: AnthropicError, request_has_media: bool) -> Anthr
     }
 }
 
+const REDACTED_ANTHROPIC_PAYLOAD: &str = "[redacted Anthropic request/replay payload]";
+const ANTHROPIC_PRIVATE_KEYS: &[&str] = &[
+    "request",
+    "request_body",
+    "messages",
+    "input",
+    "system",
+    "content",
+    "thinking",
+    "signature",
+    "encrypted_content",
+    "data",
+];
+
+fn redact_anthropic_error_body(body: &str) -> String {
+    let redacted = match serde_json::from_str::<Value>(body) {
+        Ok(mut value) => {
+            redact_anthropic_json_value(&mut value);
+            value.to_string()
+        }
+        Err(_) if contains_anthropic_private_key(body) => REDACTED_ANTHROPIC_PAYLOAD.into(),
+        Err(_) => body.to_string(),
+    };
+    redact_media_error_body(&redacted)
+}
+
+fn redact_anthropic_json_value(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if ANTHROPIC_PRIVATE_KEYS
+                    .iter()
+                    .any(|private_key| key.eq_ignore_ascii_case(private_key))
+                {
+                    *child = Value::String(REDACTED_ANTHROPIC_PAYLOAD.into());
+                } else {
+                    redact_anthropic_json_value(child);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_anthropic_json_value(item);
+            }
+        }
+        Value::String(text) => {
+            if let Ok(mut embedded) = serde_json::from_str::<Value>(text) {
+                redact_anthropic_json_value(&mut embedded);
+                *text = embedded.to_string();
+            } else if contains_anthropic_private_key(text) {
+                *text = REDACTED_ANTHROPIC_PAYLOAD.into();
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn contains_anthropic_private_key(text: &str) -> bool {
+    let compact = text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    ANTHROPIC_PRIVATE_KEYS.iter().any(|key| {
+        [
+            format!("\"{key}\":"),
+            format!("\"{key}\"="),
+            format!("\\\"{key}\\\":"),
+            format!("\\\"{key}\\\"="),
+            format!("'{key}':"),
+            format!("'{key}'="),
+        ]
+        .iter()
+        .any(|pattern| compact.contains(pattern))
+            || contains_unquoted_private_key(text, key)
+    })
+}
+
+fn contains_unquoted_private_key(text: &str, key: &str) -> bool {
+    let lowercase = text.to_ascii_lowercase();
+    lowercase.match_indices(key).any(|(start, _)| {
+        let previous_is_identifier = lowercase[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
+        if previous_is_identifier {
+            return false;
+        }
+        matches!(
+            lowercase[start + key.len()..].trim_start().chars().next(),
+            Some(':' | '=')
+        )
+    })
+}
+
 fn is_retryable(e: &AnthropicError) -> bool {
     match e {
         AnthropicError::Http(error) => error.is_retryable(),
@@ -702,6 +930,11 @@ fn compute_backoff(attempt: u32, base: Duration, max: Duration) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
     use super::*;
 
     fn client_with_reasoning_effort(reasoning_effort: ReasoningEffort) -> AnthropicMessagesClient {
@@ -718,6 +951,18 @@ mod tests {
         .unwrap();
         client.reasoning_effort = reasoning_effort;
         client
+    }
+
+    #[test]
+    fn history_media_policy_preserves_uncompacted_images_and_documents() {
+        let adapter = AnthropicProviderAdapter {
+            client: client_with_reasoning_effort(ReasoningEffort::None),
+        };
+
+        assert_eq!(
+            adapter.history_media_policy(),
+            ProviderHistoryMediaPolicy::Preserve
+        );
     }
 
     #[test]
@@ -740,6 +985,441 @@ mod tests {
             assert_eq!(body.get("output_config"), Some(&json!({"effort": "xhigh"})));
             assert!(body.get("reasoning_effort").is_none());
         }
+    }
+
+    #[test]
+    fn anthropic_thinking_request_modes_are_serialized_without_beta_header_contract() {
+        let cases = [
+            (AnthropicThinking::Auto, None, None),
+            (
+                AnthropicThinking::Enabled,
+                Some(4096),
+                Some(json!({"type":"enabled", "budget_tokens":4096})),
+            ),
+            (
+                AnthropicThinking::Enabled,
+                None,
+                Some(json!({"type":"enabled"})),
+            ),
+            (
+                AnthropicThinking::Adaptive,
+                Some(4096),
+                Some(json!({"type":"adaptive"})),
+            ),
+            (
+                AnthropicThinking::Disabled,
+                Some(4096),
+                Some(json!({"type":"disabled"})),
+            ),
+        ];
+
+        for (mode, budget, expected) in cases {
+            let mut client = client_with_reasoning_effort(ReasoningEffort::None);
+            client.thinking = mode;
+            client.thinking_budget_tokens = budget;
+            for stream in [None, Some(true)] {
+                let body = serde_json::to_value(client.request_for(
+                    "system",
+                    Vec::new(),
+                    None,
+                    128,
+                    stream,
+                ))
+                .unwrap();
+                assert_eq!(body.get("thinking").cloned(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn anthropic_replay_messages_win_over_canonical_and_preserve_unknown_fields() {
+        let replay = vec![
+            json!({
+                "role":"assistant",
+                "content":[{
+                    "type":"thinking",
+                    "thinking":"private",
+                    "signature":"opaque",
+                    "vendor_extension":{"future":true}
+                }]
+            }),
+            json!({"role":"user", "content":"Continue from where you left off."}),
+            json!({
+                "role":"assistant",
+                "content":[{"type":"text", "text":"visible"}]
+            }),
+        ];
+        let messages = session_turn_messages_to_api(
+            vec![SessionTurnMessage {
+                role: "assistant".into(),
+                content: vec![SessionTurnContentBlock::text(
+                    "canonical must not duplicate",
+                )],
+                provider_replay: Some(crate::api::ProviderReplayState::AnthropicMessages {
+                    model: "test-model".into(),
+                    messages: replay.clone(),
+                }),
+            }],
+            "test-model",
+        );
+
+        assert_eq!(serde_json::to_value(messages).unwrap(), json!(replay));
+    }
+
+    #[test]
+    fn anthropic_wrong_model_replay_falls_back_to_canonical_projection() {
+        let messages = session_turn_messages_to_api(
+            vec![SessionTurnMessage {
+                role: "assistant".into(),
+                content: vec![SessionTurnContentBlock::text("canonical")],
+                provider_replay: Some(crate::api::ProviderReplayState::AnthropicMessages {
+                    model: "other-model".into(),
+                    messages: vec![json!({
+                        "role":"assistant",
+                        "content":[{"type":"thinking", "thinking":"private"}]
+                    })],
+                }),
+            }],
+            "test-model",
+        );
+        let body = serde_json::to_value(messages).unwrap();
+
+        assert_eq!(body[0]["content"][0]["text"], "canonical");
+        assert!(!body.to_string().contains("private"));
+    }
+
+    #[test]
+    fn anthropic_tool_result_follows_full_private_assistant_replay() {
+        let assistant = json!({
+            "role":"assistant",
+            "content":[
+                {"type":"thinking", "thinking":"private", "signature":"opaque"},
+                {"type":"tool_use", "id":"toolu_1", "name":"file_read", "input":{"path":"README.md"}}
+            ]
+        });
+        let messages = session_turn_messages_to_api(
+            vec![
+                SessionTurnMessage {
+                    role: "assistant".into(),
+                    content: vec![SessionTurnContentBlock::ToolUse {
+                        id: "toolu_1".into(),
+                        name: "file_read".into(),
+                        input: json!({"path":"README.md"}),
+                    }],
+                    provider_replay: Some(crate::api::ProviderReplayState::AnthropicMessages {
+                        model: "test-model".into(),
+                        messages: vec![assistant.clone()],
+                    }),
+                },
+                SessionTurnMessage {
+                    role: "user".into(),
+                    content: vec![SessionTurnContentBlock::ToolResult {
+                        tool_use_id: "toolu_1".into(),
+                        content: "file contents".into(),
+                    }],
+                    provider_replay: None,
+                },
+            ],
+            "test-model",
+        );
+        let body = serde_json::to_value(messages).unwrap();
+
+        assert_eq!(body[0], assistant);
+        assert_eq!(body[1]["role"], "user");
+        assert_eq!(body[1]["content"][0]["type"], "tool_result");
+        assert_eq!(body[1]["content"][0]["tool_use_id"], "toolu_1");
+    }
+
+    #[test]
+    fn anthropic_assistant_keeps_raw_thinking_but_only_canonicalizes_text_and_tools() {
+        let replay_message = json!({
+            "role":"assistant",
+            "content":[
+                {"type":"thinking", "thinking":"private", "signature":"sig"},
+                {"type":"future_private", "opaque":"keep"},
+                {"type":"text", "text":"answer"},
+                {"type":"tool_use", "id":"toolu_1", "name":"file_read", "input":{"path":"README.md"}}
+            ]
+        });
+        let turn = ContinuedAssistantTurn {
+            final_response: json!({}),
+            final_blocks: replay_message["content"].as_array().unwrap().clone(),
+            final_stop_reason: "tool_use".into(),
+            merged_text: "answer".into(),
+            replay_messages: vec![replay_message.clone()],
+        };
+
+        let message = assistant_turn_message(&turn, "test-model").unwrap();
+
+        assert_eq!(message.content.len(), 2);
+        assert!(matches!(
+            message.content[0],
+            SessionTurnContentBlock::Text { .. }
+        ));
+        assert!(matches!(
+            message.content[1],
+            SessionTurnContentBlock::ToolUse { .. }
+        ));
+        assert_eq!(
+            message.provider_replay,
+            Some(crate::api::ProviderReplayState::AnthropicMessages {
+                model: "test-model".into(),
+                messages: vec![replay_message],
+            })
+        );
+    }
+
+    #[test]
+    fn anthropic_reasoning_only_success_is_rejected_without_exposing_payload() {
+        let secret = "private-thinking";
+        let turn = ContinuedAssistantTurn {
+            final_response: json!({}),
+            final_blocks: vec![json!({
+                "type":"thinking", "thinking":secret, "signature":"opaque-signature"
+            })],
+            final_stop_reason: "end_turn".into(),
+            merged_text: String::new(),
+            replay_messages: Vec::new(),
+        };
+
+        let error = assistant_turn_message(&turn, "test-model").unwrap_err();
+
+        assert!(error.to_string().contains("仅包含 thinking"));
+        assert!(!error.to_string().contains(secret));
+        assert!(!error.to_string().contains("opaque-signature"));
+    }
+
+    #[test]
+    fn anthropic_reasoning_with_empty_text_is_not_committed_as_empty_success() {
+        let secret = "private-thinking";
+        let turn = ContinuedAssistantTurn {
+            final_response: json!({}),
+            final_blocks: vec![
+                json!({
+                    "type":"thinking", "thinking":secret, "signature":"opaque-signature"
+                }),
+                json!({"type":"text", "text":"  "}),
+            ],
+            final_stop_reason: "end_turn".into(),
+            merged_text: String::new(),
+            replay_messages: Vec::new(),
+        };
+
+        let error = assistant_turn_message(&turn, "test-model").unwrap_err();
+
+        assert!(error.to_string().contains("没有可消费的 text 或 tool_use"));
+        assert!(!error.to_string().contains(secret));
+        assert!(!error.to_string().contains("opaque-signature"));
+    }
+
+    #[test]
+    fn anthropic_error_redaction_removes_nested_and_embedded_private_replay() {
+        let secret = "opaque-thinking-payload";
+        let body = json!({
+            "error": {
+                "code":"invalid_request",
+                "message": json!({
+                    "MeSsAgEs":[{"role":"assistant", "content":[{
+                        "type":"thinking", "thinking":secret, "signature":"opaque-signature"
+                    }]}]
+                }).to_string()
+            }
+        })
+        .to_string();
+
+        let redacted = redact_anthropic_error_body(&body);
+
+        assert!(redacted.contains("invalid_request"));
+        assert!(redacted.contains(REDACTED_ANTHROPIC_PAYLOAD));
+        assert!(!redacted.contains(secret));
+        assert!(!redacted.contains("opaque-signature"));
+    }
+
+    #[test]
+    fn anthropic_error_redaction_removes_echoed_request_fields_but_keeps_diagnostics() {
+        let input_secret = "private-user-input";
+        let system_secret = "private-system-prompt";
+        let content_secret = "private-content-block";
+        let body = json!({
+            "error": {
+                "code":"invalid_request",
+                "message":"safe-diagnostic",
+                "details": {
+                    "InPuT":{"prompt":input_secret},
+                    "SYSTEM":system_secret,
+                    "CoNtEnT":[{"type":"text", "text":content_secret}],
+                    "parameter":"messages.2.content"
+                }
+            }
+        })
+        .to_string();
+
+        let redacted = redact_anthropic_error_body(&body);
+
+        assert!(redacted.contains("invalid_request"));
+        assert!(redacted.contains("safe-diagnostic"));
+        assert!(redacted.contains("messages.2.content"));
+        assert!(!redacted.contains(input_secret));
+        assert!(!redacted.contains(system_secret));
+        assert!(!redacted.contains(content_secret));
+    }
+
+    #[test]
+    fn anthropic_error_redaction_hides_non_json_request_echo() {
+        let secret = "private-user-input";
+        let body = format!("invalid request: input: {secret}");
+
+        let redacted = redact_anthropic_error_body(&body);
+
+        assert_eq!(redacted, REDACTED_ANTHROPIC_PAYLOAD);
+        assert!(!redacted.contains(secret));
+
+        let quoted_body = format!(r#"invalid request: \"InPuT\" = \"{secret}\""#);
+        let quoted_redacted = redact_anthropic_error_body(&quoted_body);
+        assert_eq!(quoted_redacted, REDACTED_ANTHROPIC_PAYLOAD);
+        assert!(!quoted_redacted.contains(secret));
+    }
+
+    #[test]
+    fn anthropic_error_redaction_hides_unquoted_echo_inside_json_message() {
+        let secret = "private-system-prompt";
+        let body = json!({
+            "error": {
+                "code":"invalid_request",
+                "message":format!("validation failed; SyStEm = {secret}")
+            }
+        })
+        .to_string();
+
+        let redacted = redact_anthropic_error_body(&body);
+
+        assert!(redacted.contains("invalid_request"));
+        assert!(redacted.contains(REDACTED_ANTHROPIC_PAYLOAD));
+        assert!(!redacted.contains(secret));
+        assert!(!contains_anthropic_private_key(
+            "invalid_input: missing required field"
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_streaming_max_token_continuation_preserves_private_message_sequence() {
+        let responses = vec![
+            json!({
+                "content":[
+                    {"type":"thinking", "thinking":"private-one", "signature":"sig-one"},
+                    {"type":"text", "text":"first "}
+                ],
+                "stop_reason":"max_tokens",
+                "usage":{"input_tokens":1,"output_tokens":2}
+            }),
+            json!({
+                "content":[
+                    {"type":"redacted_thinking", "data":"opaque-two"},
+                    {"type":"text", "text":"second"}
+                ],
+                "stop_reason":"end_turn",
+                "usage":{"input_tokens":3,"output_tokens":4}
+            }),
+        ];
+        let (endpoint, requests) = spawn_json_server(responses).await;
+        let client = AnthropicMessagesClient::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            128,
+            Duration::from_secs(2),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let mut messages = vec![ApiMessage::structured(
+            "user",
+            vec![json!({"type":"text", "text":"hello"})],
+        )];
+
+        let turn = client
+            .send_text_with_continuation_for_provider_with_retry_count(
+                "system",
+                &mut messages,
+                None,
+                128,
+                0,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(turn.merged_text, "first second");
+        assert_eq!(turn.replay_messages.len(), 3);
+        assert_eq!(
+            turn.replay_messages[0]["content"][0]["thinking"],
+            "private-one"
+        );
+        assert_eq!(turn.replay_messages[1]["content"], CONTINUATION_TRIGGER);
+        assert_eq!(turn.replay_messages[2]["content"][0]["data"], "opaque-two");
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(messages.len(), 4);
+        let replayed_messages = serde_json::to_value(&messages[1..]).unwrap();
+        assert!(replayed_messages.to_string().contains("private-one"));
+        assert!(replayed_messages.to_string().contains(CONTINUATION_TRIGGER));
+    }
+
+    #[tokio::test]
+    async fn non_streaming_context_window_stop_returns_valid_partial_without_internal_retry() {
+        let responses = vec![json!({
+            "content":[
+                {"type":"thinking", "thinking":"private-context", "signature":"sig-context"},
+                {"type":"text", "text":"visible partial"}
+            ],
+            "stop_reason":"model_context_window_exceeded",
+            "usage":{"input_tokens":120,"output_tokens":8}
+        })];
+        let (endpoint, requests) = spawn_json_server(responses).await;
+        let client = AnthropicMessagesClient::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            128,
+            Duration::from_secs(2),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let mut messages = vec![ApiMessage::structured(
+            "user",
+            vec![json!({"type":"text", "text":"hello"})],
+        )];
+
+        let turn = client
+            .send_text_with_continuation_for_provider_with_retry_count(
+                "system",
+                &mut messages,
+                None,
+                128,
+                0,
+            )
+            .await
+            .unwrap();
+        let assistant = assistant_turn_message(&turn, "test-model").unwrap();
+
+        assert_eq!(turn.merged_text, "visible partial");
+        assert_eq!(turn.replay_messages.len(), 1);
+        assert_eq!(
+            turn.replay_messages[0]["content"][0]["signature"],
+            "sig-context"
+        );
+        assert_eq!(
+            provider_stop_from_turn(&turn).unwrap(),
+            ProviderStop::ContextWindowExceeded
+        );
+        assert!(matches!(
+            assistant.provider_replay,
+            Some(crate::api::ProviderReplayState::AnthropicMessages { .. })
+        ));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(messages.len(), 2);
     }
 
     #[test]
@@ -777,9 +1457,69 @@ mod tests {
             })],
             final_stop_reason: "end_turn".into(),
             merged_text: String::new(),
+            replay_messages: Vec::new(),
         };
 
-        assert_eq!(provider_stop_from_turn(&turn), ProviderStop::Done);
+        assert_eq!(provider_stop_from_turn(&turn).unwrap(), ProviderStop::Done);
+    }
+
+    #[test]
+    fn max_tokens_with_complete_tool_use_enters_tool_loop_before_continuation() {
+        let turn = ContinuedAssistantTurn {
+            final_response: json!({}),
+            final_blocks: vec![json!({
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "file_read",
+                "input": {"path": "README.md"}
+            })],
+            final_stop_reason: "max_tokens".into(),
+            merged_text: String::new(),
+            replay_messages: Vec::new(),
+        };
+
+        assert_eq!(
+            provider_stop_from_turn(&turn).unwrap(),
+            ProviderStop::ToolUse
+        );
+    }
+
+    #[test]
+    fn provider_stop_maps_context_window_exhaustion_to_recoverable_stop() {
+        let turn = ContinuedAssistantTurn {
+            final_response: json!({}),
+            final_blocks: vec![json!({"type":"text", "text":"partial"})],
+            final_stop_reason: "model_context_window_exceeded".into(),
+            merged_text: "partial".into(),
+            replay_messages: Vec::new(),
+        };
+
+        assert_eq!(
+            provider_stop_from_turn(&turn).unwrap(),
+            ProviderStop::ContextWindowExceeded
+        );
+    }
+
+    #[test]
+    fn provider_stop_rejects_non_success_terminal_reasons() {
+        for (reason, expected_error) in [
+            ("pause_turn", "server tool turn"),
+            ("refusal", "拒绝"),
+            ("vendor_extension", "不支持的 stop_reason"),
+        ] {
+            let turn = ContinuedAssistantTurn {
+                final_response: json!({}),
+                final_blocks: vec![json!({"type":"text", "text":"partial"})],
+                final_stop_reason: reason.into(),
+                merged_text: "partial".into(),
+                replay_messages: Vec::new(),
+            };
+
+            let error = provider_stop_from_turn(&turn).unwrap_err();
+
+            assert!(error.to_string().contains(expected_error));
+            assert!(!error.to_string().contains("partial"));
+        }
     }
 
     #[test]
@@ -815,14 +1555,19 @@ mod tests {
 
     #[test]
     fn responses_replay_is_ignored_when_projecting_to_anthropic() {
-        let messages = session_turn_messages_to_api(vec![SessionTurnMessage::assistant_text(
-            "canonical text",
-        )
-        .with_provider_replay(crate::api::ProviderReplayState::OpenAiResponses {
-            items: vec![json!({
-                "type":"reasoning","encrypted_content":"opaque-anthropic-must-ignore"
-            })],
-        })]);
+        let messages = session_turn_messages_to_api(
+            vec![
+                SessionTurnMessage::assistant_text("canonical text").with_provider_replay(
+                    crate::api::ProviderReplayState::OpenAiResponses {
+                        model: Some("test-model".into()),
+                        items: vec![json!({
+                            "type":"reasoning","encrypted_content":"opaque-anthropic-must-ignore"
+                        })],
+                    },
+                ),
+            ],
+            "test-model",
+        );
 
         let body = serde_json::to_string(&messages).unwrap();
         assert!(body.contains("canonical text"));
@@ -892,5 +1637,31 @@ mod tests {
             );
             assert!(!error.to_string().contains("可能不支持图片"));
         }
+    }
+
+    async fn spawn_json_server(responses: Vec<Value>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_task = Arc::clone(&requests);
+        tokio::spawn(async move {
+            for response_value in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = vec![0; 16_384];
+                let read = socket.read(&mut buffer).await.unwrap();
+                requests_for_task
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buffer[..read]).to_string());
+                let body = response_value.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (format!("http://{addr}"), requests)
     }
 }

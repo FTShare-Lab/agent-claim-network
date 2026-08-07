@@ -1,6 +1,8 @@
 # OpenAI Responses API 支持
 
-> 状态：已完成（2026-08-06；Agent Responses 主链路、15A 修订、provider 公开名称收敛与 Router Responses rerank 增补均已验收）。本文定义 HTTP JSON/SSE Responses 协议、provider replay、session 恢复、多媒体历史与验收边界；WebSocket 和统一 Reasoning 展示不在本期范围内。
+> 状态：已完成（2026-08-06；Agent Responses 主链路、15A 修订、provider 公开名称收敛与 Router Responses rerank 增补均已验收；历史媒体策略随后由 Anthropic Reasoning PRD 统一扩展到三个主对话 adapter）。本文定义 HTTP JSON/SSE Responses 协议、provider replay、session 恢复、多媒体历史与验收边界；WebSocket 和统一 Reasoning 展示不在本期范围内。
+>
+> 当前补充：后续 `PRD_anthropic_reasoning.md` 已把 Responses replay identity 收紧为“wire protocol + 精确 model + 连续 replay 世代”。本文涉及“只按协议匹配、replay 不保存 model、切回后复活旧 replay”的旧决策均由该 PRD 覆盖，以下当前行为说明已同步修订。
 
 ## 1. 背景
 
@@ -16,7 +18,7 @@ OpenAI Responses API 与 Chat Completions 不是同一套响应字段的简单�
 
 在 `store = false` 的本地状态模式下，下一次请求需要携带仍在有效上下文中的历史 input，以及上一次响应返回的完整可回放 output items。若只把 `output_text` 和 tool call 投影成 ACN 现有 canonical content，会丢失 reasoning、phase 和未来未知 item，导致工具回环、resume 或后续 Reasoning 展示无法保持协议连续性。
 
-本需求新增独立的 `openai_responses` adapter，在不改变现有 Chat/Anthropic 行为的前提下，让 Responses 的 HTTP streaming、HTTP non-streaming、工具循环、session resume、compaction 与历史多媒体形成一条完整链路。
+本需求新增独立的 `openai_responses` adapter，让 Responses 的 HTTP streaming、HTTP non-streaming、工具循环、session resume、compaction 与历史多媒体形成一条完整链路。后续 Anthropic Reasoning 需求把同一未 compact 历史媒体语义统一扩展到了 `anthropic` 与 `openai_chat`。
 
 相关官方协议说明：
 
@@ -47,7 +49,7 @@ OpenAI Responses API 与 Chat Completions 不是同一套响应字段的简单�
 - 不实现 Responses 厂商 A 到厂商 B 的状态迁移、endpoint/model 指纹或加密 reasoning 兼容判断。
 - 不实现模型生成图片、文件、音频等输出的 TUI 展示。
 - 不增加厂商专属自动删字段、自动改路径或 Responses 失败后自动切 Chat 的启发式兼容逻辑。
-- 不改变 Chat/Anthropic 当前把历史附件投影为文本占位符的行为。
+- 不让 compacted prefix 的原始附件重新进入 provider 请求；该前缀仍只使用摘要。
 
 ## 4. 已拍板产品与协议决策
 
@@ -70,9 +72,10 @@ api_key_env = "LLM_API_KEY"
 ### 4.2 本地状态管理（2A）
 
 - 每次 Responses 请求固定发送 `store = false`。
+- Agent 每次请求固定发送 `include = ["reasoning.encrypted_content"]`，取得可在无状态下一轮原样回传的加密 reasoning item；Router rerank 继续省略 `include`。
 - ACN 不使用 `previous_response_id` 作为 session 的权威状态。
-- 当前请求由有效 canonical input history、匹配当前协议的 provider replay items 和当前用户输入共同构造。
-- 不保存 endpoint/model/provider 指纹，也不为假设不存在的跨 Responses 厂商迁移增加分支。
+- 当前请求由有效 canonical input history、匹配当前 wire protocol 与精确 model、且位于当前连续世代的 provider replay items 和当前用户输入共同构造。
+- replay 保存生成它的 model；不保存 endpoint/provider 指纹，也不为假设不存在的跨 Responses 厂商迁移增加分支。
 - 若用户意外更换 Responses endpoint，而新 endpoint 拒绝旧 replay items，保留上游明确错误；不静默删除 reasoning 或自动降级重试。
 
 ### 4.3 Session 顶层可选 replay（3A）
@@ -87,6 +90,7 @@ api_key_env = "LLM_API_KEY"
   ],
   "provider_replay": {
     "protocol": "openai_responses",
+    "model": "example-model",
     "items": []
   }
 }
@@ -96,9 +100,14 @@ Rust 侧采用带 serde tag 的通用枚举，首版只实现 Responses 变体�
 
 ```rust
 enum ProviderReplayState {
-    OpenAiResponses { items: Vec<serde_json::Value> },
+    OpenAiResponses {
+        model: Option<String>,
+        items: Vec<serde_json::Value>,
+    },
 }
 ```
+
+`model = None` 只用于读取当前分支曾产生的 unbound replay；新写入必须携带 `Some(exact_model)`，unbound replay 只走 canonical 投影。
 
 约束：
 
@@ -122,6 +131,7 @@ enum ProviderReplayState {
 - 其他值映射为 Responses `reasoning.effort`；ACN 不静默改写或降级不受上游支持的 effort 值。
 - 本期不主动发送 `reasoning.summary`。
 - 返回的 reasoning item 无论包含 summary、明文、加密内容或兼容厂商扩展字段，都完整保留并在下一次 Responses 请求原样回传。
+- 因会话固定 `store = false`，Agent 请求 `include = ["reasoning.encrypted_content"]`；不能只依赖兼容 endpoint 偶然默认返回加密字段。
 - Reasoning 不投影为 assistant Text，不进入 TUI、普通 transcript、session search、Memory、claim 或团队服务。
 - 本期不新增 Reasoning streaming event；以后统一展示时在本基础上增加投影，不再次修改 session replay 基础模型。
 
@@ -130,8 +140,8 @@ enum ProviderReplayState {
 - 历史消息没有匹配的 replay 时，从 canonical Text、Image、Document、ToolUse、ToolResult 合成当前协议的 input。
 - Chat/Anthropic 切换到 Responses 时，已存在的 canonical 文本、工具和未 compact 媒体继续使用；旧协议已丢弃的 reasoning 无法恢复。
 - Responses 切换到 Chat/Anthropic 时，忽略 Responses replay，只使用 canonical content；不把 Responses reasoning 转换为其他协议的 thinking。
-- 同一 session 可以包含不同协议产生的 message。构造请求时只使用匹配当前协议的 replay；不匹配的 message 走 canonical 投影。
-- 协议切换不重写或删除历史 JSONL。以后切回 Responses 时，仍在有效上下文内的 Responses replay 可以继续使用；切换期间新增的其他协议消息从 canonical 合成。
+- 同一 session 可以包含不同协议或不同 model 产生的 message。构造请求时只使用匹配当前 `(wire protocol, exact model)` 且属于当前连续 replay 世代的 replay；不匹配的 message 走 canonical 投影。
+- 协议/model 切换不重写或删除历史 JSONL，但会切断 active replay 世代。A → B → A 后不能复活第一次 A 世代的 opaque replay；切回 A 的首次请求用 canonical history，成功后建立新的 A 世代。
 - 这是语义级连续，不承诺协议私有 reasoning 在跨协议后仍然无损。
 
 ### 4.7 Streaming、non-streaming 与 fallback（7A）
@@ -146,15 +156,15 @@ enum ProviderReplayState {
 
 ### 4.8 未 compact 历史多媒体真实重放（修正版 8B）
 
-当前 ACN 会把已经落盘的历史 Image/Document 在下一用户 turn 的 provider projection 中转换为文本占位符。本 provider 改为：
+三个主对话 adapter 统一采用以下语义：
 
 - 当前用户上传的图片/PDF 继续按现有 canonical content 落盘一次。
 - 同一逻辑 turn 的工具回环继续携带当前输入附件。
-- turn 已完成后进入下一用户 turn，或进程退出后 resume，只要原消息尚未进入 compacted prefix，Responses history 就从 canonical content 重建真实 `input_image`/`input_file`。
+- turn 已完成后进入下一用户 turn，或进程退出后 resume，只要原消息尚未进入 compacted prefix，provider history 就从 canonical content 重建真实 Image/Document 协议块。
 - 当前轮不需要把上一轮附件当作新附件重复添加；原始媒体位于上一轮 user input item 中。
 - `provider_replay` 不复制用户图片/PDF base64。
 - compacted prefix 使用摘要，不再发送该 prefix 的原始附件和旧 replay；未 compact tail 继续发送原始媒体与对应 replay。
-- Chat/Anthropic 保持现状，本期不顺带改变其历史附件策略。
+- `openai_responses`、`anthropic`、`openai_chat` 都保留未 compact 历史媒体；各 adapter 只负责转换为自身 wire block。
 
 ### 4.9 Function tool strict 策略（9A）
 
@@ -322,7 +332,7 @@ SessionMessage.provider_replay
 实施：
 
 1. 确认 worktree、分支、现有 dirty changes 和 provider/session/TUI 基线。
-2. 固化当前 Chat/Anthropic、流式 fallback、max-token continuation、tool loop 和历史附件占位行为的现有回归测试。
+2. 固化 Chat/Anthropic、流式 fallback、max-token continuation、tool loop 和历史附件投影的现有回归测试。
 3. 建立 Responses fake server/SSE fixture，覆盖可控 chunk、失败终态、工具调用、usage 与 non-streaming JSON。
 4. 明确新增模块与现有所有权，避免把 Responses DTO 塞入 provider-neutral turn loop。
 
@@ -339,7 +349,7 @@ SessionMessage.provider_replay
 1. 增加通用 `ProviderReplayState` 与 runtime/session message 可选字段。
 2. 打通 CompletedSessionTurnMessage、canonical commit、JSONL 读写和 session reload。
 3. 更新 provider projection、compaction suffix/hash、token estimate 与 transcript/search/Memory 忽略边界。
-4. 为 Responses 增加未 compact 历史多媒体真实投影能力，同时保持 Chat/Anthropic 现状。
+4. 为主对话 adapter 增加未 compact 历史多媒体真实投影能力；Responses 首先落地，随后统一扩展到 Chat/Anthropic。
 5. 明确协议不匹配时 canonical fallback、匹配时 raw replay 优先且不重复发送。
 
 阶段验收：
@@ -347,8 +357,8 @@ SessionMessage.provider_replay
 - 旧 JSONL fixture 无迁移可读。
 - 新 replay 完整 round-trip，未知 item 字段不丢失。
 - TUI/transcript/search/Memory 不展示 opaque reasoning、raw JSON 或 base64。
-- Responses resume 能恢复未 compact Image/PDF；compacted prefix 不再进入 provider request。
-- Chat/Anthropic 的历史附件和请求快照测试不发生意外变化。
+- 三个主对话 adapter 的下一轮与 resume 都能恢复未 compact Image/PDF；compacted prefix 不再进入 provider request。
+- Chat/Anthropic 的请求快照验证真实媒体转换正确，且不会把 raw media 泄漏到摘要、Memory 或普通 transcript。
 - 跨协议切换测试覆盖 Chat/Anthropic → Responses 与 Responses → Chat/Anthropic。
 
 ### 阶段 2：Responses protocol、JSON client 与 SSE client
@@ -510,14 +520,14 @@ review 处理规则：
 实施：
 
 1. 将本分支两个提交 rebase 到最新 `origin/main`，保留主线新增的 compaction context-window、工具结果分级降载、文件权限清理与 TUI session ID 行为，再叠加 Responses replay/media 投影。
-2. provider adapter 显式声明自己能够回放的私有 replay protocol；只有同协议 replay 才进入当前请求投影、token 估算和 compaction 预算。跨协议继续使用 canonical content，且不修改落盘 JSONL，之后切回 Responses 时仍可恢复原始 replay。
+2. provider adapter 显式声明自己能够回放的私有 replay identity；只有同 wire protocol、精确 model 且属于当前连续世代的 replay 才进入当前请求投影、token 估算和 compaction 预算。跨协议/model 继续使用 canonical content，且不修改落盘 JSONL；切回 Responses 时建立新世代，不复活切换前的原始 replay。
 3. 将 Responses `message.content[].type = "refusal"` 归一为可见 assistant 文本；JSON 与 SSE 共用同一终态结果，SSE 同时转发 `response.refusal.delta`。
 4. 对 rebase 冲突域、上述两条协议边界和 Router Responses rerank 重新执行定向测试、完整验证、真实 LLM TUI 与独立只读复审。
 
 阶段验收：
 
 - rebase 后仍只有两个原有语义提交，提交顺序不变，分支相对最新 `origin/main` 仅 ahead 2。
-- Responses 历史在 Responses provider 下继续计算并回传 replay；在 Chat/Anthropic 下不发送也不计入预算，session 原始 replay 不被删除。
+- Responses 历史只有在 wire protocol、精确 model 与连续世代均匹配时才计算并回传 replay；在 Chat/Anthropic、其他 model 或旧世代下不发送也不计入预算，session 原始 replay 不被删除。
 - refusal-only 的 JSON/SSE 完成响应能够显示、落盘并提交 turn，不触发空响应错误；SSE refusal delta 可实时显示。
 - 主线 compaction hardening 与 Responses prefix/suffix、媒体和 replay 边界的组合测试通过。
 - 真实 TUI 新 session 完成 Agent Responses streaming、`consult_router` 与 Router Responses rerank，fallback 为 0，stderr 为空。
@@ -588,5 +598,5 @@ review 处理规则：
 - 阶段 8 自动化验收：Router rerank 7 个定向测试、配置 90 个定向测试和 Agent provider bootstrap 2 个定向测试通过；fake server 已断言 non-streaming、`store = false`、省略 `reasoning`、`max_tokens` 到 `max_output_tokens` 的映射，以及 completed/未完成/非法 JSON 边界。完整验证重新通过 `cargo fmt --all -- --check`、全 targets/features Clippy、1927 个库测试及全部二进制/集成测试、全 targets/features check；按约定未执行版本一致性脚本。
 - 阶段 8 真实验收：先用真实 Responses rerank 对 3 个候选完成直接查询，`rerank_fallback = false`；随后在全新 TUI `session_1fe0903a` 中由 Agent Responses 发起一次 `consult_router`，Router Responses 对 4 个候选完成重排，工具结果回灌后 Agent 完成回答。共观察到 10 个 streaming delta、1 个 committed turn、0 次 non-streaming fallback、0 个非 committed turn，TUI stderr 为 0 字节；标准 `/help` → `/exit` tmux smoke 同样通过且 stderr 为空，所有测试进程均已清理。
 - 阶段 8 针对性 review：本地审查与 `code-review` 技能要求的独立只读审查均覆盖 provider alias/canonical serialization、Router one-shot 请求、终态解析与失败降级；两遍结论均为无现实 P0/P1，因此无需修复轮或二次复审，没有遗留 finding。
-- 阶段 9：两个语义提交已按 9A rebase 到 `origin/main`，保留主线新增的 compaction context-window、工具结果分级降载、文件权限清理与 TUI session ID 行为。冲突解决后补齐同协议 replay 的请求投影、token 估算以及自动/手工 compact 尾部选择，跨协议不会因未发送的 Responses replay 过度推进 `committed_message_until`；同时补齐 JSON/SSE refusal 可见文本。完整验证通过 `cargo fmt --all -- --check`、全 targets/features Clippy、2021 个库测试、全部二进制/集成测试和全 targets/features check；按约定未运行版本一致性脚本。最终真实 LLM TUI 使用全新 `session_602693cd`，观察到 14 个 streaming delta、1 个 committed turn、1 组 `consult_router` tool use/result、0 次 non-streaming fallback、0 个非 committed turn，TUI stderr 为 0 字节，Responses replay 正常落盘，所有测试进程均已清理。首轮独立审查发现 refusal-only 丢失和跨协议 replay 预算两项现实 P1；首次复审进一步发现 compact committed-tail 选择仍未按协议过滤；全部修复并回归后，最终独立只读复审覆盖 checkpoint 恢复、跨协议持久化、媒体/工具结果/文件权限与 Router 降级路径，结论为“未发现 P0/P1”，没有遗留 finding。
+- 阶段 9：两个语义提交已按 9A rebase 到 `origin/main`，保留主线新增的 compaction context-window、工具结果分级降载、文件权限清理与 TUI session ID 行为。该阶段当时补齐同协议 replay 的请求投影、token 估算以及自动/手工 compact 尾部选择；后续 `PRD_anthropic_reasoning.md` 又将其收紧为协议 + 精确 model + 连续世代。跨协议/model/旧世代都不会因未发送的 Responses replay 过度推进 `committed_message_until`；同时补齐 JSON/SSE refusal 可见文本。完整验证通过 `cargo fmt --all -- --check`、全 targets/features Clippy、2021 个库测试、全部二进制/集成测试和全 targets/features check；按约定未运行版本一致性脚本。最终真实 LLM TUI 使用全新 `session_602693cd`，观察到 14 个 streaming delta、1 个 committed turn、1 组 `consult_router` tool use/result、0 次 non-streaming fallback、0 个非 committed turn，TUI stderr 为 0 字节，Responses replay 正常落盘，所有测试进程均已清理。首轮独立审查发现 refusal-only 丢失和跨协议 replay 预算两项现实 P1；首次复审进一步发现 compact committed-tail 选择仍未按协议过滤；全部修复并回归后，最终独立只读复审覆盖 checkpoint 恢复、跨协议持久化、媒体/工具结果/文件权限与 Router 降级路径，结论为“未发现 P0/P1”，没有遗留 finding。
 - TUI：未新增或修改用户可见渲染语义；Responses 文本、工具与 fallback 继续复用既有 Text/Tool/activity 展示，reasoning 仍只保存和回传、不展示。

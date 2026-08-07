@@ -78,13 +78,22 @@ impl MemoryReviewLoop {
                     ProviderStop::MaxTokens => {
                         anyhow::bail!("review_memory provider stop=MaxTokens，无法安全完成")
                     }
+                    ProviderStop::ContextWindowExceeded => {
+                        anyhow::bail!("Memory review 上下文已满，本次后台整理已停止。")
+                    }
                 };
             }
 
-            if provider_response.stop == ProviderStop::MaxTokens {
-                anyhow::bail!(
-                    "review_memory provider stop=MaxTokens 且包含 ToolUse，拒绝执行半截工具调用"
-                );
+            match provider_response.stop {
+                ProviderStop::MaxTokens => {
+                    anyhow::bail!(
+                        "review_memory provider stop=MaxTokens 且包含 ToolUse，拒绝执行半截工具调用"
+                    );
+                }
+                ProviderStop::ContextWindowExceeded => {
+                    anyhow::bail!("Memory review 上下文已满，本次后台整理已停止，未执行工具。");
+                }
+                ProviderStop::Done | ProviderStop::ToolUse => {}
             }
             if turn_idx + 1 == self.max_turns {
                 anyhow::bail!("review_memory 达到最大 tool 循环轮数: {}", self.max_turns);

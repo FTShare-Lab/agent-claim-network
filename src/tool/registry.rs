@@ -268,16 +268,6 @@ impl ToolRegistry {
                         }
                     },
                     "required": ["process_id"],
-                    "allOf": [
-                        {
-                            "if": { "required": ["stdout_cursor"] },
-                            "then": { "required": ["stderr_cursor"] }
-                        },
-                        {
-                            "if": { "required": ["stderr_cursor"] },
-                            "then": { "required": ["stdout_cursor"] }
-                        }
-                    ],
                     "additionalProperties": false
                 }),
             },

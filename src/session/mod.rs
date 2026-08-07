@@ -1987,6 +1987,7 @@ frontier:
         })];
         let message = crate::api::SessionTurnMessage::assistant_text("done").with_provider_replay(
             ProviderReplayState::OpenAiResponses {
+                model: Some("test-model".into()),
                 items: items.clone(),
             },
         );
@@ -2003,6 +2004,7 @@ frontier:
         assert_eq!(
             stored[0].provider_replay,
             Some(ProviderReplayState::OpenAiResponses {
+                model: Some("test-model".into()),
                 items: items.clone()
             })
         );
@@ -2011,6 +2013,61 @@ frontier:
             .unwrap();
         assert!(raw.contains(r#""protocol":"openai_responses""#));
         assert!(raw.contains(r#""vendor_extension""#));
+    }
+
+    #[tokio::test]
+    async fn anthropic_provider_replay_round_trips_raw_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let agent = agent_id("agent-a");
+        let mut handle = store
+            .create_with_id_factory(&agent, "system", || session_id("session_aaaaaaac"), 1)
+            .await
+            .unwrap();
+        let messages = vec![serde_json::json!({
+            "role":"assistant",
+            "content":[{
+                "type":"thinking",
+                "thinking":"private",
+                "signature":"opaque",
+                "vendor_extension":{"future":true}
+            }]
+        })];
+        let message = crate::api::SessionTurnMessage::assistant_text("done").with_provider_replay(
+            ProviderReplayState::AnthropicMessages {
+                model: "test-model".into(),
+                messages: messages.clone(),
+            },
+        );
+
+        handle
+            .append_session_turn_messages(
+                &[CompletedSessionTurnMessage::new(message, Utc::now())],
+                "test-model",
+            )
+            .await
+            .unwrap();
+
+        let stored = handle.read_messages().await.unwrap();
+        assert_eq!(
+            stored[0].provider_replay,
+            Some(ProviderReplayState::AnthropicMessages {
+                model: "test-model".into(),
+                messages,
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_responses_replay_without_model_remains_readable_but_unbound() {
+        let raw = r#"{"index":0,"role":"assistant","content":[{"type":"text","text":"done"}],"provider_replay":{"protocol":"openai_responses","items":[{"type":"reasoning","encrypted_content":"opaque"}]},"created_at":"2026-06-17T09:33:05Z","model":"test-model"}"#;
+
+        let message: SessionMessage = serde_json::from_str(raw).unwrap();
+
+        assert!(matches!(
+            message.provider_replay,
+            Some(ProviderReplayState::OpenAiResponses { model: None, .. })
+        ));
     }
 
     #[test]

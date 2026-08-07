@@ -326,7 +326,36 @@ pub enum SessionTurnEvent {
 #[serde(tag = "protocol", rename_all = "snake_case")]
 pub enum ProviderReplayState {
     #[serde(rename = "openai_responses")]
-    OpenAiResponses { items: Vec<Value> },
+    OpenAiResponses {
+        /// 当前分支早期落盘未携带 model；缺失时按未绑定旧 replay 处理。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        items: Vec<Value>,
+    },
+    #[serde(rename = "anthropic_messages")]
+    AnthropicMessages {
+        model: String,
+        /// 完整、按顺序保存的 provider-private Messages API message。
+        messages: Vec<Value>,
+    },
+}
+
+impl ProviderReplayState {
+    pub fn matches_identity(&self, identity: &super::ProviderReplayIdentity) -> bool {
+        match self {
+            Self::OpenAiResponses {
+                model: Some(model), ..
+            } => {
+                identity.protocol == super::ProviderReplayProtocol::OpenAiResponses
+                    && model == &identity.model
+            }
+            Self::AnthropicMessages { model, .. } => {
+                identity.protocol == super::ProviderReplayProtocol::AnthropicMessages
+                    && model == &identity.model
+            }
+            Self::OpenAiResponses { model: None, .. } => false,
+        }
+    }
 }
 
 /// provider-neutral session message。

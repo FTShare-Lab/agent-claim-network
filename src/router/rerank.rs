@@ -280,6 +280,7 @@ impl RouterReranker for OpenAiResponsesReranker {
             max_output_tokens: self.max_tokens,
             stream: false,
             store: false,
+            include: None,
             reasoning: None,
         };
         let mut noop = |_event| {};
@@ -514,6 +515,7 @@ mod tests {
         assert_eq!(request["store"], false);
         assert_eq!(request["max_output_tokens"], 77);
         assert_eq!(request["tools"], json!([]));
+        assert!(request.get("include").is_none());
         assert!(request.get("reasoning").is_none());
         assert_eq!(request["input"][0]["type"], "message");
         assert_eq!(request["input"][0]["role"], "user");

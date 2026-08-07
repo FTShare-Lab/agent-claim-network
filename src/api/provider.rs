@@ -20,6 +20,17 @@ pub enum ProviderHistoryMediaPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderReplayProtocol {
     OpenAiResponses,
+    AnthropicMessages,
+}
+
+/// provider 私有 replay 的绑定身份。
+///
+/// 原样 replay 只允许回到相同 wire protocol 与精确配置 model；切换任一项都从
+/// canonical history 开始新的 replay 代际，避免跨模型误传私有状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderReplayIdentity {
+    pub protocol: ProviderReplayProtocol,
+    pub model: String,
 }
 
 #[async_trait]
@@ -29,8 +40,8 @@ pub trait ProviderAdapter: Send + Sync {
         ProviderHistoryMediaPolicy::Placeholder
     }
 
-    /// 只允许同协议 replay 进入 provider 请求与其 token/compaction 预算。
-    fn history_replay_protocol(&self) -> Option<ProviderReplayProtocol> {
+    /// 只允许相同协议与精确 model 的 replay 进入请求及 token/compaction 预算。
+    fn history_replay_identity(&self) -> Option<ProviderReplayIdentity> {
         None
     }
 
@@ -85,6 +96,27 @@ pub enum ProviderStop {
     Done,
     ToolUse,
     MaxTokens,
+    /// Provider 返回了完整、有效但因模型上下文窗口耗尽而截断的响应。
+    /// 上层必须先压缩上下文再续写，不能按 transport 故障 fallback。
+    ContextWindowExceeded,
+}
+
+/// Provider 已返回明确的非成功终态；重放同一请求不会变成完整响应。
+///
+/// Adapter 用该类型阻止 turn loop 把拒绝、暂停或上下文截断误当作
+/// transport streaming 故障并自动切到 non-streaming。
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct ProviderTerminalFailure {
+    message: String,
+}
+
+impl ProviderTerminalFailure {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

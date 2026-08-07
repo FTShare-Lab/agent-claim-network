@@ -9,7 +9,7 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 
 use super::protocol::{
-    has_tool_use_block, ApiContent, ApiMessage, ContinuedAssistantTurn, CreateMessageRequest,
+    has_tool_use_block, ApiMessage, ContinuedAssistantTurn, CreateMessageRequest,
 };
 use super::{
     compute_backoff, is_retryable, AnthropicError, AnthropicMessagesClient, CONTINUATION_TRIGGER,
@@ -82,6 +82,7 @@ impl AnthropicMessagesClient {
         let mut last_response: Option<Value> = None;
         let mut last_blocks = Vec::new();
         let mut last_stop_reason = String::from("end_turn");
+        let mut replay_messages = Vec::new();
 
         for round in 0..=MAX_CONTINUATION_TURNS {
             let body = self.request_for(
@@ -94,10 +95,12 @@ impl AnthropicMessagesClient {
             let response_turn = self
                 .send_stream_with_retry(&body, retry_count, emit)
                 .await?;
-            messages.push(ApiMessage {
-                role: "assistant".into(),
-                content: ApiContent::Blocks(response_turn.final_blocks.clone()),
+            let assistant_replay = json!({
+                "role": "assistant",
+                "content": response_turn.final_blocks.clone(),
             });
+            messages.push(ApiMessage::raw(assistant_replay.clone()));
+            replay_messages.push(assistant_replay);
             append_with_overlap_dedupe(&mut merged_text, &response_turn.merged_text);
             last_stop_reason = response_turn.final_stop_reason.clone();
             last_blocks = response_turn.final_blocks;
@@ -121,10 +124,9 @@ impl AnthropicMessagesClient {
             if round == MAX_CONTINUATION_TURNS {
                 break;
             }
-            messages.push(ApiMessage {
-                role: "user".into(),
-                content: ApiContent::Text(CONTINUATION_TRIGGER.into()),
-            });
+            let continuation = json!({"role": "user", "content": CONTINUATION_TRIGGER});
+            messages.push(ApiMessage::raw(continuation.clone()));
+            replay_messages.push(continuation);
         }
 
         let final_response = last_response.ok_or_else(|| AnthropicError::OutputShape {
@@ -136,6 +138,7 @@ impl AnthropicMessagesClient {
             final_blocks: last_blocks,
             final_stop_reason: last_stop_reason,
             merged_text,
+            replay_messages,
         })
     }
 
@@ -159,13 +162,15 @@ impl AnthropicMessagesClient {
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             let body = read_llm_error_body(resp, self.timeout).await;
-            return Err(AnthropicError::Auth(body));
+            return Err(AnthropicError::Auth(super::redact_anthropic_error_body(
+                &body,
+            )));
         }
         if !status.is_success() {
             let body = read_llm_error_body(resp, self.timeout).await;
             return Err(AnthropicError::Status {
                 status: status.as_u16(),
-                body,
+                body: super::redact_anthropic_error_body(&body),
             });
         }
 
@@ -255,27 +260,17 @@ fn event_blocks_stream_retry(event: &SessionTurnEvent) -> bool {
 struct StreamingBlock {
     value: Value,
     input_json: String,
+    finished: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct StreamingAssistantTurn {
     blocks: Vec<Option<StreamingBlock>>,
-    stop_reason: String,
+    stop_reason: Option<String>,
     merged_text: String,
     usage: Option<Value>,
+    saw_message_start: bool,
     saw_message_stop: bool,
-}
-
-impl Default for StreamingAssistantTurn {
-    fn default() -> Self {
-        Self {
-            blocks: Vec::new(),
-            stop_reason: "end_turn".into(),
-            merged_text: String::new(),
-            usage: None,
-            saw_message_stop: false,
-        }
-    }
 }
 
 impl StreamingAssistantTurn {
@@ -284,8 +279,21 @@ impl StreamingAssistantTurn {
         event: &Value,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
     ) -> Result<(), AnthropicError> {
+        if self.saw_message_stop {
+            return Err(AnthropicError::OutputShape {
+                reason: "message_stop 后仍收到 stream event".into(),
+                raw: event.to_string(),
+            });
+        }
         match event.get("type").and_then(Value::as_str) {
             Some("message_start") => {
+                if self.saw_message_start {
+                    return Err(AnthropicError::OutputShape {
+                        reason: "重复的 message_start".into(),
+                        raw: event.to_string(),
+                    });
+                }
+                self.saw_message_start = true;
                 if let Some(usage) = event
                     .get("message")
                     .and_then(|message| message.get("usage"))
@@ -327,13 +335,19 @@ impl StreamingAssistantTurn {
                     .and_then(|delta| delta.get("stop_reason"))
                     .and_then(Value::as_str)
                 {
-                    self.stop_reason = stop_reason.to_string();
+                    self.stop_reason = Some(stop_reason.to_string());
                 }
                 if let Some(usage) = event.get("usage").cloned() {
                     merge_usage(&mut self.usage, usage);
                 }
             }
             Some("message_stop") => {
+                if !self.saw_message_start {
+                    return Err(AnthropicError::OutputShape {
+                        reason: "message_stop 早于 message_start".into(),
+                        raw: event.to_string(),
+                    });
+                }
                 self.saw_message_stop = true;
                 if let Some(snapshot) = self
                     .usage
@@ -367,12 +381,16 @@ impl StreamingAssistantTurn {
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
     ) -> Result<(), AnthropicError> {
         let block = self.block_mut(index)?;
+        if block.finished {
+            return Err(AnthropicError::OutputShape {
+                reason: format!("stream delta 引用了已结束的 content block: {index}"),
+                raw: delta.to_string(),
+            });
+        }
         match delta.get("type").and_then(Value::as_str) {
             Some("text_delta") => {
-                let text = delta
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
+                require_stream_block_type(block, index, "text_delta", "text")?;
+                let text = required_stream_delta_string(delta, "text_delta", "text")?;
                 append_json_string_field(&mut block.value, "text", text);
                 self.merged_text.push_str(text);
                 if !text.is_empty() {
@@ -382,24 +400,20 @@ impl StreamingAssistantTurn {
                 }
             }
             Some("input_json_delta") => {
-                let partial = delta
-                    .get("partial_json")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
+                require_stream_block_type(block, index, "input_json_delta", "tool_use")?;
+                let partial =
+                    required_stream_delta_string(delta, "input_json_delta", "partial_json")?;
                 block.input_json.push_str(partial);
             }
             Some("thinking_delta") => {
-                let thinking = delta
-                    .get("thinking")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
+                require_stream_block_type(block, index, "thinking_delta", "thinking")?;
+                let thinking = required_stream_delta_string(delta, "thinking_delta", "thinking")?;
                 append_json_string_field(&mut block.value, "thinking", thinking);
             }
             Some("signature_delta") => {
-                let signature = delta
-                    .get("signature")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
+                require_stream_block_type(block, index, "signature_delta", "thinking")?;
+                let signature =
+                    required_stream_delta_string(delta, "signature_delta", "signature")?;
                 append_json_string_field(&mut block.value, "signature", signature);
             }
             other => {
@@ -414,6 +428,12 @@ impl StreamingAssistantTurn {
 
     fn finish_block(&mut self, index: usize) -> Result<(), AnthropicError> {
         let block = self.block_mut(index)?;
+        if block.finished {
+            return Err(AnthropicError::OutputShape {
+                reason: format!("重复的 content_block_stop: {index}"),
+                raw: String::new(),
+            });
+        }
         if block.value.get("type").and_then(Value::as_str) == Some("tool_use")
             && !block.input_json.trim().is_empty()
         {
@@ -427,6 +447,7 @@ impl StreamingAssistantTurn {
                 object.insert("input".into(), input);
             }
         }
+        block.finished = true;
         Ok(())
     }
 
@@ -437,6 +458,23 @@ impl StreamingAssistantTurn {
                 raw: String::new(),
             });
         }
+        if !self.saw_message_start {
+            return Err(AnthropicError::OutputShape {
+                reason: "stream 缺少 message_start".into(),
+                raw: String::new(),
+            });
+        }
+        if self.blocks.iter().flatten().any(|block| !block.finished) {
+            return Err(AnthropicError::OutputShape {
+                reason: "message_stop 前存在未结束的 content block".into(),
+                raw: String::new(),
+            });
+        }
+        let stop_reason = super::validated_anthropic_stop_reason(self.stop_reason.as_deref())
+            .map_err(|_| AnthropicError::OutputShape {
+                reason: "stream 缺少有效 stop_reason".into(),
+                raw: String::new(),
+            })?;
         let final_blocks = self
             .blocks
             .into_iter()
@@ -451,13 +489,14 @@ impl StreamingAssistantTurn {
             .collect::<Result<Vec<_>, _>>()?;
         let final_response = json!({
             "content": final_blocks,
-            "stop_reason": self.stop_reason,
+            "stop_reason": stop_reason.clone(),
         });
         Ok(ContinuedAssistantTurn {
             final_blocks,
-            final_stop_reason: self.stop_reason,
+            final_stop_reason: stop_reason,
             merged_text: self.merged_text,
             final_response,
+            replay_messages: Vec::new(),
         })
     }
 
@@ -474,6 +513,7 @@ impl StreamingAssistantTurn {
         self.blocks.push(Some(StreamingBlock {
             value: block,
             input_json: String::new(),
+            finished: false,
         }));
         Ok(())
     }
@@ -487,6 +527,38 @@ impl StreamingAssistantTurn {
                 raw: String::new(),
             })
     }
+}
+
+fn require_stream_block_type(
+    block: &StreamingBlock,
+    index: usize,
+    delta_type: &str,
+    expected_block_type: &str,
+) -> Result<(), AnthropicError> {
+    let actual_block_type = block.value.get("type").and_then(Value::as_str);
+    if actual_block_type == Some(expected_block_type) {
+        return Ok(());
+    }
+    Err(AnthropicError::OutputShape {
+        reason: format!(
+            "stream {delta_type} 与 content block 类型不匹配: index={index}, expected={expected_block_type}, actual={actual_block_type:?}"
+        ),
+        raw: String::new(),
+    })
+}
+
+fn required_stream_delta_string<'a>(
+    delta: &'a Value,
+    delta_type: &str,
+    field: &str,
+) -> Result<&'a str, AnthropicError> {
+    delta
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| AnthropicError::OutputShape {
+            reason: format!("stream {delta_type} 缺少字符串字段 {field}"),
+            raw: String::new(),
+        })
 }
 
 fn merge_usage(current: &mut Option<Value>, update: Value) {
@@ -620,6 +692,275 @@ mod tests {
         assert_eq!(turn.blocks.len(), 1);
     }
 
+    #[test]
+    fn streaming_thinking_and_signature_are_reduced_exactly_without_visible_delta() {
+        let mut turn = StreamingAssistantTurn::default();
+        let mut events = Vec::new();
+        for event in [
+            json!({"type":"message_start", "message":{"usage":{"input_tokens":3}}}),
+            json!({
+                "type":"content_block_start", "index":0,
+                "content_block":{"type":"thinking", "thinking":"", "signature":""}
+            }),
+            json!({
+                "type":"content_block_delta", "index":0,
+                "delta":{"type":"thinking_delta", "thinking":"private thought"}
+            }),
+            json!({
+                "type":"content_block_delta", "index":0,
+                "delta":{"type":"signature_delta", "signature":"opaque-signature"}
+            }),
+            json!({"type":"content_block_stop", "index":0}),
+            json!({
+                "type":"content_block_start", "index":1,
+                "content_block":{"type":"text", "text":""}
+            }),
+            json!({
+                "type":"content_block_delta", "index":1,
+                "delta":{"type":"text_delta", "text":"visible answer"}
+            }),
+            json!({"type":"content_block_stop", "index":1}),
+            json!({
+                "type":"message_delta", "delta":{"stop_reason":"end_turn"},
+                "usage":{"output_tokens":9}
+            }),
+            json!({"type":"message_stop"}),
+        ] {
+            turn.apply_event(&event, &mut |event| events.push(event))
+                .unwrap();
+        }
+
+        let completed = turn.finish().unwrap();
+
+        assert_eq!(
+            completed.final_blocks[0],
+            json!({
+                "type":"thinking",
+                "thinking":"private thought",
+                "signature":"opaque-signature"
+            })
+        );
+        assert_eq!(
+            completed.final_blocks[1],
+            json!({"type":"text", "text":"visible answer"})
+        );
+        assert_eq!(completed.merged_text, "visible answer");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, SessionTurnEvent::AssistantTextDelta { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn streaming_rejects_delta_block_type_mismatch_without_visible_output() {
+        for (block, delta, expected_error) in [
+            (
+                json!({"type":"thinking", "thinking":"", "signature":""}),
+                json!({"type":"text_delta", "text":"must stay private"}),
+                "text_delta",
+            ),
+            (
+                json!({"type":"text", "text":""}),
+                json!({"type":"thinking_delta", "thinking":"private"}),
+                "thinking_delta",
+            ),
+            (
+                json!({"type":"text", "text":""}),
+                json!({"type":"input_json_delta", "partial_json":"{}"}),
+                "input_json_delta",
+            ),
+            (
+                json!({"type":"text", "text":""}),
+                json!({"type":"signature_delta", "signature":"opaque"}),
+                "signature_delta",
+            ),
+        ] {
+            let mut turn = StreamingAssistantTurn::default();
+            turn.apply_event(
+                &json!({
+                    "type":"content_block_start",
+                    "index":0,
+                    "content_block":block
+                }),
+                &mut |_| {},
+            )
+            .unwrap();
+            let mut visible_events = Vec::new();
+
+            let error = turn
+                .apply_event(
+                    &json!({
+                        "type":"content_block_delta",
+                        "index":0,
+                        "delta":delta
+                    }),
+                    &mut |event| visible_events.push(event),
+                )
+                .unwrap_err();
+
+            assert!(error.to_string().contains(expected_error));
+            assert!(error.to_string().contains("类型不匹配"));
+            assert!(visible_events.is_empty());
+        }
+    }
+
+    #[test]
+    fn streaming_rejects_missing_or_non_string_delta_payloads() {
+        for invalid_value in [None, Some(Value::Null), Some(json!(7))] {
+            for (block, delta_type, field) in [
+                (json!({"type":"text", "text":""}), "text_delta", "text"),
+                (
+                    json!({"type":"tool_use", "id":"toolu_1", "name":"file_read", "input":{}}),
+                    "input_json_delta",
+                    "partial_json",
+                ),
+                (
+                    json!({"type":"thinking", "thinking":"", "signature":""}),
+                    "thinking_delta",
+                    "thinking",
+                ),
+                (
+                    json!({"type":"thinking", "thinking":"", "signature":""}),
+                    "signature_delta",
+                    "signature",
+                ),
+            ] {
+                let mut turn = StreamingAssistantTurn::default();
+                turn.apply_event(
+                    &json!({
+                        "type":"content_block_start",
+                        "index":0,
+                        "content_block":block
+                    }),
+                    &mut |_| {},
+                )
+                .unwrap();
+                let mut delta = json!({"type":delta_type});
+                if let Some(value) = invalid_value.clone() {
+                    delta[field] = value;
+                }
+                let mut visible_events = Vec::new();
+
+                let error = turn
+                    .apply_event(
+                        &json!({
+                            "type":"content_block_delta",
+                            "index":0,
+                            "delta":delta
+                        }),
+                        &mut |event| visible_events.push(event),
+                    )
+                    .unwrap_err();
+
+                assert!(error.to_string().contains(delta_type));
+                assert!(error.to_string().contains(field));
+                assert!(visible_events.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_rejects_blank_stop_reason() {
+        let mut turn = StreamingAssistantTurn::default();
+        for event in [
+            json!({"type":"message_start", "message":{}}),
+            json!({"type":"message_delta", "delta":{"stop_reason":"  "}}),
+            json!({"type":"message_stop"}),
+        ] {
+            turn.apply_event(&event, &mut |_| {}).unwrap();
+        }
+
+        let error = match turn.finish() {
+            Ok(_) => panic!("blank stop_reason must fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("缺少有效 stop_reason"));
+    }
+
+    #[test]
+    fn streaming_terminal_rejects_unfinished_content_block() {
+        let mut turn = StreamingAssistantTurn::default();
+        for event in [
+            json!({"type":"message_start", "message":{}}),
+            json!({
+                "type":"content_block_start", "index":0,
+                "content_block":{"type":"thinking", "thinking":"", "signature":""}
+            }),
+            json!({
+                "type":"message_delta", "delta":{"stop_reason":"end_turn"}
+            }),
+            json!({"type":"message_stop"}),
+        ] {
+            turn.apply_event(&event, &mut |_| {}).unwrap();
+        }
+
+        let error = match turn.finish() {
+            Ok(_) => panic!("unfinished block must fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("未结束的 content block"));
+    }
+
+    #[test]
+    fn streaming_context_window_stop_preserves_complete_partial_blocks() {
+        let mut turn = StreamingAssistantTurn::default();
+        let mut events = Vec::new();
+        for event in [
+            json!({"type":"message_start", "message":{"usage":{"input_tokens":120}}}),
+            json!({
+                "type":"content_block_start", "index":0,
+                "content_block":{"type":"thinking", "thinking":"", "signature":""}
+            }),
+            json!({
+                "type":"content_block_delta", "index":0,
+                "delta":{"type":"thinking_delta", "thinking":"private-context"}
+            }),
+            json!({
+                "type":"content_block_delta", "index":0,
+                "delta":{"type":"signature_delta", "signature":"sig-context"}
+            }),
+            json!({"type":"content_block_stop", "index":0}),
+            json!({
+                "type":"content_block_start", "index":1,
+                "content_block":{"type":"text", "text":""}
+            }),
+            json!({
+                "type":"content_block_delta", "index":1,
+                "delta":{"type":"text_delta", "text":"visible partial"}
+            }),
+            json!({"type":"content_block_stop", "index":1}),
+            json!({
+                "type":"message_delta",
+                "delta":{"stop_reason":"model_context_window_exceeded"},
+                "usage":{"output_tokens":8}
+            }),
+            json!({"type":"message_stop"}),
+        ] {
+            turn.apply_event(&event, &mut |event| events.push(event))
+                .unwrap();
+        }
+
+        let completed = turn.finish().unwrap();
+
+        assert_eq!(completed.final_stop_reason, "model_context_window_exceeded");
+        assert_eq!(completed.merged_text, "visible partial");
+        assert_eq!(completed.final_blocks[0]["thinking"], "private-context");
+        assert_eq!(completed.final_blocks[0]["signature"], "sig-context");
+        assert_eq!(completed.final_blocks[1]["text"], "visible partial");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, SessionTurnEvent::AssistantTextDelta { .. }))
+                .count(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn ctx_usage_only_event_does_not_block_stream_retry() {
         let first_body = sse_response(vec![json!({
@@ -673,10 +1014,10 @@ mod tests {
             Duration::ZERO,
         )
         .unwrap();
-        let mut messages = vec![ApiMessage {
-            role: "user".into(),
-            content: ApiContent::Text("hello".into()),
-        }];
+        let mut messages = vec![ApiMessage::structured(
+            "user",
+            vec![json!({"type":"text", "text":"hello"})],
+        )];
         let mut events = Vec::new();
 
         let turn = client
@@ -713,6 +1054,110 @@ mod tests {
                     if text == "ok"
             )
         }));
+        assert_eq!(
+            turn.replay_messages,
+            vec![json!({
+                "role":"assistant",
+                "content":[{"type":"text", "text":"ok"}]
+            })]
+        );
+    }
+
+    #[tokio::test]
+    async fn max_token_streaming_continuation_preserves_private_message_sequence() {
+        let first = sse_response(vec![
+            json!({"type":"message_start", "message":{"usage":{"input_tokens":1}}}),
+            json!({
+                "type":"content_block_start", "index":0,
+                "content_block":{"type":"thinking", "thinking":"", "signature":""}
+            }),
+            json!({
+                "type":"content_block_delta", "index":0,
+                "delta":{"type":"thinking_delta", "thinking":"private-one"}
+            }),
+            json!({
+                "type":"content_block_delta", "index":0,
+                "delta":{"type":"signature_delta", "signature":"sig-one"}
+            }),
+            json!({"type":"content_block_stop", "index":0}),
+            json!({
+                "type":"content_block_start", "index":1,
+                "content_block":{"type":"text", "text":""}
+            }),
+            json!({
+                "type":"content_block_delta", "index":1,
+                "delta":{"type":"text_delta", "text":"first "}
+            }),
+            json!({"type":"content_block_stop", "index":1}),
+            json!({"type":"message_delta", "delta":{"stop_reason":"max_tokens"}}),
+            json!({"type":"message_stop"}),
+        ]);
+        let second = sse_response(vec![
+            json!({"type":"message_start", "message":{"usage":{"input_tokens":2}}}),
+            json!({
+                "type":"content_block_start", "index":0,
+                "content_block":{"type":"redacted_thinking", "data":"opaque-two"}
+            }),
+            json!({"type":"content_block_stop", "index":0}),
+            json!({
+                "type":"content_block_start", "index":1,
+                "content_block":{"type":"text", "text":""}
+            }),
+            json!({
+                "type":"content_block_delta", "index":1,
+                "delta":{"type":"text_delta", "text":"second"}
+            }),
+            json!({"type":"content_block_stop", "index":1}),
+            json!({"type":"message_delta", "delta":{"stop_reason":"end_turn"}}),
+            json!({"type":"message_stop"}),
+        ]);
+        let (endpoint, requests) = spawn_sse_server(vec![first, second]).await;
+        let client = AnthropicMessagesClient::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            128,
+            Duration::from_secs(2),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let mut messages = vec![ApiMessage::structured(
+            "user",
+            vec![json!({"type":"text", "text":"hello"})],
+        )];
+
+        let turn = client
+            .send_text_with_continuation_streaming_for_provider(
+                "system",
+                &mut messages,
+                None,
+                128,
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(turn.merged_text, "first second");
+        assert_eq!(turn.replay_messages.len(), 3);
+        assert_eq!(
+            turn.replay_messages[0]["content"][0]["thinking"],
+            "private-one"
+        );
+        assert_eq!(
+            turn.replay_messages[0]["content"][0]["signature"],
+            "sig-one"
+        );
+        assert_eq!(turn.replay_messages[1]["role"], "user");
+        assert_eq!(turn.replay_messages[1]["content"], CONTINUATION_TRIGGER);
+        assert_eq!(turn.replay_messages[2]["content"][0]["data"], "opaque-two");
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(messages.len(), 4);
+        let replayed_messages = serde_json::to_value(&messages[1..]).unwrap();
+        assert!(replayed_messages.to_string().contains("private-one"));
+        assert!(replayed_messages.to_string().contains(CONTINUATION_TRIGGER));
     }
 
     #[tokio::test]
@@ -754,10 +1199,10 @@ mod tests {
             Duration::ZERO,
         )
         .unwrap();
-        let mut messages = vec![ApiMessage {
-            role: "user".into(),
-            content: ApiContent::Text("hello".into()),
-        }];
+        let mut messages = vec![ApiMessage::structured(
+            "user",
+            vec![json!({"type":"text", "text":"hello"})],
+        )];
 
         let result = client
             .send_text_with_continuation_streaming_for_provider(

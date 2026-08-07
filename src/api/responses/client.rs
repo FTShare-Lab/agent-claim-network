@@ -489,6 +489,7 @@ mod tests {
             max_output_tokens: 128,
             stream,
             store: false,
+            include: None,
             reasoning: None,
         }
     }

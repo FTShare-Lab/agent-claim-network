@@ -220,6 +220,9 @@ fn wait_subagents_and_code_run_descriptions_use_runtime_limits() {
         .iter()
         .find(|tool| tool.name == "write_stdin")
         .unwrap();
+    assert!(write_stdin.input_schema.get("oneOf").is_none());
+    assert!(write_stdin.input_schema.get("anyOf").is_none());
+    assert!(write_stdin.input_schema.get("allOf").is_none());
     assert!(write_stdin.input_schema["properties"]["chars"]
         .get("maxLength")
         .is_none());

@@ -40,7 +40,13 @@ pub(super) async fn externalize_heavy_user_blocks(
 ) -> ExternalizedProviderProjection {
     let mut assets = Vec::new();
     let mut retained_block_count = 0usize;
-    for message in &mut projection.messages {
+    for (message_index, message) in projection.messages.iter_mut().enumerate() {
+        if projection
+            .protected_tail_start_index
+            .is_some_and(|start| message_index >= start)
+        {
+            continue;
+        }
         if message.role != "user" {
             continue;
         }
@@ -243,6 +249,7 @@ mod tests {
                 ),
             ])],
             active_start_index: 0,
+            protected_tail_start_index: None,
         };
 
         let result = externalize_heavy_user_blocks(
@@ -276,6 +283,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protected_recovery_tail_is_not_externalized() {
+        let dir = tempfile::tempdir().unwrap();
+        let image_data = BASE64_STANDARD.encode(b"protected-image");
+        let projection = ProviderProjection {
+            system_prompt: "system".into(),
+            messages: vec![
+                SessionTurnMessage::user_text("anchor"),
+                SessionTurnMessage::user_content(vec![SessionTurnContentBlock::image(
+                    "image/png",
+                    image_data.clone(),
+                )]),
+            ],
+            active_start_index: 0,
+            protected_tail_start_index: Some(1),
+        };
+
+        let result = externalize_heavy_user_blocks(
+            projection,
+            dir.path(),
+            ProviderHistoryMediaPolicy::Placeholder,
+        )
+        .await;
+
+        assert!(result.assets.is_empty());
+        assert!(matches!(
+            &result.projection.messages[1].content[0],
+            SessionTurnContentBlock::Image { data, .. } if data == &image_data
+        ));
+    }
+
+    #[tokio::test]
     async fn does_not_treat_first_prompt_like_an_attachment_block() {
         let dir = tempfile::tempdir().unwrap();
         let prompt = "Attached file: user-typed.txt\nPath: /tmp/nope\n\nstill user text";
@@ -283,6 +321,7 @@ mod tests {
             system_prompt: String::new(),
             messages: vec![SessionTurnMessage::user_text(prompt)],
             active_start_index: 0,
+            protected_tail_start_index: None,
         };
 
         let result = externalize_heavy_user_blocks(
@@ -312,6 +351,7 @@ mod tests {
                 SessionTurnContentBlock::text(attachment),
             ])],
             active_start_index: 0,
+            protected_tail_start_index: None,
         };
 
         let result = externalize_heavy_user_blocks(
@@ -345,6 +385,7 @@ mod tests {
                 SessionTurnContentBlock::document("application/pdf", document_data.clone()),
             ])],
             active_start_index: 0,
+            protected_tail_start_index: None,
         };
 
         let result = externalize_heavy_user_blocks(

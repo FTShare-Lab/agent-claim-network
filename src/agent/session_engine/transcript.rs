@@ -7,7 +7,7 @@
 use rustc_hash::FxHashMap;
 
 use crate::api::{
-    ProviderHistoryMediaPolicy, ProviderReplayProtocol, ProviderReplayState,
+    ProviderHistoryMediaPolicy, ProviderReplayIdentity, ProviderReplayState,
     SessionTurnContentBlock, SessionTurnMessage, TurnMessage,
 };
 use crate::session::{SessionContentBlock, SessionMessage, SessionMessageRole};
@@ -170,30 +170,27 @@ pub(super) fn session_message_to_turn_message(message: SessionMessage) -> Sessio
 pub(super) fn session_messages_to_provider_turn_messages(
     messages: Vec<SessionMessage>,
     media_policy: ProviderHistoryMediaPolicy,
-    replay_protocol: Option<ProviderReplayProtocol>,
+    replay_identity: Option<ProviderReplayIdentity>,
 ) -> Vec<SessionTurnMessage> {
+    let replay_start = provider_replay_generation_start(&messages, replay_identity.as_ref());
     messages
         .into_iter()
-        .map(|message| {
-            session_message_to_turn_message_with_policy(message, media_policy, replay_protocol)
+        .enumerate()
+        .map(|(index, message)| {
+            let identity = (index >= replay_start)
+                .then_some(replay_identity.as_ref())
+                .flatten();
+            session_message_to_turn_message_with_policy(message, media_policy, identity)
         })
         .collect()
-}
-
-pub(super) fn session_message_to_provider_turn_message(
-    message: SessionMessage,
-    media_policy: ProviderHistoryMediaPolicy,
-    replay_protocol: Option<ProviderReplayProtocol>,
-) -> SessionTurnMessage {
-    session_message_to_turn_message_with_policy(message, media_policy, replay_protocol)
 }
 
 fn session_message_to_turn_message_with_policy(
     message: SessionMessage,
     media_policy: ProviderHistoryMediaPolicy,
-    replay_protocol: Option<ProviderReplayProtocol>,
+    replay_identity: Option<&ProviderReplayIdentity>,
 ) -> SessionTurnMessage {
-    let provider_replay = replay_for_protocol(message.provider_replay, replay_protocol);
+    let provider_replay = replay_for_identity(message.provider_replay, replay_identity);
     SessionTurnMessage {
         role: message.role.to_string(),
         content: message
@@ -205,17 +202,59 @@ fn session_message_to_turn_message_with_policy(
     }
 }
 
-fn replay_for_protocol(
+fn replay_for_identity(
     replay: Option<ProviderReplayState>,
-    protocol: Option<ProviderReplayProtocol>,
+    identity: Option<&ProviderReplayIdentity>,
 ) -> Option<ProviderReplayState> {
-    match (protocol, replay) {
-        (
-            Some(ProviderReplayProtocol::OpenAiResponses),
-            replay @ Some(ProviderReplayState::OpenAiResponses { .. }),
-        ) => replay,
-        _ => None,
-    }
+    replay.filter(|replay| identity.is_some_and(|identity| replay.matches_identity(identity)))
+}
+
+/// 返回当前 replay 代际可以开始附着的 message index。
+///
+/// user/tool_result 不切断代际；最近一条没有匹配当前身份 replay 的 assistant
+/// 是明确边界，边界之前的旧 replay 即使稍后切回原模型也不能复活。
+pub(super) fn provider_replay_generation_start(
+    messages: &[SessionMessage],
+    identity: Option<&ProviderReplayIdentity>,
+) -> usize {
+    let Some(identity) = identity else {
+        return messages.len();
+    };
+    messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| {
+            (message.role == SessionMessageRole::Assistant
+                && !message
+                    .provider_replay
+                    .as_ref()
+                    .is_some_and(|replay| replay.matches_identity(identity)))
+            .then_some(index.saturating_add(1))
+        })
+        .unwrap_or(0)
+}
+
+pub(super) fn provider_replay_generation_start_refs(
+    messages: &[&SessionMessage],
+    identity: Option<&ProviderReplayIdentity>,
+) -> usize {
+    let Some(identity) = identity else {
+        return messages.len();
+    };
+    messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| {
+            (message.role == SessionMessageRole::Assistant
+                && !message
+                    .provider_replay
+                    .as_ref()
+                    .is_some_and(|replay| replay.matches_identity(identity)))
+            .then_some(index.saturating_add(1))
+        })
+        .unwrap_or(0)
 }
 
 fn session_block_to_turn_with_policy(

@@ -19,7 +19,8 @@ use super::continuation::{
     append_with_overlap_dedupe, CONTINUATION_TRIGGER, MAX_CONTINUATION_TURNS,
 };
 use super::provider::{
-    ProviderAdapter, ProviderEvent, ProviderRequest, ProviderResponse, ProviderStop, ToolSpec,
+    ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy, ProviderRequest, ProviderResponse,
+    ProviderStop, ToolSpec,
 };
 use super::redact_media_error_body;
 use super::types::{SessionTurnContentBlock, SessionTurnMessage};
@@ -187,6 +188,10 @@ impl OpenAiCompatibleChatProviderAdapter {
 
 #[async_trait]
 impl ProviderAdapter for OpenAiCompatibleChatProviderAdapter {
+    fn history_media_policy(&self) -> ProviderHistoryMediaPolicy {
+        ProviderHistoryMediaPolicy::Preserve
+    }
+
     fn emit_preflight_context_estimate(&self) -> bool {
         false
     }
@@ -550,6 +555,14 @@ mod tests {
     }
 
     #[test]
+    fn history_media_policy_preserves_uncompacted_images_and_documents() {
+        assert_eq!(
+            adapter().history_media_policy(),
+            ProviderHistoryMediaPolicy::Preserve
+        );
+    }
+
+    #[test]
     fn canonical_tool_use_maps_to_chat_tool_call() {
         let messages = session_turn_messages_to_chat(vec![SessionTurnMessage {
             role: "assistant".into(),
@@ -677,6 +690,7 @@ mod tests {
             "canonical text",
         )
         .with_provider_replay(crate::api::ProviderReplayState::OpenAiResponses {
+            model: Some("test-model".into()),
             items: vec![json!({
                 "type":"reasoning","encrypted_content":"opaque-chat-must-ignore"
             })],

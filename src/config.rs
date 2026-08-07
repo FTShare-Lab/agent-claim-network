@@ -757,6 +757,12 @@ pub struct LlmChatConfig {
     pub model: String,
     #[serde(default)]
     pub reasoning_effort: ReasoningEffort,
+    /// Anthropic Messages 的显式 thinking 模式；其他 provider 忽略。
+    #[serde(default)]
+    pub anthropic_thinking: AnthropicThinking,
+    /// `anthropic_thinking = "enabled"` 时可选的 token budget。
+    #[serde(default)]
+    pub anthropic_thinking_budget_tokens: Option<u32>,
     #[serde(default = "default_llm_api_key_env")]
     pub api_key_env: String,
     #[serde(default = "default_llm_max_tokens")]
@@ -787,6 +793,8 @@ impl Default for LlmChatConfig {
             endpoint: "https://api.anthropic.com".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
             reasoning_effort: ReasoningEffort::None,
+            anthropic_thinking: AnthropicThinking::Auto,
+            anthropic_thinking_budget_tokens: None,
             api_key_env: "ANTHROPIC_API_KEY".to_string(),
             max_tokens: default_llm_max_tokens(),
             context_window: default_llm_context_window(),
@@ -797,6 +805,18 @@ impl Default for LlmChatConfig {
             api_key: None,
         }
     }
+}
+
+/// Anthropic Messages `thinking` 请求配置。
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AnthropicThinking {
+    /// 不发送 `thinking`，由上游/模型默认行为决定。
+    #[default]
+    Auto,
+    Enabled,
+    Adaptive,
+    Disabled,
 }
 
 /// Agent 主 LLM 请求的推理强度。
@@ -3079,6 +3099,41 @@ router_endpoint = "http://127.0.0.1:8061"
         let cfg = parse_and_validate(minimal_config_without_optional_defaults()).unwrap();
 
         assert_eq!(cfg.agent.llm.reasoning_effort, ReasoningEffort::None);
+    }
+
+    #[test]
+    fn anthropic_thinking_defaults_to_auto_without_budget() {
+        let cfg = parse_and_validate(minimal_config_without_optional_defaults()).unwrap();
+
+        assert_eq!(cfg.agent.llm.anthropic_thinking, AnthropicThinking::Auto);
+        assert_eq!(cfg.agent.llm.anthropic_thinking_budget_tokens, None);
+    }
+
+    #[test]
+    fn anthropic_thinking_accepts_modes_and_optional_budget() {
+        for (raw, expected) in [
+            ("auto", AnthropicThinking::Auto),
+            ("enabled", AnthropicThinking::Enabled),
+            ("adaptive", AnthropicThinking::Adaptive),
+            ("disabled", AnthropicThinking::Disabled),
+        ] {
+            let replacement = format!(
+                "model = \"example-anthropic-model\"\nanthropic_thinking = \"{raw}\"\nanthropic_thinking_budget_tokens = 4096"
+            );
+            let config = minimal_config_without_optional_defaults()
+                .replace(r#"model = "example-anthropic-model""#, &replacement);
+            let cfg = parse_and_validate(&config).unwrap();
+            assert_eq!(cfg.agent.llm.anthropic_thinking, expected);
+            assert_eq!(cfg.agent.llm.anthropic_thinking_budget_tokens, Some(4096));
+        }
+
+        expect_parse_err_contains(
+            minimal_config_without_optional_defaults().replace(
+                r#"model = "example-anthropic-model""#,
+                "model = \"example-anthropic-model\"\nanthropic_thinking = \"dynamic\"",
+            ),
+            "unknown variant `dynamic`",
+        );
     }
 
     #[test]

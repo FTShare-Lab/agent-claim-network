@@ -99,6 +99,14 @@ Router 返回完整候选 claim，而不是服务端文件路径。Agent 只能�
 
 查询无结果不是错误，Agent 可以继续使用本地知识和工具完成任务。
 
+## Session 的 provider 私有 replay
+
+Session 的 canonical content 只保存用户可见文本、附件与工具语义。`openai_responses` 和 `anthropic` 还可以在 assistant message 上保存 provider 私有 replay，用于满足同一 wire protocol 的多轮连续性要求。Replay 绑定生成它的精确配置 model；协议或 model 变化会开始新代际，切回时不复活早先代际。
+
+Provider 私有 replay 不属于用户可见 transcript，不进入 TUI、session search、Memory、recap、Claim、Router 或 Maintainer；compaction summary 也不消费它。只有未 compact、身份匹配且属于当前连续代际的 replay 会进入下一次 provider 请求和对应 token 预算。失败、取消或结构不完整的 turn 不提交 replay。
+
+`openai_chat` 当前没有 provider 私有 Reasoning replay；厂商扩展的 Reasoning 字段会被丢弃。
+
 ## Finalize 与知识形成
 
 Session finalize 对尚未 recap 的消息段做结构化复盘：

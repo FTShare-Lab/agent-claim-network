@@ -13,10 +13,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::api::{
-    ensure_compaction_request_within_context_window, estimate_provider_request_context_tokens,
-    estimate_session_turn_messages_tokens, estimated_projected_segment_tokens,
-    omit_turn_messages_tool_results, project_compaction_input_media,
-    project_compaction_input_tool_results, project_turn_message_for_safe_transcript,
+    context_recovery_protected_tail_from_marker, ensure_compaction_request_within_context_window,
+    estimate_provider_request_context_tokens, estimate_session_turn_messages_tokens,
+    estimated_projected_segment_tokens, omit_turn_messages_tool_results,
+    project_compaction_input_media, project_compaction_input_tool_results,
+    project_turn_message_for_safe_transcript, project_turn_message_tool_results,
     project_turn_messages_tool_results, provider_safe_segments, ContextUsageSnapshot,
     ContextUsageSource, ProviderProjectionBudget, SessionTurnContentBlock, SessionTurnEvent,
     SessionTurnMessage, SessionTurnPreflight, StructuredJsonAttemptRequest, StructuredJsonCaller,
@@ -35,6 +36,7 @@ use super::types::{
 const PROMPT_SUBAGENTS_COMPACTION: &str = "subagents_compaction";
 const DELEGATION_COMPACTION_SCHEMA_VERSION: u8 = 1;
 const DEFAULT_COMPACTION_REASON: &str = "provider context reached subagent auto compact threshold";
+const CONTEXT_WINDOW_RECOVERY_REASON: &str = "provider reported model context window exceeded";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProviderContextUsageAnchor {
@@ -52,6 +54,8 @@ pub struct DelegationPreflightCompactor {
     context_window: usize,
     provider_context_anchor: Option<ProviderContextUsageAnchor>,
     compacted_since_last_check: bool,
+    context_window_recovery_requested: bool,
+    context_window_recovery_tail_marker: Option<SessionTurnMessage>,
 }
 
 impl DelegationPreflightCompactor {
@@ -74,6 +78,8 @@ impl DelegationPreflightCompactor {
             context_window,
             provider_context_anchor: None,
             compacted_since_last_check: false,
+            context_window_recovery_requested: false,
+            context_window_recovery_tail_marker: None,
         }
     }
 
@@ -108,36 +114,51 @@ impl DelegationPreflightCompactor {
         runtime_projection_tokens: usize,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
     ) -> anyhow::Result<()> {
+        let forced_context_recovery = std::mem::take(&mut self.context_window_recovery_requested);
         let Some(trigger_threshold) =
             auto_compact_threshold(self.context_window, self.compaction.auto_compact_ctx_ratio)
         else {
+            if forced_context_recovery {
+                anyhow::bail!("子任务上下文已满，但自动压缩已关闭。请拆分任务后重试。");
+            }
             return Ok(());
         };
         let trigger_tokens = self
             .trigger_context_tokens(system_prompt, provider_messages)
             .saturating_add(runtime_projection_tokens);
-        if trigger_tokens < trigger_threshold {
+        if !forced_context_recovery && trigger_tokens < trigger_threshold {
             return Ok(());
         }
         let hard_threshold = hard_threshold(self.context_window);
         if provider_messages.len() < 4 {
-            if trigger_tokens >= hard_threshold {
-                self.record_hard_failure("subagent context is too large to compact safely: not enough completed message history")
-                    .await?;
-                anyhow::bail!(
-                    "subagent context is too large to compact safely: not enough completed message history"
-                );
+            if forced_context_recovery || trigger_tokens >= hard_threshold {
+                let error = "子任务上下文已满，但没有可安全压缩的历史。请拆分任务后重试。";
+                self.record_hard_failure(error).await?;
+                anyhow::bail!(error);
             }
             return Ok(());
         }
 
-        let Some(plan) = self.build_plan(provider_messages, runtime_projection_tokens) else {
-            if trigger_tokens >= hard_threshold {
-                self.record_hard_failure("subagent context is too large to compact safely: no compactable transcript range")
-                    .await?;
-                anyhow::bail!(
-                    "subagent context is too large to compact safely: no compactable transcript range"
-                );
+        let segments = provider_safe_segments(provider_messages);
+        let protected_tail_segments = match self.context_window_recovery_tail_marker.as_ref() {
+            Some(marker) => {
+                context_recovery_protected_tail_from_marker(provider_messages, &segments, marker)
+                    .context("子任务续写状态异常，无法自动恢复")?
+            }
+            None => 0,
+        };
+        if forced_context_recovery && protected_tail_segments == 0 {
+            anyhow::bail!("子任务续写状态异常，无法自动恢复");
+        }
+        let Some(plan) = self.build_plan(
+            provider_messages,
+            runtime_projection_tokens,
+            protected_tail_segments,
+        ) else {
+            if forced_context_recovery || trigger_tokens >= hard_threshold {
+                let error = "子任务上下文已满，但没有可安全压缩的历史。请拆分任务后重试。";
+                self.record_hard_failure(error).await?;
+                anyhow::bail!(error);
             }
             return Ok(());
         };
@@ -152,14 +173,22 @@ impl DelegationPreflightCompactor {
             .append_compaction_event(DelegationCompactionEventKind::Started {
                 compact_start_index: plan.compact_start_index,
                 compact_end_index: plan.compact_end_index,
-                reason: DEFAULT_COMPACTION_REASON.to_string(),
+                reason: if forced_context_recovery {
+                    CONTEXT_WINDOW_RECOVERY_REASON.to_string()
+                } else {
+                    DEFAULT_COMPACTION_REASON.to_string()
+                },
             })
             .await?;
         let checkpoint = json!({
             "schema_version": DELEGATION_COMPACTION_SCHEMA_VERSION,
             "compact_start_index": plan.compact_start_index,
             "compact_end_index": plan.compact_end_index,
-            "reason": DEFAULT_COMPACTION_REASON,
+            "reason": if forced_context_recovery {
+                CONTEXT_WINDOW_RECOVERY_REASON
+            } else {
+                DEFAULT_COMPACTION_REASON
+            },
             "created_at": Utc::now(),
         });
         self.progress
@@ -191,7 +220,7 @@ impl DelegationPreflightCompactor {
                 emit(SessionTurnEvent::CompactionFailed {
                     error: error_text.clone(),
                 });
-                if trigger_tokens >= hard_threshold {
+                if forced_context_recovery || trigger_tokens >= hard_threshold {
                     self.record_hard_failure(&error_text).await?;
                     return Err(error);
                 }
@@ -247,6 +276,18 @@ impl DelegationPreflightCompactor {
             .await?;
         self.progress.clear_compaction_checkpoint().await?;
         *provider_messages = projected_messages;
+        let projected_tokens = self
+            .trigger_context_tokens(system_prompt, provider_messages)
+            .saturating_add(runtime_projection_tokens);
+        if forced_context_recovery && projected_tokens >= trigger_tokens {
+            log::warn!(
+                target: "delegation",
+                "subagent context recovery compaction 未缩小请求：压缩前估算 {trigger_tokens} tokens，压缩后估算 {projected_tokens} tokens"
+            );
+            let error = "子任务压缩后仍超过上下文限制。请拆分任务后重试。";
+            self.record_hard_failure(error).await?;
+            anyhow::bail!(error);
+        }
         self.compacted_since_last_check = true;
         emit(SessionTurnEvent::CompactionCompleted {
             compacted_until: state.compacted_until,
@@ -303,8 +344,13 @@ impl DelegationPreflightCompactor {
         &self,
         provider_messages: &[SessionTurnMessage],
         runtime_projection_tokens: usize,
+        protected_tail_segments: usize,
     ) -> Option<CompactionPlan> {
-        let ranges = self.select_compaction_ranges(provider_messages, runtime_projection_tokens)?;
+        let ranges = self.select_compaction_ranges(
+            provider_messages,
+            runtime_projection_tokens,
+            protected_tail_segments,
+        )?;
         let compact_start_index = 1;
         let compact_end_index = ranges.compact_end_index;
         if compact_end_index <= compact_start_index {
@@ -324,10 +370,26 @@ impl DelegationPreflightCompactor {
             );
         let compact_messages_with_tool_results_omitted =
             omit_turn_messages_tool_results(compact_source.clone());
-        let tail = project_turn_messages_tool_results(
-            provider_messages.get(ranges.tail_start_index..)?.to_vec(),
-            self.compaction.tool_result_raw_max_chars,
-        );
+        let tail = provider_messages
+            .get(ranges.tail_start_index..)?
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(offset, message)| {
+                let original_index = ranges.tail_start_index.saturating_add(offset);
+                if ranges
+                    .protected_tail_start_index
+                    .is_some_and(|start| original_index >= start)
+                {
+                    message
+                } else {
+                    project_turn_message_tool_results(
+                        message,
+                        self.compaction.tool_result_raw_max_chars,
+                    )
+                }
+            })
+            .collect();
         Some(CompactionPlan {
             compact_start_index,
             compact_end_index,
@@ -343,12 +405,17 @@ impl DelegationPreflightCompactor {
         &self,
         provider_messages: &[SessionTurnMessage],
         runtime_projection_tokens: usize,
+        protected_tail_segments: usize,
     ) -> Option<CompactionRanges> {
         if provider_messages.len() < 2 {
             return None;
         }
         let segments = provider_safe_segments(provider_messages);
         if segments.is_empty() {
+            return None;
+        }
+        let compactable_segments = segments.len().saturating_sub(protected_tail_segments);
+        if compactable_segments == 0 {
             return None;
         }
         let covered_end = segments.last().map(|segment| segment.end).unwrap_or(1);
@@ -360,11 +427,20 @@ impl DelegationPreflightCompactor {
         let budget = self.provider_projection_budget(runtime_projection_tokens);
         let anchor_tokens =
             estimate_session_turn_messages_tokens(std::slice::from_ref(&provider_messages[0]));
-        let suffix_tokens = if suffix_start < provider_messages.len() {
-            estimate_session_turn_messages_tokens(&project_turn_messages_tool_results(
-                provider_messages[suffix_start..].to_vec(),
-                budget.tool_result_raw_max_chars,
-            ))
+        let fixed_tail_start = if protected_tail_segments > 0 {
+            segments[compactable_segments].start
+        } else {
+            suffix_start
+        };
+        let suffix_tokens = if fixed_tail_start < provider_messages.len() {
+            if protected_tail_segments > 0 {
+                estimate_session_turn_messages_tokens(&provider_messages[fixed_tail_start..])
+            } else {
+                estimate_session_turn_messages_tokens(&project_turn_messages_tool_results(
+                    provider_messages[fixed_tail_start..].to_vec(),
+                    budget.tool_result_raw_max_chars,
+                ))
+            }
         } else {
             0
         };
@@ -376,9 +452,9 @@ impl DelegationPreflightCompactor {
         );
         let max_tail_segments = budget.tail_previous_real_user_turns.max(1);
         let mut selected_segments = 0usize;
-        let mut tail_start_index = suffix_start;
-        for segment in segments.iter().rev() {
-            if segment.end > suffix_start {
+        let mut tail_start_index = fixed_tail_start;
+        for segment in segments[..compactable_segments].iter().rev() {
+            if segment.end > fixed_tail_start {
                 continue;
             }
             if selected_segments >= max_tail_segments {
@@ -399,6 +475,8 @@ impl DelegationPreflightCompactor {
         Some(CompactionRanges {
             compact_end_index: tail_start_index,
             tail_start_index,
+            protected_tail_start_index: (protected_tail_segments > 0)
+                .then(|| segments[compactable_segments].start),
         })
     }
 
@@ -582,6 +660,19 @@ impl SessionTurnPreflight for DelegationPreflightCompactor {
     fn clear_provider_context_usage(&mut self) {
         self.provider_context_anchor = None;
     }
+
+    fn request_context_window_recovery(
+        &mut self,
+        assistant_marker: &SessionTurnMessage,
+    ) -> anyhow::Result<()> {
+        if self.compaction.auto_compact_ctx_ratio == 0.0 {
+            anyhow::bail!("子任务上下文已满，但自动压缩已关闭。请拆分任务后重试。");
+        }
+        self.context_window_recovery_tail_marker
+            .get_or_insert_with(|| assistant_marker.clone());
+        self.context_window_recovery_requested = true;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -613,6 +704,7 @@ struct CompactionPlan {
 struct CompactionRanges {
     compact_end_index: usize,
     tail_start_index: usize,
+    protected_tail_start_index: Option<usize>,
 }
 
 impl CompactionPlan {
@@ -955,6 +1047,7 @@ mod tests {
     fn delegation_transcript_message_drops_replay_and_raw_media() {
         let message = SessionTurnMessage::assistant_text("visible answer").with_provider_replay(
             ProviderReplayState::OpenAiResponses {
+                model: Some("test-model".into()),
                 items: vec![json!({
                     "type": "reasoning",
                     "encrypted_content": "TRANSCRIPT_REPLAY"
@@ -983,6 +1076,7 @@ mod tests {
         let compactor = compactor(metadata, progress, provider);
         let mut provider_messages = compactable_messages();
         provider_messages[1].provider_replay = Some(ProviderReplayState::OpenAiResponses {
+            model: Some("test-model".into()),
             items: vec![json!({
                 "type": "reasoning",
                 "encrypted_content": "COMPACTION_REPLAY"
@@ -996,13 +1090,191 @@ mod tests {
             ));
 
         let plan = compactor
-            .build_plan(&provider_messages, 0)
+            .build_plan(&provider_messages, 0, 0)
             .expect("projection plan");
         let compact_text = message_text(&plan.compact_messages);
 
         assert!(!compact_text.contains("COMPACTION_REPLAY"));
         assert!(!compact_text.contains("COMPACTION_IMAGE"));
         assert!(compact_text.contains("image omitted from compaction summary input"));
+    }
+
+    #[tokio::test]
+    async fn forced_context_recovery_keeps_latest_anthropic_partial_pair_out_of_summary() {
+        let (_dir, _store, metadata, progress) = started_delegation().await;
+        let provider = Arc::new(JsonProvider::new(Vec::new()));
+        let compactor = compactor(metadata, progress, provider);
+        let mut provider_messages = compactable_messages();
+        provider_messages.push(
+            SessionTurnMessage::assistant_text("LATEST_CONTEXT_PARTIAL").with_provider_replay(
+                ProviderReplayState::AnthropicMessages {
+                    model: "test-model".into(),
+                    messages: vec![json!({
+                        "role":"assistant",
+                        "content":[{
+                            "type":"thinking",
+                            "thinking":"PRIVATE_CONTEXT_REASONING",
+                            "signature":"PRIVATE_CONTEXT_SIGNATURE"
+                        }, {"type":"text", "text":"LATEST_CONTEXT_PARTIAL"}]
+                    })],
+                },
+            ),
+        );
+        provider_messages.push(SessionTurnMessage::user_text(
+            "INTERNAL_CONTEXT_CONTINUATION",
+        ));
+
+        let plan = compactor
+            .build_plan(&provider_messages, 0, 2)
+            .expect("forced recovery should compact older segments");
+        let summary_input = serde_json::to_string(&plan.compact_messages).unwrap();
+        let raw_tail = serde_json::to_string(&plan.tail).unwrap();
+
+        assert!(!summary_input.contains("LATEST_CONTEXT_PARTIAL"));
+        assert!(!summary_input.contains("PRIVATE_CONTEXT_REASONING"));
+        assert!(!summary_input.contains("PRIVATE_CONTEXT_SIGNATURE"));
+        assert!(raw_tail.contains("LATEST_CONTEXT_PARTIAL"));
+        assert!(raw_tail.contains("PRIVATE_CONTEXT_REASONING"));
+        assert!(raw_tail.contains("PRIVATE_CONTEXT_SIGNATURE"));
+        assert!(raw_tail.contains("INTERNAL_CONTEXT_CONTINUATION"));
+    }
+
+    #[tokio::test]
+    async fn context_recovery_marker_precedes_later_steering() {
+        let (_dir, _store, metadata, progress) = started_delegation().await;
+        let provider = Arc::new(JsonProvider::new(Vec::new()));
+        let mut compactor = compactor(metadata, progress, provider);
+        let marker = SessionTurnMessage::assistant_text("CONTEXT_PARTIAL").with_provider_replay(
+            ProviderReplayState::AnthropicMessages {
+                model: "test-model".into(),
+                messages: vec![json!({
+                    "role":"assistant",
+                    "content":[{"type":"text", "text":"CONTEXT_PARTIAL"}]
+                })],
+            },
+        );
+        compactor
+            .request_context_window_recovery(&marker)
+            .expect("recovery marker should be established at the stop response");
+        let mut provider_messages = compactable_messages();
+        provider_messages.extend([
+            marker,
+            SessionTurnMessage::user_text("INTERNAL_CONTINUATION"),
+            SessionTurnMessage::user_text("LATER_PARENT_STEERING"),
+        ]);
+        let segments = provider_safe_segments(&provider_messages);
+        let protected = context_recovery_protected_tail_from_marker(
+            &provider_messages,
+            &segments,
+            compactor
+                .context_window_recovery_tail_marker
+                .as_ref()
+                .expect("marker should remain available"),
+        )
+        .expect("the marker should survive later steering");
+
+        let plan = compactor
+            .build_plan(&provider_messages, 0, protected)
+            .expect("older segments should remain compactable");
+        let summary_input = serde_json::to_string(&plan.compact_messages).unwrap();
+        let raw_tail = serde_json::to_string(&plan.tail).unwrap();
+
+        assert!(!summary_input.contains("CONTEXT_PARTIAL"));
+        assert!(!summary_input.contains("INTERNAL_CONTINUATION"));
+        assert!(!summary_input.contains("LATER_PARENT_STEERING"));
+        assert!(raw_tail.contains("CONTEXT_PARTIAL"));
+        assert!(raw_tail.contains("INTERNAL_CONTINUATION"));
+        assert!(raw_tail.contains("LATER_PARENT_STEERING"));
+    }
+
+    #[tokio::test]
+    async fn protected_context_tool_result_is_not_truncated() {
+        let (_dir, _store, metadata, progress) = started_delegation().await;
+        let provider = Arc::new(JsonProvider::new(Vec::new()));
+        let compactor = compactor(metadata, progress, provider);
+        let protected_result = "PROTECTED_TOOL_RESULT".repeat(1_024);
+        let mut provider_messages = compactable_messages();
+        provider_messages.extend([
+            SessionTurnMessage {
+                role: "assistant".into(),
+                provider_replay: None,
+                content: vec![SessionTurnContentBlock::ToolUse {
+                    id: "toolu_context".into(),
+                    name: "lookup".into(),
+                    input: json!({}),
+                }],
+            },
+            SessionTurnMessage::user_content(vec![SessionTurnContentBlock::ToolResult {
+                tool_use_id: "toolu_context".into(),
+                content: protected_result.clone(),
+            }]),
+        ]);
+
+        let plan = compactor
+            .build_plan(&provider_messages, 0, 1)
+            .expect("older segments should remain compactable");
+        let summary_input = serde_json::to_string(&plan.compact_messages).unwrap();
+        let raw_tail = serde_json::to_string(&plan.tail).unwrap();
+
+        assert!(!summary_input.contains(&protected_result));
+        assert!(raw_tail.contains(&protected_result));
+        assert!(!raw_tail.contains("large tool_result omitted"));
+    }
+
+    #[tokio::test]
+    async fn protected_raw_tail_is_mandatory_when_selecting_older_segments() {
+        let (_dir, _store, metadata, progress) = started_delegation().await;
+        let provider = Arc::new(JsonProvider::new(Vec::new()));
+        let compactor = compactor(metadata, progress, provider);
+        let mut provider_messages = compactable_messages();
+        provider_messages[4] = SessionTurnMessage::user_text("U".repeat(200));
+        provider_messages[5] = SessionTurnMessage::assistant_text("A".repeat(200));
+        provider_messages.extend([
+            SessionTurnMessage {
+                role: "assistant".into(),
+                provider_replay: None,
+                content: vec![SessionTurnContentBlock::ToolUse {
+                    id: "toolu_context_budget".into(),
+                    name: "lookup".into(),
+                    input: json!({}),
+                }],
+            },
+            SessionTurnMessage::user_content(vec![SessionTurnContentBlock::ToolResult {
+                tool_use_id: "toolu_context_budget".into(),
+                content: "R".repeat(600),
+            }]),
+        ]);
+        let segments = provider_safe_segments(&provider_messages);
+        let protected_start = segments[segments.len() - 1].start;
+        let raw_mandatory = estimate_session_turn_messages_tokens(&provider_messages[..1])
+            .saturating_add(estimate_session_turn_messages_tokens(
+                &provider_messages[protected_start..],
+            ));
+        let base_budget = compactor.provider_projection_budget(0);
+        assert!(base_budget.tail_token_limit > raw_mandatory);
+        let runtime_reserve = base_budget.tail_token_limit - raw_mandatory;
+
+        let ranges = compactor
+            .select_compaction_ranges(&provider_messages, runtime_reserve, 1)
+            .expect("older segments should remain compactable");
+
+        assert_eq!(ranges.tail_start_index, segments[segments.len() - 2].start);
+        assert!(ranges.tail_start_index > 4);
+        assert_eq!(ranges.protected_tail_start_index, Some(protected_start));
+    }
+
+    #[tokio::test]
+    async fn forced_context_recovery_rejects_when_only_protected_partial_pair_exists() {
+        let (_dir, _store, metadata, progress) = started_delegation().await;
+        let provider = Arc::new(JsonProvider::new(Vec::new()));
+        let compactor = compactor(metadata, progress, provider);
+        let provider_messages = vec![
+            SessionTurnMessage::user_text("objective anchor"),
+            SessionTurnMessage::assistant_text("LATEST_CONTEXT_PARTIAL"),
+            SessionTurnMessage::user_text("INTERNAL_CONTEXT_CONTINUATION"),
+        ];
+
+        assert!(compactor.build_plan(&provider_messages, 0, 2).is_none());
     }
 
     #[tokio::test]
@@ -1137,7 +1409,7 @@ mod tests {
         );
         let provider_messages = compactable_messages_with_large_tool_results();
         let plan = compactor
-            .build_plan(&provider_messages, 0)
+            .build_plan(&provider_messages, 0, 0)
             .expect("projection plan");
 
         let compact_text = message_text(&plan.compact_messages);
@@ -1195,7 +1467,7 @@ mod tests {
             ));
 
         let plan = compactor
-            .build_plan(&provider_messages, 0)
+            .build_plan(&provider_messages, 0, 0)
             .expect("media projection plan");
         let compact_input = message_text(&plan.compact_messages);
         assert!(compact_input.contains("document omitted from compaction summary input"));

@@ -293,6 +293,72 @@ pub fn provider_safe_segments(active_suffix: &[SessionTurnMessage]) -> Vec<Messa
     ranges
 }
 
+/// provider 明确报告上下文窗口耗尽后，最近的 partial assistant 及其配对 user
+/// message 必须原样参与下一次请求。普通 compaction 不使用这个额外保护边界。
+pub fn context_recovery_protected_tail_segments(
+    messages: &[SessionTurnMessage],
+    segments: &[MessageRange],
+) -> usize {
+    let Some(last) = segments.last() else {
+        return 0;
+    };
+    if last.end != messages.len() {
+        return 0;
+    }
+
+    if last.end.saturating_sub(last.start) == 2 {
+        // assistant tool_use + 对应 tool_result 是一个不可拆分的安全段。
+        return 1;
+    }
+
+    if messages
+        .get(last.start)
+        .is_some_and(|message| message.role == "user")
+        && segments.len() >= 2
+    {
+        let previous = &segments[segments.len() - 2];
+        if previous.end == last.start
+            && previous.end.saturating_sub(previous.start) == 1
+            && messages
+                .get(previous.start)
+                .is_some_and(|message| message.role == "assistant")
+        {
+            // 无工具的截断回复由 assistant partial + 内部 continuation 两段组成。
+            return 2;
+        }
+    }
+
+    1
+}
+
+/// 记录第一次 context-window 恢复必须保留的 assistant 起点。
+///
+/// 后续 provider/tool 轮次可能继续增长 active tail；调用方用这个稳定消息重新定位，
+/// 从而持续保护整条恢复链，而不是每次只保护最新的一对消息。
+pub fn context_recovery_tail_marker(
+    messages: &[SessionTurnMessage],
+    segments: &[MessageRange],
+) -> Option<SessionTurnMessage> {
+    let protected = context_recovery_protected_tail_segments(messages, segments);
+    if protected == 0 || protected > segments.len() {
+        return None;
+    }
+    let start = segments.get(segments.len() - protected)?.start;
+    messages.get(start).cloned()
+}
+
+/// 根据第一次恢复时记录的 assistant 消息，计算当前必须保留的完整 active tail。
+pub fn context_recovery_protected_tail_from_marker(
+    messages: &[SessionTurnMessage],
+    segments: &[MessageRange],
+    marker: &SessionTurnMessage,
+) -> Option<usize> {
+    let marker_segment = segments
+        .iter()
+        .position(|segment| messages.get(segment.start) == Some(marker))?;
+    Some(segments.len().saturating_sub(marker_segment))
+}
+
 pub fn tool_result_contains_all(message: &SessionTurnMessage, tool_use_ids: &[&str]) -> bool {
     tool_use_ids.iter().all(|id| {
         message.content.iter().any(|block| {
@@ -432,6 +498,7 @@ mod tests {
                 SessionTurnContentBlock::text("keep me"),
             ])
             .with_provider_replay(ProviderReplayState::OpenAiResponses {
+                model: Some("test-model".into()),
                 items: vec![json!({
                     "type": "reasoning",
                     "encrypted_content": "REPLAY_PAYLOAD"
@@ -516,6 +583,7 @@ mod tests {
             },
         ])
         .with_provider_replay(ProviderReplayState::OpenAiResponses {
+            model: Some("test-model".into()),
             items: vec![json!({"type":"reasoning","encrypted_content":"RAW_REPLAY"})],
         });
 
@@ -528,5 +596,80 @@ mod tests {
         assert!(!rendered.contains("RAW_REPLAY"));
         assert!(rendered.contains("image attachment media_type=image/png"));
         assert!(rendered.contains("filename=brief.pdf"));
+    }
+
+    #[test]
+    fn context_recovery_protects_partial_and_internal_continuation() {
+        let messages = vec![
+            SessionTurnMessage::user_text("current task"),
+            SessionTurnMessage::assistant_text("older progress"),
+            SessionTurnMessage::assistant_text("latest partial"),
+            SessionTurnMessage::user_text("continue internally"),
+        ];
+        let segments = provider_safe_segments(&messages);
+
+        assert_eq!(
+            context_recovery_protected_tail_segments(&messages, &segments),
+            2
+        );
+    }
+
+    #[test]
+    fn context_recovery_marker_keeps_the_entire_later_recovery_chain() {
+        let mut messages = vec![
+            SessionTurnMessage::user_text("current task"),
+            SessionTurnMessage::assistant_text("first partial"),
+            SessionTurnMessage::user_text("continue internally"),
+        ];
+        let first_segments = provider_safe_segments(&messages);
+        let marker = context_recovery_tail_marker(&messages, &first_segments)
+            .expect("first context recovery should establish a marker");
+
+        messages.extend([
+            SessionTurnMessage {
+                role: "assistant".into(),
+                content: vec![SessionTurnContentBlock::ToolUse {
+                    id: "toolu_1".into(),
+                    name: "lookup".into(),
+                    input: json!({}),
+                }],
+                provider_replay: None,
+            },
+            SessionTurnMessage::user_content(vec![SessionTurnContentBlock::ToolResult {
+                tool_use_id: "toolu_1".into(),
+                content: "result".into(),
+            }]),
+            SessionTurnMessage::assistant_text("second partial"),
+            SessionTurnMessage::user_text("continue internally again"),
+        ]);
+        let later_segments = provider_safe_segments(&messages);
+
+        assert_eq!(
+            context_recovery_protected_tail_from_marker(&messages, &later_segments, &marker),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn context_recovery_protects_complete_tool_pair_as_one_segment() {
+        let messages = vec![
+            SessionTurnMessage::user_text("current task"),
+            SessionTurnMessage {
+                role: "assistant".into(),
+                content: vec![SessionTurnContentBlock::ToolUse {
+                    id: "toolu_1".into(),
+                    name: "lookup".into(),
+                    input: json!({}),
+                }],
+                provider_replay: None,
+            },
+            tool_result("done"),
+        ];
+        let segments = provider_safe_segments(&messages);
+
+        assert_eq!(
+            context_recovery_protected_tail_segments(&messages, &segments),
+            1
+        );
     }
 }

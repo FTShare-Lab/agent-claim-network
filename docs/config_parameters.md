@@ -82,6 +82,8 @@ agent_id = "agent-a"
 - `endpoint`：与所选 provider 兼容的 LLM HTTP 地址，必须是绝对 HTTP(S) URL。可以填写服务 base URL，也可以填写完整请求 URL；OpenAI-compatible 的常见 base URL 形如 `https://llm.example.com/v1`，Anthropic-compatible 的常见 base URL 形如 `https://llm.example.com`。根 URL 会分别补全为 `/v1/chat/completions`、`/v1/responses` 或 `/v1/messages`；已有路径的 base URL 会追加相应末段，完整请求 URL 保持不变。
 - `model`：模型名，以配置文件为准。
 - `reasoning_effort`：控制 agent 主 LLM 的推理强度，可选值为 `none`、`low`、`medium`、`high`、`xhigh`、`max`，未配置时默认 `none`。未配置或设为 `none` 时不发送推理强度参数。
+- `anthropic_thinking`：只作用于 `provider = "anthropic"`，可选值为 `auto`、`enabled`、`adaptive`、`disabled`，默认 `auto`。`auto` 不发送 `thinking`，沿用上游默认行为；其他值显式发送对应 `thinking.type`。不作用于 Responses 或 Chat。
+- `anthropic_thinking_budget_tokens`：只作用于 `anthropic_thinking = "enabled"` 的可选 `thinking.budget_tokens`。未配置时不发送；选择 `adaptive`、`disabled` 或 `auto` 时也不发送。它不从 `reasoning_effort` 或 `max_tokens` 推导。
 - `api_key_env`：读取 agent LLM API key 的环境变量名，默认空字符串；真实 provider 必须填写。
 - `max_tokens`：单次模型响应的最大输出 token 数，默认 `65536`。
 - `context_window`：模型上下文窗口 token 数，默认 `200000`，必须大于 0。用于 TUI ctx 总量展示以及自动压缩阈值计算。
@@ -89,6 +91,8 @@ agent_id = "agent-a"
 - `retry_count`：首次失败后的额外重试次数，默认 `1`。`0` 表示一共只尝试一次，`1` 表示一共最多尝试两次。
 - `retry_base_delay_ms`：重试退避基础间隔，默认 `200`ms。第 N 次等待约为 `base * 2^(N-1)`，并叠加随机抖动。
 - `retry_max_delay_ms`：重试退避等待上限，默认 `5000`ms。
+
+特别说明：`openai_chat` 会丢弃厂商扩展 Reasoning 字段，要求 Reasoning 回传的模型应改用 `openai_responses` 或 `anthropic`。
 
 ### `[agent.inbox]`
 

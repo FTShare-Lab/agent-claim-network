@@ -20,12 +20,15 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time;
 use tokio::time::Instant;
 
+use super::continuation::{append_with_overlap_dedupe, CONTINUATION_TRIGGER};
+use super::provider::ProviderTerminalFailure;
 use crate::api::{
     estimate_provider_request_context_tokens, CompletedSessionTurnMessage, ContextUsageSnapshot,
-    ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy, ProviderReplayProtocol,
-    ProviderRequest, ProviderResponse, ProviderStop, SessionAttachment, SessionTurn,
-    SessionTurnContentBlock, SessionTurnEvent, SessionTurnInterrupted, SessionTurnMessage,
-    SessionTurnRequest, ToolBoundaryControl, ToolCallSkipReason, ToolExecutionOutcome,
+    ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy, ProviderReplayIdentity,
+    ProviderReplayState, ProviderRequest, ProviderResponse, ProviderStop, SessionAttachment,
+    SessionTurn, SessionTurnContentBlock, SessionTurnEvent, SessionTurnInterrupted,
+    SessionTurnMessage, SessionTurnRequest, ToolBoundaryControl, ToolCallSkipReason,
+    ToolExecutionOutcome,
 };
 use crate::attachment::{AttachmentKind, AttachmentLimits, NormalizedMedia, FILE_READ_MEDIA_KEY};
 use crate::claim::SessionId;
@@ -43,10 +46,92 @@ const NON_STREAMING_FALLBACK_ERROR_MAX_CHARS: usize = 4096;
 // 产品要求退避保持内部实现细节，不进入 config.toml。
 const NON_STREAMING_FALLBACK_BASE_DELAY: Duration = Duration::from_millis(250);
 const NON_STREAMING_FALLBACK_MAX_DELAY: Duration = Duration::from_secs(4);
+const MAX_CONTEXT_WINDOW_RECOVERIES: usize = 2;
 
 struct ProviderCallOutcome {
     response: ProviderResponse,
     recovered_with_non_streaming: bool,
+}
+
+#[derive(Default)]
+struct ContextWindowContinuation {
+    merged_text: String,
+    replay_model: Option<String>,
+    replay_messages: Vec<Value>,
+}
+
+impl ContextWindowContinuation {
+    fn has_pending(&self) -> bool {
+        self.replay_model.is_some()
+    }
+
+    fn fallback_replacement_text(&self, current: &str) -> String {
+        let mut merged = self.merged_text.clone();
+        append_with_overlap_dedupe(&mut merged, current);
+        merged
+    }
+
+    fn absorb_partial(&mut self, message: &SessionTurnMessage) -> anyhow::Result<()> {
+        append_with_overlap_dedupe(&mut self.merged_text, &assistant_message_text(message));
+        let Some(ProviderReplayState::AnthropicMessages { model, messages }) =
+            message.provider_replay.as_ref()
+        else {
+            anyhow::bail!("模型返回上下文截断，但缺少 Anthropic 续写状态，无法自动恢复");
+        };
+        if let Some(existing_model) = self.replay_model.as_ref() {
+            if existing_model != model {
+                anyhow::bail!("上下文恢复期间模型发生变化，无法继续本轮");
+            }
+        } else {
+            self.replay_model = Some(model.clone());
+        }
+        self.replay_messages.extend(messages.iter().cloned());
+        Ok(())
+    }
+
+    fn push_internal_continuation(&mut self) {
+        self.replay_messages.push(json!({
+            "role": "user",
+            "content": [{"type": "text", "text": CONTINUATION_TRIGGER}],
+        }));
+    }
+
+    fn merge_into(self, message: &mut SessionTurnMessage) -> anyhow::Result<()> {
+        let Some(replay_model) = self.replay_model else {
+            return Ok(());
+        };
+        let mut merged_text = self.merged_text;
+        append_with_overlap_dedupe(&mut merged_text, &assistant_message_text(message));
+        let mut non_text = message
+            .content
+            .drain(..)
+            .filter(|block| !matches!(block, SessionTurnContentBlock::Text { .. }))
+            .collect::<Vec<_>>();
+        if merged_text.trim().is_empty() {
+            message.content = non_text;
+        } else {
+            let mut content = Vec::with_capacity(non_text.len().saturating_add(1));
+            content.push(SessionTurnContentBlock::text(merged_text));
+            content.append(&mut non_text);
+            message.content = content;
+        }
+
+        let Some(ProviderReplayState::AnthropicMessages { model, messages }) =
+            message.provider_replay.take()
+        else {
+            anyhow::bail!("模型续写完成，但缺少 Anthropic 历史状态，无法保存完整结果");
+        };
+        if model != replay_model {
+            anyhow::bail!("模型续写前后的 Anthropic 历史状态不一致，无法保存完整结果");
+        }
+        let mut replay_messages = self.replay_messages;
+        replay_messages.extend(messages);
+        message.provider_replay = Some(ProviderReplayState::AnthropicMessages {
+            model,
+            messages: replay_messages,
+        });
+        Ok(())
+    }
 }
 
 /// 把进程输出回执绑定到生成它的原始 tool_result。只有该原文实际进入 provider
@@ -83,6 +168,15 @@ pub trait SessionTurnPreflight: Send {
         provider_messages: &mut Vec<SessionTurnMessage>,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
     ) -> anyhow::Result<()>;
+
+    /// 下一次 provider request 必须先执行上下文窗口恢复压缩。
+    /// 默认实现拒绝恢复，避免没有 compaction owner 的调用方原样重放满窗口请求。
+    fn request_context_window_recovery(
+        &mut self,
+        _assistant_marker: &SessionTurnMessage,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("模型上下文已满，但当前 ACN 调用链未接入自动恢复")
+    }
 
     fn observe_provider_context_usage(
         &mut self,
@@ -158,8 +252,8 @@ impl AgentTurnLoop {
         self.provider.history_media_policy()
     }
 
-    pub(crate) fn history_replay_protocol(&self) -> Option<ProviderReplayProtocol> {
-        self.provider.history_replay_protocol()
+    pub(crate) fn history_replay_identity(&self) -> Option<ProviderReplayIdentity> {
+        self.provider.history_replay_identity()
     }
 
     pub fn with_attachment_limits(mut self, limits: AttachmentLimits) -> Self {
@@ -878,8 +972,11 @@ impl AgentTurnLoop {
         )];
         let mut seen_tool_use_ids = HashSet::new();
         let mut pending_process_deliveries = Vec::<PendingProcessDelivery>::new();
+        let mut context_continuation = ContextWindowContinuation::default();
+        let mut context_window_recoveries = 0usize;
 
         let mut turn_idx = 0usize;
+        let mut provider_request_idx = 0usize;
         loop {
             if turn_idx > 0 && tool_boundary_is_cancelled(tool_boundary_control.as_ref()) {
                 return Err(SessionTurnInterrupted.into());
@@ -894,7 +991,7 @@ impl AgentTurnLoop {
             if tool_boundary_is_cancelled(tool_boundary_control.as_ref()) {
                 return Err(SessionTurnInterrupted.into());
             }
-            if turn_idx == 0 {
+            if provider_request_idx == 0 {
                 let attachment_context = ToolDispatchContext {
                     current_session_id: current_session_id.clone(),
                     current_turn_id: current_turn_id.clone(),
@@ -913,6 +1010,9 @@ impl AgentTurnLoop {
                         .await;
                 }
             }
+            provider_request_idx = provider_request_idx
+                .checked_add(1)
+                .context("run_session_turn provider 请求轮数溢出")?;
             let mut process_deliveries_for_request = Vec::new();
             let mut process_deliveries_not_in_request = Vec::new();
             for pending in &pending_process_deliveries {
@@ -946,6 +1046,7 @@ impl AgentTurnLoop {
                 self.call_provider(
                     &system_prompt,
                     &provider_messages,
+                    &context_continuation,
                     &mut provider_emit,
                     &mut durable_recorder,
                     &seen_tool_use_ids,
@@ -954,10 +1055,23 @@ impl AgentTurnLoop {
                 .await?
             };
             let provider_response = provider_call.response;
+            let stop = provider_response.stop;
             let assistant_message = provider_response.assistant_message;
             validate_assistant_message(&assistant_message)?;
             let tool_uses = collect_tool_uses(&assistant_message)?;
-            validate_provider_response_terminal_semantics(provider_response.stop, &tool_uses)?;
+            validate_provider_response_terminal_semantics(stop, &tool_uses)?;
+            if stop == ProviderStop::ContextWindowExceeded {
+                if context_window_recoveries >= MAX_CONTEXT_WINDOW_RECOVERIES {
+                    anyhow::bail!(
+                        "模型上下文已满；自动压缩并续写 {MAX_CONTEXT_WINDOW_RECOVERIES} 次后仍未完成。请简化任务或新建会话重试。"
+                    );
+                }
+                let Some(preflight) = preflight.as_mut() else {
+                    anyhow::bail!("模型上下文已满，但当前 ACN 调用链未接入自动恢复");
+                };
+                preflight.request_context_window_recovery(&assistant_message)?;
+                context_window_recoveries = context_window_recoveries.saturating_add(1);
+            }
             self.tools
                 .commit_process_deliveries(&process_deliveries_for_request)
                 .await;
@@ -974,11 +1088,16 @@ impl AgentTurnLoop {
                 }
             }
             let assistant_text = assistant_message_text(&assistant_message);
-            if !provider_call.recovered_with_non_streaming && !assistant_text.trim().is_empty() {
+            if stop != ProviderStop::ContextWindowExceeded
+                && !provider_call.recovered_with_non_streaming
+                && !assistant_text.trim().is_empty()
+            {
+                let completed_text =
+                    context_continuation.fallback_replacement_text(&assistant_text);
                 record_durable_event(
                     &mut durable_recorder,
                     SessionTurnEvent::AssistantMessageCompleted {
-                        text: assistant_text,
+                        text: completed_text,
                     },
                 )
                 .await?;
@@ -1011,8 +1130,28 @@ impl AgentTurnLoop {
                 return Err(SessionTurnInterrupted.into());
             }
 
-            let canonical_assistant_message = assistant_message.clone();
-            provider_messages.push(assistant_message);
+            let provider_assistant_message = assistant_message.clone();
+            if stop == ProviderStop::ContextWindowExceeded && tool_uses.is_empty() {
+                context_continuation.absorb_partial(&assistant_message)?;
+                provider_messages.push(provider_assistant_message);
+                if let Some(preflight) = preflight.as_mut() {
+                    if let Some(usage) = latest_provider_context_usage {
+                        preflight.observe_provider_context_usage(provider_messages.len(), usage);
+                    } else {
+                        preflight.clear_provider_context_usage();
+                    }
+                }
+                provider_messages.push(SessionTurnMessage::user_text(CONTINUATION_TRIGGER));
+                context_continuation.push_internal_continuation();
+                continue;
+            }
+
+            let mut canonical_assistant_message = assistant_message;
+            if context_continuation.has_pending() {
+                std::mem::take(&mut context_continuation)
+                    .merge_into(&mut canonical_assistant_message)?;
+            }
+            provider_messages.push(provider_assistant_message);
             if let Some(preflight) = preflight.as_mut() {
                 if let Some(usage) = latest_provider_context_usage {
                     preflight.observe_provider_context_usage(provider_messages.len(), usage);
@@ -1107,10 +1246,15 @@ impl AgentTurnLoop {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "provider 调用需同时携带 fallback 展示前缀、durable recorder 与中断边界"
+    )]
     async fn call_provider(
         &self,
         system_prompt: &str,
         messages: &[SessionTurnMessage],
+        context_continuation: &ContextWindowContinuation,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
         durable_recorder: &mut Option<&mut dyn SessionTurnEventRecorder>,
         seen_tool_use_ids: &HashSet<String>,
@@ -1138,7 +1282,9 @@ impl AgentTurnLoop {
                 emit(SessionTurnEvent::AssistantTextDelta { text });
             }
             ProviderEvent::AssistantMessageCompleted { text } => {
-                emit(SessionTurnEvent::AssistantMessageCompleted { text });
+                emit(SessionTurnEvent::AssistantMessageCompleted {
+                    text: context_continuation.fallback_replacement_text(&text),
+                });
             }
         };
 
@@ -1160,6 +1306,7 @@ impl AgentTurnLoop {
             }),
             Err(error)
                 if !emitted_assistant_text
+                    || error.downcast_ref::<ProviderTerminalFailure>().is_some()
                     || error.downcast_ref::<SessionTurnInterrupted>().is_some() =>
             {
                 Err(error)
@@ -1216,10 +1363,13 @@ impl AgentTurnLoop {
                         });
                     match fallback_result {
                         Ok(response) => {
+                            let replacement_text = context_continuation.fallback_replacement_text(
+                                &assistant_message_text(&response.assistant_message),
+                            );
                             let succeeded_event = SessionTurnEvent::NonStreamingFallbackSucceeded {
                                 attempt,
                                 max_attempts: NON_STREAMING_FALLBACK_MAX_ATTEMPTS,
-                                text: assistant_message_text(&response.assistant_message),
+                                text: replacement_text,
                             };
                             record_durable_event(durable_recorder, succeeded_event.clone()).await?;
                             emit(succeeded_event);
@@ -1229,6 +1379,21 @@ impl AgentTurnLoop {
                             });
                         }
                         Err(error) if error.downcast_ref::<SessionTurnInterrupted>().is_some() => {
+                            return Err(error);
+                        }
+                        Err(error) if error.downcast_ref::<ProviderTerminalFailure>().is_some() => {
+                            let (error_text, _) = truncate_chars(
+                                &format!("{error:#}"),
+                                NON_STREAMING_FALLBACK_ERROR_MAX_CHARS,
+                            );
+                            let failed_event =
+                                SessionTurnEvent::NonStreamingFallbackAttemptFailed {
+                                    attempt,
+                                    max_attempts: NON_STREAMING_FALLBACK_MAX_ATTEMPTS,
+                                    error: error_text,
+                                };
+                            record_durable_event(durable_recorder, failed_event.clone()).await?;
+                            emit(failed_event);
                             return Err(error);
                         }
                         Err(error) => {
@@ -1784,6 +1949,8 @@ fn validate_provider_response_terminal_semantics(
         (false, ProviderStop::MaxTokens) => {
             anyhow::bail!("provider stop=MaxTokens 且包含 ToolUse，拒绝执行半截工具调用")
         }
+        (true, ProviderStop::ContextWindowExceeded)
+        | (false, ProviderStop::ContextWindowExceeded) => Ok(()),
     }
 }
 
@@ -2319,11 +2486,12 @@ mod tests {
     use tokio::sync::{oneshot, watch, Mutex, Notify, Semaphore};
     use tokio::time::{sleep, timeout, Duration};
 
+    use super::{assistant_message_text, ProviderTerminalFailure, CONTINUATION_TRIGGER};
     use crate::agent::fs::LocalFsMemoryStore;
     use crate::api::{
         estimate_provider_request_context_tokens, AgentTurnLoop, ContextUsageSource,
-        ProviderAdapter, ProviderEvent, ProviderRequest, ProviderResponse, ProviderStop,
-        SessionTurnContentBlock, SessionTurnEvent, SessionTurnEventRecorder,
+        ProviderAdapter, ProviderEvent, ProviderReplayState, ProviderRequest, ProviderResponse,
+        ProviderStop, SessionTurnContentBlock, SessionTurnEvent, SessionTurnEventRecorder,
         SessionTurnInterrupted, SessionTurnMessage, SessionTurnPreflight, SessionTurnRequest,
         ToolBoundaryControl, ToolCallSkipReason, ToolExecutionOutcome,
     };
@@ -2349,6 +2517,14 @@ mod tests {
         requests: Mutex<Vec<ProviderRequest>>,
     }
 
+    struct TerminalFailureProvider {
+        requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    struct FallbackTerminalFailureProvider {
+        requests: Mutex<Vec<ProviderRequest>>,
+    }
+
     struct ReplaceProcessToolResultPreflight {
         calls: usize,
         tool_use_id: String,
@@ -2362,6 +2538,36 @@ mod tests {
     }
 
     struct ExternalizingTextAttachmentPreflight;
+
+    #[derive(Default)]
+    struct RecordingContextRecoveryPreflight {
+        requested: bool,
+        applied: usize,
+    }
+
+    #[async_trait]
+    impl SessionTurnPreflight for RecordingContextRecoveryPreflight {
+        async fn before_provider_request(
+            &mut self,
+            _system_prompt: &mut String,
+            _provider_messages: &mut Vec<SessionTurnMessage>,
+            _emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        ) -> anyhow::Result<()> {
+            if self.requested {
+                self.requested = false;
+                self.applied = self.applied.saturating_add(1);
+            }
+            Ok(())
+        }
+
+        fn request_context_window_recovery(
+            &mut self,
+            _assistant_marker: &SessionTurnMessage,
+        ) -> anyhow::Result<()> {
+            self.requested = true;
+            Ok(())
+        }
+    }
 
     #[async_trait]
     impl SessionTurnPreflight for ReplaceProcessToolResultPreflight {
@@ -2460,6 +2666,40 @@ mod tests {
                 emit(event);
             }
             attempt.result.map_err(anyhow::Error::msg)
+        }
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for TerminalFailureProvider {
+        async fn send(
+            &self,
+            request: ProviderRequest,
+            emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        ) -> anyhow::Result<ProviderResponse> {
+            self.requests.lock().await.push(request);
+            emit(ProviderEvent::AssistantTextDelta {
+                text: "partial".into(),
+            });
+            Err(ProviderTerminalFailure::new("provider refused request").into())
+        }
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for FallbackTerminalFailureProvider {
+        async fn send(
+            &self,
+            request: ProviderRequest,
+            emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        ) -> anyhow::Result<ProviderResponse> {
+            let is_streaming = request.stream;
+            self.requests.lock().await.push(request);
+            if is_streaming {
+                emit(ProviderEvent::AssistantTextDelta {
+                    text: "partial".into(),
+                });
+                return Err(anyhow::anyhow!("stream transport failed"));
+            }
+            Err(ProviderTerminalFailure::new("provider refused request").into())
         }
     }
 
@@ -2869,6 +3109,27 @@ mod tests {
             assistant_message: SessionTurnMessage {
                 role: "assistant".into(),
                 provider_replay: None,
+                content,
+            },
+            stop,
+        }
+    }
+
+    fn anthropic_response(
+        content: Vec<SessionTurnContentBlock>,
+        raw_content: Vec<Value>,
+        stop: ProviderStop,
+    ) -> ProviderResponse {
+        ProviderResponse {
+            assistant_message: SessionTurnMessage {
+                role: "assistant".into(),
+                provider_replay: Some(ProviderReplayState::AnthropicMessages {
+                    model: "test-model".into(),
+                    messages: vec![json!({
+                        "role": "assistant",
+                        "content": raw_content,
+                    })],
+                }),
                 content,
             },
             stop,
@@ -3304,6 +3565,216 @@ mod tests {
             event,
             SessionTurnEvent::NonStreamingFallbackSucceeded { attempt: 5, .. }
         )));
+    }
+
+    #[tokio::test]
+    async fn terminal_provider_failure_after_visible_delta_does_not_fallback() {
+        let provider = Arc::new(TerminalFailureProvider {
+            requests: Mutex::new(Vec::new()),
+        });
+        let turn_loop = tool_loop(provider.clone());
+        let mut events = Vec::new();
+
+        let error = turn_loop
+            .run_session_turn(request(), &mut |event| events.push(event))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("provider refused request"));
+        assert_eq!(provider.requests.lock().await.len(), 1);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
+                | SessionTurnEvent::NonStreamingFallbackAttemptFailed { .. }
+                | SessionTurnEvent::NonStreamingFallbackSucceeded { .. }
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_provider_failure_stops_non_streaming_fallback_after_current_attempt() {
+        let provider = Arc::new(FallbackTerminalFailureProvider {
+            requests: Mutex::new(Vec::new()),
+        });
+        let turn_loop = tool_loop(provider.clone());
+        let mut events = Vec::new();
+
+        let error = turn_loop
+            .run_session_turn(request(), &mut |event| events.push(event))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("provider refused request"));
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].stream);
+        assert!(!requests[1].stream);
+        drop(requests);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
+                ))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::NonStreamingFallbackAttemptFailed {
+                attempt: 1,
+                error,
+                ..
+            } if error.contains("provider refused request")
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::NonStreamingFallbackAttemptStarted { attempt: 2, .. }
+                | SessionTurnEvent::NonStreamingFallbackAttemptFailed { attempt: 2, .. }
+                | SessionTurnEvent::NonStreamingFallbackSucceeded { .. }
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn context_stop_during_non_streaming_fallback_switches_to_forced_preflight() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            scripted_failure(
+                vec![ProviderEvent::AssistantTextDelta {
+                    text: "streaming-partial".into(),
+                }],
+                "stream transport failed",
+            ),
+            ScriptedProviderAttempt {
+                events: Vec::new(),
+                result: Ok(anthropic_response(
+                    vec![SessionTurnContentBlock::text("fallback-context-")],
+                    vec![
+                        json!({
+                            "type":"thinking",
+                            "thinking":"private-fallback-context",
+                            "signature":"sig-fallback-context"
+                        }),
+                        json!({"type":"text", "text":"fallback-context-"}),
+                    ],
+                    ProviderStop::ContextWindowExceeded,
+                )),
+            },
+            ScriptedProviderAttempt {
+                events: Vec::new(),
+                result: Ok(anthropic_response(
+                    vec![SessionTurnContentBlock::text("final")],
+                    vec![json!({"type":"text", "text":"final"})],
+                    ProviderStop::Done,
+                )),
+            },
+        ]));
+        let turn_loop = tool_loop(provider.clone());
+        let mut preflight = RecordingContextRecoveryPreflight::default();
+        let mut events = Vec::new();
+
+        let turn = turn_loop
+            .run_session_turn_with_hooks(
+                request(),
+                &mut |event| events.push(event),
+                None,
+                None,
+                Some(&mut preflight),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            assistant_message_text(&turn.messages[1]),
+            "fallback-context-final"
+        );
+        assert_eq!(preflight.applied, 1);
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].stream);
+        assert!(!requests[1].stream);
+        assert!(requests[2].stream);
+        drop(requests);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
+                ))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::NonStreamingFallbackSucceeded { attempt: 1, .. }
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::NonStreamingFallbackAttemptStarted { attempt: 2, .. }
+                | SessionTurnEvent::NonStreamingFallbackAttemptFailed { attempt: 2, .. }
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continuation_fallback_replacement_includes_prior_context_partial() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ScriptedProviderAttempt {
+                events: Vec::new(),
+                result: Ok(anthropic_response(
+                    vec![SessionTurnContentBlock::text("context-prefix-")],
+                    vec![json!({"type":"text", "text":"context-prefix-"})],
+                    ProviderStop::ContextWindowExceeded,
+                )),
+            },
+            scripted_failure(
+                vec![ProviderEvent::AssistantTextDelta {
+                    text: "failed-continuation-partial".into(),
+                }],
+                "continuation stream failed",
+            ),
+            ScriptedProviderAttempt {
+                events: Vec::new(),
+                result: Ok(anthropic_response(
+                    vec![SessionTurnContentBlock::text("final")],
+                    vec![json!({"type":"text", "text":"final"})],
+                    ProviderStop::Done,
+                )),
+            },
+        ]));
+        let turn_loop = tool_loop(provider.clone());
+        let mut preflight = RecordingContextRecoveryPreflight::default();
+        let mut events = Vec::new();
+
+        let turn = turn_loop
+            .run_session_turn_with_hooks(
+                request(),
+                &mut |event| events.push(event),
+                None,
+                None,
+                Some(&mut preflight),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            assistant_message_text(&turn.messages[1]),
+            "context-prefix-final"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::NonStreamingFallbackSucceeded { text, .. }
+                if text == "context-prefix-final"
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::NonStreamingFallbackSucceeded { text, .. }
+                if text == "final"
+        )));
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].stream);
+        assert!(requests[1].stream);
+        assert!(!requests[2].stream);
     }
 
     #[tokio::test(start_paused = true)]
@@ -7396,6 +7867,221 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("stop=ToolUse"));
+    }
+
+    #[tokio::test]
+    async fn context_window_stop_compacts_then_commits_merged_anthropic_replay() {
+        let provider = Arc::new(FakeProvider::new(vec![
+            anthropic_response(
+                vec![SessionTurnContentBlock::text("first ")],
+                vec![
+                    json!({"type":"thinking", "thinking":"private", "signature":"sig"}),
+                    json!({"type":"text", "text":"first "}),
+                ],
+                ProviderStop::ContextWindowExceeded,
+            ),
+            anthropic_response(
+                vec![SessionTurnContentBlock::text("second")],
+                vec![json!({"type":"text", "text":"second"})],
+                ProviderStop::Done,
+            ),
+        ]));
+        let turn_loop = tool_loop(provider.clone());
+        let mut preflight = RecordingContextRecoveryPreflight::default();
+        let mut events = Vec::new();
+
+        let turn = turn_loop
+            .run_session_turn_with_hooks(
+                request(),
+                &mut |event| events.push(event),
+                None,
+                None,
+                Some(&mut preflight),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(turn.messages.len(), 2);
+        assert_eq!(assistant_message_text(&turn.messages[1]), "first second");
+        let Some(ProviderReplayState::AnthropicMessages { messages, .. }) =
+            turn.messages[1].provider_replay.as_ref()
+        else {
+            panic!("merged assistant must preserve Anthropic replay");
+        };
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"][0]["text"], CONTINUATION_TRIGGER);
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(preflight.applied, 1);
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].messages.last().unwrap().role, "user");
+        assert!(assistant_message_text(requests[1].messages.last().unwrap())
+            .contains(CONTINUATION_TRIGGER));
+    }
+
+    #[tokio::test]
+    async fn context_continuation_completed_event_contains_full_visible_response() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ScriptedProviderAttempt {
+                events: vec![
+                    ProviderEvent::AssistantTextDelta {
+                        text: "first ".into(),
+                    },
+                    ProviderEvent::AssistantMessageCompleted {
+                        text: "first ".into(),
+                    },
+                ],
+                result: Ok(anthropic_response(
+                    vec![SessionTurnContentBlock::text("first ")],
+                    vec![json!({"type":"text", "text":"first "})],
+                    ProviderStop::ContextWindowExceeded,
+                )),
+            },
+            ScriptedProviderAttempt {
+                events: vec![
+                    ProviderEvent::AssistantTextDelta {
+                        text: "second".into(),
+                    },
+                    ProviderEvent::AssistantMessageCompleted {
+                        text: "second".into(),
+                    },
+                ],
+                result: Ok(anthropic_response(
+                    vec![SessionTurnContentBlock::text("second")],
+                    vec![json!({"type":"text", "text":"second"})],
+                    ProviderStop::Done,
+                )),
+            },
+        ]));
+        let turn_loop = tool_loop(provider);
+        let mut preflight = RecordingContextRecoveryPreflight::default();
+        let mut events = Vec::new();
+
+        let turn = turn_loop
+            .run_session_turn_with_hooks(
+                request(),
+                &mut |event| events.push(event),
+                None,
+                None,
+                Some(&mut preflight),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(assistant_message_text(&turn.messages[1]), "first second");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::AssistantMessageCompleted { text }
+                if text == "first second"
+        )));
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_context_partial_is_replayed_without_empty_success() {
+        let provider = Arc::new(FakeProvider::new(vec![
+            anthropic_response(
+                Vec::new(),
+                vec![json!({
+                    "type":"thinking",
+                    "thinking":"private",
+                    "signature":"sig"
+                })],
+                ProviderStop::ContextWindowExceeded,
+            ),
+            anthropic_response(
+                vec![SessionTurnContentBlock::text("visible")],
+                vec![json!({"type":"text", "text":"visible"})],
+                ProviderStop::Done,
+            ),
+        ]));
+        let turn_loop = tool_loop(provider);
+        let mut preflight = RecordingContextRecoveryPreflight::default();
+
+        let turn = turn_loop
+            .run_session_turn_with_hooks(request(), &mut |_| {}, None, None, Some(&mut preflight))
+            .await
+            .unwrap();
+
+        assert_eq!(assistant_message_text(&turn.messages[1]), "visible");
+        let Some(ProviderReplayState::AnthropicMessages { messages, .. }) =
+            turn.messages[1].provider_replay.as_ref()
+        else {
+            panic!("reasoning-only partial must survive in final replay");
+        };
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["content"][0]["type"], "thinking");
+        assert_eq!(preflight.applied, 1);
+    }
+
+    #[tokio::test]
+    async fn context_window_recovery_has_independent_two_attempt_limit() {
+        let context_response = || {
+            anthropic_response(
+                vec![SessionTurnContentBlock::text("partial")],
+                vec![json!({"type":"text", "text":"partial"})],
+                ProviderStop::ContextWindowExceeded,
+            )
+        };
+        let provider = Arc::new(FakeProvider::new(vec![
+            context_response(),
+            context_response(),
+            context_response(),
+        ]));
+        let turn_loop = tool_loop(provider.clone());
+        let mut preflight = RecordingContextRecoveryPreflight::default();
+
+        let error = turn_loop
+            .run_session_turn_with_hooks(request(), &mut |_| {}, None, None, Some(&mut preflight))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("自动压缩并续写 2 次后仍未完成"));
+        assert_eq!(provider.requests.lock().await.len(), 3);
+        assert_eq!(preflight.applied, 2);
+    }
+
+    #[tokio::test]
+    async fn complete_tool_use_at_context_limit_executes_before_forced_compaction() {
+        let provider = Arc::new(FakeProvider::new(vec![
+            anthropic_response(
+                vec![tool_use("toolu_context", "missing_tool", json!({}))],
+                vec![json!({
+                    "type":"tool_use",
+                    "id":"toolu_context",
+                    "name":"missing_tool",
+                    "input":{}
+                })],
+                ProviderStop::ContextWindowExceeded,
+            ),
+            anthropic_response(
+                vec![SessionTurnContentBlock::text("after tool")],
+                vec![json!({"type":"text", "text":"after tool"})],
+                ProviderStop::Done,
+            ),
+        ]));
+        let turn_loop = tool_loop(provider.clone());
+        let mut preflight = RecordingContextRecoveryPreflight::default();
+
+        let turn = turn_loop
+            .run_session_turn_with_hooks(request(), &mut |_| {}, None, None, Some(&mut preflight))
+            .await
+            .unwrap();
+
+        assert_eq!(turn.messages.len(), 4);
+        assert!(matches!(
+            turn.messages[1].content.as_slice(),
+            [SessionTurnContentBlock::ToolUse { id, .. }] if id == "toolu_context"
+        ));
+        assert_eq!(turn.messages[2].role, "user");
+        assert_eq!(
+            tool_result_content(&turn.messages[2], "toolu_context")["ok"],
+            false
+        );
+        assert_eq!(assistant_message_text(&turn.messages[3]), "after tool");
+        assert_eq!(provider.requests.lock().await.len(), 2);
+        assert_eq!(preflight.applied, 1);
     }
 
     #[tokio::test]

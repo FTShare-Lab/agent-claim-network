@@ -15,6 +15,8 @@ pub struct ResponsesRequest {
     pub stream: bool,
     pub store: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub include: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ResponsesReasoning>,
 }
 
@@ -390,6 +392,7 @@ mod tests {
             max_output_tokens: 1024,
             stream: true,
             store: false,
+            include: None,
             reasoning: None,
         };
 
