@@ -1,5 +1,6 @@
-# 在 Apple Silicon Docker Desktop 上原生运行，交叉生成 DeepSWE 所需的 Linux x86_64 二进制。
-FROM debian:bookworm-slim
+# 在宿主 Docker daemon 的原生架构上运行，生成 DeepSWE 所需的 Linux x86_64 二进制。
+ARG BASE_IMAGE=debian:bookworm-slim
+FROM ${BASE_IMAGE}
 
 RUN dpkg --add-architecture amd64 \
     && apt-get update \
