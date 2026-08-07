@@ -71,6 +71,8 @@ def freeze_dataset(
     tasks_root: Path, manifest_path: Path, seed: int, sample_size: int = 5
 ) -> FrozenDatasetManifest:
     """从稳定排序的 task.toml 目录无放回抽样，绝不观察执行结果。"""
+    if isinstance(sample_size, bool) or not isinstance(sample_size, int) or sample_size <= 0:
+        raise DatasetFreezeError("抽样任务数必须为正整数")
     if not tasks_root.is_dir():
         raise DatasetFreezeError(f"任务根目录不存在: {tasks_root}")
     if not manifest_path.is_absolute():
