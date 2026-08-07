@@ -2,7 +2,7 @@
 //!
 //! 本模块只接受外部 attempt 配置，构造隔离 runtime root 中的单个 session，
 //! 并把不含 credential 的版本化 JSONL 事件和最终 result JSON 落到 attempt output 目录。
-//! 模型 API key 与 Pier 官方 adapter 一致，由容器环境变量提供（`[agent.llm].api_key_env`）。
+//! 模型 API key 由容器环境变量提供（`[agent.llm].api_key_env`）。
 
 mod bundle_router;
 
@@ -402,7 +402,7 @@ async fn run_attempt_inner(
             cfg.agent.llm.provider
         );
     }
-    // key 由 Pier 注入容器环境后经 [agent.llm].api_key_env 读取，与官方 adapter 一致。
+    // key 仅从容器环境读取，不写入评测配置或结果产物。
     if cfg.agent.llm.api_key.is_none() {
         anyhow::bail!(
             "stage=credential 容器环境缺少 [agent.llm].api_key_env 指定的模型 key: {}",

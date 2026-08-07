@@ -1,7 +1,7 @@
 """Pier `BaseAgent` 适配：上传 ACN 产物、声明出网域名、执行单个 attempt。
 
-与 Pier 官方 adapter（mini_swe_agent / codex / opencode）同一口径：模型 key 由宿主
-环境注入容器进程环境，出网由 Pier 自己的 Squid 域名 allowlist 限死，不自建代理。
+模型 key 由宿主环境注入容器进程环境，出网由宿主的域名 allowlist 限死，
+适配层不自建代理。
 """
 
 from __future__ import annotations
