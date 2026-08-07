@@ -167,15 +167,15 @@ skill 不能包含题目答案或仓库专属提示。评测期间 skill 原文�
 
 ## 6. 模型和调用渠道
 
-第一轮倾向使用本地部署的 **GLM-5.2**，由 llm-proxy 提供独立 endpoint。
+第一轮使用本地部署的 **deepseek-v4-flash-local**，由独立模型服务提供 endpoint。
 
 这样做的原因是：
 
 - 成本低，适合先验证 ACN 流水线和 claim 信号；
-- 官方已有 mini-swe-agent + GLM-5.2 的 44%±2% 结果，可作外部参照；
+- 公开数据可用于建立外部参照，但不替代本次受控实验；
 - 如果结果有区分度，再申请更强模型，不必一开始投入大量 token。
 
-运行时冻结具体 checkpoint、采样参数、上下文长度和每题限额。llm-proxy 需要返回实际模型名和
+运行时冻结具体 checkpoint、采样参数、上下文长度和每题限额。模型服务需要返回实际模型名和
 input/output/cache token，避免路由换模或缓存差异无法解释。
 
 ## 7. 记录什么
@@ -184,12 +184,12 @@ input/output/cache token，避免路由换模或缓存差异无法解释。
 | --- | --- | --- |
 | pass rate | 看任务完成质量 | DeepSWE verifier |
 | claim uplift | `pass(B_claim) - pass(B_empty)`，本期主指标 | 按题配对结果 |
-| token | 看 claim 是否减少或增加模型消耗 | llm-proxy 原始 usage |
+| token | 看 claim 是否减少或增加模型消耗 | 模型服务原始 usage |
 | 标准化费用 | 按冻结官方费率换算，缓存单独计价 | token usage + 价目表 |
 | agent step | 看完成任务需要多少轮决策 | ACN session JSONL |
 | claim retrieved / used | 确认 B 是否真的检索和引用 claim | router 记录 + trace |
 
-`agent step` 统一定义为一次完整的模型响应；tool call 数另记。实际本地 GPU 成本如果 llm-proxy
+`agent step` 统一定义为一次完整的模型响应；tool call 数另记。实际本地 GPU 成本如果模型服务
 能够提供则单列，不能和按官方费率换算的费用混成一个数。
 
 ## 8. 运行规模
@@ -219,7 +219,7 @@ Full 只补剩余 83 题，即新增 83 × 3 = 249 attempts**，不重复花钱�
 
 Smoke 完成后检查：
 
-- verifier、router、session JSONL 和 llm-proxy usage 均能稳定落盘；
+- verifier、router、session JSONL 和模型服务 usage 均能稳定落盘；
 - 无 claim 基线没有出现明显的全失败或全通过；
 - B_claim 能实际检索到 claim；
 - token 和费用可以复算，全量预算可接受；
@@ -248,8 +248,8 @@ agent 自身失败按未通过计分；runner、网络或 proxy 故障修复后�
 
 ## 11. 组会待拍板
 
-1. GLM-5.2 的具体 checkpoint、采样参数和每题 token/时间上限；
-2. llm-proxy 能否提供 input、output、cache token、实际模型名和费用数据；
+1. deepseek-v4-flash-local 的具体 checkpoint、采样参数和每题 token/时间上限；
+2. 模型服务能否提供 input、output、cache token、实际模型名和费用数据；
 3. 统一 `coding-benchmark` skill 的最终内容；
 4. 30 题固定抽样结果和全量预算；
 5. 什么信号触发更强模型的第二轮 Smoke。

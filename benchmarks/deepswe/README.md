@@ -18,8 +18,8 @@
 token 计量由 `acn_eval` 自己从上游响应的 `usage` 累计，写进 `result.json` 的 `usage`
 （`model_requests` / `incomplete_model_responses` / `response_models` / `input_tokens` /
 `output_tokens` / `cache_read_tokens` / `reasoning_tokens`）；宿主结果另计算 `cache_hit_rate`。
-**reasoning token 计入 `max_tokens`**——glm-5.2 回一个 "ok" 都要花约
-115 个推理 token，`max_tokens` 设小会让模型在发出 tool call 前被截断，attempt 直接失败。
+**reasoning token 计入 `max_tokens`**——不同模型的推理 token 开销不同，`max_tokens` 设小会让
+模型在发出 tool call 前被截断，attempt 直接失败。
 官方 `mini-swe-agent` 不设 output cap，本 runner 默认给 65536。
 
 三臂注入同一份冻结 `assets/coding-benchmark/SKILL.md`（hash 写入 manifest），路径为
@@ -106,18 +106,18 @@ skill、task 与两份 Python source tree hash。`acn_revision` 必须等于当�
 Pier 固定 `force_build=false`，使用冻结 `task.toml` 指向的官方预构建镜像，避免本机联网重建
 和架构漂移；同时固定 `n_attempts=1`、`n_concurrent_trials=1`、`max_retries=0`。
 
-`EvaluationProvenance.model` 是发送给 llm-proxy 的渠道模型名，`expected_response_model` 是
-上游实际返回的 checkpoint 名，二者都写入 execution manifest。模型别名映射需先经预探针确认
-再锁进配置：实测 `glm-5.2-auto → glm-5.2` 时应写 `model: glm-5.2-auto`、
-`response_model: glm-5.2`，而不是把两者强设为同一字符串。`reasoning_effort` 是必填的 ACN
-推理强度配置，本次 Luna 预烟运行使用 `high`。`resources` 必须记录 `cpus`、
+`EvaluationProvenance.model` 是发送给模型服务的请求模型名，`expected_response_model` 是
+上游实际返回的 checkpoint 名，二者都写入 execution manifest。当前示例使用
+`deepseek-v4-flash-local` 作为两者的冻结值；若预探针发现响应 checkpoint 不同，必须以实际值
+更新 `response_model`，不能静默忽略别名映射。`reasoning_effort` 是必填的 ACN
+推理强度配置，示例使用 `high`。`resources` 必须记录 `cpus`、
 `memory_mb`、`storage_mb`、`max_tokens`、`context_window`；`timeouts` 必须记录
 `agent_seconds`、`deadline_reserve_seconds`，`llm_retry` 必须记录三项重试参数。
 
 `manifests/luna-smoke-v1.json` 从 DeepSWE v1.1 官方 trial artifact 中冻结
 `gpt-5-6-luna / mini_swe_agent_gpt_5_6_luna_max` 的两个极端历史 cohort：5 题在四次
 rollout 中 4/4 通过，5 题 0/4 通过。manifest 同时记录 artifact SHA-256、筛选口径、
-历史 token/step 合计和本地 DeepSWE/Pier revision；真实请求仍使用代理确认后的模型别名。
+历史 token/step 合计和本地 DeepSWE/Pier revision；它只用于任务抽样，真实请求使用上述冻结模型。
 
 ## Gate 判什么
 
