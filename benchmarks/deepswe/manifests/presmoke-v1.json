@@ -1,0 +1,60 @@
+{
+  "algorithm": "random.sample_without_replacement_v1",
+  "task_directory_hash_algorithm": "sha256_directory_tree_v2",
+  "candidates_hash": "dd268d230c3cde0c0de2787a79d3180534cc5faf3e5431355d8330d60ba1b733",
+  "deepswe_revision": "e016041a6ccf8da29906afc9a3f5a8df940a1f78",
+  "pier_revision": "fefa7475a32bb05271abdea378e8083c83eb5c35",
+  "schema_version": 1,
+  "seed": 20260726,
+  "task_ids": [
+    "bandit-structured-nosec-directives",
+    "ipython-session-bundle-replay",
+    "koota-entity-snapshot-rollback",
+    "pwntools-tube-multiplexing",
+    "sql-formatter-bigquery-pipe-formatting"
+  ],
+  "task_directory_hashes": {
+    "bandit-structured-nosec-directives": {
+      "normalized": "998c06760b07fa84948f881c011c1cd91d01df2b085c4fb6d5c20ff708a1134e",
+      "source": "ead13aca0c3b606c2c6e8b0cbc34a2795de3cfb5bd387540a55985a2f8ab058c"
+    },
+    "ipython-session-bundle-replay": {
+      "normalized": "e3a34b8c00d8c12eea736e7a486dbae2352121163db5c932cd2723e4af67ac6c",
+      "source": "97fc752807171e058a8a0009a496b01092e217c80f54c57d6b602c6a371484b7"
+    },
+    "koota-entity-snapshot-rollback": {
+      "normalized": "060f7b610dc0a196f3771be8ae5db85e2ad65b4134da470043e826bcb78929c9",
+      "source": "e943b1f45dc281ad3e77c0b8a261f4a43fdbd15969db2619466dae6bb8f39ceb"
+    },
+    "pwntools-tube-multiplexing": {
+      "normalized": "400ab96df09e0fb1d10ba94c0913c7ce17b155af8435a4710b13c9ecc56aedc2",
+      "source": "34458930e37efe05c66d4e42f072ed71c22d4d1325cc92c86f343f06b9464309"
+    },
+    "sql-formatter-bigquery-pipe-formatting": {
+      "normalized": "da5a12c1a4266fec7772768904bbfa2ca675b3f08a35348c53738c69d389f71a",
+      "source": "8375c3b7fd85411dbf380c427c6b4db41be39ec0ed3586796df113adb4f5941b"
+    }
+  },
+  "task_toml_hashes": {
+    "bandit-structured-nosec-directives": {
+      "normalized": "b0384371f2e2a62b971e41e75a35073b061bdf4b1bd47800dc127ff5b04bb53a",
+      "source": "c4aa3679bb98005d081b16ec6dfef8e2c866479982cbdb12c68c5137937bbb3c"
+    },
+    "ipython-session-bundle-replay": {
+      "normalized": "bf45b7eadff270b36d168c6b061ffc0e5403a0c1f15c6e13cea4e32acbbe2c0b",
+      "source": "7fcae2af9caba5129b34063e6c6f615ee42a0f93358e7527291f9f99503ba3fc"
+    },
+    "koota-entity-snapshot-rollback": {
+      "normalized": "f8e132f04a564699e80ca699411a0206c84dde232d3460fc383a62024b65b2a7",
+      "source": "f2544cb78f3a0cfd4397875edb4b2da6840c6560f3f712d2d0c8363481fae2e9"
+    },
+    "pwntools-tube-multiplexing": {
+      "normalized": "d4fc28f9b87a80aedc2b58ac14aeb67c06d9d82361ab2a9410a69c4709b1e30e",
+      "source": "2e9d7894f7d8904c5e5402425846168ca6d52aa81e03d92875c2adc35a4caf7f"
+    },
+    "sql-formatter-bigquery-pipe-formatting": {
+      "normalized": "ae56b798f912e3c87c52bd1bc050cc34d9769262a03503b9cd4865eb66d7c171",
+      "source": "38b3c7c9668d95f67cb864681c408e8345a0d4c9bc0210f749ac5dc88247918b"
+    }
+  }
+}

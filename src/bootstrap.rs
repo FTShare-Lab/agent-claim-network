@@ -27,7 +27,7 @@ use crate::api::{
     StructuredJsonCaller, MEMORY_REVIEW_MAX_TOOL_LOOP_TURNS,
 };
 use crate::attachment::AttachmentLimits;
-use crate::claim::AgentId;
+use crate::claim::{AgentId, Claim, Dispute, InboxId, InboxMessage};
 use crate::config::{Config, LlmChatConfig, LlmProvider, ResolvedUpstream};
 use crate::delegation::{DelegationRunnerConfig, DelegationWaitConfig, LlmDelegationExecutor};
 use crate::maintainer::http_client::HttpMaintainerClient;
@@ -228,6 +228,7 @@ pub fn build_agent_cli_session_engine_with_mcp(
             workspace_root: cfg.agent.tool.workspace_root.clone(),
             turn_journal: cfg.agent.session.turn_journal.clone(),
             subagent_max_concurrent: cfg.agent.session.subagents.max_concurrent,
+            runtime_profile: crate::agent::SessionRuntimeProfile::Interactive,
         },
     )
     .with_acn_md_path(cfg.storage.acn_md_path())
@@ -242,6 +243,167 @@ pub fn build_agent_cli_session_engine_with_mcp(
         engine = engine.with_mcp_manager(mcp_manager);
     }
     Ok(engine)
+}
+
+/// 构造非交互评测 session engine。评测使用冻结 router，但不读取 inbox、私有 memory 或 ACN.md。
+pub fn build_evaluation_session_engine(
+    cfg: &Config,
+    upstream: &ResolvedUpstream,
+    router: Arc<dyn RouterClient>,
+) -> anyhow::Result<SessionEngine> {
+    if cfg.agent.llm.provider != LlmProvider::OpenAiChat {
+        anyhow::bail!("evaluation 只支持 openai_compatible_chat provider");
+    }
+    let prompts = build_session_prompt_registry(cfg)?;
+    let provider = build_provider_adapter(cfg)?;
+    let chat = &cfg.agent.llm;
+    let agent_home = cfg.agent_home(&upstream.agent_id);
+    let claim_store: Arc<dyn LocalClaimStore> =
+        Arc::new(LocalFsClaimStore::new(agent_home.clone()));
+    let reported_dispute_claim_sets: Arc<dyn ReportedDisputeClaimSetStore> =
+        Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home.clone()));
+    let available_skills = load_available_skills(cfg)?;
+    let runner = Arc::new(AgentRunner::new(
+        upstream.agent_id.clone(),
+        Arc::new(PromptInboxJsonGenerator::new(
+            prompts.clone(),
+            Arc::new(StructuredJsonCaller::new(
+                provider.clone(),
+                chat.max_tokens,
+                chat.retry_count,
+                Duration::from_millis(chat.retry_base_delay_ms),
+                Duration::from_millis(chat.retry_max_delay_ms),
+            )),
+        )),
+        claim_store,
+        reported_dispute_claim_sets,
+        Arc::new(EvaluationInboxReader),
+        Arc::new(EvaluationMemoryStore),
+        router.clone(),
+        Arc::new(EvaluationMaintainerClient),
+        Arc::new(LocalFsMaintainerUploadQueue::new(agent_home.clone())),
+        chat.retry_count,
+        available_skills,
+    ));
+    let json_caller = Arc::new(StructuredJsonCaller::new(
+        provider.clone(),
+        chat.max_tokens,
+        chat.retry_count,
+        Duration::from_millis(chat.retry_base_delay_ms),
+        Duration::from_millis(chat.retry_max_delay_ms),
+    ));
+    let attachment_limits = AttachmentLimits::from(&cfg.agent.attachment);
+    let tools = Arc::new(
+        ToolRegistry::new(&cfg.agent.tool)?
+            .with_process_id_attempts(cfg.agent.session.id_mint_max_attempts())
+            .with_process_owner_agent_id(upstream.agent_id.clone())
+            .with_router_client(router)
+            .for_evaluation(cfg.agent.llm.api_key_env.clone())
+            .with_attachment_limits(attachment_limits),
+    );
+    let turn_loop = Arc::new(
+        AgentTurnLoop::new(provider.clone(), tools.clone(), chat.max_tokens)
+            .with_attachment_limits(attachment_limits)
+            .with_tool_journal_preview_limits(
+                cfg.agent.session.turn_journal.recovery_tool_input_max_chars,
+                cfg.agent
+                    .session
+                    .turn_journal
+                    .recovery_tool_output_max_chars,
+            ),
+    );
+    let memory_review_loop = Arc::new(MemoryReviewLoop::new(
+        provider,
+        Arc::new(tools.as_ref().clone().for_memory_review()),
+        MEMORY_REVIEW_MAX_TOOL_LOOP_TURNS,
+        chat.max_tokens,
+    ));
+    Ok(SessionEngine::new(
+        runner,
+        turn_loop,
+        memory_review_loop,
+        json_caller,
+        prompts,
+        SessionStore::new(cfg.storage.agents_root.clone()),
+        SessionEngineOptions {
+            compaction: cfg.agent.session.compaction.clone(),
+            skills: cfg.agent.session.skills.clone(),
+            context_window: cfg.agent.llm.context_window,
+            user_shell: cfg.agent.session.user_shell.clone(),
+            workspace_root: cfg.agent.tool.workspace_root.clone(),
+            turn_journal: cfg.agent.session.turn_journal.clone(),
+            subagent_max_concurrent: cfg.agent.session.subagents.max_concurrent,
+            runtime_profile: crate::agent::SessionRuntimeProfile::Evaluation,
+        },
+    )
+    .with_session_metadata("evaluation", cfg.agent.llm.model.clone())
+    .with_session_search_sqlite_busy_timeout(std::time::Duration::from_millis(
+        cfg.agent.tool.session_search_sqlite_busy_timeout_ms,
+    ))
+    .with_fork_memory_review(false)
+    .with_attachment_config(cfg.agent.attachment.clone()))
+}
+
+struct EvaluationInboxReader;
+
+#[async_trait::async_trait]
+impl InboxReader for EvaluationInboxReader {
+    async fn list_pending(&self) -> anyhow::Result<Vec<InboxMessage>> {
+        Ok(Vec::new())
+    }
+
+    async fn ack(&self, _msg_id: &InboxId) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn accept_pulled(&self, _msg: &InboxMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+struct EvaluationMemoryStore;
+
+#[async_trait::async_trait]
+impl MemoryStore for EvaluationMemoryStore {
+    async fn read_memory(&self) -> anyhow::Result<String> {
+        anyhow::bail!("evaluation 不允许读取私有 memory")
+    }
+
+    async fn read_user(&self) -> anyhow::Result<String> {
+        anyhow::bail!("evaluation 不允许读取私有 memory")
+    }
+
+    async fn read_snapshot(&self) -> anyhow::Result<crate::memory::MemorySnapshot> {
+        anyhow::bail!("evaluation 不允许读取私有 memory")
+    }
+
+    async fn apply_ops(
+        &self,
+        _ops: &[crate::memory::MemoryOp],
+    ) -> anyhow::Result<crate::memory::MemoryApplyReport> {
+        anyhow::bail!("evaluation 不允许写入私有 memory")
+    }
+}
+
+struct EvaluationMaintainerClient;
+
+#[async_trait::async_trait]
+impl MaintainerClient for EvaluationMaintainerClient {
+    async fn pull_inbox(&self, _agent_id: &AgentId) -> anyhow::Result<Vec<InboxMessage>> {
+        Ok(Vec::new())
+    }
+
+    async fn ack_inbox(&self, _agent_id: &AgentId, _inbox_ids: &[InboxId]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn upload_claim(&self, _claim: &Claim) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn report_dispute(&self, _dispute: &Dispute) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// 启动时刷新全局 MCP manager；失败只降级为 warning，避免阻塞 TUI。
@@ -775,6 +937,7 @@ mod tests {
         let team = tempfile::tempdir().unwrap();
         let hosts = tempfile::tempdir().unwrap();
         let prompts = tempfile::tempdir().unwrap();
+
         write_session_prompts(prompts.path());
         let mut c = cfg(
             team.path().to_path_buf(),
@@ -791,6 +954,60 @@ mod tests {
         let engine = build_agent_cli_session_engine(&c, &upstream);
 
         assert!(engine.is_ok());
+    }
+
+    #[test]
+    fn evaluation_engine_uses_skills_from_evaluation_runtime() {
+        let team = tempfile::tempdir().unwrap();
+        let hosts = tempfile::tempdir().unwrap();
+        let prompts = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        write_session_prompts(prompts.path());
+        let mut c = cfg(
+            team.path().to_path_buf(),
+            hosts.path().to_path_buf(),
+            prompts.path().to_path_buf(),
+        );
+        c.agent.llm.provider = LlmProvider::OpenAiChat;
+        c.agent.llm.api_key = Some("test-key".into());
+        c.agent.llm.endpoint = "http://127.0.0.1:1".into();
+        let upstream = c.resolve_upstream(None).unwrap();
+
+        let global_skills = c.storage.skills_root();
+        std::fs::create_dir_all(global_skills.join("global-only")).unwrap();
+        std::fs::write(
+            global_skills.join("global-only").join("SKILL.md"),
+            "# global-only\n",
+        )
+        .unwrap();
+        c.activate_evaluation_runtime(runtime.path()).unwrap();
+        let runtime_skills = c.storage.skills_root();
+        std::fs::create_dir_all(runtime_skills.join("coding-benchmark")).unwrap();
+        std::fs::write(
+            runtime_skills.join("coding-benchmark").join("SKILL.md"),
+            "# coding-benchmark\n",
+        )
+        .unwrap();
+
+        let router = Arc::new(
+            crate::evaluation::FrozenClaimBundleRouter::new(
+                crate::evaluation::FrozenClaimBundle {
+                    schema_version: crate::evaluation::EVALUATION_SCHEMA_VERSION,
+                    claims: Vec::new(),
+                },
+                "attempt-001".into(),
+                Some("0000000000000000000000000000000000000000000000000000000000000000".into()),
+            )
+            .unwrap(),
+        );
+        let engine = build_evaluation_session_engine(&c, &upstream, router).unwrap();
+        let names: Vec<_> = engine
+            .available_skills()
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect();
+
+        assert_eq!(names, vec!["coding-benchmark"]);
     }
 
     #[test]

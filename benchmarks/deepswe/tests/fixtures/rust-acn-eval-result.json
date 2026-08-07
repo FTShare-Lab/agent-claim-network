@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "attempt_id": "attempt-1",
+  "exit_type": "completed",
+  "agent_steps": 1,
+  "claim_new_ids": [
+    "claim-1"
+  ],
+  "claim_updated_ids": [],
+  "claim_used_ids": [
+    "claim-1"
+  ],
+  "router_evidence": [
+    {
+      "schema_version": 1,
+      "evidence_id": "router-1",
+      "attempt_id": "attempt-1",
+      "bundle_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "query_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "candidate_claim_ids": [
+        "claim-1"
+      ],
+      "selected_claim_ids": [
+        "claim-1"
+      ],
+      "injected_claim_ids": [
+        "claim-1"
+      ],
+      "injected_content_hashes": [
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      ],
+      "timestamp_utc": "2026-07-26T00:00:00Z"
+    }
+  ],
+  "router_evidence_incomplete": false,
+  "event_ledger_path": "/tmp/events.jsonl",
+  "usage": {
+    "model_requests": 1,
+    "complete_model_responses": 1,
+    "incomplete_model_responses": 0,
+    "audit_incomplete": false,
+    "response_models": [
+      "fixture-checkpoint"
+    ],
+    "input_tokens": 8462,
+    "output_tokens": 53,
+    "cache_read_tokens": 0,
+    "reasoning_tokens": 41
+  }
+}

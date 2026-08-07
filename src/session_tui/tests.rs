@@ -648,6 +648,7 @@ fn live_region_tracks_recent_acn_contribution() {
         recapped_until: 18,
         new_claim_ids: vec!["claim_00000004".parse().unwrap()],
         updated_claim_ids: vec!["claim_00000006".parse().unwrap()],
+        used_claim_ids: vec![],
         new_dispute_ids: vec!["dispute_00000002".parse().unwrap()],
     });
 
@@ -2982,6 +2983,7 @@ fn compaction_progress_is_visible() {
         recapped_until: 4,
         new_claim_ids: vec!["claim_00000001".parse().unwrap()],
         updated_claim_ids: vec![],
+        used_claim_ids: vec![],
         new_dispute_ids: vec![],
     });
     assert_eq!(state.status, SessionRuntimeStatus::Compacting);

@@ -12,7 +12,7 @@ mod debug;
 pub(crate) mod derived_views;
 pub mod http_client;
 mod index;
-mod lexical;
+pub(crate) mod lexical;
 mod overview;
 mod rerank;
 mod retrieval_doc;

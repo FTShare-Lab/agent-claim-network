@@ -194,6 +194,146 @@ async fn consult_router_tool_is_exposed_only_when_router_is_configured() {
 }
 
 #[tokio::test]
+async fn evaluation_registry_limits_tools_and_keeps_router() {
+    let dir = tempfile::tempdir().unwrap();
+    let mcp_config_path = dir.path().join(".mcp.json");
+    let script_path = dir.path().join("stdio_mcp_tool.sh");
+    tokio::fs::write(&script_path, stdio_mcp_tool_script())
+        .await
+        .unwrap();
+    let mut mcp_cfg = crate::mcp::config::McpJsonConfig::default();
+    mcp_cfg.servers.insert(
+        "local".to_string(),
+        crate::mcp::config::McpServerConfig::stdio(
+            "sh".to_string(),
+            vec![script_path.display().to_string()],
+            BTreeMap::new(),
+            Vec::new(),
+        ),
+    );
+    crate::mcp::config::write_mcp_json_config_atomic(&mcp_config_path, &mcp_cfg)
+        .await
+        .unwrap();
+    let mcp_manager = Arc::new(crate::mcp::connection_manager::McpConnectionManager::new(
+        mcp_config_path,
+        dir.path().to_path_buf(),
+        None,
+    ));
+    mcp_manager.refresh_all().await.unwrap();
+    let session_search = Arc::new(SessionSearchService::new(
+        AgentId::new("agent-a").unwrap(),
+        dir.path().join("agent-a"),
+        "test-model".into(),
+        Arc::new(UnusedSessionSearchSummarizer),
+        SessionSearchConfig::default(),
+    ));
+    let registry = ToolRegistry::new(&test_tool_config(dir.path()))
+        .unwrap()
+        .with_memory_store(Arc::new(LocalFsMemoryStore::new(
+            dir.path().to_path_buf(),
+            100,
+            100,
+            true,
+        )))
+        .with_session_search(session_search)
+        .with_mcp_manager(mcp_manager)
+        .with_delegation_executor(
+            dir.path().join("agent-a"),
+            AgentId::new("agent-a").unwrap(),
+            Arc::new(ImmediateDelegationExecutor),
+            DelegationRunnerConfig::default(),
+        )
+        .with_router_client(Arc::new(TestRouter {
+            result: sample_router_result(),
+            overview: sample_scopes_overview(),
+        }))
+        .for_evaluation("ACN_TEST_EVALUATION_SECRET".into());
+
+    let names = registry
+        .definitions()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<Vec<_>>();
+    for name in [
+        "web_search",
+        "web_fetch",
+        "web_request",
+        "ask_user",
+        "memory",
+        "session_search",
+        "mcp__local__ping",
+        "create_subagent",
+        "list_subagents",
+        "wait_subagents",
+        "read_subagent",
+        "steer_subagent",
+        "update_subagent_progress",
+    ] {
+        assert!(!names.iter().any(|visible| visible == name));
+    }
+    assert!(names.iter().any(|name| name == "working_note"));
+    assert!(names.iter().any(|name| name == "consult_router"));
+    assert!(registry.memory_store.is_none());
+    assert!(registry.session_search.is_none());
+    assert!(registry.mcp_manager.is_none());
+    assert!(registry.delegation_host.is_none());
+
+    let result = registry
+        .dispatch("consult_router", json!({"mode": "overview"}))
+        .await
+        .unwrap();
+    assert_eq!(result.outcome, ToolExecutionOutcome::Completed);
+}
+
+#[tokio::test]
+async fn evaluation_code_run_removes_configured_secret_from_pipe_environment() {
+    let _secret = EnvVarGuard::set("ACN_TEST_EVALUATION_SECRET", "secret-value");
+    let _visible = EnvVarGuard::set("ACN_TEST_EVALUATION_VISIBLE", "visible-value");
+    let dir = tempfile::tempdir().unwrap();
+    let registry = ToolRegistry::new(&test_tool_config(dir.path()))
+        .unwrap()
+        .for_evaluation("ACN_TEST_EVALUATION_SECRET".into());
+
+    let result = registry
+        .dispatch(
+            "code_run",
+            json!({
+                "script": "printf 'secret=%s\\nvisible=%s\\n' \"${ACN_TEST_EVALUATION_SECRET-unset}\" \"$ACN_TEST_EVALUATION_VISIBLE\"",
+            }),
+        )
+        .await
+        .unwrap();
+    let stdout = result.output["stdout"].as_str().unwrap();
+    assert!(stdout.contains("secret=unset"));
+    assert!(stdout.contains("visible=visible-value"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn evaluation_code_run_removes_configured_secret_from_pty_environment() {
+    let _secret = EnvVarGuard::set("ACN_TEST_EVALUATION_SECRET", "secret-value");
+    let _visible = EnvVarGuard::set("ACN_TEST_EVALUATION_VISIBLE", "visible-value");
+    let dir = tempfile::tempdir().unwrap();
+    let registry = ToolRegistry::new(&test_tool_config(dir.path()))
+        .unwrap()
+        .for_evaluation("ACN_TEST_EVALUATION_SECRET".into());
+
+    let result = registry
+        .dispatch(
+            "code_run",
+            json!({
+                "script": "printf 'secret=%s\\nvisible=%s\\n' \"${ACN_TEST_EVALUATION_SECRET-unset}\" \"$ACN_TEST_EVALUATION_VISIBLE\"",
+                "tty": true,
+            }),
+        )
+        .await
+        .unwrap();
+    let stdout = result.output["stdout"].as_str().unwrap();
+    assert!(stdout.contains("secret=unset"));
+    assert!(stdout.contains("visible=visible-value"));
+}
+
+#[tokio::test]
 async fn mcp_tool_is_exposed_and_dispatched_through_registry() {
     let dir = tempfile::tempdir().unwrap();
     let script_path = dir.path().join("stdio_mcp_tool.sh");

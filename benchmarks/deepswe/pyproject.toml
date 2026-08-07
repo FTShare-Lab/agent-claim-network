@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "acn-deepswe"
+version = "0.1.0"
+description = "可审计的 ACN DeepSWE 评估基础设施"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+pier = ["datacurve-pier==0.3.0"]
+
+[project.scripts]
+acn-deepswe = "acn_deepswe.cli:main"
+acn-deepswe-presmoke = "acn_deepswe.presmoke_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+# 外部产物解析统一以 ValueError 暴露无效数据，不按字段类型拆分异常契约。
+ignore = ["TRY004"]

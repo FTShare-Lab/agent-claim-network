@@ -125,6 +125,9 @@ impl SessionEngine {
         &self,
         inbox_report: &InboxProcessReport,
     ) -> anyhow::Result<String> {
+        if self.runtime_profile == super::SessionRuntimeProfile::Evaluation {
+            return self.render_evaluation_session_system_prompt().await;
+        }
         let router_scopes_overview = match inbox_report.team_services.router {
             TeamServiceConnectionStatus::Unknown => SOLO_TEAM_SERVICES_OVERVIEW.into(),
             TeamServiceConnectionStatus::Connected => inbox_report
@@ -180,6 +183,32 @@ impl SessionEngine {
             .render(PROMPT_AGENT_SYSTEM, context)
             .context("渲染 session system prompt 失败")?;
         Ok(append_acn_md(system_prompt, self.read_acn_md().await?))
+    }
+
+    async fn render_evaluation_session_system_prompt(&self) -> anyhow::Result<String> {
+        let router = self
+            .agent
+            .router
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("evaluation session 缺少冻结 router"))?;
+        let overview = router
+            .scopes_overview()
+            .await
+            .context("读取冻结 router scope overview 失败")?;
+        let local_claims_snapshot = self.render_local_claims_snapshot().await;
+        let router_scopes_overview = format_router_scopes_overview(&overview);
+        let context = SessionSystemPromptContext {
+            agent_id: &self.agent.agent_id,
+            memory_md: "",
+            user_md: "",
+            local_claims_snapshot: &local_claims_snapshot,
+            router_scopes_overview: &router_scopes_overview,
+            available_skills: self.agent.available_skills_for_prompt(),
+            subagent_max_concurrent: self.subagent_max_concurrent,
+        };
+        self.prompt_registry
+            .render(PROMPT_AGENT_SYSTEM, context)
+            .context("渲染 evaluation session system prompt 失败")
     }
 
     pub(super) async fn read_acn_md(&self) -> anyhow::Result<Option<String>> {

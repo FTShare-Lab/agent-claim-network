@@ -256,6 +256,7 @@ pub enum SessionTurnEvent {
         recapped_until: usize,
         new_claim_ids: Vec<ClaimId>,
         updated_claim_ids: Vec<ClaimId>,
+        used_claim_ids: Vec<ClaimId>,
         new_dispute_ids: Vec<DisputeId>,
     },
     CompactionSkipped {

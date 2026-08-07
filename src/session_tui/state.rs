@@ -530,6 +530,7 @@ impl SessionTuiState {
                 recapped_until: _,
                 new_claim_ids,
                 updated_claim_ids,
+                used_claim_ids: _,
                 new_dispute_ids,
             } => {
                 if self.turn_in_flight {

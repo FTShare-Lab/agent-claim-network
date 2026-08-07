@@ -1982,6 +1982,20 @@ impl Config {
         )
     }
 
+    /// 为非交互评测加载配置；保留 upstream 契约与环境变量读取，
+    /// 但不要求 maintainer 密钥，也不创建默认运行目录。
+    pub fn load_for_evaluation(path: &Path) -> Result<Self, ConfigError> {
+        Self::load_with_options(
+            path,
+            ConfigLoadOptions {
+                require_agent_llm_api_key: false,
+                require_maintainer_admin_auth_password: false,
+                validate_upstreams: true,
+                ensure_storage_dirs: false,
+            },
+        )
+    }
+
     fn load_with_options(path: &Path, options: ConfigLoadOptions) -> Result<Self, ConfigError> {
         let raw = std::fs::read_to_string(path)?;
         Self::parse_config_with_options(&raw, Some(path), options)
@@ -2117,6 +2131,26 @@ impl Config {
         self.ensure_agent_runtime_dirs(&runtime_root)?;
         self.storage
             .activate_agent_runtime_root(runtime_root.as_path());
+        Ok(())
+    }
+
+    /// 激活评测独占 runtime；该目录由外部 harness 传入，不要求位于全局 ACN base。
+    /// 团队数据根仍保持在全局 base 下，评测只创建 agent 本地 state 与 skills 目录。
+    pub fn activate_evaluation_runtime(&mut self, runtime_root: &Path) -> Result<(), ConfigError> {
+        if !runtime_root.is_absolute() {
+            return Err(ConfigError::Validation(format!(
+                "evaluation runtime 路径必须为绝对路径: {}",
+                runtime_root.display()
+            )));
+        }
+        for dir in [
+            runtime_root.join("skills"),
+            runtime_root.join("data").join("agents"),
+        ] {
+            std::fs::create_dir_all(&dir)
+                .map_err(|source| ConfigError::CreateStorageDir { path: dir, source })?;
+        }
+        self.storage.activate_agent_runtime_root(runtime_root);
         Ok(())
     }
 

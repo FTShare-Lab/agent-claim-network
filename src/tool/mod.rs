@@ -331,6 +331,22 @@ impl ToolAccessProfile {
             delegation_child: false,
         }
     }
+
+    fn evaluation() -> Self {
+        Self {
+            local_tools: true,
+            web_tools: false,
+            working_note: true,
+            ask_user: false,
+            memory: false,
+            router: true,
+            session_search: false,
+            mcp: false,
+            delegation: false,
+            delegation_progress: false,
+            delegation_child: false,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -413,6 +429,7 @@ pub struct ToolRegistry {
     process_owner_agent_id: String,
     limits: ToolLimits,
     attachment_limits: AttachmentLimits,
+    evaluation_secret_env: Option<String>,
 }
 
 fn current_year_web_guidance() -> String {

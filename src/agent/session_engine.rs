@@ -141,6 +141,14 @@ pub struct SessionEngine {
     attachment: AttachmentConfig,
     mcp_manager: Option<Arc<McpConnectionManager>>,
     subagent_max_concurrent: usize,
+    runtime_profile: SessionRuntimeProfile,
+}
+
+/// session 的运行边界。评测模式不读取 inbox、私有 memory 或 ACN.md。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRuntimeProfile {
+    Interactive,
+    Evaluation,
 }
 
 /// 运行时直接 abort 会跳过 turn 的正常收束路径；此 guard 只回滚本轮新增或扩展的
@@ -214,6 +222,7 @@ pub struct SessionEngineOptions {
     pub workspace_root: PathBuf,
     pub turn_journal: AgentSessionTurnJournalConfig,
     pub subagent_max_concurrent: usize,
+    pub runtime_profile: SessionRuntimeProfile,
 }
 
 #[derive(Debug, Clone)]
@@ -1415,6 +1424,7 @@ impl SessionEngine {
             attachment: AttachmentConfig::default(),
             mcp_manager: None,
             subagent_max_concurrent: options.subagent_max_concurrent,
+            runtime_profile: options.runtime_profile,
         }
     }
 
@@ -2352,6 +2362,9 @@ impl SessionEngine {
         &self,
         session: &SessionHandle,
     ) -> anyhow::Result<InboxProcessReport> {
+        if self.runtime_profile == SessionRuntimeProfile::Evaluation {
+            anyhow::bail!("evaluation session 不支持 inbox 同步");
+        }
         let inbox_generator = SessionInboxJsonGenerator {
             prompt_registry: &self.prompt_registry,
             json_caller: &self.json_caller,
@@ -2400,24 +2413,30 @@ impl SessionEngine {
         emit(SessionEvent::StatusChanged {
             status: SessionRuntimeStatus::Initializing,
         });
-        emit(SessionEvent::StartupProgress {
-            label: "syncing active policies...".into(),
-        });
-        emit(SessionEvent::StartupProgress {
-            label: "processing inbox...".into(),
-        });
         let inbox_fallback_scope = crate::api::ProviderRuntimeFallbackScope::new_root();
-        let inbox_generator = SessionInboxJsonGenerator {
-            prompt_registry: &self.prompt_registry,
-            json_caller: &self.json_caller,
-            fallback_scope: inbox_fallback_scope.clone(),
+        let inbox_report = match self.runtime_profile {
+            SessionRuntimeProfile::Interactive => {
+                emit(SessionEvent::StartupProgress {
+                    label: "syncing active policies...".into(),
+                });
+                emit(SessionEvent::StartupProgress {
+                    label: "processing inbox...".into(),
+                });
+                let inbox_generator = SessionInboxJsonGenerator {
+                    prompt_registry: &self.prompt_registry,
+                    json_caller: &self.json_caller,
+                    fallback_scope: inbox_fallback_scope.clone(),
+                };
+                let report = self.runner.process_inbox_with(&inbox_generator).await?;
+                emit(SessionEvent::TeamServicesConnectionUpdated {
+                    status: report.team_services,
+                });
+                emit_warnings(&report.warnings, &mut emit);
+                self.emit_local_claims_updated(&mut emit).await;
+                report
+            }
+            SessionRuntimeProfile::Evaluation => InboxProcessReport::default(),
         };
-        let inbox_report = self.runner.process_inbox_with(&inbox_generator).await?;
-        emit(SessionEvent::TeamServicesConnectionUpdated {
-            status: inbox_report.team_services,
-        });
-        emit_warnings(&inbox_report.warnings, &mut emit);
-        self.emit_local_claims_updated(&mut emit).await;
         emit(SessionEvent::StartupProgress {
             label: "preparing session prompt...".into(),
         });
@@ -2657,6 +2676,7 @@ impl SessionEngine {
                     recapped_until,
                     new_claim_ids,
                     updated_claim_ids,
+                    used_claim_ids,
                     new_dispute_ids,
                 } => {
                     emit(SessionEvent::CompactionCompleted {
@@ -2664,6 +2684,7 @@ impl SessionEngine {
                         recapped_until,
                         new_claim_ids,
                         updated_claim_ids,
+                        used_claim_ids,
                         new_dispute_ids,
                     });
                     emit(SessionEvent::StatusChanged {
@@ -3123,6 +3144,13 @@ impl SessionEngine {
     where
         F: FnMut(SessionEvent) + Send,
     {
+        if self.runtime_profile == SessionRuntimeProfile::Evaluation {
+            let error = "evaluation session 不支持 inbox 同步".to_string();
+            emit(SessionEvent::InboxFailed {
+                error: error.clone(),
+            });
+            anyhow::bail!(error);
+        }
         match session.read_metadata().await {
             Ok(metadata) if session_is_not_open(&metadata) => {
                 let error = format!(
@@ -3788,6 +3816,7 @@ impl SessionEngine {
             recapped_until,
             new_claim_ids: outcome.report.new_claim_ids.clone(),
             updated_claim_ids: outcome.report.updated_claim_ids.clone(),
+            used_claim_ids: outcome.report.used_claim_ids.clone(),
             new_dispute_ids: outcome.report.new_dispute_ids.clone(),
         });
         self.clear_active_context_usage_anchor(&session.metadata.id);
@@ -4630,6 +4659,7 @@ impl SessionEngine {
                     recapped_until,
                     new_claim_ids: outcome.report.new_claim_ids.clone(),
                     updated_claim_ids: outcome.report.updated_claim_ids.clone(),
+                    used_claim_ids: outcome.report.used_claim_ids.clone(),
                     new_dispute_ids: outcome.report.new_dispute_ids.clone(),
                 });
                 self.append_session_event_log(

@@ -5,6 +5,7 @@ use futures::StreamExt;
 use rand::Rng;
 
 use crate::api::endpoint::{resolve_llm_endpoint, LlmEndpointKind};
+use crate::api::evaluation_usage::{record_evaluation_request_started, record_evaluation_usage};
 use crate::api::llm_http::{read_llm_error_body, LlmHttpError, LlmHttpPhase};
 use crate::api::ProviderRecoveryInterrupt;
 
@@ -219,6 +220,7 @@ impl ChatCompletionsClient {
         request: &ChatCompletionRequest,
         request_started: &mut (dyn FnMut() -> Result<(), ChatCompletionsError> + Send),
     ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
+        let request_sequence = record_evaluation_request_started();
         let pending = self
             .http
             .post(self.endpoint.as_str())
@@ -230,7 +232,13 @@ impl ChatCompletionsClient {
             .send()
             .await
             .map_err(|error| self.http_error(error, LlmHttpPhase::SendRequest))?;
-        response_json(resp, self.timeout).await
+        let response = response_json(resp, self.timeout).await?;
+        record_evaluation_usage(
+            request_sequence,
+            response.usage.as_ref(),
+            response.model.as_deref(),
+        );
+        Ok(response)
     }
 
     async fn send_streaming_with_retry(
@@ -291,6 +299,7 @@ impl ChatCompletionsClient {
         emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
         request_started: &mut (dyn FnMut() -> Result<(), ChatCompletionsError> + Send),
     ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
+        let request_sequence = record_evaluation_request_started();
         let pending = self
             .http
             .post(self.endpoint.as_str())
@@ -338,7 +347,13 @@ impl ChatCompletionsClient {
                 accumulator.apply_frame(&data, emit)?;
             }
         }
-        accumulator.finish()
+        let response = accumulator.finish()?;
+        record_evaluation_usage(
+            request_sequence,
+            response.usage.as_ref(),
+            response.model.as_deref(),
+        );
+        Ok(response)
     }
 }
 
@@ -442,6 +457,7 @@ mod tests {
 
     use super::*;
     use crate::api::chat_completions::{ChatMessage, ChatToolCall};
+    use crate::api::{with_evaluation_usage_recording, EvaluationUsageRecorder};
 
     #[tokio::test]
     async fn chat_completions_parses_non_stream_text() {
@@ -707,6 +723,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_keeps_failed_http_attempt_in_evaluation_usage() {
+        let success = json!({
+            "model": "test-model",
+            "choices": [{
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3}
+        })
+        .to_string();
+        let endpoint = spawn_responses(vec![(500, "retry".into()), (200, success)]).await;
+        let client = ChatCompletionsClient::new(
+            endpoint,
+            "test-key".into(),
+            Duration::from_secs(5),
+            1,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let recorder = std::sync::Arc::new(EvaluationUsageRecorder::default());
+
+        with_evaluation_usage_recording(recorder.clone(), async {
+            client.send(&request(false), &mut |_| {}).await.unwrap();
+        })
+        .await;
+
+        assert_eq!(recorder.response_count(), 1);
+        let records = recorder.take_records();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].request_sequence, 1);
+        assert!(!records[0].response_received);
+        assert!(records[1].is_complete);
+    }
+
+    #[tokio::test]
     async fn chat_completions_stream_body_error_names_stream_phase() {
         let body = sse_response(vec![json!({
             "choices": [{
@@ -836,6 +888,29 @@ mod tests {
             expected
         });
         (format!("http://{addr}"), handle)
+    }
+
+    async fn spawn_responses(responses: Vec<(u16, String)>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0; 8192];
+                let _ = socket.read(&mut buf).await.unwrap();
+                let reason = if status == 200 {
+                    "OK"
+                } else {
+                    "Internal Server Error"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len(),
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        format!("http://{addr}")
     }
 
     async fn spawn_server(

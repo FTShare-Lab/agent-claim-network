@@ -1,0 +1,66 @@
+{
+  "algorithm": "official_v1.1_luna_max_user_selected_followup_v1",
+  "task_directory_hash_algorithm": "sha256_directory_tree_v2",
+  "candidates_hash": "6aaf118901a061528c4d456efcd9b016b406a336ca9d69baabb40bf6791c7b1f",
+  "deepswe_revision": "e016041a6ccf8da29906afc9a3f5a8df940a1f78",
+  "historical_results": {
+    "artifact_etag": "db2b0f87cc945ee32c4f9f75501be81f",
+    "artifact_sha256": "7844056bade4cee4a2c2964c9582bf7eb1344735a28695cae7d419055656417a",
+    "artifact_url": "https://deepswe.datacurve.ai/artifacts/v1.1/trials.json",
+    "candidate_canonicalization": "UTF-8 TSV sorted by task_id: <task_id>\\t<passes_across_four_rollouts>\\n",
+    "candidate_count": 52,
+    "config": "mini_swe_agent_gpt_5_6_luna_max",
+    "harness": "mini-swe-agent",
+    "model": "gpt-5-6-luna",
+    "reasoning_effort": "max",
+    "selected_tasks": {
+      "abs-stepped-slices": {
+        "cohort": "easy",
+        "historical_cache_tokens": 19528704,
+        "historical_input_tokens": 21501865,
+        "historical_output_tokens": 173851,
+        "historical_passes": 4,
+        "historical_rollouts": 4,
+        "historical_steps": 223
+      },
+      "ts-pattern-match-each": {
+        "cohort": "medium",
+        "historical_cache_tokens": 9473024,
+        "historical_input_tokens": 11038574,
+        "historical_output_tokens": 161534,
+        "historical_passes": 3,
+        "historical_rollouts": 4,
+        "historical_steps": 159
+      }
+    },
+    "source": "deep-swe",
+    "task_selection": "user requested one related 4/4 task and one 2/4 or 3/4 task; selected the other ABS 4/4 task and the lowest-step 3/4 task"
+  },
+  "pier_revision": "fefa7475a32bb05271abdea378e8083c83eb5c35",
+  "schema_version": 1,
+  "seed": 20260728,
+  "task_ids": [
+    "abs-stepped-slices",
+    "ts-pattern-match-each"
+  ],
+  "task_directory_hashes": {
+    "abs-stepped-slices": {
+      "normalized": "ca4bcc63865dbe1446cb0116dcd47328233d351056e01e4adeb65cb86c45ce10",
+      "source": "9deb8d11681dbb806da02fefde1441c3b37e5d980c5506a616d4da10d16d4165"
+    },
+    "ts-pattern-match-each": {
+      "normalized": "5b4b001c73b30723a4180179bc8f2158e6ad9a0971291d90bd6fe7c280dbd8f0",
+      "source": "e0e93684eb5f52fa42529394319b025230f9e8404479dfd4b79172d484b4dbfd"
+    }
+  },
+  "task_toml_hashes": {
+    "abs-stepped-slices": {
+      "normalized": "164665750455835219875d18297efbef49151e21570f85963fc556d2ea377e48",
+      "source": "c84c11c21195cceeb1ddee614d20cbf36f626186a88958787286151726915827"
+    },
+    "ts-pattern-match-each": {
+      "normalized": "08df134b9461af14ced9b3bba041066b84ab6f2f09df3b7230af71583ccce0b9",
+      "source": "6928010bb103068231c3ec64d93e13e6a223c656370e086e552c2e127a8aa3df"
+    }
+  }
+}
