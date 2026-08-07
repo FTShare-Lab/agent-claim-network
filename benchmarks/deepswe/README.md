@@ -34,6 +34,8 @@ A / B_empty 容器中不存在该文件。
 sh benchmarks/deepswe/docker/build-acn-eval-amd64.sh
 acn-deepswe validate-config /absolute/tasks/<task> /absolute/checked
 acn-deepswe freeze-dataset /absolute/tasks /absolute/dataset.json --seed 17 --sample-size 5
+acn-deepswe freeze-execution-dataset /absolute/tasks /absolute/frozen.json /absolute/normalized \
+  --deepswe-checkout /absolute/DeepSWE --pier-checkout /absolute/pier --seed 17 --sample-size 30
 acn-deepswe plan /absolute/dataset.json /absolute/run --seed 99
 acn-deepswe append-freeze-barrier /absolute/host-events.jsonl attempt-1 barrier-1
 acn-deepswe freeze-claims /absolute/host-events.jsonl attempt-1 /absolute/claims.json
@@ -50,6 +52,9 @@ Docker Hub 时传 `--direct`。
 
 `freeze-dataset` 默认抽取 5 题，适用于 Pre-smoke；Smoke 固定抽 30 题时传
 `--sample-size 30`。抽样始终基于稳定排序、固定 seed 的无放回选择，并在执行前写入 manifest。
+真实运行使用 `freeze-execution-dataset`：它在写入前确认两个 checkout 的精确 revision 与干净
+工作树，批量生成 `allow_internet = false` 的任务副本，并把每题 source/normalized TOML 与目录
+tree hash 一同冻结。已有 manifest 或 normalized 目录时拒绝覆盖。
 
 `validate-config` 做 fail-closed 网络转换：只有 `agent.network_mode` 与
 `verifier.network_mode` 均为 `"no-network"` 时才生成 Pier 兼容副本，并对两个环境写入

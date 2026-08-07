@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import random
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+from .network import normalize_task_network
+from .provenance import TASK_DIRECTORY_HASH_ALGORITHM, sha256_directory_tree
 
 FREEZE_ALGORITHM = "random.sample_without_replacement_v1"
 SUPPORTED_FREEZE_ALGORITHMS = frozenset(
@@ -71,12 +78,91 @@ def freeze_dataset(
     tasks_root: Path, manifest_path: Path, seed: int, sample_size: int = 5
 ) -> FrozenDatasetManifest:
     """从稳定排序的 task.toml 目录无放回抽样，绝不观察执行结果。"""
+    if not manifest_path.is_absolute():
+        raise DatasetFreezeError(f"冻结 manifest 输出必须为绝对路径: {manifest_path}")
+    manifest = _select_dataset(tasks_root, seed, sample_size)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(manifest.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def freeze_execution_dataset(
+    tasks_root: Path,
+    manifest_path: Path,
+    normalized_root: Path,
+    deepswe_checkout: Path,
+    pier_checkout: Path,
+    seed: int,
+    sample_size: int = 5,
+) -> FrozenDatasetManifest:
+    """冻结可直接执行的任务集，并生成关闭普通公网的完整任务副本。"""
+    if not manifest_path.is_absolute():
+        raise DatasetFreezeError(f"冻结 manifest 输出必须为绝对路径: {manifest_path}")
+    if not normalized_root.is_absolute():
+        raise DatasetFreezeError(f"normalized_root 必须为绝对路径: {normalized_root}")
+    if manifest_path.exists():
+        raise DatasetFreezeError(f"冻结 manifest 已存在，拒绝覆盖: {manifest_path}")
+    if normalized_root.exists():
+        raise DatasetFreezeError(f"normalized_root 已存在，拒绝覆盖: {normalized_root}")
+
+    resolved_tasks_root = tasks_root.resolve()
+    resolved_deepswe = deepswe_checkout.resolve()
+    try:
+        resolved_tasks_root.relative_to(resolved_deepswe)
+    except ValueError as error:
+        raise DatasetFreezeError("tasks_root 必须位于 deepswe_checkout 内") from error
+    deepswe_revision = _clean_checkout_revision(resolved_deepswe, "DeepSWE")
+    pier_revision = _clean_checkout_revision(pier_checkout.resolve(), "Pier")
+    manifest = _select_dataset(resolved_tasks_root, seed, sample_size)
+
+    normalized_root.parent.mkdir(parents=True, exist_ok=True)
+    temporary_root = Path(
+        tempfile.mkdtemp(prefix=f".{normalized_root.name}.", dir=normalized_root.parent)
+    )
+    try:
+        task_toml_hashes: dict[str, dict[str, str]] = {}
+        task_directory_hashes: dict[str, dict[str, str]] = {}
+        for task_id in manifest.task_ids:
+            source_task = resolved_tasks_root / task_id
+            normalized = normalize_task_network(source_task, temporary_root)
+            normalized_task = temporary_root / task_id
+            task_toml_hashes[task_id] = {
+                "source": normalized.source_hash,
+                "normalized": normalized.normalized_hash,
+            }
+            task_directory_hashes[task_id] = {
+                "source": sha256_directory_tree(source_task),
+                "normalized": sha256_directory_tree(normalized_task),
+            }
+
+        payload = {
+            **manifest.to_dict(),
+            "deepswe_revision": deepswe_revision,
+            "pier_revision": pier_revision,
+            "task_directory_hash_algorithm": TASK_DIRECTORY_HASH_ALGORITHM,
+            "task_toml_hashes": task_toml_hashes,
+            "task_directory_hashes": task_directory_hashes,
+        }
+        _write_frozen_manifest(manifest_path, payload)
+        temporary_root.replace(normalized_root)
+    except Exception:
+        if temporary_root.exists():
+            shutil.rmtree(temporary_root)
+        if manifest_path.exists():
+            manifest_path.unlink()
+        raise
+    return manifest
+
+
+def _select_dataset(tasks_root: Path, seed: int, sample_size: int) -> FrozenDatasetManifest:
+    """从稳定候选集构建冻结对象，但不写入任何执行产物。"""
     if isinstance(sample_size, bool) or not isinstance(sample_size, int) or sample_size <= 0:
         raise DatasetFreezeError("抽样任务数必须为正整数")
     if not tasks_root.is_dir():
         raise DatasetFreezeError(f"任务根目录不存在: {tasks_root}")
-    if not manifest_path.is_absolute():
-        raise DatasetFreezeError(f"冻结 manifest 输出必须为绝对路径: {manifest_path}")
     candidates = sorted(
         (path for path in tasks_root.iterdir() if path.is_dir() and (path / "task.toml").is_file()),
         key=lambda path: path.name,
@@ -97,9 +183,51 @@ def freeze_dataset(
     manifest = FrozenDatasetManifest(
         1, FREEZE_ALGORITHM, seed, candidates_hash, tuple(sorted(path.name for path in selected))
     )
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(
-        json.dumps(manifest.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n",
-        encoding="utf-8",
-    )
     return manifest
+
+
+def _clean_checkout_revision(checkout: Path, label: str) -> str:
+    """冻结前拒绝使用没有精确 revision 或含本地改动的 checkout。"""
+    if not checkout.is_dir():
+        raise DatasetFreezeError(f"{label} checkout 不存在: {checkout}")
+    try:
+        revision = subprocess.run(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        status = subprocess.run(
+            ["git", "-C", str(checkout), "status", "--porcelain"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        raise DatasetFreezeError(f"无法读取 {label} checkout: {checkout}") from error
+    head = revision.stdout.strip() if revision.returncode == 0 else ""
+    if not head:
+        raise DatasetFreezeError(f"无法读取 {label} revision: {checkout}")
+    if status.returncode != 0:
+        raise DatasetFreezeError(f"无法读取 {label} 工作树状态: {checkout}")
+    if status.stdout.strip():
+        raise DatasetFreezeError(f"{label} 工作树不干净，拒绝冻结: {checkout}")
+    return head
+
+
+def _write_frozen_manifest(manifest_path: Path, payload: dict[str, object]) -> None:
+    """完整 manifest 只在所有输入已验证后以原子替换方式写入。"""
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{manifest_path.name}.", suffix=".tmp", dir=manifest_path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(manifest_path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
