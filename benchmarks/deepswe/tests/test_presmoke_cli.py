@@ -118,6 +118,23 @@ class PresmokeCliTests(unittest.TestCase):
             ):
                 build_task_specs(load_config(config_path), "https://upstream.invalid")
 
+    def test_plan_seed_is_independent_of_dataset_sampling_seed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            config = load_config(config_path)
+            plan = json.loads(config.attempt_plan.read_text(encoding="utf-8"))
+            plan["seed"] = 20260727
+            config.attempt_plan.write_text(json.dumps(plan), encoding="utf-8")
+
+            with patch("acn_deepswe.presmoke_cli.verify_checkout_revision"):
+                specs, _ = build_task_specs(config, "https://upstream.invalid")
+
+        self.assertEqual(specs[0].experiment.provenance.dataset_seed, 20260726)
+        self.assertEqual(
+            tuple(attempt.variant for attempt in specs[0].experiment.attempts),
+            ("A", "B_empty", "B_claim"),
+        )
+
     def test_checkout_revision_rejects_dirty_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             checkout = Path(directory) / "checkout"

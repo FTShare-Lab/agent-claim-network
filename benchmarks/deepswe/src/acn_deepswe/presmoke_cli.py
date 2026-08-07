@@ -287,8 +287,6 @@ def build_task_specs(
     plan = AttemptPlan.from_dict(_read_object(config.attempt_plan, "attempt plan"))
     if plan.freeze_candidates_hash != frozen_dataset.candidates_hash:
         raise PresmokeCliError("attempt plan.freeze_candidates_hash 不匹配冻结 manifest")
-    if plan.seed != frozen_dataset.seed:
-        raise PresmokeCliError("attempt plan.seed 不匹配冻结 manifest")
     task_toml_hashes = raw_manifest.get("task_toml_hashes")
     if not isinstance(task_toml_hashes, Mapping):
         raise PresmokeCliError("冻结 manifest.task_toml_hashes 必须是对象")
@@ -345,7 +343,7 @@ def build_task_specs(
             acn_binary_hash=acn_binary_hash,
             acn_config_hash=config_hash,
             dataset_candidates_hash=plan.freeze_candidates_hash,
-            dataset_seed=plan.seed,
+            dataset_seed=frozen_dataset.seed,
             dataset_task_ids=frozen_task_ids,
             skill_hash=skill_hash,
             acn_package_tree_hash=acn_package_tree_hash,
