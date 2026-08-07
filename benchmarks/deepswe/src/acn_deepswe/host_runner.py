@@ -149,8 +149,25 @@ def build_acn_config(provenance: EvaluationProvenance, upstream_base_url: str) -
             "retry_base_delay_ms": 1,
             "retry_max_delay_ms": 1,
         },
+        # 评测如启动 router rerank，也必须与 agent 一样走 OAI Chat Completions，
+        # 并使用同一容器内 key；禁止默认回落到外部 OpenAI 配置。
+        "router.rerank": {
+            "provider": "openai_chat",
+            "endpoint": f"{upstream_base_url.rstrip('/')}/v1/chat/completions",
+            "model": provenance.model,
+            "timeout_secs": 30,
+            "max_tokens": 512,
+            "api_key_env": CONTAINER_MODEL_KEY_ENV,
+            "retry_count": _positive_int(provenance.llm_retry, "retry_count"),
+            "retry_base_delay_ms": _positive_int(
+                provenance.llm_retry, "retry_base_delay_ms"
+            ),
+            "retry_max_delay_ms": _positive_int(
+                provenance.llm_retry, "retry_max_delay_ms"
+            ),
+        },
         "agent.llm": {
-            "provider": "openai_compatible_chat",
+            "provider": "openai_chat",
             "endpoint": f"{upstream_base_url.rstrip('/')}/v1",
             "model": provenance.model,
             "reasoning_effort": provenance.reasoning_effort,

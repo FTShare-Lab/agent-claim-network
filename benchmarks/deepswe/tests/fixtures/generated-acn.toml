@@ -13,8 +13,18 @@ timeout_secs = 30
 retry_count = 0
 retry_base_delay_ms = 1
 retry_max_delay_ms = 1
+[router.rerank]
+provider = "openai_chat"
+endpoint = "https://upstream.invalid/v1/chat/completions"
+model = "fixture-model"
+timeout_secs = 30
+max_tokens = 512
+api_key_env = "ACN_EVAL_MODEL_KEY"
+retry_count = 3
+retry_base_delay_ms = 1000
+retry_max_delay_ms = 30000
 [agent.llm]
-provider = "openai_compatible_chat"
+provider = "openai_chat"
 endpoint = "https://upstream.invalid/v1"
 model = "fixture-model"
 reasoning_effort = "max"
