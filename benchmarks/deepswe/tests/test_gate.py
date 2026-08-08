@@ -88,7 +88,7 @@ class GateValidatorTests(unittest.TestCase):
         )
         self.assertIn("USAGE_NOT_REPORTED", silent_zero.reason)
 
-    def test_incomplete_response_usage_fails_the_gate(self) -> None:
+    def test_incomplete_response_usage_is_a_nonblocking_audit_warning(self) -> None:
         result = GateValidator().validate(
             replace(
                 _b_claim_input(),
@@ -100,7 +100,11 @@ class GateValidatorTests(unittest.TestCase):
             )
         )
 
-        self.assertIn("INCOMPLETE_MODEL_USAGE", result.reason)
+        self.assertEqual(result.decision, "pass")
+        self.assertEqual(
+            result.reason,
+            "ALL_REQUIRED_EVIDENCE_PRESENT_WITH_INCOMPLETE_MODEL_USAGE",
+        )
 
         audit_failure = GateValidator().validate(
             replace(_b_claim_input(), usage=replace(LIVE_USAGE, audit_incomplete=True))

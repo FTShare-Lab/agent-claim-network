@@ -77,38 +77,47 @@ class GateValidator:
 
     def validate(self, value: AttemptGateInput) -> GateResult:
         failures: list[str] = []
+        warnings: list[str] = []
         if not SHA256_PATTERN.fullmatch(value.artifact_hash):
             failures.append("ARTIFACT_HASH_INVALID")
         if value.verifier.attempt_id != value.attempt_id:
             failures.append("VERIFIER_ATTEMPT_MISMATCH")
         if value.verifier.verifier_exit_code != 0:
             failures.append("VERIFIER_DID_NOT_RUN")
-        self._validate_usage(value.usage, value.expected_response_model, failures)
+        self._validate_usage(value.usage, value.expected_response_model, failures, warnings)
         if not value.isolation_checks or not all(value.isolation_checks.values()):
             failures.append("ISOLATION_CHECK_FAILED")
         if value.router_evidence_incomplete:
             failures.append("ROUTER_EVIDENCE_INCOMPLETE")
         self._validate_router(value, failures)
+        reason = ",".join(failures) if failures else "ALL_REQUIRED_EVIDENCE_PRESENT"
+        if warnings:
+            reason = f"{reason}_WITH_{'_AND_'.join(warnings)}"
         return GateResult(
             1,
             value.attempt_id,
             "task1-attempt",
             "pass" if not failures else "fail",
-            ",".join(failures) if failures else "ALL_REQUIRED_EVIDENCE_PRESENT",
+            reason,
             datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         )
 
     @staticmethod
     def _validate_usage(
-        usage: RustUsage, expected_response_model: str, failures: list[str]
+        usage: RustUsage,
+        expected_response_model: str,
+        failures: list[str],
+        warnings: list[str],
     ) -> None:
-        """usage 直接取自上游响应；缺失说明 token 指标不可用，实验不能计入统计。"""
+        """成功响应的 usage 必须完整；重试前的中断请求只作审计告警。"""
         if usage.model_requests <= 0:
             failures.append("NO_MODEL_REQUEST_RECORDED")
         elif usage.input_tokens <= 0 or usage.output_tokens <= 0:
             failures.append("USAGE_NOT_REPORTED")
         if usage.incomplete_model_responses:
-            failures.append("INCOMPLETE_MODEL_USAGE")
+            # 上游/链路的瞬时失败可由后续请求恢复。保留计数，避免它阻断 verifier
+            # 结果和 claim 实验；token 统计由 PRD 规定为成功响应的观测下界。
+            warnings.append("INCOMPLETE_MODEL_USAGE")
         if usage.audit_incomplete:
             failures.append("USAGE_AUDIT_INCOMPLETE")
         if not usage.response_models:
