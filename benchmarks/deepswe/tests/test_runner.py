@@ -132,6 +132,8 @@ class ConfigGenerationTests(unittest.TestCase):
         self.assertEqual(job["n_attempts"], 1)
         self.assertEqual(job["n_concurrent_trials"], 1)
         self.assertEqual(job["retry"], {"max_retries": 0})
+        # 保留预拉取的官方任务镜像；Pier 的 delete=True 会执行 down --rmi all。
+        self.assertFalse(job["environment"]["delete"])
         agent = job["agents"][0]
         self.assertIn("AcnEvalPierAgent", agent["import_path"])
         self.assertEqual(agent["kwargs"]["upstream_base_url"], UPSTREAM)
