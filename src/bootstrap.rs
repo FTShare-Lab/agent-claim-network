@@ -251,8 +251,11 @@ pub fn build_evaluation_session_engine(
     upstream: &ResolvedUpstream,
     router: Arc<dyn RouterClient>,
 ) -> anyhow::Result<SessionEngine> {
-    if cfg.agent.llm.provider != LlmProvider::OpenAiChat {
-        anyhow::bail!("evaluation 只支持 openai_compatible_chat provider");
+    if !matches!(
+        cfg.agent.llm.provider,
+        LlmProvider::OpenAiChat | LlmProvider::OpenAiResponses
+    ) {
+        anyhow::bail!("evaluation 只支持 openai_chat 或 openai_responses provider");
     }
     let prompts = build_session_prompt_registry(cfg)?;
     let provider = build_provider_adapter(cfg)?;
@@ -968,9 +971,9 @@ mod tests {
             hosts.path().to_path_buf(),
             prompts.path().to_path_buf(),
         );
-        c.agent.llm.provider = LlmProvider::OpenAiChat;
+        c.agent.llm.provider = LlmProvider::OpenAiResponses;
         c.agent.llm.api_key = Some("test-key".into());
-        c.agent.llm.endpoint = "http://127.0.0.1:1".into();
+        c.agent.llm.endpoint = "http://127.0.0.1:1/v1".into();
         let upstream = c.resolve_upstream(None).unwrap();
 
         let global_skills = c.storage.skills_root();
