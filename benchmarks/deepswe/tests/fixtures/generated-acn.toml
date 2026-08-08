@@ -14,8 +14,8 @@ retry_count = 0
 retry_base_delay_ms = 1
 retry_max_delay_ms = 1
 [router.rerank]
-provider = "openai_chat"
-endpoint = "https://upstream.invalid/v1/chat/completions"
+provider = "openai_responses"
+endpoint = "https://upstream.invalid/v1"
 model = "fixture-model"
 timeout_secs = 30
 max_tokens = 512
@@ -24,7 +24,7 @@ retry_count = 3
 retry_base_delay_ms = 1000
 retry_max_delay_ms = 30000
 [agent.llm]
-provider = "openai_chat"
+provider = "openai_responses"
 endpoint = "https://upstream.invalid/v1"
 model = "fixture-model"
 reasoning_effort = "max"

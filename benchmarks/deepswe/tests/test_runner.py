@@ -82,12 +82,12 @@ class ConfigGenerationTests(unittest.TestCase):
         llm = parsed["agent"]["llm"]
         self.assertEqual(llm["endpoint"], "https://upstream.invalid/v1")
         self.assertEqual(llm["api_key_env"], CONTAINER_MODEL_KEY_ENV)
-        self.assertEqual(llm["provider"], "openai_chat")
+        self.assertEqual(llm["provider"], "openai_responses")
         self.assertEqual(llm["reasoning_effort"], "max")
         self.assertEqual(llm["max_tokens"], provenance().resources["max_tokens"])
         rerank = parsed["router"]["rerank"]
-        self.assertEqual(rerank["provider"], "openai_chat")
-        self.assertEqual(rerank["endpoint"], "https://upstream.invalid/v1/chat/completions")
+        self.assertEqual(rerank["provider"], "openai_responses")
+        self.assertEqual(rerank["endpoint"], "https://upstream.invalid/v1")
         self.assertEqual(rerank["model"], provenance().model)
         self.assertEqual(rerank["api_key_env"], CONTAINER_MODEL_KEY_ENV)
         self.assertEqual(
