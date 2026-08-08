@@ -308,7 +308,7 @@ def build_pier_job_config(
 
 
 class Task1HostRunner:
-    """编排 A → Gate → freeze → B_empty → B_claim；默认只生成计划。"""
+    """编排 A → Gate → freeze → B_empty / B_claim；默认只生成计划。"""
 
     def __init__(
         self,
@@ -365,14 +365,20 @@ class Task1HostRunner:
         self._pier_trial_directories.clear()
         self._pier_task_checksum = None
         records: list[AttemptExecutionRecord] = []
+        cohort: str | None = None
         try:
             a_record = self._run_one_attempt(attempts[0], execution)
             records.append(a_record)
             if a_record.status in {"gate_failed", "infrastructure_failed"}:
                 raise TaskExecutionError(a_record.reason)
             self._freeze_after_a(attempts[0], execution)
-            eligible = a_record.verifier_passed is True and bool(self._frozen_claim_ids)
-            if not eligible:
+            has_frozen_claims = bool(self._frozen_claim_ids)
+            cohort = (
+                "success_efficiency"
+                if a_record.verifier_passed is True
+                else "failure_recovery"
+            ) if has_frozen_claims else "unpaired_no_claim"
+            if not has_frozen_claims:
                 if execution.require_eligible_claim:
                     raise TaskExecutionError("NO_ELIGIBLE_CLAIM")
                 for attempt in attempts[1:]:
@@ -392,7 +398,7 @@ class Task1HostRunner:
                     records.append(record)
                     if record.status in {"gate_failed", "infrastructure_failed"}:
                         raise TaskExecutionError(record.reason)
-                self._write_execution_manifest(execution, records, None)
+                self._write_execution_manifest(execution, records, None, cohort)
                 return TaskExecutionResult("no_eligible_claim")
             for attempt in attempts[1:]:
                 record = self._run_one_attempt(attempt, execution)
@@ -400,9 +406,9 @@ class Task1HostRunner:
                 if record.status in {"gate_failed", "infrastructure_failed"}:
                     raise TaskExecutionError(record.reason)
         except (OSError, ValueError, PierResultError, TaskExecutionError) as error:
-            self._write_execution_manifest(execution, records, str(error))
+            self._write_execution_manifest(execution, records, str(error), cohort)
             raise TaskExecutionError(str(error)) from error
-        self._write_execution_manifest(execution, records, None)
+        self._write_execution_manifest(execution, records, None, cohort)
         return TaskExecutionResult("passed")
 
     def _run_one_attempt(
@@ -642,6 +648,7 @@ class Task1HostRunner:
         execution: Task1ExecutionConfig,
         records: list[AttemptExecutionRecord],
         failure: str | None,
+        cohort: str | None = None,
     ) -> None:
         experiment = self.experiment.to_dict()
         if self._frozen_claim_bundle_hash is not None:
@@ -652,6 +659,7 @@ class Task1HostRunner:
                 "schema_version": 1,
                 "experiment": experiment,
                 "frozen_claim_bundle_hash": self._frozen_claim_bundle_hash,
+                "experiment_cohort": cohort,
                 "execution": {
                     "model": self.experiment.provenance.model,
                     "response_model": execution.expected_response_model,

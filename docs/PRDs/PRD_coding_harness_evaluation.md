@@ -98,7 +98,7 @@ ACN 不要求伪装成 `mini-swe-agent`，其原生文件、命令和 router 工
 | Memory | 关闭注入、读取、写入和后台 memory review；每个 attempt 使用全新 `acn_home` |
 | Session | 不 resume；每题、每组使用新的 agent id、session id 和 session 目录 |
 | Workspace | 从同一 base commit / image digest 创建 pristine 副本；组间不共享 git 对象外的运行产物 |
-| Claim | 按 3.3 的组别矩阵配置；B 不能看到 A 的 patch、session、trace、日志或私有文件 |
+| Claim | 按 3.3 的组别矩阵配置；只要 A 在 freeze barrier 前产生 claim，就同时运行两个干净 B 臂；B 不能看到 A 的 patch、session、trace、日志或私有文件 |
 | Skill | 三组注入完全相同的 `coding-benchmark` skill，记录全文 SHA-256 |
 | Prompt | 相同 system prompt、首条任务 prompt 和注入顺序；禁止中途人工补充提示 |
 | 工具 | 三组工具 schema、权限、并发上限和输出截断相同；除 router 返回内容外不得因组别变化 |
@@ -122,13 +122,29 @@ ACN 不要求伪装成 `mini-swe-agent`，其原生文件、命令和 router 工
 | --- | --- | --- | --- |
 | 历史 Memory / Session | 空 | 空 | 空 |
 | 初始本地 Claim | 空 | 空 | 空 |
-| Router | 进程内空 bundle | 进程内空 bundle | 进程内只读 bundle，仅含 A 本题 freeze barrier 前的合格 claim |
+| Router | 进程内空 bundle | 进程内空 bundle | 进程内只读 bundle，仅含 A 本题 freeze barrier 前的 claim |
 | A 的 workspace / patch / log / trace | 自身运行可见 | 不可见 | 不可见 |
 | 运行中团队数据变化 | 不读取历史 claim | 禁止 | 禁止；开始前生成只读快照 |
 
 A 完成并退出后，由宿主写入不可变 freeze barrier；claim 资格检查只采信 barrier 前的宿主事件
-账本，不采信 claim 文件自报的时间或 attempt id。`B_claim` 使用通过检查的只读快照。B 运行期间
-不得继续接收 A 的新 claim、policy 或 dispute 更新。
+账本，不采信 claim 文件自报的时间或 attempt id。只要快照非空，`B_claim` 就使用通过检查的只读
+快照；A 是否通过 verifier 不影响 claim 是否可被注入。B 运行期间不得继续接收 A 的新 claim、policy
+或 dispute 更新。
+
+### 3.3.1 成功效率与失败恢复的分层
+
+每题先运行 A，再从 pristine workspace 启动 B。A 的 verifier 结果只决定统计分层，不决定
+`B_claim` 是否启动：
+
+| 分层 | 入组条件 | B 臂 | 主要问题 |
+| --- | --- | --- | --- |
+| `success_efficiency` | A verifier 通过，且 freeze snapshot 非空 | `B_empty` 与 `B_claim` | claim 能否减少 agent step、成功响应观测 token 和耗时，同时维持完成质量？ |
+| `failure_recovery` | A verifier 未通过，且 freeze snapshot 非空 | `B_empty` 与 `B_claim` | 失败中的观察、已排除路径和测试结果能否让 `B_claim` 比干净重试更常通过 verifier？ |
+| `unpaired_no_claim` | freeze snapshot 为空 | 仅 `B_empty` | 记录 claim 产出覆盖率，不进入 claim 对照统计。 |
+
+失败 claim 不被当作已验证事实：它们只能作为带 provenance 的冻结观察供 B 自主判断。B 不得获得
+A 的 patch、workspace、session、trace 或日志，因此失败恢复衡量的是 ACN 外化 claim 的价值，而非
+续跑 A 的工作区。
 
 ### 3.4 每次运行必须落盘
 
@@ -141,26 +157,30 @@ A 完成并退出后，由宿主写入不可变 freeze barrier；claim 资格检
 - enabled tools、MCP、subagent、Memory、Claim、网络白名单和 sandbox 配置；
 - `max_tool_loop_turns`、并发工具数、file/code-run 输出上限、compact 阈值及实际是否触发；
 - agent/verifier timeout、退出原因、runner/proxy/network 异常；
-- input/output/cache token、模型请求数、agent step、tool call 及标准化费用；
+- input/output/cache token、完整与不完整模型请求数、agent step、tool call 及标准化费用；
 - workspace 初始/最终 hash、patch hash、verifier 结果、router 返回和实际使用的 claim id。
 
 缺少 manifest、配置 hash 对不上或发生白名单外联网的 attempt 不进入正式统计，修复后重跑。
+单次可重试请求若在收到响应前中断，会保留为 `incomplete_model_responses` 审计告警，但不因而
+否定已完成的 agent/verifier 结果；成功响应的 usage 必须完整。token 与标准化费用在这种情况下
+标为“成功响应观测值下界”，并按 arm 报告不完整请求数，不把未知的中断请求成本补零或伪造。
 
 ## 4. ACN 怎么跑
 
-每道题运行三个彼此隔离的 agent：
+每道题先运行 A；当且仅当 A freeze 后存在 claim 时，再运行两个彼此隔离的 B agent：
 
 | 组别 | 作用 | 可见信息 |
 | --- | --- | --- |
 | A：producer | 第一次正常运行，同时产出 claim | 无历史 claim |
 | B_empty | 全新 agent，对照组 | router 可用，但 team store 为空 |
-| B_claim | 另一个全新 agent，实验组 | 只能通过 router 获取 A 产出的 claim |
+| B_claim | 另一个全新 agent，实验组 | 只能通过 router 获取 A 产出的 freeze claim；A 成功和失败两种情况均可注入 |
 
 三个 agent 都从同一仓库快照开始，使用相同模型、system prompt、skill、工具、预算和 verifier。
 `B_empty` 与 `B_claim` 的唯一差别是 router 中有没有 A 的 claim。
 
 B_claim 不得获得 A 的 patch、工作区、session、日志或 private memory；这些内容如果被带过去，
-测到的就不是 claim 价值。
+测到的就不是 claim 价值。A 通过 verifier 的题归入效率分层；A 未通过但有 claim 的题归入失败恢复
+分层，两者绝不混合计算 uplift。
 
 ## 5. 统一 Skill
 
@@ -187,15 +207,19 @@ input/output/cache token，避免路由换模或缓存差异无法解释。
 
 | 指标 | 用途 | 来源 |
 | --- | --- | --- |
-| pass rate | 看任务完成质量 | DeepSWE verifier |
-| claim uplift | `pass(B_claim) - pass(B_empty)`，本期主指标 | 按题配对结果 |
-| token | 看 claim 是否减少或增加模型消耗 | 模型服务原始 usage |
+| 成功效率 | `B_claim` 相对 `B_empty` 的 agent step、成功响应观测 token、耗时差 | `success_efficiency` 的按题配对结果 |
+| 失败恢复 uplift | `pass(B_claim) - pass(B_empty)` | `failure_recovery` 的按题配对结果 |
+| token | 成功响应返回的原始 usage；中断请求单列计数，不补零 | 模型服务原始 usage |
 | 标准化费用 | 按冻结官方费率换算，缓存单独计价 | token usage + 价目表 |
 | agent step | 看完成任务需要多少轮决策 | ACN session JSONL |
 | claim retrieved / used | 确认 B 是否真的检索和引用 claim | router 记录 + trace |
 
 `agent step` 统一定义为一次完整的模型响应；tool call 数另记。实际本地 GPU 成本如果模型服务
 能够提供则单列，不能和按官方费率换算的费用混成一个数。
+
+出现 `incomplete_model_responses` 时，attempt 仍可进入 verifier 和 claim 分层；报告必须同时给出
+每个 arm 的不完整请求数及受影响 attempt 比例。涉及 token/费用的结论仅使用“成功响应观测值下界”
+表述，不将其解释为完整账单。
 
 ## 8. 运行规模
 
@@ -208,11 +232,13 @@ input/output/cache token，避免路由换模或缓存差异无法解释。
 5 题和 30 题都从完整任务清单按固定 seed 无放回抽取并冻结。Pre-smoke 的第 1 题必须先完成
 A、`B_empty`、`B_claim` 三臂硬门禁，确认 schema、verifier、artifact hash、broker
 request/step nonce、usage、claim/router 证据和隔离检查全部闭合，才允许运行余下 4 题。
-硬门禁通过后，余下 4 题可按平台限流并发；每题内部仍保持 A → freeze → 两个 B 臂串行。
-broker 必须使用独立随机端口，避免并发 task 共享连接或抢占固定端口。
+硬门禁通过后，余下 4 题可按平台限流并发；每题内部仍保持 A → freeze → 两个 B 臂串行。若
+freeze snapshot 为空，`B_claim` 记为 `NO_ELIGIBLE_CLAIM` 而不运行。broker 必须使用独立随机端口，
+避免并发 task 共享连接或抢占固定端口。
 
-每个 task/arm 只允许一次解题运行；verifier 0 分是有效结果，不得重跑刷分。只有明确的 runner、
-容器、网络或 proxy 故障可以原配置重试一次，并保留失败 attempt。若 Pre-smoke 后模型、skill、
+每个 task/arm 只允许一次解题运行；verifier 0 分是有效结果，不得重跑刷分。单次可重试模型请求的
+中断由 agent 内部 retry 处理，并作为非阻断审计告警留存；只有明确的 runner、容器、网络或 proxy
+故障可以原配置重试一次，并保留失败 attempt。若 Pre-smoke 后模型、skill、
 预算和执行协议不变，结果可并入 Smoke。
 
 若 Smoke 后模型、skill、预算和执行协议不变，**保留这 30 题结果，
@@ -224,11 +250,11 @@ Full 只补剩余 83 题，即新增 83 × 3 = 249 attempts**，不重复花钱�
 
 Smoke 完成后检查：
 
-- verifier、router、session JSONL 和模型服务 usage 均能稳定落盘；
+- verifier、router、session JSONL 和成功模型响应 usage 均能稳定落盘；
 - 无 claim 基线没有出现明显的全失败或全通过；
 - B_claim 能实际检索到 claim；
-- token 和费用可以复算，全量预算可接受；
-- claim 组至少在得分、token、费用或 step 中出现值得继续验证的信号。
+- token 和费用的成功响应观测值可以复算，并按 arm 报告中断请求比例；全量预算可接受；
+- 成功效率分层或失败恢复分层至少出现值得继续验证的信号。
 
 30 题只用于做投入判断，不发布强结论。Full 报告按题配对的得分差，并附 95% 置信区间。
 agent 自身失败按未通过计分；runner、网络或 proxy 故障修复后重跑，不混入模型失败。
@@ -242,14 +268,17 @@ agent 自身失败按未通过计分；runner、网络或 proxy 故障修复后�
 
 ### 图二：ACN Claim 增益
 
-展示 `B_empty` 与 `B_claim` 的：
+分两栏展示 `B_empty` 与 `B_claim`：成功效率栏只比较 A 已通过题的 step/token/耗时；失败恢复栏
+比较 A 未通过题的 verifier pass rate。两栏都报告不完整请求比例。
 
-- DeepSWE pass rate；
+成功效率栏展示：
+
 - 平均 token / task；
 - 标准化费用 / task；
 - 平均 agent step / task。
 
-另画“横轴费用、纵轴得分”的散点图。B_claim 相比 B_empty 越向左上移动，说明 claim 带来的净收益越好。
+失败恢复栏展示 `pass(B_claim) - pass(B_empty)` 及其置信区间。另画“横轴成功响应观测费用、纵轴
+通过率”的散点图，并明确费用为下界；B_claim 相比 B_empty 越向左上移动，说明 claim 带来的净收益越好。
 
 ## 11. 组会待拍板
 

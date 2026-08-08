@@ -256,6 +256,7 @@ class RealExecutionTests(unittest.TestCase):
 
         self.assertEqual(variants, [item.variant for item in plan.attempts])
         self.assertEqual([item["status"] for item in manifest["attempt_results"]], ["passed"] * 3)
+        self.assertEqual(manifest["experiment_cohort"], "success_efficiency")
         self.assertEqual(bundle["claims"][0]["id"], "claim-1")
         self.assertEqual(manifest["frozen_claim_bundle_hash"], bundle_hash)
         self.assertEqual(manifest["execution"]["host_model_key_env"], HOST_MODEL_KEY_ENV)
@@ -434,8 +435,9 @@ class ProvenanceTests(unittest.TestCase):
         )
         self.assertEqual(manifest["attempt_results"][-1]["status"], "not_run")
         self.assertEqual(manifest["attempt_results"][-1]["reason"], "NO_ELIGIBLE_CLAIM")
+        self.assertEqual(manifest["experiment_cohort"], "unpaired_no_claim")
 
-    def test_a_verifier_failure_runs_b_empty_and_skips_b_claim(self) -> None:
+    def test_a_verifier_failure_with_claims_runs_failure_recovery_pair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             plan = build_attempt_plan(DATASET, root / "run", seed=2)
@@ -462,8 +464,8 @@ class ProvenanceTests(unittest.TestCase):
                 )
             manifest = json.loads(execution.manifest_path.read_text())
 
-        self.assertEqual(variants, ["A", "B_empty"])
-        self.assertEqual(manifest["attempt_results"][-1]["status"], "not_run")
+        self.assertEqual(variants, ["A", "B_empty", "B_claim"])
+        self.assertEqual(manifest["experiment_cohort"], "failure_recovery")
 
     def test_hard_gate_rejects_ineligible_a_before_b_arms(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
