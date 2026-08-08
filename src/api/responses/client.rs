@@ -8,6 +8,7 @@ use super::protocol::{reduce_response_value, ReducedResponses, ResponsesRequest}
 use super::redact_responses_error_body;
 use super::streaming::ResponsesSseDecoder;
 use crate::api::endpoint::{resolve_llm_endpoint, LlmEndpointKind};
+use crate::api::evaluation_usage::{record_evaluation_request_started, record_evaluation_usage};
 use crate::api::llm_http::{read_llm_error_body, LlmHttpError, LlmHttpPhase};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +153,7 @@ impl ResponsesClient {
         &self,
         request: &ResponsesRequest,
     ) -> Result<ReducedResponses, ResponsesError> {
+        let request_sequence = record_evaluation_request_started();
         let response = self
             .http
             .post(self.endpoint.as_str())
@@ -161,7 +163,13 @@ impl ResponsesClient {
             .send()
             .await
             .map_err(|error| self.http_error(error, LlmHttpPhase::SendRequest))?;
-        response_json(response, self.timeout).await
+        let reduced = response_json(response, self.timeout).await?;
+        record_evaluation_usage(
+            request_sequence,
+            reduced.usage.as_ref(),
+            reduced.model.as_deref(),
+        );
+        Ok(reduced)
     }
 
     async fn send_streaming_with_retry(
@@ -213,6 +221,7 @@ impl ResponsesClient {
         request: &ResponsesRequest,
         emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
     ) -> Result<ReducedResponses, ResponsesError> {
+        let request_sequence = record_evaluation_request_started();
         let response = self
             .http
             .post(self.endpoint.as_str())
@@ -246,7 +255,13 @@ impl ResponsesClient {
             })?;
             decoder.push_chunk(&chunk, emit)?;
         }
-        decoder.finish(emit)
+        let reduced = decoder.finish(emit)?;
+        record_evaluation_usage(
+            request_sequence,
+            reduced.usage.as_ref(),
+            reduced.model.as_deref(),
+        );
+        Ok(reduced)
     }
 }
 
@@ -312,11 +327,14 @@ fn compute_backoff(attempt: u32, base: Duration, max: Duration) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     use super::*;
+    use crate::api::{with_evaluation_usage_recording, EvaluationUsageRecorder};
 
     #[tokio::test]
     async fn client_parses_matching_json_and_sse_results() {
@@ -379,6 +397,46 @@ mod tests {
         assert!(captured_request
             .to_ascii_lowercase()
             .contains("authorization: bearer test-key"));
+    }
+
+    #[tokio::test]
+    async fn client_records_native_responses_usage_for_evaluation() {
+        let body = json!({
+            "status": "completed",
+            "model": "response-model",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "ok"}]
+            }],
+            "usage": {
+                "input_tokens": 11,
+                "input_tokens_details": {"cached_tokens": 7},
+                "output_tokens": 5,
+                "output_tokens_details": {"reasoning_tokens": 3}
+            }
+        })
+        .to_string();
+        let (endpoint, _) = spawn_server("application/json", body).await;
+        let recorder = Arc::new(EvaluationUsageRecorder::default());
+
+        with_evaluation_usage_recording(recorder.clone(), async {
+            test_client(endpoint)
+                .send(&request(false), &mut |_| {})
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let records = recorder.take_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].model.as_deref(), Some("response-model"));
+        assert!(records[0].is_complete);
+        assert_eq!(records[0].input_tokens, 11);
+        assert_eq!(records[0].output_tokens, 5);
+        assert_eq!(records[0].cache_read_tokens, 7);
+        assert_eq!(records[0].reasoning_tokens, 3);
     }
 
     #[tokio::test]

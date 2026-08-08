@@ -395,13 +395,7 @@ async fn run_attempt_inner(
         );
     }
     cfg.set_tool_workspace_root(workspace_root);
-    // 只有 chat completions 客户端会上报 usage；换 provider 会让 token 指标静默归零。
-    if cfg.agent.llm.provider != LlmProvider::OpenAiChat {
-        anyhow::bail!(
-            "stage=config 评测只支持 openai_compatible_chat provider: {:?}",
-            cfg.agent.llm.provider
-        );
-    }
+    validate_evaluation_llm_provider(cfg.agent.llm.provider)?;
     // key 仅从容器环境读取，不写入评测配置或结果产物。
     if cfg.agent.llm.api_key.is_none() {
         anyhow::bail!(
@@ -450,6 +444,15 @@ async fn run_attempt_inner(
         .await
         .context("stage=finalize 收尾 session 失败")?;
     Ok(report)
+}
+
+fn validate_evaluation_llm_provider(provider: LlmProvider) -> anyhow::Result<()> {
+    match provider {
+        LlmProvider::OpenAiChat | LlmProvider::OpenAiResponses => Ok(()),
+        LlmProvider::Anthropic => anyhow::bail!(
+            "stage=config 评测只支持 openai_chat 或 openai_responses provider: {provider:?}"
+        ),
+    }
 }
 
 async fn append_attempt_claim_snapshots(
@@ -828,6 +831,13 @@ mod tests {
         assert_eq!(first, evaluation_agent_id("task-1-A").unwrap());
         assert_ne!(first, evaluation_agent_id("task-1-B_empty").unwrap());
         assert!(first.as_str().starts_with("eval_"));
+    }
+
+    #[test]
+    fn evaluation_accepts_both_openai_wire_protocols() {
+        assert!(validate_evaluation_llm_provider(LlmProvider::OpenAiChat).is_ok());
+        assert!(validate_evaluation_llm_provider(LlmProvider::OpenAiResponses).is_ok());
+        assert!(validate_evaluation_llm_provider(LlmProvider::Anthropic).is_err());
     }
 
     #[test]
