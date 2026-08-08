@@ -304,7 +304,7 @@ def build_task_specs(
     acn_binary_hash = _sha256_file(config.acn_eval)
     config_hash = _effective_config_hash(config)
     specs: list[PresmokeTaskSpec] = []
-    for task_index, task_id in enumerate(frozen_task_ids):
+    for task_id in frozen_task_ids:
         source_dir = config.source_tasks_root / task_id
         normalized_dir = config.normalized_root / task_id
         source = source_dir / "task.toml"
@@ -387,7 +387,7 @@ def build_task_specs(
                     expected_response_model=config.response_model,
                     frozen_acn_source_root=acn_source_root,
                     frozen_pier_source_root=pier_source_root,
-                    require_eligible_claim=task_index == 0,
+                    require_eligible_claim=False,
                 ),
                 jobs_directory=task_output / "jobs",
                 manifest_path=task_output / "manifest.json",

@@ -83,9 +83,10 @@ PYTHONPATH=benchmarks/deepswe/src python -m acn_deepswe.presmoke_cli \
 或环境时用 `--read-key-stdin` 按提示隐藏输入；它只在真实执行且环境无该变量时读取，dry-run
 不读，已有环境值优先，进程退出时清除。
 
-冻结 manifest 的首题 `A → Gate → B_empty/B_claim` 完全通过后才继续。当前配置使用
-`task_workers=1`，各题及每题内部的 `A → freeze → B_empty/B_claim` 都串行，
-`max_retries=0`。任一失败以非零退出，不会自动重试 solve。输出 aggregate manifest 在
+冻结 manifest 中的每题独立执行 `A → freeze → B_empty/B_claim`，并以 `task_workers` 限制题间
+并发；同一题内部保持串行，`max_retries=0`。某题没有 eligible claim 时仍保留 A 与 B_empty 结果，
+并将 B_claim 标为不适用；其余题继续执行。基础设施或 Gate 失败会以非零退出，但不会自动重试
+solve。输出 aggregate manifest 在
 `output_dir/presmoke-aggregate.json`，各题 manifest、jobs 与 claim bundle 在
 `output_dir/tasks/<task>/`。
 
@@ -134,8 +135,8 @@ rollout 中 4/4 通过，5 题 0/4 通过。manifest 同时记录 artifact SHA-2
 
 Gate 只验证基础设施、claim 归因与隔离：artifact hash、verifier 是否真的跑过、usage 是否
 完整上报、Pier task checksum/trial 隔离，以及 `B_empty` 不得见到任何 claim、`B_claim`
-只能使用冻结 bundle 内的 claim。首题 hard gate 额外要求 `B_claim` 确实检索并注入 claim；
-后续题即使模型未检索，也保留在原实验组。
+只能使用冻结 bundle 内的 claim。仅在 A 同时通过 verifier 且冻结到 claim 时执行 B_claim；否则
+该任务保留 A/B_empty，B_claim 标记为不适用。
 
 **verifier 判 0 分与 agent 自身失败都是有效实验结果，不是 Gate 失败**，按未通过计分，不得
 重跑刷分。只有 runner、容器或网络故障才允许原配置重试一次，并保留失败 attempt。
