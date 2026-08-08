@@ -271,7 +271,9 @@ def build_pier_job_config(
         "retry": {"max_retries": 0},
         "environment": {
             "force_build": False,
-            "delete": True,
+            # 结束 trial 时清理容器/卷，但保留预拉取的官方任务镜像。否则 Pier 的
+            # `down --rmi all` 会让下一次冻结 preflight 缺少 content digest，并重复下载。
+            "delete": False,
             "override_cpus": resources.get("cpus"),
             "override_memory_mb": resources.get("memory_mb"),
             "override_storage_mb": resources.get("storage_mb"),
