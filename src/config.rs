@@ -642,11 +642,11 @@ pub enum RerankProvider {
 }
 
 fn default_rerank_provider() -> RerankProvider {
-    RerankProvider::OpenAiChat
+    RerankProvider::OpenAiResponses
 }
 
 fn default_rerank_endpoint() -> String {
-    "https://api.openai.com/v1/chat/completions".to_string()
+    "https://api.openai.com/v1".to_string()
 }
 
 fn default_rerank_model() -> String {
@@ -4203,6 +4203,9 @@ router_endpoint = "http://router.example"
         std::fs::write(&config_path, raw).unwrap();
         let cfg = Config::load(&config_path).expect("filled default template should load");
         assert_eq!(cfg.upstream, "default");
+        assert_eq!(cfg.agent.llm.provider, LlmProvider::OpenAiResponses);
+        assert_eq!(cfg.router.rerank.provider, RerankProvider::OpenAiResponses);
+        assert_eq!(cfg.router.rerank.endpoint, "https://api.openai.com/v1");
         assert_eq!(cfg.agent.tool.web.max_count, DEFAULT_WEB_SEARCH_MAX_COUNT);
     }
 
@@ -5248,7 +5251,8 @@ service_name = "agent_claim_network"
         assert!(!cfg.router.embedding.model.is_empty());
         assert!(!cfg.router.embedding.api_key_env.is_empty());
         assert!(cfg.router.embedding.max_concurrency > 0);
-        assert_eq!(cfg.router.rerank.provider, RerankProvider::OpenAiChat);
+        assert_eq!(cfg.router.rerank.provider, RerankProvider::OpenAiResponses);
+        assert_eq!(cfg.router.rerank.endpoint, "https://api.openai.com/v1");
         assert!(!cfg.router.rerank.model.is_empty());
         assert!(!cfg.router.rerank.api_key_env.is_empty());
     }

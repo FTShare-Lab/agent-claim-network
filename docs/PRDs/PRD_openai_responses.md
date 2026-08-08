@@ -207,7 +207,7 @@ enum ProviderReplayState {
 - Router Responses rerank 固定 `store = false`，不使用 `previous_response_id`，不同 query 之间不共享 response state。
 - 排序输出继续使用现有 prompt 与宽容 JSON parser，不要求 endpoint 支持 Responses Structured Outputs。合法对象形态为 `{"claim_ids":["..."]}`；现有 JSON 数组、代码围栏、未知 ID 过滤、重复 ID 去重与遗漏候选追加语义保持不变。
 - 复用现有 `[router.rerank].max_tokens`：Chat 映射为 `max_tokens`，Responses 映射为 `max_output_tokens`。Responses 仅接受 `status = completed` 且存在合法排序 JSON 的结果；`incomplete`、`max_output_tokens`、非法 JSON、HTTP/认证/超时错误沿用现有 retry 后降级到 lexical/vector 顺序，不做 continuation。
-- Responses endpoint 沿用现有 resolver，接受 host root、`/v1` base URL 或完整 `/v1/responses` URL。默认 rerank provider 仍为 `openai_chat`；选择 `openai_responses` 时由用户同时配置匹配的 endpoint 和 model，不自动替换。
+- Responses endpoint 沿用现有 resolver，接受 host root、`/v1` base URL 或完整 `/v1/responses` URL。Router rerank 的默认 provider 已统一为 `openai_responses`；用户仍需保证 provider、endpoint 与 model 属于同一兼容服务，ACN 不自动切换协议或模型。
 - 本增补不修改 Agent session schema、provider replay、TUI 展示或旧 session 数据。`provider_replay.protocol = "openai_responses"` 已是稳定 wire-protocol tag，不随配置名称收敛而变化。
 
 ## 5. 请求、响应与状态归一

@@ -32,10 +32,10 @@ model = "text-embedding-3-small"
 api_key_env = "EMBEDDING_API_KEY"
 
 [router.rerank]
-provider = "openai_chat"
-endpoint = "https://api.openai.com/v1/chat/completions"
+provider = "openai_responses"
+endpoint = "https://api.openai.com/v1"
 model = "gpt-5.6-luna"
-api_key_env = "OPENAI_API_KEY"
+api_key_env = "ACN_LLM_API_KEY"
 
 # 默认只监听本机；对外部署时按实际网络边界修改。
 [maintainer.daemon]
@@ -50,13 +50,10 @@ password_env = "ACN_MAINTAINER_ADMIN_PASSWORD"
 enabled = false
 
 [agent.llm]
-provider = "openai_chat"
-endpoint = ""
-model = ""
+provider = "openai_responses"
+endpoint = "https://api.openai.com/v1"
+model = "gpt-5.6-luna"
 reasoning_effort = "none"
-# 仅 provider = "anthropic" 生效；auto 表示不发送 thinking 字段。
-anthropic_thinking = "auto"
-# anthropic_thinking_budget_tokens = 4096
 api_key_env = "ACN_LLM_API_KEY"
 max_tokens = 65536
 context_window = 200000

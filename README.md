@@ -12,7 +12,7 @@
 <p align="center">
   <img alt="license: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg">
   <img alt="rust 1.90" src="https://img.shields.io/badge/rust-1.90-orange.svg">
-  <img alt="version 0.2.1" src="https://img.shields.io/badge/version-0.2.1-brightgreen.svg">
+  <img alt="version 0.2.2" src="https://img.shields.io/badge/version-0.2.2-brightgreen.svg">
   <a href="README_EN.md"><img alt="English README" src="https://img.shields.io/badge/README-English-blue.svg"></a>
 </p>
 
@@ -118,14 +118,14 @@ maintainer_endpoint = ""         # 都留空 = 单人模式
 router_endpoint = ""
 
 [agent.llm]
-provider = "openai_chat"
+provider = "openai_responses"
 endpoint = "https://your-llm-endpoint/v1"
 model = "your-model"
 api_key_env = "ACN_LLM_API_KEY"  # 环境变量名
 ```
 
 > [!NOTE]
-> `openai_chat` 只保存可见文本和工具语义，会丢弃厂商扩展的 Reasoning 字段。若模型要求在后续请求或工具回环中回传 Reasoning，请改用 `openai_responses` 或 `anthropic`。
+> `openai_responses` 支持 Reasoning 的私有落盘和同模型连续回传；当前 TUI 只显示最终回答、后续将支持 Reasoning 的逐步推理过程显示。
 
 `upstream` 是 Agent 侧的一份配置：身份、团队地址、本机数据目录。团队地址都留空即为单人模式（不连 Router / Maintainer）。
 
@@ -158,18 +158,18 @@ api_key_env = "ACN_LLM_API_KEY"
 </details>
 
 <details>
-<summary><b>改用 Responses 协议</b></summary>
+<summary><b>改用 OpenAI Chat 协议</b></summary>
 
 ```toml
 [agent.llm]
-provider = "openai_responses"
+provider = "openai_chat"
 endpoint = "https://your-llm-endpoint/v1"
 model = "your-model"
 reasoning_effort = "none"                # none | low | medium | high | xhigh | max
 api_key_env = "ACN_LLM_API_KEY"
 ```
 
-`openai_responses` 支持 Reasoning 的私有落盘和同模型连续回传；当前 TUI 不展示 Reasoning，失败时也不会自动切换到 Chat Completions。
+`openai_chat` 适用于只提供 Chat Completions 的兼容服务，但会丢弃厂商扩展的 Reasoning 字段。要求在后续请求或工具回环中回传 Reasoning 时，应使用 `openai_responses` 或 `anthropic`。
 
 </details>
 

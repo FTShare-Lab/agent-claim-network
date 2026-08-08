@@ -78,7 +78,7 @@ agent_id = "agent-a"
 
 ### `[agent.llm]`
 
-- `provider`：agent 主对话 LLM provider。当前支持 `anthropic`、`openai_chat`、`openai_responses`。Chat 与 Responses 是彼此独立的 wire protocol，ACN 不在两者之间自动降级。
+- `provider`：agent 主对话 LLM provider。模板默认推荐 `openai_responses`，也支持 `openai_chat` 和 `anthropic`。Chat 与 Responses 是彼此独立的 wire protocol，ACN 不在两者之间自动降级。
 - `endpoint`：与所选 provider 兼容的 LLM HTTP 地址，必须是绝对 HTTP(S) URL。可以填写服务 base URL，也可以填写完整请求 URL；OpenAI-compatible 的常见 base URL 形如 `https://llm.example.com/v1`，Anthropic-compatible 的常见 base URL 形如 `https://llm.example.com`。根 URL 会分别补全为 `/v1/chat/completions`、`/v1/responses` 或 `/v1/messages`；已有路径的 base URL 会追加相应末段，完整请求 URL 保持不变。
 - `model`：模型名，以配置文件为准。
 - `reasoning_effort`：控制 agent 主 LLM 的推理强度，可选值为 `none`、`low`、`medium`、`high`、`xhigh`、`max`，未配置时默认 `none`。未配置或设为 `none` 时不发送推理强度参数。
@@ -303,7 +303,7 @@ background-shell 其余时序、容量和 PTY 参数是 `config.rs` 内部默认
 
 ### `[router.rerank]`
 
-- `provider`：候选 Claim 的重排方式。`heuristic` 使用本地启发式规则；`openai_chat` 使用 Chat Completions；`openai_responses` 使用 Responses。两种远端协议都把 query 和候选 Claim 交给通用模型排序，不要求使用专用 rerank 模型。
+- `provider`：候选 Claim 的重排方式，默认 `openai_responses`。`heuristic` 使用本地启发式规则；`openai_chat` 使用 Chat Completions；`openai_responses` 使用 Responses。两种远端协议都把 query 和候选 Claim 交给通用模型排序，不要求使用专用 rerank 模型。
 - `endpoint`：远端重排服务地址，必须是绝对 HTTP(S) URL。可以填写 host root、常见的 `/v1` base URL 或完整的 `/v1/chat/completions`、`/v1/responses` 请求 URL；ACN 按所选 provider 补全缺失路径，不在两种协议间自动切换。
 - `model`：执行重排任务的模型名。
 - `api_key_env`：读取远端重排服务 API key 的环境变量名。

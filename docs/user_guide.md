@@ -40,7 +40,7 @@ maintainer_endpoint = ""
 router_endpoint = ""
 
 [agent.llm]
-provider = "openai_chat"
+provider = "openai_responses"
 endpoint = "https://your-llm-endpoint/v1"
 model = "your-model"
 api_key_env = "ACN_LLM_API_KEY"
@@ -50,7 +50,7 @@ api_key_env = "ACN_LLM_API_KEY"
 
 | 字段 | 含义 |
 | --- | --- |
-| `provider` | 请求协议，目前支持 `openai_chat`、`openai_responses` 和 `anthropic`。 |
+| `provider` | 请求协议，默认推荐 `openai_responses`；也支持 `openai_chat` 和 `anthropic`。 |
 | `endpoint` | 与所选协议兼容的 base URL 或完整请求 URL。OpenAI-compatible 的常见 base URL 形如 `https://llm.example.com/v1`，Anthropic-compatible 的常见 base URL 形如 `https://llm.example.com`。 |
 | `model` | 该服务实际接受的模型 ID。 |
 | `api_key_env` | 保存这个 LLM API key 的环境变量名，不是 key 本身。 |
