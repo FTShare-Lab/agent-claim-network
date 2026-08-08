@@ -59,6 +59,7 @@ pub struct ReducedResponses {
     pub output_text: String,
     pub function_calls: Vec<ResponsesFunctionCall>,
     pub usage: Option<Value>,
+    pub model: Option<String>,
     pub terminal: ResponsesTerminal,
 }
 
@@ -150,6 +151,10 @@ pub fn reduce_response_value(value: Value) -> Result<ReducedResponses, Responses
             .get("usage")
             .filter(|value| !value.is_null())
             .cloned(),
+        model: object
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         terminal,
     })
 }

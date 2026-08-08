@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use serde_json::Value;
 
-/// 单次 LLM HTTP attempt 的 OpenAI 兼容 usage 投影。
+/// 单次 LLM HTTP attempt 的 OpenAI Chat / Responses usage 投影。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct EvaluationUsage {
     pub request_sequence: u64,
@@ -31,18 +31,35 @@ impl EvaluationUsage {
             response_received: true,
             model: model.map(str::to_owned),
             is_complete: model.is_some()
-                && u64_at_option(usage, &["prompt_tokens"]).is_some()
-                && u64_at_option(usage, &["completion_tokens"]).is_some(),
-            input_tokens: u64_at(usage, &["prompt_tokens"]),
-            output_tokens: u64_at(usage, &["completion_tokens"]),
-            cache_read_tokens: u64_at(usage, &["prompt_tokens_details", "cached_tokens"]),
-            reasoning_tokens: u64_at(usage, &["completion_tokens_details", "reasoning_tokens"]),
+                && u64_at_any_option(usage, &[&["input_tokens"], &["prompt_tokens"]]).is_some()
+                && u64_at_any_option(usage, &[&["output_tokens"], &["completion_tokens"]])
+                    .is_some(),
+            input_tokens: u64_at_any(usage, &[&["input_tokens"], &["prompt_tokens"]]),
+            output_tokens: u64_at_any(usage, &[&["output_tokens"], &["completion_tokens"]]),
+            cache_read_tokens: u64_at_any(
+                usage,
+                &[
+                    &["input_tokens_details", "cached_tokens"],
+                    &["prompt_tokens_details", "cached_tokens"],
+                ],
+            ),
+            reasoning_tokens: u64_at_any(
+                usage,
+                &[
+                    &["output_tokens_details", "reasoning_tokens"],
+                    &["completion_tokens_details", "reasoning_tokens"],
+                ],
+            ),
         }
     }
 }
 
-fn u64_at(value: &Value, path: &[&str]) -> u64 {
-    u64_at_option(value, path).unwrap_or(0)
+fn u64_at_any(value: &Value, paths: &[&[&str]]) -> u64 {
+    u64_at_any_option(value, paths).unwrap_or(0)
+}
+
+fn u64_at_any_option(value: &Value, paths: &[&[&str]]) -> Option<u64> {
+    paths.iter().find_map(|path| u64_at_option(value, path))
 }
 
 fn u64_at_option(value: &Value, path: &[&str]) -> Option<u64> {
@@ -192,6 +209,33 @@ mod tests {
                 request_sequence: 0,
                 response_received: true,
                 model: Some("actual-model".into()),
+                is_complete: true,
+                input_tokens: 42480,
+                output_tokens: 8193,
+                cache_read_tokens: 42368,
+                reasoning_tokens: 8100,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_openai_responses_usage_including_reasoning_and_cache() {
+        let usage = EvaluationUsage::from_response(
+            Some(&json!({
+                "input_tokens": 42480,
+                "input_tokens_details": {"cached_tokens": 42368},
+                "output_tokens": 8193,
+                "output_tokens_details": {"reasoning_tokens": 8100}
+            })),
+            Some("actual-responses-model"),
+        );
+
+        assert_eq!(
+            usage,
+            EvaluationUsage {
+                request_sequence: 0,
+                response_received: true,
+                model: Some("actual-responses-model".into()),
                 is_complete: true,
                 input_tokens: 42480,
                 output_tokens: 8193,
