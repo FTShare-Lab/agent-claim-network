@@ -12,7 +12,7 @@
 <p align="center">
   <img alt="license: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg">
   <img alt="rust 1.90" src="https://img.shields.io/badge/rust-1.90-orange.svg">
-  <img alt="version 0.2.1" src="https://img.shields.io/badge/version-0.2.1-brightgreen.svg">
+  <img alt="version 0.2.2" src="https://img.shields.io/badge/version-0.2.2-brightgreen.svg">
   <a href="README.md"><img alt="Chinese README" src="https://img.shields.io/badge/README-简体中文-blue.svg"></a>
 </p>
 
@@ -78,8 +78,6 @@ The recommended installation method is Homebrew:
 brew install FTShare-Lab/tap/acn
 ```
 
-Linux users must first install Homebrew by following [Homebrew on Linux](https://docs.brew.sh/Homebrew-on-Linux), or download the GNU/Linux archive directly from [GitHub Releases](https://github.com/FTShare-Lab/agent-claim-network/releases).
-
 This installs `acn`, `acn-router`, `acn-maintainer`, and the Maintainer Workbench. To upgrade later:
 
 ```bash
@@ -120,11 +118,14 @@ maintainer_endpoint = ""         # leave both empty for standalone mode
 router_endpoint = ""
 
 [agent.llm]
-provider = "openai_chat"
+provider = "openai_responses"
 endpoint = "https://your-llm-endpoint/v1"
 model = "your-model"
 api_key_env = "ACN_LLM_API_KEY"  # environment variable name
 ```
+
+> [!NOTE]
+> `openai_responses` supports private Reasoning persistence and replay across consecutive turns using the same model. The TUI currently displays only the final answer; step-by-step Reasoning display will be supported in the future.
 
 An `upstream` is one Agent-side configuration containing its identity, team endpoints, and local data directory. Leaving both team endpoints empty selects standalone mode, with no connection to Router or Maintainer.
 
@@ -147,6 +148,8 @@ provider = "anthropic"
 endpoint = "https://your-llm-endpoint"
 model = "your-model"
 reasoning_effort = "none"                # none | low | medium | high | xhigh | max
+anthropic_thinking = "auto"              # auto | enabled | adaptive | disabled
+# anthropic_thinking_budget_tokens = 4096 # optional when enabled
 api_key_env = "ACN_LLM_API_KEY"
 ```
 
@@ -155,18 +158,18 @@ api_key_env = "ACN_LLM_API_KEY"
 </details>
 
 <details>
-<summary><b>Use the Responses protocol</b></summary>
+<summary><b>Use the OpenAI Chat protocol</b></summary>
 
 ```toml
 [agent.llm]
-provider = "openai_responses"
+provider = "openai_chat"
 endpoint = "https://your-llm-endpoint/v1"
 model = "your-model"
 reasoning_effort = "none"                # none | low | medium | high | xhigh | max
 api_key_env = "ACN_LLM_API_KEY"
 ```
 
-The Responses provider uses HTTP SSE/JSON and local conversation state with `store = false`. A non-`none` `reasoning_effort` is sent as `reasoning.effort`. Returned reasoning items are stored in the private session and replayed unchanged in later Responses requests, but Reasoning is not displayed in the TUI yet. This provider does not automatically fall back to Chat Completions when the Responses protocol is rejected.
+`openai_chat` is intended for compatible services that expose only Chat Completions, but it discards provider-specific Reasoning fields. Use `openai_responses` or `anthropic` when the model requires Reasoning to be replayed in later requests or tool round trips.
 
 </details>
 
@@ -198,6 +201,7 @@ acn session cleanup --apply
 
 acn supervisor status
 acn supervisor jobs
+acn supervisor retry session_1234abcd
 
 acn mcp list
 acn mcp add / add-json / remove / enable / disable / status
@@ -205,7 +209,7 @@ acn mcp add / add-json / remove / enable / disable / status
 acn update
 ```
 
-If ACN was started with a custom `--config` or `--upstream`, pass the same option when inspecting the supervisor.
+If ACN was started with a custom `--config` or `--upstream`, pass the same option when managing the supervisor. ACN identifies the supervisor environment using the effective configuration, upstream, and the credential fingerprint required for finalization. When any of these changes, the next launch safely takes over the previous supervisor and continues unfinished finalize jobs in the new environment. A failed finalize can be retried using the user-visible session ID with `acn supervisor retry <session_id>`, or using the job ID shown by `jobs`.
 
 </details>
 
