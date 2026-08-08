@@ -47,7 +47,7 @@ class PresmokeRunnerTests(unittest.TestCase):
 
             self.assertEqual(load_presmoke_task_ids(manifest), tuple(task_ids))
 
-    def test_task1_failure_does_not_start_later_tasks_and_writes_aggregate(self) -> None:
+    def test_task_failure_does_not_prevent_peer_tasks_and_writes_aggregate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             specs = build_specs(root)
@@ -61,12 +61,12 @@ class PresmokeRunnerTests(unittest.TestCase):
                 runner.run(execute=True)
             aggregate = json.loads((root / "aggregate.json").read_text())
 
-        self.assertEqual(started, [TASK_IDS[0]])
+        self.assertEqual(set(started), set(TASK_IDS))
         self.assertEqual(aggregate["status"], "failed")
         self.assertEqual(aggregate["task_results"][0]["status"], "failed")
-        self.assertEqual(len(aggregate["task_results"]), 1)
+        self.assertEqual(len(aggregate["task_results"]), len(TASK_IDS))
 
-    def test_task1_success_starts_remaining_four_with_bounded_parallelism(self) -> None:
+    def test_all_tasks_start_with_bounded_parallelism(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             specs = build_specs(root)
@@ -78,13 +78,11 @@ class PresmokeRunnerTests(unittest.TestCase):
             def factory(spec: PresmokeTaskSpec) -> FakeTaskRunner:
                 def wait_for_peers() -> None:
                     with lock:
-                        if len(started) == 5:
+                        if len(started) == 4:
                             all_started.set()
                     release.wait(timeout=2)
 
-                return FakeTaskRunner(
-                    spec.task_id, started, wait_for_peers if spec.task_id != TASK_IDS[0] else None
-                )
+                return FakeTaskRunner(spec.task_id, started, wait_for_peers)
 
             runner = PresmokeHostRunner(
                 specs, root / "aggregate.json", task_workers=4, task_runner_factory=factory
@@ -96,10 +94,10 @@ class PresmokeRunnerTests(unittest.TestCase):
             thread.join(timeout=2)
 
         self.assertFalse(thread.is_alive())
-        self.assertEqual(started[0], TASK_IDS[0])
-        self.assertEqual(set(started[1:]), set(TASK_IDS[1:]))
+        self.assertEqual(len(started), len(TASK_IDS))
+        self.assertEqual(set(started), set(TASK_IDS))
 
-    def test_first_task_no_eligible_claim_stops_later_tasks(self) -> None:
+    def test_no_eligible_claim_does_not_stop_peer_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             specs = build_specs(root)
@@ -112,11 +110,14 @@ class PresmokeRunnerTests(unittest.TestCase):
                     outcome="no_eligible_claim" if spec.task_id == TASK_IDS[0] else "passed",
                 )
 
-            runner = PresmokeHostRunner(specs, root / "aggregate.json", task_runner_factory=factory)
-            with self.assertRaises(PresmokeExecutionError):
-                runner.run(execute=True)
+            results = PresmokeHostRunner(
+                specs, root / "aggregate.json", task_runner_factory=factory
+            ).run(execute=True)
+            aggregate = json.loads((root / "aggregate.json").read_text())
 
-        self.assertEqual(started, [TASK_IDS[0]])
+        self.assertEqual(set(started), set(TASK_IDS))
+        self.assertEqual(results[0].status, "no_eligible_claim")
+        self.assertEqual(aggregate["status"], "completed_with_no_eligible_claim")
 
     def test_later_no_eligible_claim_is_reported_without_failing_the_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

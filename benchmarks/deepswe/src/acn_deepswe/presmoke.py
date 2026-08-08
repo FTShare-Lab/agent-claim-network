@@ -1,4 +1,4 @@
-"""多题 pre-smoke 调度：首题 Gate 后才有限并发执行其余任务。"""
+"""多题 pre-smoke 调度：每个 task 独立完成三臂实验后汇总结果。"""
 
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ class PresmokeTaskResult:
 
 
 def load_presmoke_task_ids(manifest_path: Path | None = None) -> tuple[str, ...]:
-    """读取冻结 manifest 的顺序；第一个 task 是唯一的并发 gate。"""
+    """读取冻结 manifest 的确定性 task 顺序。"""
     path = manifest_path or Path(__file__).resolve().parents[2] / "manifests" / "presmoke-v1.json"
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -72,7 +72,7 @@ def load_presmoke_task_ids(manifest_path: Path | None = None) -> tuple[str, ...]
 
 
 class PresmokeHostRunner:
-    """Task1 完整 Gate 成功后，有限并发执行剩余 task 的三臂流程。"""
+    """有限并发执行全部 task；claim 缺失仅使该 task 的 B_claim 不适用。"""
 
     def __init__(
         self,
@@ -99,24 +99,9 @@ class PresmokeHostRunner:
     def run(self, *, execute: bool = False) -> tuple[PresmokeTaskResult, ...]:
         """执行一次 pre-smoke；不会对任意 task 或 solve 进行重试。"""
         results: dict[str, PresmokeTaskResult] = {}
-        first = self.task_specs[0]
-        first_result = self._run_task(first, execute)
-        results[first.task_id] = first_result
-        if first_result.status not in {"passed", "planned"}:
-            results[first.task_id] = PresmokeTaskResult(
-                first_result.task_id,
-                "failed",
-                first_result.manifest_path,
-                first_result.error or first_result.status,
-            )
-            ordered = self._ordered_results(results)
-            self._write_aggregate(ordered)
-            raise PresmokeExecutionError(f"Task1 Gate/基础设施失败: {results[first.task_id].error}")
-
-        remaining = self.task_specs[1:]
-        with ThreadPoolExecutor(max_workers=min(self.task_workers, len(remaining))) as executor:
+        with ThreadPoolExecutor(max_workers=min(self.task_workers, len(self.task_specs))) as executor:
             futures = {
-                executor.submit(self._run_task, spec, execute): spec.task_id for spec in remaining
+                executor.submit(self._run_task, spec, execute): spec.task_id for spec in self.task_specs
             }
             for future in as_completed(futures):
                 result = future.result()
@@ -172,9 +157,6 @@ class PresmokeHostRunner:
         actual = tuple(spec.task_id for spec in self.task_specs)
         if actual != expected:
             raise ValueError("pre-smoke task 必须覆盖冻结 manifest 的全部任务且保持顺序")
-        first_execution = self.task_specs[0].execution
-        if first_execution is not None and not first_execution.require_eligible_claim:
-            raise ValueError("pre-smoke 首题必须启用 require_eligible_claim hard gate")
         manifest_paths: set[Path] = set()
         attempt_paths: set[Path] = set()
         for spec in self.task_specs:

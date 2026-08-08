@@ -134,6 +134,9 @@ class PresmokeCliTests(unittest.TestCase):
             tuple(attempt.variant for attempt in specs[0].experiment.attempts),
             ("A", "B_empty", "B_claim"),
         )
+        self.assertTrue(
+            all(spec.execution is None or not spec.execution.require_eligible_claim for spec in specs)
+        )
 
     def test_checkout_revision_rejects_dirty_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
