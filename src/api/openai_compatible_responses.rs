@@ -13,9 +13,10 @@ use super::continuation::{
     append_with_overlap_dedupe, CONTINUATION_TRIGGER, MAX_CONTINUATION_TURNS,
 };
 use super::provider::{
-    ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy, ProviderNoConsumableOutput,
-    ProviderReplayIdentity, ProviderReplayProtocol, ProviderRequest, ProviderResponse,
-    ProviderStop, ProviderStreamFailure, ProviderTerminalFailure, ToolSpec,
+    NoopProviderRequestObserver, ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy,
+    ProviderNoConsumableOutput, ProviderReplayIdentity, ProviderReplayProtocol, ProviderRequest,
+    ProviderRequestObserver, ProviderRequestPreparationFailure, ProviderResponse, ProviderStop,
+    ProviderStreamFailure, ProviderTerminalFailure, ToolSpec,
 };
 use super::redact_media_error_body;
 use super::responses::{
@@ -37,6 +38,8 @@ pub enum OpenAiCompatibleResponsesError {
     OutputShape { reason: String },
     #[error("Responses 没有可消费输出: {reason}")]
     NoConsumableOutput { reason: String },
+    #[error("准备 Responses continuation request 失败: {reason}")]
+    RequestPreparation { reason: String },
     #[error(
         "当前模型可能不支持图片 / PDF 附件输入，请确认模型多模态能力或移除附件后重试。上游原始错误: {source}"
     )]
@@ -119,18 +122,27 @@ impl OpenAiCompatibleResponsesProviderAdapter {
         &self,
         system_prompt: &str,
         mut input: Vec<Value>,
+        base_messages: &[SessionTurnMessage],
         tools: Vec<ResponsesTool>,
         max_tokens: u32,
         stream: bool,
         retry_count: u32,
         emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        observer: &mut (dyn ProviderRequestObserver + Send),
     ) -> Result<ContinuedResponsesTurn, OpenAiCompatibleResponsesError> {
         let mut merged_text = String::new();
         let mut replay_items = Vec::new();
         let mut last_function_calls = Vec::new();
         let mut last_terminal = ResponsesTerminal::Completed;
+        let mut provider_messages = base_messages.to_vec();
 
         for round in 0..=MAX_CONTINUATION_TURNS {
+            observer
+                .before_provider_request(&provider_messages)
+                .await
+                .map_err(|error| OpenAiCompatibleResponsesError::RequestPreparation {
+                    reason: format!("{error:#}"),
+                })?;
             let request = self.request_for(
                 system_prompt,
                 input.clone(),
@@ -160,9 +172,11 @@ impl OpenAiCompatibleResponsesProviderAdapter {
             {
                 emit(ProviderEvent::ContextUsageUpdated { usage });
             }
-            append_with_overlap_dedupe(&mut merged_text, &response.output_text);
-            input.extend(response.output_items.iter().cloned());
-            replay_items.extend(response.output_items.iter().cloned());
+            let round_text = response.output_text.clone();
+            let mut round_replay_items = response.output_items.clone();
+            append_with_overlap_dedupe(&mut merged_text, &round_text);
+            input.extend(round_replay_items.iter().cloned());
+            replay_items.extend(round_replay_items.iter().cloned());
             last_terminal = response.terminal;
             last_function_calls = response.function_calls;
 
@@ -174,7 +188,21 @@ impl OpenAiCompatibleResponsesProviderAdapter {
             }
             let continuation = user_text_item(CONTINUATION_TRIGGER);
             input.push(continuation.clone());
-            replay_items.push(continuation);
+            replay_items.push(continuation.clone());
+            round_replay_items.push(continuation);
+            let content = if round_text.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![SessionTurnContentBlock::text(round_text)]
+            };
+            provider_messages.push(SessionTurnMessage {
+                role: "assistant".into(),
+                content,
+                provider_replay: Some(ProviderReplayState::OpenAiResponses {
+                    model: Some(self.model.clone()),
+                    items: round_replay_items,
+                }),
+            });
         }
 
         Ok(ContinuedResponsesTurn {
@@ -212,24 +240,51 @@ impl ProviderAdapter for OpenAiCompatibleResponsesProviderAdapter {
         request: ProviderRequest,
         emit: &mut (dyn FnMut(ProviderEvent) + Send),
     ) -> anyhow::Result<ProviderResponse> {
+        let mut observer = NoopProviderRequestObserver;
+        self.send_observed(request, emit, &mut observer).await
+    }
+
+    async fn send_with_request_observer(
+        &self,
+        request: ProviderRequest,
+        emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        observer: &mut (dyn ProviderRequestObserver + Send),
+    ) -> anyhow::Result<ProviderResponse> {
+        self.send_observed(request, emit, observer).await
+    }
+}
+
+impl OpenAiCompatibleResponsesProviderAdapter {
+    async fn send_observed(
+        &self,
+        request: ProviderRequest,
+        emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        observer: &mut (dyn ProviderRequestObserver + Send),
+    ) -> anyhow::Result<ProviderResponse> {
         let retry_count = request
             .retry_count_override
             .unwrap_or(self.client.retry_count());
-        let input = session_turn_messages_to_responses(request.messages, &self.model)?;
+        let base_messages = request.messages;
+        let input = session_turn_messages_to_responses(base_messages.clone(), &self.model)?;
         let request_has_media = input.has_media;
         let turn = match self
             .send_with_continuation(
                 &request.system_prompt,
                 input.items,
+                &base_messages,
                 tool_specs_to_responses(request.tools),
                 request.max_tokens,
                 request.stream,
                 retry_count,
                 emit,
+                observer,
             )
             .await
         {
             Ok(turn) => turn,
+            Err(OpenAiCompatibleResponsesError::RequestPreparation { reason }) => {
+                return Err(ProviderRequestPreparationFailure::new(reason).into());
+            }
             Err(error) => {
                 if request.stream && responses_adapter_stream_failure(&error) {
                     return Err(ProviderStreamFailure::new(error.to_string()).into());
@@ -321,7 +376,8 @@ fn push_user_items(
     let mut tool_outputs = Vec::new();
     for block in blocks {
         match block {
-            SessionTurnContentBlock::Text { text } => {
+            SessionTurnContentBlock::Text { text }
+            | SessionTurnContentBlock::ModelContext { text, .. } => {
                 if !text.trim().is_empty() {
                     content.push(json!({"type":"input_text","text":text}));
                 }
@@ -380,6 +436,9 @@ fn push_assistant_items(
     for block in blocks {
         match block {
             SessionTurnContentBlock::Text { text } => text_parts.push(text),
+            SessionTurnContentBlock::ModelContext { .. } => {
+                return Err(output_shape("assistant message 不允许包含 ModelContext"));
+            }
             SessionTurnContentBlock::Image { media_type, data } => text_parts.push(format!(
                 "[Assistant image omitted: media_type={media_type}, base64_bytes={}]",
                 data.len()
@@ -571,11 +630,15 @@ fn output_shape(reason: impl Into<String>) -> OpenAiCompatibleResponsesError {
 mod tests {
     use std::sync::Arc;
 
+    use async_trait::async_trait;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     use super::*;
-    use crate::api::{AgentTurnLoop, SessionTurnRequest};
+    use crate::api::{
+        AgentTurnLoop, CompletedSessionTurnMessage, ModelContextSource, SessionTurnContextAppender,
+        SessionTurnEvent, SessionTurnEventRecorder, SessionTurnHooks, SessionTurnRequest,
+    };
     use crate::config::ToolConfig;
     use crate::tool::ToolRegistry;
 
@@ -594,6 +657,85 @@ mod tests {
             .unwrap(),
             model: "test-model".into(),
             reasoning_effort,
+        }
+    }
+
+    struct StaticContextAppender {
+        messages: Vec<SessionTurnMessage>,
+    }
+
+    #[async_trait]
+    impl SessionTurnContextAppender for StaticContextAppender {
+        async fn observe_context(
+            &mut self,
+            _provider_messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<Vec<SessionTurnMessage>> {
+            Ok(self.messages.clone())
+        }
+    }
+
+    #[derive(Default)]
+    struct CompletedMessageRecorder {
+        messages: Vec<CompletedSessionTurnMessage>,
+    }
+
+    #[derive(Default)]
+    struct RecordingRequestObserver {
+        requests: Vec<Vec<SessionTurnMessage>>,
+    }
+
+    #[derive(Default)]
+    struct FailingInternalRequestPreflight {
+        ready_calls: usize,
+    }
+
+    #[async_trait]
+    impl crate::api::SessionTurnPreflight for FailingInternalRequestPreflight {
+        async fn before_provider_request(
+            &mut self,
+            _system_prompt: &mut String,
+            _provider_messages: &mut Vec<SessionTurnMessage>,
+            _emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn provider_request_ready(
+            &mut self,
+            _provider_messages: &[SessionTurnMessage],
+            _canonical_tail_count: usize,
+        ) -> anyhow::Result<()> {
+            self.ready_calls += 1;
+            if self.ready_calls == 2 {
+                anyhow::bail!("internal request WAL unavailable");
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ProviderRequestObserver for RecordingRequestObserver {
+        async fn before_provider_request(
+            &mut self,
+            messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            self.requests.push(messages.to_vec());
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SessionTurnEventRecorder for CompletedMessageRecorder {
+        async fn record(&mut self, _event: SessionTurnEvent) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn record_completed_message(
+            &mut self,
+            message: &CompletedSessionTurnMessage,
+        ) -> anyhow::Result<()> {
+            self.messages.push(message.clone());
+            Ok(())
         }
     }
 
@@ -708,6 +850,121 @@ mod tests {
         assert_eq!(input.items[1]["type"], "function_call");
         assert_eq!(input.items[1]["arguments"], r#"{"path":"a.txt"}"#);
         assert_eq!(input.items[2]["type"], "message");
+    }
+
+    #[test]
+    fn model_context_serializes_as_stable_user_input_and_preserves_prefix() {
+        let prefix_messages = vec![
+            SessionTurnMessage::model_context(
+                crate::api::ModelContextSource::Runtime,
+                "<runtime_context>stable</runtime_context>",
+            ),
+            SessionTurnMessage::model_context(
+                crate::api::ModelContextSource::BackgroundProcess,
+                "<background_processes>empty</background_processes>",
+            ),
+            SessionTurnMessage::user_text("first request"),
+        ];
+        let first = session_turn_messages_to_responses(prefix_messages.clone(), "test-model")
+            .unwrap()
+            .items;
+        let mut extended = prefix_messages;
+        extended.push(SessionTurnMessage::assistant_text("first answer"));
+        extended.push(SessionTurnMessage::user_text("second request"));
+        let second = session_turn_messages_to_responses(extended, "test-model")
+            .unwrap()
+            .items;
+
+        assert!(second.starts_with(&first));
+        assert_eq!(first[0]["role"], "user");
+        assert_eq!(
+            first[0]["content"][0]["text"],
+            "<runtime_context>stable</runtime_context>"
+        );
+        assert_eq!(first[1]["role"], "user");
+        assert_eq!(
+            first[1]["content"][0]["text"],
+            "<background_processes>empty</background_processes>"
+        );
+        assert!(!serde_json::to_string(&first).unwrap().contains("sha256-v1"));
+    }
+
+    #[tokio::test]
+    async fn consecutive_main_like_turns_keep_exact_responses_wire_prefix() {
+        let first_item = json!({
+            "type":"message","id":"msg_1","role":"assistant","status":"completed",
+            "content":[{"type":"output_text","text":"first answer"}]
+        });
+        let second_item = json!({
+            "type":"message","id":"msg_2","role":"assistant","status":"completed",
+            "content":[{"type":"output_text","text":"second answer"}]
+        });
+        let (endpoint, requests) = spawn_raw_sequence(vec![
+            sse_response(&[first_item], Some("first answer")),
+            sse_response(&[second_item], Some("second answer")),
+        ])
+        .await;
+        let adapter = Arc::new(
+            OpenAiCompatibleResponsesProviderAdapter::new(
+                "test-key".into(),
+                endpoint,
+                "test-model".into(),
+                Duration::from_secs(5),
+                0,
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .unwrap(),
+        );
+        let tools = Arc::new(ToolRegistry::new(&ToolConfig::default()).unwrap());
+        let turn_loop = AgentTurnLoop::new(adapter, tools, 128);
+
+        let first_turn = turn_loop
+            .run_session_turn(
+                SessionTurnRequest {
+                    current_session_id: None,
+                    current_turn_id: None,
+                    system_prompt: "stable system".into(),
+                    history: Vec::new(),
+                    user_text: "first request".into(),
+                    user_attachments: Vec::new(),
+                    skill_instructions: Vec::new(),
+                },
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        turn_loop
+            .run_session_turn(
+                SessionTurnRequest {
+                    current_session_id: None,
+                    current_turn_id: None,
+                    system_prompt: "stable system".into(),
+                    history: first_turn
+                        .messages
+                        .into_iter()
+                        .map(|message| message.message)
+                        .collect(),
+                    user_text: "second request".into(),
+                    user_attachments: Vec::new(),
+                    skill_instructions: Vec::new(),
+                },
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        let requests = requests.await.unwrap();
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["instructions"], requests[1]["instructions"]);
+        assert_eq!(requests[0]["tools"], requests[1]["tools"]);
+        let first_input = requests[0]["input"].as_array().unwrap();
+        let second_input = requests[1]["input"].as_array().unwrap();
+        assert!(second_input.starts_with(first_input));
+        assert_eq!(first_input[0]["role"], "user");
+        assert!(first_input[0]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("<runtime_context>")));
     }
 
     #[test]
@@ -904,9 +1161,10 @@ mod tests {
         )
         .unwrap();
         let mut events = Vec::new();
+        let mut observer = RecordingRequestObserver::default();
 
         let response = adapter
-            .send(
+            .send_with_request_observer(
                 ProviderRequest {
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("hello")],
@@ -916,6 +1174,7 @@ mod tests {
                     retry_count_override: None,
                 },
                 &mut |event| events.push(event),
+                &mut observer,
             )
             .await
             .unwrap();
@@ -947,11 +1206,23 @@ mod tests {
             requests[1]["include"],
             json!(["reasoning.encrypted_content"])
         );
-        assert_eq!(requests[1]["input"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            requests[1]["input"].as_array().unwrap().len(),
+            requests[0]["input"].as_array().unwrap().len() + 2
+        );
         assert_eq!(requests[1]["input"][1], first_output);
         assert_eq!(
             requests[1]["input"][2]["content"][0]["text"],
             CONTINUATION_TRIGGER
+        );
+        assert_eq!(observer.requests.len(), 2);
+        assert!(observer.requests[1].starts_with(&observer.requests[0]));
+        let observed_second =
+            session_turn_messages_to_responses(observer.requests[1].clone(), "test-model").unwrap();
+        assert_eq!(
+            observed_second.items,
+            requests[1]["input"].as_array().unwrap().clone(),
+            "observer 上报的 neutral history 必须投影为同一份真实 Responses input"
         );
         assert_eq!(
             events
@@ -967,7 +1238,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_loop_executes_parallel_calls_and_returns_ordered_outputs() {
+    async fn internal_request_wal_failure_stops_before_second_http_without_fallback() {
+        let partial_item = json!({
+            "type":"message","id":"msg_partial","role":"assistant","status":"incomplete",
+            "content":[{"type":"output_text","text":"partial"}]
+        });
+        let first = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":partial_item,
+            }),
+            json!({
+                "type":"response.incomplete",
+                "response":{
+                    "status":"incomplete",
+                    "incomplete_details":{"reason":"max_output_tokens"},
+                    "output":[partial_item],
+                },
+            })
+        );
+        let (endpoint, requests) = spawn_raw_sequence(vec![first]).await;
+        let adapter = Arc::new(
+            OpenAiCompatibleResponsesProviderAdapter::new(
+                "test-key".into(),
+                endpoint,
+                "test-model".into(),
+                Duration::from_secs(5),
+                0,
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .unwrap(),
+        );
+        let tools = Arc::new(ToolRegistry::new(&ToolConfig::default()).unwrap());
+        let turn_loop = AgentTurnLoop::new(adapter, tools, 128);
+        let mut preflight = FailingInternalRequestPreflight::default();
+
+        let error = turn_loop
+            .run_session_turn_with_context_hooks(
+                SessionTurnRequest {
+                    current_session_id: None,
+                    current_turn_id: None,
+                    system_prompt: "system".into(),
+                    history: Vec::new(),
+                    user_text: "continue internally".into(),
+                    user_attachments: Vec::new(),
+                    skill_instructions: Vec::new(),
+                },
+                Vec::new(),
+                &mut |_| {},
+                None,
+                SessionTurnHooks::new(None, None, Some(&mut preflight)),
+            )
+            .await
+            .unwrap_err();
+        let requests = requests.await.unwrap();
+
+        assert!(error
+            .to_string()
+            .contains("internal request WAL unavailable"));
+        assert_eq!(preflight.ready_calls, 2);
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn responses_child_like_tool_loop_preserves_wire_prefix_and_context_order() {
         let first_items = vec![
             json!({"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}),
             json!({"type":"function_call","id":"fc_1","call_id":"call_1","name":"file_read","arguments":"{\"path\":\"a.txt\"}","status":"completed"}),
@@ -1000,12 +1337,21 @@ mod tests {
                 workspace_root: workspace.path().to_path_buf(),
                 ..ToolConfig::default()
             })
-            .unwrap(),
+            .unwrap()
+            .for_delegation(None),
         );
         let turn_loop = AgentTurnLoop::new(adapter, tools, 128).with_max_tool_loop_turns(4);
+        let background = SessionTurnMessage::model_context(
+            ModelContextSource::BackgroundProcess,
+            "<background_processes>\nProcesses:\n- none\n</background_processes>",
+        );
+        let mut appender = StaticContextAppender {
+            messages: vec![background.clone()],
+        };
+        let mut recorder = CompletedMessageRecorder::default();
 
         let turn = turn_loop
-            .run_session_turn(
+            .run_session_turn_with_context_hooks(
                 SessionTurnRequest {
                     current_session_id: None,
                     current_turn_id: None,
@@ -1015,7 +1361,10 @@ mod tests {
                     user_attachments: Vec::new(),
                     skill_instructions: Vec::new(),
                 },
+                Vec::new(),
                 &mut |_| {},
+                None,
+                SessionTurnHooks::new(Some(&mut recorder), Some(&mut appender), None),
             )
             .await
             .unwrap();
@@ -1030,10 +1379,36 @@ mod tests {
             })
         }));
         assert_eq!(requests.len(), 2);
+        assert_eq!(recorder.messages, turn.messages);
+        assert!(matches!(
+            recorder
+                .messages
+                .first()
+                .and_then(|message| message.model_context_snapshot()),
+            Some((ModelContextSource::Runtime, _, _))
+        ));
+        assert_eq!(recorder.messages[1].message, background);
+        assert_eq!(
+            recorder
+                .messages
+                .iter()
+                .filter(|message| {
+                    message
+                        .model_context_snapshot()
+                        .is_some_and(|(source, _, _)| {
+                            *source == ModelContextSource::BackgroundProcess
+                        })
+                })
+                .count(),
+            1,
+            "child tool loop 的 unchanged background baseline 不得重复追加"
+        );
         assert!(requests
             .iter()
             .all(|request| { request["include"] == json!(["reasoning.encrypted_content"]) }));
         let second_input = requests[1]["input"].as_array().unwrap();
+        let first_input = requests[0]["input"].as_array().unwrap();
+        assert!(second_input.starts_with(first_input));
         let output_positions = second_input
             .iter()
             .filter(|item| item["type"] == "function_call_output")
@@ -1209,6 +1584,96 @@ mod tests {
             event,
             crate::api::SessionTurnEvent::NonStreamingFallbackSucceeded { .. }
         )));
+    }
+
+    #[tokio::test]
+    async fn failed_internal_continuation_fallback_resumes_latest_exact_input() {
+        let partial_item = json!({
+            "type":"message","id":"msg_partial","role":"assistant","status":"incomplete",
+            "content":[{"type":"output_text","text":"hello"}]
+        });
+        let final_item = json!({
+            "type":"message","id":"msg_final","role":"assistant","status":"completed",
+            "content":[{"type":"output_text","text":" world"}]
+        });
+        let first = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":partial_item,
+            }),
+            json!({
+                "type":"response.incomplete",
+                "response":{
+                    "status":"incomplete",
+                    "incomplete_details":{"reason":"max_output_tokens"},
+                    "output":[partial_item],
+                },
+            })
+        );
+        let failed_second = format!(
+            "data: {}\n\n",
+            json!({"type":"response.output_text.delta","delta":"discarded"})
+        );
+        let (endpoint, requests) = spawn_mixed_sequence(vec![
+            ("text/event-stream", first),
+            ("text/event-stream", failed_second),
+            (
+                "application/json",
+                json!({"status":"completed","output":[final_item]}).to_string(),
+            ),
+        ])
+        .await;
+        let adapter = Arc::new(
+            OpenAiCompatibleResponsesProviderAdapter::new(
+                "test-key".into(),
+                endpoint,
+                "test-model".into(),
+                Duration::from_secs(5),
+                0,
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .unwrap(),
+        );
+        let tools = Arc::new(ToolRegistry::new(&ToolConfig::default()).unwrap());
+        let turn_loop = AgentTurnLoop::new(adapter, tools, 128);
+
+        let turn = turn_loop
+            .run_session_turn(
+                SessionTurnRequest {
+                    current_session_id: None,
+                    current_turn_id: None,
+                    system_prompt: "system".into(),
+                    history: Vec::new(),
+                    user_text: "hello".into(),
+                    user_attachments: Vec::new(),
+                    skill_instructions: Vec::new(),
+                },
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        let requests = requests.await.unwrap();
+
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1]["input"], requests[2]["input"]);
+        assert_eq!(requests[1]["stream"], true);
+        assert_eq!(requests[2]["stream"], false);
+        assert_eq!(
+            requests[1]["input"].as_array().unwrap().len(),
+            requests[0]["input"].as_array().unwrap().len() + 2
+        );
+        let assistant = turn
+            .messages
+            .iter()
+            .find(|message| message.role == "assistant")
+            .unwrap();
+        assert!(matches!(
+            assistant.content.first(),
+            Some(SessionTurnContentBlock::Text { text }) if text == "hello world"
+        ));
     }
 
     #[tokio::test]

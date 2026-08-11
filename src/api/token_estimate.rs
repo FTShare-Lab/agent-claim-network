@@ -61,7 +61,8 @@ pub fn estimate_provider_replay_tokens(replay: &ProviderReplayState) -> usize {
             .iter()
             .map(estimate_json_tokens)
             .fold(0usize, usize::saturating_add),
-        ProviderReplayState::AnthropicMessages { messages, .. } => messages
+        ProviderReplayState::OpenAiChatCompletions { messages, .. }
+        | ProviderReplayState::AnthropicMessages { messages, .. } => messages
             .iter()
             .map(estimate_json_tokens)
             .fold(0usize, usize::saturating_add),
@@ -70,7 +71,8 @@ pub fn estimate_provider_replay_tokens(replay: &ProviderReplayState) -> usize {
 
 fn estimate_session_turn_content_block_tokens(block: &SessionTurnContentBlock) -> usize {
     match block {
-        SessionTurnContentBlock::Text { text } => estimate_text_tokens(text),
+        SessionTurnContentBlock::Text { text }
+        | SessionTurnContentBlock::ModelContext { text, .. } => estimate_text_tokens(text),
         SessionTurnContentBlock::SkillInstructions { instruction } => {
             estimate_text_tokens(&crate::skill::render_skill_instructions(instruction))
         }

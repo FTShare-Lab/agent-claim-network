@@ -94,7 +94,8 @@ pub(super) async fn externalize_heavy_user_blocks(
                     ),
                     ProviderHistoryMediaPolicy::Preserve => None,
                 },
-                SessionTurnContentBlock::ToolUse { .. }
+                SessionTurnContentBlock::ModelContext { .. }
+                | SessionTurnContentBlock::ToolUse { .. }
                 | SessionTurnContentBlock::ToolResult { .. } => None,
             };
             let Some(candidate) = candidate else {

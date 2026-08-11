@@ -547,6 +547,22 @@ async fn main_agent_can_terminate_subagent_process_without_taking_input_ownershi
     acknowledge_process_output(&child_registry, &running).await;
     std::fs::write(emit_tail_marker, b"ready").unwrap();
 
+    let child_projection = child_registry
+        .background_process_projection_for_owner_with_notifications(
+            &child_registry.process_owner_for_session(&session, Some(subagent_id)),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let main_projection = main_registry
+        .background_process_projection_for_owner_with_notifications(
+            &main_registry.process_owner_for_session(&session, None),
+            Vec::new(),
+        )
+        .await;
+    assert!(child_projection.contains(&process_id));
+    assert!(main_projection.is_none());
+
     let child_list = child_registry
         .dispatch_with_context("process_list", json!({}), child_context.clone())
         .await
@@ -652,6 +668,77 @@ async fn main_agent_can_terminate_subagent_process_without_taking_input_ownershi
     main_registry
         .cleanup_processes_for_owner(&session, Some(subagent_id))
         .await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn background_projection_ignores_elapsed_time_and_output_growth_but_tracks_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
+    let session = SessionId::from_str("session_aaaaaaaa").unwrap();
+    let context = file_tool_context(&session);
+    let running = registry
+        .dispatch_with_context(
+            "code_run",
+            json!({
+                "script": "printf first; sleep 0.3; printf second; sleep 3",
+                "yield_time_ms": 50,
+            }),
+            context.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(running.outcome, ToolExecutionOutcome::ProcessRunning);
+    let process_id = running.output["process_id"].as_str().unwrap().to_string();
+    let owner = registry.process_owner_for_session(&session, None);
+
+    let before = registry
+        .background_process_projection_for_owner_with_notifications(&owner, Vec::new())
+        .await
+        .unwrap();
+    acknowledge_process_output(&registry, &running).await;
+    let after_output_cursor_advance = registry
+        .background_process_projection_for_owner_with_notifications(&owner, Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        after_output_cursor_advance, before,
+        "advancing an ordinary output delivery cursor must not change the semantic projection"
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let after_output_growth = registry
+        .background_process_projection_for_owner_with_notifications(&owner, Vec::new())
+        .await
+        .unwrap();
+
+    assert_eq!(after_output_growth, before);
+    assert!(before.contains(&process_id));
+    assert!(before.contains("state=running"));
+    assert!(!before.contains("elapsed"));
+    assert!(!before.contains("stdout="));
+    assert!(!before.contains("stderr="));
+
+    let terminal = registry
+        .dispatch_with_context(
+            "write_stdin",
+            json!({"process_id": process_id, "terminate": true, "yield_time_ms": 500}),
+            context,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        terminal.outcome,
+        ToolExecutionOutcome::ProcessTerminated { .. }
+    ));
+    let after_terminal = registry
+        .background_process_projection_for_owner_with_notifications(&owner, Vec::new())
+        .await
+        .unwrap();
+
+    assert_ne!(after_terminal, before);
+    assert!(after_terminal.contains("state=terminated"));
+    assert!(after_terminal.contains("final_output_available=true"));
+    registry.cleanup_processes_for_session(&session).await;
 }
 
 #[tokio::test]

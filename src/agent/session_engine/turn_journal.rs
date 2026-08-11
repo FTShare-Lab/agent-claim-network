@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
-use crate::api::{SessionTurnEvent, SessionTurnEventRecorder};
+use crate::api::{CompletedSessionTurnMessage, SessionTurnEvent, SessionTurnEventRecorder};
 use crate::session::{
     TurnJournalEventKind, TurnJournalFlush, TurnJournalStatus, TurnJournalWriter,
 };
@@ -200,6 +200,22 @@ impl SessionTurnEventRecorder for TurnJournalDurableEventRecorder {
             | SessionTurnEvent::AssistantTextDelta { .. }
             | SessionTurnEvent::ToolCallProgress { .. } => Ok(()),
         }
+    }
+
+    async fn record_completed_message(
+        &mut self,
+        message: &CompletedSessionTurnMessage,
+    ) -> anyhow::Result<()> {
+        let Some((source, fingerprint, text)) = message.model_context_snapshot() else {
+            return Ok(());
+        };
+        self.sink
+            .send_immediate_durable(TurnJournalEventKind::ModelContextAppended {
+                source: *source,
+                fingerprint: fingerprint.to_string(),
+                text: text.to_string(),
+            })
+            .await
     }
 }
 

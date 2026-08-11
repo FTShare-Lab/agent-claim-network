@@ -5,6 +5,7 @@
 //! HTTP/streaming 与协议形状转换，不执行工具、不解释业务 JSON。
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -17,9 +18,11 @@ pub enum ProviderHistoryMediaPolicy {
 }
 
 /// 当前 adapter 可原样回放的 provider 私有历史协议。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProviderReplayProtocol {
     OpenAiResponses,
+    OpenAiChatCompletions,
     AnthropicMessages,
 }
 
@@ -27,7 +30,7 @@ pub enum ProviderReplayProtocol {
 ///
 /// 原样 replay 只允许回到相同 wire protocol 与精确配置 model；切换任一项都从
 /// canonical history 开始新的 replay 代际，避免跨模型误传私有状态。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderReplayIdentity {
     pub protocol: ProviderReplayProtocol,
     pub model: String,
@@ -60,6 +63,46 @@ pub trait ProviderAdapter: Send + Sync {
         request: ProviderRequest,
         emit: &mut (dyn FnMut(ProviderEvent) + Send),
     ) -> anyhow::Result<ProviderResponse>;
+
+    /// 在 adapter 每一个真实逻辑请求发送前上报其精确
+    /// provider-neutral history。默认 adapter 只有一次请求；内部实现
+    /// max-token continuation 的 adapter 必须覆盖此方法并逐次上报。
+    async fn send_with_request_observer(
+        &self,
+        request: ProviderRequest,
+        emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        observer: &mut (dyn ProviderRequestObserver + Send),
+    ) -> anyhow::Result<ProviderResponse> {
+        observer
+            .before_provider_request(&request.messages)
+            .await
+            .map_err(ProviderRequestPreparationFailure::from_error)?;
+        self.send(request, emit).await
+    }
+}
+
+/// adapter 内部 continuation 与上层 WAL 之间的最小边界。
+///
+/// 上报的 message vector 必须是实际将转成 wire input/messages 的同一份
+/// 规范化历史，并且只能在上一次之后追加 continuation replay suffix。
+#[async_trait]
+pub trait ProviderRequestObserver: Send {
+    async fn before_provider_request(
+        &mut self,
+        messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<()>;
+}
+
+pub(crate) struct NoopProviderRequestObserver;
+
+#[async_trait]
+impl ProviderRequestObserver for NoopProviderRequestObserver {
+    async fn before_provider_request(
+        &mut self,
+        _messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +152,27 @@ pub enum ProviderStop {
 #[error("{message}")]
 pub(crate) struct ProviderTerminalFailure {
     message: String,
+}
+
+/// Provider request 尚未发送时，其 write-ahead 准备已失败。
+///
+/// 该错误不能进入 streaming fallback，否则会绕过同一条 WAL 不变量。
+#[derive(Debug, thiserror::Error)]
+#[error("准备 Provider request 失败: {message}")]
+pub(crate) struct ProviderRequestPreparationFailure {
+    message: String,
+}
+
+impl ProviderRequestPreparationFailure {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn from_error(error: anyhow::Error) -> Self {
+        Self::new(format!("{error:#}"))
+    }
 }
 
 /// Streaming response 已损坏或未完整结束，可以安全放弃本次 attempt 并换路径重放。
@@ -230,6 +294,9 @@ pub fn assistant_text_from_message(message: &SessionTurnMessage) -> anyhow::Resu
     for block in &message.content {
         match block {
             SessionTurnContentBlock::Text { text: part } => text.push_str(part),
+            SessionTurnContentBlock::ModelContext { .. } => {
+                anyhow::bail!("结构化文本响应不能包含 ModelContext block");
+            }
             SessionTurnContentBlock::SkillInstructions { .. } => {
                 anyhow::bail!("结构化文本响应不能包含 SkillInstructions block");
             }
@@ -291,5 +358,21 @@ mod tests {
                 source: ContextUsageSource::Provider
             })
         );
+    }
+
+    #[test]
+    fn assistant_text_rejects_internal_model_context_blocks() {
+        let message = SessionTurnMessage {
+            role: "assistant".into(),
+            content: vec![SessionTurnContentBlock::ModelContext {
+                source: crate::api::ModelContextSource::Runtime,
+                fingerprint: "sha256-v1:invalid-provider-output".into(),
+                text: "<runtime_context>must not be provider output</runtime_context>".into(),
+            }],
+            provider_replay: None,
+        };
+
+        let error = assistant_text_from_message(&message).unwrap_err();
+        assert!(error.to_string().contains("ModelContext"));
     }
 }

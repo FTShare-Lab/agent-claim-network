@@ -12,6 +12,18 @@ struct ProcessExecutionDelivery {
 }
 
 impl ToolRegistry {
+    pub(crate) fn empty_background_process_projection() -> String {
+        concat!(
+            "<background_processes>\n",
+            "Authoritative runtime state, not a user request. process_id is not an OS PID.\n",
+            "Processes:\n",
+            "- none\n",
+            "Use process_list for full live-process details and write_stdin with empty chars to read final output.\n",
+            "</background_processes>"
+        )
+        .to_string()
+    }
+
     pub(crate) async fn process_snapshots_for_root_session(
         &self,
         session_id: &SessionId,
@@ -104,144 +116,74 @@ impl ToolRegistry {
         if entries.is_empty() && completion_notifications.is_empty() {
             return None;
         }
-        let mut live = Vec::new();
-        let mut terminal = Vec::new();
+        let mut rows = Vec::new();
         for entry in entries {
             let state = entry.state().await;
-            let started_at = entry
-                .started_at
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_secs())
-                .unwrap_or_default();
-            let live_elapsed_minutes = entry
-                .started_at
-                .elapsed()
-                .map(|duration| duration.as_secs() / 60)
-                .unwrap_or_default();
+            let final_output_available = !state.is_live();
             let command = truncate_chars(&entry.command, 400).0;
             let cwd = truncate_chars(&entry.cwd, 200).0;
-            if state.is_live() {
-                live.push((
-                    state,
-                    started_at,
-                    entry.id.as_str().to_string(),
+            let (exit_code, signal) = match state {
+                ProcessState::Finished {
+                    exit_code, signal, ..
+                }
+                | ProcessState::Terminated { exit_code, signal } => (exit_code, signal),
+                ProcessState::Starting
+                | ProcessState::Running
+                | ProcessState::Terminating
+                | ProcessState::Error => (None, None),
+            };
+            rows.push((
+                entry.id.as_str().to_string(),
+                entry.instance_id,
+                format!(
+                    "- process_id={} instance_id={} state={} exit_code={} signal={} final_output_available={} tty={} command={:?} cwd={:?}",
+                    entry.id.as_str(),
+                    entry.instance_id,
+                    semantic_process_state_label(state),
+                    exit_code.map_or_else(|| "null".into(), |code| code.to_string()),
+                    signal.map_or_else(|| "null".into(), |value| value.to_string()),
+                    final_output_available,
                     entry.tty,
-                    live_elapsed_minutes,
                     command,
                     cwd,
-                ));
-            } else {
-                let finished_at = entry
-                    .finished_at()
-                    .await
-                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|duration| duration.as_secs())
-                    .unwrap_or(started_at);
-                let elapsed_minutes = entry
-                    .finished_at()
-                    .await
-                    .and_then(|time| time.duration_since(entry.started_at).ok())
-                    .map(|duration| duration.as_secs() / 60)
-                    .unwrap_or_default();
-                let exit = match state {
-                    ProcessState::Finished {
-                        exit_code, signal, ..
-                    }
-                    | ProcessState::Terminated { exit_code, signal } => exit_code
-                        .map(|code| code.to_string())
-                        .or_else(|| signal.map(|signal| format!("SIG{signal}")))
-                        .unwrap_or_else(|| "unknown".into()),
-                    ProcessState::Error => "unknown".into(),
-                    ProcessState::Starting | ProcessState::Running | ProcessState::Terminating => {
-                        "-".into()
-                    }
-                };
-                terminal.push((
-                    finished_at,
-                    entry.id.as_str().to_string(),
-                    entry.instance_id,
-                    state.label().to_string(),
-                    exit,
-                    elapsed_minutes,
-                    command,
-                    entry.final_result_available().await,
-                ));
-            }
+                ),
+            ));
         }
-        let terminal_instances = terminal
+        let retained_instances = rows
             .iter()
-            .map(|entry| (entry.1.clone(), entry.2))
+            .map(|entry| (entry.0.clone(), entry.1))
             .collect::<BTreeSet<_>>();
         for completion in completion_notifications {
-            if terminal_instances.contains(&(completion.process_id.clone(), completion.instance_id))
+            if retained_instances.contains(&(completion.process_id.clone(), completion.instance_id))
             {
                 continue;
             }
-            let finished_at = completion
-                .finished_at
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_secs())
-                .unwrap_or_default();
-            terminal.push((
-                finished_at,
-                completion.process_id,
+            rows.push((
+                completion.process_id.clone(),
                 completion.instance_id,
-                completion.status,
-                completion
-                    .exit_code
-                    .map(|code| code.to_string())
-                    .or_else(|| completion.signal.map(|signal| format!("SIG{signal}")))
-                    .unwrap_or_else(|| "unknown".into()),
-                completion.elapsed_minutes,
-                "completion notification; entry evicted before final output delivery".into(),
-                false,
+                format!(
+                    "- process_id={} instance_id={} state={} exit_code={} signal={} final_output_available=false",
+                    completion.process_id,
+                    completion.instance_id,
+                    completion.status,
+                    completion
+                        .exit_code
+                        .map_or_else(|| "null".into(), |code| code.to_string()),
+                    completion
+                        .signal
+                        .map_or_else(|| "null".into(), |value| value.to_string()),
+                ),
             ));
         }
-        live.sort_by(|left, right| {
-            let rank = |state: ProcessState| match state {
-                ProcessState::Starting | ProcessState::Running => 0_u8,
-                ProcessState::Terminating => 1,
-                ProcessState::Finished { .. }
-                | ProcessState::Terminated { .. }
-                | ProcessState::Error => 2,
-            };
-            rank(left.0)
-                .cmp(&rank(right.0))
-                .then_with(|| right.1.cmp(&left.1))
-                .then_with(|| left.2.cmp(&right.2))
-        });
-        terminal.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        rows.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
 
         let mut projection = String::from(
             "<background_processes>\nAuthoritative runtime state, not a user request. process_id is not an OS PID.\n",
         );
-        if !live.is_empty() {
-            projection.push_str("Live processes:\n");
-            for (state, started_at, process_id, tty, elapsed_minutes, command, cwd) in live {
-                projection.push_str(&format!(
-                    "- process_id={process_id} state={} tty={tty} started_at={started_at} elapsed={}m command={command:?} cwd={cwd:?}\n",
-                    state.label(), elapsed_minutes
-                ));
-            }
-        }
-        if !terminal.is_empty() {
-            projection.push_str("Recently completed:\n");
-            for (
-                finished_at,
-                process_id,
-                _instance_id,
-                state,
-                exit,
-                elapsed_minutes,
-                command,
-                final_available,
-            ) in terminal
-            {
-                projection.push_str(&format!(
-                    "- process_id={process_id} state={state} exit_code={exit} finished_at={finished_at} elapsed={}m final_output_available={final_available} command={command:?}\n",
-                    elapsed_minutes
-                ));
-            }
+        projection.push_str("Processes:\n");
+        for (_, _, row) in rows {
+            projection.push_str(&row);
+            projection.push('\n');
         }
         projection.push_str(
             "Use process_list for full live-process details and write_stdin with empty chars to read final output.\n</background_processes>",
@@ -1101,6 +1043,17 @@ impl ToolRegistry {
             }
         };
         Ok((program.into(), args))
+    }
+}
+
+fn semantic_process_state_label(state: ProcessState) -> &'static str {
+    match state {
+        ProcessState::Starting => "starting",
+        ProcessState::Running => "running",
+        ProcessState::Terminating => "terminating",
+        ProcessState::Finished { .. } => "finished",
+        ProcessState::Terminated { .. } => "terminated",
+        ProcessState::Error => "error",
     }
 }
 

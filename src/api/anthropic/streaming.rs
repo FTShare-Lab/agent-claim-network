@@ -43,6 +43,7 @@ impl AnthropicMessagesClient {
         .await
     }
 
+    #[cfg(test)]
     pub(super) async fn send_text_with_continuation_streaming_for_provider_with_retry_count(
         &self,
         system: &str,
@@ -60,6 +61,34 @@ impl AnthropicMessagesClient {
             retry_count,
             emit,
             false,
+            None,
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "streaming continuation 的 retry、emit 与 request observer 需显式穿过边界"
+    )]
+    pub(super) async fn send_text_with_continuation_streaming_for_provider_with_retry_count_observed(
+        &self,
+        system: &str,
+        messages: &mut Vec<ApiMessage>,
+        tools: Option<Vec<super::protocol::ApiToolDefinition>>,
+        max_tokens: u32,
+        retry_count: u32,
+        emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        observer: &mut super::AnthropicContinuationRequestObserver<'_>,
+    ) -> Result<ContinuedAssistantTurn, AnthropicError> {
+        self.send_text_with_continuation_streaming_with_policy(
+            system,
+            messages,
+            tools,
+            max_tokens,
+            retry_count,
+            emit,
+            false,
+            Some(observer),
         )
         .await
     }
@@ -77,6 +106,7 @@ impl AnthropicMessagesClient {
         retry_count: u32,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
         error_on_unresolved_max_tokens: bool,
+        mut request_observer: Option<&mut super::AnthropicContinuationRequestObserver<'_>>,
     ) -> Result<ContinuedAssistantTurn, AnthropicError> {
         let mut merged_text = String::new();
         let mut last_response: Option<Value> = None;
@@ -85,6 +115,9 @@ impl AnthropicMessagesClient {
         let mut replay_messages = Vec::new();
 
         for round in 0..=MAX_CONTINUATION_TURNS {
+            if let Some(observer) = request_observer.as_deref_mut() {
+                observer.before_request().await?;
+            }
             let body = self.request_for(
                 system,
                 messages.clone(),
@@ -100,7 +133,8 @@ impl AnthropicMessagesClient {
                 "content": response_turn.final_blocks.clone(),
             });
             messages.push(ApiMessage::raw(assistant_replay.clone()));
-            replay_messages.push(assistant_replay);
+            replay_messages.push(assistant_replay.clone());
+            let round_text = response_turn.merged_text.clone();
             append_with_overlap_dedupe(&mut merged_text, &response_turn.merged_text);
             last_stop_reason = response_turn.final_stop_reason.clone();
             last_blocks = response_turn.final_blocks;
@@ -126,7 +160,10 @@ impl AnthropicMessagesClient {
             }
             let continuation = json!({"role": "user", "content": CONTINUATION_TRIGGER});
             messages.push(ApiMessage::raw(continuation.clone()));
-            replay_messages.push(continuation);
+            replay_messages.push(continuation.clone());
+            if let Some(observer) = request_observer.as_deref_mut() {
+                observer.push_round(vec![assistant_replay, continuation], round_text);
+            }
         }
 
         let final_response = last_response.ok_or_else(|| AnthropicError::OutputShape {
@@ -661,10 +698,28 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use async_trait::async_trait;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     use super::*;
+    use crate::api::{ProviderRequestObserver, SessionTurnMessage};
+
+    #[derive(Default)]
+    struct RecordingRequestObserver {
+        requests: Vec<Vec<SessionTurnMessage>>,
+    }
+
+    #[async_trait]
+    impl ProviderRequestObserver for RecordingRequestObserver {
+        async fn before_provider_request(
+            &mut self,
+            messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            self.requests.push(messages.to_vec());
+            Ok(())
+        }
+    }
 
     #[test]
     fn content_block_start_rejects_sparse_huge_index_without_allocating() {
@@ -1161,17 +1216,26 @@ mod tests {
             "user",
             vec![json!({"type":"text", "text":"hello"})],
         )];
+        let mut recording = RecordingRequestObserver::default();
+        let mut request_observer = super::super::AnthropicContinuationRequestObserver {
+            messages: vec![SessionTurnMessage::user_text("hello")],
+            model: "test-model".into(),
+            observer: &mut recording,
+        };
 
         let turn = client
-            .send_text_with_continuation_streaming_for_provider(
+            .send_text_with_continuation_streaming_for_provider_with_retry_count_observed(
                 "system",
                 &mut messages,
                 None,
                 128,
+                0,
                 &mut |_| {},
+                &mut request_observer,
             )
             .await
             .unwrap();
+        drop(request_observer);
 
         assert_eq!(turn.merged_text, "first second");
         assert_eq!(turn.replay_messages.len(), 3);
@@ -1192,6 +1256,24 @@ mod tests {
         let replayed_messages = serde_json::to_value(&messages[1..]).unwrap();
         assert!(replayed_messages.to_string().contains("private-one"));
         assert!(replayed_messages.to_string().contains(CONTINUATION_TRIGGER));
+        assert_eq!(recording.requests.len(), 2);
+        assert!(recording.requests[1].starts_with(&recording.requests[0]));
+        let observed_second = serde_json::to_value(super::super::session_turn_messages_to_api(
+            recording.requests[1].clone(),
+            "test-model",
+        ))
+        .unwrap();
+        let captured_second: Value = serde_json::from_str(
+            captured[1]
+                .split_once("\r\n\r\n")
+                .map(|(_, body)| body)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            observed_second, captured_second["messages"],
+            "streaming observer 必须映射为同一份 Anthropic messages"
+        );
     }
 
     #[tokio::test]

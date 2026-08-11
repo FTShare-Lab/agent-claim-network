@@ -162,12 +162,14 @@ fn validate_assistant_message(message: &SessionTurnMessage) -> anyhow::Result<()
     if message.role != "assistant" {
         anyhow::bail!("provider response role 必须是 assistant: {}", message.role);
     }
-    if message
-        .content
-        .iter()
-        .any(|block| matches!(block, SessionTurnContentBlock::ToolResult { .. }))
-    {
-        anyhow::bail!("assistant message 不允许包含 ToolResult block");
+    if message.content.iter().any(|block| {
+        matches!(
+            block,
+            SessionTurnContentBlock::ToolResult { .. }
+                | SessionTurnContentBlock::ModelContext { .. }
+        )
+    }) {
+        anyhow::bail!("assistant message 不允许包含 ToolResult 或 ModelContext block");
     }
     Ok(())
 }
