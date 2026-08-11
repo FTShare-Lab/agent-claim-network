@@ -191,7 +191,7 @@ fn build_http_client(timeout_secs: u64, api_key_env: &str) -> anyhow::Result<req
         HeaderValue::from_str(&auth).context("embedding API key header 非法")?,
     );
 
-    reqwest::Client::builder()
+    crate::http_client_builder()
         .default_headers(headers)
         .timeout(Duration::from_secs(timeout_secs))
         .build()
@@ -292,7 +292,7 @@ mod tests {
             endpoint,
             model: cfg.model.clone(),
             cache_fingerprint: EmbeddingCacheFingerprint::from_config(&cfg, "response_length"),
-            http: reqwest::Client::new(),
+            http: crate::http_client_builder().build().unwrap(),
         };
 
         assert_eq!(client.embed("hello").await.unwrap(), vec![0.25, 0.75]);
@@ -314,7 +314,7 @@ mod tests {
             endpoint,
             model: cfg.model.clone(),
             cache_fingerprint: EmbeddingCacheFingerprint::from_config(&cfg, "response_length"),
-            http: reqwest::Client::new(),
+            http: crate::http_client_builder().build().unwrap(),
         };
 
         assert_eq!(client.embed("hello").await.unwrap(), vec![0.5, 0.125]);

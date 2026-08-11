@@ -394,9 +394,9 @@ metadata 写入。
 实现选择 B。全局 `normalize_provider_messages` 的既有 adjacent-user merge 仍保持不变，符合第 3
 节非目标；本决策只移除 Anthropic adapter 在冻结边界之后的第二次本地 merge。
 
-选择原因：Anthropic Messages 协议允许连变续的 user 或 assistant turns，并在服务端把它们视作单个
+选择原因：Anthropic Messages 协议允许连续的 user 或 assistant turns，并在服务端把它们视作单个
 turn。若 adapter 在每次请求时再次合并，新增尾部恰好与冻结前缀末项同角色时会回头改写上一条
-wire message，破坏精确前缀；一对一映射既满足协议，也让已经发送的 HTTP body 前缀保持不。
+wire message，破坏精确前缀；一对一映射既满足协议，也让已经发送的 HTTP body 前缀保持不变。
 
 ### D8：成功终态响应纳入稳定 Provider 窗口（选择 B）
 
@@ -736,83 +736,18 @@ projection 逻辑应与 compactor 解耦：
 - continuation observer/WAL 纳入 Provider 总 deadline 的显式准备阶段；WAL 未成功时不发送新请求、
   不从旧 prefix fallback。context-window recovery 使用真实 continuation wire chain 的最早消息作为
   marker，保护整条未完成 replay。
+- WebSocket 增量传输与同一稳定窗口共享语义：WAL 保存可完整重建的逻辑
+  Provider history，而 wire 层可在精确前缀命中时使用 `previous_response_id`
+  只发送物理 suffix。response ID、物理 suffix 和 connection lease 不进入 WAL 或 session。
 
 实现末期额外修正了两个不新增产品语义的边界：adapter continuation 只把新增 wire suffix 同步回
 raw history，保留 compactor 的 raw `active_start_index`；response-inclusive pending window 记录最后
 一次真实 request 的精确 message boundary，未 canonical commit 时丢弃未被接受的 response suffix。
 两者分别是 D12/D14 与 D8/D9 的实现一致性修正，不形成 D17。
 
-### 16.2 Review 与修复闭环
+### 16.2 最终验收结论
 
-针对性本地审查和独立只读审查未发现 P0；发现的现实 P1 均已修复，并在每轮修复后执行受影响定向
-测试。修复闭环覆盖：
-
-1. 截断 canonical history 时的 ModelContext recovery 判断；
-2. successful active compaction 窗口跨 turn 丢失；
-3. Chat max-token continuation replay 缺失；
-4. context 变化与同请求 compaction 造成 baseline 重复；
-5. failed/cancelled/crashed compacted request 未保存精确窗口；
-6. WAL 保存 normalization 前而非实际 wire history；
-7. 重复 active-only compaction 重复 active suffix；
-8. 普通同模型 Chat assistant 错误切断旧 continuation generation；
-9. Anthropic adapter 在冻结边界后二次合并；
-10. Anthropic response-inclusive history 重复 continuation replay；
-11. 领先的 pending cursor 跳过后来写入的 shell canonical tail；
-12. continuation observer/WAL deadline 到期后从旧 prefix fallback；
-13. max-token continuation 后再触发 context-window recovery 时未保护完整 replay chain；
-14. adapter continuation 后 raw/wire `active_start_index` 漂移；
-15. 未 canonical commit 的 response-inclusive pending window 重放未接受 response。
-
-修复复验通过后完成本地全量 diff review，并使用独立只读 reviewer 对完整 tracked/untracked diff、
-D1～D16、三类 adapter、WAL/恢复、main/child context、consumer 与序列化兼容做最终门禁。最终结论为：
-没有可现实触发、具有实质影响的 P0/P1；实现与 PRD 完全对齐。
-
-### 16.3 自动化验证
-
-最终全量验证在 full-diff review 结束后重新执行并通过：
-
-- 版本一致性：ACN `0.2.2`；
-- `cargo fmt --check`；
-- `cargo clippy -- -D warnings`；
-- `cargo test`：library 2165、`acn` binary 57、maintainer 2、router 2、session cleanup
-  integration 1、session storage integration 5，另含 doc tests，全部通过；
-- `cargo check`；
-- bundled tmux TUI smoke：启动页、`/help`、`/skills`、状态栏与 clean exit 均通过，`stderr.log`
-  为 0 字节。
-
-定向/fake Provider 覆盖 main/child Responses 精确前缀、retry、跨午夜/时区、background lifecycle、
-delegation revision/fingerprint、Chat continuation、Anthropic mapping、重复 compaction、所有请求 WAL、
-失败/取消/崩溃/post-commit 恢复、D15 timeout、D16 replay marker、raw/wire boundary 和未提交 response
-rollback。Chat/Anthropic、reasoning/media/tool history 与 consumer filtering 回归全部通过。
-
-### 16.4 真实 LLM TUI 验收
-
-最终使用真实 `openai_responses`、模型 `gpt-5.6-luna` 在 tmux TUI 中完成连续四轮：
-
-1. main 用 `code_run` 启动 background process，返回 `CACHE_BG_STARTED`；
-2. 下一轮用 `write_stdin` 等待并读取 terminal output，返回 `CACHE_BG_READ_OK`；
-3. main 创建并等待 child；child 自己启动、读取 background process 后完成，main 返回
-   `CACHE_SUBAGENT_OK`；
-4. 完成 subagent 后继续普通无工具对话，返回 `CACHE_FINAL_OK`。
-
-最终 main session 为 `session_9ae8fd11`，child 为 `subagent_8d524897`。main canonical transcript
-持久化 24 条 message，其中 8 条带 Responses replay，8 条含 ModelContext，source 覆盖
-`runtime`、`background_process`、`delegation`；稳定 Provider history 同步覆盖到 canonical cursor
-24。child transcript 持久化 23 条 entry，其中 5 条 ModelContext，source 覆盖 `runtime` 与
-`background_process`。四个标记均在 turn 回到 `open` 后仍可见，TUI `stderr.log` 为 0 字节，session
-运行日志无新增 error/panic。
-
-### 16.5 第 15 节完成定义对账
-
-| 条目 | 结果 | 证据 |
-| --- | --- | --- |
-| 1 | 满足 | D1-A 与 D2～D16 均已记录；末期两个修正只落实既有决策，没有 D17。 |
-| 2 | 满足 | main/child Responses 连续请求精确 prefix 定向测试通过。 |
-| 3 | 满足 | runtime、background、delegation source-specific 单元/集成/真实 LLM 场景通过。 |
-| 4 | 满足 | main/child 持久化、retry、resume、compaction 与失败恢复测试通过。 |
-| 5 | 满足 | Chat、Anthropic、reasoning/media/tool history 回归通过。 |
-| 6 | 满足 | UI、真实 user turn、Memory、search、recap/finalize consumer 回归通过。 |
-| 7 | 满足 | 最终完整 Rust verify、bundled TUI smoke 与真实 LLM TUI smoke 通过。 |
-| 8 | 满足 | 针对性 review 无 P0；全部 P1 已修复并复验。 |
-| 9 | 满足 | 修复后完成全量本地/独立 review；零未解决 P0/P1；review 后最终验收通过。 |
-| 10 | 满足 | 本节已记录实现、测试、真实场景和 review 闭环；最终交付逐项解释 D1～D16。 |
+D1～D16 均已落实。定向测试、完整 Rust 验证、TUI 验收及本地/独立代码审查均
+通过；Responses、Chat 与 Anthropic 的精确前缀、ModelContext、WAL、compaction、resume、
+reasoning/media/tool history 与 consumer filtering 符合本文不变量。最终无未解决 P0/P1，
+也未发现实现遗漏或持久化兼容性倒退。

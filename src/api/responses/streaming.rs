@@ -10,7 +10,7 @@ use super::{
 #[derive(Default)]
 pub(super) struct ResponsesSseDecoder {
     buffer: Vec<u8>,
-    accumulator: ResponsesStreamAccumulator,
+    accumulator: ResponsesEventDecoder,
 }
 
 impl ResponsesSseDecoder {
@@ -22,7 +22,7 @@ impl ResponsesSseDecoder {
         self.buffer.extend_from_slice(chunk);
         for frame in drain_sse_frames(&mut self.buffer) {
             if let Some(data) = sse_frame_data(&frame)? {
-                self.accumulator.apply_frame(&data, emit)?;
+                self.accumulator.apply_event_text(&data, emit)?;
             }
         }
         Ok(())
@@ -34,38 +34,38 @@ impl ResponsesSseDecoder {
     ) -> Result<ReducedResponses, ResponsesError> {
         if !self.buffer.is_empty() {
             if let Some(data) = sse_frame_data(&self.buffer)? {
-                self.accumulator.apply_frame(&data, emit)?;
+                self.accumulator.apply_event_text(&data, emit)?;
             }
             self.buffer.clear();
         }
-        let value = self.accumulator.finish()?;
-        reduce_response_value(value)
+        self.accumulator.finish(false)
     }
 }
 
 #[derive(Default)]
-struct ResponsesStreamAccumulator {
+pub(super) struct ResponsesEventDecoder {
     output_items: BTreeMap<usize, Value>,
     terminal_response: Option<Value>,
     terminal_status: Option<&'static str>,
 }
 
-impl ResponsesStreamAccumulator {
-    fn apply_frame(
+impl ResponsesEventDecoder {
+    /// 应用一个 Responses JSON event；返回它是否为完整 terminal event。
+    pub(super) fn apply_event_text(
         &mut self,
         data: &str,
         emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
-    ) -> Result<(), ResponsesError> {
+    ) -> Result<bool, ResponsesError> {
         if data.trim() == "[DONE]" {
-            return Ok(());
+            return Ok(false);
         }
         let event: Value =
             serde_json::from_str(data).map_err(|error| ResponsesError::StreamFailure {
-                reason: format!("SSE data JSON 解析失败: {error}"),
+                reason: format!("Responses event JSON 解析失败: {error}"),
             })?;
         let kind = event.get("type").and_then(Value::as_str).ok_or_else(|| {
             ResponsesError::StreamFailure {
-                reason: "SSE event 缺少 type".into(),
+                reason: "Responses event 缺少 type".into(),
             }
         })?;
         if self.terminal_response.is_some() {
@@ -111,7 +111,7 @@ impl ResponsesStreamAccumulator {
             "response.completed" | "response.incomplete" => {
                 if self.terminal_response.is_some() {
                     return Err(ResponsesError::StreamFailure {
-                        reason: "Responses SSE 收到重复 terminal event".into(),
+                        reason: "Responses stream 收到重复 terminal event".into(),
                     });
                 }
                 self.terminal_status = Some(if kind == "response.completed" {
@@ -137,22 +137,29 @@ impl ResponsesStreamAccumulator {
                 });
             }
             "error" => {
+                if let Some(status) = event_error_status(&event) {
+                    return Err(ResponsesError::Status {
+                        status,
+                        body: event_error_message(Some(&event)),
+                    });
+                }
                 return Err(ResponsesError::Failed {
                     message: event_error_message(Some(&event)),
                 });
             }
-            _ => {
-                log::debug!(target: "api", "忽略未消费的 Responses SSE event type={kind}");
-            }
+            _ => log::debug!(target: "api", "忽略未消费的 Responses event type={kind}"),
         }
-        Ok(())
+        Ok(matches!(kind, "response.completed" | "response.incomplete"))
     }
 
-    fn finish(self) -> Result<Value, ResponsesError> {
+    pub(super) fn finish(
+        self,
+        require_response_id: bool,
+    ) -> Result<ReducedResponses, ResponsesError> {
         let mut response = self
             .terminal_response
             .ok_or_else(|| ResponsesError::StreamFailure {
-                reason: "Responses SSE 在 terminal event 前结束".into(),
+                reason: "Responses stream 在 terminal event 前结束".into(),
             })?;
         let response_object =
             response
@@ -169,7 +176,7 @@ impl ResponsesStreamAccumulator {
         let expected_status =
             self.terminal_status
                 .ok_or_else(|| ResponsesError::StreamFailure {
-                    reason: "Responses SSE 缺少 terminal status".into(),
+                    reason: "Responses stream 缺少 terminal status".into(),
                 })?;
         if actual_status != expected_status {
             return Err(ResponsesError::StreamFailure {
@@ -184,7 +191,7 @@ impl ResponsesStreamAccumulator {
             if index != expected_index {
                 return Err(ResponsesError::StreamFailure {
                     reason: format!(
-                        "Responses SSE output_index 不连续: 期望 {expected_index}，实际 {index}"
+                        "Responses stream output_index 不连续: 期望 {expected_index}，实际 {index}"
                     ),
                 });
             }
@@ -194,18 +201,43 @@ impl ResponsesStreamAccumulator {
         // 完整 output/replay 只以 output_item.done 为权威。terminal response 仅提供
         // status/usage 等终态元数据，其 output 可能省略 item 或使用不同的可选字段形状。
         response_object.insert("output".into(), Value::Array(output));
-        Ok(response)
+        if require_response_id
+            && response_object
+                .get("id")
+                .and_then(Value::as_str)
+                .is_none_or(|id| id.trim().is_empty())
+        {
+            return Err(ResponsesError::StreamFailure {
+                reason: "Responses WebSocket terminal response 缺少合法 id".into(),
+            });
+        }
+        reduce_response_value(response)
     }
 }
 
 fn event_error_message(error: Option<&Value>) -> String {
     let message = error
         .and_then(Value::as_object)
-        .and_then(|error| error.get("message"))
+        .and_then(|error| {
+            error.get("message").or_else(|| {
+                error
+                    .get("error")
+                    .and_then(Value::as_object)
+                    .and_then(|nested| nested.get("message"))
+            })
+        })
         .and_then(Value::as_str)
         .filter(|message| !message.trim().is_empty())
         .unwrap_or("upstream Responses stream failed");
     redact_responses_error_body(message)
+}
+
+fn event_error_status(event: &Value) -> Option<u16> {
+    event
+        .get("status")
+        .or_else(|| event.get("status_code"))
+        .and_then(Value::as_u64)
+        .and_then(|status| u16::try_from(status).ok())
 }
 
 fn drain_sse_frames(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
@@ -650,6 +682,53 @@ mod tests {
                 .push_chunk(sse_event(event).as_bytes(), &mut |_| {})
                 .unwrap_err();
             assert!(!error.to_string().contains("opaque"));
+        }
+    }
+
+    #[test]
+    fn decoder_preserves_wrapped_error_status_and_nested_message() {
+        for (event, expected_status, expected_message) in [
+            (
+                json!({
+                    "type":"error",
+                    "status":429,
+                    "error":{"message":"rate limited","secret":"opaque"}
+                }),
+                429,
+                "rate limited",
+            ),
+            (
+                json!({
+                    "type":"error",
+                    "status_code":503,
+                    "error":{"message":"temporarily unavailable","secret":"opaque"}
+                }),
+                503,
+                "temporarily unavailable",
+            ),
+            (
+                json!({
+                    "type":"error",
+                    "status":401,
+                    "error":{"message":"invalid credential","secret":"opaque"}
+                }),
+                401,
+                "invalid credential",
+            ),
+        ] {
+            let mut decoder = ResponsesSseDecoder::default();
+            let error = decoder
+                .push_chunk(sse_event(event).as_bytes(), &mut |_| {})
+                .unwrap_err();
+
+            match error {
+                ResponsesError::Status { status, body } => {
+                    assert_eq!(status, expected_status);
+                    assert_eq!(body, expected_message);
+                    assert!(!body.contains("opaque"));
+                }
+                other => panic!("expected status error, got {other}"),
+            }
         }
     }
 

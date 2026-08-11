@@ -1793,7 +1793,7 @@ async fn streamable_http_transport(
     // 约束；不能把 startup timeout 设为整个 reqwest client 的默认值，否则合法长 SSE tool call
     // 会早于 `tool_timeout_secs` 被截断。
     let client =
-        reqwest::Client::builder()
+        crate::http_client_builder()
             .build()
             .map_err(|source| McpClientError::HttpClient {
                 server: server_name.to_string(),

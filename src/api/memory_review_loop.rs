@@ -143,6 +143,8 @@ impl MemoryReviewLoop {
                     tools: tools.to_vec(),
                     max_tokens: self.max_tokens,
                     stream: false,
+                    runtime_chain_id: None,
+                    recovery_interrupt: None,
                     retry_count_override: None,
                 },
                 &mut emit,

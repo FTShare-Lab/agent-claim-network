@@ -23,7 +23,9 @@ use agent_claim_network::session::{
 };
 use agent_claim_network::session_tui::{self, StartupResume};
 use agent_claim_network::storage::{paths, read_yaml, FileLockGuard};
-use agent_claim_network::supervisor::{self, SupervisorLaunchConfig, SupervisorRetryTarget};
+use agent_claim_network::supervisor::{
+    self, FinalizingSessionDiagnostic, SupervisorLaunchConfig, SupervisorRetryTarget,
+};
 use agent_claim_network::update::{
     self, UpdateOptions, DEFAULT_UPDATE_BRANCH, DEFAULT_UPDATE_REPOSITORY_URL,
 };
@@ -78,6 +80,14 @@ async fn main() -> anyhow::Result<()> {
         ),
         timing: session_tui::SessionCleanupHousekeepingTiming::default(),
     };
+    // 先恢复可能中断的 finalize job，再判断目标 session 是否可 resume。否则 supervisor
+    // 崩溃留下的 queued/running job 会被预检反复报告为“请等待”，却没有进程继续执行。
+    if let Err(error) = supervisor::ensure_supervisor_running(&supervisor_launch).await {
+        log::warn!(
+            target: "acn",
+            "finalize supervisor 启动或接管失败，本次会话继续运行: {error:#}"
+        );
+    }
     if let Some(message) =
         direct_resume_preflight_failure(&cfg, &upstream.agent_id, &cli.resume).await
     {
@@ -88,12 +98,6 @@ async fn main() -> anyhow::Result<()> {
     let engine =
         bootstrap::build_agent_cli_session_engine_with_mcp(&cfg, &upstream, Some(mcp_manager))?
             .with_fork_memory_review(cli.fork_review);
-    if let Err(error) = supervisor::ensure_supervisor_running(&supervisor_launch).await {
-        log::warn!(
-            target: "acn",
-            "finalize supervisor 启动或接管失败，本次会话继续运行: {error:#}"
-        );
-    }
     session_tui::run_session_tui_with_resume_and_cleanup(
         engine,
         cfg.agent.session.id_mint_max_attempts(),
@@ -399,6 +403,16 @@ async fn direct_resume_preflight_failure(
         Ok(metadata) => metadata,
         Err(error) => return Some(format!("Resume failed: {error:#}\n")),
     };
+    if metadata.agent_id == *agent_id && metadata.status == SessionStatus::Finalizing {
+        let diagnostic =
+            supervisor::diagnose_finalizing_session(&cfg.agent_home(agent_id), session_id).await;
+        return Some(match diagnostic {
+            Ok(diagnostic) => direct_resume_finalizing_message(session_id, &diagnostic),
+            Err(error) => {
+                format!("Resume failed: session {session_id} 的 finalize 状态检查失败：{error:#}\n")
+            }
+        });
+    }
     direct_resume_metadata_failure(agent_id, session_id, &metadata)
 }
 
@@ -427,6 +441,29 @@ fn direct_resume_not_closed_message(session_id: &SessionId, status: SessionStatu
         "Resume failed: You can only resume Closed sessions.\nSession {session_id} current status: {}.\n",
         session_status_label(status)
     )
+}
+
+fn direct_resume_finalizing_message(
+    session_id: &SessionId,
+    diagnostic: &FinalizingSessionDiagnostic,
+) -> String {
+    match diagnostic {
+        FinalizingSessionDiagnostic::Queued { job_id } => format!(
+            "Resume failed: session {session_id} 正在等待 finalize（job {job_id}）。请稍后重试。\n"
+        ),
+        FinalizingSessionDiagnostic::Running { job_id } => format!(
+            "Resume failed: session {session_id} 正在 finalize（job {job_id}）。请稍后重试。\n"
+        ),
+        FinalizingSessionDiagnostic::Failed { job_id } => format!(
+            "Resume failed: session {session_id} 的 finalize 失败。\nJob: {job_id}\n\n请运行：\nacn supervisor retry {session_id}\n"
+        ),
+        FinalizingSessionDiagnostic::RunningWithoutJob => format!(
+            "Resume failed: session {session_id} 正在 finalize。请稍后重试。\n"
+        ),
+        FinalizingSessionDiagnostic::Orphaned => format!(
+            "Resume failed: session {session_id} 的 finalize 未完成。\n\n请运行：\nacn supervisor retry {session_id}\n"
+        ),
+    }
 }
 
 fn session_status_label(status: SessionStatus) -> &'static str {
@@ -2016,8 +2053,8 @@ mod tests {
         SessionStatus,
     };
     use agent_claim_network::supervisor::{
-        SupervisorJobView, SupervisorQueueSummary, SupervisorRuntimeState,
-        SupervisorStatusSnapshot, SupervisorStopReport,
+        FinalizingSessionDiagnostic, SupervisorJobView, SupervisorQueueSummary,
+        SupervisorRuntimeState, SupervisorStatusSnapshot, SupervisorStopReport,
     };
     use chrono::{DateTime, Utc};
     use std::path::PathBuf;
@@ -2467,6 +2504,37 @@ api_key_env = "UNUSED_TEST_LLM_KEY"
         assert_eq!(
             super::direct_resume_not_closed_message(&session_id, SessionStatus::Finalizing),
             "Resume failed: You can only resume Closed sessions.\nSession session_1234abcd current status: Finalizing.\n"
+        );
+    }
+
+    #[test]
+    fn direct_resume_finalizing_message_explains_job_state_and_retry_command() {
+        let session_id = SessionId::from_str("session_1234abcd").unwrap();
+
+        assert_eq!(
+            super::direct_resume_finalizing_message(
+                &session_id,
+                &FinalizingSessionDiagnostic::Queued {
+                    job_id: "job_queued".into(),
+                },
+            ),
+            "Resume failed: session session_1234abcd 正在等待 finalize（job job_queued）。请稍后重试。\n"
+        );
+        assert_eq!(
+            super::direct_resume_finalizing_message(
+                &session_id,
+                &FinalizingSessionDiagnostic::Failed {
+                    job_id: "job_failed".into(),
+                },
+            ),
+            "Resume failed: session session_1234abcd 的 finalize 失败。\nJob: job_failed\n\n请运行：\nacn supervisor retry session_1234abcd\n"
+        );
+        assert_eq!(
+            super::direct_resume_finalizing_message(
+                &session_id,
+                &FinalizingSessionDiagnostic::Orphaned,
+            ),
+            "Resume failed: session session_1234abcd 的 finalize 未完成。\n\n请运行：\nacn supervisor retry session_1234abcd\n"
         );
     }
 

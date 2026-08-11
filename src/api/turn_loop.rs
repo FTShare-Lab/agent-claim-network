@@ -29,10 +29,10 @@ use super::provider::{
 use crate::api::{
     estimate_provider_request_context_tokens, CompletedSessionTurnMessage, ContextUsageSnapshot,
     ModelContextSource, ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy,
-    ProviderReplayIdentity, ProviderReplayState, ProviderRequest, ProviderResponse, ProviderStop,
-    SessionAttachment, SessionTurn, SessionTurnContentBlock, SessionTurnEvent,
-    SessionTurnInterrupted, SessionTurnMessage, SessionTurnRequest, ToolBoundaryControl,
-    ToolCallSkipReason, ToolExecutionOutcome,
+    ProviderRecoveryInterrupt, ProviderReplayIdentity, ProviderReplayState, ProviderRequest,
+    ProviderResponse, ProviderRuntimeChainId, ProviderStop, SessionAttachment, SessionTurn,
+    SessionTurnContentBlock, SessionTurnEvent, SessionTurnInterrupted, SessionTurnMessage,
+    SessionTurnRequest, ToolBoundaryControl, ToolCallSkipReason, ToolExecutionOutcome,
 };
 use crate::attachment::{AttachmentKind, AttachmentLimits, NormalizedMedia, FILE_READ_MEDIA_KEY};
 use crate::claim::SessionId;
@@ -51,6 +51,9 @@ const NON_STREAMING_FALLBACK_ERROR_MAX_CHARS: usize = 4096;
 const NON_STREAMING_FALLBACK_BASE_DELAY: Duration = Duration::from_millis(250);
 const NON_STREAMING_FALLBACK_MAX_DELAY: Duration = Duration::from_secs(4);
 const MAX_CONTEXT_WINDOW_RECOVERIES: usize = 2;
+// Provider WAL 是发起网络 I/O 前的内部保护边界，不与用户可配置的
+// LLM 请求超时共用几分钟的等待时间。
+const PROVIDER_WAL_PREPARATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct ProviderCallOutcome {
     response: ProviderResponse,
@@ -123,10 +126,22 @@ impl ProviderRequestObserver for ProviderRequestProgress<'_> {
             .into());
         }
         if let Some(preflight) = self.preflight.as_deref_mut() {
-            preflight
-                .provider_request_ready(messages, self.canonical_tail_count)
-                .await
-                .map_err(ProviderRequestPreparationFailure::from_error)?;
+            match time::timeout(
+                PROVIDER_WAL_PREPARATION_TIMEOUT,
+                preflight.provider_request_ready(messages, self.canonical_tail_count),
+            )
+            .await
+            {
+                Ok(result) => {
+                    result.map_err(ProviderRequestPreparationFailure::from_error)?;
+                }
+                Err(_) => {
+                    return Err(ProviderRequestPreparationFailure::new(
+                        "Provider 请求状态保存超时（10 秒）",
+                    )
+                    .into());
+                }
+            }
         }
         self.latest_messages = messages.to_vec();
         self.preparing_write_ahead.store(false, Ordering::Release);
@@ -441,6 +456,10 @@ impl AgentTurnLoop {
 
     pub(crate) fn history_replay_identity(&self) -> Option<ProviderReplayIdentity> {
         self.provider.history_replay_identity()
+    }
+
+    pub(crate) async fn discard_runtime_chain(&self, chain_id: ProviderRuntimeChainId) {
+        self.provider.discard_runtime_chain(chain_id).await;
     }
 
     pub fn with_attachment_limits(mut self, limits: AttachmentLimits) -> Self {
@@ -1241,6 +1260,47 @@ impl AgentTurnLoop {
         tool_boundary_control: Option<ToolBoundaryControl>,
         hooks: SessionTurnHooks<'_, '_, '_>,
     ) -> anyhow::Result<SessionTurn> {
+        self.run_session_turn_with_context_and_runtime_chain_hooks(
+            request,
+            recovered_model_context,
+            ProviderRuntimeChainId::new(),
+            emit,
+            tool_boundary_control,
+            hooks,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn run_session_turn_with_runtime_chain_hooks(
+        &self,
+        request: SessionTurnRequest,
+        runtime_chain_id: ProviderRuntimeChainId,
+        emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        tool_boundary_control: Option<ToolBoundaryControl>,
+        durable_recorder: Option<&mut dyn SessionTurnEventRecorder>,
+        preflight: Option<&mut dyn SessionTurnPreflight>,
+    ) -> anyhow::Result<SessionTurn> {
+        self.run_session_turn_with_context_and_runtime_chain_hooks(
+            request,
+            Vec::new(),
+            runtime_chain_id,
+            emit,
+            tool_boundary_control,
+            SessionTurnHooks::new(durable_recorder, None, preflight),
+        )
+        .await
+    }
+
+    pub(crate) async fn run_session_turn_with_context_and_runtime_chain_hooks(
+        &self,
+        request: SessionTurnRequest,
+        recovered_model_context: Vec<CompletedSessionTurnMessage>,
+        runtime_chain_id: ProviderRuntimeChainId,
+        emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        tool_boundary_control: Option<ToolBoundaryControl>,
+        hooks: SessionTurnHooks<'_, '_, '_>,
+    ) -> anyhow::Result<SessionTurn> {
         let rollback_context = ToolDispatchContext {
             current_session_id: request.current_session_id.clone(),
             current_turn_id: request.current_turn_id.clone(),
@@ -1253,9 +1313,11 @@ impl AgentTurnLoop {
                 emit,
                 tool_boundary_control,
                 hooks,
+                runtime_chain_id,
             )
             .await;
         if result.is_err() {
+            self.provider.discard_runtime_chain(runtime_chain_id).await;
             self.tools
                 .rollback_uncommitted_process_deliveries_for_context(&rollback_context)
                 .await;
@@ -1270,6 +1332,7 @@ impl AgentTurnLoop {
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
         tool_boundary_control: Option<ToolBoundaryControl>,
         hooks: SessionTurnHooks<'_, '_, '_>,
+        runtime_chain_id: ProviderRuntimeChainId,
     ) -> anyhow::Result<SessionTurn> {
         let SessionTurnHooks {
             mut durable_recorder,
@@ -1422,6 +1485,9 @@ impl AgentTurnLoop {
             if history_replaced {
                 // compaction 是允许替换旧 history 的显式缓存断点；其首个新请求重新建立边界。
                 frozen_provider_prefix.clear();
+                // 同时废弃 connection-local previous_response_id；健康 socket 与
+                // runtime-chain sticky HTTP 状态仍可保留，下一请求必须发送完整新窗口。
+                self.provider.discard_runtime_chain(runtime_chain_id).await;
             }
             // steering、context 观察和 compaction 都可能让出执行权；若此时已收到
             // steer 或显式取消，就不能再发起一个新的 provider request。
@@ -1469,9 +1535,20 @@ impl AgentTurnLoop {
                 .await;
             let request_messages = frozen_provider_prefix.project(&provider_messages)?;
             if let Some(preflight) = preflight.as_mut() {
-                preflight
-                    .provider_request_ready(&request_messages, committed.len())
-                    .await?;
+                match time::timeout(
+                    PROVIDER_WAL_PREPARATION_TIMEOUT,
+                    preflight.provider_request_ready(&request_messages, committed.len()),
+                )
+                .await
+                {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        return Err(ProviderRequestPreparationFailure::new(
+                            "Provider 请求状态保存超时（10 秒）",
+                        )
+                        .into());
+                    }
+                }
             }
             let mut latest_provider_context_usage = None;
             let provider_call = {
@@ -1491,6 +1568,9 @@ impl AgentTurnLoop {
                 let provider_interrupt = tool_boundary_control
                     .as_ref()
                     .map(ToolBoundaryControl::cancellation_token);
+                let provider_recovery_interrupt = tool_boundary_control
+                    .as_ref()
+                    .map(ToolBoundaryControl::recovery_cancellation_token);
                 let result = self
                     .call_provider(
                         &system_prompt,
@@ -1500,6 +1580,8 @@ impl AgentTurnLoop {
                         &mut durable_recorder,
                         &seen_tool_use_ids,
                         provider_interrupt.as_ref(),
+                        provider_recovery_interrupt.as_ref(),
+                        runtime_chain_id,
                         &mut request_progress,
                     )
                     .await;
@@ -1512,6 +1594,11 @@ impl AgentTurnLoop {
                 provider_assistant_message,
                 recovered_with_non_streaming,
             } = provider_call;
+            if recovered_with_non_streaming {
+                // HTTP replacement 不属于旧 WebSocket connection-local history；即使
+                // strict prefix 会在下轮拒绝它，也应在 fallback 成功后立即废弃旧链。
+                self.provider.discard_runtime_chain(runtime_chain_id).await;
+            }
             let stop = provider_response.stop;
             let context_window_recovery_marker = if stop == ProviderStop::ContextWindowExceeded {
                 let continuation_suffix = successful_request_messages
@@ -1661,9 +1748,21 @@ impl AgentTurnLoop {
                 let completed_provider_history =
                     frozen_provider_prefix.project(&provider_messages)?;
                 if let Some(preflight) = preflight.as_mut() {
-                    preflight
-                        .provider_response_ready(&completed_provider_history, committed.len())
-                        .await?;
+                    match time::timeout(
+                        PROVIDER_WAL_PREPARATION_TIMEOUT,
+                        preflight
+                            .provider_response_ready(&completed_provider_history, committed.len()),
+                    )
+                    .await
+                    {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            return Err(ProviderRequestPreparationFailure::new(
+                                "Provider 响应状态保存超时（10 秒）",
+                            )
+                            .into());
+                        }
+                    }
                 }
                 return Ok(SessionTurn {
                     messages: committed,
@@ -1763,6 +1862,8 @@ impl AgentTurnLoop {
         durable_recorder: &mut Option<&mut dyn SessionTurnEventRecorder>,
         seen_tool_use_ids: &HashSet<String>,
         provider_interrupt: Option<&CancellationToken>,
+        provider_recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+        runtime_chain_id: ProviderRuntimeChainId,
         request_progress: &mut ProviderRequestProgress<'_>,
     ) -> anyhow::Result<ProviderCallOutcome> {
         let tools = self
@@ -1799,6 +1900,8 @@ impl AgentTurnLoop {
             tools: tools.clone(),
             max_tokens: self.max_tokens,
             stream: true,
+            runtime_chain_id: Some(runtime_chain_id),
+            recovery_interrupt: provider_recovery_interrupt.cloned(),
             retry_count_override: None,
         };
         let streaming_result = self
@@ -1823,6 +1926,12 @@ impl AgentTurnLoop {
                     recovered_with_non_streaming: false,
                 })
             }
+            Err(_error)
+                if provider_recovery_interrupt
+                    .is_some_and(ProviderRecoveryInterrupt::is_cancelled) =>
+            {
+                Err(SessionTurnInterrupted.into())
+            }
             Err(error)
                 if error.downcast_ref::<ProviderTerminalFailure>().is_some()
                     || error.downcast_ref::<SessionTurnInterrupted>().is_some()
@@ -1842,8 +1951,11 @@ impl AgentTurnLoop {
                         .is_some() =>
             {
                 for attempt in 1..=NON_STREAMING_FALLBACK_MAX_ATTEMPTS {
-                    // 上一轮失败的 durable 写入期间可能收到 cancel；此时不应虚构下一次已开始。
-                    if provider_interrupt.is_some_and(CancellationToken::is_cancelled) {
+                    // 上一轮失败或 durable 写入期间可能收到 steer/cancel；此时不能
+                    // 虚构下一次已开始，也不能为必定丢弃的 turn 继续计费。
+                    if provider_recovery_interrupt
+                        .is_some_and(ProviderRecoveryInterrupt::is_cancelled)
+                    {
                         return Err(SessionTurnInterrupted.into());
                     }
                     let (previous_error_text, _) = truncate_chars(
@@ -1856,12 +1968,20 @@ impl AgentTurnLoop {
                         previous_error: previous_error_text,
                     };
                     record_durable_event(durable_recorder, started_event.clone()).await?;
-                    if provider_interrupt.is_some_and(CancellationToken::is_cancelled) {
+                    if provider_recovery_interrupt
+                        .is_some_and(ProviderRecoveryInterrupt::is_cancelled)
+                    {
                         return Err(SessionTurnInterrupted.into());
                     }
                     emit(started_event);
-                    self.wait_for_non_streaming_fallback(attempt, provider_interrupt)
+                    self.wait_for_non_streaming_fallback(attempt, provider_recovery_interrupt)
                         .await?;
+
+                    if provider_recovery_interrupt
+                        .is_some_and(ProviderRecoveryInterrupt::is_cancelled)
+                    {
+                        return Err(SessionTurnInterrupted.into());
+                    }
 
                     let fallback_attempt_base = request_progress.latest_messages().to_vec();
                     let fallback_request = ProviderRequest {
@@ -1870,6 +1990,8 @@ impl AgentTurnLoop {
                         tools: tools.clone(),
                         max_tokens: self.max_tokens,
                         stream: false,
+                        runtime_chain_id: None,
+                        recovery_interrupt: provider_recovery_interrupt.cloned(),
                         // TUI 的 N/5 必须严格对应一次 provider-call attempt，禁止 adapter 再嵌套 retry。
                         retry_count_override: Some(0),
                     };
@@ -2028,7 +2150,7 @@ impl AgentTurnLoop {
     async fn wait_for_non_streaming_fallback(
         &self,
         attempt: u32,
-        provider_interrupt: Option<&CancellationToken>,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
     ) -> anyhow::Result<()> {
         let delay = non_streaming_fallback_delay(attempt);
         log::warn!(
@@ -2040,7 +2162,7 @@ impl AgentTurnLoop {
         );
         let sleep = time::sleep(delay);
         tokio::pin!(sleep);
-        match provider_interrupt {
+        match recovery_interrupt {
             Some(interrupt) if interrupt.is_cancelled() => Err(SessionTurnInterrupted.into()),
             Some(interrupt) => {
                 tokio::select! {
@@ -3283,10 +3405,10 @@ mod tests {
         estimate_provider_request_context_tokens, AgentTurnLoop, CompletedSessionTurnMessage,
         ContextUsageSource, ModelContextSource, ProviderAdapter, ProviderEvent,
         ProviderReplayState, ProviderRequest, ProviderRequestObserver, ProviderResponse,
-        ProviderStop, SessionTurn, SessionTurnContentBlock, SessionTurnContextAppender,
-        SessionTurnEvent, SessionTurnEventRecorder, SessionTurnHooks, SessionTurnInterrupted,
-        SessionTurnMessage, SessionTurnPreflight, SessionTurnRequest, ToolBoundaryControl,
-        ToolCallSkipReason, ToolExecutionOutcome,
+        ProviderRuntimeChainId, ProviderStop, SessionTurn, SessionTurnContentBlock,
+        SessionTurnContextAppender, SessionTurnEvent, SessionTurnEventRecorder, SessionTurnHooks,
+        SessionTurnInterrupted, SessionTurnMessage, SessionTurnPreflight, SessionTurnRequest,
+        ToolBoundaryControl, ToolCallSkipReason, ToolExecutionOutcome,
     };
     use crate::attachment::AttachmentLimits;
     use crate::config::ToolConfig;
@@ -3321,6 +3443,7 @@ mod tests {
     struct ZeroTextRecoverableProvider {
         requests: Mutex<Vec<ProviderRequest>>,
         failure_kind: ZeroTextFailureKind,
+        discarded_chains: AtomicUsize,
     }
 
     #[derive(Clone, Copy)]
@@ -3337,6 +3460,10 @@ mod tests {
     struct BlockingContinuationWalPreflight {
         provider_request_ready_calls: Arc<AtomicUsize>,
     }
+
+    struct BlockingInitialWalPreflight;
+
+    struct BlockingResponseWalPreflight;
 
     #[derive(Clone, Copy)]
     enum ZeroTextFailureKind {
@@ -3564,14 +3691,14 @@ mod tests {
                 }
             }
         }
+
+        async fn discard_runtime_chain(&self, _chain_id: ProviderRuntimeChainId) {
+            self.discarded_chains.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     #[async_trait]
     impl ProviderAdapter for ContinuationWalTimeoutProvider {
-        fn request_timeout(&self) -> Option<Duration> {
-            Some(Duration::from_millis(40))
-        }
-
         async fn send(
             &self,
             _request: ProviderRequest,
@@ -3652,6 +3779,48 @@ mod tests {
             if call >= 2 {
                 pending::<()>().await;
             }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SessionTurnPreflight for BlockingInitialWalPreflight {
+        async fn before_provider_request(
+            &mut self,
+            _system_prompt: &mut String,
+            _provider_messages: &mut Vec<SessionTurnMessage>,
+            _emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn provider_request_ready(
+            &mut self,
+            _provider_messages: &[SessionTurnMessage],
+            _canonical_tail_count: usize,
+        ) -> anyhow::Result<()> {
+            pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SessionTurnPreflight for BlockingResponseWalPreflight {
+        async fn before_provider_request(
+            &mut self,
+            _system_prompt: &mut String,
+            _provider_messages: &mut Vec<SessionTurnMessage>,
+            _emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn provider_response_ready(
+            &mut self,
+            _provider_messages: &[SessionTurnMessage],
+            _canonical_tail_count: usize,
+        ) -> anyhow::Result<()> {
+            pending::<()>().await;
             Ok(())
         }
     }
@@ -4614,6 +4783,7 @@ mod tests {
         let provider = Arc::new(ZeroTextRecoverableProvider {
             requests: Mutex::new(Vec::new()),
             failure_kind: ZeroTextFailureKind::StreamFailure,
+            discarded_chains: AtomicUsize::new(0),
         });
         let turn_loop = tool_loop(provider.clone());
         let mut events = Vec::new();
@@ -4632,6 +4802,7 @@ mod tests {
         assert!(requests[0].stream);
         assert!(!requests[1].stream);
         drop(requests);
+        assert_eq!(provider.discarded_chains.load(Ordering::SeqCst), 1);
         assert!(events.iter().any(|event| matches!(
             event,
             SessionTurnEvent::NonStreamingFallbackSucceeded { attempt: 1, .. }
@@ -4643,6 +4814,7 @@ mod tests {
         let provider = Arc::new(ZeroTextRecoverableProvider {
             requests: Mutex::new(Vec::new()),
             failure_kind: ZeroTextFailureKind::Timeout,
+            discarded_chains: AtomicUsize::new(0),
         });
         let turn_loop = tool_loop(provider.clone());
 
@@ -4666,6 +4838,7 @@ mod tests {
         let provider = Arc::new(ZeroTextRecoverableProvider {
             requests: Mutex::new(Vec::new()),
             failure_kind: ZeroTextFailureKind::NoConsumableOutput,
+            discarded_chains: AtomicUsize::new(0),
         });
         let turn_loop = tool_loop(provider.clone());
 
@@ -4689,6 +4862,7 @@ mod tests {
         let provider = Arc::new(ZeroTextRecoverableProvider {
             requests: Mutex::new(Vec::new()),
             failure_kind: ZeroTextFailureKind::Ordinary,
+            discarded_chains: AtomicUsize::new(0),
         });
         let turn_loop = tool_loop(provider.clone());
         let mut events = Vec::new();
@@ -4710,7 +4884,49 @@ mod tests {
         )));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn initial_request_wal_timeout_prevents_provider_send() {
+        let provider = Arc::new(FakeProvider::new(vec![response(
+            vec![SessionTurnContentBlock::text("must not be sent")],
+            ProviderStop::Done,
+        )]));
+        let turn_loop = tool_loop(provider.clone());
+        let mut preflight = BlockingInitialWalPreflight;
+
+        let error = turn_loop
+            .run_session_turn_with_hooks(request(), &mut |_| {}, None, None, Some(&mut preflight))
+            .await
+            .expect_err("timed-out request WAL must reject the turn");
+
+        assert!(error
+            .downcast_ref::<ProviderRequestPreparationFailure>()
+            .is_some());
+        assert!(error.to_string().contains("请求状态保存超时"));
+        assert!(provider.requests.lock().await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_response_wal_timeout_rejects_completed_turn() {
+        let provider = Arc::new(FakeProvider::new(vec![response(
+            vec![SessionTurnContentBlock::text("complete but not durable")],
+            ProviderStop::Done,
+        )]));
+        let turn_loop = tool_loop(provider.clone());
+        let mut preflight = BlockingResponseWalPreflight;
+
+        let error = turn_loop
+            .run_session_turn_with_hooks(request(), &mut |_| {}, None, None, Some(&mut preflight))
+            .await
+            .expect_err("timed-out response WAL must reject the turn");
+
+        assert!(error
+            .downcast_ref::<ProviderRequestPreparationFailure>()
+            .is_some());
+        assert!(error.to_string().contains("响应状态保存超时"));
+        assert_eq!(provider.requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn streaming_continuation_wal_timeout_is_preparation_failure_without_fallback() {
         let provider = Arc::new(ContinuationWalTimeoutProvider {
             mode: ContinuationWalTimeoutMode::Streaming,
@@ -4723,24 +4939,21 @@ mod tests {
         let turn_loop = tool_loop(provider.clone());
         let mut events = Vec::new();
 
-        let error = timeout(
-            Duration::from_secs(2),
-            turn_loop.run_session_turn_with_hooks(
+        let error = turn_loop
+            .run_session_turn_with_hooks(
                 request(),
                 &mut |event| events.push(event),
                 None,
                 None,
                 Some(&mut preflight),
-            ),
-        )
-        .await
-        .expect("WAL deadline should settle the turn")
-        .expect_err("timed-out continuation WAL must reject the turn");
+            )
+            .await
+            .expect_err("timed-out continuation WAL must reject the turn");
 
         assert!(error
             .downcast_ref::<ProviderRequestPreparationFailure>()
             .is_some());
-        assert!(error.to_string().contains("continuation WAL timeout"));
+        assert!(error.to_string().contains("请求状态保存超时"));
         assert_eq!(ready_calls.load(Ordering::SeqCst), 2);
         assert_eq!(*provider.transport_requests.lock().await, vec![true]);
         assert!(!events.iter().any(|event| matches!(
@@ -4751,7 +4964,7 @@ mod tests {
         )));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn non_streaming_continuation_wal_timeout_stops_fallback_attempts() {
         let provider = Arc::new(ContinuationWalTimeoutProvider {
             mode: ContinuationWalTimeoutMode::NonStreamingFallback,
@@ -4764,19 +4977,16 @@ mod tests {
         let turn_loop = tool_loop(provider.clone());
         let mut events = Vec::new();
 
-        let error = timeout(
-            Duration::from_secs(2),
-            turn_loop.run_session_turn_with_hooks(
+        let error = turn_loop
+            .run_session_turn_with_hooks(
                 request(),
                 &mut |event| events.push(event),
                 None,
                 None,
                 Some(&mut preflight),
-            ),
-        )
-        .await
-        .expect("fallback WAL deadline should settle the turn")
-        .expect_err("timed-out fallback WAL must reject the turn");
+            )
+            .await
+            .expect_err("timed-out fallback WAL must reject the turn");
 
         assert!(error
             .downcast_ref::<ProviderRequestPreparationFailure>()
@@ -5410,6 +5620,42 @@ mod tests {
 
         assert!(error.downcast_ref::<SessionTurnInterrupted>().is_some());
         assert_eq!(provider.requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn safe_steer_after_stream_failure_stops_before_fallback() {
+        let provider = Arc::new(ScriptedProvider::new(vec![scripted_failure(
+            vec![ProviderEvent::AssistantTextDelta {
+                text: "partial".into(),
+            }],
+            "stream failed",
+        )]));
+        let turn_loop = tool_loop(provider.clone());
+        let control = ToolBoundaryControl::new();
+        let control_from_event = control.clone();
+        let mut events = Vec::new();
+
+        let error = turn_loop
+            .run_session_turn_with_tool_boundary_control(
+                request(),
+                &mut |event| {
+                    if matches!(event, SessionTurnEvent::AssistantTextDelta { .. }) {
+                        control_from_event
+                            .cancel_if_open(ToolCallSkipReason::TurnInterruptedBeforeDispatch);
+                    }
+                    events.push(event);
+                },
+                Some(control),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<SessionTurnInterrupted>().is_some());
+        assert_eq!(provider.requests.lock().await.len(), 1);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
+        )));
     }
 
     #[tokio::test(start_paused = true)]

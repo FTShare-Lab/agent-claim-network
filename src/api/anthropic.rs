@@ -146,7 +146,7 @@ impl AnthropicMessagesClient {
         retry_base_delay: Duration,
         retry_max_delay: Duration,
     ) -> Result<Self, AnthropicError> {
-        let http = reqwest::Client::builder()
+        let http = crate::http_client_builder()
             .timeout(timeout)
             .build()
             .map_err(|error| {
@@ -1712,6 +1712,8 @@ mod tests {
                     tools: Vec::new(),
                     max_tokens: 128,
                     stream: false,
+                    runtime_chain_id: None,
+                    recovery_interrupt: None,
                     retry_count_override: None,
                 },
                 &mut |_| {},

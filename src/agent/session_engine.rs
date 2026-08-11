@@ -2328,6 +2328,7 @@ impl SessionEngine {
             sink: journal_emitter.sink(),
             assistant_delta_flusher: journal_emitter.assistant_delta_flusher(),
         };
+        let runtime_chain_id = session.runtime_chain_id();
         let result = async {
             checkpoint_result?;
             let mut turn_emit = |event| match event {
@@ -2500,6 +2501,9 @@ impl SessionEngine {
             .as_ref()
             .err()
             .is_some_and(is_canonical_messages_committed_error);
+        if result.is_err() && !canonical_messages_committed_error {
+            self.turn_loop.discard_runtime_chain(runtime_chain_id).await;
+        }
         let interrupted_status = if turn_interrupted {
             tool_boundary_interrupt_status
                 .as_ref()
@@ -2972,6 +2976,7 @@ impl SessionEngine {
             provider_replay_identity.clone(),
         )?;
         let active_start_index = history.len();
+        let runtime_chain_id = session.runtime_chain_id();
         let turn_id_for_tools = request.turn_id.clone();
         let tools = self.turn_loop.tool_registry();
         let delegation_activity = tools
@@ -3004,7 +3009,7 @@ impl SessionEngine {
         };
         let turn = self
             .turn_loop
-            .run_session_turn_with_context_hooks(
+            .run_session_turn_with_context_and_runtime_chain_hooks(
                 SessionTurnRequest {
                     current_session_id: Some(metadata.id.clone()),
                     current_turn_id: Some(turn_id_for_tools),
@@ -3015,6 +3020,7 @@ impl SessionEngine {
                     skill_instructions: request.skill_instructions,
                 },
                 request.recovered_model_context,
+                runtime_chain_id,
                 emit,
                 request.tool_boundary_control,
                 SessionTurnHooks::new(

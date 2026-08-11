@@ -305,18 +305,21 @@ pub(crate) fn build_provider_adapter(cfg: &Config) -> anyhow::Result<Arc<dyn Pro
                 .api_key
                 .clone()
                 .with_context(|| missing_loaded_api_key_message(chat))?;
-            Ok(Arc::new(
-                OpenAiCompatibleResponsesProviderAdapter::new(
-                    key,
-                    chat.endpoint.clone(),
-                    chat.model.clone(),
-                    Duration::from_secs(chat.timeout_secs),
-                    chat.retry_count,
-                    Duration::from_millis(chat.retry_base_delay_ms),
-                    Duration::from_millis(chat.retry_max_delay_ms),
-                )?
-                .with_reasoning_effort(chat.reasoning_effort),
-            ))
+            let adapter = OpenAiCompatibleResponsesProviderAdapter::new(
+                key,
+                chat.endpoint.clone(),
+                chat.model.clone(),
+                Duration::from_secs(chat.timeout_secs),
+                chat.retry_count,
+                Duration::from_millis(chat.retry_base_delay_ms),
+                Duration::from_millis(chat.retry_max_delay_ms),
+            )?
+            .with_reasoning_effort(chat.reasoning_effort)
+            .with_websockets(
+                chat.supports_websockets,
+                1usize.saturating_add(cfg.agent.session.subagents.max_concurrent),
+            )?;
+            Ok(Arc::new(adapter))
         }
     }
 }
@@ -651,6 +654,7 @@ mod tests {
                     reasoning_effort: crate::config::ReasoningEffort::None,
                     anthropic_thinking: crate::config::AnthropicThinking::Auto,
                     anthropic_thinking_budget_tokens: None,
+                    supports_websockets: false,
                     api_key_env: "ANTHROPIC_API_KEY".into(),
                     max_tokens: 1024,
                     context_window: crate::config::DEFAULT_LLM_CONTEXT_WINDOW,

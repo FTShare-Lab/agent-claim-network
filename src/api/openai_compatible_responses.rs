@@ -14,16 +14,18 @@ use super::continuation::{
 };
 use super::provider::{
     NoopProviderRequestObserver, ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy,
-    ProviderNoConsumableOutput, ProviderReplayIdentity, ProviderReplayProtocol, ProviderRequest,
-    ProviderRequestObserver, ProviderRequestPreparationFailure, ProviderResponse, ProviderStop,
+    ProviderNoConsumableOutput, ProviderRecoveryInterrupt, ProviderReplayIdentity,
+    ProviderReplayProtocol, ProviderRequest, ProviderRequestObserver,
+    ProviderRequestPreparationFailure, ProviderResponse, ProviderRuntimeChainId, ProviderStop,
     ProviderStreamFailure, ProviderTerminalFailure, ToolSpec,
 };
 use super::redact_media_error_body;
 use super::responses::{
-    is_stream_failure, ResponsesClient, ResponsesError, ResponsesReasoning, ResponsesRequest,
-    ResponsesStreamEvent, ResponsesTerminal, ResponsesTool,
+    is_stream_recovery_failure, ResponsesClient, ResponsesError, ResponsesReasoning,
+    ResponsesRequest, ResponsesStreamEvent, ResponsesTerminal, ResponsesTool,
 };
 use super::types::{ProviderReplayState, SessionTurnContentBlock, SessionTurnMessage};
+use super::SessionTurnInterrupted;
 use crate::config::ReasoningEffort;
 
 // 旧 session 的 Document 可能没有 filename；Responses 内联 file_data 仍需要
@@ -89,6 +91,17 @@ impl OpenAiCompatibleResponsesProviderAdapter {
         self
     }
 
+    pub fn with_websockets(
+        mut self,
+        enabled: bool,
+        pool_capacity: usize,
+    ) -> Result<Self, OpenAiCompatibleResponsesError> {
+        if enabled {
+            self.client = self.client.with_websockets(pool_capacity)?;
+        }
+        Ok(self)
+    }
+
     fn request_for(
         &self,
         system_prompt: &str,
@@ -127,6 +140,8 @@ impl OpenAiCompatibleResponsesProviderAdapter {
         max_tokens: u32,
         stream: bool,
         retry_count: u32,
+        runtime_chain_id: Option<ProviderRuntimeChainId>,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         emit: &mut (dyn FnMut(ProviderEvent) + Send),
         observer: &mut (dyn ProviderRequestObserver + Send),
     ) -> Result<ContinuedResponsesTurn, OpenAiCompatibleResponsesError> {
@@ -137,12 +152,18 @@ impl OpenAiCompatibleResponsesProviderAdapter {
         let mut provider_messages = base_messages.to_vec();
 
         for round in 0..=MAX_CONTINUATION_TURNS {
+            if recovery_interrupt.is_some_and(ProviderRecoveryInterrupt::is_cancelled) {
+                return Err(ResponsesError::RecoveryInterrupted.into());
+            }
             observer
                 .before_provider_request(&provider_messages)
                 .await
                 .map_err(|error| OpenAiCompatibleResponsesError::RequestPreparation {
                     reason: format!("{error:#}"),
                 })?;
+            if recovery_interrupt.is_some_and(ProviderRecoveryInterrupt::is_cancelled) {
+                return Err(ResponsesError::RecoveryInterrupted.into());
+            }
             let request = self.request_for(
                 system_prompt,
                 input.clone(),
@@ -157,12 +178,24 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                     }
                 };
                 self.client
-                    .send_with_retry_count(&request, retry_count, &mut responses_emit)
+                    .send_with_retry_count_for_runtime_chain(
+                        &request,
+                        retry_count,
+                        runtime_chain_id,
+                        recovery_interrupt,
+                        &mut responses_emit,
+                    )
                     .await?
             } else {
                 let mut noop = |_event: ResponsesStreamEvent| {};
                 self.client
-                    .send_with_retry_count(&request, retry_count, &mut noop)
+                    .send_with_retry_count_for_runtime_chain(
+                        &request,
+                        retry_count,
+                        None,
+                        recovery_interrupt,
+                        &mut noop,
+                    )
                     .await?
             };
             if let Some(usage) = response
@@ -232,7 +265,10 @@ impl ProviderAdapter for OpenAiCompatibleResponsesProviderAdapter {
     }
 
     fn request_timeout(&self) -> Option<Duration> {
-        Some(self.client.timeout())
+        // WebSocket transport 必须先把 request timeout 归类为 retry/sticky/SSE
+        // outcome；若外层使用同长 timer，会更早取消内部 future。启用 WS 时
+        // 每个真实 WS/HTTP request 由 Responses client 自己使用同一 timeout。
+        (!self.client.websockets_enabled()).then(|| self.client.timeout())
     }
 
     async fn send(
@@ -252,6 +288,10 @@ impl ProviderAdapter for OpenAiCompatibleResponsesProviderAdapter {
     ) -> anyhow::Result<ProviderResponse> {
         self.send_observed(request, emit, observer).await
     }
+
+    async fn discard_runtime_chain(&self, chain_id: ProviderRuntimeChainId) {
+        self.client.discard_runtime_chain(chain_id).await;
+    }
 }
 
 impl OpenAiCompatibleResponsesProviderAdapter {
@@ -266,6 +306,7 @@ impl OpenAiCompatibleResponsesProviderAdapter {
             .unwrap_or(self.client.retry_count());
         let base_messages = request.messages;
         let input = session_turn_messages_to_responses(base_messages.clone(), &self.model)?;
+        let recovery_interrupt = request.recovery_interrupt.clone();
         let request_has_media = input.has_media;
         let turn = match self
             .send_with_continuation(
@@ -276,6 +317,8 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                 request.max_tokens,
                 request.stream,
                 retry_count,
+                request.runtime_chain_id,
+                recovery_interrupt.as_ref(),
                 emit,
                 observer,
             )
@@ -286,15 +329,17 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                 return Err(ProviderRequestPreparationFailure::new(reason).into());
             }
             Err(error) => {
+                if matches!(
+                    &error,
+                    OpenAiCompatibleResponsesError::Client(ResponsesError::RecoveryInterrupted)
+                ) {
+                    return Err(SessionTurnInterrupted.into());
+                }
                 if request.stream && responses_adapter_stream_failure(&error) {
                     return Err(ProviderStreamFailure::new(error.to_string()).into());
                 }
                 let error = wrap_media_rejection(error, request_has_media);
-                if matches!(
-                    &error,
-                    OpenAiCompatibleResponsesError::Client(ResponsesError::Failed { .. })
-                        | OpenAiCompatibleResponsesError::Client(ResponsesError::Incomplete { .. })
-                ) {
+                if responses_adapter_terminal_failure(&error) {
                     return Err(ProviderTerminalFailure::new(error.to_string()).into());
                 }
                 return Err(error.into());
@@ -324,7 +369,32 @@ impl OpenAiCompatibleResponsesProviderAdapter {
 }
 
 fn responses_adapter_stream_failure(error: &OpenAiCompatibleResponsesError) -> bool {
-    matches!(error, OpenAiCompatibleResponsesError::Client(error) if is_stream_failure(error))
+    matches!(error, OpenAiCompatibleResponsesError::Client(error) if is_stream_recovery_failure(error))
+}
+
+fn responses_adapter_terminal_failure(error: &OpenAiCompatibleResponsesError) -> bool {
+    match error {
+        OpenAiCompatibleResponsesError::Client(
+            ResponsesError::Auth(_)
+            | ResponsesError::InvalidEndpoint(_)
+            | ResponsesError::Failed { .. }
+            | ResponsesError::Incomplete { .. },
+        )
+        | OpenAiCompatibleResponsesError::MediaRejected { .. }
+        | OpenAiCompatibleResponsesError::RequestPreparation { .. } => true,
+        OpenAiCompatibleResponsesError::Client(ResponsesError::Status { status, .. }) => {
+            *status != 429 && *status < 500
+        }
+        OpenAiCompatibleResponsesError::Client(
+            ResponsesError::Http(_)
+            | ResponsesError::StreamFailure { .. }
+            | ResponsesError::ResponseJson(_)
+            | ResponsesError::OutputShape { .. }
+            | ResponsesError::RecoveryInterrupted,
+        )
+        | OpenAiCompatibleResponsesError::OutputShape { .. }
+        | OpenAiCompatibleResponsesError::NoConsumableOutput { .. } => false,
+    }
 }
 
 struct ResponsesInput {
@@ -1171,6 +1241,8 @@ mod tests {
                     tools: Vec::new(),
                     max_tokens: 32,
                     stream: false,
+                    runtime_chain_id: None,
+                    recovery_interrupt: None,
                     retry_count_override: None,
                 },
                 &mut |event| events.push(event),

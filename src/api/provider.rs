@@ -7,7 +7,9 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 use crate::api::{SessionTurnContentBlock, SessionTurnMessage};
 
@@ -79,6 +81,9 @@ pub trait ProviderAdapter: Send + Sync {
             .map_err(ProviderRequestPreparationFailure::from_error)?;
         self.send(request, emit).await
     }
+
+    /// 丢弃未提交 logical turn 对应的 transport 私有状态；HTTP adapter 默认为空操作。
+    async fn discard_runtime_chain(&self, _chain_id: ProviderRuntimeChainId) {}
 }
 
 /// adapter 内部 continuation 与上层 WAL 之间的最小边界。
@@ -105,6 +110,66 @@ impl ProviderRequestObserver for NoopProviderRequestObserver {
     }
 }
 
+/// 仅用于当前进程内隔离 WebSocket continuation 的调用链身份。
+///
+/// 它不发送给上游，也不写入 session；fresh session、resume 与每个 delegation
+/// 都会得到新的值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProviderRuntimeChainId(u64);
+
+impl ProviderRuntimeChainId {
+    pub fn new() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl Default for ProviderRuntimeChainId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// steer/cancel 之后阻止尚未开始的 provider 恢复动作，但不打断当前 request。
+///
+/// 独立 ID 仅用于保持 `ProviderRequest` 的可比较性；实际通知由 clone 共享的
+/// `CancellationToken` 完成。
+#[derive(Debug, Clone)]
+pub struct ProviderRecoveryInterrupt {
+    id: u64,
+    token: CancellationToken,
+}
+
+impl ProviderRecoveryInterrupt {
+    pub(crate) fn new() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            token: CancellationToken::new(),
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.token.cancel();
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        self.token.cancelled().await;
+    }
+}
+
+impl PartialEq for ProviderRecoveryInterrupt {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for ProviderRecoveryInterrupt {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRequest {
     pub system_prompt: String,
@@ -112,6 +177,10 @@ pub struct ProviderRequest {
     pub tools: Vec<ToolSpec>,
     pub max_tokens: u32,
     pub stream: bool,
+    /// streaming transport 的进程内 chain 身份；非流式内部调用保持 `None`。
+    pub runtime_chain_id: Option<ProviderRuntimeChainId>,
+    /// 只阻止尚未开始的 retry、continuation 与 fallback；不能取消当前正常 request。
+    pub recovery_interrupt: Option<ProviderRecoveryInterrupt>,
     /// 覆盖 adapter 内部的额外 HTTP retry 次数；`None` 使用 provider 配置。
     pub retry_count_override: Option<u32>,
 }

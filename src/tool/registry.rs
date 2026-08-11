@@ -54,7 +54,7 @@ impl ToolRegistry {
         }
         Ok(Self {
             workspace_root: cfg.workspace_root.clone(),
-            http: reqwest::Client::new(),
+            http: crate::http_client_builder().build()?,
             notes: Arc::new(Mutex::new(Vec::new())),
             web_search_endpoint: web_search_endpoint.into(),
             web_search_api_key_env: cfg.web.api_key_env.clone(),

@@ -17,8 +17,8 @@ use super::types::{
     DelegationTranscriptMessageSource,
 };
 use crate::api::{
-    AgentTurnLoop, ModelContextSource, ProviderAdapter, SessionAttachment, SessionTurn,
-    SessionTurnContentBlock, SessionTurnContextAppender, SessionTurnEvent,
+    AgentTurnLoop, ModelContextSource, ProviderAdapter, ProviderRuntimeChainId, SessionAttachment,
+    SessionTurn, SessionTurnContentBlock, SessionTurnContextAppender, SessionTurnEvent,
     SessionTurnEventRecorder, SessionTurnHooks, SessionTurnMessage, SessionTurnPreflight,
     SessionTurnRequest, StructuredJsonCaller, ToolExecutionOutcome,
 };
@@ -233,6 +233,7 @@ impl DelegationExecutor for LlmDelegationExecutor {
                 self.tool_input_journal_preview_chars,
                 self.tool_output_journal_preview_chars,
             );
+        let runtime_chain_id = ProviderRuntimeChainId::new();
         let runtime_context = self
             .tool_registry_template
             .delegation_runtime_context()
@@ -339,9 +340,10 @@ impl DelegationExecutor for LlmDelegationExecutor {
                 history_replaced_since_last_check: false,
             };
             turn_loop
-                .run_session_turn_with_context_hooks(
+                .run_session_turn_with_context_and_runtime_chain_hooks(
                     request,
                     Vec::new(),
+                    runtime_chain_id,
                     &mut emit,
                     None,
                     SessionTurnHooks::new(
@@ -352,6 +354,7 @@ impl DelegationExecutor for LlmDelegationExecutor {
                 )
                 .await
         };
+        turn_loop.discard_runtime_chain(runtime_chain_id).await;
         drop(event_tx);
         if let Err(err) = event_recorder.await {
             log::warn!(target: "delegation", "{} event recorder join 失败: {err:#}", metadata.id);

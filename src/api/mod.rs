@@ -140,8 +140,9 @@ pub use provider::{
     assistant_text_from_message, context_usage_from_anthropic_committed_usage,
     context_usage_from_anthropic_input_usage, context_usage_from_openai_usage,
     ContextUsageSnapshot, ContextUsageSource, ProviderAdapter, ProviderEvent,
-    ProviderHistoryMediaPolicy, ProviderReplayIdentity, ProviderReplayProtocol, ProviderRequest,
-    ProviderRequestObserver, ProviderResponse, ProviderStop, ToolSpec,
+    ProviderHistoryMediaPolicy, ProviderRecoveryInterrupt, ProviderReplayIdentity,
+    ProviderReplayProtocol, ProviderRequest, ProviderRequestObserver, ProviderResponse,
+    ProviderRuntimeChainId, ProviderStop, ToolSpec,
 };
 pub use responses::{
     ReducedResponses, ResponsesClient, ResponsesError, ResponsesFunctionCall, ResponsesReasoning,

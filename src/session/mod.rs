@@ -19,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::api::{
     CompletedSessionTurnMessage, ModelContextSource, ProviderReplayIdentity, ProviderReplayState,
-    SessionTurnContentBlock, SessionTurnMessage,
+    ProviderRuntimeChainId, SessionTurnContentBlock, SessionTurnMessage,
 };
 use crate::claim::{AgentId, Claim, ClaimId, Dispute, DisputeId, SessionId, TraceId};
 use crate::skill::SkillInstructions;
@@ -844,7 +844,7 @@ impl SessionStore {
                     write_text_atomic(&paths.messages_jsonl, b"").await?;
                     write_text_atomic(&paths.turn_events_jsonl, b"").await?;
                     write_text_atomic(&paths.compaction_events_jsonl, b"").await?;
-                    return Ok(SessionHandle { metadata, paths });
+                    return Ok(SessionHandle::new(metadata, paths));
                 }
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => {
                     last_id = Some(session_id.into_string());
@@ -914,7 +914,7 @@ impl SessionStore {
             if metadata.status != SessionStatus::Closed || metadata.agent_id != *agent_id {
                 continue;
             }
-            let handle = SessionHandle { metadata, paths };
+            let handle = SessionHandle::new(metadata, paths);
             let messages = handle.read_messages().await?;
             let last_user_text = match extract_last_user_text(&messages) {
                 Some(text) => Some(text),
@@ -958,7 +958,7 @@ impl SessionStore {
                 agent_id: agent_id.to_string(),
             });
         }
-        let handle = SessionHandle { metadata, paths };
+        let handle = SessionHandle::new(metadata, paths);
         let messages = handle.read_messages().await?;
         if handle.metadata.message_count != 0
             || !messages.is_empty()
@@ -1003,7 +1003,7 @@ impl SessionStore {
                 agent_id: agent_id.to_string(),
             });
         }
-        let mut handle = SessionHandle { metadata, paths };
+        let mut handle = SessionHandle::new(metadata, paths);
         let messages = handle.read_messages().await?;
         validate_and_reconcile_resume_metadata(&mut handle, &messages).await?;
         Ok(handle)
@@ -1398,9 +1398,22 @@ fn truncate_for_resume_table(text: &str, max_chars: usize) -> String {
 pub struct SessionHandle {
     pub metadata: SessionMetadata,
     pub paths: SessionPaths,
+    runtime_chain_id: ProviderRuntimeChainId,
 }
 
 impl SessionHandle {
+    fn new(metadata: SessionMetadata, paths: SessionPaths) -> Self {
+        Self {
+            metadata,
+            paths,
+            runtime_chain_id: ProviderRuntimeChainId::new(),
+        }
+    }
+
+    pub(crate) fn runtime_chain_id(&self) -> ProviderRuntimeChainId {
+        self.runtime_chain_id
+    }
+
     async fn lock_session(&self) -> Result<FileLockGuard, SessionStoreError> {
         FileLockGuard::lock_exclusive(&self.paths.session_lock)
             .await
@@ -2926,6 +2939,21 @@ frontier:
         let err = store.open_existing_session(&agent, &id).await.unwrap_err();
 
         assert!(matches!(err, SessionStoreError::NotClosed { .. }));
+    }
+
+    #[tokio::test]
+    async fn resume_creates_new_runtime_chain_while_handle_clone_preserves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let agent = agent_id("agent-a");
+        let id = session_id("session_aaaaaaaa");
+        let original = create_session(&store, &agent, id.clone(), Utc::now(), &[], true).await;
+        let original_chain = original.runtime_chain_id();
+        assert_eq!(original.clone().runtime_chain_id(), original_chain);
+
+        let resumed = store.open_existing_session(&agent, &id).await.unwrap();
+
+        assert_ne!(resumed.runtime_chain_id(), original_chain);
     }
 
     #[tokio::test]
