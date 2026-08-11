@@ -255,9 +255,9 @@ acn mcp logout my-server
 
 - `-e KEY=VALUE` 会把值写入 `.mcp.json`，不要用于敏感 token。
 - stdio server 继承 ACN 进程权限，只添加可信命令。
-- 当前支持 stdio 与 Streamable HTTP。OAuth server 可使用 dynamic client registration，或在添加 server 时通过 `--oauth-client-id` 配置预注册的 public client ID；当前不支持 client secret、CIMD 与 device flow。
+- 当前支持 stdio 与 Streamable HTTP。OAuth server 可使用 dynamic client registration，或在添加 server 时通过 `--oauth-client-id` 配置预注册的 public client ID；OAuth MCP resource 与授权端点必须使用 HTTPS，本机 loopback 开发端点可使用 HTTP。授权服务器 metadata 必须明确声明支持 PKCE `S256`。当前不支持 client secret、CIMD 与 device flow。
 - 桌面登录执行 `acn mcp login <name>`；SSH/headless 环境执行 `acn mcp login <name> --no-browser`，在本地浏览器打开打印出的 URL，再将地址栏中的完整 redirect URL 粘贴回终端。无 Secret Service / D-Bus 的 Linux 可在添加 server 时使用 `--oauth-credentials-store file`；如授权服务要求固定 redirect URI，再配置 `--oauth-callback-port`。
-- OAuth 凭据按 selected upstream、server name 与 URL 隔离。`logout` 只删除本地凭据，不做远端 token revocation；`remove` 先删除 server 配置，再尽力清理本地凭据，凭据库不可用时会显示 warning。失败的清理可在凭据库恢复后用同名 `logout` 重试；完成前不能重新添加同名 server。
+- OAuth 凭据按 selected upstream、server name 与 URL 隔离。成功登录后会写入不含 secret 的本地登记标记；普通匿名 HTTP server 不查询 keyring。`logout` 只删除本地凭据，不做远端 token revocation；`remove` 只对已登记或显式配置 OAuth 的 server 清理本地凭据，凭据库不可用时会显示 warning。失败的清理可在凭据库恢复后用同名 `logout` 重试；完成前不能重新添加同名 server。
 - 运行时无法读取凭据库，或已登录凭据失效时，OAuth-managed 请求会直接失败并提示重新登录，不会静默改用匿名请求。
 - 不支持 SSE transport、自定义 HTTP headers、MCP Tasks 和 MCP elicitation。ACN 不宣告新版 Tasks extension，也不解析或自动过滤旧版 `execution.taskSupport`；`taskSupport = "required"` 的 legacy 工具可能仍显示为 `exposed`，并在普通调用时被 server 拒绝。普通 `2025-11-25` 工具不受影响；已知的 legacy Tasks 工具可通过 `disabled_tools` 手动关闭。
 - 外部修改 `.mcp.json` 后需要重启 TUI。TUI 内启用或禁用 server 会持久化 `enabled` 字段。

@@ -5,6 +5,7 @@
 //! callback 或 headless 环境下粘贴完整 redirect URL。
 
 use std::io::{self, Write};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -18,8 +19,8 @@ use axum::{
 };
 use keyring::v1::{Entry as KeyringEntry, Error as KeyringError};
 use rmcp::transport::auth::{
-    AuthError, AuthorizationManager, AuthorizationRequest, AuthorizationSession, CredentialStore,
-    StoredCredentials,
+    AuthError, AuthorizationManager, AuthorizationMetadata, AuthorizationRequest,
+    AuthorizationSession, CredentialStore, StoredCredentials,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -39,6 +40,7 @@ const KEYRING_SERVICE: &str = "agent-claim-network.mcp";
 const LOGIN_CALLBACK_PATH: &str = "/callback";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 const FILE_CREDENTIALS_DIR: &str = ".mcp-oauth";
+const ENROLLMENT_MARKER_CONTENT: &str = "v1\n";
 const CREDENTIAL_LOCKS_DIR: &str = ".mcp-oauth-locks";
 const PENDING_CLEANUP_DIR: &str = ".mcp-oauth-cleanup";
 static KEYRING_OPERATION_LOCK: OnceLock<Arc<AsyncMutex<()>>> = OnceLock::new();
@@ -58,6 +60,8 @@ pub enum McpOAuthError {
     CredentialStore { server: String },
     #[error("MCP server '{server}' 的已保存 OAuth 凭据无效")]
     InvalidStoredCredentials { server: String },
+    #[error("MCP server '{server}' 的 OAuth 仅允许 HTTPS 或本机 loopback HTTP endpoint")]
+    InsecureEndpoint { server: String },
     #[error("MCP server '{server}' 的 OAuth 元数据发现或客户端注册失败：{reason}")]
     AuthorizationSetup {
         server: String,
@@ -89,6 +93,7 @@ pub(crate) struct McpCredentialStore {
     server_name: String,
     account: String,
     backend: CredentialBackend,
+    enrollment_path: PathBuf,
     mutation_lease: Arc<Mutex<Option<Arc<FileLockGuard>>>>,
 }
 
@@ -127,7 +132,7 @@ pub(crate) struct McpRuntimeAuthorization {
 #[must_use = "必须持有到 MCP server 配置删除完成"]
 pub struct McpCredentialRemovalLease {
     credentials: McpCredentialStore,
-    cleanup_path: PathBuf,
+    cleanup_path: Option<PathBuf>,
 }
 
 impl McpCredentialStore {
@@ -148,6 +153,7 @@ impl McpCredentialStore {
         };
         Self {
             server_name: server_name.to_string(),
+            enrollment_path: credential_enrollment_path(config_path, &account),
             account,
             backend,
             mutation_lease: Arc::new(Mutex::new(None)),
@@ -169,6 +175,7 @@ impl McpCredentialStore {
         };
         Self {
             server_name: server_name.to_string(),
+            enrollment_path: credential_enrollment_path(config_path, &cleanup.account),
             account: cleanup.account,
             backend,
             mutation_lease: Arc::new(Mutex::new(None)),
@@ -293,6 +300,59 @@ impl McpCredentialStore {
         .await
     }
 
+    async fn is_enrolled(&self) -> Result<bool, McpOAuthError> {
+        match tokio::fs::metadata(&self.enrollment_path).await {
+            Ok(metadata) if metadata.is_file() => Ok(true),
+            Ok(_) => Err(McpOAuthError::CredentialStore {
+                server: self.server_name.clone(),
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(_) => Err(McpOAuthError::CredentialStore {
+                server: self.server_name.clone(),
+            }),
+        }
+    }
+
+    async fn mark_enrolled(&self) -> Result<(), McpOAuthError> {
+        if self.is_enrolled().await? {
+            return Ok(());
+        }
+        let path = self.enrollment_path.clone();
+        let server = self.server_name.clone();
+        let mutation_lease = self.mutation_lease();
+        tokio::task::spawn_blocking(move || {
+            let _mutation_lease = mutation_lease;
+            write_private_credentials_file(&path, ENROLLMENT_MARKER_CONTENT, &server)
+        })
+        .await
+        .map_err(|_| McpOAuthError::CredentialStore {
+            server: self.server_name.clone(),
+        })?
+    }
+
+    async fn clear_enrollment(&self) -> Result<(), McpOAuthError> {
+        let path = self.enrollment_path.clone();
+        let server = self.server_name.clone();
+        let mutation_lease = self.mutation_lease();
+        tokio::task::spawn_blocking(move || {
+            let _mutation_lease = mutation_lease;
+            match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(_) => Err(McpOAuthError::CredentialStore { server }),
+            }
+        })
+        .await
+        .map_err(|_| McpOAuthError::CredentialStore {
+            server: self.server_name.clone(),
+        })?
+    }
+
+    async fn delete_credentials_and_enrollment(&self) -> Result<(), McpOAuthError> {
+        self.delete().await?;
+        self.clear_enrollment().await
+    }
+
     pub(crate) async fn identity(&self) -> Result<Option<McpCredentialIdentity>, AuthError> {
         Ok(self.load().await?.map(|credentials| McpCredentialIdentity {
             client_id: credentials.client_id,
@@ -341,11 +401,54 @@ impl CredentialStore for McpCredentialStore {
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
         let raw = serde_json::to_string(&PersistedCredentials { credentials })
             .map_err(|_| AuthError::InternalError("encode OAuth credentials failed".to_string()))?;
-        self.write(raw).await.map_err(auth_store_error)
+        self.write(raw).await.map_err(auth_store_error)?;
+        if let Err(error) = self.mark_enrolled().await {
+            // 没有 marker 时 runtime 不会再查凭据；避免留下无法使用也无法自动清理的 token。
+            let _ = self.delete().await;
+            return Err(auth_store_error(error));
+        }
+        Ok(())
     }
 
     async fn clear(&self) -> Result<(), AuthError> {
-        self.delete().await.map_err(auth_store_error)
+        self.delete_credentials_and_enrollment()
+            .await
+            .map_err(auth_store_error)
+    }
+}
+
+#[derive(Clone)]
+struct PrefetchedCredentialStore {
+    inner: McpCredentialStore,
+    prefetched: Arc<AsyncMutex<Option<StoredCredentials>>>,
+}
+
+impl PrefetchedCredentialStore {
+    fn new(inner: McpCredentialStore, credentials: StoredCredentials) -> Self {
+        Self {
+            inner,
+            prefetched: Arc::new(AsyncMutex::new(Some(credentials))),
+        }
+    }
+}
+
+#[async_trait]
+impl CredentialStore for PrefetchedCredentialStore {
+    async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
+        if let Some(credentials) = self.prefetched.lock().await.take() {
+            return Ok(Some(credentials));
+        }
+        self.inner.load().await
+    }
+
+    async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
+        self.prefetched.lock().await.take();
+        self.inner.save(credentials).await
+    }
+
+    async fn clear(&self) -> Result<(), AuthError> {
+        self.prefetched.lock().await.take();
+        self.inner.clear().await
     }
 }
 
@@ -381,6 +484,7 @@ pub async fn login(
             server: server_name.to_string(),
         });
     };
+    validate_oauth_resource_url(server_name, &url)?;
     let listener = if no_browser && oauth_callback_port.is_some() {
         None
     } else {
@@ -493,6 +597,7 @@ async fn authorization_session(
     existing_granted_scopes: &[String],
 ) -> Result<AuthorizationSession, AuthError> {
     let metadata = manager.resolve_metadata().await?;
+    validate_authorization_metadata(&metadata.metadata, true)?;
     manager.set_metadata(metadata.metadata);
     let scopes = select_login_scopes(&manager, existing_granted_scopes);
     let mut request = AuthorizationRequest::new(callback_url)
@@ -519,16 +624,104 @@ fn select_login_scopes(
     )
 }
 
+fn validate_oauth_resource_url(server_name: &str, url: &str) -> Result<(), McpOAuthError> {
+    if secure_oauth_url(url) {
+        Ok(())
+    } else {
+        Err(McpOAuthError::InsecureEndpoint {
+            server: server_name.to_string(),
+        })
+    }
+}
+
+fn validate_authorization_metadata(
+    metadata: &AuthorizationMetadata,
+    require_pkce: bool,
+) -> Result<(), AuthError> {
+    let endpoints = [
+        Some(metadata.authorization_endpoint.as_str()),
+        Some(metadata.token_endpoint.as_str()),
+        metadata.registration_endpoint.as_deref(),
+        metadata.issuer.as_deref(),
+    ];
+    if endpoints
+        .into_iter()
+        .flatten()
+        .any(|url| !secure_oauth_url(url))
+    {
+        return Err(AuthError::MetadataError(
+            "OAuth endpoints require HTTPS or loopback HTTP".to_string(),
+        ));
+    }
+    if require_pkce
+        && !metadata
+            .code_challenge_methods_supported
+            .as_ref()
+            .is_some_and(|methods| methods.iter().any(|method| method == "S256"))
+    {
+        return Err(AuthError::PkceUnsupported);
+    }
+    Ok(())
+}
+
+fn secure_oauth_url(value: &str) -> bool {
+    let Ok(url) = reqwest_013::Url::parse(value) else {
+        return false;
+    };
+    if url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.host_str().is_none()
+    {
+        return false;
+    }
+    match url.scheme() {
+        "https" => true,
+        "http" => url.host_str().is_some_and(loopback_host),
+        _ => false,
+    }
+}
+
+fn loopback_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    let ip_host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".localhost")
+        || ip_host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 /// 清除某个 Streamable HTTP MCP server 的已保存 OAuth 凭据。
 pub async fn logout(
     config_path: &Path,
     server_name: &str,
     server: &McpServerConfig,
 ) -> Result<(), McpOAuthError> {
-    prepare_credentials_for_remove(config_path, server_name, server)
-        .await?
-        .finish()
-        .await
+    let McpTransportConfig::StreamableHttp {
+        url,
+        oauth_credentials_store,
+        ..
+    } = streamable_http_config(server_name, server)?
+    else {
+        return Err(McpOAuthError::UnsupportedTransport {
+            server: server_name.to_string(),
+        });
+    };
+    let credential_guard = lock_credential_mutation(
+        &credential_refresh_lock_path(config_path, server_name, &url),
+        server_name,
+    )
+    .await?;
+    let credentials =
+        McpCredentialStore::new(config_path, server_name, &url, oauth_credentials_store);
+    credentials.set_mutation_lease(credential_guard);
+    let result = credentials.delete_credentials_and_enrollment().await;
+    credentials.clear_mutation_lease();
+    result
 }
 
 /// 写入可重试的 cleanup 记录并持有 credential mutation lock，供 `mcp remove` 删除配置。
@@ -555,6 +748,12 @@ pub async fn prepare_credentials_for_remove(
     let credentials =
         McpCredentialStore::new(config_path, server_name, &url, oauth_credentials_store);
     credentials.set_mutation_lease(credential_guard);
+    if !server.has_explicit_oauth_options() && !credentials.is_enrolled().await? {
+        return Ok(McpCredentialRemovalLease {
+            credentials,
+            cleanup_path: None,
+        });
+    }
     let cleanup_path = pending_cleanup_path(config_path, server_name);
     let cleanup = PendingCredentialCleanup {
         account: credentials.account.clone(),
@@ -573,20 +772,26 @@ pub async fn prepare_credentials_for_remove(
     }
     Ok(McpCredentialRemovalLease {
         credentials,
-        cleanup_path,
+        cleanup_path: Some(cleanup_path),
     })
 }
 
 impl McpCredentialRemovalLease {
     /// 清理凭据；失败时保留 pending record，让无配置的 `mcp logout <name>` 仍可重试。
     pub async fn finish(self) -> Result<(), McpOAuthError> {
-        self.credentials.delete().await?;
-        remove_pending_cleanup(&self.cleanup_path, &self.credentials.server_name).await
+        let Some(cleanup_path) = &self.cleanup_path else {
+            return Ok(());
+        };
+        self.credentials.delete_credentials_and_enrollment().await?;
+        remove_pending_cleanup(cleanup_path, &self.credentials.server_name).await
     }
 
     /// 配置删除未落盘时撤销 cleanup record，并保留原凭据。
     pub async fn cancel(self) -> Result<(), McpOAuthError> {
-        remove_pending_cleanup(&self.cleanup_path, &self.credentials.server_name).await
+        let Some(cleanup_path) = &self.cleanup_path else {
+            return Ok(());
+        };
+        remove_pending_cleanup(cleanup_path, &self.credentials.server_name).await
     }
 }
 
@@ -604,7 +809,7 @@ pub async fn retry_pending_logout(
     let credentials = McpCredentialStore::from_pending_cleanup(config_path, server_name, cleanup);
     credentials.set_mutation_lease(credential_guard);
     let result = async {
-        credentials.delete().await?;
+        credentials.delete_credentials_and_enrollment().await?;
         remove_pending_cleanup(&cleanup_path, server_name).await
     }
     .await;
@@ -644,23 +849,33 @@ async fn ensure_login_target_unchanged(
 /// 交给 ACN OAuth HTTP client 持有，让每次请求按需取 token 并在过期时用 refresh token 续期；
 /// 只在建连时取一次 access token 会让长会话在 token 过期后开始 401。
 ///
-/// 未登录时不做 OAuth metadata discovery，避免给普通 HTTP server 增加一次网络请求。
-/// 凭据存储不存在记录时按未登录处理；存储本身不可用时必须失败，不能在无法确认
-/// 既有登录身份的情况下静默改用匿名连接。
+/// 从未登录且没有显式 OAuth 配置时不访问凭据存储，也不做 metadata discovery。
+/// 已登记或显式配置 OAuth 后，凭据存储不可用时必须失败，不能在无法确认既有登录
+/// 身份的情况下静默改用匿名连接。
 pub(crate) async fn authorization_manager(
     config_path: &Path,
     server_name: &str,
     url: &str,
     store: McpOAuthCredentialsStore,
+    oauth_explicitly_configured: bool,
 ) -> Result<Option<McpRuntimeAuthorization>, McpOAuthError> {
     let credentials = McpCredentialStore::new(config_path, server_name, url, store);
+    if !oauth_explicitly_configured && !credentials.is_enrolled().await? {
+        return Ok(None);
+    }
     let credential_guard = lock_credential_mutation(
         &credential_refresh_lock_path(config_path, server_name, url),
         server_name,
     )
     .await?;
     credentials.set_mutation_lease(credential_guard);
-    let result = authorization_manager_locked(server_name, url, credentials.clone()).await;
+    let result = async {
+        if !oauth_explicitly_configured && !credentials.is_enrolled().await? {
+            return Ok(None);
+        }
+        authorization_manager_locked(server_name, url, credentials.clone()).await
+    }
+    .await;
     credentials.clear_mutation_lease();
     result
 }
@@ -672,10 +887,32 @@ pub(crate) async fn authorization_manager_locked(
     url: &str,
     credentials: McpCredentialStore,
 ) -> Result<Option<McpRuntimeAuthorization>, McpOAuthError> {
+    let stored = credentials.load().await.map_err(|error| {
+        credential_store_error_or(server_name, error, |_| {
+            McpOAuthError::InvalidStoredCredentials {
+                server: server_name.to_string(),
+            }
+        })
+    })?;
+    let Some(stored) = stored else {
+        credentials.clear_enrollment().await?;
+        return Ok(None);
+    };
+    validate_oauth_resource_url(server_name, url)?;
     let mut manager = AuthorizationManager::new(url)
         .await
         .map_err(|error| authorization_setup_error(server_name, error))?;
-    manager.set_credential_store(credentials.clone());
+    let metadata = manager
+        .resolve_metadata()
+        .await
+        .map_err(|error| authorization_setup_error(server_name, error))?;
+    validate_authorization_metadata(&metadata.metadata, false)
+        .map_err(|error| authorization_setup_error(server_name, error))?;
+    manager.set_metadata(metadata.metadata);
+    manager.set_credential_store(PrefetchedCredentialStore::new(
+        credentials.clone(),
+        stored.clone(),
+    ));
     let loaded = match manager.initialize_from_store().await {
         Ok(loaded) => loaded,
         Err(error) => {
@@ -688,21 +925,14 @@ pub(crate) async fn authorization_manager_locked(
         }
     };
     if !loaded {
+        credentials.clear_enrollment().await?;
         return Ok(None);
     }
-    let identity = credentials
-        .identity()
-        .await
-        .map_err(|error| {
-            credential_store_error_or(server_name, error, |_| {
-                McpOAuthError::InvalidStoredCredentials {
-                    server: server_name.to_string(),
-                }
-            })
-        })?
-        .ok_or_else(|| McpOAuthError::InvalidStoredCredentials {
-            server: server_name.to_string(),
-        })?;
+    credentials.mark_enrolled().await?;
+    let identity = McpCredentialIdentity {
+        client_id: stored.client_id,
+        issuer: stored.issuer,
+    };
     Ok(Some(McpRuntimeAuthorization {
         manager,
         credentials,
@@ -801,6 +1031,14 @@ fn credential_file_path(config_path: &Path, account: &str) -> PathBuf {
         .unwrap_or(config_path)
         .join(FILE_CREDENTIALS_DIR)
         .join(format!("{account}.json"))
+}
+
+fn credential_enrollment_path(config_path: &Path, account: &str) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or(config_path)
+        .join(FILE_CREDENTIALS_DIR)
+        .join(format!("{account}.enrolled"))
 }
 
 fn pending_cleanup_path(config_path: &Path, server_name: &str) -> PathBuf {
@@ -1231,6 +1469,48 @@ mod tests {
         assert!(!account.contains("secret"));
     }
 
+    #[test]
+    fn oauth_urls_require_https_except_for_loopback_development() {
+        for url in [
+            "https://auth.example.test/token",
+            "http://127.0.0.1:8080/token",
+            "http://[::1]:8080/token",
+            "http://login.localhost/token",
+        ] {
+            assert!(secure_oauth_url(url), "应允许 {url}");
+        }
+        for url in [
+            "http://auth.example.test/token",
+            "ftp://auth.example.test/token",
+            "https://user:password@auth.example.test/token",
+            "https://auth.example.test/token#fragment",
+            "not-a-url",
+        ] {
+            assert!(!secure_oauth_url(url), "应拒绝 {url}");
+        }
+    }
+
+    #[test]
+    fn login_requires_authorization_server_to_advertise_pkce_s256() {
+        let mut metadata = AuthorizationMetadata::default();
+        metadata.authorization_endpoint = "https://auth.example.test/authorize".to_string();
+        metadata.token_endpoint = "https://auth.example.test/token".to_string();
+        metadata.issuer = Some("https://auth.example.test".to_string());
+
+        assert!(matches!(
+            validate_authorization_metadata(&metadata, true),
+            Err(AuthError::PkceUnsupported)
+        ));
+        metadata.code_challenge_methods_supported = Some(vec!["S256".to_string()]);
+        validate_authorization_metadata(&metadata, true).unwrap();
+
+        metadata.token_endpoint = "http://auth.example.test/token".to_string();
+        assert!(matches!(
+            validate_authorization_metadata(&metadata, false),
+            Err(AuthError::MetadataError(_))
+        ));
+    }
+
     #[tokio::test]
     async fn runtime_oauth_metadata_discovery_honors_server_startup_timeout() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1533,6 +1813,7 @@ mod tests {
             panic!("expected file credential store");
         };
         assert!(path.is_absolute());
+        assert!(store.enrollment_path.is_file());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1553,6 +1834,96 @@ mod tests {
 
         store.clear().await.unwrap();
         assert!(!path.exists());
+        assert!(!store.enrollment_path.exists());
+    }
+
+    #[tokio::test]
+    async fn anonymous_http_server_does_not_touch_unavailable_credentials_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join(".mcp.json");
+        let store = McpCredentialStore::new(
+            &config_path,
+            "docs",
+            "https://example.test/mcp",
+            McpOAuthCredentialsStore::File,
+        );
+        let CredentialBackend::File { path } = &store.backend else {
+            panic!("expected file credential store");
+        };
+        tokio::fs::create_dir_all(path).await.unwrap();
+
+        let authorization = authorization_manager(
+            &config_path,
+            "docs",
+            "https://example.test/mcp",
+            McpOAuthCredentialsStore::File,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(authorization.is_none());
+        assert!(!dir.path().join(CREDENTIAL_LOCKS_DIR).exists());
+    }
+
+    #[tokio::test]
+    async fn anonymous_remove_keeps_lock_without_creating_oauth_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join(".mcp.json");
+        let server = McpServerConfig::streamable_http("https://example.test/mcp".to_string(), None);
+        let store = McpCredentialStore::new(
+            &config_path,
+            "docs",
+            "https://example.test/mcp",
+            McpOAuthCredentialsStore::File,
+        );
+        let CredentialBackend::File { path } = &store.backend else {
+            panic!("expected file credential store");
+        };
+        tokio::fs::create_dir_all(path).await.unwrap();
+
+        let lease = prepare_credentials_for_remove(&config_path, "docs", &server)
+            .await
+            .unwrap();
+
+        assert!(!has_pending_cleanup(&config_path, "docs").await.unwrap());
+        lease.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn enrolled_oauth_rejects_plaintext_remote_resource_url_before_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join(".mcp.json");
+        let url = "http://resource.example.test/mcp";
+        let store =
+            McpCredentialStore::new(&config_path, "docs", url, McpOAuthCredentialsStore::File);
+        store
+            .save(
+                serde_json::from_value(json!({
+                    "client_id": "client",
+                    "token_response": {
+                        "access_token": "access-token",
+                        "token_type": "Bearer"
+                    }
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let result = authorization_manager(
+            &config_path,
+            "docs",
+            url,
+            McpOAuthCredentialsStore::File,
+            false,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(McpOAuthError::InsecureEndpoint { .. })
+        ));
     }
 
     #[tokio::test]
@@ -1716,6 +2087,7 @@ mod tests {
                 "docs",
                 &runtime_url,
                 McpOAuthCredentialsStore::File,
+                false,
             )
             .await
         });
@@ -1762,6 +2134,7 @@ mod tests {
             "docs",
             "https://example.test/mcp",
             McpOAuthCredentialsStore::File,
+            true,
         )
         .await;
 

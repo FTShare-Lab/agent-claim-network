@@ -216,7 +216,7 @@ MCP server 按连接方式分两类：
 - 同一个 server 上 `bearer_token_env_var` 优先于 OAuth：配置了它就不再查询系统凭据库。
 - 连接期间 access token 过期会用 refresh token 自动续期；refresh 失败时需要重新 `login`。
 - 当前不支持 MCP Tasks，也不宣告 `2026-07-28` Tasks extension。
-- 标准 `rmcp 3.0.1` 不暴露旧版 `execution.taskSupport` 字段，ACN 不额外解析或自动过滤该字段。`taskSupport = "required"` 的 legacy 工具可能仍显示为 `exposed`，随后因普通 `tools/call` 被 server 拒绝；这不影响同一 `2025-11-25` server 上的普通工具。已知的 legacy Tasks 工具应通过 `disabled_tools` 手动关闭。
+- 标准 `rmcp 3.1.2` 不暴露旧版 `execution.taskSupport` 字段，ACN 不额外解析或自动过滤该字段。`taskSupport = "required"` 的 legacy 工具可能仍显示为 `exposed`，随后因普通 `tools/call` 被 server 拒绝；这不影响同一 `2025-11-25` server 上的普通工具。已知的 legacy Tasks 工具应通过 `disabled_tools` 手动关闭。
 - 当前不支持 MCP elicitation；需要 server 在工具调用中展示 URL 或表单的交互无法完成。
 - 外部修改 `.mcp.json` 后，已运行的 TUI 不会热加载；需要重启 TUI，或后续使用专门的 reload 能力。
 

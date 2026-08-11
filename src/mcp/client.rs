@@ -508,12 +508,14 @@ impl McpClient {
                     oauth_credentials_store,
                     ..
                 } => {
+                    let oauth_explicitly_configured = server.has_explicit_oauth_options();
                     let transport = streamable_http_transport(
                         mcp_config_path,
                         &server_name,
                         url,
                         bearer_token_env_var,
                         oauth_credentials_store,
+                        oauth_explicitly_configured,
                         tool_timeout,
                         startup_timeout,
                         connection_failure_sender.clone(),
@@ -2741,6 +2743,7 @@ async fn streamable_http_transport(
     url: String,
     bearer_token_env_var: Option<String>,
     oauth_credentials_store: crate::mcp::config::McpOAuthCredentialsStore,
+    oauth_explicitly_configured: bool,
     fallback_tool_http_response_timeout: Duration,
     lifecycle_http_response_timeout: Duration,
     connection_failure: watch::Sender<Option<String>>,
@@ -2771,6 +2774,7 @@ async fn streamable_http_transport(
             server_name,
             &url,
             oauth_credentials_store,
+            oauth_explicitly_configured,
         )
         .await
         .map_err(|error| McpClientError::OAuthCredentials {

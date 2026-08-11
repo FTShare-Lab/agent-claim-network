@@ -452,7 +452,7 @@ mod tests {
             "Authorization: Bearer secret-token url=https://user:pass@example.test/mcp?token=abc",
         )]);
         result.structured_content = Some(json!({
-            "OPENAI_API_KEY=secret-token": "OPENAI_API_KEY=secret-token"
+            "SERVICE_API_KEY=fixture-secret": "SERVICE_API_KEY=fixture-secret"
         }));
 
         let value = mcp_tool_result_to_value(&result);
@@ -463,7 +463,7 @@ mod tests {
         assert!(!raw.contains("secret-token"));
         assert!(!raw.contains("user:pass"));
         assert!(!raw.contains("token=abc"));
-        assert!(!raw.contains("OPENAI_API_KEY=secret"));
+        assert!(!raw.contains("SERVICE_API_KEY=fixture-secret"));
     }
 
     fn runtime_snapshot(tools: Vec<McpToolSnapshot>) -> McpRuntimeState {

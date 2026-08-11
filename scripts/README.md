@@ -49,6 +49,35 @@ scripts/tui_real_llm_smoke.sh manual config.toml
 
 测试会产生真实 API 请求，可能消耗额度并受外部服务稳定性影响，因此它不是默认`cargo test` 或普通 CI 的组成部分。屏幕捕获、日志、最终 Session 元数据和消息保存在对应的 `target/tui-real-smoke/<label>/` 目录，便于失败后检查。
 
+## MCP OAuth 本地验收
+
+`examples/mcp_oauth_fake_server.rs` 是只监听 loopback 的 Rust fixture，不依赖真实 OAuth
+或 MCP 服务。一个进程同时提供受 OAuth 保护的 MCP 2026-07-28 endpoint、匿名新协议
+endpoint 和拒绝 `server/discover` 的 2025-11-25 兼容 endpoint：
+
+```bash
+cargo run --quiet --example mcp_oauth_fake_server -- \
+  --port 8765 \
+  --log-file target/mcp-oauth-requests.jsonl
+```
+
+默认 access token 只有 5 秒有效期，便于通过请求日志观察 refresh token 流程；
+`--omit-pkce`、`--insecure-metadata` 和 `--mismatched-callback-issuer` 分别用于验证
+缺少 PKCE S256、OAuth endpoint 使用远端明文 HTTP、callback `iss` 不匹配时客户端会
+fail-closed。fixture 会打印用于 bearer 优先级测试的固定测试 token；它不接受非
+loopback 监听地址。
+
+完整的本地端到端验收可直接运行：
+
+```bash
+scripts/mcp_oauth_smoke.sh
+```
+
+脚本要求 `cargo`、`curl`、`expect`、`jq`、`rg` 与 `tmux`。它会在
+`target/mcp-oauth-smoke.*` 下生成隔离的双 upstream 配置和验收轨迹，自动覆盖新旧协议
+协商、bearer 优先级、桌面与 headless OAuth、DCR 与预注册 client、refresh、凭据隔离、
+logout/remove、PKCE/HTTP/issuer fail-closed，以及 canonical 和 `/mcp` focused TUI smoke。
+
 ## Release 归档
 
 `package_release.sh` 把指定目标的 `acn`、`acn-router`、`acn-maintainer`、生产 Workbench、README 与双许可证组装成独立归档，并生成 SHA-256：

@@ -204,6 +204,13 @@ impl McpServerConfig {
         self.tool_timeout_secs.unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS)
     }
 
+    /// 是否显式配置过 OAuth。未配置这些字段的普通 HTTP server 不应访问 keyring。
+    pub(crate) fn has_explicit_oauth_options(&self) -> bool {
+        self.oauth_client_id.is_some()
+            || self.oauth_callback_port.is_some()
+            || self.oauth_credentials_store.is_some()
+    }
+
     pub fn transport_kind(&self, name: &str) -> Result<McpTransportKind, McpConfigError> {
         if let Some(transport) = self.transport {
             return Ok(transport);

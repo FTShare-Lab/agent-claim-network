@@ -16,7 +16,7 @@ ACN 当前已经有 provider-neutral 的工具回环：`ToolRegistry::definition
 
 协议依据：
 
-- 本实现使用 `rmcp 3.0.1`，建连时优先通过 `server/discover` 协商 `2026-07-28` 协议。
+- 本实现使用 `rmcp 3.1.2`，建连时优先通过 `server/discover` 协商 `2026-07-28` 协议。
 - 对明确不支持 `server/discover` 的旧 server，自动退回 `initialize`，使用 `2025-11-25` 的旧生命周期；不要求用户在配置中填写版本。
 - 选型 MCP Rust SDK 时优先选择能跟随协议版本演进的实现，避免手写 transport后续迁移成本过高。
 
@@ -160,11 +160,11 @@ acn mcp login linear --no-browser
 acn mcp logout linear
 ```
 
-`login` 只适用于支持 OAuth discovery，且支持动态 client registration 或配置了预注册 `oauth_client_id` 的 Streamable HTTP server。命令使用 PKCE 和 loopback redirect；桌面环境自动打开浏览器并监听 callback，`--no-browser` 则打印授权 URL，并要求用户从浏览器地址栏复制完整 redirect URL 粘贴回终端。scope 会合并已有 grant、server challenge 与 resource metadata 的要求；仅在这些来源均为空时使用 authorization server metadata。授权、token 交换和 refresh 均绑定当前 MCP resource。未登录的 OAuth server 在连接失败时会提示对应的 `login` 命令。
+`login` 只适用于支持 OAuth discovery，且支持动态 client registration 或配置了预注册 `oauth_client_id` 的 Streamable HTTP server。MCP resource 与 OAuth metadata 中的授权端点必须使用 HTTPS，仅本机 loopback 开发端点可使用 HTTP；authorization server metadata 必须明确声明支持 PKCE `S256`，缺失该字段也拒绝登录。命令使用 PKCE 和 loopback redirect；桌面环境自动打开浏览器并监听 callback，`--no-browser` 则打印授权 URL，并要求用户从浏览器地址栏复制完整 redirect URL 粘贴回终端。scope 会合并已有 grant、server challenge 与 resource metadata 的要求；仅在这些来源均为空时使用 authorization server metadata。授权、token 交换和 refresh 均绑定当前 MCP resource。未登录的 OAuth server 在连接失败时会提示对应的 `login` 命令。
 
-OAuth 凭据按 selected upstream、server name 与 URL 隔离。默认写入系统 keyring；`oauth_credentials_store = "file"` 时写入 selected upstream runtime 的 `.mcp-oauth/` 私有目录，供没有 Secret Service / D-Bus 的 headless Linux 使用。`logout` 只删除本地凭据，不请求远端 token revocation。当前不支持 client secret、CIMD 与 device flow。
+OAuth 凭据按 selected upstream、server name 与 URL 隔离。默认写入系统 keyring；`oauth_credentials_store = "file"` 时写入 selected upstream runtime 的 `.mcp-oauth/` 私有目录，供没有 Secret Service / D-Bus 的 headless Linux 使用。成功保存凭据后另写入不含 secret 的私有登记标记，只有已登记或显式配置 OAuth 的 server 才在运行时访问凭据库；普通匿名 HTTP server 不依赖 keyring。`logout` 只删除本地凭据和登记标记，不请求远端 token revocation。当前不支持 client secret、CIMD 与 device flow。
 
-运行时找不到凭据记录时按未登录连接；凭据库不可用、refresh 要求重新授权或已加载身份被删除时必须 fail closed，不得把 OAuth-managed 请求降级为匿名请求。
+已登记或显式配置 OAuth 的 server 在运行时找不到凭据记录时清除过期登记并按未登录连接；凭据库不可用、refresh 要求重新授权或已加载身份被删除时必须 fail closed，不得把 OAuth-managed 请求降级为匿名请求。
 
 登录失败要区分 discovery / DCR、PKCE、callback state、RFC 9207 issuer 和 token endpoint 阶段；CLI 输出可行动的分类原因，但不直接透传可能包含 URL、响应 body 或凭据的底层错误文本。
 
@@ -174,7 +174,7 @@ OAuth 凭据按 selected upstream、server name 与 URL 隔离。默认写入系
 acn mcp remove pal
 ```
 
-先写入不含 token 的私有待清理记录并锁定该 server 的凭据变更，再删除 selected upstream runtime 下的 server 配置，最后尽力删除本地 OAuth 凭据。凭据库不可用时命令返回成功并显示 warning，明确说明配置已删除、凭据清理失败；不能因为 keyring / D-Bus 故障阻止配置删除。待清理记录会保留凭据 backend 与不可逆 account hash，因此配置不存在时仍可执行同名 `acn mcp logout <name>` 重试；清理完成前不允许重新添加同名 server。
+删除 Streamable HTTP server 时先锁定该 server 的凭据变更；只有存在 OAuth 登记标记或显式 OAuth 配置时，才写入不含 token 的私有待清理记录。随后删除 selected upstream runtime 下的 server 配置，最后尽力删除本地 OAuth 凭据和登记标记。普通匿名 HTTP server 不访问 keyring，也不产生待清理记录。凭据库不可用时命令返回成功并显示 warning，明确说明配置已删除、凭据清理失败；不能因为 keyring / D-Bus 故障阻止配置删除。待清理记录会保留凭据 backend 与不可逆 account hash，因此配置不存在时仍可执行同名 `acn mcp logout <name>` 重试；清理完成前不允许重新添加同名 server。
 
 ### 启用 / 禁用 server
 
@@ -262,7 +262,7 @@ streamable_http：
 
 - stdio server 通过 `env` / `env_vars` 获取 API key。
 - Streamable HTTP server 通过 `bearer_token_env_var` 获取 bearer token。
-- 支持 OAuth discovery、动态 client registration 或预注册 public client ID、PKCE、桌面 loopback callback 与 headless redirect URL 粘贴。
+- 支持 OAuth discovery、动态 client registration 或预注册 public client ID、严格要求 metadata 声明 PKCE `S256`、桌面 loopback callback 与 headless redirect URL 粘贴；OAuth 端点使用 HTTPS，仅本机 loopback 可使用 HTTP。
 - OAuth token / client id 可持久化到系统 keyring，或 selected upstream runtime 下权限受限的文件；凭据按 upstream、server name 与 URL 隔离。
 - OAuth scope 合并已有 grant、`WWW-Authenticate` 的 `scope` 与 resource metadata 的 `scopes_supported`；仅当前述来源均为空时，使用授权服务器 metadata 的 `scopes_supported`。授权服务器声明支持且请求 scope 非空时追加 `offline_access`。
 - OAuth discovery 优先使用 protected resource metadata 声明的 `resource`；没有声明时才使用 MCP server URL。authorization code exchange 与 refresh token 请求始终使用同一个值，保证 token audience 绑定。
@@ -305,7 +305,7 @@ MCP 普通 `tools/call` 的最终结果按 JSON-RPC request / response 模型返
   - 只有 transport/connection 错误、disable/reconnect 或 ACN shutdown 才摘除并清理共享 client。
 - 超时错误要作为 tool_result 回灌给模型，不能 panic 或卡住 turn loop。
 - 当前不实现 MCP Tasks，也不宣告 `2026-07-28` Tasks extension。普通工具仍按 `tools/call` 调用。
-- 直接使用 crates.io `rmcp 3.0.1`，不 vendoring SDK 源码。该版本不暴露旧版 `execution.taskSupport` 字段，ACN 不增加旁路协议解析或自动过滤。
+- 直接使用 crates.io `rmcp 3.1.2`，不 vendoring SDK 源码。该版本不暴露旧版 `execution.taskSupport` 字段，ACN 不增加旁路协议解析或自动过滤。
 - `taskSupport = "required"` 的 legacy 工具可能仍被分类为 `exposed`，随后因 ACN 发送普通 `tools/call` 而被 server 拒绝；这不影响同一 `2025-11-25` server 上的普通工具。已知的 legacy Tasks 工具由用户通过 `disabled_tools` 手动关闭。
 
 后续如果需要支持长任务，可单独设计 task-augmented execution 或 idle timeout；当前不做。
@@ -919,7 +919,7 @@ MCP tool cell：
 
 这里有两种版本，含义不同：
 
-- `rmcp 3.0.1` 是 ACN 内部使用的 Rust SDK 版本。
+- `rmcp 3.1.2` 是 ACN 内部使用的 Rust SDK 版本。
 - `2025-03-26`、`2025-11-25`、`2026-07-28` 是 ACN 与 MCP server 在网络上说的协议版本。
 
 升级 `rmcp` 不会要求所有 MCP server 一起升级。ACN 建连时由 SDK 和 server 协商共同支持的协议版本，不让用户在 `.mcp.json` 中手动填写版本。
@@ -935,4 +935,4 @@ MCP tool cell：
 
 如果双方没有共同版本，ACN 应明确报协议不兼容，而不是尝试发送可能被误解的数据。
 
-协议协商和 OAuth 是两件事。前者只决定 MCP 消息格式；后者决定 token 申请给哪个 resource。即使 ACN 回退到旧的 `initialize` 协议，OAuth 仍使用 `rmcp 3.0.1` 的实现：从 protected resource metadata 取到的 `resource` 会同时用于授权、换 token 和 refresh token。因此“旧协议回退”不会把 refresh token 也回退到旧 SDK 的丢值行为。若 server 自己没有提供 resource metadata，SDK 才按规范使用 MCP URL 作为 fallback；这时失败会作为认证错误明确返回，不会静默换一种协议重试。
+协议协商和 OAuth 是两件事。前者只决定 MCP 消息格式；后者决定 token 申请给哪个 resource。即使 ACN 回退到旧的 `initialize` 协议，OAuth 仍使用 `rmcp 3.1.2` 的实现：从 protected resource metadata 取到的 `resource` 会同时用于授权、换 token 和 refresh token。因此“旧协议回退”不会把 refresh token 也回退到旧 SDK 的丢值行为。若 server 自己没有提供 resource metadata，SDK 才按规范使用 MCP URL 作为 fallback；这时失败会作为认证错误明确返回，不会静默换一种协议重试。
