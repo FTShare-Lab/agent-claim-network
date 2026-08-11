@@ -361,6 +361,7 @@ Compact 进行中时，TUI 只用 live box 顶部状态表达进度：
 - compaction summary 使用结构化 JSON 输出，shape error 按 `[agent.llm].retry_count` 限制重试。
 - 主会话和 delegation 的 compaction summary 请求优先携带完整工具结果；完整请求超限后依次降级为“大型结果省略”和“全部结果省略”，canonical transcript 始终保留原文。
 - 全部 tool result 省略后仍超限则不调用 provider，也不推进 compaction frontier。每次 JSON retry 同样按最终请求重新执行保守预算检查。
+- 对同时包含 committed summary 与 recap 的 compact，先只构造并完成 summary 的本地预算预检；预检失败时两类 provider 请求均不启动。预检通过后 summary 与 recap 可以并发执行；任一实际调用失败时都不提交 checkpoint 或推进指针。
 - 推进 committed compact frontier / `recapped_until` 时，summary 与 recap/finalize 侧必须同时成功；手动 `/compact` 与自动 preflight compact 遵循同一原子提交语义。
 - 自动 compact 只在 provider request preflight 触发，不再依赖 turn commit 后的单独检查。
 - 旧 `session.yaml.compaction` 可迁移；旧 `compaction_checkpoint.yaml` 不兼容、不恢复。

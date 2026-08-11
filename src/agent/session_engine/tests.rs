@@ -100,8 +100,8 @@ enum ProviderStep {
         control: SessionTurnControl,
     },
     JsonByRequestKind {
-        compaction_response: Option<ProviderResponse>,
-        recap_response: Option<ProviderResponse>,
+        compaction_responses: VecDeque<ProviderResponse>,
+        recap_responses: VecDeque<ProviderResponse>,
     },
     Error {
         message: &'static str,
@@ -143,22 +143,22 @@ impl ProviderAdapter for RecordingProvider {
         let next_step = {
             let mut steps = self.steps.lock().await;
             if let Some(ProviderStep::JsonByRequestKind {
-                compaction_response,
-                recap_response,
+                compaction_responses,
+                recap_responses,
             }) = steps.front_mut()
             {
                 let selected = if request_for_kind.system_prompt.contains("session 历史压缩")
                     || request_for_kind.system_prompt.contains("committed_summary")
                 {
-                    compaction_response.take()
+                    compaction_responses.pop_front()
                 } else if request_for_kind.system_prompt.contains("复盘阶段")
                     || request_for_kind.system_prompt.contains("new_claims")
                 {
-                    recap_response.take()
+                    recap_responses.pop_front()
                 } else {
                     anyhow::bail!("recording provider could not classify JSON request")
                 };
-                if compaction_response.is_none() && recap_response.is_none() {
+                if compaction_responses.is_empty() && recap_responses.is_empty() {
                     steps.pop_front();
                 }
                 return selected.ok_or_else(|| {
@@ -488,6 +488,102 @@ impl ProviderAdapter for BlockingAfterFileReadProvider {
     }
 }
 
+/// 用于验证 compact 与 recap 在预算预检通过后会同时开始。
+/// 摘要请求必须等到 recap 请求已进入 provider；若实现退回串行，该请求会超时。
+struct ConcurrentCompactionRecapProvider {
+    recap_started: Notify,
+    calls: AtomicUsize,
+}
+
+impl ConcurrentCompactionRecapProvider {
+    fn new() -> Self {
+        Self {
+            recap_started: Notify::new(),
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl ProviderAdapter for ConcurrentCompactionRecapProvider {
+    fn emit_preflight_context_estimate(&self) -> bool {
+        false
+    }
+
+    async fn send(
+        &self,
+        request: ProviderRequest,
+        _emit: &mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> anyhow::Result<ProviderResponse> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if request.system_prompt.contains("session 历史压缩")
+            || request.system_prompt.contains("committed_summary")
+        {
+            tokio::time::timeout(Duration::from_millis(200), self.recap_started.notified())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("recap provider request did not start concurrently")
+                })?;
+            return Ok(provider_response(
+                r#"{"committed_summary":"old turn summarized","active_turn_summary":null}"#,
+            ));
+        }
+        if request.system_prompt.contains("复盘阶段")
+            || request.system_prompt.contains("new_claims")
+        {
+            self.recap_started.notify_one();
+            return Ok(provider_response(
+                r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
+            ));
+        }
+        anyhow::bail!("unexpected provider request in compaction concurrency test")
+    }
+}
+
+struct SummaryFailureWithRecapProvider {
+    requests: Mutex<Vec<ProviderRequest>>,
+}
+
+impl SummaryFailureWithRecapProvider {
+    fn new() -> Self {
+        Self {
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    async fn requests(&self) -> Vec<ProviderRequest> {
+        self.requests.lock().await.clone()
+    }
+}
+
+#[async_trait]
+impl ProviderAdapter for SummaryFailureWithRecapProvider {
+    fn emit_preflight_context_estimate(&self) -> bool {
+        false
+    }
+
+    async fn send(
+        &self,
+        request: ProviderRequest,
+        _emit: &mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> anyhow::Result<ProviderResponse> {
+        self.requests.lock().await.push(request.clone());
+        if request.system_prompt.contains("session 历史压缩")
+            || request.system_prompt.contains("committed_summary")
+        {
+            anyhow::bail!("summary provider unavailable")
+        }
+        if request.system_prompt.contains("复盘阶段")
+            || request.system_prompt.contains("new_claims")
+        {
+            return Ok(provider_response(
+                r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
+            ));
+        }
+        Ok(provider_response("continued after provider failure"))
+    }
+}
+
 struct FinalizingStateCheckingProvider {
     session_yaml: PathBuf,
 }
@@ -638,9 +734,19 @@ fn tool_use_step(id: &str, name: &str, input: serde_json::Value) -> ProviderStep
 }
 
 fn json_by_request_kind_step(compaction_text: &str, recap_text: &str) -> ProviderStep {
+    json_by_request_kind_responses(&[compaction_text], &[recap_text])
+}
+
+fn json_by_request_kind_responses(compaction_texts: &[&str], recap_texts: &[&str]) -> ProviderStep {
     ProviderStep::JsonByRequestKind {
-        compaction_response: Some(provider_response(compaction_text)),
-        recap_response: Some(provider_response(recap_text)),
+        compaction_responses: compaction_texts
+            .iter()
+            .map(|text| provider_response(text))
+            .collect(),
+        recap_responses: recap_texts
+            .iter()
+            .map(|text| provider_response(text))
+            .collect(),
     }
 }
 
@@ -2027,9 +2133,18 @@ async fn context_window_recovery_compacts_and_recaps_only_committed_history() {
 
     let requests = provider.requests().await;
     assert_eq!(requests.len(), 4);
-    assert!(requests[1].system_prompt.contains("committed_summary"));
-    assert!(requests[2].system_prompt.contains("new_claims"));
-    let recap_request = serde_json::to_string(&requests[2].messages).unwrap();
+    let compaction_request = requests
+        .iter()
+        .find(|request| request.system_prompt.contains("committed_summary"))
+        .expect("committed summary request");
+    assert!(serde_json::to_string(&compaction_request.messages)
+        .unwrap()
+        .contains("OLDER_COMMITTED_USER_ONE"));
+    let recap_request = requests
+        .iter()
+        .find(|request| request.system_prompt.contains("new_claims"))
+        .expect("recap request");
+    let recap_request = serde_json::to_string(&recap_request.messages).unwrap();
     assert!(recap_request.contains("OLDER_COMMITTED_USER_ONE"));
     assert!(!recap_request.contains("CURRENT-PARTIAL"));
     assert!(!recap_request.contains("private-committed-history-context"));
@@ -3068,8 +3183,10 @@ async fn auto_compaction_failure_continues_with_raw_history_when_request_still_f
         summary = serde_json::to_string(&overlong).unwrap()
     );
     let provider = Arc::new(RecordingProvider::new(vec![
-        response_step(&response, Vec::new()),
-        response_step(&response, Vec::new()),
+        json_by_request_kind_responses(
+            &[&response, &response],
+            &[r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#],
+        ),
         response_step("continued with full history", Vec::new()),
     ]));
     let (mut engine, store) = build_test_engine(&dir, provider.clone());
@@ -3104,8 +3221,8 @@ async fn auto_compaction_failure_continues_with_raw_history_when_request_still_f
         .expect("raw request still fits and should continue");
 
     let requests = provider.requests().await;
-    assert_eq!(requests.len(), 3);
-    let final_request = serde_json::to_string(&requests[2].messages).unwrap();
+    assert_eq!(requests.len(), 4);
+    let final_request = serde_json::to_string(&requests[3].messages).unwrap();
     assert!(final_request.contains("old request"));
     assert!(final_request.contains("continue safely"));
     assert!(events.iter().any(|event| matches!(
@@ -3126,7 +3243,7 @@ async fn auto_compaction_failure_continues_with_raw_history_when_request_still_f
     let history = compaction.provider_history.as_ref().unwrap();
     assert!(history.pending_turn.is_none());
     assert_eq!(history.canonical_message_until, metadata.message_count);
-    assert!(history.messages.starts_with(&requests[2].messages));
+    assert!(history.messages.starts_with(&requests[3].messages));
     assert!(session
         .read_compaction_checkpoint()
         .await
@@ -3137,10 +3254,7 @@ async fn auto_compaction_failure_continues_with_raw_history_when_request_still_f
 #[tokio::test]
 async fn auto_compaction_provider_failure_continues_with_raw_history_when_request_still_fits() {
     let dir = tempfile::tempdir().unwrap();
-    let provider = Arc::new(RecordingProvider::new(vec![
-        error_step("summary provider unavailable", Vec::new()),
-        response_step("continued after provider failure", Vec::new()),
-    ]));
+    let provider = Arc::new(SummaryFailureWithRecapProvider::new());
     let (mut engine, store) = build_test_engine(&dir, provider.clone());
     engine.context_window = 20_000;
     engine.compaction.auto_compact_ctx_ratio = 0.00001;
@@ -3167,7 +3281,7 @@ async fn auto_compaction_provider_failure_continues_with_raw_history_when_reques
         .expect("a recoverable compaction provider failure should not abort a safe raw request");
 
     let requests = provider.requests().await;
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     assert!(events.iter().any(|event| matches!(
         event,
         SessionEvent::Warning { message }
@@ -3187,24 +3301,19 @@ async fn auto_compaction_provider_failure_continues_with_raw_history_when_reques
     let history = compaction.provider_history.as_ref().unwrap();
     assert!(history.pending_turn.is_none());
     assert_eq!(history.canonical_message_until, metadata.message_count);
-    assert!(history.messages.starts_with(&requests[1].messages));
+    assert!(history.messages.starts_with(&requests[2].messages));
 }
 
 #[tokio::test]
 async fn auto_compaction_projection_failure_continues_raw_when_full_request_still_fits() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(vec![
-        response_step(
-            r#"{"committed_summary":"short summary","active_turn_summary":null}"#,
-            Vec::new(),
-        ),
-        response_step(
-            r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
-            Vec::new(),
-        ),
-        response_step(
-            r#"{"committed_summary":"tiny","active_turn_summary":null}"#,
-            Vec::new(),
+        json_by_request_kind_responses(
+            &[
+                r#"{"committed_summary":"short summary","active_turn_summary":null}"#,
+                r#"{"committed_summary":"tiny","active_turn_summary":null}"#,
+            ],
+            &[r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#],
         ),
         response_step("continued after hard-tail failure", Vec::new()),
     ]));
@@ -3275,8 +3384,10 @@ async fn auto_compaction_failure_blocks_when_raw_request_with_output_reserve_doe
         summary = serde_json::to_string(&overlong).unwrap()
     );
     let provider = Arc::new(RecordingProvider::new(vec![
-        response_step(&response, Vec::new()),
-        response_step(&response, Vec::new()),
+        json_by_request_kind_responses(
+            &[&response, &response],
+            &[r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#],
+        ),
     ]));
     let (mut engine, store) = build_test_engine(&dir, provider.clone());
     engine.context_window = 6_000;
@@ -3332,7 +3443,7 @@ async fn auto_compaction_failure_blocks_when_raw_request_with_output_reserve_doe
         error.to_string(),
         "Context compaction failed: the generated summary exceeded 10 characters after 2 attempts. Run /compact to retry."
     );
-    assert_eq!(provider.requests().await.len(), 2);
+    assert_eq!(provider.requests().await.len(), 3);
     assert!(events.iter().any(|event| matches!(
         event,
         SessionEvent::TurnFailed { error }
@@ -4418,13 +4529,10 @@ async fn manual_compact_applied_checkpoint_preserves_report_and_clears_file_read
 #[tokio::test]
 async fn manual_compact_post_summary_failure_writes_failed_audit() {
     let dir = tempfile::tempdir().unwrap();
-    let provider = Arc::new(RecordingProvider::new(vec![
-        response_step(
-            r#"{"committed_summary":"old turn summarized","active_turn_summary":null}"#,
-            Vec::new(),
-        ),
-        response_step("not json", Vec::new()),
-    ]));
+    let provider = Arc::new(RecordingProvider::new(vec![json_by_request_kind_step(
+        r#"{"committed_summary":"old turn summarized","active_turn_summary":null}"#,
+        "not json",
+    )]));
     let (mut engine, store) = build_test_engine(&dir, provider.clone());
     engine.context_window = 20_000;
     engine.compaction.tail_target_ctx_ratio = 0.015;
@@ -4466,8 +4574,10 @@ async fn manual_compact_exhausts_overlong_summary_repairs_without_advancing_stat
         summary = serde_json::to_string(&overlong).unwrap()
     );
     let provider = Arc::new(RecordingProvider::new(vec![
-        response_step(&response, Vec::new()),
-        response_step(&response, Vec::new()),
+        json_by_request_kind_responses(
+            &[&response, &response],
+            &[r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#],
+        ),
     ]));
     let (mut engine, store) = build_test_engine(&dir, provider.clone());
     engine.context_window = 20_000;
@@ -4500,7 +4610,7 @@ async fn manual_compact_exhausts_overlong_summary_repairs_without_advancing_stat
         .await
         .expect_err("two overlong summaries must fail manual compaction");
 
-    assert_eq!(provider.requests().await.len(), 2);
+    assert_eq!(provider.requests().await.len(), 3);
     let metadata = session.read_metadata().await.unwrap();
     assert_eq!(metadata.message_count, original_message_count);
     assert_eq!(metadata.recapped_until, 0);
@@ -4559,6 +4669,41 @@ async fn manual_compact_over_budget_summary_does_not_start_recap_provider() {
         .await
         .unwrap_or_default();
     assert!(!audit_log.contains(r#""kind":"started""#));
+}
+
+#[tokio::test]
+async fn manual_compact_starts_summary_and_recap_concurrently_after_budget_preflight() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ConcurrentCompactionRecapProvider::new());
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.context_window = 20_000;
+    engine.compaction.tail_target_ctx_ratio = 0.015;
+    engine.compaction.tail_hard_ctx_ratio = 0.0225;
+    engine.compaction.tail_previous_real_user_turns = 1;
+    let mut session = create_test_session(&store, "session_face000b").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "old request ".repeat(120)),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "old answer ".repeat(120)),
+            NewSessionMessage::text(SessionMessageRole::User, "latest request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "latest answer"),
+        ])
+        .await
+        .unwrap();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        engine.compact_session_checkpoint_with_events(&mut session, &mut |_| {}),
+    )
+    .await
+    .expect("compaction should not wait for recap before starting the summary request")
+    .expect("concurrent compact and recap should succeed");
+
+    assert!(matches!(outcome, ManualCompactionOutcome::Compacted(_)));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    let metadata = session.read_metadata().await.unwrap();
+    assert_eq!(metadata.recapped_until, metadata.message_count);
+    assert!(metadata.compaction.is_some());
 }
 
 #[tokio::test]

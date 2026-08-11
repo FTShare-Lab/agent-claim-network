@@ -882,6 +882,17 @@ struct GeneratedCompactionSummary {
     audit_id: String,
 }
 
+/// 已完成本地预算预检、但尚未发给 provider 的压缩摘要请求。
+///
+/// 将预检与模型调用分开后，已确认可发起的摘要和 recap 可以并行；预检失败时
+/// 则不会启动任何 recap 请求。
+#[derive(Debug)]
+struct PreparedCompactionSummaryRequest {
+    system_prompt: String,
+    provider_messages: Vec<SessionTurnMessage>,
+    payload_preview: CompactionAuditTextPreview,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("{field} exceeds summary_max_chars: actual_chars={actual_chars}, max_chars={max_chars}")]
 struct CompactionSummaryTooLong {
@@ -3887,11 +3898,18 @@ impl SessionEngine {
                         plan.ranges.recap_start_index, plan.ranges.recap_end_index
                     )
                 })?;
-            // Summary 先完成本地预算检查；超限时不能并发启动无效的 recap provider 请求。
-            let generated_compaction = self
-                .generate_compaction_summary(session, &summary_inputs, emit)
-                .await?;
-            let prepared_recap = match self.prepare_finalize_segment(recap_segment).await {
+            let prepared_summary = self.prepare_compaction_summary_request(&summary_inputs)?;
+            let (summary_result, recap_result) = tokio::join!(
+                self.generate_prepared_compaction_summary(
+                    session,
+                    &summary_inputs,
+                    prepared_summary,
+                    emit,
+                ),
+                self.prepare_finalize_segment(recap_segment),
+            );
+            let generated_compaction = summary_result?;
+            let prepared_recap = match recap_result {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     let audit_ids = vec![generated_compaction.audit_id.clone()];
@@ -4428,14 +4446,22 @@ impl SessionEngine {
                                 active_turn_transcript_with_tool_results_omitted: None,
                                 summary_max_chars: self.compaction.summary_max_chars,
                             };
-                            // Summary 先完成本地预算检查；超限时不能并发启动无效的 recap provider 请求。
-                            let generated_compaction = self
-                                .generate_compaction_summary(session, &summary_inputs, emit)
-                                .await?;
+                            let prepared_summary =
+                                self.prepare_compaction_summary_request(&summary_inputs)?;
+                            let (summary_result, recap_result) = tokio::join!(
+                                self.generate_prepared_compaction_summary(
+                                    session,
+                                    &summary_inputs,
+                                    prepared_summary,
+                                    emit,
+                                ),
+                                self.prepare_finalize_segment(recap_segment),
+                            );
+                            let generated_compaction = summary_result?;
                             generated_audit_ids.push(generated_compaction.audit_id.clone());
                             let compaction = generated_compaction.outcome;
                             let (used_claim_ids, prepared_claims, prepared_disputes) =
-                                audit_try!(self.prepare_finalize_segment(recap_segment).await);
+                                audit_try!(recap_result);
                             let summary = audit_try!(validate_compaction_summary_text(
                                 audit_try!(compaction.committed_summary.with_context(|| {
                                     "compaction summary missing committed_summary"
@@ -4805,6 +4831,19 @@ impl SessionEngine {
     where
         F: FnMut(SessionEvent),
     {
+        let prepared = self.prepare_compaction_summary_request(inputs)?;
+        self.generate_prepared_compaction_summary(session, inputs, prepared, emit)
+            .await
+    }
+
+    /// 构造并验证压缩摘要请求，但不进行 provider 调用。
+    ///
+    /// 该阶段必须在 recap 前完成，避免 compact 已确定无法执行时仍消耗一次
+    /// recap 模型调用。通过后调用方可安全地并发执行摘要与 recap。
+    fn prepare_compaction_summary_request(
+        &self,
+        inputs: &CompactionSummaryInputs<'_>,
+    ) -> anyhow::Result<PreparedCompactionSummaryRequest> {
         let system_prompt = self
             .prompt_registry
             .render(
@@ -4874,7 +4913,28 @@ impl SessionEngine {
                 }
             }
         }
-        let payload_preview = audit_text_preview(&user_text, COMPACTION_AUDIT_PREVIEW_CHARS);
+        Ok(PreparedCompactionSummaryRequest {
+            system_prompt,
+            provider_messages,
+            payload_preview: audit_text_preview(&user_text, COMPACTION_AUDIT_PREVIEW_CHARS),
+        })
+    }
+
+    async fn generate_prepared_compaction_summary<F>(
+        &self,
+        session: &SessionHandle,
+        inputs: &CompactionSummaryInputs<'_>,
+        prepared: PreparedCompactionSummaryRequest,
+        emit: &mut F,
+    ) -> anyhow::Result<GeneratedCompactionSummary>
+    where
+        F: FnMut(SessionEvent),
+    {
+        let PreparedCompactionSummaryRequest {
+            system_prompt,
+            provider_messages,
+            payload_preview,
+        } = prepared;
         let audit_id = compaction_audit_id(session, &inputs.audit, &payload_preview.hash);
         self.append_compaction_audit_event(
             session,
