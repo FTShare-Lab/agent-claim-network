@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
 
-use super::ToolCallSkipReason;
+use super::{ProviderRecoveryInterrupt, ToolCallSkipReason};
 
 #[derive(Debug, Default)]
 struct DispatchState {
@@ -19,6 +19,7 @@ struct DispatchState {
 struct ToolBoundaryControlInner {
     dispatch: Mutex<DispatchState>,
     cancellation: CancellationToken,
+    recovery_cancellation: ProviderRecoveryInterrupt,
 }
 
 /// 一个 session turn 独占的工具派发线性化控制面。
@@ -33,6 +34,7 @@ impl ToolBoundaryControl {
             inner: Arc::new(ToolBoundaryControlInner {
                 dispatch: Mutex::new(DispatchState::default()),
                 cancellation: CancellationToken::new(),
+                recovery_cancellation: ProviderRecoveryInterrupt::new(),
             }),
         }
     }
@@ -76,6 +78,12 @@ impl ToolBoundaryControl {
         self.inner.cancellation.clone()
     }
 
+    /// steer 与显式取消都会关闭后续 provider retry、continuation 和 fallback，
+    /// 但该 token 不用于打断已经在正常运行的 provider request 或工具调用。
+    pub(crate) fn recovery_cancellation_token(&self) -> ProviderRecoveryInterrupt {
+        self.inner.recovery_cancellation.clone()
+    }
+
     fn set_cancel_reason(&self, reason: ToolCallSkipReason, replace_existing: bool) {
         let changed = {
             let mut dispatch = lock_dispatch_state(&self.inner.dispatch);
@@ -87,10 +95,13 @@ impl ToolBoundaryControl {
                 false
             }
         };
-        // steer 只关闭后续 dispatch，已启动的工具必须自然收束到安全边界；只有用户的
-        // 明确取消才会向运行中工具发送取消 token。
-        if changed && replace_existing {
-            self.inner.cancellation.cancel();
+        if changed {
+            // steer 不打断当前 request/工具，但不能在它失败或结束后再启动 retry、
+            // continuation 或 fallback。显式取消额外打断当前运行单元。
+            self.inner.recovery_cancellation.cancel();
+            if replace_existing {
+                self.inner.cancellation.cancel();
+            }
         }
     }
 }

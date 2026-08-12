@@ -81,6 +81,7 @@ agent_id = "agent-a"
 - `provider`：agent 主对话 LLM provider。模板默认推荐 `openai_responses`，也支持 `openai_chat` 和 `anthropic`。Chat 与 Responses 是彼此独立的 wire protocol，ACN 不在两者之间自动降级。
 - `endpoint`：与所选 provider 兼容的 LLM HTTP 地址，必须是绝对 HTTP(S) URL。可以填写服务 base URL，也可以填写完整请求 URL；OpenAI-compatible 的常见 base URL 形如 `https://llm.example.com/v1`，Anthropic-compatible 的常见 base URL 形如 `https://llm.example.com`。根 URL 会分别补全为 `/v1/chat/completions`、`/v1/responses` 或 `/v1/messages`；已有路径的 base URL 会追加相应末段，完整请求 URL 保持不变。
 - `model`：模型名，以配置文件为准。
+- `supports_websockets`：可选，默认 `false`。仅 `openai_responses` 可设为 `true`；请只在 endpoint 明确支持 Responses WebSocket 协议时开启。
 - `reasoning_effort`：控制 agent 主 LLM 的推理强度，可选值为 `none`、`low`、`medium`、`high`、`xhigh`、`max`，未配置时默认 `none`。未配置或设为 `none` 时不发送推理强度参数。
 - `anthropic_thinking`：只作用于 `provider = "anthropic"`，可选值为 `auto`、`enabled`、`adaptive`、`disabled`，默认 `auto`。`auto` 不发送 `thinking`，沿用上游默认行为；其他值显式发送对应 `thinking.type`。不作用于 Responses 或 Chat。
 - `anthropic_thinking_budget_tokens`：只作用于 `anthropic_thinking = "enabled"` 的可选 `thinking.budget_tokens`。未配置时不发送；选择 `adaptive`、`disabled` 或 `auto` 时也不发送。它不从 `reasoning_effort` 或 `max_tokens` 推导。
@@ -181,6 +182,11 @@ ACN 会用有效配置、选中的 upstream 和 finalize 所需凭据摘要生�
       "type": "streamable_http",
       "url": "https://mcp.linear.app/mcp",
       "bearer_token_env_var": "LINEAR_API_KEY"
+    },
+    "oauth-server": {
+      "type": "streamable_http",
+      "url": "https://example.com/mcp",
+      "oauth_client_id": "public-client-id"
     }
   }
 }
@@ -189,7 +195,7 @@ ACN 会用有效配置、选中的 upstream 和 finalize 所需凭据摘要生�
 MCP server 按连接方式分两类：
 
 - `stdio`：进程型 MCP server。ACN 会按 `command` / `args` 启动一个子进程，并通过 stdin/stdout 与它通信；适合 `npx`、`uvx`、本机脚本或本机二进制。它的文件、网络和环境变量权限等同 ACN 进程。
-- `streamable_http`：HTTP endpoint 型 MCP server。ACN 不启动子进程，只向 `url` 发 HTTP MCP 请求；这个 endpoint 可以是 localhost、内网地址或公网服务。需要 token 时通过 `bearer_token_env_var` 指定环境变量，不建议把真实 token 写进配置文件。
+- `streamable_http`：远程 HTTP MCP server。可匿名访问，也可使用 bearer token 或 OAuth。
 
 常用命令：
 
@@ -197,13 +203,15 @@ MCP server 按连接方式分两类：
 - `acn mcp get <name> [--json]`
 - `acn mcp add <name> [-e KEY=VALUE] [--env-var KEY] -- <command...>`
 - `acn mcp add <name> --url <url> [--bearer-token-env-var ENV]`
+- `acn mcp add <name> --url <url> [--oauth-client-id ID] [--oauth-callback-port PORT] [--oauth-credentials-store keyring|file]`
 - `acn mcp add-json <name> '<server-json>'`
 - `acn mcp remove <name>`
 - `acn mcp enable <name>` / `acn mcp disable <name>`
+- `acn mcp login <name> [--no-browser]` / `acn mcp logout <name>`
 
 字段要点：
 
-- `enabled` 可选，默认 `true`；disable / enable 只切换这个字段，不删除 server 配置。
+- `enabled` 可选，默认 `true`。
 - 默认 enabled 的 server 会在 TUI 启动时被自动连接；`acn mcp status` 不带 server name 时会连接所有 enabled server。
 - `acn mcp status <name>` 只连接并检查指定 server，不会启动其他 enabled server。
 - `stdio` MCP server 会作为本地子进程运行，权限等同 ACN 进程。只添加可信 server；不确定来源建议先 disable，确认后再 enable/status。
@@ -211,9 +219,15 @@ MCP server 按连接方式分两类：
 - `enabled_tools` / `disabled_tools` 按 MCP server 原始 tool name 过滤。
 - `-e KEY=VALUE` 会把 value 写入 `.mcp.json`，真实 token 推荐用 `--env-var KEY` 或 `--bearer-token-env-var ENV`。
 - `add-json` 接受单个 `McpServerConfig` JSON，支持上文列出的全部字段，不接受完整的 `{"mcpServers": {...}}`。输入的 `type: "http"` 会规范化并保存为 `type: "streamable_http"`。
-- 不要在 `add-json` 中直接写入 token；stdio 使用 `env_vars`，远程 HTTP 使用 `bearer_token_env_var`。未知字段以及尚未支持的 `sse`、`oauth`、`headers` 会被拒绝。
-- 当前不支持 OAuth、浏览器授权回调和 MCP elicitation；需要这类交互鉴权的 server 暂时不能完成登录。
-- 外部修改 `.mcp.json` 后，已运行的 TUI 不会热加载；需要重启 TUI，或后续使用专门的 reload 能力。
+- 不要在 `add-json` 中写入 token；stdio 使用 `env_vars`，远程 HTTP 使用 `bearer_token_env_var`。
+- `oauth_client_id` 仅用于服务方提供的预注册 public client ID；未配置时登录会动态注册 public client。
+- `oauth_callback_port` 仅在服务方要求固定 redirect URI 时配置；否则使用随机端口。
+- `oauth_credentials_store` 可取 `keyring`（默认）或 `file`；没有系统 keyring 的 headless 环境使用 `file`。
+- bearer 与 OAuth 选项互斥。OAuth server 添加后执行 `acn mcp login <name>`；SSH/headless 环境使用 `--no-browser`。
+- OAuth access token 会在 MCP 调用前按授权服务器返回的有效期自动刷新；静态 bearer token 不会由 ACN 刷新。登录失效或修改 `oauth_client_id` 后需要重新执行 `login`。
+- `logout` 删除本地 OAuth 凭据；`remove` 删除配置并清理对应的本地凭据。
+- 当前不支持旧版独立 SSE transport、自定义 HTTP headers、OAuth client secret、device flow、MCP Tasks 与 MCP elicitation；Streamable HTTP 返回的 SSE event stream 正常支持。
+- `.mcp.json` 不会自动热加载；修改已有 server 后可在 `/mcp` 中 Reconnect，新增、删除或重命名 server 需要重启 TUI 后生效。
 
 ### `[agent.memory]`
 

@@ -413,6 +413,7 @@ pub enum DelegationTranscriptKind {
 pub enum DelegationTranscriptMessageSource {
     Objective,
     Steering,
+    ModelContext,
     Assistant,
     ToolResult,
     CompactionSummary,

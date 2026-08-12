@@ -330,6 +330,8 @@ impl StructuredJsonCaller {
             tools: Vec::new(),
             max_tokens: self.max_tokens,
             stream: false,
+            runtime_chain_id: None,
+            recovery_interrupt: None,
             retry_count_override: None,
         };
 
@@ -355,6 +357,8 @@ impl StructuredJsonCaller {
             tools: Vec::new(),
             max_tokens: self.max_tokens,
             stream: false,
+            runtime_chain_id: None,
+            recovery_interrupt: None,
             retry_count_override,
         };
 
@@ -509,6 +513,7 @@ fn is_terminal_structured_json_block(block: &SessionTurnContentBlock) -> bool {
         block,
         SessionTurnContentBlock::Image { .. }
             | SessionTurnContentBlock::Document { .. }
+            | SessionTurnContentBlock::ModelContext { .. }
             | SessionTurnContentBlock::SkillInstructions { .. }
             | SessionTurnContentBlock::ToolUse { .. }
             | SessionTurnContentBlock::ToolResult { .. }
@@ -524,6 +529,9 @@ fn structured_text_from_message(message: &SessionTurnMessage) -> anyhow::Result<
     for block in &message.content {
         match block {
             SessionTurnContentBlock::Text { text: part } => text.push_str(part),
+            SessionTurnContentBlock::ModelContext { .. } => {
+                anyhow::bail!("结构化 JSON 响应不能包含 ModelContext block");
+            }
             SessionTurnContentBlock::SkillInstructions { .. } => {
                 anyhow::bail!("结构化文本响应不能包含 SkillInstructions block");
             }

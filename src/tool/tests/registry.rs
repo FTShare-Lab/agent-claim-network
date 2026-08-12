@@ -421,6 +421,9 @@ pub(super) fn stdio_mcp_tool_script() -> &'static str {
 while IFS= read -r line; do
 id="$(response_id "$line")"
 case "$line" in
+  *'"method":"server/discover"'*)
+    printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id"
+    ;;
   *'"method":"initialize"'*)
     printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"stdio-tool-mock","version":"1.0.0"}}}\n' "$id"
     ;;
@@ -448,6 +451,9 @@ timestamp() {
 while IFS= read -r line; do
   id=$(response_id "$line")
   case "$line" in
+    *'"method":"server/discover"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id"
+      ;;
     *'"method":"initialize"'*)
       printf '{"event":"initialize","pid":%s,"ts":%s}\n' "$$" "$(timestamp)" >> "$MCP_FIXTURE_LOG"
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"parallel-stdio-mock","version":"1.0.0"}}}\n' "$id"
@@ -499,6 +505,12 @@ pub(super) async fn parallel_mcp_test_response(
     let id = payload.get("id").cloned().unwrap_or(Value::Null);
     let method = payload.get("method").and_then(Value::as_str).unwrap_or("");
     match method {
+        "server/discover" => axum::Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32601, "message": "Method not found"},
+        }))
+        .into_response(),
         "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
         "initialize" => mcp_test_json_response(
             id,

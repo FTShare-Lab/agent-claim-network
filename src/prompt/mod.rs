@@ -347,6 +347,26 @@ mod tests {
     }
 
     #[test]
+    fn repository_claim_guidance_prioritizes_reusable_decisions() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let reg = PromptRegistry::new(&root).unwrap();
+        let out = reg.render("what_is_claim", ()).unwrap();
+
+        assert!(out.contains(
+            "优先保留会显著影响未来决策、任务成败，或减少高成本重复探索的非显而易见结论"
+        ));
+        assert!(out.contains("关键约束、不变量和决策边界的完整判断"));
+        assert!(out.contains("适用条件、限定或因果依据"));
+        assert!(out.contains("才适合单独成为 claim"));
+        assert!(out.contains("不要把多个彼此无关的判断强行合并"));
+        assert!(out.contains("架构关系背后的因果判断"));
+        assert!(out.contains("重要成功或失败路径"));
+        assert!(out.contains("适用条件、因果解释和行动含义"));
+        assert!(out.contains("搜索顺序、命令流水、一次性错误或未验证猜测"));
+        assert!(out.contains("不能单独证明一条 claim 应为 `high`"));
+    }
+
+    #[test]
     fn repository_agent_system_mentions_skills_as_protocol() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
         let reg = PromptRegistry::new(&root).unwrap();
@@ -510,6 +530,11 @@ mod tests {
         assert!(out.contains("必须输出完整属性和 `status`"));
         assert!(out.contains("仍相关的来源 id 需要一并返回"));
         assert!(out.contains("后端也会忽略并把新 claim 初始化为 `active`"));
+        assert!(out.contains("# claim 提炼步骤"));
+        assert!(out.contains("关键决策节点"));
+        assert!(out.contains("不要把这些要素单独摘成缺少判断含义的碎片"));
+        assert!(out.contains("已显著消耗探索成本"));
+        assert!(out.contains("不要为了覆盖清单而为每一类凑 claim"));
         assert!(!out.contains("`router_context`："));
         assert!(!out.contains("router_context.candidate_claims"));
         assert!(!out.contains("transcript、router_context 或 local_claims"));

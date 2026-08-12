@@ -16,20 +16,20 @@ use crate::api::{
     estimated_projected_segment_tokens, large_tool_result_omission_text,
     omit_turn_messages_tool_results, project_compaction_input_media,
     project_compaction_input_tool_results, project_turn_message_tool_results,
-    provider_safe_segments, ProviderHistoryMediaPolicy, ProviderReplayIdentity,
-    SessionTurnContentBlock, SessionTurnMessage, TurnMessage,
+    provider_anchor_end_index, provider_safe_segments, ProviderHistoryMediaPolicy,
+    ProviderReplayIdentity, SessionTurnContentBlock, SessionTurnMessage, TurnMessage,
     FILE_EDIT_AUTHORITY_COMPACTION_NOTICE,
 };
 pub(super) use crate::api::{active_segment_messages, MessageRange, ProviderProjectionBudget};
 use crate::session::{
-    ActiveTurnCompactionCursor, SessionCompactionState, SessionContentBlock, SessionMessage,
-    SessionMessageRole,
+    ActiveTurnCompactionCursor, CompactedProviderHistory, SessionCompactionState,
+    SessionContentBlock, SessionMessage, SessionMessageRole, SessionMetadata,
 };
 
 use super::transcript::{
-    flatten_session_content_lossy, is_real_user_turn, provider_replay_generation_start_refs,
-    session_message_to_turn_message, session_messages_to_provider_turn_messages,
-    turn_messages_to_transcript,
+    flatten_session_content_lossy, is_model_context_message, is_real_user_turn,
+    provider_replay_generation_start_refs, session_message_to_turn_message,
+    session_messages_to_provider_turn_messages, turn_messages_to_transcript,
 };
 use super::MEDIA_BLOCK_ESTIMATED_TOKENS;
 
@@ -150,6 +150,21 @@ pub(super) fn compacted_context_for_turn(
             session_messages_to_provider_turn_messages(messages, media_policy, replay_identity),
         ));
     };
+    if let Some(provider_history) =
+        replayable_compacted_provider_history(metadata, messages.len(), replay_identity.as_ref())
+    {
+        let mut history = provider_history.messages.clone();
+        history.extend(session_messages_to_provider_turn_messages(
+            messages
+                .iter()
+                .skip(provider_history.canonical_message_until)
+                .cloned()
+                .collect(),
+            media_policy,
+            replay_identity,
+        ));
+        return Ok((system_prompt.to_string(), history));
+    }
     let committed_message_until = compaction.committed_message_until();
     if committed_message_until == 0 && compaction.committed_summary().trim().is_empty() {
         return Ok((
@@ -192,6 +207,27 @@ pub(super) fn compacted_context_for_turn(
     ));
     history.extend(committed_suffix);
     Ok((system_prompt.to_string(), history))
+}
+
+/// 返回可在本轮原样重放的已发送 Provider 窗口。
+///
+/// pending write-ahead 的 canonical cursor 可以暂时领先于落盘 transcript；稳定 cursor
+/// 则必须落在 canonical 边界内。调用方同时用它确定不可再次规范化的 wire 前缀。
+pub(super) fn replayable_compacted_provider_history<'a>(
+    metadata: &'a SessionMetadata,
+    canonical_message_count: usize,
+    replay_identity: Option<&ProviderReplayIdentity>,
+) -> Option<&'a CompactedProviderHistory> {
+    metadata
+        .compaction
+        .as_ref()?
+        .provider_history
+        .as_deref()
+        .filter(|history| {
+            history.replay_identity.as_ref() == replay_identity
+                && (history.canonical_message_until <= canonical_message_count
+                    || history.pending_turn.is_some())
+        })
 }
 
 pub(super) fn compacted_committed_summary_message(
@@ -303,6 +339,7 @@ pub(super) fn assistant_turn_end_text_after(
         .skip(user_index.saturating_add(1))
         .take_while(|message| {
             message.role == SessionMessageRole::Assistant
+                || is_model_context_message(message)
                 || message
                     .content
                     .iter()
@@ -371,20 +408,6 @@ pub(super) fn project_provider_context(
         .map(|cursor| cursor.compacted_until_segment)
         .unwrap_or(0);
     let system_prompt = base_system_prompt.to_string();
-    let committed_summary_message =
-        compacted_committed_summary_message(compaction.committed_summary());
-    let committed_suffix = session_messages_to_provider_turn_messages(
-        session_messages
-            .iter()
-            .skip(committed_message_until)
-            .cloned()
-            .collect(),
-        media_policy,
-        replay_identity,
-    )
-    .into_iter()
-    .map(|message| project_turn_message_tool_results(message, budget.tool_result_raw_max_chars))
-    .collect::<Vec<_>>();
     let active_projection = project_active_suffix(
         active_suffix,
         active_compacted_until_segment,
@@ -392,28 +415,62 @@ pub(super) fn project_provider_context(
         active_turn_summary,
         protected_active_tail_segments,
     );
-    let mandatory_tokens = committed_summary_message
-        .as_ref()
-        .map(|message| estimate_session_turn_messages_tokens(std::slice::from_ref(message)))
-        .unwrap_or(0)
-        .saturating_add(estimate_session_turn_messages_tokens(&committed_suffix))
-        .saturating_add(estimate_session_turn_messages_tokens(
-            &active_projection.messages,
+    let mut messages = if let Some(provider_history) =
+        compaction.provider_history.as_ref().filter(|history| {
+            history.replay_identity.as_ref() == replay_identity.as_ref()
+                && (history.canonical_message_until <= session_messages.len()
+                    || history.pending_turn.is_some())
+        }) {
+        let mut messages = provider_history.messages.clone();
+        messages.extend(session_messages_to_provider_turn_messages(
+            session_messages
+                .iter()
+                .skip(provider_history.canonical_message_until)
+                .cloned()
+                .collect(),
+            media_policy,
+            replay_identity,
         ));
-    let preserve_limit = raw_preserve_budget_after_mandatory(
-        budget.tail_token_limit,
-        budget.tail_hard_token_limit,
-        mandatory_tokens,
-    );
-    let mut messages = committed_summary_message.into_iter().collect::<Vec<_>>();
-    messages.extend(compacted_committed_raw_preserves(
-        session_messages,
-        committed_message_until,
-        preserve_limit,
-        budget.tail_previous_real_user_turns,
-        budget.tool_result_raw_max_chars,
-    ));
-    messages.extend(committed_suffix);
+        messages
+    } else {
+        let committed_summary_message =
+            compacted_committed_summary_message(compaction.committed_summary());
+        let committed_suffix = session_messages_to_provider_turn_messages(
+            session_messages
+                .iter()
+                .skip(committed_message_until)
+                .cloned()
+                .collect(),
+            media_policy,
+            replay_identity,
+        )
+        .into_iter()
+        .map(|message| project_turn_message_tool_results(message, budget.tool_result_raw_max_chars))
+        .collect::<Vec<_>>();
+        let mandatory_tokens = committed_summary_message
+            .as_ref()
+            .map(|message| estimate_session_turn_messages_tokens(std::slice::from_ref(message)))
+            .unwrap_or(0)
+            .saturating_add(estimate_session_turn_messages_tokens(&committed_suffix))
+            .saturating_add(estimate_session_turn_messages_tokens(
+                &active_projection.messages,
+            ));
+        let preserve_limit = raw_preserve_budget_after_mandatory(
+            budget.tail_token_limit,
+            budget.tail_hard_token_limit,
+            mandatory_tokens,
+        );
+        let mut messages = committed_summary_message.into_iter().collect::<Vec<_>>();
+        messages.extend(compacted_committed_raw_preserves(
+            session_messages,
+            committed_message_until,
+            preserve_limit,
+            budget.tail_previous_real_user_turns,
+            budget.tool_result_raw_max_chars,
+        ));
+        messages.extend(committed_suffix);
+        messages
+    };
     let active_start_index = messages.len();
     let protected_tail_start_index = active_projection
         .protected_tail_start_index
@@ -439,23 +496,25 @@ pub(super) fn project_active_suffix(
     active_turn_summary: Option<&str>,
     protected_tail_segments: usize,
 ) -> ActiveSuffixProjection {
-    let Some(anchor) = active_suffix.first().cloned() else {
+    if active_suffix.is_empty() {
         return ActiveSuffixProjection {
             messages: Vec::new(),
             protected_tail_start_index: None,
         };
-    };
+    }
+    let anchor_end = provider_anchor_end_index(&active_suffix);
+    let anchor = active_suffix[..anchor_end].to_vec();
     let segments = active_provider_safe_segments(&active_suffix);
     let compacted_until_segment = compacted_until_segment.min(segments.len());
     let protected_message_start = (protected_tail_segments > 0
         && protected_tail_segments <= segments.len())
     .then(|| segments[segments.len() - protected_tail_segments].start);
     let skip_messages_until = if compacted_until_segment == 0 {
-        1
+        anchor_end
     } else {
         segments[compacted_until_segment - 1].end
     };
-    let mut projected = vec![anchor];
+    let mut projected = anchor;
     let summary_inserted = compacted_until_segment > 0
         && active_turn_summary
             .map(str::trim)
@@ -481,7 +540,7 @@ pub(super) fn project_active_suffix(
     let protected_tail_start_index = protected_message_start.and_then(|original_start| {
         let skipped = original_start.checked_sub(skip_messages_until)?;
         Some(
-            1usize
+            anchor_end
                 .saturating_add(usize::from(summary_inserted))
                 .saturating_add(skipped),
         )
@@ -612,6 +671,37 @@ pub(super) fn validate_session_compaction_state(
                 metadata.message_count
             );
         }
+        if let Some(history) = compaction.provider_history.as_ref() {
+            if let Some(pending) = history.pending_turn.as_ref() {
+                if pending.base_message_count > metadata.message_count
+                    || history.canonical_message_until < pending.base_message_count
+                {
+                    anyhow::bail!(
+                        "session {} compaction pending provider_history cursor 无效: base={}, until={}, message_count={}",
+                        metadata.id,
+                        pending.base_message_count,
+                        history.canonical_message_until,
+                        metadata.message_count
+                    );
+                }
+                if pending
+                    .provider_request_message_count
+                    .is_some_and(|count| count > history.messages.len())
+                {
+                    anyhow::bail!(
+                        "session {} compaction pending provider request boundary 大于 history messages={}",
+                        metadata.id,
+                        history.messages.len()
+                    );
+                }
+            } else if history.canonical_message_until > metadata.message_count {
+                anyhow::bail!(
+                    "session {} compaction provider_history canonical_message_until 大于 message_count={}",
+                    metadata.id,
+                    metadata.message_count
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -661,7 +751,8 @@ pub(super) fn estimated_session_message_tokens_projected<'a>(
         let mut canonical_tokens = 0usize;
         for block in &message.content {
             match block {
-                SessionContentBlock::Text { text } => {
+                SessionContentBlock::Text { text }
+                | SessionContentBlock::ModelContext { text, .. } => {
                     canonical_tokens = canonical_tokens.saturating_add(estimate_text_tokens(text));
                 }
                 SessionContentBlock::SkillInstructions { instruction } => {

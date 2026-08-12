@@ -55,6 +55,7 @@ use crate::mcp::client::McpProgressEvent;
 use crate::mcp::connection_manager::{McpConnectionManager, McpToolProgressReporter};
 use crate::mcp::name::is_mcp_visible_tool_name;
 use crate::mcp::redact::redact_mcp_sensitive_text;
+use crate::mcp::tool::McpToolRoute;
 use crate::router::http_client::RouterClientError;
 use crate::router::{AgentQuery, RouterClient};
 use crate::session::{SessionMetadata, SessionPaths, SessionStatus};
@@ -222,6 +223,9 @@ pub struct ToolDispatchContext {
     pub progress_tx: Option<mpsc::UnboundedSender<ToolProgressUpdate>>,
     /// 仅用于支持当前 turn 可中断的长时间工具调用。
     pub cancellation: Option<CancellationToken>,
+    /// 本次 Provider sampling 实际看到的 MCP 路由。`Some` 表示模型调用必须严格
+    /// 受该快照约束；即使当前 catalog 已出现同名 replacement，也不能改投新 generation。
+    pub(crate) provider_mcp_routes: Option<Arc<BTreeMap<String, McpToolRoute>>>,
     /// 同一 assistant 响应内，阻止在同路径前序写失败后继续假定中间状态。
     pub(crate) failed_file_write_paths: Option<Arc<Mutex<BTreeSet<PathBuf>>>>,
 }

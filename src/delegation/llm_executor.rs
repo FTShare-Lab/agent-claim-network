@@ -17,8 +17,9 @@ use super::types::{
     DelegationTranscriptMessageSource,
 };
 use crate::api::{
-    AgentTurnLoop, ProviderAdapter, SessionAttachment, SessionTurn, SessionTurnContentBlock,
-    SessionTurnEvent, SessionTurnEventRecorder, SessionTurnMessage, SessionTurnPreflight,
+    AgentTurnLoop, ModelContextSource, ProviderAdapter, ProviderRuntimeChainId, SessionAttachment,
+    SessionTurn, SessionTurnContentBlock, SessionTurnContextAppender, SessionTurnEvent,
+    SessionTurnEventRecorder, SessionTurnHooks, SessionTurnMessage, SessionTurnPreflight,
     SessionTurnRequest, StructuredJsonCaller, ToolExecutionOutcome,
 };
 use crate::attachment::AttachmentLimits;
@@ -232,6 +233,7 @@ impl DelegationExecutor for LlmDelegationExecutor {
                 self.tool_input_journal_preview_chars,
                 self.tool_output_journal_preview_chars,
             );
+        let runtime_chain_id = ProviderRuntimeChainId::new();
         let runtime_context = self
             .tool_registry_template
             .delegation_runtime_context()
@@ -266,19 +268,6 @@ impl DelegationExecutor for LlmDelegationExecutor {
                 }
             }
         });
-        progress
-            .append_transcript_entry(DelegationTranscriptEntry {
-                at: chrono::Utc::now(),
-                kind: DelegationTranscriptKind::Message {
-                    source: DelegationTranscriptMessageSource::Objective,
-                    message: SessionTurnMessage::user_text(delegation_user_text(
-                        &metadata,
-                        &context.initial_steering,
-                    )),
-                },
-            })
-            .await
-            .map_err(|err| DelegationExecutionError::new(err.to_string()))?;
         let mut transcript_recorder = DelegationTranscriptRecorder {
             progress: progress.clone(),
         };
@@ -336,25 +325,36 @@ impl DelegationExecutor for LlmDelegationExecutor {
                 progress: progress.clone(),
                 last_seq: last_steering_seq,
             };
+            let background_tools = Arc::new(self.tool_registry_template.clone());
+            let mut context_appender = DelegationBackgroundContextAppender::new(
+                Arc::clone(&background_tools),
+                metadata.parent_session_id.clone(),
+                metadata.id.to_string(),
+            );
             let mut composite_preflight = DelegationCompositePreflight {
                 steering: &mut steering_preflight,
                 compactor: &mut compactor,
-                background: DelegationBackgroundProcessPreflight::new(
-                    Arc::new(self.tool_registry_template.clone()),
-                    metadata.parent_session_id.clone(),
-                    metadata.id.to_string(),
-                ),
+                tools: background_tools,
+                session_id: metadata.parent_session_id.clone(),
+                subagent_id: metadata.id.to_string(),
+                history_replaced_since_last_check: false,
             };
             turn_loop
-                .run_session_turn_with_hooks(
+                .run_session_turn_with_context_and_runtime_chain_hooks(
                     request,
+                    Vec::new(),
+                    runtime_chain_id,
                     &mut emit,
                     None,
-                    Some(&mut transcript_recorder),
-                    Some(&mut composite_preflight),
+                    SessionTurnHooks::new(
+                        Some(&mut transcript_recorder),
+                        Some(&mut context_appender),
+                        Some(&mut composite_preflight),
+                    ),
                 )
                 .await
         };
+        turn_loop.discard_runtime_chain(runtime_chain_id).await;
         drop(event_tx);
         if let Err(err) = event_recorder.await {
             log::warn!(target: "delegation", "{} event recorder join 失败: {err:#}", metadata.id);
@@ -365,9 +365,6 @@ impl DelegationExecutor for LlmDelegationExecutor {
         process_cleanup_guard.disarm();
         let outcome = async {
             let turn = turn_result.map_err(|err| DelegationExecutionError::new(err.to_string()))?;
-            append_completed_turn_messages(&progress, &turn)
-                .await
-                .map_err(|err| DelegationExecutionError::new(err.to_string()))?;
             let summary = assistant_text_from_turn(&turn);
             let summary = if summary.trim().is_empty() {
                 "subagent completed without textual result".to_string()
@@ -441,25 +438,6 @@ fn delegation_user_text(metadata: &DelegationMetadata, steering: &[DelegationSte
     text
 }
 
-async fn append_completed_turn_messages(
-    progress: &DelegationProgressSink,
-    turn: &SessionTurn,
-) -> anyhow::Result<()> {
-    for (idx, completed) in turn.messages.iter().enumerate() {
-        if idx == 0 {
-            continue;
-        }
-        let source = transcript_source_for_message(&completed.message);
-        progress
-            .append_transcript_entry(transcript_entry_for_message(
-                source,
-                completed.message.clone(),
-            ))
-            .await?;
-    }
-    Ok(())
-}
-
 struct DelegationSteeringPreflight {
     progress: DelegationProgressSink,
     last_seq: u64,
@@ -468,109 +446,61 @@ struct DelegationSteeringPreflight {
 struct DelegationCompositePreflight<'a> {
     steering: &'a mut DelegationSteeringPreflight,
     compactor: &'a mut DelegationPreflightCompactor,
-    background: DelegationBackgroundProcessPreflight,
-}
-
-/// 子代理同样需要每次 request 的 owner-scoped runtime projection；它放在 compactor
-/// 之后，绝不进入 delegation transcript 或 compaction summary。
-struct DelegationBackgroundProcessPreflight {
     tools: Arc<ToolRegistry>,
     session_id: SessionId,
     subagent_id: String,
-    placement: Option<DelegationBackgroundProjectionPlacement>,
-    projection: Option<String>,
+    history_replaced_since_last_check: bool,
+}
+
+/// child 与 main 共用 append-on-semantic-change，只改变 owner scope 与持久化目标。
+struct DelegationBackgroundContextAppender {
+    tools: Arc<ToolRegistry>,
+    session_id: SessionId,
+    subagent_id: String,
     completion_delivery_ids: Vec<crate::tool::ProcessCompletionDeliveryReceipt>,
 }
 
-enum DelegationBackgroundProjectionPlacement {
-    AppendedText { message_index: usize },
-    InsertedMessage { message_index: usize },
-}
-
-impl DelegationBackgroundProcessPreflight {
+impl DelegationBackgroundContextAppender {
     fn new(tools: Arc<ToolRegistry>, session_id: SessionId, subagent_id: String) -> Self {
         Self {
             tools,
             session_id,
             subagent_id,
-            placement: None,
-            projection: None,
             completion_delivery_ids: Vec::new(),
         }
     }
+}
 
-    /// 从上一 request 移除 runtime-only projection，并为即将发起的 request 读取一次新的快照。
-    /// 此时尚未插入，因而 compactor 可以把它排除在 transcript 之外但预留 token。
-    async fn prepare_provider_request(
+#[async_trait]
+impl SessionTurnContextAppender for DelegationBackgroundContextAppender {
+    async fn observe_context(
         &mut self,
-        provider_messages: &mut Vec<SessionTurnMessage>,
-    ) -> bool {
-        let mut removed_projection = false;
-        if let Some(placement) = self.placement.take() {
-            match placement {
-                DelegationBackgroundProjectionPlacement::AppendedText { message_index } => {
-                    if let Some(message) = provider_messages.get_mut(message_index) {
-                        let _ = message.content.pop();
-                        removed_projection = true;
-                    }
-                }
-                DelegationBackgroundProjectionPlacement::InsertedMessage { message_index } => {
-                    if message_index < provider_messages.len() {
-                        provider_messages.remove(message_index);
-                        removed_projection = true;
-                    }
-                }
-            }
-        }
+        _provider_messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<Vec<SessionTurnMessage>> {
         self.tools
             .rollback_process_deliveries_for_owner(&self.session_id, Some(&self.subagent_id))
             .await;
-        let (projection, completion_delivery_ids) = self
+        let (projection, delivery_ids) = self
             .tools
             .begin_background_process_projection_delivery_for_owner(
                 &self.session_id,
                 Some(&self.subagent_id),
             )
             .await;
-        self.projection = projection;
-        self.completion_delivery_ids = completion_delivery_ids;
-        removed_projection
-    }
-
-    fn reserved_tokens(&self) -> usize {
-        self.projection.as_ref().map_or(0, |projection| {
-            crate::api::estimate_session_turn_messages_tokens(&[SessionTurnMessage::user_text(
-                projection,
-            )])
-        })
-    }
-
-    /// compaction 完成后才把 snapshot 附着到最后一条 user message，保持 Anthropic
-    /// `tool_result` 所在 user message 的相邻角色约束。
-    async fn insert_projection(&mut self, provider_messages: &mut Vec<SessionTurnMessage>) {
-        let Some(projection) = self.projection.clone() else {
-            return;
+        self.completion_delivery_ids = delivery_ids;
+        let text = match projection {
+            Some(text) => Some(text),
+            None => Some(ToolRegistry::empty_background_process_projection()),
         };
-        if let Some((message_index, message)) = provider_messages
-            .iter_mut()
-            .enumerate()
-            .last()
-            .filter(|(_, message)| message.role == "user")
-        {
-            message
-                .content
-                .push(SessionTurnContentBlock::text(projection));
-            self.placement =
-                Some(DelegationBackgroundProjectionPlacement::AppendedText { message_index });
-        } else {
-            let message_index = provider_messages.len();
-            provider_messages.push(SessionTurnMessage::user_text(projection));
-            self.placement =
-                Some(DelegationBackgroundProjectionPlacement::InsertedMessage { message_index });
-        }
+        Ok(text
+            .map(|text| {
+                SessionTurnMessage::model_context(ModelContextSource::BackgroundProcess, text)
+            })
+            .into_iter()
+            .collect())
     }
 
-    async fn after_provider_response_success(&mut self) {
+    async fn after_provider_response_success(&mut self) -> anyhow::Result<()> {
         if !self.completion_delivery_ids.is_empty() {
             self.tools
                 .commit_completion_notification_delivery_for_owner(
@@ -581,6 +511,7 @@ impl DelegationBackgroundProcessPreflight {
                 .await;
             self.completion_delivery_ids.clear();
         }
+        Ok(())
     }
 }
 
@@ -645,6 +576,20 @@ impl SessionTurnEventRecorder for DelegationTranscriptRecorder {
             .await
             .map_err(anyhow::Error::from)
     }
+
+    async fn record_completed_message(
+        &mut self,
+        message: &crate::api::CompletedSessionTurnMessage,
+    ) -> anyhow::Result<()> {
+        let source = transcript_source_for_message(&message.message);
+        self.progress
+            .append_transcript_entry(transcript_entry_for_message(
+                source,
+                message.message.clone(),
+            ))
+            .await
+            .map_err(anyhow::Error::from)
+    }
 }
 
 #[async_trait]
@@ -682,7 +627,7 @@ impl SessionTurnPreflight for DelegationSteeringPreflight {
 
 #[async_trait]
 impl SessionTurnPreflight for DelegationCompositePreflight<'_> {
-    async fn before_provider_request(
+    async fn before_context_observation(
         &mut self,
         system_prompt: &mut String,
         provider_messages: &mut Vec<SessionTurnMessage>,
@@ -690,33 +635,38 @@ impl SessionTurnPreflight for DelegationCompositePreflight<'_> {
     ) -> anyhow::Result<()> {
         self.steering
             .before_provider_request(system_prompt, provider_messages, emit)
-            .await?;
-        let removed_background_projection = self
-            .background
-            .prepare_provider_request(provider_messages)
-            .await;
-        if removed_background_projection {
-            self.compactor.clear_runtime_projection_context_anchor();
-        }
+            .await
+    }
+
+    async fn before_provider_request(
+        &mut self,
+        system_prompt: &mut String,
+        provider_messages: &mut Vec<SessionTurnMessage>,
+        emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+    ) -> anyhow::Result<()> {
         self.compactor
-            .before_provider_request_with_runtime_reserve(
-                system_prompt,
-                provider_messages,
-                self.background.reserved_tokens(),
-                emit,
-            )
+            .before_provider_request(system_prompt, provider_messages, emit)
             .await?;
         if self.compactor.take_compacted_since_last_check() {
-            self.background
-                .tools
-                .clear_delegation_file_read_state(
-                    &self.background.session_id,
-                    &self.background.subagent_id,
-                )
+            self.history_replaced_since_last_check = true;
+            self.tools
+                .clear_delegation_file_read_state(&self.session_id, &self.subagent_id)
                 .await;
         }
-        self.background.insert_projection(provider_messages).await;
         Ok(())
+    }
+
+    fn history_replacement_expected(
+        &self,
+        system_prompt: &str,
+        provider_messages: &[SessionTurnMessage],
+    ) -> bool {
+        self.compactor
+            .history_replacement_expected(system_prompt, provider_messages)
+    }
+
+    fn take_history_replaced_since_last_check(&mut self) -> bool {
+        std::mem::take(&mut self.history_replaced_since_last_check)
     }
 
     fn request_context_window_recovery(
@@ -725,11 +675,6 @@ impl SessionTurnPreflight for DelegationCompositePreflight<'_> {
     ) -> anyhow::Result<()> {
         self.compactor
             .request_context_window_recovery(assistant_marker)
-    }
-
-    async fn after_provider_response_success(&mut self) -> anyhow::Result<()> {
-        self.background.after_provider_response_success().await;
-        Ok(())
     }
 
     fn observe_provider_context_usage(
@@ -943,6 +888,7 @@ fn file_mutation_evidence_from_tool_results(turn: &SessionTurn) -> FileMutationE
                     }
                 }
                 SessionTurnContentBlock::Text { .. }
+                | SessionTurnContentBlock::ModelContext { .. }
                 | SessionTurnContentBlock::SkillInstructions { .. }
                 | SessionTurnContentBlock::Image { .. }
                 | SessionTurnContentBlock::Document { .. } => {}
@@ -991,6 +937,7 @@ fn append_text_blocks(message: &SessionTurnMessage, out: &mut String) {
             }
             SessionTurnContentBlock::Image { .. }
             | SessionTurnContentBlock::Document { .. }
+            | SessionTurnContentBlock::ModelContext { .. }
             | SessionTurnContentBlock::SkillInstructions { .. }
             | SessionTurnContentBlock::ToolUse { .. }
             | SessionTurnContentBlock::ToolResult { .. } => {}
@@ -1090,6 +1037,82 @@ mod tests {
             panic!("expected tool_completed with file_change");
         };
         assert_eq!(recorded, &file_change);
+    }
+
+    #[tokio::test]
+    async fn transcript_recorder_persists_completed_messages_in_provider_order() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = DelegationStore::new(dir.path().join("sessions/session_aaaaaaaa"));
+        let metadata = store
+            .create_with_id_factory(
+                DelegationCreateRequest {
+                    parent_session_id: SessionId::from_str("session_aaaaaaaa")
+                        .expect("valid session id"),
+                    parent_turn_id: "turn-1".into(),
+                    owner_agent_id: AgentId::new("agent-a").expect("valid agent id"),
+                    title: "ordered transcript".into(),
+                    role: "verifier".into(),
+                    objective: "verify order".into(),
+                    constraints: Vec::new(),
+                },
+                || DelegationId::from_str("subagent_11111112").expect("valid subagent id"),
+            )
+            .await
+            .expect("create subagent");
+        let progress = DelegationProgressSink::for_test(store.clone(), metadata.id.clone());
+        let mut recorder = DelegationTranscriptRecorder { progress };
+        let messages = vec![
+            SessionTurnMessage::model_context(
+                ModelContextSource::Runtime,
+                "<runtime_context>date</runtime_context>",
+            ),
+            SessionTurnMessage::model_context(
+                ModelContextSource::BackgroundProcess,
+                "<background_processes>empty</background_processes>",
+            ),
+            SessionTurnMessage::user_text("Objective:\nverify order"),
+            SessionTurnMessage::assistant_text("done"),
+        ];
+        for message in &messages {
+            recorder
+                .record_completed_message(&CompletedSessionTurnMessage::new(
+                    message.clone(),
+                    Utc::now(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let entries = store
+            .read_transcript_entries(&metadata.id)
+            .await
+            .expect("read transcript");
+        let persisted = entries
+            .into_iter()
+            .map(|entry| match entry.kind {
+                DelegationTranscriptKind::Message { source, message } => (source, message),
+                other => panic!("unexpected transcript entry: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            persisted
+                .iter()
+                .map(|(source, _)| *source)
+                .collect::<Vec<_>>(),
+            vec![
+                DelegationTranscriptMessageSource::ModelContext,
+                DelegationTranscriptMessageSource::ModelContext,
+                DelegationTranscriptMessageSource::Objective,
+                DelegationTranscriptMessageSource::Assistant,
+            ]
+        );
+        assert_eq!(
+            persisted
+                .into_iter()
+                .map(|(_, message)| message)
+                .collect::<Vec<_>>(),
+            messages
+        );
     }
 
     #[test]

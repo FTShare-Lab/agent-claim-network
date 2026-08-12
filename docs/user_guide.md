@@ -222,6 +222,19 @@ acn mcp add linear \
   --bearer-token-env-var LINEAR_API_KEY
 ```
 
+添加并登录 OAuth server：
+
+```bash
+acn mcp add oauth-server --url https://example.com/mcp
+acn mcp login oauth-server
+```
+
+常用可选项：
+
+- 服务方提供预注册 public client ID 时，添加 server 时传入 `--oauth-client-id <id>`。
+- SSH/headless 环境添加 server 时传入 `--oauth-credentials-store file`，登录时使用 `--no-browser`。
+- 服务方要求固定 redirect URI 时，添加 server 时传入 `--oauth-callback-port <port>`。
+
 添加单个 JSON 配置：
 
 ```bash
@@ -253,14 +266,20 @@ acn mcp status my-server
 acn mcp disable my-server
 acn mcp enable my-server
 acn mcp remove my-server
+acn mcp login my-server
+acn mcp login my-server --no-browser
+acn mcp logout my-server
 ```
 
 注意：
 
 - `-e KEY=VALUE` 会把值写入 `.mcp.json`，不要用于敏感 token。
 - stdio server 继承 ACN 进程权限，只添加可信命令。
-- 当前支持 stdio 与 Streamable HTTP；不支持 OAuth 登录、浏览器授权回调、SSE transport、自定义 HTTP headers 和 MCP elicitation。
-- 外部修改 `.mcp.json` 后需要重启 TUI。TUI 内启用或禁用 server 会持久化 `enabled` 字段。
+- bearer 与 OAuth 配置互斥；bearer server 不需要执行 `mcp login`。
+- OAuth access token 会在 MCP 调用前按授权服务器返回的有效期自动刷新；静态 bearer token 不会由 ACN 刷新。登录失效或修改 `--oauth-client-id` 后，重新执行 `acn mcp login <name>`。
+- `acn mcp logout <name>` 删除本地 OAuth 凭据；`remove` 同时删除配置和对应的本地凭据。
+- 当前不支持旧版独立 SSE transport、自定义 HTTP headers、OAuth client secret、device flow、MCP Tasks 与 MCP elicitation；Streamable HTTP 返回的 SSE event stream 正常支持。
+- `.mcp.json` 不会自动热加载；修改已有 server 后可在 `/mcp` 中 Reconnect，新增、删除或重命名 server 需要重启 TUI 后生效。
 
 ## 后台进程
 

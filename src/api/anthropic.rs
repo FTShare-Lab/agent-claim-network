@@ -26,9 +26,10 @@ use super::continuation::{
 use super::endpoint::{resolve_llm_endpoint, LlmEndpointKind};
 use super::llm_http::{read_llm_error_body, LlmHttpError, LlmHttpPhase};
 use super::provider::{
-    ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy, ProviderNoConsumableOutput,
-    ProviderReplayIdentity, ProviderReplayProtocol, ProviderRequest, ProviderResponse,
-    ProviderStop, ProviderStreamFailure, ProviderTerminalFailure, ToolSpec,
+    NoopProviderRequestObserver, ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy,
+    ProviderNoConsumableOutput, ProviderReplayIdentity, ProviderReplayProtocol, ProviderRequest,
+    ProviderRequestObserver, ProviderRequestPreparationFailure, ProviderResponse, ProviderStop,
+    ProviderStreamFailure, ProviderTerminalFailure, ToolSpec,
 };
 use super::redact_media_error_body;
 use super::types::{SessionTurnContentBlock, SessionTurnEvent, SessionTurnMessage};
@@ -60,6 +61,8 @@ pub enum AnthropicError {
     NoConsumableOutput { reason: String },
     #[error("Anthropic streaming 返回确定性错误: {reason}")]
     TerminalFailure { reason: String },
+    #[error("准备 Anthropic continuation request 失败: {reason}")]
+    RequestPreparation { reason: String },
     #[error("prompt 渲染失败: {0}")]
     Prompt(#[from] PromptError),
     #[error(
@@ -96,6 +99,41 @@ pub struct AnthropicProviderAdapter {
     client: AnthropicMessagesClient,
 }
 
+/// 把 Anthropic adapter 内部的每次 max-token continuation 投影为
+/// provider-neutral 只追加 suffix，供 turn loop 在真实请求前写 WAL。
+struct AnthropicContinuationRequestObserver<'a> {
+    messages: Vec<SessionTurnMessage>,
+    model: String,
+    observer: &'a mut (dyn ProviderRequestObserver + Send),
+}
+
+impl AnthropicContinuationRequestObserver<'_> {
+    async fn before_request(&mut self) -> Result<(), AnthropicError> {
+        self.observer
+            .before_provider_request(&self.messages)
+            .await
+            .map_err(|error| AnthropicError::RequestPreparation {
+                reason: format!("{error:#}"),
+            })
+    }
+
+    fn push_round(&mut self, replay_messages: Vec<Value>, text: String) {
+        let content = if text.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![SessionTurnContentBlock::text(text)]
+        };
+        self.messages.push(SessionTurnMessage {
+            role: "assistant".into(),
+            content,
+            provider_replay: Some(crate::api::ProviderReplayState::AnthropicMessages {
+                model: self.model.clone(),
+                messages: replay_messages,
+            }),
+        });
+    }
+}
+
 impl AnthropicMessagesClient {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -108,7 +146,7 @@ impl AnthropicMessagesClient {
         retry_base_delay: Duration,
         retry_max_delay: Duration,
     ) -> Result<Self, AnthropicError> {
-        let http = reqwest::Client::builder()
+        let http = crate::http_client_builder()
             .timeout(timeout)
             .build()
             .map_err(|error| {
@@ -242,6 +280,7 @@ impl AnthropicMessagesClient {
             .map_err(|error| self.http_error(error, LlmHttpPhase::DecodeJsonBody))
     }
 
+    #[cfg(test)]
     async fn send_text_with_continuation_for_provider_with_retry_count(
         &self,
         system: &str,
@@ -257,10 +296,36 @@ impl AnthropicMessagesClient {
             max_tokens,
             retry_count,
             false,
+            None,
         )
         .await
     }
 
+    async fn send_text_with_continuation_for_provider_with_retry_count_observed(
+        &self,
+        system: &str,
+        messages: &mut Vec<ApiMessage>,
+        tools: Option<Vec<ApiToolDefinition>>,
+        max_tokens: u32,
+        retry_count: u32,
+        observer: &mut AnthropicContinuationRequestObserver<'_>,
+    ) -> Result<ContinuedAssistantTurn, AnthropicError> {
+        self.send_text_with_continuation_with_policy(
+            system,
+            messages,
+            tools,
+            max_tokens,
+            retry_count,
+            false,
+            Some(observer),
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "continuation 协议、retry 与 request observer 需显式穿过同一边界"
+    )]
     async fn send_text_with_continuation_with_policy(
         &self,
         system: &str,
@@ -269,6 +334,7 @@ impl AnthropicMessagesClient {
         max_tokens: u32,
         retry_count: u32,
         error_on_unresolved_max_tokens: bool,
+        mut request_observer: Option<&mut AnthropicContinuationRequestObserver<'_>>,
     ) -> Result<ContinuedAssistantTurn, AnthropicError> {
         let mut merged_text = String::new();
         let mut last_response: Option<Value> = None;
@@ -277,6 +343,9 @@ impl AnthropicMessagesClient {
         let mut replay_messages = Vec::new();
 
         for round in 0..=MAX_CONTINUATION_TURNS {
+            if let Some(observer) = request_observer.as_deref_mut() {
+                observer.before_request().await?;
+            }
             let body = self.request_for(system, messages.clone(), tools.clone(), max_tokens, None);
             let response = self.send_with_retry_count(&body, retry_count).await?;
             let assistant_blocks =
@@ -290,10 +359,9 @@ impl AnthropicMessagesClient {
                 "content": assistant_blocks.clone(),
             });
             messages.push(ApiMessage::raw(assistant_replay.clone()));
-            replay_messages.push(assistant_replay);
-            if let Some(text) = extract_text_blocks(&response) {
-                append_with_overlap_dedupe(&mut merged_text, &text);
-            }
+            replay_messages.push(assistant_replay.clone());
+            let round_text = extract_text_blocks(&response).unwrap_or_default();
+            append_with_overlap_dedupe(&mut merged_text, &round_text);
             last_stop_reason = stop_reason.clone();
             last_blocks = assistant_blocks;
             last_response = Some(response);
@@ -320,7 +388,10 @@ impl AnthropicMessagesClient {
             }
             let continuation = json!({"role": "user", "content": CONTINUATION_TRIGGER});
             messages.push(ApiMessage::raw(continuation.clone()));
-            replay_messages.push(continuation);
+            replay_messages.push(continuation.clone());
+            if let Some(observer) = request_observer.as_deref_mut() {
+                observer.push_round(vec![assistant_replay, continuation], round_text);
+            }
         }
 
         let final_response = last_response.ok_or_else(|| AnthropicError::OutputShape {
@@ -363,10 +434,32 @@ impl ProviderAdapter for AnthropicProviderAdapter {
         request: ProviderRequest,
         emit: &mut (dyn FnMut(ProviderEvent) + Send),
     ) -> anyhow::Result<ProviderResponse> {
+        let mut observer = NoopProviderRequestObserver;
+        self.send_observed(request, emit, &mut observer).await
+    }
+
+    async fn send_with_request_observer(
+        &self,
+        request: ProviderRequest,
+        emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        observer: &mut (dyn ProviderRequestObserver + Send),
+    ) -> anyhow::Result<ProviderResponse> {
+        self.send_observed(request, emit, observer).await
+    }
+}
+
+impl AnthropicProviderAdapter {
+    async fn send_observed(
+        &self,
+        request: ProviderRequest,
+        emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        observer: &mut (dyn ProviderRequestObserver + Send),
+    ) -> anyhow::Result<ProviderResponse> {
         let retry_count = request
             .retry_count_override
             .unwrap_or(self.client.retry_count);
-        let request_has_media = request.messages.iter().any(|message| {
+        let base_messages = request.messages;
+        let request_has_media = base_messages.iter().any(|message| {
             message.content.iter().any(|block| {
                 matches!(
                     block,
@@ -376,8 +469,13 @@ impl ProviderAdapter for AnthropicProviderAdapter {
             })
         });
         let mut api_messages =
-            session_turn_messages_to_api(request.messages, self.client.model.as_str());
+            session_turn_messages_to_api(base_messages.clone(), self.client.model.as_str());
         let api_tools = tool_specs_to_api(request.tools);
+        let mut request_observer = AnthropicContinuationRequestObserver {
+            messages: base_messages,
+            model: self.client.model.as_str().to_owned(),
+            observer,
+        };
 
         let turn_result = if request.stream {
             let mut provider_emit = |event| match event {
@@ -403,28 +501,33 @@ impl ProviderAdapter for AnthropicProviderAdapter {
                 | SessionTurnEvent::ToolCallInterrupted { .. } => {}
             };
             self.client
-                .send_text_with_continuation_streaming_for_provider_with_retry_count(
+                .send_text_with_continuation_streaming_for_provider_with_retry_count_observed(
                     &request.system_prompt,
                     &mut api_messages,
                     api_tools,
                     request.max_tokens,
                     retry_count,
                     &mut provider_emit,
+                    &mut request_observer,
                 )
                 .await
         } else {
             self.client
-                .send_text_with_continuation_for_provider_with_retry_count(
+                .send_text_with_continuation_for_provider_with_retry_count_observed(
                     &request.system_prompt,
                     &mut api_messages,
                     api_tools,
                     request.max_tokens,
                     retry_count,
+                    &mut request_observer,
                 )
                 .await
         };
         let turn = match turn_result {
             Ok(turn) => turn,
+            Err(AnthropicError::RequestPreparation { reason }) => {
+                return Err(ProviderRequestPreparationFailure::new(reason).into());
+            }
             Err(error) => {
                 if request.stream && anthropic_adapter_stream_failure(&error) {
                     return Err(ProviderStreamFailure::new(error.to_string()).into());
@@ -515,38 +618,39 @@ impl AnthropicProviderAdapter {
 }
 
 fn session_turn_messages_to_api(messages: Vec<SessionTurnMessage>, model: &str) -> Vec<ApiMessage> {
-    messages
-        .into_iter()
-        .flat_map(|message| {
-            if let Some(crate::api::ProviderReplayState::AnthropicMessages {
-                model: replay_model,
-                messages,
-            }) = message.provider_replay
-            {
-                if replay_model == model {
-                    return messages
-                        .into_iter()
-                        .map(ApiMessage::raw)
-                        .collect::<Vec<_>>();
-                }
+    let mut out = Vec::new();
+    for message in messages {
+        if let Some(crate::api::ProviderReplayState::AnthropicMessages {
+            model: replay_model,
+            messages,
+        }) = message.provider_replay
+        {
+            if replay_model == model {
+                out.extend(messages.into_iter().map(ApiMessage::raw));
+                continue;
             }
-            let content = message
-                .content
-                .into_iter()
-                .filter_map(session_turn_block_to_api)
-                .collect::<Vec<_>>();
-            if content.is_empty() {
-                Vec::new()
-            } else {
-                vec![ApiMessage::structured(message.role, content)]
-            }
-        })
-        .collect()
+        }
+        let content = message
+            .content
+            .into_iter()
+            .filter_map(session_turn_block_to_api)
+            .collect::<Vec<_>>();
+        if content.is_empty() {
+            continue;
+        }
+        // Messages API 会在服务端合并连续的同角色 turn。本地保持一条 neutral
+        // message 对应一条 wire message，避免跨已冻结请求边界改写缓存前缀。
+        out.push(ApiMessage::structured(message.role, content));
+    }
+    out
 }
 
 fn session_turn_block_to_api(block: SessionTurnContentBlock) -> Option<Value> {
     match block {
-        SessionTurnContentBlock::Text { text } => Some(json!({"type": "text", "text": text})),
+        SessionTurnContentBlock::Text { text }
+        | SessionTurnContentBlock::ModelContext { text, .. } => {
+            Some(json!({"type": "text", "text": text}))
+        }
         SessionTurnContentBlock::SkillInstructions { instruction } => Some(json!({
             "type": "text",
             "text": crate::skill::render_skill_instructions(&instruction),
@@ -947,6 +1051,7 @@ fn is_retryable(e: &AnthropicError) -> bool {
         | AnthropicError::InvalidEndpoint(_)
         | AnthropicError::Prompt(_)
         | AnthropicError::TerminalFailure { .. }
+        | AnthropicError::RequestPreparation { .. }
         | AnthropicError::NoConsumableOutput { .. } => false,
         // 多模态拒收是确定性 4xx，重试无意义
         AnthropicError::MediaRejected { .. } => false,
@@ -964,6 +1069,7 @@ fn is_stream_retryable(error: &AnthropicError) -> bool {
         | AnthropicError::OutputShape { .. }
         | AnthropicError::NoConsumableOutput { .. }
         | AnthropicError::TerminalFailure { .. }
+        | AnthropicError::RequestPreparation { .. }
         | AnthropicError::Prompt(_)
         | AnthropicError::MediaRejected { .. } => false,
     }
@@ -996,6 +1102,22 @@ mod tests {
 
     use super::*;
 
+    #[derive(Default)]
+    struct RecordingRequestObserver {
+        requests: Vec<Vec<SessionTurnMessage>>,
+    }
+
+    #[async_trait]
+    impl ProviderRequestObserver for RecordingRequestObserver {
+        async fn before_provider_request(
+            &mut self,
+            messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            self.requests.push(messages.to_vec());
+            Ok(())
+        }
+    }
+
     fn client_with_reasoning_effort(reasoning_effort: ReasoningEffort) -> AnthropicMessagesClient {
         let mut client = AnthropicMessagesClient::new(
             "key".into(),
@@ -1021,6 +1143,86 @@ mod tests {
         assert_eq!(
             adapter.history_media_policy(),
             ProviderHistoryMediaPolicy::Preserve
+        );
+    }
+
+    #[test]
+    fn model_context_keeps_anthropic_wire_prefix_stable_without_local_role_merge() {
+        let prefix = vec![
+            SessionTurnMessage::model_context(
+                crate::api::ModelContextSource::Runtime,
+                "<runtime_context>stable</runtime_context>",
+            ),
+            SessionTurnMessage::model_context(
+                crate::api::ModelContextSource::BackgroundProcess,
+                "<background_processes>empty</background_processes>",
+            ),
+            SessionTurnMessage::user_text("first request"),
+        ];
+        let first =
+            serde_json::to_value(session_turn_messages_to_api(prefix.clone(), "test-model"))
+                .unwrap();
+        let mut extended = prefix;
+        extended.push(SessionTurnMessage::assistant_text("first answer"));
+        extended.push(SessionTurnMessage::user_text("second request"));
+        let second =
+            serde_json::to_value(session_turn_messages_to_api(extended, "test-model")).unwrap();
+        let first_messages = first.as_array().unwrap();
+        let second_messages = second.as_array().unwrap();
+
+        assert!(second_messages.starts_with(first_messages));
+        assert_eq!(first_messages.len(), 3);
+        assert!(first_messages
+            .iter()
+            .all(|message| message["role"] == "user"));
+        assert_eq!(
+            first_messages[0]["content"][0]["text"],
+            "<runtime_context>stable</runtime_context>"
+        );
+        assert_eq!(
+            first_messages[1]["content"][0]["text"],
+            "<background_processes>empty</background_processes>"
+        );
+        assert_eq!(first_messages[2]["content"][0]["text"], "first request");
+        assert!(!first.to_string().contains("sha256-v1"));
+    }
+
+    #[test]
+    fn model_context_after_tool_result_keeps_distinct_anthropic_wire_message() {
+        let messages = vec![
+            SessionTurnMessage {
+                role: "assistant".into(),
+                content: vec![SessionTurnContentBlock::ToolUse {
+                    id: "toolu_1".into(),
+                    name: "file_read".into(),
+                    input: json!({"path":"README.md"}),
+                }],
+                provider_replay: None,
+            },
+            SessionTurnMessage::user_content(vec![SessionTurnContentBlock::ToolResult {
+                tool_use_id: "toolu_1".into(),
+                content: "done".into(),
+            }]),
+            SessionTurnMessage::model_context(
+                crate::api::ModelContextSource::BackgroundProcess,
+                "<background_processes>changed</background_processes>",
+            ),
+        ];
+
+        let body =
+            serde_json::to_value(session_turn_messages_to_api(messages, "test-model")).unwrap();
+        let api_messages = body.as_array().unwrap();
+
+        assert_eq!(api_messages.len(), 3);
+        assert_eq!(api_messages[0]["role"], "assistant");
+        assert_eq!(api_messages[1]["role"], "user");
+        assert_eq!(api_messages[1]["content"][0]["type"], "tool_result");
+        assert_eq!(api_messages[1]["content"][0]["tool_use_id"], "toolu_1");
+        assert_eq!(api_messages[2]["role"], "user");
+        assert_eq!(api_messages[2]["content"][0]["type"], "text");
+        assert_eq!(
+            api_messages[2]["content"][0]["text"],
+            "<background_processes>changed</background_processes>"
         );
     }
 
@@ -1469,6 +1671,76 @@ mod tests {
         let replayed_messages = serde_json::to_value(&messages[1..]).unwrap();
         assert!(replayed_messages.to_string().contains("private-one"));
         assert!(replayed_messages.to_string().contains(CONTINUATION_TRIGGER));
+    }
+
+    #[tokio::test]
+    async fn non_streaming_continuation_observer_matches_exact_anthropic_messages() {
+        let responses = vec![
+            json!({
+                "content":[
+                    {"type":"thinking", "thinking":"private-one", "signature":"sig-one"},
+                    {"type":"text", "text":"first "}
+                ],
+                "stop_reason":"max_tokens",
+                "usage":{"input_tokens":1,"output_tokens":2}
+            }),
+            json!({
+                "content":[{"type":"text", "text":"second"}],
+                "stop_reason":"end_turn",
+                "usage":{"input_tokens":3,"output_tokens":4}
+            }),
+        ];
+        let (endpoint, requests) = spawn_json_server(responses).await;
+        let adapter = AnthropicProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            128,
+            Duration::from_secs(2),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let mut observer = RecordingRequestObserver::default();
+
+        adapter
+            .send_with_request_observer(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 128,
+                    stream: false,
+                    runtime_chain_id: None,
+                    recovery_interrupt: None,
+                    retry_count_override: None,
+                },
+                &mut |_| {},
+                &mut observer,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(observer.requests.len(), 2);
+        assert!(observer.requests[1].starts_with(&observer.requests[0]));
+        let observed_second = serde_json::to_value(session_turn_messages_to_api(
+            observer.requests[1].clone(),
+            "test-model",
+        ))
+        .unwrap();
+        let captured = requests.lock().unwrap();
+        let captured_second: Value = serde_json::from_str(
+            captured[1]
+                .split_once("\r\n\r\n")
+                .map(|(_, body)| body)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            observed_second, captured_second["messages"],
+            "observer 上报的 neutral history 必须映射为同一份 Anthropic messages"
+        );
     }
 
     #[tokio::test]

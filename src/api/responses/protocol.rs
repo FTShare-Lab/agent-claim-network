@@ -50,6 +50,7 @@ pub enum ResponsesTerminal {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReducedResponses {
+    pub response_id: Option<String>,
     pub output_items: Vec<Value>,
     pub output_text: String,
     pub function_calls: Vec<ResponsesFunctionCall>,
@@ -134,6 +135,11 @@ pub fn reduce_response_value(value: Value) -> Result<ReducedResponses, Responses
         }
     }
     Ok(ReducedResponses {
+        response_id: object
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_string),
         output_items,
         output_text,
         function_calls,

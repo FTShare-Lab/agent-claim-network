@@ -5,6 +5,16 @@
 use super::*;
 
 impl ToolRegistry {
+    pub(crate) fn subscribe_delegation_activity_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<tokio::sync::watch::Receiver<u64>>, ToolError> {
+        let Some(host) = &self.delegation_host else {
+            return Ok(None);
+        };
+        Ok(Some(host.runner_for(session_id)?.subscribe_activity()))
+    }
+
     pub async fn abandon_delegations_for_session(
         &self,
         session_id: &SessionId,

@@ -18,10 +18,11 @@ use crate::api::{
     estimated_projected_segment_tokens, omit_turn_messages_tool_results,
     project_compaction_input_media, project_compaction_input_tool_results,
     project_turn_message_for_safe_transcript, project_turn_message_tool_results,
-    project_turn_messages_tool_results, provider_safe_segments, ContextUsageSnapshot,
-    ContextUsageSource, ProviderProjectionBudget, SessionTurnContentBlock, SessionTurnEvent,
-    SessionTurnMessage, SessionTurnPreflight, StructuredJsonAttemptRequest, StructuredJsonCaller,
-    ToolSpec, FILE_EDIT_AUTHORITY_COMPACTION_NOTICE,
+    project_turn_messages_tool_results, provider_anchor_end_index, provider_safe_segments,
+    trailing_model_context_segments, ContextUsageSnapshot, ContextUsageSource,
+    ProviderProjectionBudget, SessionTurnContentBlock, SessionTurnEvent, SessionTurnMessage,
+    SessionTurnPreflight, StructuredJsonAttemptRequest, StructuredJsonCaller, ToolSpec,
+    FILE_EDIT_AUTHORITY_COMPACTION_NOTICE,
 };
 use crate::config::SessionCompactionConfig;
 use crate::prompt::PromptRegistry;
@@ -107,6 +108,18 @@ impl DelegationPreflightCompactor {
             .unwrap_or(full_estimate)
     }
 
+    pub(crate) fn history_replacement_expected(
+        &self,
+        system_prompt: &str,
+        provider_messages: &[SessionTurnMessage],
+    ) -> bool {
+        auto_compact_threshold(self.context_window, self.compaction.auto_compact_ctx_ratio)
+            .is_some_and(|threshold| {
+                self.context_window_recovery_requested
+                    || self.trigger_context_tokens(system_prompt, provider_messages) >= threshold
+            })
+    }
+
     async fn maybe_compact(
         &mut self,
         system_prompt: &str,
@@ -140,16 +153,22 @@ impl DelegationPreflightCompactor {
         }
 
         let segments = provider_safe_segments(provider_messages);
-        let protected_tail_segments = match self.context_window_recovery_tail_marker.as_ref() {
+        let recovery_protected_tail_segments = match self
+            .context_window_recovery_tail_marker
+            .as_ref()
+        {
             Some(marker) => {
                 context_recovery_protected_tail_from_marker(provider_messages, &segments, marker)
                     .context("子任务续写状态异常，无法自动恢复")?
             }
             None => 0,
         };
-        if forced_context_recovery && protected_tail_segments == 0 {
+        if forced_context_recovery && recovery_protected_tail_segments == 0 {
             anyhow::bail!("子任务续写状态异常，无法自动恢复");
         }
+        let protected_tail_segments = recovery_protected_tail_segments.max(
+            trailing_model_context_segments(provider_messages, &segments),
+        );
         let Some(plan) = self.build_plan(
             provider_messages,
             runtime_projection_tokens,
@@ -301,8 +320,9 @@ impl DelegationPreflightCompactor {
         Ok(())
     }
 
-    /// 动态 runtime projection 不进入 delegation transcript，因此不能直接交给 compactor；
-    /// 但它必须预留在这一次请求的 token 预算中。
+    /// 旧 runtime-only projection 预算路径的回归辅助；生产路径的持久化 context 已直接
+    /// 包含在 provider_messages 中。
+    #[cfg(test)]
     pub async fn before_provider_request_with_runtime_reserve(
         &mut self,
         system_prompt: &str,
@@ -352,15 +372,21 @@ impl DelegationPreflightCompactor {
             runtime_projection_tokens,
             protected_tail_segments,
         )?;
-        let compact_start_index = 1;
+        let compact_start_index = provider_anchor_end_index(provider_messages);
         let compact_end_index = ranges.compact_end_index;
         if compact_end_index <= compact_start_index {
             return None;
         }
-        let anchor = provider_messages.first()?.clone();
+        let prefix = provider_messages.get(..compact_start_index)?.to_vec();
+        let anchor = prefix
+            .iter()
+            .rev()
+            .find(|message| message.model_context_snapshot().is_none() && message.role == "user")?
+            .clone();
         let compact_source = provider_messages
             .get(compact_start_index..compact_end_index)?
             .iter()
+            .filter(|message| message.model_context_snapshot().is_none())
             .cloned()
             .map(project_compaction_input_media)
             .collect::<Vec<_>>();
@@ -394,6 +420,7 @@ impl DelegationPreflightCompactor {
         Some(CompactionPlan {
             compact_start_index,
             compact_end_index,
+            prefix,
             anchor,
             compact_messages: compact_source,
             compact_messages_with_large_tool_results_omitted,
@@ -419,15 +446,18 @@ impl DelegationPreflightCompactor {
         if compactable_segments == 0 {
             return None;
         }
-        let covered_end = segments.last().map(|segment| segment.end).unwrap_or(1);
+        let anchor_end = provider_anchor_end_index(provider_messages);
+        let covered_end = segments
+            .last()
+            .map(|segment| segment.end)
+            .unwrap_or(anchor_end);
         let suffix_start = if covered_end < provider_messages.len() {
             covered_end
         } else {
             provider_messages.len()
         };
         let budget = self.provider_projection_budget(runtime_projection_tokens);
-        let anchor_tokens =
-            estimate_session_turn_messages_tokens(std::slice::from_ref(&provider_messages[0]));
+        let anchor_tokens = estimate_session_turn_messages_tokens(&provider_messages[..anchor_end]);
         let fixed_tail_start = if protected_tail_segments > 0 {
             segments[compactable_segments].start
         } else {
@@ -625,12 +655,6 @@ impl DelegationPreflightCompactor {
             .await?;
         Ok(())
     }
-
-    /// runtime-only projection 已从 provider messages 移除后，旧 provider usage 不能继续作为
-    /// 本轮 compaction 的 anchor，否则会把已删除 projection 与新的 reserve 重复计数。
-    pub(crate) fn clear_runtime_projection_context_anchor(&mut self) {
-        self.provider_context_anchor = None;
-    }
 }
 
 #[async_trait]
@@ -695,6 +719,7 @@ struct DelegationCompactionPayload {
 struct CompactionPlan {
     compact_start_index: usize,
     compact_end_index: usize,
+    prefix: Vec<SessionTurnMessage>,
     anchor: SessionTurnMessage,
     compact_messages: Vec<SessionTurnMessage>,
     compact_messages_with_large_tool_results_omitted: Vec<SessionTurnMessage>,
@@ -710,8 +735,13 @@ struct CompactionRanges {
 
 impl CompactionPlan {
     fn projected_messages(&self, summary: &str) -> Vec<SessionTurnMessage> {
-        let mut out = Vec::with_capacity(self.tail.len().saturating_add(2));
-        out.push(self.anchor.clone());
+        let mut out = Vec::with_capacity(
+            self.prefix
+                .len()
+                .saturating_add(self.tail.len())
+                .saturating_add(1),
+        );
+        out.extend(self.prefix.clone());
         out.push(delegation_compaction_summary_message(summary));
         out.extend(self.tail.clone());
         out
@@ -781,6 +811,9 @@ pub fn transcript_entry_for_message(
 pub fn transcript_source_for_message(
     message: &SessionTurnMessage,
 ) -> DelegationTranscriptMessageSource {
+    if message.model_context_snapshot().is_some() {
+        return DelegationTranscriptMessageSource::ModelContext;
+    }
     if message.role == "assistant" {
         return DelegationTranscriptMessageSource::Assistant;
     }
@@ -1516,6 +1549,7 @@ mod tests {
             CompactionPlan {
                 compact_start_index: 1,
                 compact_end_index: 3,
+                prefix: vec![SessionTurnMessage::user_text("objective anchor")],
                 anchor: SessionTurnMessage::user_text("objective anchor"),
                 compact_messages: compact_source.clone(),
                 compact_messages_with_large_tool_results_omitted:
@@ -1557,6 +1591,7 @@ mod tests {
         let plan = CompactionPlan {
             compact_start_index: 1,
             compact_end_index: 2,
+            prefix: vec![SessionTurnMessage::user_text("objective anchor")],
             anchor: SessionTurnMessage::user_text("objective anchor"),
             compact_messages: compact_source.clone(),
             compact_messages_with_large_tool_results_omitted: compact_source.clone(),
@@ -1595,6 +1630,7 @@ mod tests {
         let plan = CompactionPlan {
             compact_start_index: 1,
             compact_end_index: 2,
+            prefix: vec![SessionTurnMessage::user_text("objective anchor")],
             anchor: SessionTurnMessage::user_text("objective anchor"),
             compact_messages: vec![SessionTurnMessage::assistant_text("plain summary input")],
             compact_messages_with_large_tool_results_omitted: vec![
@@ -1640,6 +1676,7 @@ mod tests {
         let plan = CompactionPlan {
             compact_start_index: 1,
             compact_end_index: 2,
+            prefix: vec![SessionTurnMessage::user_text("objective anchor")],
             anchor: SessionTurnMessage::user_text("objective anchor"),
             compact_messages: vec![SessionTurnMessage::assistant_text("plain summary input")],
             compact_messages_with_large_tool_results_omitted: vec![
@@ -2011,6 +2048,57 @@ mod tests {
             state.summary,
             "merged summary keeps alpha-token and adds beta-token"
         );
+    }
+
+    #[tokio::test]
+    async fn child_compactor_budgets_and_preserves_frozen_context_rebaseline() {
+        let (_dir, _store, metadata, progress) = started_delegation().await;
+        let provider = Arc::new(JsonProvider::new(vec![json_response(
+            "summary keeps the prior child work",
+        )]));
+        let mut compactor = compactor(metadata, progress, Arc::clone(&provider));
+        compactor.observe_provider_context_usage(
+            6,
+            ContextUsageSnapshot {
+                used_tokens: 500,
+                source: ContextUsageSource::Provider,
+            },
+        );
+        let mut provider_messages = compactable_messages();
+        provider_messages.insert(
+            2,
+            SessionTurnMessage::model_context(
+                crate::api::ModelContextSource::Runtime,
+                "<runtime_context>OLD_CONTEXT_MUST_NOT_BECOME_USER_INTENT</runtime_context>",
+            ),
+        );
+        assert!(compactor
+            .history_replacement_expected("stable subagent system prompt", &provider_messages));
+        let frozen_baseline = vec![
+            SessionTurnMessage::model_context(
+                crate::api::ModelContextSource::Runtime,
+                "<runtime_context>current child date</runtime_context>",
+            ),
+            SessionTurnMessage::model_context(
+                crate::api::ModelContextSource::BackgroundProcess,
+                "<background_processes>current child processes</background_processes>",
+            ),
+        ];
+        provider_messages.extend(frozen_baseline.clone());
+
+        compactor
+            .before_provider_request(
+                &mut "stable subagent system prompt".to_string(),
+                &mut provider_messages,
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert!(compactor.take_compacted_since_last_check());
+        assert!(provider_messages.ends_with(&frozen_baseline));
+        let summary_request = message_text(&provider.requests().await[0].messages);
+        assert!(!summary_request.contains("OLD_CONTEXT_MUST_NOT_BECOME_USER_INTENT"));
     }
 
     #[tokio::test]

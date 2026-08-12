@@ -151,7 +151,9 @@ mod tests {
             socket.write_all(response.as_bytes()).await.unwrap();
         });
 
-        let resp = reqwest::Client::new()
+        let resp = crate::http_client_builder()
+            .build()
+            .unwrap()
             .get(format!("http://{addr}"))
             .send()
             .await

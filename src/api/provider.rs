@@ -5,8 +5,11 @@
 //! HTTP/streaming 与协议形状转换，不执行工具、不解释业务 JSON。
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 use crate::api::{SessionTurnContentBlock, SessionTurnMessage};
 
@@ -17,9 +20,11 @@ pub enum ProviderHistoryMediaPolicy {
 }
 
 /// 当前 adapter 可原样回放的 provider 私有历史协议。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProviderReplayProtocol {
     OpenAiResponses,
+    OpenAiChatCompletions,
     AnthropicMessages,
 }
 
@@ -27,7 +32,7 @@ pub enum ProviderReplayProtocol {
 ///
 /// 原样 replay 只允许回到相同 wire protocol 与精确配置 model；切换任一项都从
 /// canonical history 开始新的 replay 代际，避免跨模型误传私有状态。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderReplayIdentity {
     pub protocol: ProviderReplayProtocol,
     pub model: String,
@@ -60,7 +65,110 @@ pub trait ProviderAdapter: Send + Sync {
         request: ProviderRequest,
         emit: &mut (dyn FnMut(ProviderEvent) + Send),
     ) -> anyhow::Result<ProviderResponse>;
+
+    /// 在 adapter 每一个真实逻辑请求发送前上报其精确
+    /// provider-neutral history。默认 adapter 只有一次请求；内部实现
+    /// max-token continuation 的 adapter 必须覆盖此方法并逐次上报。
+    async fn send_with_request_observer(
+        &self,
+        request: ProviderRequest,
+        emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        observer: &mut (dyn ProviderRequestObserver + Send),
+    ) -> anyhow::Result<ProviderResponse> {
+        observer
+            .before_provider_request(&request.messages)
+            .await
+            .map_err(ProviderRequestPreparationFailure::from_error)?;
+        self.send(request, emit).await
+    }
+
+    /// 丢弃未提交 logical turn 对应的 transport 私有状态；HTTP adapter 默认为空操作。
+    async fn discard_runtime_chain(&self, _chain_id: ProviderRuntimeChainId) {}
 }
+
+/// adapter 内部 continuation 与上层 WAL 之间的最小边界。
+///
+/// 上报的 message vector 必须是实际将转成 wire input/messages 的同一份
+/// 规范化历史，并且只能在上一次之后追加 continuation replay suffix。
+#[async_trait]
+pub trait ProviderRequestObserver: Send {
+    async fn before_provider_request(
+        &mut self,
+        messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<()>;
+}
+
+pub(crate) struct NoopProviderRequestObserver;
+
+#[async_trait]
+impl ProviderRequestObserver for NoopProviderRequestObserver {
+    async fn before_provider_request(
+        &mut self,
+        _messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// 仅用于当前进程内隔离 WebSocket continuation 的调用链身份。
+///
+/// 它不发送给上游，也不写入 session；fresh session、resume 与每个 delegation
+/// 都会得到新的值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProviderRuntimeChainId(u64);
+
+impl ProviderRuntimeChainId {
+    pub fn new() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl Default for ProviderRuntimeChainId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// steer/cancel 之后阻止尚未开始的 provider 恢复动作，但不打断当前 request。
+///
+/// 独立 ID 仅用于保持 `ProviderRequest` 的可比较性；实际通知由 clone 共享的
+/// `CancellationToken` 完成。
+#[derive(Debug, Clone)]
+pub struct ProviderRecoveryInterrupt {
+    id: u64,
+    token: CancellationToken,
+}
+
+impl ProviderRecoveryInterrupt {
+    pub(crate) fn new() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            token: CancellationToken::new(),
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.token.cancel();
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        self.token.cancelled().await;
+    }
+}
+
+impl PartialEq for ProviderRecoveryInterrupt {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for ProviderRecoveryInterrupt {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRequest {
@@ -69,6 +177,10 @@ pub struct ProviderRequest {
     pub tools: Vec<ToolSpec>,
     pub max_tokens: u32,
     pub stream: bool,
+    /// streaming transport 的进程内 chain 身份；非流式内部调用保持 `None`。
+    pub runtime_chain_id: Option<ProviderRuntimeChainId>,
+    /// 只阻止尚未开始的 retry、continuation 与 fallback；不能取消当前正常 request。
+    pub recovery_interrupt: Option<ProviderRecoveryInterrupt>,
     /// 覆盖 adapter 内部的额外 HTTP retry 次数；`None` 使用 provider 配置。
     pub retry_count_override: Option<u32>,
 }
@@ -109,6 +221,27 @@ pub enum ProviderStop {
 #[error("{message}")]
 pub(crate) struct ProviderTerminalFailure {
     message: String,
+}
+
+/// Provider request 尚未发送时，其 write-ahead 准备已失败。
+///
+/// 该错误不能进入 streaming fallback，否则会绕过同一条 WAL 不变量。
+#[derive(Debug, thiserror::Error)]
+#[error("准备 Provider request 失败: {message}")]
+pub(crate) struct ProviderRequestPreparationFailure {
+    message: String,
+}
+
+impl ProviderRequestPreparationFailure {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn from_error(error: anyhow::Error) -> Self {
+        Self::new(format!("{error:#}"))
+    }
 }
 
 /// Streaming response 已损坏或未完整结束，可以安全放弃本次 attempt 并换路径重放。
@@ -230,6 +363,9 @@ pub fn assistant_text_from_message(message: &SessionTurnMessage) -> anyhow::Resu
     for block in &message.content {
         match block {
             SessionTurnContentBlock::Text { text: part } => text.push_str(part),
+            SessionTurnContentBlock::ModelContext { .. } => {
+                anyhow::bail!("结构化文本响应不能包含 ModelContext block");
+            }
             SessionTurnContentBlock::SkillInstructions { .. } => {
                 anyhow::bail!("结构化文本响应不能包含 SkillInstructions block");
             }
@@ -291,5 +427,21 @@ mod tests {
                 source: ContextUsageSource::Provider
             })
         );
+    }
+
+    #[test]
+    fn assistant_text_rejects_internal_model_context_blocks() {
+        let message = SessionTurnMessage {
+            role: "assistant".into(),
+            content: vec![SessionTurnContentBlock::ModelContext {
+                source: crate::api::ModelContextSource::Runtime,
+                fingerprint: "sha256-v1:invalid-provider-output".into(),
+                text: "<runtime_context>must not be provider output</runtime_context>".into(),
+            }],
+            provider_replay: None,
+        };
+
+        let error = assistant_text_from_message(&message).unwrap_err();
+        assert!(error.to_string().contains("ModelContext"));
     }
 }

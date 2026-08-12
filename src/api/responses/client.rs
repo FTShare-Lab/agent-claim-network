@@ -7,9 +7,11 @@ use rand::Rng;
 use super::protocol::{reduce_response_value, ReducedResponses, ResponsesRequest};
 use super::redact_responses_error_body;
 use super::streaming::ResponsesSseDecoder;
+use super::websocket::{ResponsesWebSocketTransport, WebSocketSendOutcome};
 use crate::api::endpoint::{resolve_llm_endpoint, LlmEndpointKind};
 use crate::api::evaluation_usage::{record_evaluation_request_started, record_evaluation_usage};
 use crate::api::llm_http::{read_llm_error_body, LlmHttpError, LlmHttpPhase};
+use crate::api::{ProviderRecoveryInterrupt, ProviderRuntimeChainId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponsesStreamEvent {
@@ -36,6 +38,8 @@ pub enum ResponsesError {
     Failed { message: String },
     #[error("Responses 返回未完成终态: {reason}")]
     Incomplete { reason: String },
+    #[error("Responses recovery interrupted")]
+    RecoveryInterrupted,
 }
 
 pub struct ResponsesClient {
@@ -46,6 +50,7 @@ pub struct ResponsesClient {
     retry_base_delay: Duration,
     retry_max_delay: Duration,
     timeout: Duration,
+    websocket: Option<Arc<ResponsesWebSocketTransport>>,
 }
 
 impl ResponsesClient {
@@ -57,16 +62,14 @@ impl ResponsesClient {
         retry_base_delay: Duration,
         retry_max_delay: Duration,
     ) -> Result<Self, ResponsesError> {
-        let http = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(|error| {
-                ResponsesError::Http(LlmHttpError::new(
-                    error,
-                    LlmHttpPhase::BuildClient,
-                    Some(timeout),
-                ))
-            })?;
+        let builder = crate::http_client_builder().timeout(timeout);
+        let http = builder.build().map_err(|error| {
+            ResponsesError::Http(LlmHttpError::new(
+                error,
+                LlmHttpPhase::BuildClient,
+                Some(timeout),
+            ))
+        })?;
         Ok(Self {
             http,
             endpoint: Arc::new(
@@ -78,7 +81,24 @@ impl ResponsesClient {
             retry_base_delay,
             retry_max_delay,
             timeout,
+            websocket: None,
         })
+    }
+
+    pub(crate) fn with_websockets(mut self, pool_capacity: usize) -> Result<Self, ResponsesError> {
+        self.websocket = Some(Arc::new(ResponsesWebSocketTransport::new(
+            self.endpoint.as_str(),
+            Arc::clone(&self.api_key),
+            pool_capacity,
+            self.timeout,
+        )?));
+        Ok(self)
+    }
+
+    pub(crate) async fn discard_runtime_chain(&self, chain_id: ProviderRuntimeChainId) {
+        if let Some(websocket) = &self.websocket {
+            websocket.discard_runtime_chain(chain_id).await;
+        }
     }
 
     pub(crate) fn retry_count(&self) -> u32 {
@@ -87,6 +107,10 @@ impl ResponsesClient {
 
     pub(crate) fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    pub(crate) fn websockets_enabled(&self) -> bool {
+        self.websocket.is_some()
     }
 
     fn http_error(&self, error: reqwest::Error, phase: LlmHttpPhase) -> ResponsesError {
@@ -108,11 +132,44 @@ impl ResponsesClient {
         retry_count: u32,
         emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
     ) -> Result<ReducedResponses, ResponsesError> {
+        self.send_with_retry_count_for_runtime_chain(request, retry_count, None, None, emit)
+            .await
+    }
+
+    pub(crate) async fn send_with_retry_count_for_runtime_chain(
+        &self,
+        request: &ResponsesRequest,
+        retry_count: u32,
+        runtime_chain_id: Option<ProviderRuntimeChainId>,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+        emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
+    ) -> Result<ReducedResponses, ResponsesError> {
+        ensure_recovery_active(recovery_interrupt)?;
         if request.stream {
-            self.send_streaming_with_retry(request, retry_count, emit)
+            if let (Some(websocket), Some(runtime_chain_id)) = (&self.websocket, runtime_chain_id) {
+                match websocket
+                    .send_with_retry_count(
+                        request,
+                        runtime_chain_id,
+                        retry_count,
+                        self.retry_base_delay,
+                        self.retry_max_delay,
+                        recovery_interrupt,
+                        emit,
+                    )
+                    .await?
+                {
+                    WebSocketSendOutcome::Response(response) => return Ok(response),
+                    WebSocketSendOutcome::FallbackToHttp => {
+                        ensure_recovery_active(recovery_interrupt)?;
+                    }
+                }
+            }
+            self.send_streaming_with_retry(request, retry_count, recovery_interrupt, emit)
                 .await
         } else {
-            self.send_json_with_retry(request, retry_count).await
+            self.send_json_with_retry(request, retry_count, recovery_interrupt)
+                .await
         }
     }
 
@@ -120,9 +177,11 @@ impl ResponsesClient {
         &self,
         request: &ResponsesRequest,
         retry_count: u32,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
     ) -> Result<ReducedResponses, ResponsesError> {
         let mut last_retryable = None;
         for attempt in 0..=retry_count {
+            ensure_recovery_active(recovery_interrupt)?;
             match self.send_json_once(request).await {
                 Ok(value) => return Ok(value),
                 Err(error) if is_retryable(&error) && attempt < retry_count => {
@@ -137,7 +196,7 @@ impl ResponsesClient {
                         error
                     );
                     last_retryable = Some(error);
-                    tokio::time::sleep(backoff).await;
+                    wait_for_backoff(backoff, recovery_interrupt).await?;
                 }
                 Err(error) => return Err(error),
             }
@@ -176,10 +235,12 @@ impl ResponsesClient {
         &self,
         request: &ResponsesRequest,
         retry_count: u32,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
     ) -> Result<ReducedResponses, ResponsesError> {
         let mut last_retryable = None;
         for attempt in 0..=retry_count {
+            ensure_recovery_active(recovery_interrupt)?;
             let mut emitted_visible_text = false;
             let result = {
                 let mut tracking_emit = |event| {
@@ -204,7 +265,7 @@ impl ResponsesClient {
                         error
                     );
                     last_retryable = Some(error);
-                    tokio::time::sleep(backoff).await;
+                    wait_for_backoff(backoff, recovery_interrupt).await?;
                 }
                 Err(error) => return Err(error),
             }
@@ -302,15 +363,48 @@ fn is_retryable(error: &ResponsesError) -> bool {
         | ResponsesError::InvalidEndpoint(_)
         | ResponsesError::OutputShape { .. }
         | ResponsesError::Failed { .. }
-        | ResponsesError::Incomplete { .. } => false,
+        | ResponsesError::Incomplete { .. }
+        | ResponsesError::RecoveryInterrupted => false,
     }
 }
 
-pub(crate) fn is_stream_failure(error: &ResponsesError) -> bool {
+pub(crate) fn is_stream_recovery_failure(error: &ResponsesError) -> bool {
     matches!(error, ResponsesError::StreamFailure { .. })
+        || matches!(error, ResponsesError::Http(error) if error.is_retryable())
 }
 
-fn compute_backoff(attempt: u32, base: Duration, max: Duration) -> Duration {
+fn ensure_recovery_active(
+    recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+) -> Result<(), ResponsesError> {
+    if recovery_interrupt.is_some_and(ProviderRecoveryInterrupt::is_cancelled) {
+        return Err(ResponsesError::RecoveryInterrupted);
+    }
+    Ok(())
+}
+
+async fn wait_for_backoff(
+    backoff: Duration,
+    recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+) -> Result<(), ResponsesError> {
+    if backoff.is_zero() {
+        return ensure_recovery_active(recovery_interrupt);
+    }
+    match recovery_interrupt {
+        Some(interrupt) => {
+            tokio::select! {
+                biased;
+                _ = interrupt.cancelled() => Err(ResponsesError::RecoveryInterrupted),
+                _ = tokio::time::sleep(backoff) => Ok(()),
+            }
+        }
+        None => {
+            tokio::time::sleep(backoff).await;
+            Ok(())
+        }
+    }
+}
+
+pub(super) fn compute_backoff(attempt: u32, base: Duration, max: Duration) -> Duration {
     let factor = 1u32.checked_shl(attempt.min(10)).unwrap_or(u32::MAX);
     let capped = base.saturating_mul(factor).min(max);
     let center = u64::try_from(capped.as_millis()).unwrap_or(u64::MAX);

@@ -125,8 +125,8 @@ pub(crate) struct ProcessCompletion {
     pub(crate) root_session_id: String,
     pub(crate) owner: ProcessOwner,
     pub(crate) process_id: String,
-    /// 仅供 runtime 用来区分被容量淘汰后重用同一 logical process_id 的两次 allocation；
-    /// 不是模型可见字段，也不是 OS PID。
+    /// 区分被容量淘汰后重用同一 logical process_id 的两次 allocation；不是 OS PID。
+    /// lifecycle context 会把它作为稳定语义字段提供给模型。
     pub(crate) instance_id: u64,
     pub(crate) status: String,
     pub(crate) exit_code: Option<i32>,
@@ -684,10 +684,6 @@ impl ManagedProcess {
 
     pub(crate) async fn finished_at(&self) -> Option<SystemTime> {
         *self.finished_at.lock().await
-    }
-
-    pub(crate) async fn final_result_available(&self) -> bool {
-        !self.state().await.is_live()
     }
 
     /// Ctrl-C 是软中断请求：目标可以捕获/忽略 SIGINT，entry 必须继续保持 running，

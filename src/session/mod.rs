@@ -17,7 +17,10 @@ use serde_json::Value;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-use crate::api::{CompletedSessionTurnMessage, ProviderReplayState, SessionTurnContentBlock};
+use crate::api::{
+    CompletedSessionTurnMessage, ModelContextSource, ProviderReplayIdentity, ProviderReplayState,
+    ProviderRuntimeChainId, SessionTurnContentBlock, SessionTurnMessage,
+};
 use crate::claim::{AgentId, Claim, ClaimId, Dispute, DisputeId, SessionId, TraceId};
 use crate::skill::SkillInstructions;
 use crate::storage::{
@@ -35,9 +38,9 @@ pub use turn_journal::{
     canonical_user_content_hash, replay_turn_journal, turn_journal_recovery_context,
     turn_journal_recovery_context_for_chain, CompactionAssetKind, CompactionAssetReference,
     RecoveryContextLimits, TurnJournalEvent, TurnJournalEventKind, TurnJournalFlush,
-    TurnJournalNonStreamingFallback, TurnJournalNonStreamingFallbackState, TurnJournalProjection,
-    TurnJournalRead, TurnJournalStatus, TurnJournalTimelineItem, TurnJournalToolCall,
-    TurnJournalTurn, TurnJournalWarning, TurnJournalWriter,
+    TurnJournalModelContext, TurnJournalNonStreamingFallback, TurnJournalNonStreamingFallbackState,
+    TurnJournalProjection, TurnJournalRead, TurnJournalStatus, TurnJournalTimelineItem,
+    TurnJournalToolCall, TurnJournalTurn, TurnJournalWarning, TurnJournalWriter,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -234,6 +237,35 @@ pub struct SessionCompactionState {
     pub active_turn_summary: Option<String>,
     pub summary_updated_at: DateTime<Utc>,
     pub frontier: CompactionFrontier,
+    /// 最近一次实际发送的 provider-neutral 历史窗口。
+    /// 普通 main request 与 compaction 后请求共用该有界 WAL；后续请求
+    /// 从稳定基线与 canonical cursor 继续追加，禁止重新投影旧前缀。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_history: Option<Box<CompactedProviderHistory>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactedProviderHistory {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_identity: Option<ProviderReplayIdentity>,
+    /// `None` 表示 cursor 已随 canonical commit 确认；`Some` 表示这是当前 turn
+    /// 的 write-ahead 窗口。它可以是最后一次实际请求，也可以暂存尚待 canonical
+    /// commit 接受的 response-inclusive history，cursor 可暂时领先 messages.jsonl。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_turn: Option<PendingProviderHistoryTurn>,
+    pub canonical_message_until: usize,
+    pub messages: Vec<SessionTurnMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingProviderHistoryTurn {
+    pub turn_id: String,
+    pub base_message_count: usize,
+    /// `messages[..provider_request_message_count]` 是本 turn 最后一次真正发给
+    /// Provider 的请求。其后的 response suffix 只有 canonical commit 后才能成为
+    /// 稳定历史；失败、取消或 crash 恢复时必须裁掉。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_request_message_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,6 +298,7 @@ impl SessionCompactionState {
                 committed_message_until,
                 active_turn: None,
             },
+            provider_history: None,
         }
     }
 
@@ -307,6 +340,8 @@ impl<'de> Deserialize<'de> for SessionCompactionState {
             compacted_until: Option<usize>,
             #[serde(default)]
             summary: Option<String>,
+            #[serde(default)]
+            provider_history: Option<Box<CompactedProviderHistory>>,
         }
 
         let wire = Wire::deserialize(deserializer)?;
@@ -325,6 +360,7 @@ impl<'de> Deserialize<'de> for SessionCompactionState {
             active_turn_summary: wire.active_turn_summary,
             summary_updated_at: wire.summary_updated_at,
             frontier,
+            provider_history: wire.provider_history,
         };
         state.normalize_active_turn();
         Ok(state)
@@ -451,6 +487,11 @@ pub enum SessionContentBlock {
     Text {
         text: String,
     },
+    ModelContext {
+        source: ModelContextSource,
+        fingerprint: String,
+        text: String,
+    },
     SkillInstructions {
         instruction: SkillInstructions,
     },
@@ -516,6 +557,15 @@ impl From<SessionTurnContentBlock> for SessionContentBlock {
     fn from(block: SessionTurnContentBlock) -> Self {
         match block {
             SessionTurnContentBlock::Text { text } => Self::Text { text },
+            SessionTurnContentBlock::ModelContext {
+                source,
+                fingerprint,
+                text,
+            } => Self::ModelContext {
+                source,
+                fingerprint,
+                text,
+            },
             SessionTurnContentBlock::SkillInstructions { instruction } => {
                 Self::SkillInstructions { instruction }
             }
@@ -547,6 +597,15 @@ impl From<SessionContentBlock> for SessionTurnContentBlock {
     fn from(block: SessionContentBlock) -> Self {
         match block {
             SessionContentBlock::Text { text } => Self::Text { text },
+            SessionContentBlock::ModelContext {
+                source,
+                fingerprint,
+                text,
+            } => Self::ModelContext {
+                source,
+                fingerprint,
+                text,
+            },
             SessionContentBlock::SkillInstructions { instruction } => {
                 Self::SkillInstructions { instruction }
             }
@@ -785,7 +844,7 @@ impl SessionStore {
                     write_text_atomic(&paths.messages_jsonl, b"").await?;
                     write_text_atomic(&paths.turn_events_jsonl, b"").await?;
                     write_text_atomic(&paths.compaction_events_jsonl, b"").await?;
-                    return Ok(SessionHandle { metadata, paths });
+                    return Ok(SessionHandle::new(metadata, paths));
                 }
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => {
                     last_id = Some(session_id.into_string());
@@ -855,7 +914,7 @@ impl SessionStore {
             if metadata.status != SessionStatus::Closed || metadata.agent_id != *agent_id {
                 continue;
             }
-            let handle = SessionHandle { metadata, paths };
+            let handle = SessionHandle::new(metadata, paths);
             let messages = handle.read_messages().await?;
             let last_user_text = match extract_last_user_text(&messages) {
                 Some(text) => Some(text),
@@ -899,7 +958,7 @@ impl SessionStore {
                 agent_id: agent_id.to_string(),
             });
         }
-        let handle = SessionHandle { metadata, paths };
+        let handle = SessionHandle::new(metadata, paths);
         let messages = handle.read_messages().await?;
         if handle.metadata.message_count != 0
             || !messages.is_empty()
@@ -944,7 +1003,7 @@ impl SessionStore {
                 agent_id: agent_id.to_string(),
             });
         }
-        let mut handle = SessionHandle { metadata, paths };
+        let mut handle = SessionHandle::new(metadata, paths);
         let messages = handle.read_messages().await?;
         validate_and_reconcile_resume_metadata(&mut handle, &messages).await?;
         Ok(handle)
@@ -1245,6 +1304,10 @@ fn is_real_user_message(message: &SessionMessage) -> bool {
         && !message
             .content
             .iter()
+            .any(|block| matches!(block, SessionContentBlock::ModelContext { .. }))
+        && !message
+            .content
+            .iter()
             .any(|block| matches!(block, SessionContentBlock::ToolResult { .. }))
 }
 
@@ -1335,9 +1398,22 @@ fn truncate_for_resume_table(text: &str, max_chars: usize) -> String {
 pub struct SessionHandle {
     pub metadata: SessionMetadata,
     pub paths: SessionPaths,
+    runtime_chain_id: ProviderRuntimeChainId,
 }
 
 impl SessionHandle {
+    fn new(metadata: SessionMetadata, paths: SessionPaths) -> Self {
+        Self {
+            metadata,
+            paths,
+            runtime_chain_id: ProviderRuntimeChainId::new(),
+        }
+    }
+
+    pub(crate) fn runtime_chain_id(&self) -> ProviderRuntimeChainId {
+        self.runtime_chain_id
+    }
+
     async fn lock_session(&self) -> Result<FileLockGuard, SessionStoreError> {
         FileLockGuard::lock_exclusive(&self.paths.session_lock)
             .await
@@ -2866,6 +2942,21 @@ frontier:
     }
 
     #[tokio::test]
+    async fn resume_creates_new_runtime_chain_while_handle_clone_preserves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let agent = agent_id("agent-a");
+        let id = session_id("session_aaaaaaaa");
+        let original = create_session(&store, &agent, id.clone(), Utc::now(), &[], true).await;
+        let original_chain = original.runtime_chain_id();
+        assert_eq!(original.clone().runtime_chain_id(), original_chain);
+
+        let resumed = store.open_existing_session(&agent, &id).await.unwrap();
+
+        assert_ne!(resumed.runtime_chain_id(), original_chain);
+    }
+
+    #[tokio::test]
     async fn open_existing_session_rejects_inconsistent_open_finalized_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path().to_path_buf());
@@ -3350,6 +3441,41 @@ frontier:
     }
 
     #[test]
+    fn model_context_is_not_a_real_or_resumable_user_turn() {
+        let messages = vec![
+            SessionMessage {
+                index: 0,
+                role: SessionMessageRole::User,
+                content: vec![SessionContentBlock::text("real user")],
+                created_at: Utc::now(),
+                model: "test-model".into(),
+                provider_replay: None,
+            },
+            SessionMessage {
+                index: 1,
+                role: SessionMessageRole::User,
+                content: vec![SessionContentBlock::ModelContext {
+                    source: ModelContextSource::Runtime,
+                    fingerprint: "sha256-v1:test".into(),
+                    text: "<runtime_context>hidden</runtime_context>".into(),
+                }],
+                created_at: Utc::now(),
+                model: "test-model".into(),
+                provider_replay: None,
+            },
+        ];
+
+        assert_eq!(count_real_user_turns(&messages), 1);
+        assert_eq!(
+            extract_last_user_text(&messages).as_deref(),
+            Some("real user")
+        );
+        let turns = extract_last_n_timeline_turns(&messages, 5);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user_text, "real user");
+    }
+
+    #[test]
     fn count_real_user_turns_skips_shell_command_records() {
         let messages = vec![
             SessionMessage {
@@ -3425,6 +3551,7 @@ frontier:
                 original_user_request: Some("failed user".into()),
                 canonical_user_content_hash: None,
                 canonical_user_first_text: None,
+                model_context: Vec::new(),
                 skill_instructions: Vec::new(),
                 compaction_assets: Vec::new(),
                 assistant_text: "partial assistant".into(),

@@ -6,6 +6,7 @@
 mod client;
 mod protocol;
 mod streaming;
+mod websocket;
 
 const REDACTED_RESPONSES_PAYLOAD: &str = "[redacted Responses request/replay payload]";
 
@@ -84,7 +85,7 @@ fn contains_responses_payload_key(text: &str) -> bool {
     })
 }
 
-pub(crate) use client::is_stream_failure;
+pub(crate) use client::is_stream_recovery_failure;
 pub use client::{ResponsesClient, ResponsesError, ResponsesStreamEvent};
 pub use protocol::{
     reduce_response_value, ReducedResponses, ResponsesFunctionCall, ResponsesReasoning,

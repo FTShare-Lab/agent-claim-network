@@ -119,6 +119,7 @@ pub(crate) fn project_compaction_input_media(
                 data.len(),
             )),
             SessionTurnContentBlock::Text { .. }
+            | SessionTurnContentBlock::ModelContext { .. }
             | SessionTurnContentBlock::SkillInstructions { .. }
             | SessionTurnContentBlock::ToolUse { .. }
             | SessionTurnContentBlock::ToolResult { .. } => None,
@@ -241,7 +242,7 @@ pub fn large_tool_result_omission_text(original_chars: usize) -> String {
 
 pub fn provider_safe_segments(active_suffix: &[SessionTurnMessage]) -> Vec<MessageRange> {
     let mut ranges = Vec::new();
-    let mut index = 1;
+    let mut index = provider_anchor_end_index(active_suffix);
     while index < active_suffix.len() {
         let message = &active_suffix[index];
         if message.role == "assistant" {
@@ -251,6 +252,7 @@ pub fn provider_safe_segments(active_suffix: &[SessionTurnMessage]) -> Vec<Messa
                 .filter_map(|block| match block {
                     SessionTurnContentBlock::ToolUse { id, .. } => Some(id.as_str()),
                     SessionTurnContentBlock::Text { .. }
+                    | SessionTurnContentBlock::ModelContext { .. }
                     | SessionTurnContentBlock::SkillInstructions { .. }
                     | SessionTurnContentBlock::Image { .. }
                     | SessionTurnContentBlock::Document { .. }
@@ -291,6 +293,42 @@ pub fn provider_safe_segments(active_suffix: &[SessionTurnMessage]) -> Vec<Messa
         break;
     }
     ranges
+}
+
+/// 返回 active history 尾部尚未投递的独立 ModelContext 所占安全段数。
+///
+/// context appender 会在 compaction 前先冻结并持久化这些消息；本次压缩必须原样保留，
+/// 否则 transcript 会记录一份 Provider 从未实际看见的快照。
+pub fn trailing_model_context_segments(
+    messages: &[SessionTurnMessage],
+    segments: &[MessageRange],
+) -> usize {
+    segments
+        .iter()
+        .rev()
+        .take_while(|segment| {
+            segment.end == segment.start.saturating_add(1)
+                && messages
+                    .get(segment.start)
+                    .is_some_and(|message| message.model_context_snapshot().is_some())
+        })
+        .count()
+}
+
+/// active suffix 的不可压缩前缀：零到多条初始 ModelContext，加上首条真实 user/objective。
+pub fn provider_anchor_end_index(messages: &[SessionTurnMessage]) -> usize {
+    let context_end = messages
+        .iter()
+        .take_while(|message| message.model_context_snapshot().is_some())
+        .count();
+    if messages.get(context_end).is_some_and(|message| {
+        message.role == "user"
+            && message.model_context_snapshot().is_none()
+            && !message_contains_tool_result(message)
+    }) {
+        return context_end.saturating_add(1);
+    }
+    context_end.max(usize::from(!messages.is_empty()))
 }
 
 /// provider 明确报告上下文窗口耗尽后，最近的 partial assistant 及其配对 user
@@ -670,6 +708,33 @@ mod tests {
         assert_eq!(
             context_recovery_protected_tail_segments(&messages, &segments),
             1
+        );
+    }
+
+    #[test]
+    fn trailing_model_contexts_are_counted_as_mandatory_compaction_segments() {
+        let messages = vec![
+            SessionTurnMessage::user_text("current task"),
+            SessionTurnMessage::assistant_text("completed an earlier step"),
+            SessionTurnMessage::model_context(
+                crate::api::ModelContextSource::Runtime,
+                "<runtime_context>current_date: 2026-08-11</runtime_context>",
+            ),
+            SessionTurnMessage::model_context(
+                crate::api::ModelContextSource::BackgroundProcess,
+                "<background_processes>state=completed</background_processes>",
+            ),
+        ];
+        let segments = provider_safe_segments(&messages);
+
+        assert_eq!(trailing_model_context_segments(&messages, &segments), 2);
+
+        let with_real_user_tail =
+            [messages, vec![SessionTurnMessage::user_text("new request")]].concat();
+        let segments = provider_safe_segments(&with_real_user_tail);
+        assert_eq!(
+            trailing_model_context_segments(&with_real_user_tail, &segments),
+            0
         );
     }
 }

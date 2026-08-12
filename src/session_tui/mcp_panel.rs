@@ -1353,9 +1353,6 @@ fn exposure_reason(exposure: &McpToolExposure) -> Option<&'static str> {
             reason: McpToolFilterReason::NotInEnabledTools,
         } => Some("not_in_enabled_tools"),
         McpToolExposure::Unsupported {
-            reason: McpToolUnsupportedReason::TaskRequired,
-        } => Some("task_required"),
-        McpToolExposure::Unsupported {
             reason: McpToolUnsupportedReason::InvalidSchema,
         } => Some("invalid_schema"),
     }
@@ -1523,7 +1520,6 @@ fn pad_width(text: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
     use std::sync::Arc;
 
     use crossterm::event::{KeyEvent, KeyModifiers};
@@ -2084,9 +2080,9 @@ mod tests {
                     },
                 ),
                 tool(
-                    "long_task",
+                    "invalid_schema",
                     McpToolExposure::Unsupported {
-                        reason: McpToolUnsupportedReason::TaskRequired,
+                        reason: McpToolUnsupportedReason::InvalidSchema,
                     },
                 ),
             ],
@@ -2097,6 +2093,7 @@ mod tests {
         };
         McpRuntimeState {
             servers: std::collections::BTreeMap::from([("pal".into(), server)]),
+            generations: std::collections::BTreeMap::from([("pal".into(), 1)]),
             startup_error: None,
             workspace_root: Some(PathBuf::from("/workspace/acn")),
         }
@@ -2108,22 +2105,16 @@ mod tests {
             title: None,
             description: Some("test tool".into()),
             exposure,
-            raw_tool: Tool {
-                name: Cow::Borrowed(name),
-                title: None,
-                description: Some(Cow::Borrowed("test tool")),
-                input_schema: Arc::new(
+            raw_tool: Tool::new(
+                name,
+                "test tool",
+                Arc::new(
                     json!({"type": "object", "properties": {"q": {"type": "string"}}})
                         .as_object()
                         .cloned()
                         .unwrap_or_default(),
                 ),
-                output_schema: None,
-                annotations: None,
-                execution: None,
-                icons: None,
-                meta: None,
-            },
+            ),
         }
     }
 

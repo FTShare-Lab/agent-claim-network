@@ -119,8 +119,8 @@ pub use compaction_projection::{
     context_recovery_tail_marker, estimated_projected_segment_tokens,
     large_tool_result_omission_text, project_turn_message_for_safe_transcript,
     project_turn_message_tool_results, project_turn_messages_for_safe_transcript,
-    project_turn_messages_tool_results, provider_safe_segments, MessageRange,
-    ProviderProjectionBudget,
+    project_turn_messages_tool_results, provider_anchor_end_index, provider_safe_segments,
+    trailing_model_context_segments, MessageRange, ProviderProjectionBudget,
 };
 pub(crate) use compaction_projection::{
     ensure_compaction_request_within_context_window, omit_turn_messages_tool_results,
@@ -144,8 +144,9 @@ pub use provider::{
     assistant_text_from_message, context_usage_from_anthropic_committed_usage,
     context_usage_from_anthropic_input_usage, context_usage_from_openai_usage,
     ContextUsageSnapshot, ContextUsageSource, ProviderAdapter, ProviderEvent,
-    ProviderHistoryMediaPolicy, ProviderReplayIdentity, ProviderReplayProtocol, ProviderRequest,
-    ProviderResponse, ProviderStop, ToolSpec,
+    ProviderHistoryMediaPolicy, ProviderRecoveryInterrupt, ProviderReplayIdentity,
+    ProviderReplayProtocol, ProviderRequest, ProviderRequestObserver, ProviderResponse,
+    ProviderRuntimeChainId, ProviderStop, ToolSpec,
 };
 pub use responses::{
     ReducedResponses, ResponsesClient, ResponsesError, ResponsesFunctionCall, ResponsesReasoning,
@@ -159,14 +160,18 @@ pub use token_estimate::{
     estimate_text_tokens,
 };
 pub(crate) use tool_boundary::ToolBoundaryControl;
-pub use turn_loop::{AgentTurnLoop, SessionTurnEventRecorder, SessionTurnPreflight};
+pub(crate) use turn_loop::SessionTurnHooks;
+pub use turn_loop::{
+    AgentTurnLoop, SessionTurnContextAppender, SessionTurnEventRecorder, SessionTurnPreflight,
+};
 pub use types::{
     AvailableSkill, ClaimDraft, CompletedSessionTurnMessage, DisputeDraft, InboxInternalizeKind,
-    InternalizeOutcome, InternalizeRequest, MemoryReviewRequest, ProviderReplayState, RecapOutcome,
-    SessionAttachment, SessionCompactionOutcome, SessionCompactionRequest, SessionRecapRequest,
-    SessionSearchSummaryOutcome, SessionSearchSummaryRequest, SessionTurn, SessionTurnContentBlock,
-    SessionTurnEvent, SessionTurnInterrupted, SessionTurnMessage, SessionTurnRequest,
-    ToolCallSkipReason, ToolExecutionOutcome, TurnMessage,
+    InternalizeOutcome, InternalizeRequest, MemoryReviewRequest, ModelContextSource,
+    ProviderReplayState, RecapOutcome, SessionAttachment, SessionCompactionOutcome,
+    SessionCompactionRequest, SessionRecapRequest, SessionSearchSummaryOutcome,
+    SessionSearchSummaryRequest, SessionTurn, SessionTurnContentBlock, SessionTurnEvent,
+    SessionTurnInterrupted, SessionTurnMessage, SessionTurnRequest, ToolCallSkipReason,
+    ToolExecutionOutcome, TurnMessage,
 };
 
 #[cfg(test)]

@@ -214,6 +214,15 @@ pub struct SupervisorJobView {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalizingSessionDiagnostic {
+    Queued { job_id: String },
+    Running { job_id: String },
+    Failed { job_id: String },
+    RunningWithoutJob,
+    Orphaned,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "by", rename_all = "snake_case")]
 pub enum SupervisorRetryTarget {
@@ -611,6 +620,50 @@ pub async fn supervisor_jobs(agent_home: &Path) -> anyhow::Result<Vec<Supervisor
     Ok(jobs.iter().map(job_to_view).collect())
 }
 
+/// 解释一个 `Finalizing` session 为什么暂时不能 resume。
+///
+/// 历史成功 job 不属于当前未完成的 finalize；没有未成功 job 时，通过非阻塞探测
+/// `finalize.lock` 区分真实执行中的前台 finalize 与需要恢复的孤儿状态。
+pub async fn diagnose_finalizing_session(
+    agent_home: &Path,
+    session_id: &SessionId,
+) -> anyhow::Result<FinalizingSessionDiagnostic> {
+    let paths = SupervisorPaths::new(agent_home);
+    let session_paths = SessionPaths::new(agent_home, session_id);
+    let metadata = read_yaml::<SessionMetadata>(&session_paths.session_yaml)
+        .await
+        .with_context(|| format!("读取 session {session_id} metadata 失败"))?;
+    if metadata.status != SessionStatus::Finalizing {
+        anyhow::bail!(
+            "session {session_id} 当前状态为 {:?}，不是 Finalizing",
+            metadata.status
+        );
+    }
+
+    let jobs = read_jobs(&paths).await?;
+    let matching = unresolved_finalize_jobs(&jobs, session_id);
+    ensure_unique_unresolved_job(session_id, &matching)?;
+    if let Some(job) = matching.first() {
+        return Ok(match job.status {
+            SupervisorJobStatus::Queued => FinalizingSessionDiagnostic::Queued {
+                job_id: job.id.clone(),
+            },
+            SupervisorJobStatus::Running => FinalizingSessionDiagnostic::Running {
+                job_id: job.id.clone(),
+            },
+            SupervisorJobStatus::Failed => FinalizingSessionDiagnostic::Failed {
+                job_id: job.id.clone(),
+            },
+            SupervisorJobStatus::Succeeded => FinalizingSessionDiagnostic::Orphaned,
+        });
+    }
+
+    match FileLockGuard::try_lock_exclusive(&session_paths.finalize_lock).await? {
+        Some(_guard) => Ok(FinalizingSessionDiagnostic::Orphaned),
+        None => Ok(FinalizingSessionDiagnostic::RunningWithoutJob),
+    }
+}
+
 /// 为强制替换预检 supervisor；无法通过专属 IPC 确认身份的存活 PID 会阻止终止。
 pub async fn preflight_supervisor_shutdown(
     agent_home: &Path,
@@ -807,7 +860,7 @@ pub async fn run_supervisor(
         .with_context(|| format!("绑定 supervisor UDS: {}", paths.socket_path.display()))?;
     set_socket_owner_only(&paths.socket_path).await?;
     write_pid_file(&paths).await?;
-    reset_stale_running_jobs(&paths).await?;
+    reconcile_stale_running_jobs(&paths).await?;
     append_supervisor_log(&paths, "supervisor started").await;
 
     let (notify_tx, notify_rx) = mpsc::unbounded_channel();
@@ -1159,26 +1212,26 @@ async fn enqueue_finalize_job(
     session_id: SessionId,
     notify_on_completion: bool,
 ) -> anyhow::Result<SupervisorJob> {
+    validate_finalizing_session(paths, agent_id, &session_id).await?;
     let jobs = read_jobs(paths).await?;
-    let matching = jobs
-        .iter()
-        .filter(|job| finalize_job_session_id(job) == &session_id)
-        .collect::<Vec<_>>();
-    if matching.len() > 1 {
-        anyhow::bail!(session_job_invariant_error(&session_id, &matching));
-    }
+    let matching = unresolved_finalize_jobs(&jobs, &session_id);
+    ensure_unique_unresolved_job(&session_id, &matching)?;
     if let Some(job) = matching.first() {
         validate_job_agent(job, agent_id)?;
-        if job.status == SupervisorJobStatus::Failed {
-            anyhow::bail!(
+        return match job.status {
+            SupervisorJobStatus::Queued | SupervisorJobStatus::Running => Ok((**job).clone()),
+            SupervisorJobStatus::Failed => anyhow::bail!(
                 "session {session_id} 的 finalize job {} 已失败；请使用 `acn supervisor retry {session_id}`",
                 job.id
-            );
-        }
-        return Ok((**job).clone());
+            ),
+            // `matching` 已排除成功 job；保留穷尽分支避免隐藏未来状态扩展。
+            SupervisorJobStatus::Succeeded => anyhow::bail!(
+                "session {session_id} 的未成功 job 过滤结果包含 succeeded job {}",
+                job.id
+            ),
+        };
     }
 
-    validate_finalizing_session(paths, agent_id, &session_id).await?;
     create_finalize_job(paths, agent_id, session_id, notify_on_completion).await
 }
 
@@ -1191,13 +1244,8 @@ async fn retry_finalize_job(
     let jobs = read_jobs(paths).await?;
     let (session_id, existing_job) = match target {
         SupervisorRetryTarget::Session { session_id } => {
-            let matching = jobs
-                .iter()
-                .filter(|job| finalize_job_session_id(job) == &session_id)
-                .collect::<Vec<_>>();
-            if matching.len() > 1 {
-                anyhow::bail!(session_job_invariant_error(&session_id, &matching));
-            }
+            let matching = unresolved_finalize_jobs(&jobs, &session_id);
+            ensure_unique_unresolved_job(&session_id, &matching)?;
             (session_id, matching.first().map(|job| (**job).clone()))
         }
         SupervisorRetryTarget::Job { job_id } => {
@@ -1206,36 +1254,55 @@ async fn retry_finalize_job(
                 .find(|job| job.id == job_id)
                 .with_context(|| format!("未找到 supervisor job {job_id}"))?;
             let session_id = finalize_job_session_id(job).clone();
-            let matching = jobs
-                .iter()
-                .filter(|candidate| finalize_job_session_id(candidate) == &session_id)
-                .collect::<Vec<_>>();
-            if matching.len() > 1 {
-                anyhow::bail!(session_job_invariant_error(&session_id, &matching));
-            }
+            let matching = unresolved_finalize_jobs(&jobs, &session_id);
+            ensure_unique_unresolved_job(&session_id, &matching)?;
             (session_id, Some(job.clone()))
         }
     };
 
     validate_finalizing_session(paths, agent_id, &session_id).await?;
-    let Some(mut job) = existing_job else {
-        let job =
-            create_recovery_finalize_job(paths, agent_id, session_id.clone(), notify_on_completion)
-                .await?;
-        append_supervisor_log(
-            paths,
-            format!(
-                "manual retry created orphan finalize job {} session={} manual_retries={}",
-                job.id, session_id, job.manual_retries
-            ),
-        )
-        .await;
-        return Ok(SupervisorRetryReport {
-            session_id,
-            job_id: job.id,
-            previous_attempts: 0,
-            manual_retries: job.manual_retries,
-        });
+    let mut finalize_guard = None;
+    let mut job = match existing_job {
+        Some(job) => job,
+        None => {
+            let session_paths = SessionPaths::new(&paths.agent_home, &session_id);
+            let guard = FileLockGuard::try_lock_exclusive(&session_paths.finalize_lock)
+                .await?
+                .with_context(|| format!("session {session_id} 正在 finalize，无需 retry"))?;
+            finalize_guard = Some(guard);
+
+            // 获取 finalize 锁后重新检查持久状态，避免把刚开始的真实 finalize 误判为孤儿。
+            validate_finalizing_session(paths, agent_id, &session_id).await?;
+            let refreshed_jobs = read_jobs(paths).await?;
+            let matching = unresolved_finalize_jobs(&refreshed_jobs, &session_id);
+            ensure_unique_unresolved_job(&session_id, &matching)?;
+            match matching.first() {
+                Some(job) => (**job).clone(),
+                None => {
+                    let job = create_recovery_finalize_job(
+                        paths,
+                        agent_id,
+                        session_id.clone(),
+                        notify_on_completion,
+                    )
+                    .await?;
+                    append_supervisor_log(
+                        paths,
+                        format!(
+                            "manual retry created orphan finalize job {} session={} manual_retries={}",
+                            job.id, session_id, job.manual_retries
+                        ),
+                    )
+                    .await;
+                    return Ok(SupervisorRetryReport {
+                        session_id,
+                        job_id: job.id,
+                        previous_attempts: 0,
+                        manual_retries: job.manual_retries,
+                    });
+                }
+            }
+        }
     };
 
     validate_job_agent(&job, agent_id)?;
@@ -1261,6 +1328,7 @@ async fn retry_finalize_job(
     job.started_at = None;
     job.finished_at = None;
     write_job(paths, &job).await?;
+    drop(finalize_guard);
     append_supervisor_log(
         paths,
         format!(
@@ -1322,11 +1390,33 @@ fn validate_job_agent(job: &SupervisorJob, agent_id: &AgentId) -> anyhow::Result
     Ok(())
 }
 
-fn session_job_invariant_error(session_id: &SessionId, jobs: &[&SupervisorJob]) -> String {
+fn unresolved_finalize_jobs<'a>(
+    jobs: &'a [SupervisorJob],
+    session_id: &SessionId,
+) -> Vec<&'a SupervisorJob> {
+    jobs.iter()
+        .filter(|job| {
+            finalize_job_session_id(job) == session_id
+                && job.status != SupervisorJobStatus::Succeeded
+        })
+        .collect()
+}
+
+fn ensure_unique_unresolved_job(
+    session_id: &SessionId,
+    jobs: &[&SupervisorJob],
+) -> anyhow::Result<()> {
+    if jobs.len() > 1 {
+        anyhow::bail!(unresolved_job_invariant_error(session_id, jobs));
+    }
+    Ok(())
+}
+
+fn unresolved_job_invariant_error(session_id: &SessionId, jobs: &[&SupervisorJob]) -> String {
     let mut ids = jobs.iter().map(|job| job.id.as_str()).collect::<Vec<_>>();
     ids.sort_unstable();
     format!(
-        "session {session_id} 存在多个 finalize job，违反唯一性约束: {}",
+        "session {session_id} 存在多个未成功 finalize job，违反唯一性约束: {}",
         ids.join(", ")
     )
 }
@@ -1466,15 +1556,41 @@ async fn has_queued_jobs(paths: &SupervisorPaths) -> anyhow::Result<bool> {
     Ok(next_queued_job(paths).await?.is_some())
 }
 
-async fn reset_stale_running_jobs(paths: &SupervisorPaths) -> anyhow::Result<()> {
+async fn reconcile_stale_running_jobs(paths: &SupervisorPaths) -> anyhow::Result<()> {
     let mut jobs = read_jobs(paths).await?;
     for job in &mut jobs {
-        if job.status == SupervisorJobStatus::Running {
-            job.status = SupervisorJobStatus::Queued;
-            job.updated_at = Utc::now();
-            job.last_error = Some("recovered stale running job after supervisor start".into());
-            write_job(paths, job).await?;
+        if job.status != SupervisorJobStatus::Running {
+            continue;
         }
+
+        let session_id = finalize_job_session_id(job);
+        let session_paths = SessionPaths::new(&paths.agent_home, session_id);
+        let session_status = read_yaml::<SessionMetadata>(&session_paths.session_yaml)
+            .await
+            .with_context(|| {
+                format!(
+                    "读取 stale running job {} 的 session {session_id} metadata 失败",
+                    job.id
+                )
+            })?
+            .status;
+        let now = Utc::now();
+        match session_status {
+            SessionStatus::Closed | SessionStatus::Open => {
+                // finalize 先提交 session，再提交 job。若进程在两次原子写之间退出，或
+                // session 已经被 resume，旧 Running job 不能再次关闭新的会话周期。
+                job.status = SupervisorJobStatus::Succeeded;
+                job.finished_at = Some(now);
+                job.last_error = None;
+            }
+            SessionStatus::Finalizing => {
+                job.status = SupervisorJobStatus::Queued;
+                job.finished_at = None;
+                job.last_error = Some("recovered stale running job after supervisor start".into());
+            }
+        }
+        job.updated_at = now;
+        write_job(paths, job).await?;
     }
     Ok(())
 }
@@ -3465,6 +3581,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enqueue_finalize_creates_new_job_after_historical_successes() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+
+        let mut first = create_finalize_job(&paths, &agent_id, session_id.clone(), true).await?;
+        first.status = SupervisorJobStatus::Succeeded;
+        write_job(&paths, &first).await?;
+        let mut second = create_finalize_job(&paths, &agent_id, session_id.clone(), true).await?;
+        second.status = SupervisorJobStatus::Succeeded;
+        write_job(&paths, &second).await?;
+
+        let current = enqueue_finalize_job(&paths, &agent_id, session_id.clone(), false).await?;
+        let jobs = read_jobs(&paths).await?;
+
+        assert_ne!(current.id, first.id);
+        assert_ne!(current.id, second.id);
+        assert_eq!(current.status, SupervisorJobStatus::Queued);
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(unresolved_finalize_jobs(&jobs, &session_id).len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn enqueue_finalize_rejects_failed_job_with_retry_hint() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let paths = SupervisorPaths::new(dir.path());
@@ -3595,6 +3737,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_session_creates_recovery_job_after_historical_success() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        let mut historical =
+            create_finalize_job(&paths, &agent_id, session_id.clone(), true).await?;
+        historical.status = SupervisorJobStatus::Succeeded;
+        write_job(&paths, &historical).await?;
+
+        let report = retry_finalize_job(
+            &paths,
+            &agent_id,
+            SupervisorRetryTarget::Session {
+                session_id: session_id.clone(),
+            },
+            false,
+        )
+        .await?;
+        let jobs = read_jobs(&paths).await?;
+
+        assert_ne!(report.job_id, historical.id);
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(unresolved_finalize_jobs(&jobs, &session_id).len(), 1);
+        assert_eq!(report.manual_retries, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_session_does_not_create_job_while_foreground_finalize_holds_lock(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        let session_paths = SessionPaths::new(&paths.agent_home, &session_id);
+        let _finalize_guard = FileLockGuard::lock_exclusive(&session_paths.finalize_lock).await?;
+
+        let error = retry_finalize_job(
+            &paths,
+            &agent_id,
+            SupervisorRetryTarget::Session {
+                session_id: session_id.clone(),
+            },
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("正在 finalize，无需 retry"));
+        assert!(read_jobs(&paths).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalizing_session_diagnostic_distinguishes_failed_running_and_orphaned(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        let mut job = create_finalize_job(&paths, &agent_id, session_id.clone(), true).await?;
+        job.status = SupervisorJobStatus::Failed;
+        write_job(&paths, &job).await?;
+
+        assert_eq!(
+            diagnose_finalizing_session(&paths.agent_home, &session_id).await?,
+            FinalizingSessionDiagnostic::Failed {
+                job_id: job.id.clone()
+            }
+        );
+
+        job.status = SupervisorJobStatus::Succeeded;
+        write_job(&paths, &job).await?;
+        let session_paths = SessionPaths::new(&paths.agent_home, &session_id);
+        let finalize_guard = FileLockGuard::lock_exclusive(&session_paths.finalize_lock).await?;
+        assert_eq!(
+            diagnose_finalizing_session(&paths.agent_home, &session_id).await?,
+            FinalizingSessionDiagnostic::RunningWithoutJob
+        );
+        drop(finalize_guard);
+        assert_eq!(
+            diagnose_finalizing_session(&paths.agent_home, &session_id).await?,
+            FinalizingSessionDiagnostic::Orphaned
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn retry_job_id_cannot_recover_session_without_a_job() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let paths = SupervisorPaths::new(dir.path());
@@ -3644,11 +3879,7 @@ mod tests {
 
         write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
         let mut job = create_finalize_job(&paths, &agent_id, session_id.clone(), true).await?;
-        for status in [
-            SupervisorJobStatus::Queued,
-            SupervisorJobStatus::Running,
-            SupervisorJobStatus::Succeeded,
-        ] {
+        for status in [SupervisorJobStatus::Queued, SupervisorJobStatus::Running] {
             job.status = status.clone();
             write_job(&paths, &job).await?;
             let error = retry_finalize_job(
@@ -3662,11 +3893,23 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-            assert!(error.contains(match status {
-                SupervisorJobStatus::Succeeded => "不能 retry",
-                _ => "无需 retry",
-            }));
+            assert!(error.contains("无需 retry"));
         }
+
+        job.status = SupervisorJobStatus::Succeeded;
+        write_job(&paths, &job).await?;
+        let error = retry_finalize_job(
+            &paths,
+            &agent_id,
+            SupervisorRetryTarget::Job {
+                job_id: job.id.clone(),
+            },
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("不能 retry"));
         Ok(())
     }
 
@@ -3803,7 +4046,10 @@ mod tests {
     async fn stale_running_job_is_requeued_without_refunding_attempt() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let paths = SupervisorPaths::new(dir.path());
-        let mut running = queued_finalize_job("job_running", "session_11111111".parse()?);
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id: SessionId = "session_11111111".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        let mut running = queued_finalize_job("job_running", session_id);
         running.status = SupervisorJobStatus::Running;
         running.attempts = 2;
         running.started_at = Some(Utc::now());
@@ -3814,7 +4060,7 @@ mod tests {
         write_yaml_atomic(&job_path(&paths, &running.id), &running).await?;
         write_yaml_atomic(&job_path(&paths, &failed.id), &failed).await?;
 
-        reset_stale_running_jobs(&paths).await?;
+        reconcile_stale_running_jobs(&paths).await?;
 
         let recovered = read_yaml::<SupervisorJob>(&job_path(&paths, &running.id)).await?;
         assert_eq!(recovered.status, SupervisorJobStatus::Queued);
@@ -3825,6 +4071,62 @@ mod tests {
         );
         let terminal = read_yaml::<SupervisorJob>(&job_path(&paths, &failed.id)).await?;
         assert_eq!(terminal, failed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_running_job_keeps_state_when_session_metadata_is_unreadable(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let mut running = queued_finalize_job("job_running", "session_11111111".parse()?);
+        running.status = SupervisorJobStatus::Running;
+        running.attempts = 2;
+        running.started_at = Some(Utc::now());
+        write_yaml_atomic(&job_path(&paths, &running.id), &running).await?;
+
+        let error = reconcile_stale_running_jobs(&paths)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("读取 stale running job job_running"));
+        let preserved = read_yaml::<SupervisorJob>(&job_path(&paths, &running.id)).await?;
+        assert_eq!(preserved, running);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_running_job_does_not_reprocess_closed_or_reopened_session() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let closed_session: SessionId = "session_11111111".parse()?;
+        let reopened_session: SessionId = "session_22222222".parse()?;
+        write_test_session(&paths, &agent_id, &closed_session, SessionStatus::Closed).await?;
+        write_test_session(&paths, &agent_id, &reopened_session, SessionStatus::Open).await?;
+
+        for (job_id, session_id) in [
+            ("job_closed", closed_session),
+            ("job_reopened", reopened_session),
+        ] {
+            let mut job = queued_finalize_job(job_id, session_id);
+            job.status = SupervisorJobStatus::Running;
+            job.attempts = 1;
+            job.started_at = Some(Utc::now());
+            write_yaml_atomic(&job_path(&paths, &job.id), &job).await?;
+        }
+
+        reconcile_stale_running_jobs(&paths).await?;
+
+        for job_id in ["job_closed", "job_reopened"] {
+            let recovered = read_yaml::<SupervisorJob>(&job_path(&paths, job_id)).await?;
+            assert_eq!(recovered.status, SupervisorJobStatus::Succeeded);
+            assert_eq!(recovered.attempts, 1);
+            assert!(recovered.finished_at.is_some());
+            assert!(recovered.last_error.is_none());
+        }
         Ok(())
     }
 

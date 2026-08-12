@@ -53,7 +53,7 @@ impl ChatCompletionsClient {
         retry_base_delay: Duration,
         retry_max_delay: Duration,
     ) -> Result<Self, ChatCompletionsError> {
-        let http = reqwest::Client::builder()
+        let http = crate::http_client_builder()
             .timeout(timeout)
             .build()
             .map_err(|error| {

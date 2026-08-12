@@ -15,8 +15,21 @@ impl ToolRegistry {
         let Some(mcp_manager) = &self.mcp_manager else {
             return Err(ToolError::UnknownTool(visible_name.to_string()));
         };
-        let catalog = crate::mcp::tool::tool_catalog(&mcp_manager.snapshot_sync());
-        let Some(route) = catalog.route(visible_name).cloned() else {
+        let frozen_route = match &context.provider_mcp_routes {
+            Some(routes) => Some(
+                routes
+                    .get(visible_name)
+                    .cloned()
+                    .ok_or_else(|| ToolError::UnknownTool(visible_name.to_string()))?,
+            ),
+            None => None,
+        };
+        let route = frozen_route.clone().or_else(|| {
+            crate::mcp::tool::tool_catalog(&mcp_manager.snapshot_sync())
+                .route(visible_name)
+                .cloned()
+        });
+        let Some(route) = route else {
             return Err(ToolError::UnknownTool(visible_name.to_string()));
         };
         let progress_reporter = mcp_progress_reporter(visible_name, &context);
@@ -28,7 +41,19 @@ impl ToolRegistry {
             route.raw_tool_name,
             context.current_turn_id.as_deref().unwrap_or("unknown")
         );
-        let result = if require_read_only {
+        let result = if frozen_route.is_some() {
+            mcp_manager
+                .call_tool_cancellable_for_generation(
+                    &route.server_name,
+                    &route.raw_tool_name,
+                    Some(input),
+                    progress_reporter,
+                    require_read_only,
+                    context.cancellation,
+                    route.generation,
+                )
+                .await
+        } else if require_read_only {
             mcp_manager
                 .call_read_only_tool_cancellable(
                     &route.server_name,

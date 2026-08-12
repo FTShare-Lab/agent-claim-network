@@ -755,6 +755,9 @@ pub struct LlmChatConfig {
     pub provider: LlmProvider,
     pub endpoint: String,
     pub model: String,
+    /// 仅 `openai_responses` 可用；显式声明 endpoint 支持 Responses WebSocket transport。
+    #[serde(default)]
+    pub supports_websockets: bool,
     #[serde(default)]
     pub reasoning_effort: ReasoningEffort,
     /// Anthropic Messages 的显式 thinking 模式；其他 provider 忽略。
@@ -792,6 +795,7 @@ impl Default for LlmChatConfig {
             provider: LlmProvider::Anthropic,
             endpoint: "https://api.anthropic.com".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
+            supports_websockets: false,
             reasoning_effort: ReasoningEffort::None,
             anthropic_thinking: AnthropicThinking::Auto,
             anthropic_thinking_budget_tokens: None,
@@ -2370,6 +2374,11 @@ fn validate_config(
             "agent.llm.max_tokens must be > 0".into(),
         ));
     }
+    if cfg.agent.llm.supports_websockets && cfg.agent.llm.provider != LlmProvider::OpenAiResponses {
+        return Err(ConfigError::Validation(
+            "agent.llm.supports_websockets 只能用于 provider = \"openai_responses\"".into(),
+        ));
+    }
     if cfg.agent.llm.context_window == 0 {
         return Err(ConfigError::Validation(
             "agent.llm.context_window must be > 0".into(),
@@ -3133,6 +3142,41 @@ router_endpoint = "http://127.0.0.1:8061"
         let cfg = parse_and_validate(minimal_config_without_optional_defaults()).unwrap();
 
         assert_eq!(cfg.agent.llm.reasoning_effort, ReasoningEffort::None);
+    }
+
+    #[test]
+    fn websocket_support_defaults_off_and_is_limited_to_responses() {
+        let base = minimal_config_without_optional_defaults();
+        let cfg = parse_and_validate(base).unwrap();
+        assert!(!cfg.agent.llm.supports_websockets);
+
+        let responses = base
+            .replace(
+                r#"provider = "anthropic""#,
+                r#"provider = "openai_responses""#,
+            )
+            .replace(
+                r#"model = "example-anthropic-model""#,
+                "model = \"example-model\"\nsupports_websockets = true",
+            );
+        let cfg = parse_and_validate(&responses).unwrap();
+        assert!(cfg.agent.llm.supports_websockets);
+
+        for provider in ["anthropic", "openai_chat"] {
+            let raw = base
+                .replace(
+                    r#"provider = "anthropic""#,
+                    &format!(r#"provider = "{provider}""#),
+                )
+                .replace(
+                    r#"model = "example-anthropic-model""#,
+                    "model = \"example-model\"\nsupports_websockets = true",
+                );
+            expect_parse_err_contains(
+                raw,
+                "agent.llm.supports_websockets 只能用于 provider = \"openai_responses\"",
+            );
+        }
     }
 
     #[test]
