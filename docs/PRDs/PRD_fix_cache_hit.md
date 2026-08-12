@@ -271,6 +271,12 @@ main delegation 不再限制为“每个顶层 user turn 只读取一次”。�
 - 新 compact window 必须重新建立当前完整 snapshot 和 baseline，避免 summary 中的旧状态被误认为当前态。
 - compaction 后第一次 Provider 请求仍须满足“新窗口内只追加”的不变量。
 
+### 10.4 Provider preamble 的外部能力变更
+
+- MCP server 的 ready 集合、工具 schema、过滤结果或 connection generation 真实变化时，允许后续逻辑 Provider sampling 产生一次工具 preamble cache break；这是能力边界变化，不伪装成 append-only history。
+- 同一次逻辑 sampling 的 transport retry、fallback 和 adapter continuation 必须复用入口冻结的同一工具快照。
+- 仅 MCP server 改变 `tools/list` 返回顺序而语义集合不变时，不允许产生 cache break；内置工具保持固定前缀，MCP 后缀按稳定 visible name 排序。
+
 ## 11. 已拍板补充决策
 
 ### D1：普通 subagent progress 不自动进入 main projection（选择 A）

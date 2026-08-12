@@ -65,7 +65,7 @@ ACN 当前已经具备以下基础：
 ```
 
 - stdio：一个 ready server 对应一个常驻 child process。主 agent、所有 delegation child 和后续 turn 都复用该进程。macOS/Linux 下 child 位于 ACN 独占的进程组；disable、reconnect、transport failure 或进程 shutdown 收束连接时，同组后代也必须被清理。异步关闭被取消或 runtime 正在退出时，由 child wrapper 的同步 Drop guard 终止进程组，并交给独立 reaper 回收直属 child。主动创建新 session/进程组逃逸的 daemon 不属于该保证。
-- Streamable HTTP：一个 ready server 对应一个初始化后的逻辑 session；server 返回`MCP-Session-Id` 时，后续请求继续携带同一 session id。当前 `rmcp 0.15` 对“server 延迟后返回JSON”的同一 session POST 在 transport worker 内串行，这是已接受的 SDK/transport 边界，不用短连接、连接池或 ACN 锁绕开。
+- Streamable HTTP：一个 ready server 对应一个初始化后的逻辑 session；server 返回`MCP-Session-Id` 时，后续请求继续携带同一 session id。当前锁定的 `rmcp 3.1.2` 对“server 延迟后返回 JSON”的同一 session POST 在 transport worker 内串行，这是已接受的 SDK/transport 边界，不用短连接、连接池或 ACN 锁绕开。
 - `McpConnectionManager` 是连接生命周期的唯一 owner；`ToolRegistry`、parent 和 child 只持有同一个 manager 的 `Arc`，不单独创建 client。
 - CLI `mcp status` 等独立命令如果启动的是另一个 ACN 进程，仍有自己的短暂进程级 manager；这不属于“同一运行中 TUI session”的复用范围。
 

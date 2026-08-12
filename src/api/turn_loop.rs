@@ -36,6 +36,7 @@ use crate::api::{
 };
 use crate::attachment::{AttachmentKind, AttachmentLimits, NormalizedMedia, FILE_READ_MEDIA_KEY};
 use crate::claim::SessionId;
+use crate::mcp::tool::McpToolRoute;
 use crate::skill::SkillInstructions;
 use crate::tool::diff::{take_file_change, FileChange};
 use crate::tool::{
@@ -63,6 +64,9 @@ struct ProviderCallOutcome {
     /// 内部 continuation 已经放入请求的 partial replay。
     provider_assistant_message: SessionTurnMessage,
     recovered_with_non_streaming: bool,
+    /// 与该次逻辑 sampling 的 tool definitions 同时冻结；内部 retry、fallback、
+    /// continuation 不得刷新，工具派发也不得落到 replacement generation。
+    provider_mcp_routes: Arc<BTreeMap<String, McpToolRoute>>,
 }
 
 /// 跟踪一次 turn-loop Provider call 内部实际发送的最新请求。
@@ -629,9 +633,14 @@ impl AgentTurnLoop {
     }
 
     /// 按 source order 切分并执行工具；并发 task 只回传结果，所有事件与 journal 写入均由此协调器串行完成。
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "工具协调器需要同时携带本轮 Provider catalog、journal 与取消边界"
+    )]
     async fn execute_tool_uses_in_batches(
         &self,
         tool_uses: &[CanonicalToolUse],
+        provider_mcp_routes: &Arc<BTreeMap<String, McpToolRoute>>,
         current_session_id: &Option<SessionId>,
         current_turn_id: &Option<String>,
         tool_boundary_control: Option<&ToolBoundaryControl>,
@@ -700,6 +709,7 @@ impl AgentTurnLoop {
                     is_safe_batch,
                     current_session_id,
                     current_turn_id,
+                    provider_mcp_routes,
                     tool_boundary_control,
                     emit,
                     durable_recorder,
@@ -741,6 +751,7 @@ impl AgentTurnLoop {
         require_concurrency_safe: bool,
         current_session_id: &Option<SessionId>,
         current_turn_id: &Option<String>,
+        provider_mcp_routes: &Arc<BTreeMap<String, McpToolRoute>>,
         tool_boundary_control: Option<&ToolBoundaryControl>,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
         durable_recorder: &mut Option<&mut dyn SessionTurnEventRecorder>,
@@ -867,6 +878,7 @@ impl AgentTurnLoop {
                         tool_use_id: Some(tool_use.id.clone()),
                         progress_tx: Some(progress_tx.clone()),
                         cancellation: cancellation.clone(),
+                        provider_mcp_routes: Some(Arc::clone(provider_mcp_routes)),
                         failed_file_write_paths: Some(Arc::clone(&failed_file_write_paths)),
                     };
                     let tools = Arc::clone(&self.tools);
@@ -1593,6 +1605,7 @@ impl AgentTurnLoop {
                 request_messages: successful_request_messages,
                 provider_assistant_message,
                 recovered_with_non_streaming,
+                provider_mcp_routes,
             } = provider_call;
             if recovered_with_non_streaming {
                 // HTTP replacement 不属于旧 WebSocket connection-local history；即使
@@ -1777,6 +1790,7 @@ impl AgentTurnLoop {
             let Some(executed_tool_uses) = self
                 .execute_tool_uses_in_batches(
                     &tool_uses,
+                    &provider_mcp_routes,
                     &current_session_id,
                     &current_turn_id,
                     tool_boundary_control.as_ref(),
@@ -1866,9 +1880,9 @@ impl AgentTurnLoop {
         runtime_chain_id: ProviderRuntimeChainId,
         request_progress: &mut ProviderRequestProgress<'_>,
     ) -> anyhow::Result<ProviderCallOutcome> {
-        let tools = self
-            .tools
-            .definitions()
+        let (tool_definitions, provider_mcp_routes) = self.tools.definitions_with_mcp_routes();
+        let provider_mcp_routes = Arc::new(provider_mcp_routes);
+        let tools = tool_definitions
             .into_iter()
             .map(Into::into)
             .collect::<Vec<_>>();
@@ -1924,6 +1938,7 @@ impl AgentTurnLoop {
                     request_messages: request_progress.latest_messages().to_vec(),
                     provider_assistant_message,
                     recovered_with_non_streaming: false,
+                    provider_mcp_routes: Arc::clone(&provider_mcp_routes),
                 })
             }
             Err(_error)
@@ -2043,6 +2058,7 @@ impl AgentTurnLoop {
                                 request_messages: request_progress.latest_messages().to_vec(),
                                 provider_assistant_message,
                                 recovered_with_non_streaming: true,
+                                provider_mcp_routes: Arc::clone(&provider_mcp_routes),
                             });
                         }
                         Err(error)
@@ -2973,6 +2989,7 @@ async fn emit_forced_abort_interrupts(
                     tool_use_id: Some(tool_use.id.clone()),
                     progress_tx: None,
                     cancellation: None,
+                    provider_mcp_routes: None,
                     failed_file_write_paths: None,
                 })
                 .await

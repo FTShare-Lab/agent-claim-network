@@ -163,6 +163,17 @@ impl ToolRegistry {
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
+        self.definitions_with_mcp_routes().0
+    }
+
+    /// 为一次逻辑 Provider sampling 同时冻结工具定义与 MCP 路由 generation。
+    /// adapter 内部 retry、fallback 与 continuation 必须复用这一份结果。
+    pub(crate) fn definitions_with_mcp_routes(
+        &self,
+    ) -> (
+        Vec<ToolDefinition>,
+        BTreeMap<String, crate::mcp::tool::McpToolRoute>,
+    ) {
         let web_time_guidance = current_year_web_guidance();
         let code_run_process_scope = self.code_run_process_scope_description();
         let write_stdin_description = self.write_stdin_description();
@@ -580,9 +591,11 @@ impl ToolRegistry {
         if self.access.delegation_progress && self.delegation_progress.is_some() {
             definitions.push(update_subagent_progress_definition());
         }
+        let mut mcp_routes = BTreeMap::new();
         if self.access.mcp {
             if let Some(mcp_manager) = &self.mcp_manager {
                 let catalog = crate::mcp::tool::tool_catalog(&mcp_manager.snapshot_sync());
+                mcp_routes = catalog.routes().clone();
                 definitions.extend(catalog.definitions().iter().map(|tool| ToolDefinition {
                     name: tool.visible_name.clone(),
                     description: tool.description.clone(),
@@ -590,7 +603,7 @@ impl ToolRegistry {
                 }));
             }
         }
-        definitions
+        (definitions, mcp_routes)
     }
 
     pub(super) fn code_run_process_scope_description(&self) -> &'static str {
