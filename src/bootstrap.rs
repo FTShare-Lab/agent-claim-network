@@ -208,6 +208,9 @@ pub fn build_agent_cli_session_engine_with_mcp(
         memory_review_tool_registry,
         MEMORY_REVIEW_MAX_TOOL_LOOP_TURNS,
         chat.max_tokens,
+        chat.retry_count,
+        Duration::from_millis(chat.retry_base_delay_ms),
+        Duration::from_millis(chat.retry_max_delay_ms),
     ));
     let mut engine = SessionEngine::new(
         runner,

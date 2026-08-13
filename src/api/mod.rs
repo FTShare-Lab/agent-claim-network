@@ -138,6 +138,7 @@ pub use openai_compatible_responses::{
     OpenAiCompatibleResponsesError, OpenAiCompatibleResponsesProviderAdapter,
 };
 pub use placeholder::{resolve_placeholders, PlaceholderError};
+pub(crate) use provider::ProviderTransport;
 pub use provider::{
     assistant_text_from_message, context_usage_from_anthropic_committed_usage,
     context_usage_from_anthropic_input_usage, context_usage_from_openai_usage,
@@ -151,8 +152,11 @@ pub use responses::{
     ReducedResponses, ResponsesClient, ResponsesError, ResponsesFunctionCall, ResponsesReasoning,
     ResponsesRequest, ResponsesStreamEvent, ResponsesTerminal, ResponsesTool,
 };
+#[cfg(test)]
+pub(crate) use structured_json::StructuredJsonNoConsumableOutput;
 pub(crate) use structured_json::{
-    structured_json_business_retryable, StructuredJsonAttemptRequest,
+    structured_json_business_retryable, structured_json_no_consumable_transport,
+    StructuredJsonAttemptRequest,
 };
 pub use structured_json::{StructuredJsonAttemptReport, StructuredJsonCaller};
 pub use token_estimate::{

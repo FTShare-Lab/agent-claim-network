@@ -3443,10 +3443,11 @@ mod tests {
         estimate_provider_request_context_tokens, AgentTurnLoop, CompletedSessionTurnMessage,
         ContextUsageSource, ModelContextSource, ProviderAdapter, ProviderEvent,
         ProviderReplayState, ProviderRequest, ProviderRequestObserver, ProviderResponse,
-        ProviderRuntimeChainId, ProviderStop, SessionTurn, SessionTurnContentBlock,
-        SessionTurnContextAppender, SessionTurnEvent, SessionTurnEventRecorder, SessionTurnHooks,
-        SessionTurnInterrupted, SessionTurnMessage, SessionTurnPreflight, SessionTurnRequest,
-        ToolBoundaryControl, ToolCallSkipReason, ToolExecutionOutcome,
+        ProviderRuntimeChainId, ProviderStop, ProviderTransport, SessionTurn,
+        SessionTurnContentBlock, SessionTurnContextAppender, SessionTurnEvent,
+        SessionTurnEventRecorder, SessionTurnHooks, SessionTurnInterrupted, SessionTurnMessage,
+        SessionTurnPreflight, SessionTurnRequest, ToolBoundaryControl, ToolCallSkipReason,
+        ToolExecutionOutcome,
     };
     use crate::attachment::AttachmentLimits;
     use crate::config::ToolConfig;
@@ -3714,6 +3715,7 @@ mod tests {
                     Err(ProviderStreamFailure::new("stream ended before terminal event").into())
                 }
                 ZeroTextFailureKind::NoConsumableOutput => Err(ProviderNoConsumableOutput::new(
+                    ProviderTransport::ResponsesSse,
                     "provider returned no consumable output",
                 )
                 .into()),

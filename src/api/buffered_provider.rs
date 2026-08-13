@@ -7,7 +7,7 @@ use crate::api::{
     ProviderRuntimeFallbackScope, ProviderStreamOutputMode,
 };
 
-use super::provider::{ProviderNoConsumableOutput, ProviderStreamFailure};
+use super::provider::ProviderStreamFailure;
 
 #[derive(Debug, Clone)]
 pub(crate) struct BufferedProviderRuntime {
@@ -34,10 +34,10 @@ pub(crate) async fn send_buffered_with_fallback(
     let mut noop = |_event: ProviderEvent| {};
     match provider.send(request.clone(), &mut noop).await {
         Ok(response) => Ok(response),
-        Err(error)
-            if error.downcast_ref::<ProviderStreamFailure>().is_some()
-                || error.downcast_ref::<ProviderNoConsumableOutput>().is_some() =>
-        {
+        Err(error) if error.downcast_ref::<ProviderStreamFailure>().is_some() => {
+            if let Some(chain_id) = request.runtime_chain_id {
+                provider.discard_runtime_chain(chain_id).await;
+            }
             request.stream = false;
             request.stream_output_mode = ProviderStreamOutputMode::Buffered;
             request.runtime_chain_id = None;
@@ -56,12 +56,15 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::api::provider::ProviderTerminalFailure;
+    use crate::api::provider::{
+        ProviderNoConsumableOutput, ProviderTerminalFailure, ProviderTransport,
+    };
     use crate::api::{ProviderStop, SessionTurnContentBlock, SessionTurnMessage, ToolSpec};
 
     struct QueueProvider {
         outcomes: Mutex<VecDeque<anyhow::Result<ProviderResponse>>>,
         requests: Mutex<Vec<ProviderRequest>>,
+        discarded_chains: Mutex<Vec<ProviderRuntimeChainId>>,
     }
 
     #[async_trait]
@@ -80,6 +83,10 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_else(|| anyhow::bail!("missing fake outcome"))
+        }
+
+        async fn discard_runtime_chain(&self, chain_id: ProviderRuntimeChainId) {
+            self.discarded_chains.lock().unwrap().push(chain_id);
         }
     }
 
@@ -117,6 +124,7 @@ mod tests {
                 Ok(response()),
             ])),
             requests: Mutex::new(Vec::new()),
+            discarded_chains: Mutex::new(Vec::new()),
         });
         let erased: Arc<dyn ProviderAdapter> = provider.clone();
 
@@ -131,6 +139,7 @@ mod tests {
         assert!(!requests[1].stream);
         assert!(requests[1].runtime_chain_id.is_none());
         assert!(requests[1].runtime_fallback_scope.is_none());
+        assert_eq!(provider.discarded_chains.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -141,6 +150,7 @@ mod tests {
             )
             .into())])),
             requests: Mutex::new(Vec::new()),
+            discarded_chains: Mutex::new(Vec::new()),
         });
         let erased: Arc<dyn ProviderAdapter> = provider.clone();
 
@@ -150,5 +160,29 @@ mod tests {
 
         assert!(error.downcast_ref::<ProviderTerminalFailure>().is_some());
         assert_eq!(provider.requests.lock().unwrap().len(), 1);
+        assert!(provider.discarded_chains.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_no_consumable_output_never_changes_transport() {
+        let provider = Arc::new(QueueProvider {
+            outcomes: Mutex::new(VecDeque::from([Err(ProviderNoConsumableOutput::new(
+                ProviderTransport::ResponsesSse,
+                "reasoning only",
+            )
+            .into())])),
+            requests: Mutex::new(Vec::new()),
+            discarded_chains: Mutex::new(Vec::new()),
+        });
+        let erased: Arc<dyn ProviderAdapter> = provider.clone();
+
+        let error = send_buffered_with_fallback(&erased, request())
+            .await
+            .unwrap_err();
+
+        let no_output = error.downcast_ref::<ProviderNoConsumableOutput>().unwrap();
+        assert_eq!(no_output.transport(), ProviderTransport::ResponsesSse);
+        assert_eq!(provider.requests.lock().unwrap().len(), 1);
+        assert!(provider.discarded_chains.lock().unwrap().is_empty());
     }
 }

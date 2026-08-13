@@ -83,6 +83,7 @@ mod tests {
             &self,
             _kind: InboxInternalizeKind,
             _request: InternalizeRequest,
+            _preferred_transport: Option<crate::api::ProviderTransport>,
         ) -> anyhow::Result<Value> {
             Ok(serde_json::json!({}))
         }

@@ -1,6 +1,6 @@
 # 内部 LLM 任务流式化
 
-> 状态：已完成（2026-08-12）
+> 状态：已完成（2026-08-13）
 
 ## 范围
 
@@ -10,8 +10,10 @@ Agent 内部任务复用 `[agent.llm]` 的 provider、timeout 与 retry 配置�
 
 ## 重试与降级
 
-- 协议层没有取得完整可消费结果时，按配置重试当前 transport；耗尽后按 WS → SSE → non-streaming 或 SSE → non-streaming 降级。
-- 完整结果的 JSON、schema 或引用校验失败时，使用独立的业务重试轮次；Inbox 重发原始请求，其余结构化任务可追加纠错信息。
+- 连接、协议或流中断等传输失败按配置重试当前 transport；耗尽后按 WS → SSE → non-streaming 或 SSE → non-streaming 降级。
+- 请求正常结束但只有 reasoning/thinking、没有可消费文本或工具调用时，不视为传输失败，也不触发 transport fallback 或 sticky；清除本次 continuation 后，使用独立的业务重试轮次，在本次实际 transport 上原样重发请求，不追加纠错信息。
+- 上述无可消费输出的可恢复重试不在 TUI 显示 Warning；日志和任务审计保留 attempt、transport 与失败原因，重试耗尽后再在 TUI 显示最终错误。
+- 完整结果的 JSON、schema 或引用校验失败时，也使用独立的业务重试轮次；Inbox 重发原始请求，其余结构化任务可追加纠错信息。
 - 流式 partial 在内部缓冲，失败后整段丢弃；只有完整终态可以进入业务校验、工具执行或持久化。
 - 认证、非法请求、上下文耗尽与取消属于终止错误，不盲目切换 transport。
 - MaxTokens 沿用各 adapter 已有的 continuation 与最终终止行为。

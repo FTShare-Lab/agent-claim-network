@@ -23,7 +23,7 @@ use super::provider::{
     NoopProviderRequestObserver, ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy,
     ProviderNoConsumableOutput, ProviderReplayIdentity, ProviderReplayProtocol, ProviderRequest,
     ProviderRequestObserver, ProviderRequestPreparationFailure, ProviderResponse, ProviderStop,
-    ProviderStreamFailure, ProviderTerminalFailure, ToolSpec,
+    ProviderStreamFailure, ProviderTerminalFailure, ProviderTransport, ToolSpec,
 };
 use super::redact_media_error_body;
 use super::types::{ProviderReplayState, SessionTurnContentBlock, SessionTurnMessage};
@@ -306,6 +306,11 @@ impl OpenAiCompatibleChatProviderAdapter {
         emit: &mut (dyn FnMut(ProviderEvent) + Send),
         observer: &mut (dyn ProviderRequestObserver + Send),
     ) -> anyhow::Result<ProviderResponse> {
+        let transport = if request.stream {
+            ProviderTransport::ChatSse
+        } else {
+            ProviderTransport::ChatNonStreaming
+        };
         let retry_count = request
             .retry_count_override
             .unwrap_or(self.client.retry_count());
@@ -352,7 +357,7 @@ impl OpenAiCompatibleChatProviderAdapter {
         match provider_response_from_turn(turn, &self.model) {
             Ok(response) => Ok(response),
             Err(OpenAiCompatibleChatError::NoConsumableOutput { reason }) => {
-                Err(ProviderNoConsumableOutput::new(reason).into())
+                Err(ProviderNoConsumableOutput::new(transport, reason).into())
             }
             Err(error) => Err(error.into()),
         }

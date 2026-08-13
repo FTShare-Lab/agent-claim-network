@@ -10,6 +10,7 @@ use super::streaming::ResponsesSseDecoder;
 use super::websocket::{ResponsesWebSocketTransport, WebSocketSendOutcome};
 use crate::api::endpoint::{resolve_llm_endpoint, LlmEndpointKind};
 use crate::api::llm_http::{read_llm_error_body, LlmHttpError, LlmHttpPhase};
+use crate::api::provider::ProviderTransport;
 use crate::api::{ProviderRecoveryInterrupt, ProviderRuntimeChainId, ProviderRuntimeFallbackScope};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +169,33 @@ impl ResponsesClient {
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
     ) -> Result<ReducedResponses, ResponsesError> {
+        self.send_with_retry_count_for_runtime_scope_and_transport(
+            request,
+            retry_count,
+            runtime_chain_id,
+            runtime_fallback_scope,
+            retry_after_partial,
+            recovery_interrupt,
+            emit,
+        )
+        .await
+        .map(|(response, _transport)| response)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Responses transport 需显式携带 continuation、fallback scope 与缓冲语义"
+    )]
+    pub(crate) async fn send_with_retry_count_for_runtime_scope_and_transport(
+        &self,
+        request: &ResponsesRequest,
+        retry_count: u32,
+        runtime_chain_id: Option<ProviderRuntimeChainId>,
+        runtime_fallback_scope: Option<&ProviderRuntimeFallbackScope>,
+        retry_after_partial: bool,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+        emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
+    ) -> Result<(ReducedResponses, ProviderTransport), ResponsesError> {
         ensure_recovery_active(recovery_interrupt)?;
         if request.stream {
             if let (Some(websocket), Some(runtime_chain_id)) = (&self.websocket, runtime_chain_id) {
@@ -185,7 +213,9 @@ impl ResponsesClient {
                     )
                     .await?
                 {
-                    WebSocketSendOutcome::Response(response) => return Ok(response),
+                    WebSocketSendOutcome::Response(response) => {
+                        return Ok((response, ProviderTransport::ResponsesWebSocket));
+                    }
                     WebSocketSendOutcome::FallbackToHttp => {
                         ensure_recovery_active(recovery_interrupt)?;
                     }
@@ -199,9 +229,11 @@ impl ResponsesClient {
                 emit,
             )
             .await
+            .map(|response| (response, ProviderTransport::ResponsesSse))
         } else {
             self.send_json_with_retry(request, retry_count, recovery_interrupt)
                 .await
+                .map(|response| (response, ProviderTransport::ResponsesNonStreaming))
         }
     }
 
@@ -468,16 +500,34 @@ mod tests {
         let (json_endpoint, _) = spawn_server("application/json", json_body).await;
         let (sse_endpoint, _) = spawn_server("text/event-stream", sse_body).await;
 
-        let json_result = test_client(json_endpoint)
-            .send(&request(false), &mut |_| {})
+        let (json_result, json_transport) = test_client(json_endpoint)
+            .send_with_retry_count_for_runtime_scope_and_transport(
+                &request(false),
+                0,
+                None,
+                None,
+                false,
+                None,
+                &mut |_| {},
+            )
             .await
             .unwrap();
-        let sse_result = test_client(sse_endpoint)
-            .send(&request(true), &mut |_| {})
+        let (sse_result, sse_transport) = test_client(sse_endpoint)
+            .send_with_retry_count_for_runtime_scope_and_transport(
+                &request(true),
+                0,
+                None,
+                None,
+                false,
+                None,
+                &mut |_| {},
+            )
             .await
             .unwrap();
 
         assert_eq!(json_result, sse_result);
+        assert_eq!(json_transport, ProviderTransport::ResponsesNonStreaming);
+        assert_eq!(sse_transport, ProviderTransport::ResponsesSse);
     }
 
     #[tokio::test]

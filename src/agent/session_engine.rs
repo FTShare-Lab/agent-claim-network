@@ -1063,6 +1063,7 @@ impl InboxJsonGenerator for SessionInboxJsonGenerator<'_> {
         &self,
         kind: InboxInternalizeKind,
         request: InternalizeRequest,
+        preferred_transport: Option<crate::api::ProviderTransport>,
     ) -> anyhow::Result<serde_json::Value> {
         let prompt_name = match kind {
             InboxInternalizeKind::PolicyUpdate => PROMPT_INBOX_POLICY_UPDATE_INTERNALIZE,
@@ -1080,6 +1081,7 @@ impl InboxJsonGenerator for SessionInboxJsonGenerator<'_> {
                 system_prompt,
                 vec![SessionTurnMessage::user_text(user_text)],
                 crate::api::BufferedProviderRuntime::new(self.fallback_scope.clone()),
+                preferred_transport,
             )
             .await
     }
@@ -4987,11 +4989,16 @@ impl SessionEngine {
                 |value| parse_compaction_summary_outcome(value, inputs),
                 |retry_index, retry_total, e| {
                     let message = format!(
-                        "compaction summary JSON invalid, retrying ({retry_index}/{retry_total}): {e:#}"
+                        "compaction summary output invalid, retrying ({retry_index}/{retry_total}): {e:#}"
                     );
-                    emit(SessionEvent::Warning {
-                        message: message.clone(),
-                    });
+                    // reasoning-only / no-consumable 属于可自动恢复的 provider
+                    // 业务重试：保留日志与 compaction audit，只在最终失败时
+                    // 向 TUI 报错，避免成功恢复后仍留下误导性 Warning。
+                    if should_emit_compaction_retry_warning(e) {
+                        emit(SessionEvent::Warning {
+                            message: message.clone(),
+                        });
+                    }
                     retry_warnings.push(message);
                 },
                 |attempt| {
@@ -5041,6 +5048,10 @@ impl SessionEngine {
             }
         }
     }
+}
+
+fn should_emit_compaction_retry_warning(error: &anyhow::Error) -> bool {
+    crate::api::structured_json_no_consumable_transport(error).is_none()
 }
 
 fn compaction_noop_reason(

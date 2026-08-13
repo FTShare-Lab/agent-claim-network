@@ -20,7 +20,8 @@ use super::runner::{AgentRunner, InboxProcessReport, TeamServiceConnectionStatus
 use super::traits::ClaimedInboxMessage;
 use crate::api::{
     resolve_placeholders, BufferedProviderRuntime, InboxInternalizeKind, InternalizeOutcome,
-    InternalizeRequest, ProviderRuntimeFallbackScope, SessionTurnMessage, StructuredJsonCaller,
+    InternalizeRequest, ProviderRuntimeFallbackScope, ProviderTransport, SessionTurnMessage,
+    StructuredJsonCaller,
 };
 use crate::claim::{
     Claim, ClaimId, ClaimStatus, Dispute, DisputeId, InboxId, InboxMessage, InboxMessageKind,
@@ -38,6 +39,7 @@ pub(crate) trait InboxJsonGenerator: Send + Sync {
         &self,
         kind: InboxInternalizeKind,
         request: InternalizeRequest,
+        preferred_transport: Option<ProviderTransport>,
     ) -> anyhow::Result<serde_json::Value>;
 }
 
@@ -66,6 +68,7 @@ impl InboxJsonGenerator for PromptInboxJsonGenerator {
         &self,
         kind: InboxInternalizeKind,
         request: InternalizeRequest,
+        preferred_transport: Option<ProviderTransport>,
     ) -> anyhow::Result<serde_json::Value> {
         let prompt_name = match kind {
             InboxInternalizeKind::PolicyUpdate => "inbox_policy_update_internalize",
@@ -83,6 +86,7 @@ impl InboxJsonGenerator for PromptInboxJsonGenerator {
                 system_prompt,
                 vec![SessionTurnMessage::user_text(user_text)],
                 BufferedProviderRuntime::new(self.fallback_scope.clone()),
+                preferred_transport,
             )
             .await
     }
@@ -484,11 +488,18 @@ impl AgentRunner {
             .map(|claim| (claim.id.clone(), claim.clone()))
             .collect();
         let mut last_err = None;
+        let mut preferred_transport = None;
         let (now, prepared_claims, prepared_updates, prepared_disputes) = {
             let mut prepared = None;
             for attempt in 0..=self.llm_retry_count {
                 match self
-                    .internalize_and_prepare_once(generator, kind, request.clone(), &local_by_id)
+                    .internalize_and_prepare_once(
+                        generator,
+                        kind,
+                        request.clone(),
+                        &local_by_id,
+                        preferred_transport,
+                    )
                     .await
                 {
                     Ok(value) => {
@@ -499,13 +510,27 @@ impl AgentRunner {
                         if crate::api::structured_json_business_retryable(&e)
                             && attempt < self.llm_retry_count =>
                     {
-                        log::warn!(
-                            target: "agent",
-                            "agent {} internalize_inbox 输出未通过协议校验，重试 ({}/{}): {e:#}",
-                            self.agent_id,
-                            attempt + 1,
-                            self.llm_retry_count
-                        );
+                        if let Some(transport) =
+                            crate::api::structured_json_no_consumable_transport(&e)
+                        {
+                            preferred_transport = Some(transport);
+                            log::warn!(
+                                target: "agent",
+                                "agent {} internalize_inbox 没有可消费输出，使用相同 transport 原样重试 ({}/{}): transport={}; {e:#}",
+                                self.agent_id,
+                                attempt + 1,
+                                self.llm_retry_count,
+                                transport
+                            );
+                        } else {
+                            log::warn!(
+                                target: "agent",
+                                "agent {} internalize_inbox 输出未通过协议校验，重试 ({}/{}): {e:#}",
+                                self.agent_id,
+                                attempt + 1,
+                                self.llm_retry_count
+                            );
+                        }
                         last_err = Some(e);
                     }
                     Err(e) => return Err(e),
@@ -642,6 +667,7 @@ impl AgentRunner {
         kind: InboxInternalizeKind,
         request: InternalizeRequest,
         local_by_id: &FxHashMap<ClaimId, Claim>,
+        preferred_transport: Option<ProviderTransport>,
     ) -> anyhow::Result<PreparedInternalization> {
         let mut allowed_policy_ids = inbox_policy_ids(&request.inbox_messages)
             .into_iter()
@@ -670,7 +696,9 @@ impl AgentRunner {
             .iter()
             .map(|claim| claim.id.clone())
             .collect();
-        let raw = generator.generate_json(kind, request).await?;
+        let raw = generator
+            .generate_json(kind, request, preferred_transport)
+            .await?;
         self.prepare_internalized_output(
             raw,
             local_by_id,
@@ -858,6 +886,7 @@ mod tests {
             &self,
             kind: InboxInternalizeKind,
             _request: InternalizeRequest,
+            _preferred_transport: Option<ProviderTransport>,
         ) -> anyhow::Result<Value> {
             assert_eq!(kind, self.expected_kind);
             Ok(self.response.clone())
@@ -865,8 +894,9 @@ mod tests {
     }
 
     struct RetryRecordingInboxGenerator {
-        responses: Mutex<VecDeque<Value>>,
+        responses: Mutex<VecDeque<anyhow::Result<Value>>>,
         requests: Mutex<Vec<InternalizeRequest>>,
+        preferred_transports: Mutex<Vec<Option<ProviderTransport>>>,
     }
 
     #[async_trait]
@@ -875,13 +905,18 @@ mod tests {
             &self,
             _kind: InboxInternalizeKind,
             request: InternalizeRequest,
+            preferred_transport: Option<ProviderTransport>,
         ) -> anyhow::Result<Value> {
             self.requests.lock().unwrap().push(request);
+            self.preferred_transports
+                .lock()
+                .unwrap()
+                .push(preferred_transport);
             self.responses
                 .lock()
                 .unwrap()
                 .pop_front()
-                .ok_or_else(|| anyhow::anyhow!("missing fake inbox response"))
+                .ok_or_else(|| anyhow::anyhow!("missing fake inbox response"))?
         }
     }
 
@@ -1135,18 +1170,19 @@ mod tests {
         inbox.accept_pulled(&message).await.unwrap();
         let generator = Arc::new(RetryRecordingInboxGenerator {
             responses: Mutex::new(VecDeque::from([
-                json!({
+                Ok(json!({
                     "new_claims": [{"id":"$new_claim_0$"}],
                     "updated_claims": [],
                     "new_disputes": [],
-                }),
-                json!({
+                })),
+                Ok(json!({
                     "new_claims": [],
                     "updated_claims": [],
                     "new_disputes": [],
-                }),
+                })),
             ])),
             requests: Mutex::new(Vec::new()),
+            preferred_transports: Mutex::new(Vec::new()),
         });
         let runner = AgentRunner::new(
             AgentId::new("agent-a").unwrap(),
@@ -1173,6 +1209,61 @@ mod tests {
         let requests = generator.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0], requests[1]);
+        assert_eq!(
+            generator.preferred_transports.lock().unwrap().as_slice(),
+            &[None, None]
+        );
+    }
+
+    #[tokio::test]
+    async fn no_consumable_inbox_retry_preserves_actual_transport() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_home = dir.path().to_path_buf();
+        let inbox = Arc::new(LocalFsInboxReader::new(agent_home.clone()));
+        let message = receipt_test_message(PolicyStatus::Active);
+        inbox.accept_pulled(&message).await.unwrap();
+        let generator = Arc::new(RetryRecordingInboxGenerator {
+            responses: Mutex::new(VecDeque::from([
+                Err(crate::api::StructuredJsonNoConsumableOutput::new(
+                    "Responses 响应没有可消费的 output_text 或 function_call".into(),
+                    ProviderTransport::ResponsesNonStreaming,
+                )
+                .into()),
+                Ok(json!({
+                    "new_claims": [],
+                    "updated_claims": [],
+                    "new_disputes": [],
+                })),
+            ])),
+            requests: Mutex::new(Vec::new()),
+            preferred_transports: Mutex::new(Vec::new()),
+        });
+        let runner = AgentRunner::new(
+            AgentId::new("agent-a").unwrap(),
+            generator.clone(),
+            Arc::new(LocalFsClaimStore::new(agent_home.clone())),
+            Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home.clone())),
+            inbox,
+            Arc::new(LocalFsMemoryStore::new(
+                agent_home.clone(),
+                1600,
+                1000,
+                false,
+            )),
+            Arc::new(EmptyRouterClient),
+            Arc::new(NoopMaintainerClient),
+            Arc::new(LocalFsMaintainerUploadQueue::new(agent_home)),
+            1,
+            Vec::<SkillSummary>::new(),
+        );
+
+        let report = runner.process_inbox_with(generator.as_ref()).await.unwrap();
+
+        assert_eq!(report.policy_count, 1);
+        assert_eq!(
+            generator.preferred_transports.lock().unwrap().as_slice(),
+            &[None, Some(ProviderTransport::ResponsesNonStreaming)]
+        );
     }
 
     async fn assert_invalid_inbox_output_has_no_side_effects(
@@ -1662,6 +1753,7 @@ mod tests {
                 InboxInternalizeKind::ClaimAttributeUpdate,
                 request,
                 &local_by_id,
+                None,
             )
             .await
             .unwrap();

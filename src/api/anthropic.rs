@@ -29,7 +29,7 @@ use super::provider::{
     NoopProviderRequestObserver, ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy,
     ProviderNoConsumableOutput, ProviderReplayIdentity, ProviderReplayProtocol, ProviderRequest,
     ProviderRequestObserver, ProviderRequestPreparationFailure, ProviderResponse, ProviderStop,
-    ProviderStreamFailure, ProviderTerminalFailure, ToolSpec,
+    ProviderStreamFailure, ProviderTerminalFailure, ProviderTransport, ToolSpec,
 };
 use super::redact_media_error_body;
 use super::types::{SessionTurnContentBlock, SessionTurnEvent, SessionTurnMessage};
@@ -454,6 +454,11 @@ impl AnthropicProviderAdapter {
         emit: &mut (dyn FnMut(ProviderEvent) + Send),
         observer: &mut (dyn ProviderRequestObserver + Send),
     ) -> anyhow::Result<ProviderResponse> {
+        let transport = if request.stream {
+            ProviderTransport::AnthropicSse
+        } else {
+            ProviderTransport::AnthropicNonStreaming
+        };
         let retry_count = request
             .retry_count_override
             .unwrap_or(self.client.retry_count);
@@ -560,7 +565,7 @@ impl AnthropicProviderAdapter {
         let assistant_message = match assistant_turn_message(&turn, self.client.model.as_str()) {
             Ok(message) => message,
             Err(AnthropicError::NoConsumableOutput { reason }) => {
-                return Err(ProviderNoConsumableOutput::new(reason).into());
+                return Err(ProviderNoConsumableOutput::new(transport, reason).into());
             }
             Err(error) => return Err(error.into()),
         };

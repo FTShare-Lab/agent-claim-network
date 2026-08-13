@@ -243,7 +243,9 @@ Compaction summarizer 必须输出结构化 JSON，不接受自由文本。V1 �
 Summary 生成使用两层 retry，均受 `[agent.llm].retry_count` 限制：
 
 - 每次 provider/transport 调用按协议层预算重试当前 transport，耗尽后再执行 transport fallback。
-- 收到完整结果后，structured JSON 解析失败或 shape error 使用独立的业务预算重试，业务总尝试次数为 `1 + retry_count`。
+- 请求正常结束但只有 reasoning/thinking、没有可消费输出时，不触发 transport fallback；清除本次 continuation 后，使用独立的业务预算在本次实际 transport 上原样重发请求。
+- 该可恢复重试在 TUI 中静默进行，日志与 compaction audit 仍保留详情；只有重试耗尽时才向用户显示最终错误。
+- 收到可消费结果后，structured JSON 解析失败或 shape error 也使用独立的业务预算重试，业务总尝试次数为 `1 + retry_count`。
 - retry 耗尽后，本次 compact 失败，不移动任何 compaction / recap 指针。
 
 主会话和 delegation 生成 summary 时优先使用完整 transcript。只有完整 summary 请求
@@ -356,7 +358,7 @@ Compact 进行中时，TUI 只用 live box 顶部状态表达进度：
 - 手动 `/compact` 在没有新可压缩内容时显示 `Nothing new to compact.`，不重写同一份 summary。
 - compact 进行中 TUI live box 标题显示 `Compacting · Session history · Ns`，内容不显示`thinking...`、`compacting session...`、`compaction started` 或 `compaction completed`。
 - compact 失败时 TUI 显示 `Compaction failed: ...`，`Compaction` 首字母大写。
-- compaction summary 使用结构化 JSON 输出，shape error 按 `[agent.llm].retry_count` 限制重试。
+- compaction summary 使用结构化 JSON 输出；整轮没有可消费输出、JSON parse 或 shape error 均按 `[agent.llm].retry_count` 限制业务重试。
 - 主会话和 delegation 的 compaction summary 请求优先携带完整工具结果；完整请求超限后依次降级为“大型结果省略”和“全部结果省略”，canonical transcript 始终保留原文。
 - 全部 tool result 省略后仍超限则不调用 provider，也不推进 compaction frontier。每次 JSON retry 同样按最终请求重新执行保守预算检查。
 - 对同时包含 committed summary 与 recap 的 compact，先只构造并完成 summary 的本地预算预检；预检失败时两类 provider 请求均不启动。预检通过后 summary 与 recap 可以并发执行；任一实际调用失败时都不提交 checkpoint 或推进指针。
@@ -437,7 +439,7 @@ Todo:
 Todo:
 
 - 升级 compaction summarizer 输出结构化 JSON：`committed_summary` 与 `active_turn_summary` 两个 key 必须存在。
-- JSON parse / shape error 按 `[agent.llm].retry_count` 与 provider retry 共用 retry budget。
+- 整轮没有可消费输出、JSON parse 或 shape error 使用独立的业务 retry budget，并受 `[agent.llm].retry_count` 限制。
 - retry 耗尽时 compact 失败，不移动 compaction / recap 指针。
 - compact summary 与 recap/finalize 侧原子提交：二者同时成功后才移动`frontier.committed_message_until` 与 `recapped_until`。
 - 手动 `/compact` 和自动 preflight compact 共用同一原子提交语义。

@@ -1834,6 +1834,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responses_client_reports_websocket_as_actual_transport() {
+        let (server, _) = start_websocket_server(FakeBehavior::Success).await;
+        let client = super::super::ResponsesClient::new(
+            server.endpoint.clone(),
+            "test-key".into(),
+            Duration::from_secs(2),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap()
+        .with_websockets(1)
+        .unwrap();
+        let chain = ProviderRuntimeChainId::new();
+
+        let (response, transport) = client
+            .send_with_retry_count_for_runtime_scope_and_transport(
+                &request(vec![json!({"type":"message","n":1})]),
+                0,
+                Some(chain),
+                None,
+                false,
+                None,
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.output_text, "ok");
+        assert_eq!(transport, crate::api::ProviderTransport::ResponsesWebSocket);
+    }
+
+    #[tokio::test]
     async fn reasoning_and_tool_items_use_shared_reducer_without_visible_delta() {
         let (server, _) = start_websocket_server(FakeBehavior::ReasoningAndTool).await;
         let transport = transport(&server.endpoint, 1);

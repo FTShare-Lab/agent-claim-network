@@ -352,21 +352,82 @@ impl ProviderStreamFailure {
     }
 }
 
+/// Provider 实际完成一次请求时使用的 transport。
+///
+/// 该信息只用于内部重试选择和日志诊断，不进入用户可见错误。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderTransport {
+    ResponsesWebSocket,
+    ResponsesSse,
+    ResponsesNonStreaming,
+    ChatSse,
+    ChatNonStreaming,
+    AnthropicSse,
+    AnthropicNonStreaming,
+}
+
+impl ProviderTransport {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResponsesWebSocket => "responses_websocket",
+            Self::ResponsesSse => "responses_sse",
+            Self::ResponsesNonStreaming => "responses_non_streaming",
+            Self::ChatSse => "chat_sse",
+            Self::ChatNonStreaming => "chat_non_streaming",
+            Self::AnthropicSse => "anthropic_sse",
+            Self::AnthropicNonStreaming => "anthropic_non_streaming",
+        }
+    }
+
+    pub(crate) const fn is_streaming(self) -> bool {
+        !matches!(
+            self,
+            Self::ResponsesNonStreaming | Self::ChatNonStreaming | Self::AnthropicNonStreaming
+        )
+    }
+
+    pub(crate) fn retry_fallback_scope(
+        self,
+        base: &ProviderRuntimeFallbackScope,
+    ) -> ProviderRuntimeFallbackScope {
+        if self == Self::ResponsesSse {
+            let scope = base.new_child();
+            scope.mark_websocket_sticky();
+            scope
+        } else {
+            base.clone()
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Provider 正常结束，但没有 ACN 可以提交的非空文本或完整工具调用。
 ///
-/// 该结果没有产生 provider replay 或工具副作用，允许直接切换 non-streaming 重试；
-/// 显式拒绝、token limit 和上下文窗口恢复不能映射为此类型。
+/// 该结果没有产生可提交的 provider replay 或工具副作用。内部任务会清除本次
+/// continuation，并使用独立业务预算在相同实际 transport 上原样重试；显式拒绝、
+/// token limit 和上下文窗口恢复不能映射为此类型。
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub(crate) struct ProviderNoConsumableOutput {
+    transport: ProviderTransport,
     message: String,
 }
 
 impl ProviderNoConsumableOutput {
-    pub(crate) fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(transport: ProviderTransport, message: impl Into<String>) -> Self {
         Self {
+            transport,
             message: message.into(),
         }
+    }
+
+    pub(crate) const fn transport(&self) -> ProviderTransport {
+        self.transport
     }
 }
 

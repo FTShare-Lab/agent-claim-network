@@ -17,7 +17,7 @@ use super::provider::{
     ProviderNoConsumableOutput, ProviderRecoveryInterrupt, ProviderReplayIdentity,
     ProviderReplayProtocol, ProviderRequest, ProviderRequestObserver,
     ProviderRequestPreparationFailure, ProviderResponse, ProviderRuntimeChainId, ProviderStop,
-    ProviderStreamFailure, ProviderTerminalFailure, ToolSpec,
+    ProviderStreamFailure, ProviderTerminalFailure, ProviderTransport, ToolSpec,
 };
 use super::redact_media_error_body;
 use super::responses::{
@@ -160,6 +160,11 @@ impl OpenAiCompatibleResponsesProviderAdapter {
         let mut replay_items = Vec::new();
         let mut last_function_calls = Vec::new();
         let mut last_terminal = ResponsesTerminal::Completed;
+        let mut last_transport = if stream {
+            ProviderTransport::ResponsesSse
+        } else {
+            ProviderTransport::ResponsesNonStreaming
+        };
         let mut provider_messages = base_messages.to_vec();
 
         for round in 0..=MAX_CONTINUATION_TURNS {
@@ -182,14 +187,14 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                 max_tokens,
                 stream,
             );
-            let response = if stream {
+            let (response, transport) = if stream {
                 let mut responses_emit = |event| match event {
                     ResponsesStreamEvent::TextDelta { text } => {
                         emit(ProviderEvent::AssistantTextDelta { text });
                     }
                 };
                 self.client
-                    .send_with_retry_count_for_runtime_scope(
+                    .send_with_retry_count_for_runtime_scope_and_transport(
                         &request,
                         retry_count,
                         runtime_chain_id,
@@ -201,16 +206,20 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                     .await?
             } else {
                 let mut noop = |_event: ResponsesStreamEvent| {};
-                self.client
-                    .send_with_retry_count_for_runtime_chain(
-                        &request,
-                        retry_count,
-                        None,
-                        recovery_interrupt,
-                        &mut noop,
-                    )
-                    .await?
+                (
+                    self.client
+                        .send_with_retry_count_for_runtime_chain(
+                            &request,
+                            retry_count,
+                            None,
+                            recovery_interrupt,
+                            &mut noop,
+                        )
+                        .await?,
+                    ProviderTransport::ResponsesNonStreaming,
+                )
             };
+            last_transport = transport;
             if let Some(usage) = response
                 .usage
                 .as_ref()
@@ -256,6 +265,7 @@ impl OpenAiCompatibleResponsesProviderAdapter {
             replay_items,
             function_calls: last_function_calls,
             terminal: last_terminal,
+            transport: last_transport,
         })
     }
 }
@@ -362,10 +372,11 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                 return Err(error.into());
             }
         };
+        let transport = turn.transport;
         let response = match provider_response_from_turn(turn, &self.model) {
             Ok(response) => response,
             Err(OpenAiCompatibleResponsesError::NoConsumableOutput { reason }) => {
-                return Err(ProviderNoConsumableOutput::new(reason).into());
+                return Err(ProviderNoConsumableOutput::new(transport, reason).into());
             }
             Err(error) => return Err(error.into()),
         };
@@ -424,6 +435,7 @@ struct ContinuedResponsesTurn {
     replay_items: Vec<Value>,
     function_calls: Vec<super::responses::ResponsesFunctionCall>,
     terminal: ResponsesTerminal,
+    transport: ProviderTransport,
 }
 
 fn session_turn_messages_to_responses(
@@ -1105,6 +1117,7 @@ mod tests {
                 arguments: r#"{"path":"a.txt"}"#.into(),
             }],
             terminal: ResponsesTerminal::Completed,
+            transport: ProviderTransport::ResponsesSse,
         };
 
         let response = provider_response_from_turn(turn, "test-model").unwrap();
@@ -1129,6 +1142,7 @@ mod tests {
                 replay_items: vec![json!({"type":"output_image","data":secret})],
                 function_calls: Vec::new(),
                 terminal: ResponsesTerminal::Completed,
+                transport: ProviderTransport::ResponsesSse,
             },
             "test-model",
         )
@@ -1169,6 +1183,7 @@ mod tests {
                 replay_items: vec![json!({"type":"message"})],
                 function_calls: Vec::new(),
                 terminal: ResponsesTerminal::MaxOutputTokens,
+                transport: ProviderTransport::ResponsesSse,
             },
             "test-model",
         )
@@ -1200,6 +1215,7 @@ mod tests {
                 })],
                 function_calls: Vec::new(),
                 terminal: ResponsesTerminal::Completed,
+                transport: ProviderTransport::ResponsesSse,
             },
             "test-model",
         )
