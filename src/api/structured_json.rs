@@ -41,6 +41,14 @@ impl StructuredJsonAttemptRequest {
     }
 
     pub(crate) fn compaction(system_prompt: String, messages: Vec<SessionTurnMessage>) -> Self {
+        Self::retryable_provider(system_prompt, messages)
+    }
+
+    /// 由结构化调用层统一承担 provider/解析/shape 重试，避免 adapter 与上层重复放大预算。
+    pub(crate) fn retryable_provider(
+        system_prompt: String,
+        messages: Vec<SessionTurnMessage>,
+    ) -> Self {
         Self {
             system_prompt,
             messages,
@@ -334,6 +342,8 @@ impl StructuredJsonCaller {
         };
 
         let mut emit = |_event: ProviderEvent| {};
+        // 标准调用由 adapter 自己完成 provider retry；这里不能用单次 request timeout
+        // 包住整个 send，否则会在 adapter 的重试预算耗尽前取消调用。
         let response = self
             .provider
             .send(request, &mut emit)
@@ -359,11 +369,39 @@ impl StructuredJsonCaller {
         };
 
         let mut emit = |_event: ProviderEvent| {};
-        let response = self
-            .provider
-            .send(request, &mut emit)
-            .await
-            .map_err(|error| JsonCallFailure::new(JsonCallError::Provider(error), None, None))?;
+        let response = if retry_count_override == Some(0) {
+            match self.provider.request_timeout() {
+                Some(timeout) => {
+                    tokio::time::timeout(timeout, self.provider.send(request, &mut emit))
+                        .await
+                        .map_err(|_| {
+                            JsonCallFailure::new(
+                                JsonCallError::Provider(anyhow::anyhow!(
+                                    "结构化 JSON provider request 超时: {timeout:?}"
+                                )),
+                                None,
+                                None,
+                            )
+                        })?
+                        .map_err(|error| {
+                            JsonCallFailure::new(JsonCallError::Provider(error), None, None)
+                        })?
+                }
+                None => self
+                    .provider
+                    .send(request, &mut emit)
+                    .await
+                    .map_err(|error| {
+                        JsonCallFailure::new(JsonCallError::Provider(error), None, None)
+                    })?,
+            }
+        } else {
+            // None 保留 adapter 内部完整 retry 语义，与普通 ProviderRequest 一致。
+            self.provider
+                .send(request, &mut emit)
+                .await
+                .map_err(|error| JsonCallFailure::new(JsonCallError::Provider(error), None, None))?
+        };
 
         parse_structured_response_observed(response)
     }
@@ -634,6 +672,24 @@ mod tests {
         requests: Mutex<Vec<ProviderRequest>>,
     }
 
+    struct SlowProvider;
+
+    #[async_trait]
+    impl ProviderAdapter for SlowProvider {
+        fn request_timeout(&self) -> Option<Duration> {
+            Some(Duration::from_millis(1))
+        }
+
+        async fn send(
+            &self,
+            _request: ProviderRequest,
+            _emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        ) -> anyhow::Result<ProviderResponse> {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            text_response(r#"{"ok":true}"#)
+        }
+    }
+
     impl FakeProvider {
         fn new(responses: Vec<anyhow::Result<ProviderResponse>>) -> Self {
             Self {
@@ -717,6 +773,54 @@ mod tests {
         assert!(requests[0].tools.is_empty());
         assert_eq!(requests[0].max_tokens, 512);
         assert!(!requests[0].stream);
+    }
+
+    #[tokio::test]
+    async fn provider_request_timeout_does_not_cancel_standard_structured_call() {
+        let caller = caller(Arc::new(SlowProvider));
+
+        let value = caller
+            .generate_json("system".into(), Vec::new())
+            .await
+            .expect("standard call must preserve adapter-owned retry/timeout semantics");
+
+        assert_eq!(value, json!({"ok": true}));
+    }
+
+    #[tokio::test]
+    async fn provider_request_timeout_does_not_cancel_standard_observed_call() {
+        let caller = caller(Arc::new(SlowProvider));
+
+        let value = caller
+            .generate_json_validated_with_attempt_notice(
+                "system".into(),
+                Vec::new(),
+                Ok,
+                |_, _, _| {},
+                |_| std::future::ready(()),
+            )
+            .await
+            .expect("standard observed call must preserve adapter-owned timeout semantics");
+
+        assert_eq!(value, json!({"ok": true}));
+    }
+
+    #[tokio::test]
+    async fn provider_request_timeout_bounds_explicit_single_attempt_calls() {
+        let caller = caller(Arc::new(SlowProvider));
+
+        let error = caller
+            .generate_json_validated_with_guarded_attempts(
+                StructuredJsonAttemptRequest::compaction("system".into(), Vec::new()),
+                Ok,
+                |_, _, _| {},
+                |_| std::future::ready(()),
+                |_, _| Ok(()),
+            )
+            .await
+            .expect_err("explicit single-provider attempts must use request_timeout");
+
+        assert!(error.to_string().contains("provider request 超时"));
     }
 
     #[tokio::test]

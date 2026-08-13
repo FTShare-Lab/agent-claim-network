@@ -10,12 +10,13 @@ use rand::RngCore;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::claim::{AgentId, DisputeId, PolicyId, PolicyStatus};
+use crate::claim::{AgentId, ArbitrationResolutionId, DisputeId, PolicyId, PolicyStatus};
 use crate::config::MaintainerHistoryConfig;
 use crate::router::RouterQueryResult;
 use crate::storage::{append_jsonl_record, paths, read_jsonl_records, JsonlRotationConfig};
 use crate::time::serde_utc;
 
+use super::arbitration::ObservationState;
 use super::{ClaimSweepReport, DeliveryMessageType};
 
 pub const STREAM_POLICY_EVENTS: &str = "policy_events";
@@ -24,6 +25,7 @@ pub const STREAM_SWEEP_RUNS: &str = "sweep_runs";
 pub const STREAM_HTTP_AUDIT_LOGS: &str = "http_audit_logs";
 pub const STREAM_ROUTER_QUERY_AUDIT_LOGS: &str = "router_query_audit_logs";
 pub const STREAM_AGENT_ACTIVITY_EVENTS: &str = "agent_activity_events";
+pub const STREAM_RESOLUTION_OBSERVATION_EVENTS: &str = "resolution_observation_events";
 
 #[derive(Clone)]
 pub struct HistoryStore {
@@ -60,6 +62,53 @@ impl HistoryStore {
             .await
     }
 
+    /// Resolution 恢复路径可能重复执行；稳定 event_id 已存在时不再追加。
+    pub async fn ensure_policy_event(&self, record: &PolicyEventRecord) -> anyhow::Result<()> {
+        let _guard = self.lock.lock().await;
+        if self
+            .list_records::<PolicyEventRecord>(STREAM_POLICY_EVENTS)
+            .await?
+            .iter()
+            .any(|existing| existing.event_id == record.event_id)
+        {
+            return Ok(());
+        }
+        append_jsonl_record(
+            &paths::team_store_maintainer_history_current_path(
+                &self.team_root,
+                STREAM_POLICY_EVENTS,
+            ),
+            record,
+            self.rotation,
+        )
+        .await
+    }
+
+    /// 与 Resolution 的 durable commit 共用幂等键，响应丢失或重启不会重复记账。
+    pub async fn ensure_dispute_resolution_event(
+        &self,
+        record: &DisputeResolutionEventRecord,
+    ) -> anyhow::Result<()> {
+        let _guard = self.lock.lock().await;
+        if self
+            .list_records::<DisputeResolutionEventRecord>(STREAM_DISPUTE_RESOLUTION_EVENTS)
+            .await?
+            .iter()
+            .any(|existing| existing.event_id == record.event_id)
+        {
+            return Ok(());
+        }
+        append_jsonl_record(
+            &paths::team_store_maintainer_history_current_path(
+                &self.team_root,
+                STREAM_DISPUTE_RESOLUTION_EVENTS,
+            ),
+            record,
+            self.rotation,
+        )
+        .await
+    }
+
     pub async fn write_sweep_run(&self, record: &SweepRunRecord) -> anyhow::Result<()> {
         self.write_record(STREAM_SWEEP_RUNS, record).await
     }
@@ -78,6 +127,14 @@ impl HistoryStore {
         record: &RouterQueryAuditRecord,
     ) -> anyhow::Result<()> {
         self.write_record(STREAM_ROUTER_QUERY_AUDIT_LOGS, record)
+            .await
+    }
+
+    pub async fn write_resolution_observation_event(
+        &self,
+        record: &ResolutionObservationEventRecord,
+    ) -> anyhow::Result<()> {
+        self.write_record(STREAM_RESOLUTION_OBSERVATION_EVENTS, record)
             .await
     }
 
@@ -105,6 +162,13 @@ impl HistoryStore {
 
     pub async fn list_router_query_audits(&self) -> anyhow::Result<Vec<RouterQueryAuditRecord>> {
         self.list_records(STREAM_ROUTER_QUERY_AUDIT_LOGS).await
+    }
+
+    pub async fn list_resolution_observation_events(
+        &self,
+    ) -> anyhow::Result<Vec<ResolutionObservationEventRecord>> {
+        self.list_records(STREAM_RESOLUTION_OBSERVATION_EVENTS)
+            .await
     }
 
     async fn write_record<T: Serialize>(&self, stream: &str, record: &T) -> anyhow::Result<()> {
@@ -206,6 +270,19 @@ pub struct RouterQueryAuditRecord {
     pub scope: String,
     pub semantic_query: Option<String>,
     pub result: RouterQueryResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolutionObservationEventRecord {
+    pub event_id: String,
+    pub resolution_id: ArbitrationResolutionId,
+    pub dispute_id: DisputeId,
+    pub agent_id: AgentId,
+    #[serde(with = "serde_utc")]
+    pub occurred_at: DateTime<Utc>,
+    pub previous_state: Option<ObservationState>,
+    pub current_state: ObservationState,
+    pub reasons: Vec<String>,
 }
 
 pub fn fresh_record_id(prefix: &str) -> String {

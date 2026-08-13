@@ -116,6 +116,115 @@ pub fn team_store_disputes_dir(team_root: &Path) -> PathBuf {
     team_root.join("maintainer").join("disputes")
 }
 
+pub fn team_store_arbitrations_dir(team_root: &Path) -> PathBuf {
+    team_root.join("maintainer").join("arbitrations")
+}
+
+/// `team_root/maintainer/arbitrations/semantic-inputs.lock`：Claim、治理 Policy、
+/// Dispute 与 Resolution 写入同自动采用最终复核之间的跨进程协调锁。
+pub fn team_store_arbitration_semantic_inputs_lock_path(team_root: &Path) -> PathBuf {
+    team_store_arbitrations_dir(team_root).join("semantic-inputs.lock")
+}
+
+/// `team_root/maintainer/arbitrations/semantic-inputs-revision.yaml`：所有会改变
+/// 仲裁语义输入的写入在持锁时递增，用于 Adopt 的乐观两阶段复核。
+pub fn team_store_arbitration_semantic_inputs_revision_path(team_root: &Path) -> PathBuf {
+    team_store_arbitrations_dir(team_root).join("semantic-inputs-revision.yaml")
+}
+
+pub fn team_store_arbitration_dispute_dir(
+    team_root: &Path,
+    dispute_id: &crate::claim::DisputeId,
+) -> PathBuf {
+    team_store_arbitrations_dir(team_root).join(dispute_id.as_str())
+}
+
+/// 固定的 create-once 自动分析。
+pub fn team_store_arbitration_automatic_analysis_path(
+    team_root: &Path,
+    dispute_id: &crate::claim::DisputeId,
+) -> PathBuf {
+    team_store_arbitration_dispute_dir(team_root, dispute_id).join("automatic_analysis.yaml")
+}
+
+pub fn team_store_arbitration_manual_analysis_path(
+    team_root: &Path,
+    dispute_id: &crate::claim::DisputeId,
+) -> PathBuf {
+    team_store_arbitration_dispute_dir(team_root, dispute_id).join("manual_analysis.yaml")
+}
+
+pub fn team_store_arbitration_resolution_path(
+    team_root: &Path,
+    dispute_id: &crate::claim::DisputeId,
+) -> PathBuf {
+    team_store_arbitration_dispute_dir(team_root, dispute_id).join("resolution.yaml")
+}
+
+/// 旧版本 resolution 记录使用的只读兼容目录；新写入不再使用。
+pub fn team_store_arbitration_legacy_decisions_dir(
+    team_root: &Path,
+    dispute_id: &crate::claim::DisputeId,
+) -> PathBuf {
+    team_store_arbitration_dispute_dir(team_root, dispute_id).join("decisions")
+}
+
+pub fn team_store_arbitration_pending_deliveries_dir(team_root: &Path) -> PathBuf {
+    team_store_arbitrations_dir(team_root).join("pending-deliveries")
+}
+
+pub fn team_store_arbitration_pending_delivery_path(
+    team_root: &Path,
+    resolution_id: &crate::claim::ArbitrationResolutionId,
+) -> PathBuf {
+    team_store_arbitration_pending_deliveries_dir(team_root).join(format!("{resolution_id}.yaml"))
+}
+
+pub fn team_store_arbitration_pending_observations_dir(team_root: &Path) -> PathBuf {
+    team_store_arbitrations_dir(team_root).join("pending-observations")
+}
+
+pub fn team_store_arbitration_pending_observation_path(
+    team_root: &Path,
+    resolution_id: &crate::claim::ArbitrationResolutionId,
+) -> PathBuf {
+    team_store_arbitration_pending_observations_dir(team_root).join(format!("{resolution_id}.yaml"))
+}
+
+pub fn team_store_arbitration_event_inbox_index_path(
+    team_root: &Path,
+    inbox_id: &crate::claim::InboxId,
+) -> PathBuf {
+    team_store_arbitrations_dir(team_root)
+        .join("event-index")
+        .join("inboxes")
+        .join(format!("{inbox_id}.yaml"))
+}
+
+pub fn team_store_arbitration_event_claim_index_dir(
+    team_root: &Path,
+    claim_id: &crate::claim::ClaimId,
+) -> PathBuf {
+    team_store_arbitrations_dir(team_root)
+        .join("event-index")
+        .join("claims")
+        .join(claim_id.as_str())
+}
+
+pub fn team_store_arbitration_observations_dir(
+    team_root: &Path,
+    dispute_id: &crate::claim::DisputeId,
+) -> PathBuf {
+    team_store_arbitration_dispute_dir(team_root, dispute_id).join("observations")
+}
+
+pub fn team_store_arbitration_lock_path(
+    team_root: &Path,
+    dispute_id: &crate::claim::DisputeId,
+) -> PathBuf {
+    team_store_arbitration_dispute_dir(team_root, dispute_id).join("arbitration.lock")
+}
+
 pub fn team_store_policies_dir(team_root: &Path) -> PathBuf {
     team_root.join("maintainer").join("policies")
 }
@@ -225,6 +334,17 @@ pub fn agent_home_inbox_dir(agent_home: &Path) -> PathBuf {
     agent_home.join("inbox")
 }
 
+pub fn agent_home_inbox_effects_dir(agent_home: &Path) -> PathBuf {
+    agent_home_inbox_dir(agent_home).join("effects")
+}
+
+pub fn agent_home_inbox_effect_path(
+    agent_home: &Path,
+    inbox_id: &crate::claim::InboxId,
+) -> PathBuf {
+    agent_home_inbox_effects_dir(agent_home).join(format!("{inbox_id}.yaml"))
+}
+
 pub fn agent_home_memories_dir(agent_home: &Path) -> PathBuf {
     agent_home.join("memories")
 }
@@ -305,6 +425,14 @@ mod tests {
         assert_eq!(
             team_store_disputes_dir(&root),
             PathBuf::from("/tmp/team/maintainer/disputes")
+        );
+        assert_eq!(
+            team_store_arbitration_semantic_inputs_lock_path(&root),
+            PathBuf::from("/tmp/team/maintainer/arbitrations/semantic-inputs.lock")
+        );
+        assert_eq!(
+            team_store_arbitration_semantic_inputs_revision_path(&root),
+            PathBuf::from("/tmp/team/maintainer/arbitrations/semantic-inputs-revision.yaml")
         );
         assert_eq!(
             team_store_auth_keys_path(&root),

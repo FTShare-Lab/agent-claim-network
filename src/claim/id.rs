@@ -128,6 +128,71 @@ prefixed_id!(InboxId, "inbox_");
 prefixed_id!(MaintainerActionId, "intent_");
 prefixed_id!(SessionId, "session_");
 
+/// 已关闭 Dispute 的唯一 Resolution ID。读取时兼容旧 `arbitration_` 前缀，
+/// 新写入统一使用 `resolution_`。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ArbitrationResolutionId(String);
+
+impl ArbitrationResolutionId {
+    pub const PREFIX: &'static str = "resolution_";
+
+    pub fn random() -> Self {
+        Self(format!("{}{}", Self::PREFIX, random_hex8()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ArbitrationResolutionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Ord for ArbitrationResolutionId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl PartialOrd for ArbitrationResolutionId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl FromStr for ArbitrationResolutionId {
+    type Err = IdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let suffix = value
+            .strip_prefix(Self::PREFIX)
+            .or_else(|| value.strip_prefix("arbitration_"))
+            .ok_or_else(|| IdError::WrongPrefix {
+                expected: Self::PREFIX,
+                actual: value.to_string(),
+            })?;
+        if suffix.len() != 8
+            || !suffix
+                .chars()
+                .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+        {
+            return Err(IdError::BadSuffix(suffix.to_string()));
+        }
+        Ok(Self(value.to_string()))
+    }
+}
+
+impl<'de> Deserialize<'de> for ArbitrationResolutionId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 impl ClaimId {
     /// 用纳秒级时间戳 + claim name + scope + 4 位随机 salt 派生 claim id 候选。
     /// 仍保持 `claim_` + 8 位 hex 格式；调用方负责同批和本地文件查重。
@@ -319,7 +384,7 @@ impl From<PolicyId> for SourceId {
 }
 
 /// agent 标识，人类指定，校验 `^[a-z0-9_-]+$`
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct AgentId(String);
 

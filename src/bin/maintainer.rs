@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context;
+use tokio_util::sync::CancellationToken;
 
 use agent_claim_network::bootstrap;
 use agent_claim_network::build_info;
@@ -23,10 +24,12 @@ async fn main() -> anyhow::Result<()> {
     let (cfg, _cfg_path) = Config::load_or_init_for_maintainer_daemon(cli.config.as_deref())
         .with_context(|| format!("加载 config: {:?}", cli.config))?;
     let maintainer = bootstrap::build_maintainer_service(&cfg);
+    let cancel = CancellationToken::new();
     let ticker_maintainer = maintainer.clone();
     let interval = Duration::from_secs(cfg.maintainer.sweep.tick_interval_secs);
     let sweep_scheduler = server::SweepScheduler::new(cfg.maintainer.sweep.tick_interval_secs);
     let ticker_scheduler = sweep_scheduler.clone();
+    let ticker_cancel = cancel.child_token();
     let ticker = tokio::spawn(async move {
         let triggered_at = now_seconds();
         if let Err(err) = ticker_maintainer
@@ -43,7 +46,10 @@ async fn main() -> anyhow::Result<()> {
             ticker_scheduler
                 .mark_next_after(now_seconds(), interval)
                 .await;
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                _ = ticker_cancel.cancelled() => return,
+                _ = tokio::time::sleep(interval) => {}
+            }
             let triggered_at = now_seconds();
             if let Err(err) = ticker_maintainer
                 .run_stale_sweep_with_trigger(triggered_at, "ticker")
@@ -57,8 +63,11 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
-    let server_result = server::serve(maintainer, &cfg, sweep_scheduler).await;
-    ticker.abort();
+    let server_result = server::serve(maintainer, &cfg, sweep_scheduler, cancel.clone()).await;
+    cancel.cancel();
+    if let Err(error) = ticker.await {
+        log::warn!(target: "maintainer_bin", "stale sweep ticker join 失败: {error}");
+    }
     server_result
 }
 

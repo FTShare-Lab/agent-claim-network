@@ -16,9 +16,9 @@
 //! 校验格式，给出更精准的错误上下文（哪条 claim 哪个字段挂了）。
 //!
 //! ## InboxMessage 直接复用领域实体
-//! `InternalizeRequest` 把 `InboxMessage` 整条塞进去而不是 PolicySummary，
-//! 因为 inbox 消息本身就是给 agent 的下行消息——LLM 看到的形态与 agent
-//! 实际收到的形态保持一致即可。
+//! 普通 `InternalizeRequest` 和仲裁专用请求都把完整 `InboxMessage` 交给 Agent
+//! 自己的模型，而不是改成 PolicySummary。仲裁请求额外保留完整结构化裁决、当前
+//! Agent 的本地知识和原 Dispute 的 direct Claim 快照。
 
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -429,6 +429,17 @@ pub struct InternalizeRequest {
     pub inbox_messages: Vec<InboxMessage>,
     #[serde(default)]
     pub local_claims: Vec<Claim>,
+}
+
+/// 带结构化裁决的 ClaimAttributeUpdate 专用单次内化输入。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArbitrationInternalizeRequest {
+    pub agent_id: AgentId,
+    pub arbitration_message: InboxMessage,
+    #[serde(default)]
+    pub local_claims: Vec<Claim>,
+    #[serde(default)]
+    pub direct_claims: Vec<Claim>,
 }
 
 /// session recap / finalize 请求：补充 agent 当前完整本地 claim。

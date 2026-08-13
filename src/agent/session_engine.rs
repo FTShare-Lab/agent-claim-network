@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use super::context::AgentContext;
-use super::inbox::InboxJsonGenerator;
+use super::inbox::{ArbitrationJsonValidator, InboxJsonGenerator, PreparedArbitration};
 use super::runner::{AgentRunner, InboxProcessReport};
 use super::runner_trace::trace_name_from_task;
 use super::user_shell::{
@@ -23,11 +23,12 @@ use super::user_shell::{
 };
 use crate::api::{
     ensure_compaction_request_within_context_window, estimate_session_turn_messages_tokens,
-    project_compaction_input_media, AgentTurnLoop, ContextUsageSnapshot, ContextUsageSource,
-    InboxInternalizeKind, InternalizeRequest, MemoryReviewLoop, SessionAttachment,
-    SessionCompactionOutcome, SessionTurn, SessionTurnEvent, SessionTurnEventRecorder,
-    SessionTurnInterrupted, SessionTurnMessage, SessionTurnPreflight, SessionTurnRequest,
-    StructuredJsonAttemptRequest, StructuredJsonCaller, ToolBoundaryControl, TurnMessage,
+    project_compaction_input_media, AgentTurnLoop, ArbitrationInternalizeRequest,
+    ContextUsageSnapshot, ContextUsageSource, InboxInternalizeKind, InternalizeRequest,
+    MemoryReviewLoop, SessionAttachment, SessionCompactionOutcome, SessionTurn, SessionTurnEvent,
+    SessionTurnEventRecorder, SessionTurnInterrupted, SessionTurnMessage, SessionTurnPreflight,
+    SessionTurnRequest, StructuredJsonAttemptRequest, StructuredJsonCaller, ToolBoundaryControl,
+    TurnMessage,
 };
 use crate::claim::{AgentId, Claim, ClaimId, DisputeId, SessionId, SourceId, TraceId};
 use crate::config::{
@@ -874,6 +875,54 @@ impl InboxJsonGenerator for SessionInboxJsonGenerator<'_> {
             .generate_json(
                 system_prompt,
                 vec![SessionTurnMessage::user_text(user_text)],
+            )
+            .await
+    }
+
+    async fn generate_arbitration_json(
+        &self,
+        request: ArbitrationInternalizeRequest,
+    ) -> anyhow::Result<serde_json::Value> {
+        let system_prompt = self
+            .prompt_registry
+            .render(PROMPT_INBOX_CLAIM_ATTRIBUTE_UPDATE_INTERNALIZE, ())
+            .context("渲染 inbox_claim_attribute_update_internalize prompt 失败")?;
+        let user_text = serde_json::to_string_pretty(&request)?;
+        self.json_caller
+            .generate_json(
+                system_prompt,
+                vec![SessionTurnMessage::user_text(user_text)],
+            )
+            .await
+    }
+
+    async fn generate_validated_arbitration_json(
+        &self,
+        request: ArbitrationInternalizeRequest,
+        validator: &mut ArbitrationJsonValidator<'_>,
+    ) -> anyhow::Result<PreparedArbitration> {
+        let agent_id = request.agent_id.clone();
+        let system_prompt = self
+            .prompt_registry
+            .render(PROMPT_INBOX_CLAIM_ATTRIBUTE_UPDATE_INTERNALIZE, ())
+            .context("渲染 inbox_claim_attribute_update_internalize prompt 失败")?;
+        let user_text = serde_json::to_string_pretty(&request)?;
+        self.json_caller
+            .generate_json_validated_with_guarded_attempts(
+                StructuredJsonAttemptRequest::retryable_provider(
+                    system_prompt,
+                    vec![SessionTurnMessage::user_text(user_text)],
+                ),
+                validator,
+                |retry, total, error| {
+                    log::warn!(
+                        target: "agent",
+                        "agent {} arbitration inbox 输出校验失败，重试 ({retry}/{total}): {error:#}",
+                        agent_id
+                    );
+                },
+                |_| std::future::ready(()),
+                |_, _| Ok(()),
             )
             .await
     }

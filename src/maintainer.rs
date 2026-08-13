@@ -10,6 +10,7 @@
 //! - 基于 trace 的“内化建议”自动推送
 //! - dispute 自动检测；dispute 由 Agent 报告、Maintainer 解决，Router 只反映派生状态
 
+pub mod arbitration;
 pub mod history;
 pub mod http_client;
 pub mod outbox_io;
@@ -27,8 +28,10 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::sync::Mutex;
 
+#[cfg(test)]
+use crate::claim::DisputeId;
 use crate::claim::{
-    AgentId, Claim, ClaimId, ClaimStatus, Dispute, DisputeId, DisputeStatus, InboxId, InboxMessage,
+    AgentId, Claim, ClaimId, ClaimStatus, Dispute, DisputeStatus, InboxId, InboxMessage,
     InboxMessageKind, MaintainerActionId, OutboxEntry, OutboxTarget, Policy, PolicyId,
     PolicyMessageType, PolicyStatus,
 };
@@ -272,6 +275,15 @@ impl Maintainer {
         Ok(guard)
     }
 
+    /// 对会改变仲裁语义的权威文件写入加跨进程锁。锁顺序固定为
+    /// per-dispute（若有）→ semantic inputs → outbox 进程锁 → outbox 文件锁。
+    async fn lock_arbitration_semantic_inputs(&self) -> anyhow::Result<FileLockGuard> {
+        let path = paths::team_store_arbitration_semantic_inputs_lock_path(&self.team_root);
+        FileLockGuard::lock_exclusive(&path)
+            .await
+            .with_context(|| format!("获取仲裁语义输入锁失败: {path:?}"))
+    }
+
     /// 子进程回归测试专用：确认真实 Maintainer 已拿锁后暂停，供另一进程验证等待语义。
     #[cfg(test)]
     async fn pause_after_outbox_lock_for_subprocess_test(&self) -> anyhow::Result<()> {
@@ -306,6 +318,7 @@ impl Maintainer {
         now: DateTime<Utc>,
         target_agents: Option<Vec<AgentId>>,
     ) -> anyhow::Result<(crate::claim::PolicyId, usize)> {
+        let semantic_guard = self.lock_arbitration_semantic_inputs().await?;
         let _guard = self.outbox_lock.lock().await;
         let _file_guard = self.lock_outbox_file().await?;
         let action_id = self.mint_action_id_for_outbox().await?;
@@ -321,6 +334,9 @@ impl Maintainer {
             updated_at: None,
             target_agents: normalize_target_agents(target_agents),
         };
+        arbitration::ArbitrationStore::new(self.team_root.clone())
+            .bump_semantic_inputs_revision(&semantic_guard)
+            .await?;
         self.write_policy(&policy).await?;
         let pushed = self.create_outbox_entries(&policy, &action_id, now).await?;
         log::info!(
@@ -344,6 +360,7 @@ impl Maintainer {
         policy_id: &crate::claim::PolicyId,
         now: DateTime<Utc>,
     ) -> anyhow::Result<usize> {
+        let semantic_guard = self.lock_arbitration_semantic_inputs().await?;
         let _guard = self.outbox_lock.lock().await;
         let _file_guard = self.lock_outbox_file().await?;
         let p = paths::team_store_policies_dir(&self.team_root).join(format!("{policy_id}.yaml"));
@@ -352,6 +369,9 @@ impl Maintainer {
         policy.updated_at = Some(now);
         policy.target_agents = normalize_target_agents(policy.target_agents);
         let action_id = self.mint_action_id_for_outbox().await?;
+        arbitration::ArbitrationStore::new(self.team_root.clone())
+            .bump_semantic_inputs_revision(&semantic_guard)
+            .await?;
         write_yaml_atomic(&p, &policy).await?;
         let pushed = self.create_outbox_entries(&policy, &action_id, now).await?;
         log::info!(
@@ -362,25 +382,28 @@ impl Maintainer {
         Ok(pushed)
     }
 
-    /// 关闭 dispute：把对应文件 status 改为 resolved，设置 resolved_at；可选更新 summary。
-    /// 不删除 dispute 文件。
-    pub async fn resolve_dispute(
+    /// 测试底层 replay 兼容时使用；生产关闭入口必须经 ResolutionService，确保
+    /// resolved Dispute 始终同时拥有结构化 Resolution。
+    #[cfg(test)]
+    async fn mark_dispute_resolved_for_test(
         &self,
         dispute_id: &DisputeId,
-        new_summary: Option<String>,
         now: DateTime<Utc>,
     ) -> anyhow::Result<()> {
-        let p = paths::team_store_disputes_dir(&self.team_root).join(format!("{dispute_id}.yaml"));
-        let mut d: Dispute = read_yaml(&p).await?;
-        d.status = DisputeStatus::Resolved;
-        d.resolved_at = Some(now);
-        if let Some(s) = new_summary {
-            d.summary = s;
+        let store = arbitration::ArbitrationStore::new(self.team_root.clone());
+        let _guard = store.lock_dispute(dispute_id).await?;
+        let semantic_guard = store.lock_semantic_inputs().await?;
+        let mut record = store.read_dispute(dispute_id).await?;
+        if record.dispute.status != DisputeStatus::Open {
+            anyhow::bail!("dispute={dispute_id} 已 resolved");
         }
-        write_yaml_atomic(&p, &d).await?;
+        record.dispute.status = DisputeStatus::Resolved;
+        record.dispute.resolved_at = Some(now);
+        store.bump_semantic_inputs_revision(&semantic_guard).await?;
+        store.write_dispute(&record).await?;
         log::info!(
             target: "maintainer",
-            "resolve_dispute id={} → status=resolved",
+            "mark_dispute_resolved_for_test id={} → status=resolved",
             dispute_id
         );
         Ok(())
@@ -388,6 +411,7 @@ impl Maintainer {
 
     /// 接收 agent 主动上传的 claim mirror。
     pub async fn upload_claim(&self, claim: &Claim) -> anyhow::Result<()> {
+        let semantic_guard = self.lock_arbitration_semantic_inputs().await?;
         let lock_path = paths::team_store_agent_claim_mirror_lock_path(
             &self.team_root,
             &claim.holder,
@@ -399,6 +423,9 @@ impl Maintainer {
             .with_context(|| format!("获取 Claim 镜像写入锁失败: {lock_path:?}"))?;
         let dir = paths::team_store_agent_claims_dir(&self.team_root, &claim.holder);
         let path = dir.join(format!("{}.yaml", claim.id));
+        arbitration::ArbitrationStore::new(self.team_root.clone())
+            .bump_semantic_inputs_revision(&semantic_guard)
+            .await?;
         write_yaml_atomic(&path, claim).await?;
         Ok(())
     }
@@ -406,9 +433,23 @@ impl Maintainer {
     /// 接收 agent 主动上报的 dispute 文件。
     pub async fn report_dispute(&self, dispute: &Dispute) -> anyhow::Result<()> {
         dispute.validate_agent_report()?;
-        let path =
-            paths::team_store_disputes_dir(&self.team_root).join(format!("{}.yaml", dispute.id));
-        write_yaml_atomic(&path, dispute).await?;
+        let store = arbitration::ArbitrationStore::new(self.team_root.clone());
+        let _guard = store.lock_dispute(&dispute.id).await?;
+        let semantic_guard = store.lock_semantic_inputs().await?;
+        match store.read_dispute(&dispute.id).await {
+            Ok(existing) => {
+                if !same_report_payload(&existing.dispute, dispute) {
+                    anyhow::bail!("dispute id={} 已存在但原始字段不同", dispute.id);
+                }
+                return Ok(());
+            }
+            Err(error) if arbitration_not_found(&error) => {}
+            Err(error) => return Err(error),
+        }
+        store.bump_semantic_inputs_revision(&semantic_guard).await?;
+        store
+            .write_dispute(&arbitration::MaintainerDisputeRecord::from(dispute.clone()))
+            .await?;
         Ok(())
     }
 
@@ -1269,6 +1310,28 @@ fn normalize_target_agents(target_agents: Option<Vec<AgentId>>) -> Option<Vec<Ag
     }
 }
 
+pub(crate) fn same_report_payload(existing: &Dispute, incoming: &Dispute) -> bool {
+    existing.id == incoming.id
+        && existing.name == incoming.name
+        && existing.reporter_agent_id == incoming.reporter_agent_id
+        && existing.claims == incoming.claims
+        && existing.summary == incoming.summary
+        && existing.created_at == incoming.created_at
+}
+
+fn arbitration_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == ErrorKind::NotFound)
+            || cause
+                .downcast_ref::<crate::storage::StorageError>()
+                .is_some_and(|storage| {
+                    matches!(storage, crate::storage::StorageError::Io { source, .. } if source.kind() == ErrorKind::NotFound)
+                })
+    })
+}
+
 /// 直接根据 policy.message_type 派生 InboxMessageKind，新 outbox 路径用这个。
 fn policy_inbox_kind_for_policy(policy: &Policy) -> InboxMessageKind {
     match policy.message_type {
@@ -1277,6 +1340,7 @@ fn policy_inbox_kind_for_policy(policy: &Policy) -> InboxMessageKind {
         },
         PolicyMessageType::ClaimAttributeUpdate => InboxMessageKind::ClaimAttributeUpdate {
             policy: policy.clone(),
+            arbitration_resolution: None,
         },
     }
 }
@@ -1584,7 +1648,8 @@ mod tests {
         assert_eq!(list_outbox(&m).await.len(), 1);
     }
 
-    /// 子进程辅助测试：走真实 Maintainer 发布路径，并在拿到 outbox 锁后等待父测试放行。
+    /// 子进程辅助测试：走不涉及仲裁语义输入锁的真实 outbox 发布路径，
+    /// 并在拿到 outbox 锁后等待父测试放行。
     #[tokio::test]
     async fn outbox_file_lock_subprocess_holder() -> anyhow::Result<()> {
         let Some(team_root) = std::env::var_os("ACN_TEST_OUTBOX_LOCK_TEAM_ROOT") else {
@@ -1602,10 +1667,8 @@ mod tests {
         )
         .with_action_id_candidates([action_id]);
         holder
-            .publish_new_policy(
-                "child_process_action".into(),
+            .claim_update_suggestion(
                 "child must hold outbox lock from the real maintainer publish path".into(),
-                "maintainer/test".into(),
                 "2026-05-14T10:00:00Z".parse().unwrap(),
                 None,
             )
@@ -1658,10 +1721,8 @@ mod tests {
         .with_action_id_candidates([child_action_id.clone(), parent_action_id.clone()]);
         let mut publish = tokio::spawn(async move {
             other
-                .publish_new_policy(
-                    "cross_process_action".into(),
+                .claim_update_suggestion(
                     "outbox lock must serialize action ID minting".into(),
-                    "maintainer/test".into(),
                     "2026-05-14T10:00:00Z".parse().unwrap(),
                     None,
                 )
@@ -1782,7 +1843,7 @@ mod tests {
         assert!(matches!(entries[0].target, OutboxTarget::Broadcast));
     }
 
-    /// resolve_dispute 把 status 改为 resolved，并保留文件
+    /// 底层状态写入会保留文件并递增语义输入 revision。
     #[tokio::test]
     async fn resolve_dispute_updates_status_and_keeps_file() {
         let (m, _team) = build(7, 30);
@@ -1798,17 +1859,32 @@ mod tests {
         };
         let p = paths::team_store_disputes_dir(m.team_root()).join(format!("{}.yaml", dispute.id));
         write_yaml_atomic(&p, &dispute).await.unwrap();
+        let arbitration_store = arbitration::ArbitrationStore::new(m.team_root().to_path_buf());
+        assert_eq!(
+            arbitration_store
+                .read_semantic_inputs_revision()
+                .await
+                .unwrap(),
+            0
+        );
 
         let now: DateTime<Utc> = "2026-04-22T10:00:00Z".parse().unwrap();
-        m.resolve_dispute(&dispute.id, Some("已确认 scope 不同".into()), now)
+        m.mark_dispute_resolved_for_test(&dispute.id, now)
             .await
             .unwrap();
 
         let after: Dispute = read_yaml(&p).await.unwrap();
         assert_eq!(after.status, DisputeStatus::Resolved);
         assert_eq!(after.resolved_at, Some(now));
-        assert_eq!(after.summary, "已确认 scope 不同");
+        assert_eq!(after.summary, "原始 summary");
         assert!(p.exists(), "不应物理删除 dispute 文件");
+        assert_eq!(
+            arbitration_store
+                .read_semantic_inputs_revision()
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1834,6 +1910,43 @@ mod tests {
         dispute.resolved_at = Some("2026-04-22T00:00:00Z".parse().unwrap());
         assert!(m.report_dispute(&dispute).await.is_err());
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn late_open_replay_does_not_overwrite_resolved_dispute() {
+        let (m, _team) = build(7, 30);
+        let original = Dispute {
+            id: DisputeId::random(),
+            name: "replayed".into(),
+            reporter_agent_id: AgentId::new("agent-a").unwrap(),
+            claims: vec![ClaimId::random(), ClaimId::random()],
+            summary: "original payload".into(),
+            status: DisputeStatus::Open,
+            created_at: "2026-04-21T00:00:00Z".parse().unwrap(),
+            resolved_at: None,
+        };
+        m.report_dispute(&original).await.unwrap();
+        let resolved_at: DateTime<Utc> = "2026-04-22T00:00:00Z".parse().unwrap();
+        m.mark_dispute_resolved_for_test(&original.id, resolved_at)
+            .await
+            .unwrap();
+
+        m.report_dispute(&original).await.unwrap();
+
+        let path =
+            paths::team_store_disputes_dir(m.team_root()).join(format!("{}.yaml", original.id));
+        let stored: Dispute = read_yaml(&path).await.unwrap();
+        assert_eq!(stored.status, DisputeStatus::Resolved);
+        assert_eq!(stored.resolved_at, Some(resolved_at));
+
+        let mut conflicting = original;
+        conflicting.summary = "different payload".into();
+        assert!(m
+            .report_dispute(&conflicting)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("原始字段不同"));
     }
 
     /// claim sweep 检测旧 active claim，并通过 ClaimAttributeUpdate 提醒对应 agent
@@ -1928,7 +2041,7 @@ mod tests {
         ));
         assert!(matches!(
             &entries[0].inbox_message.kind,
-            InboxMessageKind::ClaimAttributeUpdate { policy } if policy.id == policy_id
+            InboxMessageKind::ClaimAttributeUpdate { policy, .. } if policy.id == policy_id
         ));
     }
 
