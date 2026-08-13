@@ -3410,7 +3410,7 @@ Ctrl+O      光标位于附件时预览当前输入框和队列里的附件</cod
               </button>
               <button id="tab-workbench-disputes" type="button" role="tab" aria-selected="false" aria-controls="workbench-detail" tabindex="-1" data-workbench="disputes">
                 <strong>Disputes</strong>
-                <span>查看 open/resolved 冲突，进入相关 claim，执行 resolve，必要时发送 claim attribute update。</span>
+                <span>查看 open/resolved 冲突与 direct Claims，审阅 Automatic / Manual Analysis，显式 Adopt 或人工 Resolve。</span>
               </button>
               <button id="tab-workbench-team-auth" type="button" role="tab" aria-selected="false" aria-controls="workbench-detail" tabindex="-1" data-workbench="team_auth">
                 <strong>Team Auth</strong>
@@ -3545,7 +3545,7 @@ evidence_summary: Synthesized from practical experience with DSL tools…</pre>
           <div class="memory-map">
             <div class="memory-box">
               <h3>私有记忆：Agent 自己的长期上下文</h3>
-              <p>私有记忆不会以任何直接形式被团队可见或进入流转，它只在当前 Agent 的 session 中作为上下文影响判断。Agent Memory 不会被 Maintainer / Router / 其他 Agent 看见。<br><br><b>更新时机</b>：<br>1. Session 中 Agent 主动调用 <code>memory</code> 工具；<br>2. Session 中来自旁路的定期非阻塞性 memory review 任务。</p>
+              <p>私有记忆不会被 Maintainer、Router、其他 Agent 或结构化仲裁 inbox 读取。MEMORY.md 与 USER.md 只服务当前 Agent 的 session；仲裁 inbox 只使用完整 Resolution、非 deprecated 本地 Claim 与 direct Claim 快照。<br><br><b>更新时机</b>：<br>1. Session 中 Agent 主动调用 <code>memory</code> 工具；<br>2. Session 中来自旁路的定期非阻塞性 memory review 任务。</p>
               <div class="memory-subgrid">
                 <div class="memory-subbox">
                   <h4>USER.md</h4>
@@ -3918,11 +3918,11 @@ evidence_summary: Synthesized from practical experience with DSL tools…</pre>
       },
       disputes: {
         title: "Disputes 页面：处理冲突而不是抹平冲突",
-        body: "管理员可以在 Disputes 页面查看 open/resolved dispute，按关键词、状态、严重度过滤，进入相关 claim，并执行 resolve。Resolve 保留原 Dispute 记录，只更新 status、resolved_at 和 summary；必要时还可以向对应 Agent 发送 claim attribute update，让 resolve 消息被 Agent 察觉并应用。",
+        body: "管理员可以在 Disputes 页面查看 open/resolved dispute 与 direct Claims，审阅可选的 Automatic Analysis 和显式创建的 Manual Analysis。manual 模式下上报只保存 Dispute；管理员可 Analyze 后 Adopt approved 结果，也可直接 Human Resolve。两条路径都保留原始 summary，只增量写入 resolution，并通过结构化通知让 holder Agent 自主内化。",
         boxes: [
-          ["可见内容", "dispute id、name、reporter_agent_id、claims、summary、status、created_at。"],
-          ["典型动作", "查看冲突双方 claim，给出复审结论，将 dispute 标记为 resolved，并按需发出 claim attribute update。"],
-          ["边界", "Resolve 是团队治理结论，不会自动重写每个 Agent 的私有 memory；Agent 仍需处理投递消息后应用。"],
+          ["可见内容", "dispute、direct Claims、当前 resolution、Automatic / Manual Analysis 与 holder adoption。"],
+          ["典型动作", "运行 Manual Analysis、采用 approved Analysis、人工 Resolve，或驳回并替换 automatic Resolution。"],
+          ["边界", "Analysis 只是分析结果；Adopt / Resolve 才形成 Resolution。Maintainer 不直接改写 holder Claim 或私有 Memory。"],
           ["相关页面", '<a href="../app/">Maintainer 管理台</a>']
         ]
       },
@@ -4004,10 +4004,10 @@ created_at: 2026-04-28T05:34:22Z`
         title: "Dispute：让冲突成为一等对象",
         body: "Dispute 记录 Claim 之间的不兼容或冲突。它属于团队治理流：Agent 在团队模式下发现并报告给 Maintainer，Router 查询时可以附带摘要。",
         bullets: [
-          "Dispute 至少引用两条不同 claim，不能自我引用。",
+          "Dispute.claims 至少列出两条不同 direct Claim，不能自我引用。",
           "open dispute 提醒候选 claim 存在争议，但不阻塞工作。",
-          "Maintainer resolve 后更新 status/resolved_at/summary，文件仍保留。",
-          "Resolve 还可以通过给对应 Agent 发 claim attribute update，让 resolve 消息被 Agent 察觉并应用。",
+          "Automatic / Manual Analysis 只保存模型分析；Adopt 或 Human Resolve 才写入 Resolution 并关闭 Dispute。",
+          "新 resolution 保留原始 summary，并可通过结构化 ClaimAttributeUpdate 让 holder Agent 自主内化。",
           "单人模式不报告 Dispute，也不维护以后补传的队列。"
         ],
         tags: ["open", "resolved", "conflict", "summary"],
@@ -4153,9 +4153,9 @@ finalize_session:
         {
           actor: "maintainer · review",
           title: "复审给出团队治理结论",
-          summary: "Maintainer 核对容量数据后 resolve Dispute，但不直接修改任何 Agent 的本地 Claim。",
-          detail: "复审确认 40 是当前生产集群的聚合连接预算，pool=96 的压测没有计入共享数据库上的其他服务。Maintainer 将 dispute_0f83c2ad 标记为 resolved，并保留结论：worker 需求应通过有界队列处理，除非数据库预算发生变化。",
-          boundary: "Resolve 更新的是 Dispute 的 status、resolved_at 和 summary。claim_14d9a6c3 此刻仍由 runtime-agent 持有，Maintainer 没有权限把它直接改成 stale 或 deprecated。",
+          summary: "Maintainer 核对容量数据后形成 Resolution 并 resolve Dispute，但不直接修改任何 Agent 的本地 Claim。",
+          detail: "复审确认 40 是当前生产集群的聚合连接预算，pool=96 的压测没有计入共享数据库上的其他服务。Maintainer 保留 dispute_0f83c2ad 的原始 summary，在 resolution 中记录结论：worker 需求应通过有界队列处理，除非数据库预算发生变化。",
+          boundary: "Resolution 更新 Dispute 的 status 与 resolved_at，不改写原始 summary。claim_14d9a6c3 仍由 runtime-agent 持有，Maintainer 没有权限把它直接改成 stale 或 deprecated。",
           input: "open dispute + 容量复审证据",
           decision: "确认当前 scope 下的预算边界",
           output: "dispute_0f83c2ad resolved",

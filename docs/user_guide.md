@@ -299,3 +299,9 @@ acn session cleanup --apply
 ## 团队管理页面
 
 团队模式下，Maintainer endpoint 同时提供知识管理页面。它用于查看 claim、dispute、policy、agent、outbox/send log、stale sweep、Router 查询和 HTTP audit。管理员鉴权与团队 key 配置见 [配置参数](config_parameters.md)。
+
+`manual` 下新 Dispute 只保存为 open，等待管理者 Analyze 或 Human Resolve；`shadow`/`auto` 会创建唯一 Automatic Analysis。详情页同时显示可选 Automatic Analysis、单一 Manual Analysis 和当前 Resolution。再次 Analyze 会覆盖 Manual Analysis 槽，不形成历史列表。approved Analysis 可以 Adopt；Adopt 会复核当前输入，不重新调用模型。
+
+`auto` 采用前若发现分析输入变化，页面显示第几轮、5 分钟或 15 分钟等待、下次重试时间和原因；第三轮仍变化时停止自动处理并等待人工。resolved Dispute 以当前 Resolution 为主，Analysis 作为只读审计信息。`Delivery & Holder Adoption` 默认折叠，可展开查看每个 holder 和逐 Claim 的 mirror 对照。Automatic Resolution 可通过 Reject & Replace 更新为人工 Resolution。
+
+holder 收到结构化 Resolution 后仍由 Agent 自己决定是否更新本地 Claim。仲裁专用模型调用只读取完整仲裁消息、全部非 deprecated 本地 Claim 与全部 direct Claim 快照，不读取 Memory 或 USER。Effect Journal 保存已校验效果，崩溃恢复不再次调用模型。

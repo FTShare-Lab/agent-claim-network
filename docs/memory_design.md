@@ -106,6 +106,10 @@ Memory 写入遵循：
 
 Memory 不会被直接上传给 Router 或 Maintainer。Agent 可以基于私有经验形成 claim，但 claim 必须用独立、自包含的 statement、scope 和 evidence summary 表达，不能泄露 `USER.md` 或让团队反查具体 Memory 条目，团队也并没有这样的能力。
 
+Maintainer Dispute Analysis 与 holder Agent 的结构化 Resolution inbox 内化都不读取 `MEMORY.md`、`USER.md`、session transcript、Trace 或工具上下文。仲裁 inbox 的一次专用调用只接收完整消息、非 deprecated 本地 Claim 与 direct Claim 快照。
+
+Automatic/Manual Analysis、Resolution、observation 与 inbox effect journal 是执行恢复或审计记录，不是模型长期记忆，也不会被注入普通 session。Effect Journal 只保存已经校验的稳定 plan；崩溃恢复复用 plan，不再次调用内化模型。
+
 借用团队 claim 也不会自动写 Memory。只有当 Agent 判断某项经验对未来任务稳定有用时，才通过 Memory 工具沉淀。
 
 ## 后台 Memory Review

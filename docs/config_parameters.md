@@ -331,6 +331,21 @@ background-shell 其余时序、容量和 PTY 参数是 `config.rs` 内部默认
 
 - `enabled`：maintainer 是否校验来自 agent 的团队鉴权信封。默认值：`false`。为 `false` 时仍要求请求体是 `{ auth, data }` 信封，但不校验 `auth.acn_key`。
 
+### `[maintainer.arbitration]`
+
+- `enabled`：是否启用分析服务。默认 `false`；关闭时 Analyze/Adopt 返回不可用，人工 Resolve、Resolution 投递恢复，以及关闭前已经固定的采用意图恢复仍可用，恢复过程不调用 LLM。
+- `mode`：`manual` 在上报时只保存 Dispute，由管理者显式 Analyze 后决定 Adopt 或直接 Human Resolve；`shadow` 为新 Dispute 创建唯一 Automatic Analysis但不自动采用；`auto` 创建并在通过验证后自动采用。默认 `shadow`。三种启用模式下，管理者都可对 approved Analysis 显式 Adopt。
+- `confidence_threshold`：proposal 和 verification 都必须达到的置信度，范围 `[0, 1]`，默认 `0.90`。
+- `max_source_claims`：直接 Claim 的 source graph 广度优先加载上限，默认 `20`。该上限不作用于 Router 返回的补充候选或治理 Policy。
+
+Analysis 由有界、单 consumer 的持久事件队列驱动。`auto` 的 Automatic Analysis 在采用前检测到输入变化时，依次写入 5 分钟和 15 分钟的持久延迟并在同一记录内重分析，最多三轮。daemon 恢复已持久化的执行态、延迟重分析和 adopting 状态；`manual` 上报的 Dispute 不补建 Automatic Analysis，`shadow` 结果也不会因配置切换而自动采用。
+
+Resolution 由独立有界事件队列完成提交与可选 holder 投递。固定 Resolution intent 会先写入 pending commit/delivery；失败时退避，启动时只恢复这些持久任务。即使无需通知 holder，也沿用同一提交恢复边界。ACK、相关 Claim 上传与 Resolution 切换定向触发 holder observation。
+
+### `[maintainer.llm]`
+
+该节使用与 `[agent.llm]` 相同的 provider-neutral Chat 字段，但是独立配置。只在 `maintainer.arbitration.enabled=true` 时必须提供，且 `api_key_env` 指向的环境变量必须存在。proposal 与 verification 使用同一配置但执行两次独立请求；Maintainer 不会使用 `[agent.llm]` 作为回退。超时、重试、context window 与推理强度的含义与 `[agent.llm]` 一致。
+
 ### `[maintainer.id]`
 
 - `mint_max_retries`：Maintainer 生成需要查重的 ID 时，发生碰撞后的最大重抽次数。当前包括 policy、outbox inbox 和 action ID；总尝试次数为 `1 + mint_max_retries`。dispute id 由 agent 侧派生，不走该配置。

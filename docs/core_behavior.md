@@ -62,20 +62,34 @@ Trace 保存在 holder Agent 本地，不上传 Maintainer，也不进入 Router
 
 Dispute 表示多个 claim 之间可能存在冲突、不兼容或适用范围不清：
 
-- 至少引用相关 claim 集合
+- 至少引用一组 direct Claim；`Dispute.claims` 只记录这组直接冲突对象
 - 记录 reporter Agent 和自然语言 summary
 - Agent 上报时只能是 `open`，且不得预填 `resolved_at`
-- Maintainer 可以将其改为 `resolved` 并写入解决说明与时间
+- Maintainer 可以通过人工 Resolution，或在显式启用 `auto` 后通过双阶段 Analysis 形成 Resolution，将其改为 `resolved`
 
 冲突不会阻止当前任务继续。Agent 应把矛盾暴露给用户或在上下文中作出有依据的选择，并在确有必要时报告 dispute。
 
 已经解决的 dispute 仍保留为历史事实。Router 查询候选 claim 时同时返回相关 dispute，使借用方看见已知争议。
+
+新 Resolution 不改写 Dispute 的原始 `summary`。自动模型可选择 `coexist`、`lifecycle_update`、`conflict_resolved` 或 `unresolved`；前三种在双阶段高置信且一致时可关闭 Dispute，`unresolved` 本身表示等待人类管理者处理并始终保持 open，可选交接说明缺失不会把它变成技术失败。`lifecycle_update` 用于团队当前基线已迁移、旧默认失效或旧路径被替代的演进；只有新旧路径当前仍受支持且 scope 明确不同时才使用 `coexist`。Reject & Replace 通过 `expected_resolution_id` 替换当前 automatic Resolution。
+
+Proposal 与独立 Verification 都使用仲裁专用 system prompt，并包含项目统一的 Claim、Dispute、Policy 定义，确保两阶段按同一领域语义解释输入对象；实际团队 Policy 仍只取上下文中的 `policy_update` 记录。
+
+`shadow`/`auto` 下，新 Dispute create-once 写入唯一 Automatic Analysis并进入有界串行调度器；`manual` 只保存 Dispute。Manual Analyze 覆盖单一 Manual Analysis 槽，也可直接 Human Resolve。direct Claim 暂未准备好时，同一 Analysis 先等待上下文，最终仍不完整才标为 failed。
+
+被新的 Manual Analyze 覆盖或已由 Resolution 关闭的 Analysis 会停止当前模型等待。Resolution 的固定提交意图先持久化，再幂等补齐 Dispute、投递与治理历史；进程重启沿用原 ID 恢复。
+
+Semantic V5 对 direct/source Claim、治理 Policy、目标 Dispute、Router candidate Claim 内容及真实 Router Dispute 内容/status 的变化敏感，并忽略 Router candidate 的派生 lifecycle ID 列表。`auto` 的 Automatic Analysis 在采用前发现输入变化时，5 分钟后执行第 2 轮；再次变化则 15 分钟后执行第 3 轮；第三次仍变化就停止自动处理、保持 open。每轮 Proposal、Verification、fingerprint、时间和变化原因都保留在同一 Analysis。Manual、shadow、unresolved、failed、低置信和 Verification 不通过不使用该自动重分析流程。
 
 Dispute 属于团队治理流：只有配置团队服务时，Agent 才把 finalize 或 inbox 内化形成的 dispute 报告给 Maintainer。单人模式不创建待日后补传的 dispute 队列。
 
 ## Inbox
 
 Inbox 是 Maintainer 到 Agent 的下行通道。当前支持 `PolicyUpdate` 和 `ClaimAttributeUpdate`，两类消息都内嵌完整 Policy。
+
+带 `arbitration_resolution` 的 ClaimAttributeUpdate 会单条内化，并只发起一次专用结构化模型调用；配置内的纠错重试共享同一个总预算。输入包含完整仲裁消息、当前 Agent 全部非 deprecated 本地 Claim，以及原 Dispute 全部 direct Claim 快照；不读取 Memory、USER、session transcript 或工具上下文。后端校验输出协议、holder、更新目标与基本引用格式。每条消息在 `<agent_home>/inbox/effects/` 保存已校验 Effect Journal，崩溃后直接重放 plan，不再次调用模型；若本地 Claim 已被后续操作修改则记录 superseded warning，不覆盖新内容。仲裁造成的 Claim 更新在 pending 上传中保留 durable 标记，鉴权恢复后继续补传。
+
+Maintainer 以 receipt ACK、通知 Policy provenance、mirror 更新时间和 assessment 字段派生 `not_delivered`、`delivered_unobserved`、`observed_converged`、`observed_diverged` 或 `unknown`。ACK、相关 Claim 上传与 Resolution 切换定向刷新当前 Resolution；详情读取可按需刷新。旧 Resolution 的 cache 保留且不再更新。Observation 只用于治理可见性。
 
 消息的本地生命周期是 pending、claimed、handled：
 
