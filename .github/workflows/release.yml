@@ -141,6 +141,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out release source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
       - name: Download release archives
         uses: actions/download-artifact@v8
         with:
@@ -163,7 +168,25 @@ jobs:
           if gh release view "${GITHUB_REF_NAME}" --json isDraft >"${release_state}" 2>/dev/null; then
             test "$(jq -r .isDraft "${release_state}")" = "true"
           else
-            gh release create "${GITHUB_REF_NAME}" --draft --verify-tag --generate-notes
+            tag_type="$(
+              git for-each-ref \
+                "refs/tags/${GITHUB_REF_NAME}" \
+                --format='%(objecttype)'
+            )"
+            test "${tag_type}" = "tag"
+
+            tag_notes="$(
+              git for-each-ref \
+                "refs/tags/${GITHUB_REF_NAME}" \
+                --format='%(contents)'
+            )"
+            test -n "${tag_notes}"
+
+            gh release create "${GITHUB_REF_NAME}" \
+              --draft \
+              --verify-tag \
+              --notes "${tag_notes}" \
+              --generate-notes
           fi
           gh release upload "${GITHUB_REF_NAME}" release-assets/* --clobber
           gh release edit "${GITHUB_REF_NAME}" --draft=false
