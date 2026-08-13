@@ -32,15 +32,15 @@ use super::{
     parse_compaction_summary_outcome, project_provider_context,
     select_compaction_summary_end_index, session_compaction_transcript_projection,
     session_messages_to_provider_turn_messages, session_messages_to_turn_messages,
-    session_messages_to_turn_transcript, spawn_turn_control_journal_forwarder,
-    ActiveProjectionContext, CompactionAuditScope, CompactionAuditSummaryContext,
-    CompactionAuditTrigger, CompactionRanges, CompactionSummaryInputs,
-    DelegationProjectionBaseline, MainModelContextAppender, ManualCompactionOutcome,
-    PreflightCompactionRequest, PreflightCompactor, ProviderContextUsageAnchor,
-    ProviderProjectionBudget, SessionCompactionNoopReason, SessionCompactionResult, SessionEngine,
-    SessionEvent, SessionTurnCommittedPostCommitError, TurnJournalEmitter, TurnJournalSink,
-    COMPACTION_CHECKPOINT_SCHEMA_VERSION, DELEGATION_PROJECTION_MAX_CHARS,
-    DELEGATION_PROJECTION_MAX_ITEMS, MEDIA_BLOCK_ESTIMATED_TOKENS,
+    session_messages_to_turn_transcript, should_emit_compaction_retry_warning,
+    spawn_turn_control_journal_forwarder, ActiveProjectionContext, CompactionAuditScope,
+    CompactionAuditSummaryContext, CompactionAuditTrigger, CompactionRanges,
+    CompactionSummaryInputs, DelegationProjectionBaseline, MainModelContextAppender,
+    ManualCompactionOutcome, PreflightCompactionRequest, PreflightCompactor,
+    ProviderContextUsageAnchor, ProviderProjectionBudget, SessionCompactionNoopReason,
+    SessionCompactionResult, SessionEngine, SessionEvent, SessionTurnCommittedPostCommitError,
+    TurnJournalEmitter, TurnJournalSink, COMPACTION_CHECKPOINT_SCHEMA_VERSION,
+    DELEGATION_PROJECTION_MAX_CHARS, DELEGATION_PROJECTION_MAX_ITEMS, MEDIA_BLOCK_ESTIMATED_TOKENS,
 };
 use crate::agent::{
     InboxReader, LocalClaimStore, MemoryStore, ReportedDisputeClaimSetStore, SessionRuntimeStatus,
@@ -615,6 +615,7 @@ impl InboxJsonGenerator for NoopInboxGenerator {
         &self,
         _kind: InboxInternalizeKind,
         _request: InternalizeRequest,
+        _preferred_transport: Option<crate::api::ProviderTransport>,
     ) -> anyhow::Result<serde_json::Value> {
         Ok(json!({}))
     }
@@ -1202,6 +1203,9 @@ fn build_test_engine_with_team_mode(
         tools,
         2,
         1024,
+        0,
+        Duration::ZERO,
+        Duration::ZERO,
     ));
     let json_caller = Arc::new(StructuredJsonCaller::new(
         provider_for_loops,
@@ -4371,6 +4375,19 @@ async fn manual_compact_noop_reports_nothing_new_for_empty_session() {
     ));
 }
 
+#[test]
+fn no_consumable_compaction_retry_is_hidden_from_tui_but_other_retry_warnings_remain() {
+    let no_consumable = crate::api::StructuredJsonNoConsumableOutput::new(
+        "Responses 响应没有可消费的 output_text 或 function_call".into(),
+        crate::api::ProviderTransport::ResponsesSse,
+    );
+
+    assert!(!should_emit_compaction_retry_warning(&no_consumable.into()));
+    assert!(should_emit_compaction_retry_warning(&anyhow::anyhow!(
+        "compaction summary JSON invalid"
+    )));
+}
+
 #[tokio::test]
 async fn manual_compact_noop_reports_raw_tail_budget_when_new_history_is_preserved() {
     let dir = tempfile::tempdir().unwrap();
@@ -6537,7 +6554,12 @@ async fn compaction_summary_falls_back_to_omitting_all_tool_results_before_provi
 
     let requests = provider.requests().await;
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].retry_count_override, Some(0));
+    assert_eq!(requests[0].retry_count_override, None);
+    assert!(requests[0].stream);
+    assert_eq!(
+        requests[0].stream_output_mode,
+        crate::api::ProviderStreamOutputMode::Buffered
+    );
     let payload = last_user_text(&requests[0]);
     assert!(payload.contains("tool_result omitted from compaction summary input"));
     assert!(!payload.contains("RAW_SUMMARY_TOOL_RESULT"));

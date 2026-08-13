@@ -112,8 +112,12 @@ impl SessionEngine {
 
         let memory_review_loop = self.memory_review_loop.clone();
         let agent_id = self.runner.agent_id.clone();
+        let fallback_scope = session.runtime_fallback_scope();
         tokio::spawn(async move {
-            if let Err(e) = memory_review_loop.run(request, review_prompt).await {
+            if let Err(e) = memory_review_loop
+                .run_with_scope(request, review_prompt, fallback_scope)
+                .await
+            {
                 log::warn!(
                     target: "agent",
                     "agent {agent_id} background memory review failed: {e}"

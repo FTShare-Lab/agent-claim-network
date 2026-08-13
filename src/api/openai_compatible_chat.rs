@@ -23,7 +23,7 @@ use super::provider::{
     NoopProviderRequestObserver, ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy,
     ProviderNoConsumableOutput, ProviderReplayIdentity, ProviderReplayProtocol, ProviderRequest,
     ProviderRequestObserver, ProviderRequestPreparationFailure, ProviderResponse, ProviderStop,
-    ProviderStreamFailure, ProviderTerminalFailure, ToolSpec,
+    ProviderStreamFailure, ProviderTerminalFailure, ProviderTransport, ToolSpec,
 };
 use super::redact_media_error_body;
 use super::types::{ProviderReplayState, SessionTurnContentBlock, SessionTurnMessage};
@@ -54,6 +54,7 @@ pub struct OpenAiCompatibleChatProviderAdapter {
     client: ChatCompletionsClient,
     model: String,
     reasoning_effort: ReasoningEffort,
+    temperature: Option<f32>,
 }
 
 impl OpenAiCompatibleChatProviderAdapter {
@@ -77,12 +78,19 @@ impl OpenAiCompatibleChatProviderAdapter {
             )?,
             model,
             reasoning_effort: ReasoningEffort::None,
+            temperature: None,
         })
     }
 
     /// 设置 Chat Completions 请求的推理强度；`none` 会在序列化时省略。
     pub fn with_reasoning_effort(mut self, reasoning_effort: ReasoningEffort) -> Self {
         self.reasoning_effort = reasoning_effort;
+        self
+    }
+
+    /// 为内部确定性任务设置采样温度；普通 Agent 请求保持 provider 默认值。
+    pub(crate) fn with_temperature(mut self, temperature: f32) -> Self {
+        self.temperature = Some(temperature);
         self
     }
 
@@ -110,7 +118,7 @@ impl OpenAiCompatibleChatProviderAdapter {
             stream_options: stream.then_some(ChatStreamOptions {
                 include_usage: true,
             }),
-            temperature: None,
+            temperature: self.temperature,
         }
     }
 
@@ -127,6 +135,7 @@ impl OpenAiCompatibleChatProviderAdapter {
         max_tokens: u32,
         stream: bool,
         retry_count: u32,
+        retry_after_partial: bool,
         emit: &mut (dyn FnMut(ProviderEvent) + Send),
         observer: &mut (dyn ProviderRequestObserver + Send),
     ) -> Result<ContinuedChatTurn, OpenAiCompatibleChatError> {
@@ -158,7 +167,12 @@ impl OpenAiCompatibleChatProviderAdapter {
                     }
                 };
                 self.client
-                    .send_with_retry_count(&request, retry_count, &mut chat_emit)
+                    .send_with_retry_count_and_mode(
+                        &request,
+                        retry_count,
+                        retry_after_partial,
+                        &mut chat_emit,
+                    )
                     .await?
             } else {
                 let mut noop = |_event: ChatStreamEvent| {};
@@ -292,9 +306,16 @@ impl OpenAiCompatibleChatProviderAdapter {
         emit: &mut (dyn FnMut(ProviderEvent) + Send),
         observer: &mut (dyn ProviderRequestObserver + Send),
     ) -> anyhow::Result<ProviderResponse> {
+        let transport = if request.stream {
+            ProviderTransport::ChatSse
+        } else {
+            ProviderTransport::ChatNonStreaming
+        };
         let retry_count = request
             .retry_count_override
             .unwrap_or(self.client.retry_count());
+        let retry_after_partial =
+            request.stream_output_mode == crate::api::ProviderStreamOutputMode::Buffered;
         let base_messages = request.messages;
         let mut messages = session_turn_messages_to_chat(base_messages.clone(), &self.model)?;
         let request_has_media = messages_contain_media(&messages);
@@ -308,6 +329,7 @@ impl OpenAiCompatibleChatProviderAdapter {
                 request.max_tokens,
                 request.stream,
                 retry_count,
+                retry_after_partial,
                 emit,
                 observer,
             )
@@ -335,7 +357,7 @@ impl OpenAiCompatibleChatProviderAdapter {
         match provider_response_from_turn(turn, &self.model) {
             Ok(response) => Ok(response),
             Err(OpenAiCompatibleChatError::NoConsumableOutput { reason }) => {
-                Err(ProviderNoConsumableOutput::new(reason).into())
+                Err(ProviderNoConsumableOutput::new(transport, reason).into())
             }
             Err(error) => Err(error.into()),
         }
@@ -752,6 +774,7 @@ mod tests {
             .unwrap(),
             model: "test-model".into(),
             reasoning_effort,
+            temperature: None,
         }
     }
 
@@ -1007,7 +1030,9 @@ mod tests {
                     tools: Vec::new(),
                     max_tokens: 128,
                     stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
                     runtime_chain_id: None,
+                    runtime_fallback_scope: None,
                     recovery_interrupt: None,
                     retry_count_override: None,
                 },
@@ -1034,7 +1059,9 @@ mod tests {
                     tools: Vec::new(),
                     max_tokens: 128,
                     stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
                     runtime_chain_id: None,
+                    runtime_fallback_scope: None,
                     recovery_interrupt: None,
                     retry_count_override: None,
                 },
@@ -1112,6 +1139,16 @@ mod tests {
         let req = adapter().request_for("system", Vec::new(), Vec::new(), 128, false);
         let body = serde_json::to_value(req).unwrap();
 
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn configured_temperature_is_sent_without_enabling_reasoning() {
+        let adapter = adapter().with_temperature(0.0);
+        let req = adapter.request_for("system", Vec::new(), Vec::new(), 128, true);
+        let body = serde_json::to_value(req).unwrap();
+
+        assert_eq!(body.get("temperature"), Some(&json!(0.0)));
         assert!(body.get("reasoning_effort").is_none());
     }
 

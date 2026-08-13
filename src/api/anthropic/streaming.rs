@@ -61,6 +61,7 @@ impl AnthropicMessagesClient {
             retry_count,
             emit,
             false,
+            false,
             None,
         )
         .await
@@ -77,6 +78,7 @@ impl AnthropicMessagesClient {
         tools: Option<Vec<super::protocol::ApiToolDefinition>>,
         max_tokens: u32,
         retry_count: u32,
+        retry_after_partial: bool,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
         observer: &mut super::AnthropicContinuationRequestObserver<'_>,
     ) -> Result<ContinuedAssistantTurn, AnthropicError> {
@@ -88,6 +90,7 @@ impl AnthropicMessagesClient {
             retry_count,
             emit,
             false,
+            retry_after_partial,
             Some(observer),
         )
         .await
@@ -106,6 +109,7 @@ impl AnthropicMessagesClient {
         retry_count: u32,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
         error_on_unresolved_max_tokens: bool,
+        retry_after_partial: bool,
         mut request_observer: Option<&mut super::AnthropicContinuationRequestObserver<'_>>,
     ) -> Result<ContinuedAssistantTurn, AnthropicError> {
         let mut merged_text = String::new();
@@ -126,7 +130,7 @@ impl AnthropicMessagesClient {
                 Some(true),
             );
             let response_turn = self
-                .send_stream_with_retry(&body, retry_count, emit)
+                .send_stream_with_retry(&body, retry_count, retry_after_partial, emit)
                 .await?;
             let assistant_replay = json!({
                 "role": "assistant",
@@ -257,6 +261,7 @@ impl AnthropicMessagesClient {
         &self,
         body: &CreateMessageRequest,
         retry_count: u32,
+        retry_after_partial: bool,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
     ) -> Result<ContinuedAssistantTurn, AnthropicError> {
         let mut last_retryable: Option<AnthropicError> = None;
@@ -274,7 +279,7 @@ impl AnthropicMessagesClient {
             match result {
                 Ok(turn) => return Ok(turn),
                 Err(e)
-                    if !replay_blocking_event_emitted
+                    if (!replay_blocking_event_emitted || retry_after_partial)
                         && is_stream_retryable(&e)
                         && attempt < retry_count =>
                 {
@@ -410,9 +415,7 @@ impl StreamingAssistantTurn {
             }
             Some("ping") => {}
             Some("error") => {
-                return Err(AnthropicError::TerminalFailure {
-                    reason: "Anthropic stream 返回 error event".into(),
-                });
+                return Err(anthropic_stream_error_event(event));
             }
             other => {
                 return Err(AnthropicError::StreamFailure {
@@ -576,6 +579,33 @@ impl StreamingAssistantTurn {
                 reason: format!("stream delta 引用了未开始的 content block: {index}"),
                 raw: String::new(),
             })
+    }
+}
+
+fn anthropic_stream_error_event(event: &Value) -> AnthropicError {
+    let error = event.get("error").and_then(Value::as_object);
+    let error_type = error
+        .and_then(|error| error.get("type").or_else(|| error.get("code")))
+        .and_then(Value::as_str);
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("upstream stream failed");
+    let reason = format!(
+        "Anthropic stream 返回 error event: type={} message={}",
+        error_type.unwrap_or("unknown"),
+        super::redact_anthropic_error_body(message)
+    );
+    if matches!(
+        error_type,
+        Some("rate_limit_error" | "api_error" | "overloaded_error" | "server_error")
+    ) {
+        AnthropicError::StreamFailure {
+            reason,
+            raw: String::new(),
+        }
+    } else {
+        AnthropicError::TerminalFailure { reason }
     }
 }
 
@@ -745,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_error_event_is_not_misclassified_as_broken_stream() {
+    fn deterministic_error_event_is_terminal() {
         let mut turn = StreamingAssistantTurn::default();
         let error = turn
             .apply_event(
@@ -758,6 +788,29 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, AnthropicError::TerminalFailure { .. }));
+    }
+
+    #[test]
+    fn transient_error_events_are_stream_failures_without_secret_leakage() {
+        for error_type in ["rate_limit_error", "api_error", "overloaded_error"] {
+            let mut turn = StreamingAssistantTurn::default();
+            let error = turn
+                .apply_event(
+                    &json!({
+                        "type":"error",
+                        "error":{
+                            "type":error_type,
+                            "message":"temporarily unavailable",
+                            "api_key":"secret-value"
+                        }
+                    }),
+                    &mut |_| {},
+                )
+                .unwrap_err();
+
+            assert!(matches!(error, AnthropicError::StreamFailure { .. }));
+            assert!(!error.to_string().contains("secret-value"));
+        }
     }
 
     #[test]
@@ -1230,6 +1283,7 @@ mod tests {
                 None,
                 128,
                 0,
+                false,
                 &mut |_| {},
                 &mut request_observer,
             )

@@ -29,7 +29,7 @@ use super::provider::{
     NoopProviderRequestObserver, ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy,
     ProviderNoConsumableOutput, ProviderReplayIdentity, ProviderReplayProtocol, ProviderRequest,
     ProviderRequestObserver, ProviderRequestPreparationFailure, ProviderResponse, ProviderStop,
-    ProviderStreamFailure, ProviderTerminalFailure, ToolSpec,
+    ProviderStreamFailure, ProviderTerminalFailure, ProviderTransport, ToolSpec,
 };
 use super::redact_media_error_body;
 use super::types::{SessionTurnContentBlock, SessionTurnEvent, SessionTurnMessage};
@@ -146,7 +146,9 @@ impl AnthropicMessagesClient {
         retry_base_delay: Duration,
         retry_max_delay: Duration,
     ) -> Result<Self, AnthropicError> {
-        let http = crate::http_client_builder()
+        let endpoint = resolve_llm_endpoint(&endpoint, LlmEndpointKind::AnthropicMessages)
+            .map_err(|error| AnthropicError::InvalidEndpoint(error.to_string()))?;
+        let http = crate::http_client_builder_for_endpoint(&endpoint)
             .timeout(timeout)
             .build()
             .map_err(|error| {
@@ -159,10 +161,7 @@ impl AnthropicMessagesClient {
         Ok(Self {
             http,
             api_key: Arc::new(api_key),
-            endpoint: Arc::new(
-                resolve_llm_endpoint(&endpoint, LlmEndpointKind::AnthropicMessages)
-                    .map_err(|error| AnthropicError::InvalidEndpoint(error.to_string()))?,
-            ),
+            endpoint: Arc::new(endpoint),
             model: Arc::new(model),
             retry_count,
             retry_base_delay,
@@ -455,9 +454,16 @@ impl AnthropicProviderAdapter {
         emit: &mut (dyn FnMut(ProviderEvent) + Send),
         observer: &mut (dyn ProviderRequestObserver + Send),
     ) -> anyhow::Result<ProviderResponse> {
+        let transport = if request.stream {
+            ProviderTransport::AnthropicSse
+        } else {
+            ProviderTransport::AnthropicNonStreaming
+        };
         let retry_count = request
             .retry_count_override
             .unwrap_or(self.client.retry_count);
+        let retry_after_partial =
+            request.stream_output_mode == crate::api::ProviderStreamOutputMode::Buffered;
         let base_messages = request.messages;
         let request_has_media = base_messages.iter().any(|message| {
             message.content.iter().any(|block| {
@@ -507,6 +513,7 @@ impl AnthropicProviderAdapter {
                     api_tools,
                     request.max_tokens,
                     retry_count,
+                    retry_after_partial,
                     &mut provider_emit,
                     &mut request_observer,
                 )
@@ -558,7 +565,7 @@ impl AnthropicProviderAdapter {
         let assistant_message = match assistant_turn_message(&turn, self.client.model.as_str()) {
             Ok(message) => message,
             Err(AnthropicError::NoConsumableOutput { reason }) => {
-                return Err(ProviderNoConsumableOutput::new(reason).into());
+                return Err(ProviderNoConsumableOutput::new(transport, reason).into());
             }
             Err(error) => return Err(error.into()),
         };
@@ -570,7 +577,7 @@ impl AnthropicProviderAdapter {
 }
 
 fn anthropic_adapter_stream_failure(error: &AnthropicError) -> bool {
-    matches!(error, AnthropicError::StreamFailure { .. })
+    is_stream_retryable(error)
 }
 
 impl AnthropicProviderAdapter {
@@ -1712,7 +1719,9 @@ mod tests {
                     tools: Vec::new(),
                     max_tokens: 128,
                     stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
                     runtime_chain_id: None,
+                    runtime_fallback_scope: None,
                     recovery_interrupt: None,
                     retry_count_override: None,
                 },

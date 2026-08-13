@@ -11,7 +11,8 @@ use super::websocket::{ResponsesWebSocketTransport, WebSocketSendOutcome};
 use crate::api::endpoint::{resolve_llm_endpoint, LlmEndpointKind};
 use crate::api::evaluation_usage::{record_evaluation_request_started, record_evaluation_usage};
 use crate::api::llm_http::{read_llm_error_body, LlmHttpError, LlmHttpPhase};
-use crate::api::{ProviderRecoveryInterrupt, ProviderRuntimeChainId};
+use crate::api::provider::ProviderTransport;
+use crate::api::{ProviderRecoveryInterrupt, ProviderRuntimeChainId, ProviderRuntimeFallbackScope};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponsesStreamEvent {
@@ -62,7 +63,9 @@ impl ResponsesClient {
         retry_base_delay: Duration,
         retry_max_delay: Duration,
     ) -> Result<Self, ResponsesError> {
-        let builder = crate::http_client_builder().timeout(timeout);
+        let endpoint = resolve_llm_endpoint(&endpoint, LlmEndpointKind::OpenAiResponses)
+            .map_err(|error| ResponsesError::InvalidEndpoint(error.to_string()))?;
+        let builder = crate::http_client_builder_for_endpoint(&endpoint).timeout(timeout);
         let http = builder.build().map_err(|error| {
             ResponsesError::Http(LlmHttpError::new(
                 error,
@@ -72,10 +75,7 @@ impl ResponsesClient {
         })?;
         Ok(Self {
             http,
-            endpoint: Arc::new(
-                resolve_llm_endpoint(&endpoint, LlmEndpointKind::OpenAiResponses)
-                    .map_err(|error| ResponsesError::InvalidEndpoint(error.to_string()))?,
-            ),
+            endpoint: Arc::new(endpoint),
             api_key: Arc::new(api_key),
             retry_count,
             retry_base_delay,
@@ -144,32 +144,97 @@ impl ResponsesClient {
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
     ) -> Result<ReducedResponses, ResponsesError> {
+        self.send_with_retry_count_for_runtime_scope(
+            request,
+            retry_count,
+            runtime_chain_id,
+            None,
+            false,
+            recovery_interrupt,
+            emit,
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Responses transport 需显式携带 continuation、fallback scope 与缓冲语义"
+    )]
+    pub(crate) async fn send_with_retry_count_for_runtime_scope(
+        &self,
+        request: &ResponsesRequest,
+        retry_count: u32,
+        runtime_chain_id: Option<ProviderRuntimeChainId>,
+        runtime_fallback_scope: Option<&ProviderRuntimeFallbackScope>,
+        retry_after_partial: bool,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+        emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
+    ) -> Result<ReducedResponses, ResponsesError> {
+        self.send_with_retry_count_for_runtime_scope_and_transport(
+            request,
+            retry_count,
+            runtime_chain_id,
+            runtime_fallback_scope,
+            retry_after_partial,
+            recovery_interrupt,
+            emit,
+        )
+        .await
+        .map(|(response, _transport)| response)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Responses transport 需显式携带 continuation、fallback scope 与缓冲语义"
+    )]
+    pub(crate) async fn send_with_retry_count_for_runtime_scope_and_transport(
+        &self,
+        request: &ResponsesRequest,
+        retry_count: u32,
+        runtime_chain_id: Option<ProviderRuntimeChainId>,
+        runtime_fallback_scope: Option<&ProviderRuntimeFallbackScope>,
+        retry_after_partial: bool,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+        emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
+    ) -> Result<(ReducedResponses, ProviderTransport), ResponsesError> {
         ensure_recovery_active(recovery_interrupt)?;
         if request.stream {
             if let (Some(websocket), Some(runtime_chain_id)) = (&self.websocket, runtime_chain_id) {
                 match websocket
-                    .send_with_retry_count(
+                    .send_with_retry_count_for_scope(
                         request,
                         runtime_chain_id,
+                        runtime_fallback_scope,
                         retry_count,
                         self.retry_base_delay,
                         self.retry_max_delay,
                         recovery_interrupt,
+                        retry_after_partial,
                         emit,
                     )
                     .await?
                 {
-                    WebSocketSendOutcome::Response(response) => return Ok(response),
+                    WebSocketSendOutcome::Response(response) => {
+                        return Ok((response, ProviderTransport::ResponsesWebSocket));
+                    }
                     WebSocketSendOutcome::FallbackToHttp => {
                         ensure_recovery_active(recovery_interrupt)?;
                     }
                 }
             }
-            self.send_streaming_with_retry(request, retry_count, recovery_interrupt, emit)
-                .await
+            self.send_streaming_with_retry(
+                request,
+                retry_count,
+                retry_after_partial,
+                recovery_interrupt,
+                emit,
+            )
+            .await
+            .map(|response| (response, ProviderTransport::ResponsesSse))
         } else {
             self.send_json_with_retry(request, retry_count, recovery_interrupt)
                 .await
+                .map(|response| (response, ProviderTransport::ResponsesNonStreaming))
         }
     }
 
@@ -235,6 +300,7 @@ impl ResponsesClient {
         &self,
         request: &ResponsesRequest,
         retry_count: u32,
+        retry_after_partial: bool,
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
     ) -> Result<ReducedResponses, ResponsesError> {
@@ -252,7 +318,9 @@ impl ResponsesClient {
             match result {
                 Ok(value) => return Ok(value),
                 Err(error)
-                    if !emitted_visible_text && is_retryable(&error) && attempt < retry_count =>
+                    if (!emitted_visible_text || retry_after_partial)
+                        && is_retryable(&error)
+                        && attempt < retry_count =>
                 {
                     let backoff =
                         compute_backoff(attempt, self.retry_base_delay, self.retry_max_delay);
@@ -371,6 +439,7 @@ fn is_retryable(error: &ResponsesError) -> bool {
 pub(crate) fn is_stream_recovery_failure(error: &ResponsesError) -> bool {
     matches!(error, ResponsesError::StreamFailure { .. })
         || matches!(error, ResponsesError::Http(error) if error.is_retryable())
+        || matches!(error, ResponsesError::Status { status, .. } if *status == 429 || *status >= 500)
 }
 
 fn ensure_recovery_active(
@@ -449,16 +518,34 @@ mod tests {
         let (json_endpoint, _) = spawn_server("application/json", json_body).await;
         let (sse_endpoint, _) = spawn_server("text/event-stream", sse_body).await;
 
-        let json_result = test_client(json_endpoint)
-            .send(&request(false), &mut |_| {})
+        let (json_result, json_transport) = test_client(json_endpoint)
+            .send_with_retry_count_for_runtime_scope_and_transport(
+                &request(false),
+                0,
+                None,
+                None,
+                false,
+                None,
+                &mut |_| {},
+            )
             .await
             .unwrap();
-        let sse_result = test_client(sse_endpoint)
-            .send(&request(true), &mut |_| {})
+        let (sse_result, sse_transport) = test_client(sse_endpoint)
+            .send_with_retry_count_for_runtime_scope_and_transport(
+                &request(true),
+                0,
+                None,
+                None,
+                false,
+                None,
+                &mut |_| {},
+            )
             .await
             .unwrap();
 
         assert_eq!(json_result, sse_result);
+        assert_eq!(json_transport, ProviderTransport::ResponsesNonStreaming);
+        assert_eq!(sse_transport, ProviderTransport::ResponsesSse);
     }
 
     #[tokio::test]

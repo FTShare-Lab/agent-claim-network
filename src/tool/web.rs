@@ -5,6 +5,14 @@
 use super::*;
 
 impl ToolRegistry {
+    fn http_for_url(&self, url: &str) -> &reqwest::Client {
+        if crate::is_loopback_endpoint(url) {
+            &self.direct_http
+        } else {
+            &self.http
+        }
+    }
+
     pub(super) async fn web_search(&self, input: Value) -> Result<ToolExecution, ToolError> {
         let args: WebSearchArgs =
             serde_json::from_value(input).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
@@ -17,7 +25,7 @@ impl ToolRegistry {
         if !(args.url.starts_with("http://") || args.url.starts_with("https://")) {
             return Err(ToolError::InvalidUrl(args.url));
         }
-        let mut req = self.http.get(&args.url);
+        let mut req = self.http_for_url(&args.url).get(&args.url);
         for header in args.headers.unwrap_or_default() {
             req = req.header(header.name, header.value);
         }
@@ -53,7 +61,7 @@ impl ToolRegistry {
             "DELETE" => reqwest::Method::DELETE,
             other => return Err(ToolError::InvalidArgs(format!("不支持的 method: {other}"))),
         };
-        let mut req = self.http.request(method, &args.url);
+        let mut req = self.http_for_url(&args.url).request(method, &args.url);
         for header in args.headers.unwrap_or_default() {
             req = req.header(header.name, header.value);
         }
@@ -122,7 +130,7 @@ impl ToolRegistry {
         }
 
         let resp = self
-            .http
+            .http_for_url(&self.web_search_endpoint)
             .post(&self.web_search_endpoint)
             .bearer_auth(api_key)
             .json(&body)

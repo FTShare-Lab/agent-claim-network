@@ -228,6 +228,7 @@ impl SessionEngine {
     pub(super) async fn prepare_finalize_segment(
         &self,
         session_messages: &[SessionMessage],
+        fallback_scope: crate::api::ProviderRuntimeFallbackScope,
     ) -> anyhow::Result<(Vec<ClaimId>, Vec<Claim>, Vec<Dispute>)> {
         let transcript = session_messages_to_turn_transcript(session_messages);
         let local_claims = llm_visible_claims(self.agent.claim_store.list_local_claims().await?);
@@ -241,65 +242,24 @@ impl SessionEngine {
             transcript: &transcript,
             local_claims: &local_claims,
         };
-        let mut last_err = None;
-        for attempt in 0..=self.runner.llm_retry_count {
-            let raw = match self.generate_recap_json(&payload).await {
-                Ok(raw) => raw,
-                Err(e) if attempt < self.runner.llm_retry_count => {
-                    log::warn!(
-                        target: "agent",
-                        "agent {} finalize_session JSON 生成失败，重试 ({}/{}): {e:#}",
-                        self.agent.agent_id,
-                        attempt + 1,
-                        self.runner.llm_retry_count
-                    );
-                    last_err = Some(e);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            match prepare_recap_value(
-                raw,
-                &self.agent.agent_id,
-                &allowed,
-                &local_by_id,
-                Utc::now(),
-            ) {
-                Ok(prepared) => return Ok(prepared),
-                Err(e) if attempt < self.runner.llm_retry_count => {
-                    log::warn!(
-                        target: "agent",
-                        "agent {} finalize_session 输出未通过协议校验，重试 ({}/{}): {e:#}",
-                        self.agent.agent_id,
-                        attempt + 1,
-                        self.runner.llm_retry_count
-                    );
-                    last_err = Some(e);
-                }
-                Err(e) => {
-                    return Err(RecoverableCompactionPreparationError::other(e).into());
-                }
-            }
-        }
-        Err(RecoverableCompactionPreparationError::other(
-            last_err.unwrap_or_else(|| anyhow::anyhow!("finalize_session retry loop 未返回结果")),
-        )
-        .into())
-    }
-
-    async fn generate_recap_json(
-        &self,
-        payload: &SessionRecapPayload<'_>,
-    ) -> anyhow::Result<serde_json::Value> {
         let system_prompt = self
             .prompt_registry
             .render(PROMPT_SESSION_RECAP, ())
             .context("渲染 session_recap prompt 失败")?;
-        let user_text = serde_json::to_string_pretty(payload)?;
+        let user_text = serde_json::to_string_pretty(&payload)?;
+        let agent_id = self.agent.agent_id.clone();
         self.json_caller
-            .generate_json(
+            .generate_json_streaming_validated_with_retry_notice(
                 system_prompt,
                 vec![SessionTurnMessage::user_text(user_text)],
+                crate::api::BufferedProviderRuntime::new(fallback_scope),
+                |raw| prepare_recap_value(raw, &agent_id, &allowed, &local_by_id, Utc::now()),
+                |retry_index, retry_total, error| {
+                    log::warn!(
+                        target: "agent",
+                        "agent {agent_id} finalize_session 输出无效，重试 ({retry_index}/{retry_total}): {error:#}"
+                    );
+                },
             )
             .await
             .map_err(|source| RecoverableCompactionPreparationError::other(source).into())
@@ -335,8 +295,9 @@ impl SessionEngine {
                 }
             }
             _ => {
-                let (used_claim_ids, prepared_claims, prepared_disputes) =
-                    self.prepare_finalize_segment(segment).await?;
+                let (used_claim_ids, prepared_claims, prepared_disputes) = self
+                    .prepare_finalize_segment(segment, session.runtime_fallback_scope())
+                    .await?;
                 let trace_text = session_trace_text(segment);
                 let trace_created_at = Utc::now();
                 let trace_id = checkpoint_trace_id(

@@ -17,7 +17,7 @@ use super::provider::{
     ProviderNoConsumableOutput, ProviderRecoveryInterrupt, ProviderReplayIdentity,
     ProviderReplayProtocol, ProviderRequest, ProviderRequestObserver,
     ProviderRequestPreparationFailure, ProviderResponse, ProviderRuntimeChainId, ProviderStop,
-    ProviderStreamFailure, ProviderTerminalFailure, ToolSpec,
+    ProviderStreamFailure, ProviderTerminalFailure, ProviderTransport, ToolSpec,
 };
 use super::redact_media_error_body;
 use super::responses::{
@@ -55,6 +55,7 @@ pub struct OpenAiCompatibleResponsesProviderAdapter {
     client: ResponsesClient,
     model: String,
     reasoning_effort: ReasoningEffort,
+    include_reasoning_replay: bool,
 }
 
 impl OpenAiCompatibleResponsesProviderAdapter {
@@ -82,12 +83,18 @@ impl OpenAiCompatibleResponsesProviderAdapter {
             )?,
             model,
             reasoning_effort: ReasoningEffort::None,
+            include_reasoning_replay: true,
         })
     }
 
     /// 设置 Responses `reasoning.effort`；`none` 会省略整个 reasoning 字段。
     pub fn with_reasoning_effort(mut self, reasoning_effort: ReasoningEffort) -> Self {
         self.reasoning_effort = reasoning_effort;
+        self
+    }
+
+    pub(crate) fn with_reasoning_replay(mut self, enabled: bool) -> Self {
+        self.include_reasoning_replay = enabled;
         self
     }
 
@@ -118,7 +125,9 @@ impl OpenAiCompatibleResponsesProviderAdapter {
             max_output_tokens: max_tokens,
             stream,
             store: false,
-            include: Some(vec!["reasoning.encrypted_content".into()]),
+            include: self
+                .include_reasoning_replay
+                .then(|| vec!["reasoning.encrypted_content".into()]),
             reasoning: reasoning_effort_name(self.reasoning_effort).map(|effort| {
                 ResponsesReasoning {
                     effort: effort.to_string(),
@@ -141,6 +150,8 @@ impl OpenAiCompatibleResponsesProviderAdapter {
         stream: bool,
         retry_count: u32,
         runtime_chain_id: Option<ProviderRuntimeChainId>,
+        runtime_fallback_scope: Option<&crate::api::ProviderRuntimeFallbackScope>,
+        retry_after_partial: bool,
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         emit: &mut (dyn FnMut(ProviderEvent) + Send),
         observer: &mut (dyn ProviderRequestObserver + Send),
@@ -149,6 +160,11 @@ impl OpenAiCompatibleResponsesProviderAdapter {
         let mut replay_items = Vec::new();
         let mut last_function_calls = Vec::new();
         let mut last_terminal = ResponsesTerminal::Completed;
+        let mut last_transport = if stream {
+            ProviderTransport::ResponsesSse
+        } else {
+            ProviderTransport::ResponsesNonStreaming
+        };
         let mut provider_messages = base_messages.to_vec();
 
         for round in 0..=MAX_CONTINUATION_TURNS {
@@ -171,33 +187,39 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                 max_tokens,
                 stream,
             );
-            let response = if stream {
+            let (response, transport) = if stream {
                 let mut responses_emit = |event| match event {
                     ResponsesStreamEvent::TextDelta { text } => {
                         emit(ProviderEvent::AssistantTextDelta { text });
                     }
                 };
                 self.client
-                    .send_with_retry_count_for_runtime_chain(
+                    .send_with_retry_count_for_runtime_scope_and_transport(
                         &request,
                         retry_count,
                         runtime_chain_id,
+                        runtime_fallback_scope,
+                        retry_after_partial,
                         recovery_interrupt,
                         &mut responses_emit,
                     )
                     .await?
             } else {
                 let mut noop = |_event: ResponsesStreamEvent| {};
-                self.client
-                    .send_with_retry_count_for_runtime_chain(
-                        &request,
-                        retry_count,
-                        None,
-                        recovery_interrupt,
-                        &mut noop,
-                    )
-                    .await?
+                (
+                    self.client
+                        .send_with_retry_count_for_runtime_chain(
+                            &request,
+                            retry_count,
+                            None,
+                            recovery_interrupt,
+                            &mut noop,
+                        )
+                        .await?,
+                    ProviderTransport::ResponsesNonStreaming,
+                )
             };
+            last_transport = transport;
             if let Some(usage) = response
                 .usage
                 .as_ref()
@@ -243,6 +265,7 @@ impl OpenAiCompatibleResponsesProviderAdapter {
             replay_items,
             function_calls: last_function_calls,
             terminal: last_terminal,
+            transport: last_transport,
         })
     }
 }
@@ -304,6 +327,8 @@ impl OpenAiCompatibleResponsesProviderAdapter {
         let retry_count = request
             .retry_count_override
             .unwrap_or(self.client.retry_count());
+        let retry_after_partial =
+            request.stream_output_mode == crate::api::ProviderStreamOutputMode::Buffered;
         let base_messages = request.messages;
         let input = session_turn_messages_to_responses(base_messages.clone(), &self.model)?;
         let recovery_interrupt = request.recovery_interrupt.clone();
@@ -318,6 +343,8 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                 request.stream,
                 retry_count,
                 request.runtime_chain_id,
+                request.runtime_fallback_scope.as_ref(),
+                retry_after_partial,
                 recovery_interrupt.as_ref(),
                 emit,
                 observer,
@@ -345,10 +372,11 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                 return Err(error.into());
             }
         };
+        let transport = turn.transport;
         let response = match provider_response_from_turn(turn, &self.model) {
             Ok(response) => response,
             Err(OpenAiCompatibleResponsesError::NoConsumableOutput { reason }) => {
-                return Err(ProviderNoConsumableOutput::new(reason).into());
+                return Err(ProviderNoConsumableOutput::new(transport, reason).into());
             }
             Err(error) => return Err(error.into()),
         };
@@ -407,6 +435,7 @@ struct ContinuedResponsesTurn {
     replay_items: Vec<Value>,
     function_calls: Vec<super::responses::ResponsesFunctionCall>,
     terminal: ResponsesTerminal,
+    transport: ProviderTransport,
 }
 
 fn session_turn_messages_to_responses(
@@ -727,6 +756,7 @@ mod tests {
             .unwrap(),
             model: "test-model".into(),
             reasoning_effort,
+            include_reasoning_replay: true,
         }
     }
 
@@ -1087,6 +1117,7 @@ mod tests {
                 arguments: r#"{"path":"a.txt"}"#.into(),
             }],
             terminal: ResponsesTerminal::Completed,
+            transport: ProviderTransport::ResponsesSse,
         };
 
         let response = provider_response_from_turn(turn, "test-model").unwrap();
@@ -1111,6 +1142,7 @@ mod tests {
                 replay_items: vec![json!({"type":"output_image","data":secret})],
                 function_calls: Vec::new(),
                 terminal: ResponsesTerminal::Completed,
+                transport: ProviderTransport::ResponsesSse,
             },
             "test-model",
         )
@@ -1151,6 +1183,7 @@ mod tests {
                 replay_items: vec![json!({"type":"message"})],
                 function_calls: Vec::new(),
                 terminal: ResponsesTerminal::MaxOutputTokens,
+                transport: ProviderTransport::ResponsesSse,
             },
             "test-model",
         )
@@ -1182,6 +1215,7 @@ mod tests {
                 })],
                 function_calls: Vec::new(),
                 terminal: ResponsesTerminal::Completed,
+                transport: ProviderTransport::ResponsesSse,
             },
             "test-model",
         )
@@ -1241,7 +1275,9 @@ mod tests {
                     tools: Vec::new(),
                     max_tokens: 32,
                     stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
                     runtime_chain_id: None,
+                    runtime_fallback_scope: None,
                     recovery_interrupt: None,
                     retry_count_override: None,
                 },

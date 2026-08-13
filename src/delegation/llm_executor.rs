@@ -194,6 +194,7 @@ impl DelegationExecutor for LlmDelegationExecutor {
         context: DelegationExecutionContext,
         progress: DelegationProgressSink,
     ) -> Result<DelegationExecutionOutcome, DelegationExecutionError> {
+        let runtime_fallback_scope = context.runtime_fallback_scope();
         let metadata = context.metadata;
         let cleanup_tools = Arc::new(self.tool_registry_template.clone());
         let mut process_cleanup_guard = OwnerProcessCleanupOnDrop::new(
@@ -279,6 +280,7 @@ impl DelegationExecutor for LlmDelegationExecutor {
             tool_specs,
             self.compaction.clone(),
             self.context_window,
+            runtime_fallback_scope.clone(),
         );
         let turn_result = {
             let mut tool_names = BTreeMap::<String, String>::new();
@@ -344,6 +346,7 @@ impl DelegationExecutor for LlmDelegationExecutor {
                     request,
                     Vec::new(),
                     runtime_chain_id,
+                    runtime_fallback_scope,
                     &mut emit,
                     None,
                     SessionTurnHooks::new(

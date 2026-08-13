@@ -1272,10 +1272,12 @@ impl AgentTurnLoop {
         tool_boundary_control: Option<ToolBoundaryControl>,
         hooks: SessionTurnHooks<'_, '_, '_>,
     ) -> anyhow::Result<SessionTurn> {
+        let fallback_root = crate::api::ProviderRuntimeFallbackScope::new_root();
         self.run_session_turn_with_context_and_runtime_chain_hooks(
             request,
             recovered_model_context,
             ProviderRuntimeChainId::new(),
+            fallback_root.new_child(),
             emit,
             tool_boundary_control,
             hooks,
@@ -1293,10 +1295,12 @@ impl AgentTurnLoop {
         durable_recorder: Option<&mut dyn SessionTurnEventRecorder>,
         preflight: Option<&mut dyn SessionTurnPreflight>,
     ) -> anyhow::Result<SessionTurn> {
+        let fallback_root = crate::api::ProviderRuntimeFallbackScope::new_root();
         self.run_session_turn_with_context_and_runtime_chain_hooks(
             request,
             Vec::new(),
             runtime_chain_id,
+            fallback_root.new_child(),
             emit,
             tool_boundary_control,
             SessionTurnHooks::new(durable_recorder, None, preflight),
@@ -1304,11 +1308,16 @@ impl AgentTurnLoop {
         .await
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "turn runtime 需显式携带 continuation chain、fallback scope 与 hooks"
+    )]
     pub(crate) async fn run_session_turn_with_context_and_runtime_chain_hooks(
         &self,
         request: SessionTurnRequest,
         recovered_model_context: Vec<CompletedSessionTurnMessage>,
         runtime_chain_id: ProviderRuntimeChainId,
+        runtime_fallback_scope: crate::api::ProviderRuntimeFallbackScope,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
         tool_boundary_control: Option<ToolBoundaryControl>,
         hooks: SessionTurnHooks<'_, '_, '_>,
@@ -1326,6 +1335,7 @@ impl AgentTurnLoop {
                 tool_boundary_control,
                 hooks,
                 runtime_chain_id,
+                runtime_fallback_scope,
             )
             .await;
         if result.is_err() {
@@ -1337,6 +1347,10 @@ impl AgentTurnLoop {
         result
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "turn runtime 需显式携带 continuation chain、fallback scope 与 hooks"
+    )]
     async fn run_session_turn_with_hooks_inner(
         &self,
         request: SessionTurnRequest,
@@ -1345,6 +1359,7 @@ impl AgentTurnLoop {
         tool_boundary_control: Option<ToolBoundaryControl>,
         hooks: SessionTurnHooks<'_, '_, '_>,
         runtime_chain_id: ProviderRuntimeChainId,
+        runtime_fallback_scope: crate::api::ProviderRuntimeFallbackScope,
     ) -> anyhow::Result<SessionTurn> {
         let SessionTurnHooks {
             mut durable_recorder,
@@ -1594,6 +1609,7 @@ impl AgentTurnLoop {
                         provider_interrupt.as_ref(),
                         provider_recovery_interrupt.as_ref(),
                         runtime_chain_id,
+                        &runtime_fallback_scope,
                         &mut request_progress,
                     )
                     .await;
@@ -1878,6 +1894,7 @@ impl AgentTurnLoop {
         provider_interrupt: Option<&CancellationToken>,
         provider_recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         runtime_chain_id: ProviderRuntimeChainId,
+        runtime_fallback_scope: &crate::api::ProviderRuntimeFallbackScope,
         request_progress: &mut ProviderRequestProgress<'_>,
     ) -> anyhow::Result<ProviderCallOutcome> {
         let (tool_definitions, provider_mcp_routes) = self.tools.definitions_with_mcp_routes();
@@ -1914,7 +1931,9 @@ impl AgentTurnLoop {
             tools: tools.clone(),
             max_tokens: self.max_tokens,
             stream: true,
+            stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
             runtime_chain_id: Some(runtime_chain_id),
+            runtime_fallback_scope: Some(runtime_fallback_scope.clone()),
             recovery_interrupt: provider_recovery_interrupt.cloned(),
             retry_count_override: None,
         };
@@ -2005,7 +2024,9 @@ impl AgentTurnLoop {
                         tools: tools.clone(),
                         max_tokens: self.max_tokens,
                         stream: false,
+                        stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
                         runtime_chain_id: None,
+                        runtime_fallback_scope: None,
                         recovery_interrupt: provider_recovery_interrupt.cloned(),
                         // TUI 的 N/5 必须严格对应一次 provider-call attempt，禁止 adapter 再嵌套 retry。
                         retry_count_override: Some(0),
@@ -3422,10 +3443,11 @@ mod tests {
         estimate_provider_request_context_tokens, AgentTurnLoop, CompletedSessionTurnMessage,
         ContextUsageSource, ModelContextSource, ProviderAdapter, ProviderEvent,
         ProviderReplayState, ProviderRequest, ProviderRequestObserver, ProviderResponse,
-        ProviderRuntimeChainId, ProviderStop, SessionTurn, SessionTurnContentBlock,
-        SessionTurnContextAppender, SessionTurnEvent, SessionTurnEventRecorder, SessionTurnHooks,
-        SessionTurnInterrupted, SessionTurnMessage, SessionTurnPreflight, SessionTurnRequest,
-        ToolBoundaryControl, ToolCallSkipReason, ToolExecutionOutcome,
+        ProviderRuntimeChainId, ProviderStop, ProviderTransport, SessionTurn,
+        SessionTurnContentBlock, SessionTurnContextAppender, SessionTurnEvent,
+        SessionTurnEventRecorder, SessionTurnHooks, SessionTurnInterrupted, SessionTurnMessage,
+        SessionTurnPreflight, SessionTurnRequest, ToolBoundaryControl, ToolCallSkipReason,
+        ToolExecutionOutcome,
     };
     use crate::attachment::AttachmentLimits;
     use crate::config::ToolConfig;
@@ -3693,6 +3715,7 @@ mod tests {
                     Err(ProviderStreamFailure::new("stream ended before terminal event").into())
                 }
                 ZeroTextFailureKind::NoConsumableOutput => Err(ProviderNoConsumableOutput::new(
+                    ProviderTransport::ResponsesSse,
                     "provider returned no consumable output",
                 )
                 .into()),

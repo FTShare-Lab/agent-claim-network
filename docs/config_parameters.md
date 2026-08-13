@@ -317,17 +317,17 @@ background-shell 其余时序、容量和 PTY 参数是 `config.rs` 内部默认
 
 ### `[router.rerank]`
 
-- `provider`：候选 Claim 的重排方式，默认 `openai_responses`。`heuristic` 使用本地启发式规则；`openai_chat` 使用 Chat Completions；`openai_responses` 使用 Responses。两种远端协议都把 query 和候选 Claim 交给通用模型排序，不要求使用专用 rerank 模型。
-- `endpoint`：远端重排服务地址，必须是绝对 HTTP(S) URL。可以填写 host root、常见的 `/v1` base URL 或完整的 `/v1/chat/completions`、`/v1/responses` 请求 URL；ACN 按所选 provider 补全缺失路径，不在两种协议间自动切换。
+- `provider`：候选 Claim 的重排方式，默认 `openai_responses`。`heuristic` 使用本地启发式规则；`openai_chat` 使用 Chat Completions；`openai_responses` 使用 Responses；`anthropic` 使用 Anthropic Messages。远端协议都把 query 和候选 Claim 交给通用模型排序，不要求使用专用 rerank 模型。
+- `endpoint`：远端重排服务地址，必须是绝对 HTTP(S) URL。可以填写 host root、常见的 `/v1` base URL 或完整的 `/v1/chat/completions`、`/v1/responses`、`/v1/messages` 请求 URL；ACN 按所选 provider 补全缺失路径，不在协议间自动切换。
 - `model`：执行重排任务的模型名。
 - `api_key_env`：读取远端重排服务 API key 的环境变量名。
 - `timeout_secs`：单次 rerank 请求超时秒数。
-- `max_tokens`：模型返回排序结果时的最大输出 token 数；`openai_chat` 映射为 `max_tokens`，`openai_responses` 映射为 `max_output_tokens`。
-- `retry_count`：rerank 请求首次失败后的额外重试次数。
+- `max_tokens`：模型返回排序结果时的最大输出 token 数。
+- `retry_count`：远端请求失败或排序结果无效时的额外重试次数。
 - `retry_base_delay_ms`：rerank 请求重试退避基础间隔毫秒数。
 - `retry_max_delay_ms`：rerank 请求重试退避上限毫秒数。
 
-`openai_responses` rerank 固定使用 non-streaming、`store = false` 的单轮请求，不发送 `reasoning` 字段，也不保存或回传上游 reasoning。Responses 未完成、输出不是合法排序 JSON 或最终请求失败时，Router 沿用现有 lexical/vector 排序降级。
+远端 rerank 默认使用流式请求；流式不可用时会尝试普通请求。rerank 不启用模型的 reasoning/thinking；最终失败时，Router 继续使用原有检索排序。
 
 ### `[maintainer.sweep]`
 
@@ -398,5 +398,5 @@ Maintainer 启动时会自动 ensure `router-service` 内部 key：hash 写在 `
 ### Router / Maintainer 侧环境变量
 
 - `[router.embedding].api_key_env`：真实 embedding 路径必需，配置为要读取的 embedding API key 环境变量名。
-- `[router.rerank].api_key_env`：`provider = "openai_chat"` 或 `provider = "openai_responses"` 时必需，配置为要读取的远端重排服务 API key 环境变量名。
+- `[router.rerank].api_key_env`：`provider = "openai_chat"`、`provider = "openai_responses"` 或 `provider = "anthropic"` 时必需，配置为要读取的远端重排服务 API key 环境变量名。
 - `[maintainer.auth.admin].password_env`：启用 maintainer 管理台管理员鉴权时必需，配置为要读取的 Basic Auth 密码环境变量名。

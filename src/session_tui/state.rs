@@ -67,6 +67,7 @@ pub struct SessionTuiState {
     turn_in_flight: bool,
     committed_turn_finishing: bool,
     shell_in_flight: bool,
+    foreground_task_started_at: Option<Instant>,
     status_notice: Option<String>,
     start_separator_flushed: bool,
     attachment_cfg: AttachmentConfig,
@@ -119,6 +120,17 @@ pub(super) enum ContributionKind {
     Finalize,
 }
 
+fn is_elapsed_title_status(status: SessionRuntimeStatus) -> bool {
+    matches!(
+        status,
+        SessionRuntimeStatus::Initializing
+            | SessionRuntimeStatus::Running
+            | SessionRuntimeStatus::SyncingInbox
+            | SessionRuntimeStatus::Compacting
+            | SessionRuntimeStatus::Finalizing
+    )
+}
+
 impl Default for SessionTuiState {
     fn default() -> Self {
         let now = Instant::now();
@@ -149,6 +161,7 @@ impl Default for SessionTuiState {
             turn_in_flight: false,
             committed_turn_finishing: false,
             shell_in_flight: false,
+            foreground_task_started_at: None,
             status_notice: None,
             start_separator_flushed: false,
             attachment_cfg: AttachmentConfig::default(),
@@ -169,6 +182,12 @@ impl SessionTuiState {
         Self::default()
     }
 
+    pub(super) fn foreground_task_elapsed_secs(&self) -> u64 {
+        self.foreground_task_started_at
+            .map(|started_at| started_at.elapsed().as_secs())
+            .unwrap_or(0)
+    }
+
     fn bump_input_revision(&mut self) {
         self.input_revision = self.input_revision.saturating_add(1);
     }
@@ -183,6 +202,9 @@ impl SessionTuiState {
         self.refresh_focus_timer();
         match event {
             SessionEvent::StartupProgress { label } => {
+                if self.status != SessionRuntimeStatus::Initializing {
+                    self.foreground_task_started_at = Some(Instant::now());
+                }
                 self.status = SessionRuntimeStatus::Initializing;
                 self.transcript.set_activity(Some(label));
             }
@@ -195,6 +217,13 @@ impl SessionTuiState {
                 self.bottom_pane.set_finalize_failed(false);
             }
             SessionEvent::StatusChanged { status } => {
+                let was_foreground_task = is_elapsed_title_status(self.status);
+                let is_foreground_task = is_elapsed_title_status(status);
+                if is_foreground_task && (!was_foreground_task || self.status != status) {
+                    self.foreground_task_started_at = Some(Instant::now());
+                } else if !is_foreground_task {
+                    self.foreground_task_started_at = None;
+                }
                 self.status = status;
                 if matches!(
                     status,
@@ -335,6 +364,7 @@ impl SessionTuiState {
             SessionEvent::UserShellCommandStarted { command } => {
                 self.network.clear_last_contribution();
                 self.status = SessionRuntimeStatus::Running;
+                self.foreground_task_started_at = Some(Instant::now());
                 self.shell_in_flight = true;
                 self.transcript
                     .set_activity(Some("running shell command...".into()));
@@ -352,6 +382,7 @@ impl SessionTuiState {
             } => {
                 self.message_count = message_count;
                 self.status = SessionRuntimeStatus::Open;
+                self.foreground_task_started_at = None;
                 self.shell_in_flight = false;
                 self.transcript.set_activity(None);
                 self.transcript.complete_shell(
@@ -368,6 +399,7 @@ impl SessionTuiState {
             }
             SessionEvent::UserShellCommandFailed { command, error } => {
                 self.status = SessionRuntimeStatus::Open;
+                self.foreground_task_started_at = None;
                 self.shell_in_flight = false;
                 self.transcript.set_activity(None);
                 self.transcript.fail_shell(command, error);
@@ -379,6 +411,7 @@ impl SessionTuiState {
                 self.message_count = message_count;
                 self.turn_count = self.turn_count.saturating_add(1);
                 self.status = SessionRuntimeStatus::Open;
+                self.foreground_task_started_at = None;
                 self.turn_in_flight = false;
                 self.committed_turn_finishing = true;
                 self.transcript.set_activity(None);
@@ -438,6 +471,9 @@ impl SessionTuiState {
                 recap_start_index: _,
                 recap_end_index: _,
             } => {
+                if self.status != SessionRuntimeStatus::Compacting {
+                    self.foreground_task_started_at = Some(Instant::now());
+                }
                 self.status = SessionRuntimeStatus::Compacting;
                 self.transcript.set_activity(None);
             }
@@ -449,6 +485,10 @@ impl SessionTuiState {
                 used_claim_ids: _,
                 new_dispute_ids,
             } => {
+                if self.turn_in_flight {
+                    self.status = SessionRuntimeStatus::Running;
+                    self.foreground_task_started_at = Some(Instant::now());
+                }
                 self.transcript.set_activity(None);
                 self.network.last_contribution = Some(ContributionSnapshot {
                     kind: ContributionKind::Compact,
@@ -461,6 +501,7 @@ impl SessionTuiState {
             }
             SessionEvent::CompactionFailed { error } => {
                 self.status = SessionRuntimeStatus::Error;
+                self.foreground_task_started_at = None;
                 self.transcript.set_activity(None);
                 self.push_error(compaction_failure_message(error));
             }
@@ -503,6 +544,7 @@ impl SessionTuiState {
                 self.push_error(format!("Inbox failed: {error}"));
             }
             SessionEvent::SessionClosed => {
+                self.foreground_task_started_at = None;
                 self.turn_in_flight = false;
                 self.shell_in_flight = false;
                 self.committed_turn_finishing = false;
@@ -1225,6 +1267,7 @@ impl SessionTuiState {
         self.turn_in_flight = false;
         self.committed_turn_finishing = false;
         self.shell_in_flight = false;
+        self.foreground_task_started_at = None;
         self.bottom_pane.set_finalize_failed(false);
         self.start_separator_flushed = false;
         self.delegation_panel = DelegationPanelState::default();
@@ -1371,6 +1414,7 @@ impl SessionTuiState {
         self.clear_pending_tool_boundary_steer();
         self.interrupted_background_processes.clear();
         self.status = SessionRuntimeStatus::Running;
+        self.foreground_task_started_at = Some(Instant::now());
         self.turn_in_flight = true;
         self.committed_turn_finishing = false;
         self.turn_animation.begin_turn();
@@ -1411,6 +1455,7 @@ impl SessionTuiState {
         self.refresh_focus_timer();
         self.turn_in_flight = false;
         self.committed_turn_finishing = false;
+        self.foreground_task_started_at = None;
         self.clear_pending_tool_boundary_steer();
         self.clear_settled_status_notice();
     }
@@ -1427,6 +1472,7 @@ impl SessionTuiState {
     fn fail_running_turn_inner(&mut self, error: impl Into<String>, restore_queue: bool) {
         self.refresh_focus_timer();
         self.status = SessionRuntimeStatus::Error;
+        self.foreground_task_started_at = None;
         self.turn_in_flight = false;
         self.committed_turn_finishing = false;
         self.turn_animation.cancel_turn();
@@ -1454,6 +1500,7 @@ impl SessionTuiState {
     fn cancel_running_turn_inner(&mut self, reason: impl Into<String>, restore_queue: bool) {
         self.refresh_focus_timer();
         self.status = SessionRuntimeStatus::Open;
+        self.foreground_task_started_at = None;
         self.turn_in_flight = false;
         self.committed_turn_finishing = false;
         self.turn_animation.cancel_turn();
@@ -1496,6 +1543,7 @@ impl SessionTuiState {
         self.refresh_focus_timer();
         self.turn_in_flight = false;
         self.committed_turn_finishing = false;
+        self.foreground_task_started_at = None;
         self.turn_animation.cancel_turn();
         self.transcript.set_activity(None);
         self.pending_user_echo = None;
@@ -1507,6 +1555,7 @@ impl SessionTuiState {
     pub fn interrupt_running_turn_for_steer(&mut self, reason: impl Into<String>) {
         self.refresh_focus_timer();
         self.status = SessionRuntimeStatus::Open;
+        self.foreground_task_started_at = None;
         self.turn_in_flight = false;
         self.committed_turn_finishing = false;
         self.turn_animation.cancel_turn();

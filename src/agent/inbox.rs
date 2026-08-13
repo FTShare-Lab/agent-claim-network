@@ -19,8 +19,9 @@ use super::prepare::{
 use super::runner::{AgentRunner, InboxProcessReport, TeamServiceConnectionStatus};
 use super::traits::ClaimedInboxMessage;
 use crate::api::{
-    resolve_placeholders, InboxInternalizeKind, InternalizeOutcome, InternalizeRequest,
-    SessionTurnMessage, StructuredJsonCaller,
+    resolve_placeholders, BufferedProviderRuntime, InboxInternalizeKind, InternalizeOutcome,
+    InternalizeRequest, ProviderRuntimeFallbackScope, ProviderTransport, SessionTurnMessage,
+    StructuredJsonCaller,
 };
 use crate::claim::{
     Claim, ClaimId, ClaimStatus, Dispute, DisputeId, InboxId, InboxMessage, InboxMessageKind,
@@ -30,18 +31,22 @@ use crate::maintainer::traits::MaintainerClientError;
 use crate::prompt::PromptRegistry;
 use crate::tracing::tracer;
 
+type PreparedInternalization = (DateTime<Utc>, Vec<Claim>, Vec<Claim>, Vec<Dispute>);
+
 #[async_trait]
 pub(crate) trait InboxJsonGenerator: Send + Sync {
     async fn generate_json(
         &self,
         kind: InboxInternalizeKind,
         request: InternalizeRequest,
+        preferred_transport: Option<ProviderTransport>,
     ) -> anyhow::Result<serde_json::Value>;
 }
 
 pub(crate) struct PromptInboxJsonGenerator {
     prompt_registry: Arc<PromptRegistry>,
     json_caller: Arc<StructuredJsonCaller>,
+    fallback_scope: ProviderRuntimeFallbackScope,
 }
 
 impl PromptInboxJsonGenerator {
@@ -52,6 +57,7 @@ impl PromptInboxJsonGenerator {
         Self {
             prompt_registry,
             json_caller,
+            fallback_scope: ProviderRuntimeFallbackScope::new_root(),
         }
     }
 }
@@ -62,6 +68,7 @@ impl InboxJsonGenerator for PromptInboxJsonGenerator {
         &self,
         kind: InboxInternalizeKind,
         request: InternalizeRequest,
+        preferred_transport: Option<ProviderTransport>,
     ) -> anyhow::Result<serde_json::Value> {
         let prompt_name = match kind {
             InboxInternalizeKind::PolicyUpdate => "inbox_policy_update_internalize",
@@ -75,9 +82,11 @@ impl InboxJsonGenerator for PromptInboxJsonGenerator {
             .map_err(anyhow::Error::from)?;
         let user_text = serde_json::to_string_pretty(&request)?;
         self.json_caller
-            .generate_json(
+            .generate_json_streaming_once(
                 system_prompt,
                 vec![SessionTurnMessage::user_text(user_text)],
+                BufferedProviderRuntime::new(self.fallback_scope.clone()),
+                preferred_transport,
             )
             .await
     }
@@ -479,25 +488,49 @@ impl AgentRunner {
             .map(|claim| (claim.id.clone(), claim.clone()))
             .collect();
         let mut last_err = None;
+        let mut preferred_transport = None;
         let (now, prepared_claims, prepared_updates, prepared_disputes) = {
             let mut prepared = None;
             for attempt in 0..=self.llm_retry_count {
                 match self
-                    .internalize_and_prepare_once(generator, kind, request.clone(), &local_by_id)
+                    .internalize_and_prepare_once(
+                        generator,
+                        kind,
+                        request.clone(),
+                        &local_by_id,
+                        preferred_transport,
+                    )
                     .await
                 {
                     Ok(value) => {
                         prepared = Some(value);
                         break;
                     }
-                    Err(e) if attempt < self.llm_retry_count => {
-                        log::warn!(
-                            target: "agent",
-                            "agent {} internalize_inbox 输出未通过协议校验，重试 ({}/{}): {e:#}",
-                            self.agent_id,
-                            attempt + 1,
-                            self.llm_retry_count
-                        );
+                    Err(e)
+                        if crate::api::structured_json_business_retryable(&e)
+                            && attempt < self.llm_retry_count =>
+                    {
+                        if let Some(transport) =
+                            crate::api::structured_json_no_consumable_transport(&e)
+                        {
+                            preferred_transport = Some(transport);
+                            log::warn!(
+                                target: "agent",
+                                "agent {} internalize_inbox 没有可消费输出，使用相同 transport 原样重试 ({}/{}): transport={}; {e:#}",
+                                self.agent_id,
+                                attempt + 1,
+                                self.llm_retry_count,
+                                transport
+                            );
+                        } else {
+                            log::warn!(
+                                target: "agent",
+                                "agent {} internalize_inbox 输出未通过协议校验，重试 ({}/{}): {e:#}",
+                                self.agent_id,
+                                attempt + 1,
+                                self.llm_retry_count
+                            );
+                        }
                         last_err = Some(e);
                     }
                     Err(e) => return Err(e),
@@ -634,7 +667,8 @@ impl AgentRunner {
         kind: InboxInternalizeKind,
         request: InternalizeRequest,
         local_by_id: &FxHashMap<ClaimId, Claim>,
-    ) -> anyhow::Result<(DateTime<Utc>, Vec<Claim>, Vec<Claim>, Vec<Dispute>)> {
+        preferred_transport: Option<ProviderTransport>,
+    ) -> anyhow::Result<PreparedInternalization> {
         let mut allowed_policy_ids = inbox_policy_ids(&request.inbox_messages)
             .into_iter()
             .collect::<FxHashSet<_>>();
@@ -657,12 +691,31 @@ impl AgentRunner {
         }
         // Dispute 仍只能指向当前本地 claim 或本批新 claim；这里只扩展 ClaimDraft 的
         // source_claim_ids 白名单，不把仅作为历史来源可见的 claim 升格为 dispute 对象。
-        let mut allowed_dispute_claim_ids: FxHashSet<ClaimId> = request
+        let allowed_dispute_claim_ids: FxHashSet<ClaimId> = request
             .local_claims
             .iter()
             .map(|claim| claim.id.clone())
             .collect();
-        let raw = generator.generate_json(kind, request).await?;
+        let raw = generator
+            .generate_json(kind, request, preferred_transport)
+            .await?;
+        self.prepare_internalized_output(
+            raw,
+            local_by_id,
+            allowed_policy_ids,
+            allowed_source_claim_ids,
+            allowed_dispute_claim_ids,
+        )
+    }
+
+    fn prepare_internalized_output(
+        &self,
+        raw: serde_json::Value,
+        local_by_id: &FxHashMap<ClaimId, Claim>,
+        allowed_policy_ids: FxHashSet<PolicyId>,
+        mut allowed_source_claim_ids: FxHashSet<ClaimId>,
+        mut allowed_dispute_claim_ids: FxHashSet<ClaimId>,
+    ) -> anyhow::Result<PreparedInternalization> {
         let now = Utc::now();
         let resolved = resolve_placeholders(raw, now)?;
         let outcome: InternalizeOutcome = serde_json::from_value(resolved).map_err(|e| {
@@ -781,6 +834,7 @@ fn push_upload_warning(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -832,9 +886,37 @@ mod tests {
             &self,
             kind: InboxInternalizeKind,
             _request: InternalizeRequest,
+            _preferred_transport: Option<ProviderTransport>,
         ) -> anyhow::Result<Value> {
             assert_eq!(kind, self.expected_kind);
             Ok(self.response.clone())
+        }
+    }
+
+    struct RetryRecordingInboxGenerator {
+        responses: Mutex<VecDeque<anyhow::Result<Value>>>,
+        requests: Mutex<Vec<InternalizeRequest>>,
+        preferred_transports: Mutex<Vec<Option<ProviderTransport>>>,
+    }
+
+    #[async_trait]
+    impl InboxJsonGenerator for RetryRecordingInboxGenerator {
+        async fn generate_json(
+            &self,
+            _kind: InboxInternalizeKind,
+            request: InternalizeRequest,
+            preferred_transport: Option<ProviderTransport>,
+        ) -> anyhow::Result<Value> {
+            self.requests.lock().unwrap().push(request);
+            self.preferred_transports
+                .lock()
+                .unwrap()
+                .push(preferred_transport);
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("missing fake inbox response"))?
         }
     }
 
@@ -1077,6 +1159,111 @@ mod tests {
                 "new_disputes": [],
             }),
         })
+    }
+
+    #[tokio::test]
+    async fn business_retry_resends_unchanged_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_home = dir.path().to_path_buf();
+        let inbox = Arc::new(LocalFsInboxReader::new(agent_home.clone()));
+        let message = receipt_test_message(PolicyStatus::Active);
+        inbox.accept_pulled(&message).await.unwrap();
+        let generator = Arc::new(RetryRecordingInboxGenerator {
+            responses: Mutex::new(VecDeque::from([
+                Ok(json!({
+                    "new_claims": [{"id":"$new_claim_0$"}],
+                    "updated_claims": [],
+                    "new_disputes": [],
+                })),
+                Ok(json!({
+                    "new_claims": [],
+                    "updated_claims": [],
+                    "new_disputes": [],
+                })),
+            ])),
+            requests: Mutex::new(Vec::new()),
+            preferred_transports: Mutex::new(Vec::new()),
+        });
+        let runner = AgentRunner::new(
+            AgentId::new("agent-a").unwrap(),
+            generator.clone(),
+            Arc::new(LocalFsClaimStore::new(agent_home.clone())),
+            Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home.clone())),
+            inbox,
+            Arc::new(LocalFsMemoryStore::new(
+                agent_home.clone(),
+                1600,
+                1000,
+                false,
+            )),
+            Arc::new(EmptyRouterClient),
+            Arc::new(NoopMaintainerClient),
+            Arc::new(LocalFsMaintainerUploadQueue::new(agent_home)),
+            1,
+            Vec::<SkillSummary>::new(),
+        );
+
+        let report = runner.process_inbox_with(generator.as_ref()).await.unwrap();
+
+        assert_eq!(report.policy_count, 1);
+        let requests = generator.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        assert_eq!(
+            generator.preferred_transports.lock().unwrap().as_slice(),
+            &[None, None]
+        );
+    }
+
+    #[tokio::test]
+    async fn no_consumable_inbox_retry_preserves_actual_transport() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_home = dir.path().to_path_buf();
+        let inbox = Arc::new(LocalFsInboxReader::new(agent_home.clone()));
+        let message = receipt_test_message(PolicyStatus::Active);
+        inbox.accept_pulled(&message).await.unwrap();
+        let generator = Arc::new(RetryRecordingInboxGenerator {
+            responses: Mutex::new(VecDeque::from([
+                Err(crate::api::StructuredJsonNoConsumableOutput::new(
+                    "Responses 响应没有可消费的 output_text 或 function_call".into(),
+                    ProviderTransport::ResponsesNonStreaming,
+                )
+                .into()),
+                Ok(json!({
+                    "new_claims": [],
+                    "updated_claims": [],
+                    "new_disputes": [],
+                })),
+            ])),
+            requests: Mutex::new(Vec::new()),
+            preferred_transports: Mutex::new(Vec::new()),
+        });
+        let runner = AgentRunner::new(
+            AgentId::new("agent-a").unwrap(),
+            generator.clone(),
+            Arc::new(LocalFsClaimStore::new(agent_home.clone())),
+            Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home.clone())),
+            inbox,
+            Arc::new(LocalFsMemoryStore::new(
+                agent_home.clone(),
+                1600,
+                1000,
+                false,
+            )),
+            Arc::new(EmptyRouterClient),
+            Arc::new(NoopMaintainerClient),
+            Arc::new(LocalFsMaintainerUploadQueue::new(agent_home)),
+            1,
+            Vec::<SkillSummary>::new(),
+        );
+
+        let report = runner.process_inbox_with(generator.as_ref()).await.unwrap();
+
+        assert_eq!(report.policy_count, 1);
+        assert_eq!(
+            generator.preferred_transports.lock().unwrap().as_slice(),
+            &[None, Some(ProviderTransport::ResponsesNonStreaming)]
+        );
     }
 
     async fn assert_invalid_inbox_output_has_no_side_effects(
@@ -1566,6 +1753,7 @@ mod tests {
                 InboxInternalizeKind::ClaimAttributeUpdate,
                 request,
                 &local_by_id,
+                None,
             )
             .await
             .unwrap();

@@ -1169,7 +1169,7 @@ fn slash_command_states_do_not_display_micro_tetris_board() {
     });
     state.apply_event(SessionEvent::InboxStarted);
     let inbox_lines = super::inline_live_lines_with_width(&state, 80);
-    assert!(lines_text(&inbox_lines).contains("Inbox · Syncing updates"));
+    assert!(lines_text(&inbox_lines).contains("Inbox · Syncing updates · 0s"));
     assert!(!micro_tetris_has_cell(&inbox_lines));
 
     state.apply_event(SessionEvent::SessionStarted {
@@ -1182,7 +1182,7 @@ fn slash_command_states_do_not_display_micro_tetris_board() {
     state.apply_event(SessionEvent::FinalizeStarted);
     let finalize_lines = super::inline_live_lines_with_width(&state, 80);
     let finalize_text = lines_text(&finalize_lines);
-    assert!(finalize_text.contains("Finalizing · Committing contribution"));
+    assert!(finalize_text.contains("Finalizing · Committing contribution · 0s"));
     assert!(finalize_text.contains("finalizing session_1234abcd..."));
     assert!(!micro_tetris_has_cell(&finalize_lines));
 }
@@ -2646,7 +2646,7 @@ fn inbox_events_render_status_summary() {
         .any(|line| line.to_string().contains("syncing inbox")));
     assert!(super::inline_live_lines_with_width(&state, 80)
         .iter()
-        .any(|line| line.to_string().contains("Inbox · Syncing updates")));
+        .any(|line| line.to_string().contains("Inbox · Syncing updates · 0s")));
 
     state.apply_event(SessionEvent::InboxCompleted {
         processed: 2,
@@ -2701,7 +2701,9 @@ fn compaction_progress_is_visible() {
     assert_eq!(state.status_label(), "compacting");
     assert!(super::inline_live_lines_with_width(&state, 80)
         .iter()
-        .any(|line| line.to_string().contains("Compacting · Session history")));
+        .any(|line| line
+            .to_string()
+            .contains("Compacting · Session history · 0s")));
     let compacting_text = super::inline_live_lines_with_width(&state, 80)
         .into_iter()
         .map(|line| line.to_string())
@@ -3908,23 +3910,23 @@ fn configured_visual_row_limit_applies_to_every_live_box_status() {
     let cases = [
         (
             SessionRuntimeStatus::Initializing,
-            "Initializing · Syncing inbox",
+            "Initializing · Syncing inbox · 0s",
         ),
         (
             SessionRuntimeStatus::Running,
-            "Working · Streaming response",
+            "Working · Streaming response · 0s",
         ),
         (
             SessionRuntimeStatus::SyncingInbox,
-            "Inbox · Syncing updates",
+            "Inbox · Syncing updates · 0s",
         ),
         (
             SessionRuntimeStatus::Compacting,
-            "Compacting · Session history",
+            "Compacting · Session history · 0s",
         ),
         (
             SessionRuntimeStatus::Finalizing,
-            "Finalizing · Committing contribution",
+            "Finalizing · Committing contribution · 0s",
         ),
         (SessionRuntimeStatus::Open, "Idle"),
         (SessionRuntimeStatus::Error, "Attention · Last turn failed"),

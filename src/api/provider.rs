@@ -7,7 +7,8 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -130,6 +131,91 @@ impl Default for ProviderRuntimeChainId {
     }
 }
 
+#[derive(Debug)]
+struct ProviderFallbackState {
+    id: u64,
+    websocket_sticky: AtomicBool,
+}
+
+impl ProviderFallbackState {
+    fn new() -> Arc<Self> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        Arc::new(Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            websocket_sticky: AtomicBool::new(false),
+        })
+    }
+}
+
+/// 当前进程内的 WebSocket 降级作用域。
+///
+/// session root 只由 Inbox 使用；主 Agent 与各 Subagent 持有独立 local state，
+/// 同时动态观察同一个 root。该状态不持久化，resume 会重新创建。
+#[derive(Debug, Clone)]
+pub struct ProviderRuntimeFallbackScope {
+    local: Arc<ProviderFallbackState>,
+    inherited_root: Option<Arc<ProviderFallbackState>>,
+}
+
+impl ProviderRuntimeFallbackScope {
+    pub fn new_root() -> Self {
+        Self {
+            local: ProviderFallbackState::new(),
+            inherited_root: None,
+        }
+    }
+
+    /// 创建只继承 session root、但不继承当前 local sticky 的 actor scope。
+    pub fn new_child(&self) -> Self {
+        let root = self
+            .inherited_root
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| Arc::clone(&self.local));
+        Self {
+            local: ProviderFallbackState::new(),
+            inherited_root: Some(root),
+        }
+    }
+
+    pub(crate) fn websocket_sticky(&self) -> bool {
+        self.local.websocket_sticky.load(Ordering::Acquire)
+            || self
+                .inherited_root
+                .as_ref()
+                .is_some_and(|root| root.websocket_sticky.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn mark_websocket_sticky(&self) {
+        self.local.websocket_sticky.store(true, Ordering::Release);
+    }
+}
+
+impl Default for ProviderRuntimeFallbackScope {
+    fn default() -> Self {
+        Self::new_root()
+    }
+}
+
+impl PartialEq for ProviderRuntimeFallbackScope {
+    fn eq(&self, other: &Self) -> bool {
+        self.local.id == other.local.id
+            && self.inherited_root.as_ref().map(|state| state.id)
+                == other.inherited_root.as_ref().map(|state| state.id)
+    }
+}
+
+impl Eq for ProviderRuntimeFallbackScope {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProviderStreamOutputMode {
+    /// 增量事件已经对前台可见，收到 partial 后不能从头重放同一 transport。
+    #[default]
+    Live,
+    /// 调用方只在完整终态后消费结果，partial 可以丢弃并安全重放。
+    Buffered,
+}
+
 /// steer/cancel 之后阻止尚未开始的 provider 恢复动作，但不打断当前 request。
 ///
 /// 独立 ID 仅用于保持 `ProviderRequest` 的可比较性；实际通知由 clone 共享的
@@ -177,8 +263,12 @@ pub struct ProviderRequest {
     pub tools: Vec<ToolSpec>,
     pub max_tokens: u32,
     pub stream: bool,
+    /// streaming delta 是直接可见还是只在内部缓冲。
+    pub stream_output_mode: ProviderStreamOutputMode,
     /// streaming transport 的进程内 chain 身份；非流式内部调用保持 `None`。
     pub runtime_chain_id: Option<ProviderRuntimeChainId>,
+    /// WebSocket sticky 的运行期作用域，与 continuation chain 相互独立。
+    pub runtime_fallback_scope: Option<ProviderRuntimeFallbackScope>,
     /// 只阻止尚未开始的 retry、continuation 与 fallback；不能取消当前正常 request。
     pub recovery_interrupt: Option<ProviderRecoveryInterrupt>,
     /// 覆盖 adapter 内部的额外 HTTP retry 次数；`None` 使用 provider 配置。
@@ -262,21 +352,82 @@ impl ProviderStreamFailure {
     }
 }
 
+/// Provider 实际完成一次请求时使用的 transport。
+///
+/// 该信息只用于内部重试选择和日志诊断，不进入用户可见错误。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderTransport {
+    ResponsesWebSocket,
+    ResponsesSse,
+    ResponsesNonStreaming,
+    ChatSse,
+    ChatNonStreaming,
+    AnthropicSse,
+    AnthropicNonStreaming,
+}
+
+impl ProviderTransport {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResponsesWebSocket => "responses_websocket",
+            Self::ResponsesSse => "responses_sse",
+            Self::ResponsesNonStreaming => "responses_non_streaming",
+            Self::ChatSse => "chat_sse",
+            Self::ChatNonStreaming => "chat_non_streaming",
+            Self::AnthropicSse => "anthropic_sse",
+            Self::AnthropicNonStreaming => "anthropic_non_streaming",
+        }
+    }
+
+    pub(crate) const fn is_streaming(self) -> bool {
+        !matches!(
+            self,
+            Self::ResponsesNonStreaming | Self::ChatNonStreaming | Self::AnthropicNonStreaming
+        )
+    }
+
+    pub(crate) fn retry_fallback_scope(
+        self,
+        base: &ProviderRuntimeFallbackScope,
+    ) -> ProviderRuntimeFallbackScope {
+        if self == Self::ResponsesSse {
+            let scope = base.new_child();
+            scope.mark_websocket_sticky();
+            scope
+        } else {
+            base.clone()
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Provider 正常结束，但没有 ACN 可以提交的非空文本或完整工具调用。
 ///
-/// 该结果没有产生 provider replay 或工具副作用，允许直接切换 non-streaming 重试；
-/// 显式拒绝、token limit 和上下文窗口恢复不能映射为此类型。
+/// 该结果没有产生可提交的 provider replay 或工具副作用。内部任务会清除本次
+/// continuation，并使用独立业务预算在相同实际 transport 上原样重试；显式拒绝、
+/// token limit 和上下文窗口恢复不能映射为此类型。
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub(crate) struct ProviderNoConsumableOutput {
+    transport: ProviderTransport,
     message: String,
 }
 
 impl ProviderNoConsumableOutput {
-    pub(crate) fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(transport: ProviderTransport, message: impl Into<String>) -> Self {
         Self {
+            transport,
             message: message.into(),
         }
+    }
+
+    pub(crate) const fn transport(&self) -> ProviderTransport {
+        self.transport
     }
 }
 
@@ -443,5 +594,22 @@ mod tests {
 
         let error = assistant_text_from_message(&message).unwrap_err();
         assert!(error.to_string().contains("ModelContext"));
+    }
+
+    #[test]
+    fn fallback_scope_inherits_only_session_root() {
+        let root = ProviderRuntimeFallbackScope::new_root();
+        let main = root.new_child();
+        let subagent = main.new_child();
+
+        main.mark_websocket_sticky();
+        assert!(main.websocket_sticky());
+        assert!(!root.websocket_sticky());
+        assert!(!subagent.websocket_sticky());
+
+        root.mark_websocket_sticky();
+        assert!(main.websocket_sticky());
+        assert!(subagent.websocket_sticky());
+        assert!(root.new_child().websocket_sticky());
     }
 }

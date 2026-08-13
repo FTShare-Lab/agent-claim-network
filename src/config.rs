@@ -639,6 +639,8 @@ pub enum RerankProvider {
     OpenAiChat,
     #[serde(rename = "openai_responses", alias = "openai_compatible_responses")]
     OpenAiResponses,
+    #[serde(rename = "anthropic")]
+    Anthropic,
 }
 
 fn default_rerank_provider() -> RerankProvider {
@@ -3270,6 +3272,7 @@ router_endpoint = "http://127.0.0.1:8061"
         for (raw, expected, canonical) in [
             ("heuristic", RerankProvider::Heuristic, "heuristic"),
             ("openai_chat", RerankProvider::OpenAiChat, "openai_chat"),
+            ("anthropic", RerankProvider::Anthropic, "anthropic"),
             (
                 "openai_responses",
                 RerankProvider::OpenAiResponses,

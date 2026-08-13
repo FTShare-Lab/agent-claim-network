@@ -19,7 +19,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::api::{
     CompletedSessionTurnMessage, ModelContextSource, ProviderReplayIdentity, ProviderReplayState,
-    ProviderRuntimeChainId, SessionTurnContentBlock, SessionTurnMessage,
+    ProviderRuntimeChainId, ProviderRuntimeFallbackScope, SessionTurnContentBlock,
+    SessionTurnMessage,
 };
 use crate::claim::{AgentId, Claim, ClaimId, Dispute, DisputeId, SessionId, TraceId};
 use crate::skill::SkillInstructions;
@@ -1399,19 +1400,51 @@ pub struct SessionHandle {
     pub metadata: SessionMetadata,
     pub paths: SessionPaths,
     runtime_chain_id: ProviderRuntimeChainId,
+    inbox_fallback_scope: ProviderRuntimeFallbackScope,
+    runtime_fallback_scope: ProviderRuntimeFallbackScope,
 }
 
 impl SessionHandle {
     fn new(metadata: SessionMetadata, paths: SessionPaths) -> Self {
+        let inbox_fallback_scope = ProviderRuntimeFallbackScope::new_root();
+        let runtime_fallback_scope = inbox_fallback_scope.new_child();
         Self {
             metadata,
             paths,
             runtime_chain_id: ProviderRuntimeChainId::new(),
+            inbox_fallback_scope,
+            runtime_fallback_scope,
         }
     }
 
     pub(crate) fn runtime_chain_id(&self) -> ProviderRuntimeChainId {
         self.runtime_chain_id
+    }
+
+    pub(crate) fn inbox_fallback_scope(&self) -> ProviderRuntimeFallbackScope {
+        self.inbox_fallback_scope.clone()
+    }
+
+    /// Inbox 自身写 session root；若 Main 已经确认 WS 不可用，后续 Inbox 也跳过 WS，
+    /// 并把这个运行期结论提升到 root，供当前与未来 Subagent 共同观察。
+    pub(crate) fn inbox_fallback_scope_for_request(&self) -> ProviderRuntimeFallbackScope {
+        let inbox_scope = self.inbox_fallback_scope();
+        if self.runtime_fallback_scope.websocket_sticky() {
+            inbox_scope.mark_websocket_sticky();
+        }
+        inbox_scope
+    }
+
+    pub(crate) fn runtime_fallback_scope(&self) -> ProviderRuntimeFallbackScope {
+        self.runtime_fallback_scope.clone()
+    }
+
+    pub(crate) fn replace_runtime_fallback_root(
+        &mut self,
+        inbox_fallback_scope: ProviderRuntimeFallbackScope,
+    ) {
+        self.runtime_fallback_scope = inbox_fallback_scope.new_child();
+        self.inbox_fallback_scope = inbox_fallback_scope;
     }
 
     async fn lock_session(&self) -> Result<FileLockGuard, SessionStoreError> {
@@ -2954,6 +2987,48 @@ frontier:
         let resumed = store.open_existing_session(&agent, &id).await.unwrap();
 
         assert_ne!(resumed.runtime_chain_id(), original_chain);
+    }
+
+    #[tokio::test]
+    async fn session_inbox_sticky_is_shared_but_actor_local_sticky_is_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let agent = agent_id("agent-a");
+        let id = session_id("session_aaaaaaaa");
+        let handle = create_session(&store, &agent, id, Utc::now(), &[], false).await;
+        let inbox = handle.inbox_fallback_scope();
+        let main = handle.runtime_fallback_scope();
+        let subagent = inbox.new_child();
+
+        main.mark_websocket_sticky();
+        assert!(main.websocket_sticky());
+        assert!(!subagent.websocket_sticky());
+
+        inbox.mark_websocket_sticky();
+        assert!(main.websocket_sticky());
+        assert!(subagent.websocket_sticky());
+    }
+
+    #[tokio::test]
+    async fn later_inbox_promotes_main_sticky_to_session_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let agent = agent_id("agent-a");
+        let id = session_id("session_aaaaaaaa");
+        let handle = create_session(&store, &agent, id, Utc::now(), &[], false).await;
+        let inbox = handle.inbox_fallback_scope();
+        let main = handle.runtime_fallback_scope();
+        let subagent = inbox.new_child();
+
+        main.mark_websocket_sticky();
+        assert!(!inbox.websocket_sticky());
+        assert!(!subagent.websocket_sticky());
+
+        let request_scope = handle.inbox_fallback_scope_for_request();
+
+        assert!(request_scope.websocket_sticky());
+        assert!(inbox.websocket_sticky());
+        assert!(subagent.websocket_sticky());
     }
 
     #[tokio::test]

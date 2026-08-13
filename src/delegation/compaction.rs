@@ -20,9 +20,9 @@ use crate::api::{
     project_turn_message_for_safe_transcript, project_turn_message_tool_results,
     project_turn_messages_tool_results, provider_anchor_end_index, provider_safe_segments,
     trailing_model_context_segments, ContextUsageSnapshot, ContextUsageSource,
-    ProviderProjectionBudget, SessionTurnContentBlock, SessionTurnEvent, SessionTurnMessage,
-    SessionTurnPreflight, StructuredJsonAttemptRequest, StructuredJsonCaller, ToolSpec,
-    FILE_EDIT_AUTHORITY_COMPACTION_NOTICE,
+    ProviderProjectionBudget, ProviderRuntimeFallbackScope, SessionTurnContentBlock,
+    SessionTurnEvent, SessionTurnMessage, SessionTurnPreflight, StructuredJsonAttemptRequest,
+    StructuredJsonCaller, ToolSpec, FILE_EDIT_AUTHORITY_COMPACTION_NOTICE,
 };
 use crate::config::SessionCompactionConfig;
 use crate::prompt::PromptRegistry;
@@ -53,6 +53,7 @@ pub struct DelegationPreflightCompactor {
     tool_specs: Vec<ToolSpec>,
     compaction: SessionCompactionConfig,
     context_window: usize,
+    runtime_fallback_scope: ProviderRuntimeFallbackScope,
     provider_context_anchor: Option<ProviderContextUsageAnchor>,
     compacted_since_last_check: bool,
     context_window_recovery_requested: bool,
@@ -60,6 +61,10 @@ pub struct DelegationPreflightCompactor {
 }
 
 impl DelegationPreflightCompactor {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "subagent compactor 需绑定持久化、预算、provider 与 fallback scope"
+    )]
     pub fn new(
         metadata: DelegationMetadata,
         progress: DelegationProgressSink,
@@ -68,6 +73,7 @@ impl DelegationPreflightCompactor {
         tool_specs: Vec<ToolSpec>,
         compaction: SessionCompactionConfig,
         context_window: usize,
+        runtime_fallback_scope: ProviderRuntimeFallbackScope,
     ) -> Self {
         Self {
             metadata,
@@ -77,6 +83,7 @@ impl DelegationPreflightCompactor {
             tool_specs,
             compaction,
             context_window,
+            runtime_fallback_scope,
             provider_context_anchor: None,
             compacted_since_last_check: false,
             context_window_recovery_requested: false,
@@ -617,7 +624,11 @@ impl DelegationPreflightCompactor {
         let value = self
             .json_caller
             .generate_json_validated_with_guarded_attempts(
-                StructuredJsonAttemptRequest::compaction(system_prompt, provider_messages),
+                StructuredJsonAttemptRequest::compaction_streaming(
+                    system_prompt,
+                    provider_messages,
+                    crate::api::BufferedProviderRuntime::new(self.runtime_fallback_scope.clone()),
+                ),
                 |value| parse_summary(value, self.compaction.summary_max_chars),
                 |_, _, _| {},
                 |_| std::future::ready(()),
@@ -1055,6 +1066,7 @@ mod tests {
             Vec::new(),
             config,
             context_window,
+            ProviderRuntimeFallbackScope::new_root().new_child(),
         )
     }
 
@@ -1609,7 +1621,12 @@ mod tests {
         assert_eq!(summary, "bounded summary");
         let requests = provider.requests().await;
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].retry_count_override, Some(0));
+        assert_eq!(requests[0].retry_count_override, None);
+        assert!(requests[0].stream);
+        assert_eq!(
+            requests[0].stream_output_mode,
+            crate::api::ProviderStreamOutputMode::Buffered
+        );
         let payload = message_text(&requests[0].messages);
         assert!(payload.contains("tool_result omitted from compaction summary input"));
         assert!(!payload.contains("RAW_DELEGATION_SUMMARY"));

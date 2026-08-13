@@ -382,6 +382,7 @@ impl DelegationToolHost {
 pub struct ToolRegistry {
     workspace_root: PathBuf,
     http: reqwest::Client,
+    direct_http: reqwest::Client,
     notes: Arc<Mutex<Vec<String>>>,
     web_search_endpoint: String,
     web_search_api_key_env: String,

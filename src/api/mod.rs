@@ -8,6 +8,7 @@
 //! 具体实现切换在 `bootstrap` 阶段完成（取决于 config 里的 `[agent.llm].provider`）。
 
 mod anthropic;
+mod buffered_provider;
 mod chat_completions;
 mod compaction_projection;
 mod continuation;
@@ -107,6 +108,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 }
 
 pub use anthropic::{AnthropicError, AnthropicProviderAdapter};
+pub(crate) use buffered_provider::{send_buffered_with_fallback, BufferedProviderRuntime};
 pub use chat_completions::{
     ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
     ChatCompletionsClient, ChatCompletionsError, ChatContentPart, ChatFileData, ChatFinishReason,
@@ -140,19 +142,26 @@ pub use openai_compatible_responses::{
     OpenAiCompatibleResponsesError, OpenAiCompatibleResponsesProviderAdapter,
 };
 pub use placeholder::{resolve_placeholders, PlaceholderError};
+pub(crate) use provider::ProviderTransport;
 pub use provider::{
     assistant_text_from_message, context_usage_from_anthropic_committed_usage,
     context_usage_from_anthropic_input_usage, context_usage_from_openai_usage,
     ContextUsageSnapshot, ContextUsageSource, ProviderAdapter, ProviderEvent,
     ProviderHistoryMediaPolicy, ProviderRecoveryInterrupt, ProviderReplayIdentity,
     ProviderReplayProtocol, ProviderRequest, ProviderRequestObserver, ProviderResponse,
-    ProviderRuntimeChainId, ProviderStop, ToolSpec,
+    ProviderRuntimeChainId, ProviderRuntimeFallbackScope, ProviderStop, ProviderStreamOutputMode,
+    ToolSpec,
 };
 pub use responses::{
     ReducedResponses, ResponsesClient, ResponsesError, ResponsesFunctionCall, ResponsesReasoning,
     ResponsesRequest, ResponsesStreamEvent, ResponsesTerminal, ResponsesTool,
 };
-pub(crate) use structured_json::StructuredJsonAttemptRequest;
+#[cfg(test)]
+pub(crate) use structured_json::StructuredJsonNoConsumableOutput;
+pub(crate) use structured_json::{
+    structured_json_business_retryable, structured_json_no_consumable_transport,
+    StructuredJsonAttemptRequest,
+};
 pub use structured_json::{StructuredJsonAttemptReport, StructuredJsonCaller};
 pub use token_estimate::{
     estimate_json_tokens, estimate_provider_replay_tokens,
