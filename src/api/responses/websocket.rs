@@ -18,7 +18,7 @@ use super::protocol::{ReducedResponses, ResponsesRequest};
 use super::streaming::ResponsesEventDecoder;
 use super::{redact_responses_error_body, ResponsesError, ResponsesStreamEvent};
 use crate::api::llm_http::read_llm_error_body;
-use crate::api::{ProviderRecoveryInterrupt, ProviderRuntimeChainId};
+use crate::api::{ProviderRecoveryInterrupt, ProviderRuntimeChainId, ProviderRuntimeFallbackScope};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CONNECTION_AGE: Duration = Duration::from_secs(55 * 60);
@@ -45,7 +45,7 @@ impl ResponsesWebSocketTransport {
         request_timeout: Duration,
     ) -> Result<Self, ResponsesError> {
         let endpoint = websocket_endpoint(http_endpoint)?;
-        let builder = crate::http_client_builder()
+        let builder = crate::http_client_builder_for_endpoint(http_endpoint)
             // 当前 WebSocket 实现使用 HTTP/1.1 Upgrade，不支持 HTTP/2 Extended CONNECT。
             .http1_only()
             // Upgrade 必须由配置的 endpoint 直接完成，避免重定向掩盖网关或路径配置错误。
@@ -68,6 +68,7 @@ impl ResponsesWebSocketTransport {
         self.pool.clear_chain(chain_id).await;
     }
 
+    #[cfg(test)]
     #[allow(
         clippy::too_many_arguments,
         reason = "WebSocket retry 需显式携带 chain、退避、steer 恢复边界与事件 sink"
@@ -82,8 +83,38 @@ impl ResponsesWebSocketTransport {
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
     ) -> Result<WebSocketSendOutcome, ResponsesError> {
+        self.send_with_retry_count_for_scope(
+            request,
+            chain_id,
+            None,
+            retry_count,
+            retry_base_delay,
+            retry_max_delay,
+            recovery_interrupt,
+            false,
+            emit,
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "WebSocket retry 需显式携带 fallback scope 与缓冲语义"
+    )]
+    pub(super) async fn send_with_retry_count_for_scope(
+        &self,
+        request: &ResponsesRequest,
+        chain_id: ProviderRuntimeChainId,
+        fallback_scope: Option<&ProviderRuntimeFallbackScope>,
+        retry_count: u32,
+        retry_base_delay: Duration,
+        retry_max_delay: Duration,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+        retry_after_partial: bool,
+        emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
+    ) -> Result<WebSocketSendOutcome, ResponsesError> {
         ensure_recovery_active(recovery_interrupt)?;
-        if self.pool.is_sticky(chain_id).await {
+        if self.websocket_sticky(chain_id, fallback_scope).await {
             return Ok(WebSocketSendOutcome::FallbackToHttp);
         }
         let snapshot = RequestSnapshot::new(request)?;
@@ -94,9 +125,16 @@ impl ResponsesWebSocketTransport {
         loop {
             ensure_recovery_active(recovery_interrupt)?;
             let attempt_started = Instant::now();
+            let waiting_for_pool = AtomicBool::new(false);
             let acquire = tokio::time::timeout(
                 self.request_timeout,
-                self.acquire_connection(chain_id, &snapshot, force_full_history),
+                self.acquire_connection(
+                    chain_id,
+                    fallback_scope,
+                    &snapshot,
+                    force_full_history,
+                    &waiting_for_pool,
+                ),
             );
             tokio::pin!(acquire);
             let acquired_result = match recovery_interrupt {
@@ -113,6 +151,9 @@ impl ResponsesWebSocketTransport {
             };
             let acquired = match acquired_result {
                 Ok(acquired) => acquired,
+                Err(_) if waiting_for_pool.load(Ordering::Acquire) => Err(
+                    ConnectFailure::PoolTimeout("Responses WebSocket 连接池等待超时".into()),
+                ),
                 Err(_) => Err(ConnectFailure::Retryable(
                     "Responses WebSocket request 在响应开始前超时".into(),
                 )),
@@ -122,7 +163,10 @@ impl ResponsesWebSocketTransport {
                 Ok(Some(acquired)) => acquired,
                 Ok(None) => return Ok(WebSocketSendOutcome::FallbackToHttp),
                 Err(ConnectFailure::ImmediateDowngrade) => {
-                    self.pool.mark_sticky(chain_id).await;
+                    self.mark_websocket_sticky(chain_id, fallback_scope).await;
+                    return Ok(WebSocketSendOutcome::FallbackToHttp);
+                }
+                Err(ConnectFailure::PoolTimeout(_)) => {
                     return Ok(WebSocketSendOutcome::FallbackToHttp);
                 }
                 Err(ConnectFailure::Deterministic(error)) => return Err(error),
@@ -140,8 +184,28 @@ impl ResponsesWebSocketTransport {
                     force_full_history = true;
                     continue;
                 }
+                Err(ConnectFailure::TransientStatus(error)) if attempt < retry_count => {
+                    wait_before_retry(
+                        attempt,
+                        retry_count,
+                        retry_base_delay,
+                        retry_max_delay,
+                        &error,
+                        recovery_interrupt,
+                    )
+                    .await?;
+                    attempt = attempt.saturating_add(1);
+                    force_full_history = true;
+                    continue;
+                }
                 Err(ConnectFailure::Retryable(_)) => {
-                    self.pool.mark_sticky(chain_id).await;
+                    self.mark_websocket_sticky(chain_id, fallback_scope).await;
+                    return Ok(WebSocketSendOutcome::FallbackToHttp);
+                }
+                Err(ConnectFailure::TransientStatus(_)) => {
+                    // 429/5xx 只说明当前握手暂时失败，不能据此断定这个 endpoint
+                    // 在后续请求中不支持 WebSocket。
+                    self.pool.clear_chain(chain_id).await;
                     return Ok(WebSocketSendOutcome::FallbackToHttp);
                 }
             };
@@ -220,11 +284,13 @@ impl ResponsesWebSocketTransport {
                     self.pool.clear_chain(chain_id).await;
                     return Ok(WebSocketSendOutcome::FallbackToHttp);
                 }
-                Err(WebSocketRequestFailure::Response(error)) if emitted_visible_text => {
+                Err(WebSocketRequestFailure::Response(error))
+                    if emitted_visible_text && !retry_after_partial =>
+                {
                     if websocket_error_triggers_sticky_downgrade(&error) {
                         // 当前 response 已经向 TUI 发出 partial，不再从头执行 WS/SSE，
                         // 但连接损坏仍表示这条 runtime chain 后续应直接使用 HTTP。
-                        self.pool.mark_sticky(chain_id).await;
+                        self.mark_websocket_sticky(chain_id, fallback_scope).await;
                     } else {
                         // 429/5xx 与确定性 response 错误只使本次 continuation 失效；
                         // 它们不能被误判成 endpoint 的 WebSocket transport 不可用。
@@ -251,7 +317,7 @@ impl ResponsesWebSocketTransport {
                     if websocket_error_is_retryable(&error) =>
                 {
                     if websocket_error_triggers_sticky_downgrade(&error) {
-                        self.pool.mark_sticky(chain_id).await;
+                        self.mark_websocket_sticky(chain_id, fallback_scope).await;
                     } else {
                         // 429/5xx 是当前 response 的暂态状态，不代表 endpoint 的
                         // WebSocket transport 不可用；只废弃本次 continuation。
@@ -270,11 +336,13 @@ impl ResponsesWebSocketTransport {
     async fn acquire_connection(
         &self,
         chain_id: ProviderRuntimeChainId,
+        fallback_scope: Option<&ProviderRuntimeFallbackScope>,
         snapshot: &RequestSnapshot,
         force_full_history: bool,
+        waiting_for_pool: &AtomicBool,
     ) -> Result<Option<(WebSocketConnection, RequestSelection)>, ConnectFailure> {
         loop {
-            if self.pool.is_sticky(chain_id).await {
+            if self.websocket_sticky(chain_id, fallback_scope).await {
                 return Ok(None);
             }
             if let Some((connection, selection)) = self
@@ -287,7 +355,7 @@ impl ResponsesWebSocketTransport {
 
             match self.pool.permits.clone().try_acquire_owned() {
                 Ok(permit) => {
-                    if self.pool.is_sticky(chain_id).await {
+                    if self.websocket_sticky(chain_id, fallback_scope).await {
                         drop(permit);
                         return Ok(None);
                     }
@@ -314,14 +382,18 @@ impl ResponsesWebSocketTransport {
             let permit_available = self.pool.permits.clone().acquire_owned();
             tokio::pin!(idle_available);
             tokio::pin!(permit_available);
+            waiting_for_pool.store(true, Ordering::Release);
             tokio::select! {
                 biased;
-                () = &mut idle_available => {}
+                () = &mut idle_available => {
+                    waiting_for_pool.store(false, Ordering::Release);
+                }
                 permit = &mut permit_available => {
+                    waiting_for_pool.store(false, Ordering::Release);
                     let permit = permit.map_err(|_| {
                         ConnectFailure::Retryable("WebSocket connection pool 已关闭".into())
                     })?;
-                    if self.pool.is_sticky(chain_id).await {
+                    if self.websocket_sticky(chain_id, fallback_scope).await {
                         drop(permit);
                         return Ok(None);
                     }
@@ -356,6 +428,12 @@ impl ResponsesWebSocketTransport {
                             redact_responses_error_body(&body),
                         )))
                     }
+                    StatusCode::TOO_MANY_REQUESTS => Err(ConnectFailure::TransientStatus(format!(
+                        "WebSocket handshake 返回 HTTP {status}"
+                    ))),
+                    status if status.is_server_error() => Err(ConnectFailure::TransientStatus(
+                        format!("WebSocket handshake 返回 HTTP {status}"),
+                    )),
                     // 握手发生在 response.create 发送前，400/403 等状态无法证明是
                     // 模型请求参数错误，网关也常用它们拒绝 Upgrade。有限重试后转
                     // HTTP；若确为业务错误，HTTP Responses 会返回权威错误内容。
@@ -374,6 +452,26 @@ impl ResponsesWebSocketTransport {
             .await
             .map_err(|_| ConnectFailure::Retryable("WebSocket connect timeout".into()))??;
         Ok(WebSocketConnection::new(websocket, permit))
+    }
+
+    async fn websocket_sticky(
+        &self,
+        chain_id: ProviderRuntimeChainId,
+        fallback_scope: Option<&ProviderRuntimeFallbackScope>,
+    ) -> bool {
+        fallback_scope.is_some_and(ProviderRuntimeFallbackScope::websocket_sticky)
+            || self.pool.is_sticky(chain_id).await
+    }
+
+    async fn mark_websocket_sticky(
+        &self,
+        chain_id: ProviderRuntimeChainId,
+        fallback_scope: Option<&ProviderRuntimeFallbackScope>,
+    ) {
+        if let Some(scope) = fallback_scope {
+            scope.mark_websocket_sticky();
+        }
+        self.pool.mark_sticky(chain_id).await;
     }
 }
 
@@ -954,7 +1052,9 @@ fn stream_failure(reason: impl Into<String>) -> WebSocketRequestFailure {
 
 enum ConnectFailure {
     ImmediateDowngrade,
+    PoolTimeout(String),
     Retryable(String),
+    TransientStatus(String),
     Deterministic(ResponsesError),
 }
 
@@ -962,7 +1062,9 @@ impl std::fmt::Display for ConnectFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ImmediateDowngrade => f.write_str("WebSocket endpoint 要求其他 Upgrade"),
+            Self::PoolTimeout(message) => f.write_str(message),
             Self::Retryable(message) => f.write_str(message),
+            Self::TransientStatus(message) => f.write_str(message),
             Self::Deterministic(error) => error.fmt(f),
         }
     }
@@ -1779,7 +1881,9 @@ mod tests {
                     tools: Vec::new(),
                     max_tokens: 32,
                     stream: true,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
                     runtime_chain_id: Some(ProviderRuntimeChainId::new()),
+                    runtime_fallback_scope: None,
                     recovery_interrupt: None,
                     retry_count_override: Some(0),
                 },
@@ -1833,7 +1937,9 @@ mod tests {
                     tools: Vec::new(),
                     max_tokens: 32,
                     stream: true,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
                     runtime_chain_id: Some(ProviderRuntimeChainId::new()),
+                    runtime_fallback_scope: None,
                     recovery_interrupt: None,
                     retry_count_override: None,
                 },
@@ -3074,6 +3180,49 @@ mod tests {
                 assert_eq!(response.output_text, "http");
             }
             assert_eq!(state.handshakes.load(Ordering::SeqCst), 2, "{status}");
+            assert_eq!(state.posts.load(Ordering::SeqCst), 2, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_handshake_statuses_retry_without_sticky_downgrade() {
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let (server, state) = start_handshake_server(status).await;
+            let client = super::super::ResponsesClient::new(
+                server.endpoint.clone(),
+                "test-key".into(),
+                Duration::from_secs(2),
+                1,
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .unwrap()
+            .with_websockets(1)
+            .unwrap();
+            let chain = ProviderRuntimeChainId::new();
+            let fallback_scope = ProviderRuntimeFallbackScope::new_root();
+
+            for n in 1..=2 {
+                let response = client
+                    .send_with_retry_count_for_runtime_scope(
+                        &request(vec![json!({"type":"message","n":n})]),
+                        1,
+                        Some(chain),
+                        Some(&fallback_scope),
+                        false,
+                        None,
+                        &mut |_| {},
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.output_text, "http");
+                assert!(!fallback_scope.websocket_sticky(), "{status}");
+            }
+
+            assert_eq!(state.handshakes.load(Ordering::SeqCst), 4, "{status}");
             assert_eq!(state.posts.load(Ordering::SeqCst), 2, "{status}");
         }
     }

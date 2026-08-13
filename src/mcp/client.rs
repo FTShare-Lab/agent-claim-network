@@ -2792,13 +2792,12 @@ async fn streamable_http_transport(
     };
     // transport 准备和建连协商由 `McpClient::connect` 的统一 startup deadline 约束；
     // 不能把它设为 reqwest client 的默认 timeout，否则合法长 SSE tool call 会提前被截断。
-    let client =
-        crate::http_client_builder()
-            .build()
-            .map_err(|source| McpClientError::HttpClient {
-                server: server_name.to_string(),
-                source,
-            })?;
+    let client = crate::http_client_builder_for_endpoint(&url)
+        .build()
+        .map_err(|source| McpClientError::HttpClient {
+            server: server_name.to_string(),
+            source,
+        })?;
     let credential_refresh_lock_path =
         oauth::credential_refresh_lock_path(mcp_config_path, server_name, &url);
     let mut config = StreamableHttpClientTransportConfig::with_uri(url);
@@ -2966,7 +2965,7 @@ mod tests {
     fn request_headers_does_not_duplicate_rmcp_protocol_version() {
         let client = AcnMcpHttpClient::new(
             "remote".into(),
-            reqwest::Client::new(),
+            crate::direct_http_client_builder().build().unwrap(),
             false,
             Duration::from_secs(1),
             Duration::from_secs(1),
@@ -3044,8 +3043,7 @@ mod tests {
         };
         use rmcp::model::{PingRequest, RequestId};
         use rmcp::transport::auth::{
-            AuthorizationManager, AuthorizationMetadata, CredentialStore, InMemoryCredentialStore,
-            StoredCredentials,
+            AuthorizationMetadata, CredentialStore, InMemoryCredentialStore, StoredCredentials,
         };
 
         #[derive(Clone)]
@@ -3128,7 +3126,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut manager = AuthorizationManager::new(format!("{base_url}/mcp"))
+        let mut manager = oauth::new_authorization_manager(&format!("{base_url}/mcp"))
             .await
             .unwrap();
         let mut metadata = AuthorizationMetadata::default();
@@ -3140,7 +3138,7 @@ mod tests {
         let client = AcnMcpOAuthHttpClient::new_for_test(
             AcnMcpHttpClient::new(
                 "remote".into(),
-                reqwest::Client::new(),
+                crate::direct_http_client_builder().build().unwrap(),
                 true,
                 Duration::from_secs(1),
                 Duration::from_secs(1),
@@ -3189,7 +3187,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut manager = AuthorizationManager::new(format!("{base_url}/mcp"))
+        let mut manager = oauth::new_authorization_manager(&format!("{base_url}/mcp"))
             .await
             .unwrap();
         let mut metadata = AuthorizationMetadata::default();
@@ -3201,7 +3199,7 @@ mod tests {
         let client = AcnMcpOAuthHttpClient::new_for_test(
             AcnMcpHttpClient::new(
                 "remote".into(),
-                reqwest::Client::new(),
+                crate::direct_http_client_builder().build().unwrap(),
                 true,
                 Duration::from_secs(1),
                 Duration::from_secs(1),
@@ -3241,8 +3239,7 @@ mod tests {
         };
         use rmcp::model::{PingRequest, RequestId};
         use rmcp::transport::auth::{
-            AuthorizationManager, AuthorizationMetadata, CredentialStore, InMemoryCredentialStore,
-            StoredCredentials,
+            AuthorizationMetadata, CredentialStore, InMemoryCredentialStore, StoredCredentials,
         };
 
         async fn mcp_endpoint(State(requests): State<Arc<AtomicUsize>>) -> impl IntoResponse {
@@ -3280,7 +3277,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut manager = AuthorizationManager::new(format!("{base_url}/mcp"))
+        let mut manager = oauth::new_authorization_manager(&format!("{base_url}/mcp"))
             .await
             .unwrap();
         let mut metadata = AuthorizationMetadata::default();
@@ -3293,7 +3290,7 @@ mod tests {
         let client = AcnMcpOAuthHttpClient::new_for_test(
             AcnMcpHttpClient::new(
                 "remote".into(),
-                reqwest::Client::new(),
+                crate::direct_http_client_builder().build().unwrap(),
                 true,
                 Duration::from_secs(1),
                 Duration::from_secs(1),
@@ -3408,7 +3405,7 @@ mod tests {
         let first = AcnMcpOAuthHttpClient::new_for_test(
             AcnMcpHttpClient::new(
                 "remote".into(),
-                reqwest::Client::new(),
+                crate::direct_http_client_builder().build().unwrap(),
                 true,
                 Duration::from_secs(1),
                 Duration::from_secs(1),
@@ -3419,7 +3416,7 @@ mod tests {
         let second = AcnMcpOAuthHttpClient::new_for_test(
             AcnMcpHttpClient::new(
                 "remote".into(),
-                reqwest::Client::new(),
+                crate::direct_http_client_builder().build().unwrap(),
                 true,
                 Duration::from_secs(1),
                 Duration::from_secs(1),
@@ -3563,7 +3560,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut manager = AuthorizationManager::new(&resource_url).await.unwrap();
+        let mut manager = oauth::new_authorization_manager(&resource_url)
+            .await
+            .unwrap();
         let mut metadata = AuthorizationMetadata::default();
         metadata.issuer = Some(format!("{base_url}/"));
         metadata.authorization_endpoint = format!("{base_url}/authorize");
@@ -3582,7 +3581,7 @@ mod tests {
         let client = AcnMcpOAuthHttpClient::new(
             AcnMcpHttpClient::new(
                 "remote".into(),
-                reqwest::Client::new(),
+                crate::direct_http_client_builder().build().unwrap(),
                 true,
                 Duration::from_secs(1),
                 Duration::from_secs(1),
@@ -3683,7 +3682,7 @@ mod tests {
         let client = AcnMcpOAuthHttpClient::new_for_test(
             AcnMcpHttpClient::new(
                 "remote".into(),
-                reqwest::Client::new(),
+                crate::direct_http_client_builder().build().unwrap(),
                 true,
                 Duration::from_secs(1),
                 Duration::from_millis(20),
@@ -3878,7 +3877,7 @@ mod tests {
         let client = AcnMcpOAuthHttpClient::new_for_test(
             AcnMcpHttpClient::new(
                 "remote".into(),
-                reqwest::Client::new(),
+                crate::direct_http_client_builder().build().unwrap(),
                 true,
                 Duration::from_secs(1),
                 Duration::from_millis(400),
@@ -4012,7 +4011,7 @@ mod tests {
             let client = AcnMcpOAuthHttpClient::new_for_test(
                 AcnMcpHttpClient::new(
                     "remote".into(),
-                    reqwest::Client::new(),
+                    crate::direct_http_client_builder().build().unwrap(),
                     true,
                     Duration::from_secs(1),
                     Duration::from_secs(1),
@@ -4089,7 +4088,14 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let response = reqwest::get(format!("http://{address}")).await.unwrap();
+        let endpoint = format!("http://{address}");
+        let response = crate::http_client_builder_for_endpoint(&endpoint)
+            .build()
+            .unwrap()
+            .get(endpoint)
+            .send()
+            .await
+            .unwrap();
         let source_error = response.bytes().await.unwrap_err();
         server.await.unwrap();
 
@@ -4141,7 +4147,7 @@ mod tests {
         let uri = Arc::<str>::from(format!("http://{address}/mcp"));
         let client = AcnMcpHttpClient::new(
             "remote".into(),
-            reqwest::Client::new(),
+            crate::direct_http_client_builder().build().unwrap(),
             false,
             Duration::from_secs(1),
             Duration::from_secs(1),
@@ -4293,14 +4299,14 @@ mod tests {
         );
         let oauth_client = AcnMcpHttpClient::new(
             "remote".into(),
-            reqwest::Client::new(),
+            crate::direct_http_client_builder().build().unwrap(),
             true,
             Duration::from_secs(1),
             Duration::from_secs(1),
         );
         let static_client = AcnMcpHttpClient::new(
             "remote".into(),
-            reqwest::Client::new(),
+            crate::direct_http_client_builder().build().unwrap(),
             false,
             Duration::from_secs(1),
             Duration::from_secs(1),

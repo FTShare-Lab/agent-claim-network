@@ -55,6 +55,7 @@ pub struct OpenAiCompatibleResponsesProviderAdapter {
     client: ResponsesClient,
     model: String,
     reasoning_effort: ReasoningEffort,
+    include_reasoning_replay: bool,
 }
 
 impl OpenAiCompatibleResponsesProviderAdapter {
@@ -82,12 +83,18 @@ impl OpenAiCompatibleResponsesProviderAdapter {
             )?,
             model,
             reasoning_effort: ReasoningEffort::None,
+            include_reasoning_replay: true,
         })
     }
 
     /// 设置 Responses `reasoning.effort`；`none` 会省略整个 reasoning 字段。
     pub fn with_reasoning_effort(mut self, reasoning_effort: ReasoningEffort) -> Self {
         self.reasoning_effort = reasoning_effort;
+        self
+    }
+
+    pub(crate) fn with_reasoning_replay(mut self, enabled: bool) -> Self {
+        self.include_reasoning_replay = enabled;
         self
     }
 
@@ -118,7 +125,9 @@ impl OpenAiCompatibleResponsesProviderAdapter {
             max_output_tokens: max_tokens,
             stream,
             store: false,
-            include: Some(vec!["reasoning.encrypted_content".into()]),
+            include: self
+                .include_reasoning_replay
+                .then(|| vec!["reasoning.encrypted_content".into()]),
             reasoning: reasoning_effort_name(self.reasoning_effort).map(|effort| {
                 ResponsesReasoning {
                     effort: effort.to_string(),
@@ -141,6 +150,8 @@ impl OpenAiCompatibleResponsesProviderAdapter {
         stream: bool,
         retry_count: u32,
         runtime_chain_id: Option<ProviderRuntimeChainId>,
+        runtime_fallback_scope: Option<&crate::api::ProviderRuntimeFallbackScope>,
+        retry_after_partial: bool,
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         emit: &mut (dyn FnMut(ProviderEvent) + Send),
         observer: &mut (dyn ProviderRequestObserver + Send),
@@ -178,10 +189,12 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                     }
                 };
                 self.client
-                    .send_with_retry_count_for_runtime_chain(
+                    .send_with_retry_count_for_runtime_scope(
                         &request,
                         retry_count,
                         runtime_chain_id,
+                        runtime_fallback_scope,
+                        retry_after_partial,
                         recovery_interrupt,
                         &mut responses_emit,
                     )
@@ -304,6 +317,8 @@ impl OpenAiCompatibleResponsesProviderAdapter {
         let retry_count = request
             .retry_count_override
             .unwrap_or(self.client.retry_count());
+        let retry_after_partial =
+            request.stream_output_mode == crate::api::ProviderStreamOutputMode::Buffered;
         let base_messages = request.messages;
         let input = session_turn_messages_to_responses(base_messages.clone(), &self.model)?;
         let recovery_interrupt = request.recovery_interrupt.clone();
@@ -318,6 +333,8 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                 request.stream,
                 retry_count,
                 request.runtime_chain_id,
+                request.runtime_fallback_scope.as_ref(),
+                retry_after_partial,
                 recovery_interrupt.as_ref(),
                 emit,
                 observer,
@@ -727,6 +744,7 @@ mod tests {
             .unwrap(),
             model: "test-model".into(),
             reasoning_effort,
+            include_reasoning_replay: true,
         }
     }
 
@@ -1241,7 +1259,9 @@ mod tests {
                     tools: Vec::new(),
                     max_tokens: 32,
                     stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
                     runtime_chain_id: None,
+                    runtime_fallback_scope: None,
                     recovery_interrupt: None,
                     retry_count_override: None,
                 },

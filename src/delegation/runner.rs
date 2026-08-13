@@ -18,6 +18,7 @@ use super::types::{
     DelegationCreateRequest, DelegationId, DelegationMetadata, DelegationResult, DelegationStatus,
     DelegationSteering, DelegationSummary, DelegationTranscriptEntry, DelegationUpdate,
 };
+use crate::api::ProviderRuntimeFallbackScope;
 use crate::claim::SessionId;
 use crate::config::{
     DEFAULT_SESSION_DELEGATION_MAX_CONCURRENT,
@@ -68,6 +69,13 @@ impl Default for DelegationRunnerConfig {
 pub struct DelegationExecutionContext {
     pub metadata: DelegationMetadata,
     pub initial_steering: Vec<DelegationSteering>,
+    pub(crate) runtime_fallback_scope: ProviderRuntimeFallbackScope,
+}
+
+impl DelegationExecutionContext {
+    pub(crate) fn runtime_fallback_scope(&self) -> ProviderRuntimeFallbackScope {
+        self.runtime_fallback_scope.clone()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -286,6 +294,7 @@ struct DelegationRunnerInner {
     activity: DelegationActivityHub,
     state: tokio::sync::Mutex<RunnerState>,
     pump_lock: tokio::sync::Mutex<()>,
+    fallback_root: tokio::sync::RwLock<ProviderRuntimeFallbackScope>,
 }
 
 #[derive(Default)]
@@ -319,6 +328,7 @@ impl DelegationRunner {
                 activity: DelegationActivityHub::new(),
                 state: tokio::sync::Mutex::new(RunnerState::default()),
                 pump_lock: tokio::sync::Mutex::new(()),
+                fallback_root: tokio::sync::RwLock::new(ProviderRuntimeFallbackScope::new_root()),
             }),
         })
     }
@@ -333,6 +343,10 @@ impl DelegationRunner {
 
     pub fn subscribe_activity(&self) -> watch::Receiver<u64> {
         self.inner.activity.subscribe()
+    }
+
+    pub(crate) async fn bind_fallback_root(&self, root: ProviderRuntimeFallbackScope) {
+        *self.inner.fallback_root.write().await = root;
     }
 
     pub async fn create(
@@ -714,6 +728,7 @@ impl DelegationRunnerInner {
         let context = DelegationExecutionContext {
             metadata,
             initial_steering,
+            runtime_fallback_scope: self.fallback_root.read().await.new_child(),
         };
         let (executed, mut task_checkpoint_guard) = match self.executor.begin_task(&context).await {
             Ok(()) => {

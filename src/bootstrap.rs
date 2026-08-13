@@ -317,7 +317,7 @@ pub(crate) fn build_provider_adapter(cfg: &Config) -> anyhow::Result<Arc<dyn Pro
             .with_reasoning_effort(chat.reasoning_effort)
             .with_websockets(
                 chat.supports_websockets,
-                1usize.saturating_add(cfg.agent.session.subagents.max_concurrent),
+                cfg.agent.session.subagents.max_concurrent.saturating_add(3),
             )?;
             Ok(Arc::new(adapter))
         }

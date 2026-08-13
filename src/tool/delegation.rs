@@ -5,6 +5,18 @@
 use super::*;
 
 impl ToolRegistry {
+    pub(crate) async fn bind_delegation_fallback_root_for_session(
+        &self,
+        session_id: &SessionId,
+        root: crate::api::ProviderRuntimeFallbackScope,
+    ) -> Result<(), ToolError> {
+        let Some(host) = &self.delegation_host else {
+            return Ok(());
+        };
+        host.runner_for(session_id)?.bind_fallback_root(root).await;
+        Ok(())
+    }
+
     pub(crate) fn subscribe_delegation_activity_for_session(
         &self,
         session_id: &SessionId,

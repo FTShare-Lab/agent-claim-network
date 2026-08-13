@@ -240,12 +240,10 @@ Compaction summarizer 必须输出结构化 JSON，不接受自由文本。V1 �
 - `active_turn_summary` 为字符串时，表示本次更新 active turn 摘要；为 `null` 时沿用现有`active_turn_summary`。
 - 输出 JSON 形状不合法、字段缺失、字段类型不合法，均视为 shape error。
 
-Summary 生成必须套现有 LLM retry 逻辑，受 `[agent.llm].retry_count` 限制：
+Summary 生成使用两层 retry，均受 `[agent.llm].retry_count` 限制：
 
-- 总尝试次数为 `1 + retry_count`。
-- provider/transport 失败按现有 LLM retry 策略重试。
-- structured JSON 解析失败或 shape error 也按同一个 retry budget 重试。
-- compaction request 禁用 provider adapter 的内层 retry，由上述单一控制器统一计数，避免两层重试相乘。
+- 每次 provider/transport 调用按协议层预算重试当前 transport，耗尽后再执行 transport fallback。
+- 收到完整结果后，structured JSON 解析失败或 shape error 使用独立的业务预算重试，业务总尝试次数为 `1 + retry_count`。
 - retry 耗尽后，本次 compact 失败，不移动任何 compaction / recap 指针。
 
 主会话和 delegation 生成 summary 时优先使用完整 transcript。只有完整 summary 请求
@@ -305,7 +303,7 @@ struct CompactionPlan {
 
 Compact 进行中时，TUI 只用 live box 顶部状态表达进度：
 
-- live box 标题显示 `Compacting · Session history`。
+- live box 标题显示 `Compacting · Session history · Ns`。
 - live box 内容保留 compact 触发前当前 assistant turn 已经可见的文本、工具状态和工具结果预览。
 - 不显示 `thinking...`，也不在正文 activity 行显示 `compacting session...`。
 - 不向 transcript 插入 `compaction started` / `compaction completed` 正文消息。
@@ -356,7 +354,7 @@ Compact 进行中时，TUI 只用 live box 顶部状态表达进度：
 - compact 后 provider request 相对优先保留最近真实 user turn 的最终 assistant 回答，其优先级高于普通过程性 assistant 文本。
 - compact 后 provider request 尽量保留 previous real user turns 的用户需求和对话语义。
 - 手动 `/compact` 在没有新可压缩内容时显示 `Nothing new to compact.`，不重写同一份 summary。
-- compact 进行中 TUI live box 标题显示 `Compacting · Session history`，内容不显示`thinking...`、`compacting session...`、`compaction started` 或 `compaction completed`。
+- compact 进行中 TUI live box 标题显示 `Compacting · Session history · Ns`，内容不显示`thinking...`、`compacting session...`、`compaction started` 或 `compaction completed`。
 - compact 失败时 TUI 显示 `Compaction failed: ...`，`Compaction` 首字母大写。
 - compaction summary 使用结构化 JSON 输出，shape error 按 `[agent.llm].retry_count` 限制重试。
 - 主会话和 delegation 的 compaction summary 请求优先携带完整工具结果；完整请求超限后依次降级为“大型结果省略”和“全部结果省略”，canonical transcript 始终保留原文。

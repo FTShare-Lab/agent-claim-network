@@ -52,7 +52,9 @@ impl ChatCompletionsClient {
         retry_base_delay: Duration,
         retry_max_delay: Duration,
     ) -> Result<Self, ChatCompletionsError> {
-        let http = crate::http_client_builder()
+        let endpoint = resolve_llm_endpoint(&endpoint, LlmEndpointKind::OpenAiChatCompletions)
+            .map_err(|error| ChatCompletionsError::InvalidEndpoint(error.to_string()))?;
+        let http = crate::http_client_builder_for_endpoint(&endpoint)
             .timeout(timeout)
             .build()
             .map_err(|error| {
@@ -64,10 +66,7 @@ impl ChatCompletionsClient {
             })?;
         Ok(Self {
             http,
-            endpoint: Arc::new(
-                resolve_llm_endpoint(&endpoint, LlmEndpointKind::OpenAiChatCompletions)
-                    .map_err(|error| ChatCompletionsError::InvalidEndpoint(error.to_string()))?,
-            ),
+            endpoint: Arc::new(endpoint),
             api_key: Arc::new(api_key),
             retry_count,
             retry_base_delay,
@@ -103,8 +102,19 @@ impl ChatCompletionsClient {
         retry_count: u32,
         emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
     ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
+        self.send_with_retry_count_and_mode(request, retry_count, false, emit)
+            .await
+    }
+
+    pub(crate) async fn send_with_retry_count_and_mode(
+        &self,
+        request: &ChatCompletionRequest,
+        retry_count: u32,
+        retry_after_partial: bool,
+        emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
+    ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
         if request.stream {
-            self.send_streaming_with_retry(request, retry_count, emit)
+            self.send_streaming_with_retry(request, retry_count, retry_after_partial, emit)
                 .await
         } else {
             self.send_json_with_retry(request, retry_count).await
@@ -165,6 +175,7 @@ impl ChatCompletionsClient {
         &self,
         request: &ChatCompletionRequest,
         retry_count: u32,
+        retry_after_partial: bool,
         emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
     ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
         let mut last_retryable = None;
@@ -179,7 +190,11 @@ impl ChatCompletionsClient {
             };
             match result {
                 Ok(value) => return Ok(value),
-                Err(e) if !emitted && is_retryable(&e) && attempt < retry_count => {
+                Err(e)
+                    if (!emitted || retry_after_partial)
+                        && is_retryable(&e)
+                        && attempt < retry_count =>
+                {
                     let backoff =
                         compute_backoff(attempt, self.retry_base_delay, self.retry_max_delay);
                     log::warn!(
@@ -298,6 +313,8 @@ fn is_retryable(error: &ChatCompletionsError) -> bool {
 
 pub(crate) fn is_stream_failure(error: &ChatCompletionsError) -> bool {
     matches!(error, ChatCompletionsError::StreamFailure { .. })
+        || matches!(error, ChatCompletionsError::Http(error) if error.is_retryable())
+        || matches!(error, ChatCompletionsError::Status { status, .. } if *status == 429 || *status >= 500)
 }
 
 fn compute_backoff(attempt: u32, base: Duration, max: Duration) -> Duration {

@@ -9,8 +9,10 @@ use anyhow::Context;
 use serde_json::{json, Value};
 
 use crate::api::{
-    MemoryReviewRequest, ProviderAdapter, ProviderEvent, ProviderRequest, ProviderResponse,
-    ProviderStop, SessionTurnContentBlock, SessionTurnMessage, ToolExecutionOutcome, ToolSpec,
+    send_buffered_with_fallback, BufferedProviderRuntime, MemoryReviewRequest, ProviderAdapter,
+    ProviderRequest, ProviderResponse, ProviderRuntimeFallbackScope, ProviderStop,
+    ProviderStreamOutputMode, SessionTurnContentBlock, SessionTurnMessage, ToolExecutionOutcome,
+    ToolSpec,
 };
 use crate::tool::ToolRegistry;
 
@@ -44,6 +46,17 @@ impl MemoryReviewLoop {
         request: MemoryReviewRequest,
         review_prompt: String,
     ) -> anyhow::Result<()> {
+        let root = ProviderRuntimeFallbackScope::new_root();
+        self.run_with_scope(request, review_prompt, root.new_child())
+            .await
+    }
+
+    pub async fn run_with_scope(
+        &self,
+        request: MemoryReviewRequest,
+        review_prompt: String,
+        fallback_scope: ProviderRuntimeFallbackScope,
+    ) -> anyhow::Result<()> {
         if self.max_turns == 0 {
             anyhow::bail!("review_memory max_turns 必须大于 0");
         }
@@ -58,10 +71,11 @@ impl MemoryReviewLoop {
 
         let mut messages = request.transcript;
         messages.push(SessionTurnMessage::user_text(review_prompt));
+        let runtime = BufferedProviderRuntime::new(fallback_scope);
 
         for turn_idx in 0..self.max_turns {
             let provider_response = self
-                .call_provider(&request.system_prompt, &messages, &memory_tools)
+                .call_provider(&request.system_prompt, &messages, &memory_tools, &runtime)
                 .await?;
             let assistant_message = provider_response.assistant_message;
             validate_assistant_message(&assistant_message)?;
@@ -133,23 +147,24 @@ impl MemoryReviewLoop {
         system_prompt: &str,
         messages: &[SessionTurnMessage],
         tools: &[ToolSpec],
+        runtime: &BufferedProviderRuntime,
     ) -> anyhow::Result<ProviderResponse> {
-        let mut emit = |_event: ProviderEvent| {};
-        self.provider
-            .send(
-                ProviderRequest {
-                    system_prompt: system_prompt.to_string(),
-                    messages: messages.to_vec(),
-                    tools: tools.to_vec(),
-                    max_tokens: self.max_tokens,
-                    stream: false,
-                    runtime_chain_id: None,
-                    recovery_interrupt: None,
-                    retry_count_override: None,
-                },
-                &mut emit,
-            )
-            .await
+        send_buffered_with_fallback(
+            &self.provider,
+            ProviderRequest {
+                system_prompt: system_prompt.to_string(),
+                messages: messages.to_vec(),
+                tools: tools.to_vec(),
+                max_tokens: self.max_tokens,
+                stream: true,
+                stream_output_mode: ProviderStreamOutputMode::Buffered,
+                runtime_chain_id: Some(runtime.chain_id),
+                runtime_fallback_scope: Some(runtime.fallback_scope.clone()),
+                recovery_interrupt: None,
+                retry_count_override: None,
+            },
+        )
+        .await
     }
 }
 
@@ -314,7 +329,11 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert!(!requests[0].stream);
+        assert!(requests[0].stream);
+        assert_eq!(
+            requests[0].stream_output_mode,
+            ProviderStreamOutputMode::Buffered
+        );
         assert_eq!(requests[0].tools.len(), 1);
         assert_eq!(requests[0].tools[0].name, "memory");
         let last = requests[1].messages.last().unwrap();

@@ -57,7 +57,7 @@ impl HttpRouterClient {
         agent_id: AgentId,
         api_key: Option<String>,
     ) -> anyhow::Result<Self> {
-        let http = crate::http_client_builder()
+        let http = crate::http_client_builder_for_endpoint(&endpoint)
             .timeout(Duration::from_secs(cfg.timeout_secs))
             .build()?;
         let auth = ClientAuth {

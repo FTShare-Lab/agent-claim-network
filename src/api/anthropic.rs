@@ -146,7 +146,9 @@ impl AnthropicMessagesClient {
         retry_base_delay: Duration,
         retry_max_delay: Duration,
     ) -> Result<Self, AnthropicError> {
-        let http = crate::http_client_builder()
+        let endpoint = resolve_llm_endpoint(&endpoint, LlmEndpointKind::AnthropicMessages)
+            .map_err(|error| AnthropicError::InvalidEndpoint(error.to_string()))?;
+        let http = crate::http_client_builder_for_endpoint(&endpoint)
             .timeout(timeout)
             .build()
             .map_err(|error| {
@@ -159,10 +161,7 @@ impl AnthropicMessagesClient {
         Ok(Self {
             http,
             api_key: Arc::new(api_key),
-            endpoint: Arc::new(
-                resolve_llm_endpoint(&endpoint, LlmEndpointKind::AnthropicMessages)
-                    .map_err(|error| AnthropicError::InvalidEndpoint(error.to_string()))?,
-            ),
+            endpoint: Arc::new(endpoint),
             model: Arc::new(model),
             retry_count,
             retry_base_delay,
@@ -458,6 +457,8 @@ impl AnthropicProviderAdapter {
         let retry_count = request
             .retry_count_override
             .unwrap_or(self.client.retry_count);
+        let retry_after_partial =
+            request.stream_output_mode == crate::api::ProviderStreamOutputMode::Buffered;
         let base_messages = request.messages;
         let request_has_media = base_messages.iter().any(|message| {
             message.content.iter().any(|block| {
@@ -507,6 +508,7 @@ impl AnthropicProviderAdapter {
                     api_tools,
                     request.max_tokens,
                     retry_count,
+                    retry_after_partial,
                     &mut provider_emit,
                     &mut request_observer,
                 )
@@ -570,7 +572,7 @@ impl AnthropicProviderAdapter {
 }
 
 fn anthropic_adapter_stream_failure(error: &AnthropicError) -> bool {
-    matches!(error, AnthropicError::StreamFailure { .. })
+    is_stream_retryable(error)
 }
 
 impl AnthropicProviderAdapter {
@@ -1712,7 +1714,9 @@ mod tests {
                     tools: Vec::new(),
                     max_tokens: 128,
                     stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
                     runtime_chain_id: None,
+                    runtime_fallback_scope: None,
                     recovery_interrupt: None,
                     retry_count_override: None,
                 },

@@ -6536,7 +6536,12 @@ async fn compaction_summary_falls_back_to_omitting_all_tool_results_before_provi
 
     let requests = provider.requests().await;
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].retry_count_override, Some(0));
+    assert_eq!(requests[0].retry_count_override, None);
+    assert!(requests[0].stream);
+    assert_eq!(
+        requests[0].stream_output_mode,
+        crate::api::ProviderStreamOutputMode::Buffered
+    );
     let payload = last_user_text(&requests[0]);
     assert!(payload.contains("tool_result omitted from compaction summary input"));
     assert!(!payload.contains("RAW_SUMMARY_TOOL_RESULT"));

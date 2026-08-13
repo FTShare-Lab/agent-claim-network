@@ -21,6 +21,7 @@ pub mod build_info;
 pub mod claim;
 pub mod config;
 pub mod delegation;
+mod http_client;
 pub mod maintainer;
 pub mod mcp;
 pub mod memory;
@@ -48,13 +49,7 @@ pub mod tracing;
 pub mod update;
 pub mod upstream_migration;
 
-/// 构造项目内统一使用的 HTTP client builder。
-///
-/// 生产环境遵从系统和环境代理配置；单元测试中的 fake server 均监听本机回环地址，
-/// 必须避免被测试机的代理转发。
-pub(crate) fn http_client_builder() -> reqwest::ClientBuilder {
-    let builder = reqwest::Client::builder();
-    #[cfg(test)]
-    let builder = builder.no_proxy();
-    builder
-}
+pub(crate) use http_client::{
+    direct_http_client_013_builder, direct_http_client_builder, http_client_013_builder,
+    http_client_builder, http_client_builder_for_endpoint, is_loopback_endpoint,
+};

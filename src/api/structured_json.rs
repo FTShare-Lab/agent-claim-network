@@ -10,7 +10,8 @@ use anyhow::Context;
 use serde_json::Value;
 
 use crate::api::{
-    ProviderAdapter, ProviderEvent, ProviderRequest, ProviderResponse, ProviderStop,
+    send_buffered_with_fallback, BufferedProviderRuntime, ProviderAdapter, ProviderEvent,
+    ProviderRequest, ProviderResponse, ProviderStop, ProviderStreamOutputMode,
     SessionTurnContentBlock, SessionTurnMessage,
 };
 
@@ -25,10 +26,28 @@ pub struct StructuredJsonCaller {
     retry_max_delay: Duration,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("结构化 JSON provider 调用失败: {0}")]
+pub(crate) struct StructuredJsonProviderFailure(String);
+
+#[derive(Debug, thiserror::Error)]
+#[error("结构化 JSON 调用收到不可重试终态: {0}")]
+pub(crate) struct StructuredJsonTerminalFailure(String);
+
+pub(crate) fn structured_json_business_retryable(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<StructuredJsonProviderFailure>()
+        .is_none()
+        && error
+            .downcast_ref::<StructuredJsonTerminalFailure>()
+            .is_none()
+}
+
 pub(crate) struct StructuredJsonAttemptRequest {
     system_prompt: String,
     messages: Vec<SessionTurnMessage>,
     provider_retry_count_override: Option<u32>,
+    buffered_runtime: Option<BufferedProviderRuntime>,
 }
 
 impl StructuredJsonAttemptRequest {
@@ -37,14 +56,43 @@ impl StructuredJsonAttemptRequest {
             system_prompt,
             messages,
             provider_retry_count_override: None,
+            buffered_runtime: None,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn compaction(system_prompt: String, messages: Vec<SessionTurnMessage>) -> Self {
         Self {
             system_prompt,
             messages,
             provider_retry_count_override: Some(0),
+            buffered_runtime: None,
+        }
+    }
+
+    pub(crate) fn compaction_streaming(
+        system_prompt: String,
+        messages: Vec<SessionTurnMessage>,
+        runtime: BufferedProviderRuntime,
+    ) -> Self {
+        Self {
+            system_prompt,
+            messages,
+            provider_retry_count_override: None,
+            buffered_runtime: Some(runtime),
+        }
+    }
+
+    fn streaming(
+        system_prompt: String,
+        messages: Vec<SessionTurnMessage>,
+        runtime: BufferedProviderRuntime,
+    ) -> Self {
+        Self {
+            system_prompt,
+            messages,
+            provider_retry_count_override: None,
+            buffered_runtime: Some(runtime),
         }
     }
 }
@@ -94,6 +142,48 @@ impl StructuredJsonCaller {
     ) -> anyhow::Result<Value> {
         self.generate_json_with_retry_notice(system_prompt, messages, |_, _, _| {})
             .await
+    }
+
+    pub(crate) async fn generate_json_streaming_once(
+        &self,
+        system_prompt: String,
+        messages: Vec<SessionTurnMessage>,
+        runtime: BufferedProviderRuntime,
+    ) -> anyhow::Result<Value> {
+        self.generate_json_once_observed(system_prompt, messages, None, Some(&runtime))
+            .await
+            .map(|parsed| parsed.value)
+            .map_err(|failure| match failure.error {
+                JsonCallError::Provider(error) => {
+                    StructuredJsonProviderFailure(format!("{error:#}")).into()
+                }
+                JsonCallError::Terminal(error) => {
+                    StructuredJsonTerminalFailure(format!("{error:#}")).into()
+                }
+                JsonCallError::Parse(error) | JsonCallError::RetryableShape(error) => error,
+            })
+    }
+
+    pub(crate) async fn generate_json_streaming_validated_with_retry_notice<T, V, F>(
+        &self,
+        system_prompt: String,
+        messages: Vec<SessionTurnMessage>,
+        runtime: BufferedProviderRuntime,
+        validate: V,
+        on_retry: F,
+    ) -> anyhow::Result<T>
+    where
+        V: FnMut(Value) -> anyhow::Result<T>,
+        F: FnMut(u32, u32, &anyhow::Error),
+    {
+        self.generate_json_validated_with_guarded_attempts(
+            StructuredJsonAttemptRequest::streaming(system_prompt, messages, runtime),
+            validate,
+            on_retry,
+            |_| std::future::ready(()),
+            |_, _| Ok(()),
+        )
+        .await
     }
 
     /// 请求模型生成 JSON，并在每次 retry 前通知调用方。
@@ -206,6 +296,7 @@ impl StructuredJsonCaller {
             system_prompt,
             messages,
             provider_retry_count_override,
+            buffered_runtime,
         } = request;
         let mut attempt = 0;
         let base_messages = messages;
@@ -217,6 +308,7 @@ impl StructuredJsonCaller {
                     system_prompt.clone(),
                     attempt_messages.clone(),
                     provider_retry_count_override,
+                    buffered_runtime.as_ref(),
                 )
                 .await
             {
@@ -267,6 +359,7 @@ impl StructuredJsonCaller {
                         failure.error,
                         JsonCallError::Parse(_) | JsonCallError::RetryableShape(_)
                     ) || (provider_retry_count_override.is_some()
+                        && buffered_runtime.is_none()
                         && matches!(failure.error, JsonCallError::Provider(_)));
                     let will_retry = retryable && attempt < self.retry_count;
                     let raw_text = failure.raw_text.clone();
@@ -330,7 +423,9 @@ impl StructuredJsonCaller {
             tools: Vec::new(),
             max_tokens: self.max_tokens,
             stream: false,
+            stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
             runtime_chain_id: None,
+            runtime_fallback_scope: None,
             recovery_interrupt: None,
             retry_count_override: None,
         };
@@ -350,24 +445,30 @@ impl StructuredJsonCaller {
         system_prompt: String,
         messages: Vec<SessionTurnMessage>,
         retry_count_override: Option<u32>,
+        buffered_runtime: Option<&BufferedProviderRuntime>,
     ) -> Result<JsonCallParsed, JsonCallFailure> {
         let request = ProviderRequest {
             system_prompt,
             messages,
             tools: Vec::new(),
             max_tokens: self.max_tokens,
-            stream: false,
-            runtime_chain_id: None,
+            stream: buffered_runtime.is_some(),
+            stream_output_mode: buffered_runtime
+                .map(|_| ProviderStreamOutputMode::Buffered)
+                .unwrap_or(ProviderStreamOutputMode::Live),
+            runtime_chain_id: buffered_runtime.map(|runtime| runtime.chain_id),
+            runtime_fallback_scope: buffered_runtime.map(|runtime| runtime.fallback_scope.clone()),
             recovery_interrupt: None,
             retry_count_override,
         };
 
-        let mut emit = |_event: ProviderEvent| {};
-        let response = self
-            .provider
-            .send(request, &mut emit)
-            .await
-            .map_err(|error| JsonCallFailure::new(JsonCallError::Provider(error), None, None))?;
+        let response = if buffered_runtime.is_some() {
+            send_buffered_with_fallback(&self.provider, request).await
+        } else {
+            let mut emit = |_event: ProviderEvent| {};
+            self.provider.send(request, &mut emit).await
+        }
+        .map_err(|error| JsonCallFailure::new(JsonCallError::Provider(error), None, None))?;
 
         parse_structured_response_observed(response)
     }

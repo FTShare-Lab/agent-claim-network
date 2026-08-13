@@ -34,6 +34,7 @@ use crate::auth::sha256_hex;
 use crate::mcp::config::{
     read_mcp_json_config, McpOAuthCredentialsStore, McpServerConfig, McpTransportConfig,
 };
+pub(crate) use crate::mcp::oauth_http::new_authorization_manager;
 use crate::storage::FileLockGuard;
 
 const KEYRING_SERVICE: &str = "agent-claim-network.mcp";
@@ -527,7 +528,7 @@ pub async fn login(
         })?
         .map(|credentials| credentials.granted_scopes)
         .unwrap_or_default();
-    let mut manager = AuthorizationManager::new(url)
+    let mut manager = new_authorization_manager(&url)
         .await
         .map_err(|error| authorization_setup_error(server_name, error))?;
     manager.set_credential_store(credentials.clone());
@@ -916,7 +917,7 @@ pub(crate) async fn authorization_manager_locked(
         });
     }
     validate_oauth_resource_url(server_name, url)?;
-    let mut manager = AuthorizationManager::new(url)
+    let mut manager = new_authorization_manager(url)
         .await
         .map_err(|error| authorization_setup_error(server_name, error))?;
     let metadata = manager
@@ -1735,7 +1736,7 @@ mod tests {
 
     #[tokio::test]
     async fn existing_grant_prevents_authorization_metadata_scope_fallback() {
-        let mut manager = AuthorizationManager::new("https://resource.example.test/mcp")
+        let mut manager = new_authorization_manager("https://resource.example.test/mcp")
             .await
             .unwrap();
         let mut metadata = rmcp::transport::auth::AuthorizationMetadata::default();
@@ -2413,7 +2414,7 @@ mod tests {
             .into_future(),
         );
         let resource = format!("{authorization_server}/mcp");
-        let manager = AuthorizationManager::new(resource.clone()).await.unwrap();
+        let manager = new_authorization_manager(&resource).await.unwrap();
 
         let session = authorization_session(
             manager,
@@ -2469,7 +2470,7 @@ mod tests {
         );
 
         *registration.lock().unwrap() = None;
-        let manager = AuthorizationManager::new(format!("{authorization_server}/mcp"))
+        let manager = new_authorization_manager(&format!("{authorization_server}/mcp"))
             .await
             .unwrap();
         let preregistered = authorization_session(
@@ -2489,7 +2490,7 @@ mod tests {
         );
         assert!(registration.lock().unwrap().is_none());
 
-        let manager = AuthorizationManager::new(format!("{authorization_server}/mcp"))
+        let manager = new_authorization_manager(&format!("{authorization_server}/mcp"))
             .await
             .unwrap();
         let issuer_checked =

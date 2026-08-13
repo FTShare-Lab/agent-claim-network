@@ -151,10 +151,11 @@ mod tests {
             socket.write_all(response.as_bytes()).await.unwrap();
         });
 
-        let resp = crate::http_client_builder()
+        let endpoint = format!("http://{addr}");
+        let resp = crate::http_client_builder_for_endpoint(&endpoint)
             .build()
             .unwrap()
-            .get(format!("http://{addr}"))
+            .get(endpoint)
             .send()
             .await
             .unwrap();

@@ -1054,6 +1054,7 @@ struct CompactionAuditTextPreview {
 struct SessionInboxJsonGenerator<'a> {
     prompt_registry: &'a PromptRegistry,
     json_caller: &'a StructuredJsonCaller,
+    fallback_scope: crate::api::ProviderRuntimeFallbackScope,
 }
 
 #[async_trait]
@@ -1075,9 +1076,10 @@ impl InboxJsonGenerator for SessionInboxJsonGenerator<'_> {
             .with_context(|| format!("渲染 {prompt_name} prompt 失败"))?;
         let user_text = serde_json::to_string_pretty(&request)?;
         self.json_caller
-            .generate_json(
+            .generate_json_streaming_once(
                 system_prompt,
                 vec![SessionTurnMessage::user_text(user_text)],
+                crate::api::BufferedProviderRuntime::new(self.fallback_scope.clone()),
             )
             .await
     }
@@ -2092,6 +2094,7 @@ impl SessionEngine {
         let inbox_generator = SessionInboxJsonGenerator {
             prompt_registry: &self.prompt_registry,
             json_caller: &self.json_caller,
+            fallback_scope: session.inbox_fallback_scope_for_request(),
         };
         let report = self.runner.process_inbox_with(&inbox_generator).await?;
         self.append_session_warnings_log(session, &report.warnings)
@@ -2142,9 +2145,11 @@ impl SessionEngine {
         emit(SessionEvent::StartupProgress {
             label: "processing inbox...".into(),
         });
+        let inbox_fallback_scope = crate::api::ProviderRuntimeFallbackScope::new_root();
         let inbox_generator = SessionInboxJsonGenerator {
             prompt_registry: &self.prompt_registry,
             json_caller: &self.json_caller,
+            fallback_scope: inbox_fallback_scope.clone(),
         };
         let inbox_report = self.runner.process_inbox_with(&inbox_generator).await?;
         emit(SessionEvent::TeamServicesConnectionUpdated {
@@ -2161,7 +2166,7 @@ impl SessionEngine {
         emit(SessionEvent::StartupProgress {
             label: "creating session...".into(),
         });
-        let session = self
+        let mut session = self
             .session_store
             .create_with_metadata_id_factory(
                 &self.runner.agent_id,
@@ -2172,6 +2177,7 @@ impl SessionEngine {
                 max_attempts,
             )
             .await?;
+        session.replace_runtime_fallback_root(inbox_fallback_scope);
         emit(SessionEvent::SessionStarted {
             session_id: session.metadata.id.clone(),
             agent_id: self.agent.agent_id.clone(),
@@ -2880,6 +2886,7 @@ impl SessionEngine {
         let inbox_generator = SessionInboxJsonGenerator {
             prompt_registry: &self.prompt_registry,
             json_caller: &self.json_caller,
+            fallback_scope: session.inbox_fallback_scope_for_request(),
         };
         let result = self.runner.process_inbox_with(&inbox_generator).await;
         match result {
@@ -2988,8 +2995,13 @@ impl SessionEngine {
         )?;
         let active_start_index = history.len();
         let runtime_chain_id = session.runtime_chain_id();
+        let runtime_fallback_scope = session.runtime_fallback_scope();
         let turn_id_for_tools = request.turn_id.clone();
         let tools = self.turn_loop.tool_registry();
+        tools
+            .bind_delegation_fallback_root_for_session(&metadata.id, session.inbox_fallback_scope())
+            .await
+            .context("绑定 subagent fallback scope 失败")?;
         let delegation_activity = tools
             .subscribe_delegation_activity_for_session(&metadata.id)
             .context("订阅 subagent activity 失败")?;
@@ -3032,6 +3044,7 @@ impl SessionEngine {
                 },
                 request.recovered_model_context,
                 runtime_chain_id,
+                runtime_fallback_scope,
                 emit,
                 request.tool_boundary_control,
                 SessionTurnHooks::new(
@@ -3906,7 +3919,7 @@ impl SessionEngine {
                     prepared_summary,
                     emit,
                 ),
-                self.prepare_finalize_segment(recap_segment),
+                self.prepare_finalize_segment(recap_segment, session.runtime_fallback_scope()),
             );
             let generated_compaction = summary_result?;
             let prepared_recap = match recap_result {
@@ -4082,7 +4095,10 @@ impl SessionEngine {
         let recap_segment_hash = audit_try!(hash_session_segment(recap_segment));
         let (used_claim_ids, prepared_claims, prepared_disputes) = match prepared_recap {
             Some(prepared) => prepared,
-            None => audit_try!(self.prepare_finalize_segment(recap_segment).await),
+            None => audit_try!(
+                self.prepare_finalize_segment(recap_segment, session.runtime_fallback_scope())
+                    .await
+            ),
         };
         let trace_text = session_trace_text(recap_segment);
         let trace_created_at = Utc::now();
@@ -4455,7 +4471,10 @@ impl SessionEngine {
                                     prepared_summary,
                                     emit,
                                 ),
-                                self.prepare_finalize_segment(recap_segment),
+                                self.prepare_finalize_segment(
+                                    recap_segment,
+                                    session.runtime_fallback_scope(),
+                                ),
                             );
                             let generated_compaction = summary_result?;
                             generated_audit_ids.push(generated_compaction.audit_id.clone());
@@ -4478,8 +4497,12 @@ impl SessionEngine {
                             )
                         }
                         (true, false) => {
-                            let (used_claim_ids, prepared_claims, prepared_disputes) =
-                                self.prepare_finalize_segment(recap_segment).await?;
+                            let (used_claim_ids, prepared_claims, prepared_disputes) = self
+                                .prepare_finalize_segment(
+                                    recap_segment,
+                                    session.runtime_fallback_scope(),
+                                )
+                                .await?;
                             let summary = metadata
                                 .compaction
                                 .as_ref()
@@ -4956,7 +4979,11 @@ impl SessionEngine {
         let result = self
             .json_caller
             .generate_json_validated_with_guarded_attempts(
-                StructuredJsonAttemptRequest::compaction(system_prompt, provider_messages),
+                StructuredJsonAttemptRequest::compaction_streaming(
+                    system_prompt,
+                    provider_messages,
+                    crate::api::BufferedProviderRuntime::new(session.runtime_fallback_scope()),
+                ),
                 |value| parse_compaction_summary_outcome(value, inputs),
                 |retry_index, retry_total, e| {
                     let message = format!(

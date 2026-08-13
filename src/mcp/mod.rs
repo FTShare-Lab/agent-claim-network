@@ -10,6 +10,7 @@ pub mod config;
 pub mod connection_manager;
 pub mod name;
 pub mod oauth;
+mod oauth_http;
 mod process_group;
 pub mod redact;
 pub mod tool;

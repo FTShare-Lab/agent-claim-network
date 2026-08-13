@@ -130,22 +130,15 @@ impl ResponsesEventDecoder {
                 );
             }
             "response.failed" => {
-                return Err(ResponsesError::Failed {
-                    message: event_error_message(
-                        event.get("response").and_then(|r| r.get("error")),
-                    ),
-                });
+                return Err(response_stream_error(
+                    &event,
+                    event
+                        .get("response")
+                        .and_then(|response| response.get("error")),
+                ));
             }
             "error" => {
-                if let Some(status) = event_error_status(&event) {
-                    return Err(ResponsesError::Status {
-                        status,
-                        body: event_error_message(Some(&event)),
-                    });
-                }
-                return Err(ResponsesError::Failed {
-                    message: event_error_message(Some(&event)),
-                });
+                return Err(response_stream_error(&event, Some(&event)));
             }
             _ => log::debug!(target: "api", "忽略未消费的 Responses event type={kind}"),
         }
@@ -232,10 +225,52 @@ fn event_error_message(error: Option<&Value>) -> String {
     redact_responses_error_body(message)
 }
 
+fn response_stream_error(event: &Value, error: Option<&Value>) -> ResponsesError {
+    let message = event_error_message(error);
+    if let Some(status) = event_error_status(event) {
+        return ResponsesError::Status {
+            status,
+            body: message,
+        };
+    }
+    if event_error_code(event).is_some_and(is_transient_error_code) {
+        return ResponsesError::StreamFailure { reason: message };
+    }
+    ResponsesError::Failed { message }
+}
+
+fn event_error_code(event: &Value) -> Option<&str> {
+    event
+        .get("code")
+        .or_else(|| event.pointer("/error/code"))
+        .or_else(|| event.pointer("/error/type"))
+        .or_else(|| event.pointer("/response/error/code"))
+        .or_else(|| event.pointer("/response/error/type"))
+        .and_then(Value::as_str)
+}
+
+fn is_transient_error_code(code: &str) -> bool {
+    matches!(
+        code,
+        "rate_limit_error"
+            | "rate_limit_exceeded"
+            | "server_error"
+            | "api_error"
+            | "overloaded_error"
+            | "internal_server_error"
+            | "service_unavailable"
+            | "temporarily_unavailable"
+    )
+}
+
 fn event_error_status(event: &Value) -> Option<u16> {
     event
         .get("status")
         .or_else(|| event.get("status_code"))
+        .or_else(|| event.pointer("/error/status"))
+        .or_else(|| event.pointer("/error/status_code"))
+        .or_else(|| event.pointer("/response/error/status"))
+        .or_else(|| event.pointer("/response/error/status_code"))
         .and_then(Value::as_u64)
         .and_then(|status| u16::try_from(status).ok())
 }
@@ -683,6 +718,46 @@ mod tests {
                 .unwrap_err();
             assert!(!error.to_string().contains("opaque"));
         }
+    }
+
+    #[test]
+    fn decoder_classifies_code_only_transient_events_as_stream_failures() {
+        for event in [
+            json!({
+                "type":"response.failed",
+                "response":{"error":{"code":"server_error","message":"try again"}}
+            }),
+            json!({
+                "type":"error",
+                "code":"rate_limit_exceeded",
+                "message":"slow down"
+            }),
+        ] {
+            let mut decoder = ResponsesSseDecoder::default();
+            let error = decoder
+                .push_chunk(sse_event(event).as_bytes(), &mut |_| {})
+                .unwrap_err();
+
+            assert!(matches!(error, ResponsesError::StreamFailure { .. }));
+        }
+    }
+
+    #[test]
+    fn decoder_keeps_deterministic_code_only_error_terminal() {
+        let mut decoder = ResponsesSseDecoder::default();
+        let error = decoder
+            .push_chunk(
+                sse_event(json!({
+                    "type":"error",
+                    "code":"invalid_request_error",
+                    "message":"invalid input"
+                }))
+                .as_bytes(),
+                &mut |_| {},
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, ResponsesError::Failed { .. }));
     }
 
     #[test]
