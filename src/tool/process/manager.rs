@@ -2545,7 +2545,7 @@ mod tests {
                 .await
         });
 
-        let replacement = tokio::time::timeout(Duration::from_millis(200), reservation)
+        let replacement = tokio::time::timeout(Duration::from_secs(5), reservation)
             .await
             .expect("new reservation must not await evicted entry cleanup")
             .expect("reservation task should not panic")
@@ -2555,12 +2555,9 @@ mod tests {
             .find_for_owner(&ProcessOwner::main("session"), replacement.id.as_str())
             .await
             .is_some());
-        tokio::time::timeout(
-            Duration::from_millis(200),
-            cleanup_gate.wait_until_entered(),
-        )
-        .await
-        .expect("eviction cleanup must run detached from the successful reservation");
+        tokio::time::timeout(Duration::from_secs(5), cleanup_gate.wait_until_entered())
+            .await
+            .expect("eviction cleanup must run detached from the successful reservation");
         cleanup_gate.release();
     }
 

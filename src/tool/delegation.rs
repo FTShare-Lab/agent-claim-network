@@ -183,6 +183,10 @@ impl ToolRegistry {
                 active
             }
         };
+        #[cfg(test)]
+        if let Some(notify) = &host.wait_subagents_snapshot_resolved {
+            notify.notify_one();
+        }
         let cancellation = context.cancellation.unwrap_or_default();
         let deadline = time::Instant::now() + timeout;
 
@@ -197,6 +201,13 @@ impl ToolRegistry {
                 ));
             }
 
+            let activity_changed = async {
+                #[cfg(test)]
+                if let Some(notify) = &host.wait_subagents_blocking {
+                    notify.notify_one();
+                }
+                activity_rx.changed().await
+            };
             tokio::select! {
                 _ = time::sleep_until(deadline) => {
                     let state = load_wait_subagents_state(runner.store(), &waited_ids).await?;
@@ -207,7 +218,7 @@ impl ToolRegistry {
                     };
                     return Ok(wait_subagents_response(outcome, until, waited_ids, state));
                 }
-                changed = activity_rx.changed() => {
+                changed = activity_changed => {
                     if changed.is_err() {
                         return Err(ToolError::Delegation(
                             "wait_subagents activity channel closed unexpectedly".into(),

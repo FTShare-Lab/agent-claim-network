@@ -519,7 +519,7 @@ impl ProviderAdapter for ConcurrentCompactionRecapProvider {
         if request.system_prompt.contains("session 历史压缩")
             || request.system_prompt.contains("committed_summary")
         {
-            tokio::time::timeout(Duration::from_millis(200), self.recap_started.notified())
+            tokio::time::timeout(Duration::from_secs(5), self.recap_started.notified())
                 .await
                 .map_err(|_| {
                     anyhow::anyhow!("recap provider request did not start concurrently")
@@ -3668,7 +3668,7 @@ async fn aborted_turn_rolls_back_new_file_read_authority() {
             .await
     });
     tokio::time::timeout(
-        Duration::from_secs(1),
+        Duration::from_secs(5),
         provider.second_call_started.notified(),
     )
     .await
@@ -3676,7 +3676,7 @@ async fn aborted_turn_rolls_back_new_file_read_authority() {
     turn.abort();
     assert!(turn.await.unwrap_err().is_cancelled());
 
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if tools
                 .begin_file_read_state_checkpoint(&session_id, "probe")
@@ -6262,17 +6262,23 @@ async fn failed_continuation_chain_preserves_earlier_unresolved_context() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn turn_journal_emitter_flushes_delta_by_timer_without_next_delta() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut emitter = TurnJournalEmitter::new(tx, Duration::from_millis(5), 1024);
+    tokio::task::yield_now().await;
 
     emitter.assistant_delta("partial".into());
+    tokio::time::advance(Duration::from_millis(4)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        rx.try_recv().is_err(),
+        "assistant delta must remain buffered before the configured interval"
+    );
+    tokio::time::advance(Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
 
-    let command = tokio::time::timeout(Duration::from_millis(100), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let command = rx.recv().await.unwrap();
     match command.kind {
         TurnJournalEventKind::AssistantDelta { text } => assert_eq!(text, "partial"),
         other => panic!("unexpected journal command: {other:?}"),

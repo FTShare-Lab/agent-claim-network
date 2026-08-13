@@ -324,6 +324,10 @@ struct DelegationToolHost {
     executor: Arc<dyn DelegationExecutor>,
     config: DelegationRunnerConfig,
     runners: Arc<StdMutex<BTreeMap<SessionId, DelegationRunner>>>,
+    #[cfg(test)]
+    wait_subagents_snapshot_resolved: Option<Arc<tokio::sync::Notify>>,
+    #[cfg(test)]
+    wait_subagents_blocking: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl DelegationToolHost {
@@ -339,6 +343,10 @@ impl DelegationToolHost {
             executor,
             config,
             runners: Arc::new(StdMutex::new(BTreeMap::new())),
+            #[cfg(test)]
+            wait_subagents_snapshot_resolved: None,
+            #[cfg(test)]
+            wait_subagents_blocking: None,
         }
     }
 

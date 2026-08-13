@@ -4308,16 +4308,13 @@ mod tests {
 
         let refresh_manager = Arc::clone(&manager);
         let refresh = tokio::spawn(async move { refresh_manager.refresh_all().await });
-        for _ in 0..20 {
-            if tokio::fs::try_exists(&attempts_path).await.unwrap() {
-                break;
+        time::timeout(Duration::from_secs(5), async {
+            while !tokio::fs::try_exists(&attempts_path).await.unwrap() {
+                time::sleep(Duration::from_millis(10)).await;
             }
-            time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            tokio::fs::try_exists(&attempts_path).await.unwrap(),
-            "fixture 应先记录首次连接尝试"
-        );
+        })
+        .await
+        .expect("fixture 应先记录首次连接尝试");
 
         manager.disable_server("retry_server").await.unwrap();
         refresh.await.unwrap().unwrap();

@@ -18,7 +18,7 @@ use crate::claim::{
 use crate::config::ToolConfig;
 use crate::delegation::{
     DelegationCreateRequest, DelegationExecutionContext, DelegationExecutionError,
-    DelegationExecutionOutcome, DelegationProgressSink, DelegationStore,
+    DelegationExecutionOutcome, DelegationProgressSink, DelegationStatus, DelegationStore,
 };
 use crate::router::{
     CandidateClaim, DisputeRef, RetrievalDebug, RouterQueryResult, ScopeOverviewItem,
@@ -217,9 +217,11 @@ impl DelegationExecutor for ImmediateDelegationExecutor {
 
 struct WaitingDelegationExecutor {
     slow_started: Arc<Notify>,
+    late_started: Arc<Notify>,
     progress_gate: Arc<Notify>,
     progress_recorded: Arc<Notify>,
     release: Arc<Notify>,
+    late_release: Arc<Notify>,
 }
 
 #[async_trait]
@@ -232,6 +234,15 @@ impl DelegationExecutor for WaitingDelegationExecutor {
         if context.metadata.title == "fast" {
             return Ok(DelegationExecutionOutcome {
                 summary: "fast completed".into(),
+                changed_files: Vec::new(),
+                artifacts: Vec::new(),
+            });
+        }
+        if context.metadata.title == "late" {
+            self.late_started.notify_one();
+            self.late_release.notified().await;
+            return Ok(DelegationExecutionOutcome {
+                summary: "late completed".into(),
                 changed_files: Vec::new(),
                 artifacts: Vec::new(),
             });
@@ -257,22 +268,33 @@ async fn wait_test_registry() -> (
     Arc<ToolRegistry>,
     SessionId,
     Arc<WaitingDelegationExecutor>,
+    DelegationStore,
+    Arc<Notify>,
+    Arc<Notify>,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let agents_root = dir.path().join("agents");
     let agent_home = agents_root.join("agent-a");
     let agent_id = AgentId::new("agent-a").unwrap();
     let session_id = SessionId::from_str("session_1234abcd").unwrap();
+    let delegation_store = DelegationStore::new_for_session(
+        crate::storage::paths::agent_home_session_dir(&agent_home, &session_id),
+        session_id.clone(),
+    );
     SessionStore::new(agents_root)
         .create_with_id_factory(&agent_id, "system", || session_id.clone(), 1)
         .await
         .unwrap();
     let executor = Arc::new(WaitingDelegationExecutor {
         slow_started: Arc::new(Notify::new()),
+        late_started: Arc::new(Notify::new()),
         progress_gate: Arc::new(Notify::new()),
         progress_recorded: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
+        late_release: Arc::new(Notify::new()),
     });
+    let wait_snapshot_resolved = Arc::new(Notify::new());
+    let wait_blocking = Arc::new(Notify::new());
     let registry = Arc::new(
         ToolRegistry::new(&test_tool_config(dir.path()))
             .unwrap()
@@ -282,16 +304,28 @@ async fn wait_test_registry() -> (
                 executor.clone(),
                 DelegationRunnerConfig {
                     max_concurrent: 2,
-                    wall_timeout: Duration::from_secs(5),
+                    wall_timeout: Duration::from_secs(15),
                     wait: DelegationWaitConfig {
                         default_timeout: Duration::from_secs(1),
                         min_timeout: Duration::from_secs(1),
-                        max_timeout: Duration::from_secs(2),
+                        max_timeout: Duration::from_secs(10),
                     },
                 },
+            )
+            .with_wait_subagents_snapshot_notify(
+                Arc::clone(&wait_snapshot_resolved),
+                Arc::clone(&wait_blocking),
             ),
     );
-    (dir, registry, session_id, executor)
+    (
+        dir,
+        registry,
+        session_id,
+        executor,
+        delegation_store,
+        wait_snapshot_resolved,
+        wait_blocking,
+    )
 }
 
 async fn create_wait_test_subagent(
