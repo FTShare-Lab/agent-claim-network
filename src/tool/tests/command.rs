@@ -92,10 +92,11 @@ async fn code_run_tty_uses_fixed_size_and_accepts_interactive_input() {
         .unwrap();
     assert_eq!(running.outcome, ToolExecutionOutcome::ProcessRunning);
     assert_eq!(running.output["tty"], true);
-    assert!(running.output["stdout"]
+    let initial_stdout = running.output["stdout"]
         .as_str()
-        .is_some_and(|stdout| stdout.contains("31 97")));
-    let process_id = running.output["process_id"].as_str().unwrap();
+        .unwrap_or_default()
+        .to_string();
+    let process_id = running.output["process_id"].as_str().unwrap().to_string();
     acknowledge_process_output(&registry, &running).await;
     let completed = registry
         .dispatch(
@@ -109,9 +110,16 @@ async fn code_run_tty_uses_fixed_size_and_accepts_interactive_input() {
         .await
         .unwrap();
     assert_eq!(completed.output["success"], true);
-    assert!(completed.output["stdout"]
-        .as_str()
-        .is_some_and(|stdout| stdout.contains("reply=hello")));
+    let completed_stdout = completed.output["stdout"].as_str().unwrap_or_default();
+    let full_stdout = format!("{initial_stdout}{completed_stdout}");
+    assert!(
+        full_stdout.contains("31 97"),
+        "PTY did not report the configured size; stdout={full_stdout:?}"
+    );
+    assert!(
+        full_stdout.contains("reply=hello"),
+        "PTY did not accept interactive input; stdout={full_stdout:?}"
+    );
 }
 
 #[tokio::test]
