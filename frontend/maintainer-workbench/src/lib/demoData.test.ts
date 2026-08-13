@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
+import type {
+  AnalysisListResponse,
+  ArbitrationAnalysisDetail,
+  DisputeDetail,
+} from '../features/disputes/types'
 import {
   demoAgents,
   demoAudits,
@@ -16,6 +21,8 @@ import {
 const ID_PATTERNS = {
   claim: /^claim_[0-9a-f]{8}$/,
   dispute: /^dispute_[0-9a-f]{8}$/,
+  arbitration: /^arbitration_[0-9a-f]{8}$/,
+  analysis: /^analysis_[0-9a-f]{16}$/,
   policy: /^policy_[0-9a-f]{8}$/,
   inbox: /^inbox_[0-9a-f]{8}$/,
   action: /^intent_[0-9a-f]{8}$/,
@@ -45,6 +52,9 @@ describe('public demo data contract', () => {
 
     for (const dispute of demoDisputes) {
       expect(dispute.claims.every((claimId) => claimIds.has(claimId))).toBe(true)
+      if (dispute.resolution) {
+        expect(dispute.resolution.resolution_id).toMatch(ID_PATTERNS.arbitration)
+      }
     }
     for (const view of demoClaims) {
       expect(
@@ -233,6 +243,35 @@ describe('public demo data contract', () => {
       }
     }
     expect(demoAudits.some((audit) => audit.path === '/claims/upload')).toBe(true)
+  })
+
+  it('serves consistent dispute detail, analysis, and resolution routes', async () => {
+    const resolved = demoDisputes.find((dispute) => dispute.status === 'resolved')
+    const open = demoDisputes.find((dispute) => dispute.status === 'open')
+    expect(resolved?.resolution).toBeDefined()
+    expect(open).toBeDefined()
+
+    const detail = await requestStaticDemoData<DisputeDetail>(
+      `/api/disputes/${resolved!.id}`,
+    )
+    const analyses = await requestStaticDemoData<AnalysisListResponse>(
+      `/api/disputes/${resolved!.id}/analyses`,
+    )
+    const analysisId = analyses.automatic_analysis!.analysis_id
+    expect(analysisId).toMatch(ID_PATTERNS.analysis)
+    const analysis = await requestStaticDemoData<ArbitrationAnalysisDetail>(
+      `/api/disputes/${resolved!.id}/analyses/${analysisId}`,
+    )
+
+    expect(detail.resolution).toEqual(resolved!.resolution)
+    expect(detail.automatic_analysis).toEqual(analyses.automatic_analysis)
+    expect(detail.holder_adoption?.summary.converged).toBe(1)
+    expect(analysis.analysis_id).toBe(analysisId)
+    expect(analysis.resolution_id).toBe(resolved!.resolution!.resolution_id)
+
+    await expect(
+      requestStaticDemoData(`/api/disputes/${open!.id}/analyses`),
+    ).resolves.toEqual({})
   })
 
   it('keeps policy statements textual and rejects public-demo writes', async () => {

@@ -4,8 +4,9 @@ import {
   orderActionsByCreatedAt,
   orderAgentsByRecentActivity,
   orderClaimsByStatusAndRecentChange,
+  orderDisputesByStatusAndRecentChange,
   orderOutboxByCreatedAt,
-  orderPoliciesByStatusAndPublishedAt,
+  orderPoliciesByTypeAndRecentChange,
   orderSendLogBySentAt,
 } from './tableOrdering'
 
@@ -98,35 +99,70 @@ describe('workbench table ordering', () => {
     ])
   })
 
-  it('orders policy history by status, published time, then policy ID', () => {
+  it('orders policy history by message type and most recent change', () => {
     const rows = [
       {
         id: 'policy_44444444',
-        status: 'deprecated' as const,
+        message_type: 'claim_attribute_update' as const,
         created_at: '2026-05-16T10:00:00Z',
       },
       {
         id: 'policy_33333333',
-        status: 'active' as const,
+        message_type: 'policy_update' as const,
         created_at: '2026-05-14T10:00:00Z',
+        updated_at: '2026-05-17T10:00:00Z',
       },
       {
         id: 'policy_22222222',
-        status: 'active' as const,
+        message_type: 'policy_update' as const,
         created_at: '2026-05-15T10:00:00Z',
       },
       {
         id: 'policy_11111111',
-        status: 'active' as const,
+        message_type: 'claim_attribute_update' as const,
         created_at: '2026-05-15T10:00:00Z',
       },
     ]
 
-    expect(orderPoliciesByStatusAndPublishedAt(rows).map((row) => row.id)).toEqual([
-      'policy_11111111',
-      'policy_22222222',
+    expect(orderPoliciesByTypeAndRecentChange(rows).map((row) => row.id)).toEqual([
       'policy_33333333',
+      'policy_22222222',
       'policy_44444444',
+      'policy_11111111',
+    ])
+  })
+
+  it('orders open disputes before resolved disputes and each group by recent change', () => {
+    const rows = [
+      {
+        id: 'dispute_44444444',
+        status: 'resolved' as const,
+        created_at: '2026-05-15T10:00:00Z',
+        resolved_at: '2026-05-18T10:00:00Z',
+      },
+      {
+        id: 'dispute_33333333',
+        status: 'open' as const,
+        created_at: '2026-05-16T10:00:00Z',
+      },
+      {
+        id: 'dispute_22222222',
+        status: 'resolved' as const,
+        created_at: '2026-05-14T10:00:00Z',
+        resolved_at: '2026-05-17T10:00:00Z',
+      },
+      {
+        id: 'dispute_11111111',
+        status: 'open' as const,
+        created_at: '2026-05-17T10:00:00Z',
+      },
+    ]
+
+    expect(orderDisputesByStatusAndRecentChange(rows).map((row) => row.id)).toEqual([
+      'dispute_11111111',
+      'dispute_33333333',
+      'dispute_44444444',
+      'dispute_22222222',
     ])
   })
 

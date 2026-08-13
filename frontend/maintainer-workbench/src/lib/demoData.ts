@@ -2,7 +2,14 @@
 import type { AgentView } from '../features/agents/types'
 import type { HttpAuditRecord } from '../features/audits/types'
 import type { ClaimView } from '../features/claims/types'
-import type { Dispute } from '../features/disputes/types'
+import type {
+  AnalysisListResponse,
+  ArbitrationAnalysisDetail,
+  ArbitrationAnalysisSummary,
+  Dispute,
+  DisputeDetail,
+  DisputeResolution,
+} from '../features/disputes/types'
 import type {
   AgentActivityRecord,
   MaintainerActionRow,
@@ -30,6 +37,12 @@ const IDS = {
   disputes: {
     retryBoundary: 'dispute_5c8a2f71',
     routerAuthority: 'dispute_d0946be3',
+  },
+  arbitration: {
+    routerAuthority: 'arbitration_6e14bc92',
+  },
+  analyses: {
+    routerAuthority: 'analysis_d0946be36e14bc92',
   },
   policies: {
     preserveProvenance: 'policy_31e7c9a4',
@@ -157,6 +170,51 @@ export const demoClaims: ClaimView[] = [
 ]
 demoClaims.sort((left, right) => right.claim.created_at.localeCompare(left.claim.created_at))
 
+const demoRouterResolvedAt = ago({ days: 1, hours: 3 })
+const demoRouterResolution: DisputeResolution = {
+  resolution_id: IDS.arbitration.routerAuthority,
+  resolved_by: 'automatic',
+  resolved_at: demoRouterResolvedAt,
+  resolution_type: 'conflict_resolved',
+  resolution_basis: 'evidence',
+  conclusion: 'Router 候选只作为参考上下文；保留 advisory Claim，并废弃把精确 scope 匹配视为授权的旧 Claim。',
+  claim_assessments: [
+    {
+      claim_id: IDS.claims.routerAdvisory,
+      recommended_status: 'active',
+      assessment: '该 Claim 与跨场景证据一致，应继续作为当前团队规则。',
+      reason: '候选来源与本地复核职责需要同时保留。',
+    },
+    {
+      claim_id: IDS.claims.scopeAuthority,
+      recommended_status: 'deprecated',
+      assessment: '精确 scope 匹配不能替代 Agent 的本地判断。',
+      reason: '现有证据不足以把检索相关性提升为授权。',
+    },
+  ],
+}
+const demoRouterAnalysis: ArbitrationAnalysisSummary = {
+  analysis_id: IDS.analyses.routerAuthority,
+  source: 'automatic',
+  state: 'adopted',
+  created_at: ago({ days: 1, hours: 4 }),
+  updated_at: demoRouterResolvedAt,
+  semantic_fingerprint: `sha256-v1:${'6e14bc92'.repeat(8)}`,
+  resolution_id: IDS.arbitration.routerAuthority,
+  adoptable: false,
+  adoption_blocker: 'The analysis has already been adopted.',
+  proposal: {
+    resolution_type: demoRouterResolution.resolution_type!,
+    resolution_basis: demoRouterResolution.resolution_basis!,
+    conclusion: demoRouterResolution.conclusion,
+    claim_assessments: demoRouterResolution.claim_assessments ?? [],
+    confidence: 0.91,
+    evidence_refs: [IDS.claims.routerAdvisory, IDS.claims.scopeAuthority],
+    missing_evidence: [],
+    reasoning: '候选相关性不能取代持有者对当前任务上下文的复核。',
+  },
+}
+
 export const demoDisputes: Dispute[] = [
   {
     id: IDS.disputes.retryBoundary,
@@ -175,9 +233,31 @@ export const demoDisputes: Dispute[] = [
     summary: '两条 Claim 对精确 scope 匹配是否构成可信授权给出相反结论。复审认定 scope 只能影响检索排序，不能替代 Agent 的本地判断；保留 advisory 规则，并将“默认接受”Claim 标记为 deprecated，不再作为有效候选参与借用。',
     status: 'resolved',
     created_at: ago({ days: 8 }),
-    resolved_at: ago({ days: 6, hours: 4 }),
+    resolved_at: demoRouterResolvedAt,
+    resolution: demoRouterResolution,
   },
 ]
+
+const demoRouterDisputeSnapshot: Dispute = {
+  id: IDS.disputes.routerAuthority,
+  name: 'router_candidate_authority_conflict',
+  reporter_agent_id: 'research-agent',
+  claims: [IDS.claims.routerAdvisory, IDS.claims.scopeAuthority],
+  summary: demoDisputes[1].summary,
+  status: 'open',
+  created_at: demoDisputes[1].created_at,
+}
+const demoRouterDirectClaims = demoClaims
+  .filter((view) => demoRouterDisputeSnapshot.claims.includes(view.claim.id))
+  .map((view) => view.claim)
+const demoRouterContextHash = `sha256-v1:${'d0946be3'.repeat(8)}`
+const demoRouterResolutionContext = {
+  dispute_id: IDS.disputes.routerAuthority,
+  ...demoRouterResolution,
+  context_snapshot_hash: demoRouterContextHash,
+  dispute_snapshot: demoRouterDisputeSnapshot,
+  direct_claim_snapshots: demoRouterDirectClaims,
+}
 
 export const demoPolicies: Policy[] = [
   {
@@ -315,6 +395,7 @@ const demoOutbox: OutboxEntry[] = [
       id: IDS.inbox.deprecateScopeAuthority,
       message_type: 'claim_attribute_update',
       policy: demoPolicies[1],
+      arbitration_resolution: demoRouterResolutionContext,
     },
   },
   {
@@ -386,6 +467,100 @@ const demoOutbox: OutboxEntry[] = [
     },
   },
 ]
+
+const demoAnalysisLists: Record<string, AnalysisListResponse> = {
+  [IDS.disputes.retryBoundary]: {},
+  [IDS.disputes.routerAuthority]: {
+    automatic_analysis: demoRouterAnalysis,
+  },
+}
+const demoRouterAnalysisDetail: ArbitrationAnalysisDetail = {
+  ...demoRouterAnalysis,
+  frozen_context: {
+    generated_at: demoRouterAnalysis.created_at,
+    dispute: demoRouterDisputeSnapshot,
+    direct_claims: demoRouterDirectClaims,
+    source_claims: [],
+    policies: demoPolicies.filter((policy) => policy.message_type === 'policy_update'),
+    router_candidate_claims: [],
+    router_disputes: [],
+    prior_resolutions: [],
+    warnings: [],
+  },
+  verification: {
+    verdict: 'approve',
+    resolution_type_agreed: true,
+    resolution_basis_agreed: true,
+    conclusion_agreed: true,
+    claim_assessments: demoRouterDirectClaims.map((claim) => ({
+      claim_id: claim.id,
+      agreed: true,
+      reason: 'assessment 与冻结证据一致',
+    })),
+    confidence: 0.94,
+    missing_evidence: [],
+    reasoning: 'proposal 覆盖了两条直接 Claim，且没有把 Router 排名误作授权。',
+  },
+  warnings: [],
+  validation_result: 'valid',
+}
+const demoAnalysisDetails: Record<string, Record<string, ArbitrationAnalysisDetail>> = {
+  [IDS.disputes.retryBoundary]: {},
+  [IDS.disputes.routerAuthority]: {
+    [IDS.analyses.routerAuthority]: demoRouterAnalysisDetail,
+  },
+}
+const demoDisputeDetails: Record<string, DisputeDetail> = {
+  [IDS.disputes.retryBoundary]: demoDisputes[0],
+  [IDS.disputes.routerAuthority]: {
+    ...demoDisputes[1],
+    automatic_analysis: demoRouterAnalysis,
+    holder_adoption: {
+      observed_at: ago({ hours: 12 }),
+      summary: {
+        notified_holders: 1,
+        delivered: 1,
+        converged: 1,
+        diverged: 0,
+        unobserved: 0,
+        unknown: 0,
+      },
+      holders: [
+        {
+          agent_id: 'research-agent',
+          delivery_state: 'delivered',
+          observation_state: 'observed_converged',
+          assessment_count: 2,
+          matched_count: 2,
+          reasons: ['holder mirror 已保留 advisory Claim，并将旧 authority Claim 标记为 deprecated'],
+          last_delivered_at: ago({ hours: 18 }),
+          last_observed_at: ago({ hours: 12 }),
+          claims: (demoRouterResolution.claim_assessments ?? []).map((assessment) => {
+            const current = demoRouterDirectClaims.find((claim) => claim.id === assessment.claim_id)
+            return {
+              claim_id: assessment.claim_id,
+              claim_name: current?.name ?? assessment.claim_id,
+              recommended_status: assessment.recommended_status,
+              current_status: assessment.recommended_status,
+              recommended_scope: assessment.recommended_scope,
+              current_scope: assessment.recommended_scope ?? current?.scope,
+              recommended_statement: assessment.recommended_statement,
+              current_statement: assessment.recommended_statement ?? current?.statement,
+              policy_provenance_present: true,
+              matches: true,
+              mismatch_reasons: [],
+            }
+          }),
+          technical: {
+            policy_id: IDS.policies.deprecateScopeAuthority,
+            inbox_id: IDS.inbox.deprecateScopeAuthority,
+            snapshot_source: 'current mirror',
+          },
+        },
+      ],
+    },
+  },
+}
 
 const demoPolicyEvents: PolicyEventRecord[] = [
   {
@@ -761,6 +936,26 @@ export async function requestStaticDemoData<T>(path: string, init?: RequestInit)
     }
     if (pathname === '/api/agents') return clone(demoAgents) as T
     if (pathname === '/api/disputes') return clone(demoDisputes) as T
+    if (pathname.startsWith('/api/disputes/')) {
+      const segments = pathname
+        .slice('/api/disputes/'.length)
+        .split('/')
+        .map((segment) => decodeURIComponent(segment))
+      const [disputeId, resource, analysisId] = segments
+      const detail = demoDisputeDetails[disputeId]
+      if (!detail) throw new Error(`Unknown demo dispute: ${disputeId}`)
+
+      if (segments.length === 1) return clone(detail) as T
+      if (resource === 'analyses' && segments.length === 2) {
+        return clone(demoAnalysisLists[disputeId] ?? {}) as T
+      }
+      if (resource === 'analyses' && segments.length === 3) {
+        const analysis = demoAnalysisDetails[disputeId]?.[analysisId]
+        if (!analysis) throw new Error(`Unknown demo arbitration analysis: ${analysisId}`)
+        return clone(analysis) as T
+      }
+      throw new Error(`Unknown demo dispute route: ${pathname}`)
+    }
     if (pathname === '/api/policies') return clone(demoPolicyRecords) as T
     if (pathname === '/api/sweeps') return clone(demoSweeps) as T
     if (pathname === '/api/audits') return clone(demoAudits) as T

@@ -314,7 +314,7 @@ export function ClaimsPage() {
               </dl>
             </div>
             <div className="rounded-lg border border-slate-200 p-3">
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Related Claim(s)</div>
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Direct Claim(s)</div>
               <div className="mt-2 flex flex-wrap gap-1">
                 {selectedDispute.claims.map((claimId) => (
                   <button
