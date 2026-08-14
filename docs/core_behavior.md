@@ -91,6 +91,8 @@ Inbox 是 Maintainer 到 Agent 的下行通道。当前支持 `PolicyUpdate` 和
 
 Maintainer 以 receipt ACK、通知 Policy provenance、mirror 更新时间和 assessment 字段派生 `not_delivered`、`delivered_unobserved`、`observed_converged`、`observed_diverged` 或 `unknown`。ACK、相关 Claim 上传与 Resolution 切换定向刷新当前 Resolution；详情读取可按需刷新。旧 Resolution 的 cache 保留且不再更新。Observation 只用于治理可见性。
 
+Workbench 将 Observation 展示为 Resolution 时的 Claim 快照与当前 holder mirror 的前后对照。底层状态仍用于判断送达、是否观察到更新和数据是否可用；界面不把 Agent 是否逐字段采用 Resolution 建议作为评分。
+
 消息的本地生命周期是 pending、claimed、handled：
 
 - pending 可以被处理器领取

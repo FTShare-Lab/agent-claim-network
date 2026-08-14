@@ -121,6 +121,9 @@ export type AnalysisListResponse = {
 export type ClaimAdoptionComparison = {
   claim_id: string
   claim_name: string
+  snapshot_status?: 'active' | 'stale' | 'deprecated' | null
+  snapshot_scope?: string | null
+  snapshot_statement?: string | null
   recommended_status: 'active' | 'stale' | 'deprecated'
   current_status?: 'active' | 'stale' | 'deprecated' | null
   recommended_scope?: string | null

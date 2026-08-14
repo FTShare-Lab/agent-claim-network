@@ -540,6 +540,9 @@ const demoDisputeDetails: Record<string, DisputeDetail> = {
             return {
               claim_id: assessment.claim_id,
               claim_name: current?.name ?? assessment.claim_id,
+              snapshot_status: current?.id === IDS.claims.scopeAuthority ? 'active' : current?.status,
+              snapshot_scope: current?.scope,
+              snapshot_statement: current?.statement,
               recommended_status: assessment.recommended_status,
               current_status: assessment.recommended_status,
               recommended_scope: assessment.recommended_scope,

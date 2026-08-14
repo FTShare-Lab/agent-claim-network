@@ -234,7 +234,8 @@ Observation 只用于治理可见性，不触发 Analysis、Resolution、通知�
 - Automatic Analysis 等待重分析时展示轮次、5/15 分钟等待、下次重试时间与原因。
 - 第三次输入变化后展示“分析输入连续变化，已停止自动处理，等待人工”。
 - resolved Dispute 以当前 Resolution 为主，Analysis 作为只读审计信息。
-- Delivery & Holder Adoption 默认折叠；展开后字段化展示 holder 与逐 Claim 对照。
+- Direct Claim、Analysis 与 Resolution 使用明确的视觉分区；Resolution assessment 标为治理建议，不与 Claim 当前状态混淆。
+- Delivery & Holder Adoption 默认折叠；展开后按 holder 展示 Resolution 时的 Claim 快照与当前 mirror，重点呈现 Agent 的实际内化结果，不以是否逐字段遵循建议作为界面评价。
 - 页面展示唯一 Automatic Analysis、当前 Manual Analysis 与当前 Resolution。
 
 ## 配置

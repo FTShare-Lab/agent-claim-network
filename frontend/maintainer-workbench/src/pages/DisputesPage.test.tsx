@@ -103,7 +103,7 @@ function analysisDetail(analysis: ArbitrationAnalysisSummary): ArbitrationAnalys
       direct_claims: claimsResponse.map((item) => item.claim),
       source_claims: [],
       policies: [{ id: 'policy_team' }],
-      router_candidate_claims: [],
+      router_candidate_claims: [{ id: 'claim_related_a' }, { id: 'claim_related_b' }],
       router_disputes: [],
       prior_resolutions: [],
       warnings: [],
@@ -168,7 +168,7 @@ const resolvedDispute = {
   resolution,
 }
 
-const longRecommendedStatement = '推荐的知识陈述包含明确的版本、部署拓扑、复现条件和操作边界。'.repeat(10)
+const longSnapshotStatement = '裁决时快照中的知识陈述包含明确的版本、部署拓扑、复现条件和操作边界。'.repeat(10)
 const longCurrentStatement = '当前镜像中的知识陈述保留了旧版本默认行为，并包含需要人工复核的运行条件。'.repeat(10)
 
 const resolvedDetail: DisputeDetail = {
@@ -219,11 +219,14 @@ const resolvedDetail: DisputeDetail = {
         claims: [{
           claim_id: 'claim_a',
           claim_name: 'claim-a-name',
+          snapshot_status: 'active',
+          snapshot_scope: 'payments / previous',
+          snapshot_statement: longSnapshotStatement,
           recommended_status: 'deprecated',
           current_status: 'active',
           recommended_scope: 'payments / current',
           current_scope: 'payments / legacy',
-          recommended_statement: longRecommendedStatement,
+          recommended_statement: longSnapshotStatement,
           current_statement: longCurrentStatement,
           policy_provenance_present: false,
           matches: false,
@@ -398,6 +401,9 @@ describe('DisputesPage', () => {
     expect(automatic).toHaveTextContent('不建议修改 Claim')
     expect(within(automatic).queryByText(/Direct Claim assessments/)).not.toBeInTheDocument()
     expect(within(automatic).queryByRole('button', { name: '采用此分析' })).not.toBeInTheDocument()
+    fireEvent.click(await within(automatic).findByText('Analysis context summary'))
+    expect(automatic).toHaveTextContent('Related Claims in context2')
+    expect(automatic).not.toHaveTextContent('Router candidates')
     expect(await within(drawer).findByRole('article', { name: 'Manual analysis analysis_manual_latest' })).toHaveTextContent('approved')
     expect(within(drawer).queryByRole('button', { name: /manual analysis history/i })).not.toBeInTheDocument()
     expect(within(drawer).queryByText('Attempt Timeline')).not.toBeInTheDocument()
@@ -530,34 +536,41 @@ describe('DisputesPage', () => {
     render(renderWorkbenchRoute('/disputes'))
     fireEvent.click(await screen.findByText('Already resolved'))
     const drawer = await screen.findByRole('dialog', { name: 'Already resolved' })
-    expect(await within(drawer).findByRole('region', { name: 'Current resolution' })).toHaveTextContent('automatic conclusion')
+    const currentResolution = await within(drawer).findByRole('region', { name: 'Current resolution' })
+    expect(currentResolution).toHaveTextContent('automatic conclusion')
+    expect(currentResolution).toHaveTextContent('Resolution recommendations')
+    expect(currentResolution).toHaveTextContent('not the Claims\' current status')
+    expect(currentResolution).toHaveTextContent('Recommended · active')
     expect(within(drawer).queryByRole('button', { name: /decision chain/i })).not.toBeInTheDocument()
     expect(within(drawer).queryByText(/Cannot adopt:/)).not.toBeInTheDocument()
     expect(within(drawer).queryByText('Approved，但采用被阻止')).not.toBeInTheDocument()
     expect(within(drawer).queryByText('Dispute 已经被其他 Decision 解决')).not.toBeInTheDocument()
+    expect(within(drawer).queryByRole('button', { name: 'Analyze' })).not.toBeInTheDocument()
+    expect(within(drawer).queryByRole('button', { name: 'Resolve Dispute' })).not.toBeInTheDocument()
   })
 
-  it('shows adoption summary while collapsed and five holder states after expansion', async () => {
+  it('summarizes observed updates without scoring recommendation compliance', async () => {
     render(renderWorkbenchRoute('/disputes'))
     fireEvent.click(await screen.findByText('Already resolved'))
     const panel = await screen.findByRole('region', { name: 'Delivery and holder adoption' })
 
     await waitFor(() => expect(panel).toHaveTextContent('Notified5'))
     expect(panel).toHaveTextContent('Delivered4')
-    expect(panel).toHaveTextContent('Converged1')
-    expect(panel).toHaveTextContent('Diverged1')
-    expect(panel).toHaveTextContent('Unobserved / unknown2')
+    expect(panel).toHaveTextContent('Observed updates2')
+    expect(panel).toHaveTextContent('Awaiting update1')
+    expect(panel).toHaveTextContent('Mirror unavailable1')
+    expect(panel).not.toHaveTextContent('Converged')
+    expect(panel).not.toHaveTextContent('Diverged')
     expect(within(panel).queryByText('agent-diverged')).not.toBeInTheDocument()
 
     fireEvent.click(within(panel).getByRole('button', { name: 'Show holder adoption' }))
     expect(within(panel).getByText('尚未送达')).toBeInTheDocument()
-    expect(within(panel).getByText('已送达，尚未观察到关联更新')).toBeInTheDocument()
-    expect(within(panel).getByText('已观察到采纳')).toBeInTheDocument()
-    expect(within(panel).getByText('已更新但与建议不一致')).toBeInTheDocument()
-    expect(within(panel).getByText('当前无法判断')).toBeInTheDocument()
+    expect(within(panel).getByText('已送达，等待 Agent 更新')).toBeInTheDocument()
+    expect(within(panel).getAllByText('已观察到 Agent 更新')).toHaveLength(2)
+    expect(within(panel).getByText('当前 Claim mirror 不可用')).toBeInTheDocument()
   })
 
-  it('renders Claim adoption comparison, long-text toggles, and structured technical fields', async () => {
+  it('renders Claim snapshots before and after Agent internalization', async () => {
     render(renderWorkbenchRoute('/disputes'))
     fireEvent.click(await screen.findByText('Already resolved'))
     const panel = await screen.findByRole('region', { name: 'Delivery and holder adoption' })
@@ -565,16 +578,20 @@ describe('DisputesPage', () => {
     fireEvent.click(within(panel).getByRole('button', { name: 'Show holder adoption' }))
     const holder = within(panel).getByRole('article', { name: 'Holder adoption agent-diverged' })
 
-    fireEvent.click(within(holder).getByText('Claim comparison (1)'))
+    fireEvent.click(within(holder).getByText('Before / after (1)'))
     const comparison = within(holder).getByRole('article', { name: 'Claim adoption claim_a' })
-    expect(comparison).toHaveTextContent('Recommended status')
-    expect(comparison).toHaveTextContent('Current status')
-    expect(comparison).toHaveTextContent('Missing')
-    expect(comparison).not.toHaveTextContent(longRecommendedStatement)
+    expect(comparison).toHaveTextContent('Before · Resolution snapshot')
+    expect(comparison).toHaveTextContent('After · Current Agent Claim')
+    expect(comparison).toHaveTextContent('payments / previous')
+    expect(comparison).toHaveTextContent('payments / legacy')
+    expect(comparison).not.toHaveTextContent('Recommended status')
+    expect(comparison).not.toHaveTextContent('Matched')
+    expect(comparison).not.toHaveTextContent('Mismatch')
+    expect(comparison).not.toHaveTextContent(longSnapshotStatement)
     fireEvent.click(within(comparison).getAllByRole('button', { name: '展开全文' })[0])
-    expect(comparison).toHaveTextContent(longRecommendedStatement)
+    expect(comparison).toHaveTextContent(longSnapshotStatement)
     fireEvent.click(within(comparison).getByRole('button', { name: '收起全文' }))
-    expect(comparison).not.toHaveTextContent(longRecommendedStatement)
+    expect(comparison).not.toHaveTextContent(longSnapshotStatement)
 
     fireEvent.click(within(holder).getByText('技术详情'))
     expect(holder).toHaveTextContent('Policy ID:')

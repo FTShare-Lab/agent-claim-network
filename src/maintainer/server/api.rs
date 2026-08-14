@@ -19,7 +19,7 @@ use crate::claim::{
 use crate::maintainer::arbitration::{
     is_analysis_conflict, is_analysis_retry, AnalysisError, AnalysisJob, AnalysisPhase,
     AnalysisSource, AnalysisState, ArbitrationAnalysis, ArbitrationAnalysisId, ArbitrationProposal,
-    ArbitrationResolutionRecord, ArbitrationStore, ArbitrationVerification,
+    ArbitrationResolutionRecord, ArbitrationStore, ArbitrationVerification, ClaimObservation,
     FrozenArbitrationContext, HumanResolutionInput, MaintainerDisputeRecord, ObservationService,
     ObservationState, RejectResolutionInput, ResolutionObservation, ResolutionService,
 };
@@ -221,6 +221,9 @@ pub struct HolderAdoptionSummary {
 pub struct HolderClaimAdoptionView {
     pub claim_id: ClaimId,
     pub claim_name: String,
+    pub snapshot_status: Option<ClaimStatus>,
+    pub snapshot_scope: Option<String>,
+    pub snapshot_statement: Option<String>,
     pub recommended_status: ClaimStatus,
     pub current_status: Option<ClaimStatus>,
     pub recommended_scope: Option<String>,
@@ -653,18 +656,8 @@ fn holder_adoption_view(
                 claims: holder
                     .claims
                     .iter()
-                    .map(|claim| HolderClaimAdoptionView {
-                        claim_id: claim.claim_id.clone(),
-                        claim_name: claim.claim_name.clone(),
-                        recommended_status: claim.recommended_status,
-                        current_status: claim.current_status,
-                        recommended_scope: claim.recommended_scope.clone(),
-                        current_scope: claim.current_scope.clone(),
-                        recommended_statement: claim.recommended_statement.clone(),
-                        current_statement: claim.current_statement.clone(),
-                        policy_provenance_present: claim.policy_provenance_present,
-                        matches: claim.matched,
-                        mismatch_reasons: claim.mismatch_reasons.clone(),
+                    .map(|claim| {
+                        holder_claim_adoption_view(&resolution_record.direct_claim_snapshots, claim)
                     })
                     .collect(),
                 technical: HolderAdoptionTechnicalView {
@@ -701,6 +694,31 @@ fn holder_adoption_view(
                 .count(),
         },
         holders,
+    }
+}
+
+fn holder_claim_adoption_view(
+    snapshots: &[Claim],
+    claim: &ClaimObservation,
+) -> HolderClaimAdoptionView {
+    let snapshot = snapshots
+        .iter()
+        .find(|snapshot| snapshot.id == claim.claim_id);
+    HolderClaimAdoptionView {
+        claim_id: claim.claim_id.clone(),
+        claim_name: claim.claim_name.clone(),
+        snapshot_status: snapshot.map(|snapshot| snapshot.status),
+        snapshot_scope: snapshot.map(|snapshot| snapshot.scope.clone()),
+        snapshot_statement: snapshot.map(|snapshot| snapshot.statement.clone()),
+        recommended_status: claim.recommended_status,
+        current_status: claim.current_status,
+        recommended_scope: claim.recommended_scope.clone(),
+        current_scope: claim.current_scope.clone(),
+        recommended_statement: claim.recommended_statement.clone(),
+        current_statement: claim.current_statement.clone(),
+        policy_provenance_present: claim.policy_provenance_present,
+        matches: claim.matched,
+        mismatch_reasons: claim.mismatch_reasons.clone(),
     }
 }
 
@@ -1997,6 +2015,42 @@ mod tests {
             source_claim_ids: vec![],
             evidence_summary: "summary".into(),
         }
+    }
+
+    #[test]
+    fn holder_adoption_projects_resolution_snapshot_and_current_mirror() {
+        let holder = AgentId::new("agent-a").unwrap();
+        let mut snapshot = sample_claim(&holder, ClaimStatus::Active, now_seconds());
+        snapshot.scope = "runtime / previous".into();
+        snapshot.statement = "previous production behavior".into();
+        let observation = ClaimObservation {
+            claim_id: snapshot.id.clone(),
+            claim_name: snapshot.name.clone(),
+            recommended_status: ClaimStatus::Deprecated,
+            current_status: Some(ClaimStatus::Stale),
+            recommended_scope: None,
+            current_scope: Some("runtime / current".into()),
+            recommended_statement: None,
+            current_statement: Some("current production behavior".into()),
+            policy_provenance_present: true,
+            matched: false,
+            mismatch_reasons: vec!["recommendation mismatch".into()],
+        };
+
+        let view = holder_claim_adoption_view(&[snapshot], &observation);
+
+        assert_eq!(view.snapshot_status, Some(ClaimStatus::Active));
+        assert_eq!(view.snapshot_scope.as_deref(), Some("runtime / previous"));
+        assert_eq!(
+            view.snapshot_statement.as_deref(),
+            Some("previous production behavior")
+        );
+        assert_eq!(view.current_status, Some(ClaimStatus::Stale));
+        assert_eq!(view.current_scope.as_deref(), Some("runtime / current"));
+        assert_eq!(
+            view.current_statement.as_deref(),
+            Some("current production behavior")
+        );
     }
 
     async fn seed_claim(team_root: &std::path::Path, claim: &Claim) {

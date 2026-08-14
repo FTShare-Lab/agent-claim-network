@@ -48,7 +48,7 @@ export function AnalysisCard({ analysis, label, onAdopt, adopting = false, compa
   // “等待重分析”或“采用被阻止”等仅对 open Dispute 有意义的操作状态。
   const status = resolutionClosed ? undefined : analysisStatus(analysis)
   return (
-    <article aria-label={`${label} ${analysis.analysis_id}`} className="rounded-md border border-slate-200 bg-white p-3">
+    <article aria-label={`${label} ${analysis.analysis_id}`} className="rounded-lg border border-violet-200 bg-white p-3 shadow-sm">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div>
           <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">{label}</div>
@@ -205,7 +205,7 @@ export function AnalysisCard({ analysis, label, onAdopt, adopting = false, compa
             <div><dt className="text-slate-500">Direct Claims</dt><dd className="font-semibold">{detail.frozen_context.direct_claims.length}</dd></div>
             <div><dt className="text-slate-500">Source Claims</dt><dd className="font-semibold">{detail.frozen_context.source_claims.length}</dd></div>
             <div><dt className="text-slate-500">Policies</dt><dd className="font-semibold">{detail.frozen_context.policies.length}</dd></div>
-            <div><dt className="text-slate-500">Router candidates</dt><dd className="font-semibold">{detail.frozen_context.router_candidate_claims.length}</dd></div>
+            <div><dt className="text-slate-500">Related Claims in context</dt><dd className="font-semibold">{detail.frozen_context.router_candidate_claims.length}</dd></div>
             <div><dt className="text-slate-500">Prior resolutions</dt><dd className="font-semibold">{detail.frozen_context.prior_resolutions.length}</dd></div>
             <div><dt className="text-slate-500">Frozen at</dt><dd className="font-mono">{formatDateTime(detail.frozen_context.generated_at)}</dd></div>
           </dl>
@@ -240,7 +240,7 @@ export function AnalysisCard({ analysis, label, onAdopt, adopting = false, compa
       {!resolutionClosed && analysis.adoptable && analysis.state === 'approved' && onAdopt ? (
         <button
           type="button"
-          className="mt-3 rounded-md bg-blue-700 px-3 py-1.5 text-sm font-semibold text-white disabled:bg-slate-300"
+          className="mt-3 rounded-md bg-violet-700 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-violet-800 disabled:bg-slate-300"
           disabled={adopting}
           onClick={() => onAdopt(analysis.analysis_id)}
         >

@@ -4,7 +4,7 @@ import { useSearchParams } from 'react-router'
 import { StatusBadge } from '../components/badges/StatusBadge'
 import { DataTable } from '../components/data-table/DataTable'
 import { DetailDrawer } from '../components/drawer/DetailDrawer'
-import { DetailTextBlock } from '../components/drawer/DetailTextBlock'
+import { DrawerSection } from '../components/drawer/DrawerSection'
 import { FilterBar } from '../components/filters/FilterBar'
 import { PaginationBar } from '../components/pagination/PaginationBar'
 import { useDisputesQuery } from '../features/disputes/hooks'
@@ -254,9 +254,8 @@ export function ClaimsPage() {
       >
         {selectedClaim.data ? (
           <>
-            <div className="rounded-lg border border-slate-200 p-3">
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Overview</div>
-              <dl className="mt-2 space-y-2 text-sm">
+            <DrawerSection title="Overview">
+              <dl className="space-y-2 text-sm">
                 <div className="flex justify-between gap-3"><dt className="text-slate-500">Holder Agent</dt><dd className="font-mono text-xs text-slate-900">{selectedClaim.data.claim.holder}</dd></div>
                 <div className="flex justify-between gap-3"><dt className="text-slate-500">Status</dt><dd><StatusBadge>{selectedClaim.data.claim.status}</StatusBadge></dd></div>
                 <div className="flex justify-between gap-3"><dt className="text-slate-500">Confidence</dt><dd className="font-medium capitalize text-slate-900">{selectedClaim.data.claim.confidence}</dd></div>
@@ -265,11 +264,10 @@ export function ClaimsPage() {
                   <div className="flex justify-between gap-3"><dt className="text-slate-500">Updated At</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedClaim.data.claim.updated_at)}</dd></div>
                 ) : null}
               </dl>
-            </div>
-            <div className="rounded-lg border border-slate-200 p-3">
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Related Disputes</div>
+            </DrawerSection>
+            <DrawerSection title="Related Disputes">
               {selectedClaim.data.open_dispute_ids.length || selectedClaim.data.resolved_dispute_ids.length ? (
-                <div className="mt-2 flex flex-wrap gap-1">
+                <div className="flex flex-wrap gap-1">
                   {[...selectedClaim.data.open_dispute_ids, ...selectedClaim.data.resolved_dispute_ids].map((disputeId) => (
                     <button
                       key={disputeId}
@@ -282,40 +280,44 @@ export function ClaimsPage() {
                   ))}
                 </div>
               ) : (
-                <div className="mt-2 text-xs text-slate-500">No disputes</div>
+                <div className="text-xs text-slate-500">No disputes</div>
               )}
-            </div>
-            <div className="rounded-lg border border-slate-200 p-3">
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Scope</div>
-              <div className="mt-2 text-xs leading-5 text-slate-600">{selectedClaim.data.claim.scope}</div>
-            </div>
-            <div className="rounded-lg border border-slate-200 p-3">
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Statement</div>
-              <div className="mt-2 text-xs leading-5 text-slate-600">{selectedClaim.data.claim.statement}</div>
-            </div>
-            <div className="rounded-lg border border-slate-200 p-3">
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Evidence Summary</div>
-              <div className="mt-2 text-xs leading-5 text-slate-600">{selectedClaim.data.claim.evidence_summary}</div>
-            </div>
-            <div className="rounded-lg border border-slate-200 p-3">
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Source IDs</div>
-              <DetailTextBlock className="mt-2">{JSON.stringify(selectedClaim.data.claim.source_claim_ids, null, 2)}</DetailTextBlock>
-            </div>
+            </DrawerSection>
+            <DrawerSection title="Scope" tone="claim">
+              <div className="text-sm leading-6 text-slate-900">{selectedClaim.data.claim.scope}</div>
+            </DrawerSection>
+            <DrawerSection title="Statement" tone="claim">
+              <div className="whitespace-pre-wrap text-sm leading-6 text-slate-900">{selectedClaim.data.claim.statement}</div>
+            </DrawerSection>
+            <DrawerSection title="Evidence Summary" tone="claim">
+              <div className="whitespace-pre-wrap text-sm leading-6 text-slate-800">{selectedClaim.data.claim.evidence_summary}</div>
+            </DrawerSection>
+            <DrawerSection title="Source IDs" tone="claim">
+              {selectedClaim.data.claim.source_claim_ids.length ? (
+                <div className="flex flex-wrap gap-1">
+                  {selectedClaim.data.claim.source_claim_ids.map((sourceId) => (
+                    <span key={sourceId} className="rounded bg-white px-1.5 py-0.5 font-mono text-[11px] text-slate-700 ring-1 ring-blue-100">
+                      {sourceId}
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-xs text-slate-500">No sources</div>
+              )}
+            </DrawerSection>
           </>
         ) : selectedDispute ? (
           <>
-            <div className="rounded-lg border border-slate-200 p-3">
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Overview</div>
-              <dl className="mt-2 space-y-2 text-sm">
+            <DrawerSection title="Overview">
+              <dl className="space-y-2 text-sm">
                 <div className="flex justify-between gap-3"><dt className="text-slate-500">Status</dt><dd><StatusBadge tone={selectedDispute.status === 'open' ? 'danger' : 'success'}>{selectedDispute.status}</StatusBadge></dd></div>
                 <div className="flex justify-between gap-3"><dt className="text-slate-500">Severity</dt><dd><StatusBadge tone={severityTone(selectedDispute)}>{severityFromDispute(selectedDispute)}</StatusBadge></dd></div>
                 <div className="flex justify-between gap-3"><dt className="text-slate-500">Created At</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedDispute.created_at)}</dd></div>
                 <div className="flex justify-between gap-3"><dt className="text-slate-500">Updated At</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedDispute.resolved_at ?? selectedDispute.created_at)}</dd></div>
               </dl>
-            </div>
-            <div className="rounded-lg border border-slate-200 p-3">
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Direct Claim(s)</div>
-              <div className="mt-2 flex flex-wrap gap-1">
+            </DrawerSection>
+            <DrawerSection title="Direct Claim(s)" tone="claim">
+              <div className="flex flex-wrap gap-1">
                 {selectedDispute.claims.map((claimId) => (
                   <button
                     key={claimId}
@@ -327,15 +329,10 @@ export function ClaimsPage() {
                   </button>
                 ))}
               </div>
-            </div>
-            <div className="rounded-lg border border-slate-200 p-3">
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Summary</div>
-              <div className="mt-2 text-xs leading-5 text-slate-600">{selectedDispute.summary}</div>
-            </div>
-            <div className="rounded-lg border border-slate-200 p-3">
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Source IDs</div>
-              <DetailTextBlock className="mt-2">{JSON.stringify(selectedDispute.claims, null, 2)}</DetailTextBlock>
-            </div>
+            </DrawerSection>
+            <DrawerSection title="Summary">
+              <div className="whitespace-pre-wrap text-sm leading-6 text-slate-800">{selectedDispute.summary}</div>
+            </DrawerSection>
           </>
         ) : null}
       </DetailDrawer>

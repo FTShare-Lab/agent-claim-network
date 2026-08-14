@@ -11,78 +11,69 @@ import { ExpandableText } from './ExpandableText'
 
 const observationLabels: Record<HolderAdoption['observation_state'], string> = {
   not_delivered: '尚未送达',
-  delivered_unobserved: '已送达，尚未观察到关联更新',
-  observed_converged: '已观察到采纳',
-  observed_diverged: '已更新但与建议不一致',
-  unknown: '当前无法判断',
+  delivered_unobserved: '已送达，等待 Agent 更新',
+  observed_converged: '已观察到 Agent 更新',
+  observed_diverged: '已观察到 Agent 更新',
+  unknown: '当前 Claim mirror 不可用',
 }
 
 function observationTone(state: HolderAdoption['observation_state']) {
-  if (state === 'observed_converged') return 'success' as const
-  if (state === 'observed_diverged') return 'danger' as const
+  if (state === 'observed_converged' || state === 'observed_diverged') return 'success' as const
   if (state === 'delivered_unobserved') return 'warning' as const
   return 'neutral' as const
 }
 
+function changedFields(claim: ClaimAdoptionComparison) {
+  const fields: string[] = []
+  if (claim.snapshot_status && claim.current_status && claim.snapshot_status !== claim.current_status) fields.push('status')
+  if (claim.snapshot_scope && claim.current_scope && claim.snapshot_scope !== claim.current_scope) fields.push('scope')
+  if (claim.snapshot_statement && claim.current_statement && claim.snapshot_statement !== claim.current_statement) fields.push('statement')
+  return fields
+}
+
 function ClaimComparison({ claim }: { claim: ClaimAdoptionComparison }) {
+  const changes = changedFields(claim)
+  const hasSnapshot = Boolean(claim.snapshot_status || claim.snapshot_scope || claim.snapshot_statement)
   return (
-    <article aria-label={`Claim adoption ${claim.claim_id}`} className="rounded-md border border-slate-200 bg-white p-2.5">
+    <article aria-label={`Claim adoption ${claim.claim_id}`} className="rounded-lg border border-cyan-100 bg-white p-3">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="min-w-0">
           <div className="break-words text-xs font-semibold text-slate-900">{claim.claim_name ?? 'Claim'}</div>
           <div className="mt-0.5 break-all font-mono text-[11px] text-slate-500">{claim.claim_id}</div>
         </div>
-        <StatusBadge tone={claim.matches ? 'success' : 'danger'}>{claim.matches ? 'Matched' : 'Mismatch'}</StatusBadge>
+        {!hasSnapshot ? (
+          <StatusBadge tone="warning">Snapshot unavailable</StatusBadge>
+        ) : claim.current_status ? (
+          <StatusBadge tone={changes.length ? 'info' : 'neutral'}>
+            {changes.length ? `Changed · ${changes.join(', ')}` : 'No visible field change'}
+          </StatusBadge>
+        ) : (
+          <StatusBadge tone="warning">Mirror unavailable</StatusBadge>
+        )}
       </div>
 
-      <dl className="mt-2 grid gap-2 text-[11px] sm:grid-cols-2">
-        <div className="rounded bg-slate-50 p-2">
-          <dt className="font-medium text-slate-500">Recommended status</dt>
-          <dd className="mt-1"><StatusBadge>{claim.recommended_status}</StatusBadge></dd>
-        </div>
-        <div className="rounded bg-slate-50 p-2">
-          <dt className="font-medium text-slate-500">Current status</dt>
-          <dd className="mt-1">{claim.current_status ? <StatusBadge>{claim.current_status}</StatusBadge> : 'Mirror unavailable'}</dd>
-        </div>
-        <div className="rounded bg-slate-50 p-2">
-          <dt className="font-medium text-slate-500">Recommended scope</dt>
-          <dd className="mt-1 break-words text-slate-800">{claim.recommended_scope ?? 'Keep current scope'}</dd>
-        </div>
-        <div className="rounded bg-slate-50 p-2">
-          <dt className="font-medium text-slate-500">Current scope</dt>
-          <dd className="mt-1 break-words text-slate-800">{claim.current_scope ?? 'Mirror unavailable'}</dd>
-        </div>
-      </dl>
-
-      <div className="mt-2 grid gap-2 text-xs sm:grid-cols-2">
-        <div className="rounded border border-slate-100 p-2">
-          <div className="text-[11px] font-medium text-slate-500">Recommended statement</div>
-          <ExpandableText className="mt-1 block leading-5 text-slate-700" limit={130} emptyLabel="Keep current statement">
-            {claim.recommended_statement}
+      <div className="mt-3 grid gap-2.5 text-xs sm:grid-cols-2">
+        <div className="rounded-lg border border-slate-200 bg-slate-50/80 p-2.5">
+          <div className="text-[11px] font-bold uppercase tracking-wide text-slate-600">Before · Resolution snapshot</div>
+          <div className="mt-2">{claim.snapshot_status ? <StatusBadge>{claim.snapshot_status}</StatusBadge> : <span className="text-slate-500">Snapshot unavailable</span>}</div>
+          <div className="mt-2 text-[11px] font-medium text-slate-500">Scope</div>
+          <div className="mt-0.5 break-words leading-5 text-slate-800">{claim.snapshot_scope ?? 'Snapshot unavailable'}</div>
+          <div className="mt-2 text-[11px] font-medium text-slate-500">Statement</div>
+          <ExpandableText className="mt-0.5 block leading-5 text-slate-800" limit={130} emptyLabel="Snapshot unavailable">
+            {claim.snapshot_statement}
           </ExpandableText>
         </div>
-        <div className="rounded border border-slate-100 p-2">
-          <div className="text-[11px] font-medium text-slate-500">Current statement</div>
-          <ExpandableText className="mt-1 block leading-5 text-slate-700" limit={130} emptyLabel="Mirror unavailable">
+        <div className="rounded-lg border border-cyan-200 bg-cyan-50/70 p-2.5">
+          <div className="text-[11px] font-bold uppercase tracking-wide text-cyan-800">After · Current Agent Claim</div>
+          <div className="mt-2">{claim.current_status ? <StatusBadge>{claim.current_status}</StatusBadge> : <span className="text-slate-500">Mirror unavailable</span>}</div>
+          <div className="mt-2 text-[11px] font-medium text-cyan-700">Scope</div>
+          <div className="mt-0.5 break-words leading-5 text-slate-900">{claim.current_scope ?? 'Mirror unavailable'}</div>
+          <div className="mt-2 text-[11px] font-medium text-cyan-700">Statement</div>
+          <ExpandableText className="mt-0.5 block leading-5 text-slate-900" limit={130} emptyLabel="Mirror unavailable">
             {claim.current_statement}
           </ExpandableText>
         </div>
       </div>
-
-      <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-slate-600">
-        <span>Policy provenance</span>
-        <StatusBadge tone={claim.policy_provenance_present ? 'success' : 'warning'}>
-          {claim.policy_provenance_present ? 'Present' : 'Missing'}
-        </StatusBadge>
-      </div>
-      {claim.mismatch_reasons.length ? (
-        <div className="mt-2 rounded bg-amber-50 p-2 text-xs leading-5 text-amber-900">
-          <div className="text-[11px] font-semibold uppercase tracking-wide text-amber-700">Mismatch reason</div>
-          {claim.mismatch_reasons.map((reason) => (
-            <ExpandableText key={reason} className="mt-1 block" limit={180}>{reason}</ExpandableText>
-          ))}
-        </div>
-      ) : null}
     </article>
   )
 }
@@ -94,7 +85,7 @@ function HolderCard({ holder, observedAt }: { holder: HolderAdoption; observedAt
         <div>
           <div className="text-xs font-semibold text-slate-900">{holder.agent_id}</div>
           <div className="mt-1 text-[11px] text-slate-500">
-            {holder.assessment_count} assessment{holder.assessment_count === 1 ? '' : 's'} · {holder.matched_count} matched
+            {holder.claims.length} Claim snapshot{holder.claims.length === 1 ? '' : 's'} available
           </div>
         </div>
         <div className="flex flex-wrap justify-end gap-1.5">
@@ -112,24 +103,22 @@ function HolderCard({ holder, observedAt }: { holder: HolderAdoption; observedAt
         <div><dt className="text-slate-500">Last observation</dt><dd className="mt-0.5 font-mono text-slate-800">{formatDateTime(holder.last_observed_at ?? observedAt)}</dd></div>
       </dl>
 
-      {holder.reasons.length ? (
+      {holder.reasons.length && !['observed_converged', 'observed_diverged'].includes(holder.observation_state) ? (
         <div className="mt-3 rounded bg-white p-2 text-xs leading-5 text-slate-700">
           {holder.reasons.map((reason) => (
             <ExpandableText key={reason} className="block" limit={200}>{reason}</ExpandableText>
           ))}
         </div>
-      ) : (
-        <div className="mt-3 text-xs text-slate-500">No additional observation reason.</div>
-      )}
+      ) : null}
 
       <details className="mt-3 rounded-md border border-slate-200 bg-white p-2.5">
         <summary className="cursor-pointer text-xs font-medium text-blue-700">
-          Claim comparison ({holder.claims.length})
+          Before / after ({holder.claims.length})
         </summary>
         <div className="mt-2 space-y-2">
           {holder.claims.length
             ? holder.claims.map((claim) => <ClaimComparison key={claim.claim_id} claim={claim} />)
-            : <div className="text-xs text-slate-500">No Claim comparison is available.</div>}
+            : <div className="text-xs text-slate-500">No Claim snapshots are available.</div>}
         </div>
       </details>
 
@@ -157,15 +146,18 @@ export function HolderAdoptionPanel({ adoption }: { adoption?: HolderAdoptionVie
     unobserved: 0,
     unknown: 0,
   }
-  const unseen = summary.unobserved + summary.unknown
+  const observedUpdates = summary.converged + summary.diverged
 
   return (
-    <section aria-label="Delivery and holder adoption" className="rounded-lg border border-slate-200 p-3">
+    <section aria-label="Delivery and holder adoption" className="rounded-xl border border-cyan-200 bg-cyan-50/30 p-3.5 shadow-sm">
       <div className="flex items-center justify-between gap-3">
-        <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Delivery &amp; Holder Adoption</div>
+        <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-[0.08em] text-cyan-950">
+          <span aria-hidden="true" className="h-4 w-1 rounded-full bg-cyan-600" />
+          Delivery &amp; Holder Adoption
+        </div>
         <button
           type="button"
-          className="rounded-md border border-slate-200 bg-white px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
+          className="rounded-md border border-cyan-200 bg-white px-2 py-1 text-xs font-semibold text-cyan-800 hover:bg-cyan-50"
           aria-expanded={expanded}
           onClick={() => setExpanded((current) => !current)}
         >
@@ -174,12 +166,12 @@ export function HolderAdoptionPanel({ adoption }: { adoption?: HolderAdoptionVie
       </div>
 
       <dl className="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-3">
-        <div className="rounded bg-slate-50 p-2"><dt className="text-slate-500">Notified</dt><dd className="mt-0.5 text-base font-semibold">{summary.notified_holders}</dd></div>
-        <div className="rounded bg-slate-50 p-2"><dt className="text-slate-500">Delivered</dt><dd className="mt-0.5 text-base font-semibold">{summary.delivered}</dd></div>
-        <div className="rounded bg-emerald-50 p-2"><dt className="text-emerald-700">Converged</dt><dd className="mt-0.5 text-base font-semibold text-emerald-800">{summary.converged}</dd></div>
-        <div className="rounded bg-rose-50 p-2"><dt className="text-rose-700">Diverged</dt><dd className="mt-0.5 text-base font-semibold text-rose-800">{summary.diverged}</dd></div>
-        <div className="rounded bg-amber-50 p-2"><dt className="text-amber-700">Unobserved / unknown</dt><dd className="mt-0.5 text-base font-semibold text-amber-800">{unseen}</dd></div>
-        <div className="rounded bg-slate-50 p-2"><dt className="text-slate-500">Last observed</dt><dd className="mt-1 font-mono text-[11px]">{formatDateTime(adoption?.observed_at)}</dd></div>
+        <div className="rounded bg-white p-2"><dt className="text-slate-600">Notified</dt><dd className="mt-0.5 text-base font-semibold text-slate-950">{summary.notified_holders}</dd></div>
+        <div className="rounded bg-white p-2"><dt className="text-slate-600">Delivered</dt><dd className="mt-0.5 text-base font-semibold text-slate-950">{summary.delivered}</dd></div>
+        <div className="rounded bg-emerald-50 p-2"><dt className="text-emerald-700">Observed updates</dt><dd className="mt-0.5 text-base font-semibold text-emerald-800">{observedUpdates}</dd></div>
+        <div className="rounded bg-amber-50 p-2"><dt className="text-amber-700">Awaiting update</dt><dd className="mt-0.5 text-base font-semibold text-amber-800">{summary.unobserved}</dd></div>
+        <div className="rounded bg-slate-100 p-2"><dt className="text-slate-600">Mirror unavailable</dt><dd className="mt-0.5 text-base font-semibold text-slate-800">{summary.unknown}</dd></div>
+        <div className="rounded bg-white p-2"><dt className="text-slate-600">Last observed</dt><dd className="mt-1 font-mono text-[11px] text-slate-800">{formatDateTime(adoption?.observed_at)}</dd></div>
       </dl>
 
       {expanded ? (
@@ -193,7 +185,7 @@ export function HolderAdoptionPanel({ adoption }: { adoption?: HolderAdoptionVie
       ) : (
         <div className="mt-2 text-xs text-slate-500">
           {summary.notified_holders
-            ? `${summary.notified_holders} holder${summary.notified_holders === 1 ? '' : 's'} tracked; expand to inspect delivery and Claim matching.`
+            ? `${summary.notified_holders} holder${summary.notified_holders === 1 ? '' : 's'} tracked; expand to inspect how each Agent changed its Claims.`
             : 'No holder notification is associated with the current resolution.'}
         </div>
       )}
