@@ -78,7 +78,7 @@ const automaticAnalysis: ArbitrationAnalysisSummary = {
   created_at: createdAt,
   updated_at: '2026-05-15T10:05:00Z',
   semantic_fingerprint: 'sha256-v1:auto',
-  proposal: { ...proposal, resolution_type: 'unresolved', confidence: 0.71 },
+  proposal,
   adoptable: false,
   adoption_blocker: 'The verification result is unresolved.',
 }
@@ -121,6 +121,15 @@ function analysisDetail(analysis: ArbitrationAnalysisSummary): ArbitrationAnalys
       confidence: 0.95,
       missing_evidence: [],
       reasoning: 'Independent verification agrees with every core field.',
+    } : analysis.state === 'unresolved' ? {
+      verdict: 'unresolved',
+      resolution_type_agreed: false,
+      resolution_basis_agreed: false,
+      conclusion_agreed: false,
+      claim_assessments: [],
+      confidence: 0.58,
+      missing_evidence: ['A decisive reproduction is missing.'],
+      reasoning: 'Independent verification cannot approve the proposed Claim changes.',
     } : undefined,
     warnings: [],
     validation_result: 'valid',
@@ -386,6 +395,8 @@ describe('DisputesPage', () => {
 
     const automatic = await within(drawer).findByRole('article', { name: 'Automatic analysis analysis_automatic' })
     expect(automatic).toHaveTextContent('unresolved')
+    expect(automatic).toHaveTextContent('不建议修改 Claim')
+    expect(within(automatic).queryByText(/Direct Claim assessments/)).not.toBeInTheDocument()
     expect(within(automatic).queryByRole('button', { name: '采用此分析' })).not.toBeInTheDocument()
     expect(await within(drawer).findByRole('article', { name: 'Manual analysis analysis_manual_latest' })).toHaveTextContent('approved')
     expect(within(drawer).queryByRole('button', { name: /manual analysis history/i })).not.toBeInTheDocument()

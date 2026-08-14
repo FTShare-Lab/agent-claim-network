@@ -20,15 +20,16 @@
 4. Policy 的 status、scope 与 target 是否适用；
 5. 是否存在会改变 resolution_type 的反证；
 6. conclusion 是否被输入证据直接支持；
-7. 每条 Claim assessment 是否都有稳定依据；
-8. recommended status、scope、statement 是否与结论一致；
-9. 是否存在足以改变 type、basis、conclusion 或任一 assessment 的 missing evidence。
+7. evidence_refs 是否完整且唯一引用了全部 direct Claim，并包含支撑结论的其他决定性输入对象；
+8. 若能形成 resolved 类型，每条 Claim assessment 是否都有稳定依据；
+9. resolved 类型的 recommended status、scope、statement 是否与结论一致；
+10. 是否存在足以改变 type、basis、conclusion 或 resolved assessment 的 missing evidence。
 
 Resolution Type 的完整定义：
 - `coexist`：多条 Claim 在当前仍然有效，且适用于明确不同的 scope、版本、环境或操作路径。不能仅因它们“历史上都曾有效”就判为 coexist。
 - `lifecycle_update`：Claim 描述同一能力或操作路径的时间/版本演进；输入证据表明团队当前基线已经迁移，旧默认失效、旧路径被替代或退出支持。旧 Claim 在历史上真实，不代表当前仍应 active。
 - `conflict_resolved`：Claim 在相同或可比较的 scope、时间和条件下不能同时成立；它们不属于当前并存，也不只是正常生命周期演进；现有证据足以判断哪个方向更可靠。
-- `unresolved`：现有材料不足以安全选择，存在会改变核心结论的证据缺口，或无法形成稳定一致的 assessment。Dispute 必须保持 open，等待人类管理者处理。
+- `unresolved`：现有材料不足以安全选择，存在会改变核心结论的证据缺口，或无法形成稳定一致的 assessment。Dispute 必须保持 open，等待人类管理者处理；不要为任何 Claim 推荐 status、scope 或 statement 修改。
 
 边界示例：团队当前基线从 Node 18 迁移到 Node 22，旧 workaround 不再是当前默认，应考虑 `lifecycle_update`；query v4 已迁移到当前 v5 基线也是生命周期边界。只有 Node 18 与 Node 22 都明确仍受支持且限定在不同部署范围时，才考虑 `coexist`。示例只解释边界，不是脱离输入证据的硬编码 status 或 type/status 规则。
 
@@ -44,7 +45,7 @@ recommended_status 的语义：
 - `stale`：可能过时、适用性不确定或需要重新验证，但尚不足以确认彻底退出；
 - `deprecated`：不应继续作为当前知识基线使用，但可保留用于历史、兼容或人工恢复。
 
-status 必须由你根据证据判断；不要假设 status 只能单向变化，不要套用固定 type/status 组合，也不要使用风险关键词门。每个 direct_claim 必须且只能有一条 assessment。evidence_refs 只能引用输入内真实 ID。missing_evidence 必须具体说明缺少什么，以及它为什么会改变核心结论。
+status 必须由你根据证据判断；不要假设 status 只能单向变化，不要套用固定 type/status 组合，也不要使用风险关键词门。只有 `coexist`、`lifecycle_update`、`conflict_resolved` 才为每个 direct_claim 输出且只输出一条 assessment。`unresolved` 必须输出空的 `claim_assessments`，不以 `stale` 或其他状态代替“等待人工”。evidence_refs 只能引用输入内真实 ID，不能重复，并且必须包含每个 direct Claim ID；Policy 是主要依据时也不能省略 direct Claim，unresolved 也必须引用承载证据缺口的 direct Claim。missing_evidence 必须具体说明缺少什么，以及它为什么会改变核心结论。
 
 `confidence` 的统一含义是：“当前冻结上下文是否足以稳定支持把这份裁决作为正式治理结论并关闭 Dispute”。它不是对语言表达的满意度，也不是“我有多确信 unresolved 是合理的”。自动提交门槛为 {{ confidence_threshold | default(0.90) }}：
 - `0.00–0.49`：存在决定性缺失、明显矛盾或输入无法理解，必须 unresolved；
@@ -68,10 +69,11 @@ status 必须由你根据证据判断；不要假设 status 只能单向变化�
     "reason": "中文理由"
   }],
   "confidence": 0.0,
-  "evidence_refs": ["输入内 ID"],
+  "evidence_refs": ["全部 direct Claim ID", "其他决定性输入对象 ID"],
   "missing_evidence": [],
   "human_review_reason": null,
   "reasoning": "中文推理摘要"
 }
 
+当 `resolution_type="unresolved"` 时，上述 `claim_assessments` 必须为 `[]`；conclusion、missing_evidence、human_review_reason 与 reasoning 用于向人类说明为什么暂不能裁决。
 `human_review_reason` 只是可选的人工交接说明，可以为 null；缺失不能让正确的 unresolved 变成技术失败。

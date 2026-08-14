@@ -59,7 +59,7 @@ Agent 会在团队 Claim 互相冲突、适用范围不清或发生生命周期�
 | `evidence` | Claim evidence、source Claim 或 Router 补充知识是决定性依据 |
 | `insufficient_evidence` | 不能形成正式结论，只能 unresolved |
 
-每条 direct Claim 必须且只能有一条 assessment，包含 Claim ID、recommended status、判断、理由和可选 scope/statement 建议。Proposal 与 Verification 的 confidence 都表示当前冻结上下文是否足以支持正式关闭 Dispute。任一阶段低于门槛、Verification 不同意核心字段或 assessment、或任一阶段选择 unresolved，都使 Analysis 进入 `unresolved`。
+只有 `coexist`、`lifecycle_update`、`conflict_resolved` 才要求每条 direct Claim 必须且只能有一条 assessment，包含 Claim ID、recommended status、判断、理由和可选 scope/statement 建议。每个 Proposal 的 `evidence_refs` 必须唯一覆盖全部 direct Claim，并可继续引用支撑结论的 Policy、source Claim、Router candidate Claim、真实 Router Dispute 或历史 Resolution；Policy 是主要依据或结果为 `unresolved` 时也不能省略 direct Claim。`unresolved` 不输出 Claim assessment，也不建议 status、scope 或 statement 修改；它只说明缺失材料并等待人类管理者处理。Proposal 与 Verification 的 confidence 都表示当前冻结上下文是否足以支持正式关闭 Dispute。任一阶段低于门槛、Verification 不同意核心字段或 assessment、或任一阶段选择 unresolved，都使 Analysis 进入 `unresolved`。
 
 ## 模式与 Analysis 生命周期
 

@@ -41,6 +41,9 @@ type AnalysisCardProps = {
 export function AnalysisCard({ analysis, label, onAdopt, adopting = false, compact = false, resolutionClosed = false }: AnalysisCardProps) {
   const detail = 'frozen_context' in analysis ? analysis : undefined
   const proposal = analysis.proposal
+  const unresolved = analysis.state === 'unresolved'
+    || proposal?.resolution_type === 'unresolved'
+    || detail?.verification?.verdict === 'unresolved'
   // Resolution 已经消费了 Analysis；即使客户端仍持有采用前的缓存，也不再展示
   // “等待重分析”或“采用被阻止”等仅对 open Dispute 有意义的操作状态。
   const status = resolutionClosed ? undefined : analysisStatus(analysis)
@@ -109,7 +112,12 @@ export function AnalysisCard({ analysis, label, onAdopt, adopting = false, compa
               <ExpandableText className="mt-1 block" limit={220}>{proposal.human_review_reason}</ExpandableText>
             </div>
           ) : null}
-          {!compact ? (
+          {!compact && unresolved ? (
+            <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 p-2.5 text-xs leading-5 text-amber-900">
+              当前 Analysis 未形成可采用的裁决结论，不建议修改 Claim；Dispute 保持 open，等待人类管理者处理。
+            </div>
+          ) : null}
+          {!compact && !unresolved ? (
             <details className="mt-3 rounded-md border border-blue-100 bg-white p-2.5" open>
               <summary className="cursor-pointer text-xs font-medium text-blue-800">
                 Direct Claim assessments ({proposal.claim_assessments.length})
@@ -141,7 +149,6 @@ export function AnalysisCard({ analysis, label, onAdopt, adopting = false, compa
                     ) : null}
                   </article>
                 ))}
-                {!proposal.claim_assessments.length ? <div className="text-xs text-slate-500">No Claim assessments.</div> : null}
               </div>
             </details>
           ) : null}
@@ -175,10 +182,14 @@ export function AnalysisCard({ analysis, label, onAdopt, adopting = false, compa
           <ExpandableText className="mt-2 block text-xs leading-5 text-slate-700" limit={220}>
             {detail.verification.reasoning}
           </ExpandableText>
-          <div className="mt-2 text-[11px] text-slate-500">
-            {detail.verification.claim_assessments.filter((assessment) => assessment.agreed).length}
-            /{detail.verification.claim_assessments.length} Claim assessments agreed
-          </div>
+          {detail.verification.verdict === 'unresolved' ? (
+            <div className="mt-2 text-[11px] text-slate-500">Verification 未给出 Claim 修改建议，等待人类管理者处理。</div>
+          ) : (
+            <div className="mt-2 text-[11px] text-slate-500">
+              {detail.verification.claim_assessments.filter((assessment) => assessment.agreed).length}
+              /{detail.verification.claim_assessments.length} Claim assessments agreed
+            </div>
+          )}
           {detail.verification.missing_evidence?.length ? (
             <ul className="mt-2 list-disc space-y-1 pl-4 text-xs leading-5 text-amber-900">
               {detail.verification.missing_evidence.map((item) => <li key={item}>{item}</li>)}

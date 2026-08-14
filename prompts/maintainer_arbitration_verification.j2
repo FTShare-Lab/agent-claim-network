@@ -20,15 +20,16 @@
 4. Policy 的 status、scope 与 target 是否适用；
 5. 是否存在会改变 resolution_type 的反证；
 6. conclusion 是否被证据直接支持；
-7. 每条 assessment 是否都有稳定依据；
-8. recommended status、scope、statement 是否与结论一致；
-9. 是否存在足以改变任一核心字段的 missing evidence。
+7. Proposal 的 evidence_refs 是否完整且唯一引用全部 direct Claim，并包含支撑结论的其他决定性输入对象；
+8. 若 Proposal 试图形成 resolved 类型，每条 assessment 是否都有稳定依据；
+9. resolved Proposal 的 recommended status、scope、statement 是否与结论一致；
+10. 是否存在足以改变任一核心字段的 missing evidence。
 
 Resolution Type：
 - `coexist`：多条 Claim 当前仍有效，并明确分属不同 scope、版本、环境或操作路径；历史上都曾有效并不足够。
 - `lifecycle_update`：同一能力或路径发生时间/版本演进，团队当前基线已迁移，旧默认失效、旧路径被替代或退出支持；历史真实性不代表当前仍应 active。
 - `conflict_resolved`：Claim 在相同或可比较条件下不能同时成立，不属于当前并存或正常演进，且证据足以选择更可靠方向。
-- `unresolved`：材料不足、Proposal 与独立复核存在核心分歧，或缺少会改变结论的证据；Dispute 必须保持 open 等待人类。
+- `unresolved`：材料不足、Proposal 与独立复核存在核心分歧，或缺少会改变结论的证据；Dispute 必须保持 open 等待人类，不给出 Claim status、scope 或 statement 修改建议。
 
 Node 18 旧 workaround 被当前 Node 22 团队基线替代，或 query v4 已迁移到当前 v5 基线，通常属于 lifecycle 边界；只有新旧版本都明确当前受支持并分属不同范围时，才同意 coexist。示例不是硬编码规则。
 
@@ -41,7 +42,7 @@ Resolution Basis：
 
 Claim status：`active` 表示当前环境和 scope 下仍可采用；`stale` 表示可能过时或需重新验证但尚不能确认退出；`deprecated` 表示不应继续作为当前知识基线，但可保留用于历史、兼容或人工恢复。status 由证据决定，不设单调门或固定 type/status 组合。
 
-分别判断 resolution type、basis、conclusion 和每条 direct Claim assessment；任一核心项目不同意，verdict 必须为 unresolved。任一实质 missing evidence 未解决，confidence 必须低于门槛。evidence_refs 与评估理由只能依赖输入中的真实对象。
+分别判断 resolution type、basis、conclusion；仅当 verdict 为 approve 时逐条确认 direct Claim assessment。任一核心项目不同意，verdict 必须为 unresolved。任一实质 missing evidence 未解决，confidence 必须低于门槛。evidence_refs 与评估理由只能依赖输入中的真实对象；evidence_refs 必须无重复并覆盖全部 direct Claim，Policy 作为主要依据或 Proposal 为 unresolved 时也不例外。verdict 为 unresolved 时 `claim_assessments` 必须为 `[]`，具体分歧写入 missing_evidence 与 reasoning。
 
 `confidence` 表示“当前冻结上下文是否足以稳定支持把这份 Proposal 作为正式治理结论并自动关闭 Dispute”，不是复核器对自身措辞的满意度，也不是对 unresolved 判断的确信程度。自动提交门槛为 {{ confidence_threshold | default(0.90) }}：
 - `0.00–0.49`：决定性缺失、明显矛盾或输入无法理解，必须 unresolved；
@@ -66,3 +67,5 @@ Claim status：`active` 表示当前环境和 scope 下仍可采用；`stale` �
   "missing_evidence": [],
   "reasoning": "中文独立复核摘要"
 }
+
+当 `verdict="unresolved"` 时，上述 `claim_assessments` 必须为 `[]`；只有 approve 才完整且唯一覆盖全部 direct Claims。

@@ -71,9 +71,9 @@ Dispute 表示多个 claim 之间可能存在冲突、不兼容或适用范围�
 
 已经解决的 dispute 仍保留为历史事实。Router 查询候选 claim 时同时返回相关 dispute，使借用方看见已知争议。
 
-新 Resolution 不改写 Dispute 的原始 `summary`。自动模型可选择 `coexist`、`lifecycle_update`、`conflict_resolved` 或 `unresolved`；前三种在双阶段高置信且一致时可关闭 Dispute，`unresolved` 本身表示等待人类管理者处理并始终保持 open，可选交接说明缺失不会把它变成技术失败。`lifecycle_update` 用于团队当前基线已迁移、旧默认失效或旧路径被替代的演进；只有新旧路径当前仍受支持且 scope 明确不同时才使用 `coexist`。Reject & Replace 通过 `expected_resolution_id` 替换当前 automatic Resolution。
+新 Resolution 不改写 Dispute 的原始 `summary`。自动模型可选择 `coexist`、`lifecycle_update`、`conflict_resolved` 或 `unresolved`；前三种在双阶段高置信且一致时可关闭 Dispute，`unresolved` 本身表示等待人类管理者处理并始终保持 open，不输出 Claim assessment 或 status、scope、statement 修改建议，可选交接说明缺失也不会把它变成技术失败。`lifecycle_update` 用于团队当前基线已迁移、旧默认失效或旧路径被替代的演进；只有新旧路径当前仍受支持且 scope 明确不同时才使用 `coexist`。Reject & Replace 通过 `expected_resolution_id` 替换当前 automatic Resolution。
 
-Proposal 与独立 Verification 都使用仲裁专用 system prompt，并包含项目统一的 Claim、Dispute、Policy 定义，确保两阶段按同一领域语义解释输入对象；实际团队 Policy 仍只取上下文中的 `policy_update` 记录。
+Proposal 与独立 Verification 都使用仲裁专用 system prompt，并包含项目统一的 Claim、Dispute、Policy 定义，确保两阶段按同一领域语义解释输入对象；实际团队 Policy 仍只取上下文中的 `policy_update` 记录。Proposal 的 `evidence_refs` 唯一覆盖全部 direct Claim，也可引用上下文中其他决定性对象，使 resolved 与 unresolved 结论都能追溯到争议主体和依据。
 
 `shadow`/`auto` 下，新 Dispute create-once 写入唯一 Automatic Analysis并进入有界串行调度器；`manual` 只保存 Dispute。Manual Analyze 覆盖单一 Manual Analysis 槽，也可直接 Human Resolve。direct Claim 暂未准备好时，同一 Analysis 先等待上下文，最终仍不完整才标为 failed。
 

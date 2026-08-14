@@ -615,7 +615,7 @@ mod tests {
             assert!(prompt.contains("0.98–1.00"));
             assert!(prompt.contains("自动关闭"));
             assert!(prompt.contains("missing evidence"));
-            for check in 1..=9 {
+            for check in 1..=10 {
                 assert!(
                     prompt.contains(&format!("{check}.")),
                     "missing confidence check {check}"
@@ -624,10 +624,17 @@ mod tests {
         }
         assert!(proposal.contains("`human_review_reason` 只是可选的人工交接说明"));
         assert!(proposal.contains("缺失不能让正确的 unresolved 变成技术失败"));
+        assert!(proposal.contains("`unresolved` 必须输出空的 `claim_assessments`"));
+        assert!(proposal.contains("不以 `stale` 或其他状态代替“等待人工”"));
+        assert!(proposal.contains("必须包含每个 direct Claim ID"));
+        assert!(proposal.contains("Policy 是主要依据时也不能省略 direct Claim"));
+        assert!(proposal.contains("unresolved 也必须引用承载证据缺口的 direct Claim"));
         assert!(verification.contains("Proposal 是待审查对象，不是既定事实"));
         assert!(verification.contains("不得照抄它的结论或 confidence"));
         assert!(verification.contains("任一核心项目不同意"));
         assert!(verification.contains("门槛+0.01"));
+        assert!(verification.contains("verdict 为 unresolved 时 `claim_assessments` 必须为 `[]`"));
+        assert!(verification.contains("evidence_refs 必须无重复并覆盖全部 direct Claim"));
     }
 
     #[test]

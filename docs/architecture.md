@@ -66,7 +66,7 @@ Maintainer 是团队治理与投递服务：
 
 Maintainer 不以 trace 引用次数直接修改 claim，也不删除已经解决的历史 dispute。
 
-自裁决的 Proposal 与 Verification system prompt 都注入项目统一的 Claim、Dispute、Policy 领域定义。模型输入使用原始 Dispute、`direct_claims`、有上限的 `source_claims`、全部治理 `policy_update`、Router candidate Claim、Router 返回的真实 Dispute 与相同 direct Claim 集合的已有 Resolution。Proposal 与 Verification 分开调用；任一阶段低置信、不同意或返回 unresolved 都使 Dispute 保持 open。
+自裁决的 Proposal 与 Verification system prompt 都注入项目统一的 Claim、Dispute、Policy 领域定义。模型输入使用原始 Dispute、`direct_claims`、有上限的 `source_claims`、全部治理 `policy_update`、Router candidate Claim、Router 返回的真实 Dispute 与相同 direct Claim 集合的已有 Resolution。Proposal 的 `evidence_refs` 必须唯一覆盖全部 direct Claim，可附加引用上下文中的其他决定性对象。Proposal 与 Verification 分开调用；任一阶段低置信、不同意或返回 unresolved 都使 Dispute 保持 open，且 unresolved 不携带 Claim 修改建议。
 
 `manual` 上报只保存 Dispute。`shadow`/`auto` 为每个 Dispute 创建唯一 Automatic Analysis，并由有界单 consumer 调度器执行。Analysis 先持久化再入队，请求取消时由持久恢复唤醒补齐两者之间的窗口。Semantic V5 跟踪真实知识内容；Router candidate 以 Claim 内容参与上下文和 fingerprint，其检索索引关联的 Dispute ID 列表属于派生检索元数据。`auto` 在采用前发现输入变化时，依次等待 5 分钟和 15 分钟后在同一 Automatic Analysis 内执行第 2、3 轮；第三轮仍变化则停止自动处理并保持 open。持久延迟队列允许其他 Analysis 继续运行，重启后按原 `next_retry_at` 恢复。
 

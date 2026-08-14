@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use rand::RngCore;
 use tokio_util::sync::CancellationToken;
 
-use crate::claim::{ClaimId, Dispute, DisputeId, DisputeStatus, ResolvedBy};
+use crate::claim::{ClaimId, Dispute, DisputeId, DisputeStatus, ResolutionType, ResolvedBy};
 use crate::config::{ArbitrationMode, MaintainerArbitrationConfig};
 
 use super::context::{is_context_not_ready, ArbitrationContextBuilder, BuiltArbitrationContext};
@@ -756,7 +756,7 @@ impl ArbitrationService {
                 return Ok(false);
             }
         };
-        if let Err(error) = validate_verification(context, &verification) {
+        if let Err(error) = validate_verification(context, proposal, &verification) {
             self.finish_failed(job, token, "verification_invalid", &error)
                 .await?;
             return Ok(false);
@@ -1042,11 +1042,21 @@ fn validate_proposal(
         .iter()
         .map(|claim| claim.id.clone())
         .collect();
-    if proposal.claim_assessments.is_empty() {
-        anyhow::bail!("proposal 必须完整且唯一覆盖全部直接 Claim");
+    if proposal.resolution_type == ResolutionType::Unresolved {
+        if !proposal.claim_assessments.is_empty() {
+            anyhow::bail!("unresolved proposal 不能包含 Claim 修改建议");
+        }
+    } else {
+        if proposal.claim_assessments.is_empty() {
+            anyhow::bail!("resolved proposal 必须完整且唯一覆盖全部直接 Claim");
+        }
+        validate_assessments(&direct_ids, &proposal.claim_assessments)?;
     }
-    validate_assessments(&direct_ids, &proposal.claim_assessments)?;
     let visible = visible_evidence_ids(context);
+    let evidence_refs: BTreeSet<&str> = proposal.evidence_refs.iter().map(String::as_str).collect();
+    if evidence_refs.len() != proposal.evidence_refs.len() {
+        anyhow::bail!("proposal evidence_refs 不能包含重复 ID");
+    }
     let invalid: Vec<&str> = proposal
         .evidence_refs
         .iter()
@@ -1059,11 +1069,23 @@ fn validate_proposal(
             invalid.join(", ")
         );
     }
+    let missing_direct: Vec<&str> = direct_ids
+        .iter()
+        .map(ClaimId::as_str)
+        .filter(|id| !evidence_refs.contains(*id))
+        .collect();
+    if !missing_direct.is_empty() {
+        anyhow::bail!(
+            "proposal evidence_refs 必须覆盖全部直接 Claim，缺少: {}",
+            missing_direct.join(", ")
+        );
+    }
     Ok(())
 }
 
 fn validate_verification(
     context: &FrozenArbitrationContext,
+    proposal: &super::types::ArbitrationProposal,
     verification: &super::types::ArbitrationVerification,
 ) -> anyhow::Result<()> {
     if !verification.confidence.is_finite() || !(0.0..=1.0).contains(&verification.confidence) {
@@ -1072,25 +1094,34 @@ fn validate_verification(
     if verification.reasoning.trim().is_empty() {
         anyhow::bail!("verification reasoning 不能为空");
     }
-    let expected: BTreeSet<ClaimId> = context
-        .direct_claims
-        .iter()
-        .map(|claim| claim.id.clone())
-        .collect();
-    let actual: BTreeSet<ClaimId> = verification
-        .claim_assessments
-        .iter()
-        .map(|assessment| assessment.claim_id.clone())
-        .collect();
-    if actual.len() != verification.claim_assessments.len() || actual != expected {
-        anyhow::bail!("verification 必须完整且唯一覆盖全部直接 Claim");
-    }
-    if verification
-        .claim_assessments
-        .iter()
-        .any(|assessment| assessment.reason.trim().is_empty())
-    {
-        anyhow::bail!("verification 的每条 Claim assessment reason 不能为空");
+    if verification.verdict == VerificationVerdict::Unresolved {
+        if !verification.claim_assessments.is_empty() {
+            anyhow::bail!("unresolved verification 不能包含逐 Claim 建议");
+        }
+    } else {
+        if proposal.resolution_type == ResolutionType::Unresolved {
+            anyhow::bail!("unresolved proposal 不能被 verification approve");
+        }
+        let expected: BTreeSet<ClaimId> = context
+            .direct_claims
+            .iter()
+            .map(|claim| claim.id.clone())
+            .collect();
+        let actual: BTreeSet<ClaimId> = verification
+            .claim_assessments
+            .iter()
+            .map(|assessment| assessment.claim_id.clone())
+            .collect();
+        if actual.len() != verification.claim_assessments.len() || actual != expected {
+            anyhow::bail!("approved verification 必须完整且唯一覆盖全部直接 Claim");
+        }
+        if verification
+            .claim_assessments
+            .iter()
+            .any(|assessment| assessment.reason.trim().is_empty())
+        {
+            anyhow::bail!("verification 的每条 Claim assessment reason 不能为空");
+        }
     }
     Ok(())
 }
@@ -1407,18 +1438,22 @@ mod tests {
                 } else {
                     "现有证据不足".into()
                 },
-                claim_assessments: context
-                    .direct_claims
-                    .iter()
-                    .map(|claim| ClaimAssessment {
-                        claim_id: claim.id.clone(),
-                        recommended_status: claim.status,
-                        assessment: "已检查".into(),
-                        recommended_scope: None,
-                        recommended_statement: None,
-                        reason: "直接证据".into(),
-                    })
-                    .collect(),
+                claim_assessments: if resolved {
+                    context
+                        .direct_claims
+                        .iter()
+                        .map(|claim| ClaimAssessment {
+                            claim_id: claim.id.clone(),
+                            recommended_status: claim.status,
+                            assessment: "已检查".into(),
+                            recommended_scope: None,
+                            recommended_statement: None,
+                            reason: "直接证据".into(),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
                 confidence: if resolved { 0.96 } else { 0.55 },
                 evidence_refs: context
                     .direct_claims
@@ -1451,15 +1486,19 @@ mod tests {
                 resolution_type_agreed: approved,
                 resolution_basis_agreed: approved,
                 conclusion_agreed: approved,
-                claim_assessments: context
-                    .direct_claims
-                    .iter()
-                    .map(|claim| ClaimAssessmentVerification {
-                        claim_id: claim.id.clone(),
-                        agreed: approved,
-                        reason: "复核结果".into(),
-                    })
-                    .collect(),
+                claim_assessments: if approved {
+                    context
+                        .direct_claims
+                        .iter()
+                        .map(|claim| ClaimAssessmentVerification {
+                            claim_id: claim.id.clone(),
+                            agreed: true,
+                            reason: "复核结果".into(),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
                 confidence: if approved { 0.95 } else { 0.50 },
                 missing_evidence: proposal.missing_evidence.clone(),
                 reasoning: "独立复核".into(),
@@ -2051,14 +2090,29 @@ mod tests {
         unresolved.seed_claims().await;
         let unresolved_job = unresolved.report().await;
         let cancel = CancellationToken::new();
-        assert_eq!(
-            unresolved
-                .service
-                .process_analysis(&unresolved_job, &cancel)
-                .await
+        let unresolved_analysis = unresolved
+            .service
+            .process_analysis(&unresolved_job, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(unresolved_analysis.state, AnalysisState::Unresolved);
+        assert!(
+            unresolved_analysis
+                .proposal
+                .as_ref()
                 .unwrap()
-                .state,
-            AnalysisState::Unresolved
+                .claim_assessments
+                .is_empty(),
+            "unresolved proposal 不应建议修改 Claim"
+        );
+        assert!(
+            unresolved_analysis
+                .verification
+                .as_ref()
+                .unwrap()
+                .claim_assessments
+                .is_empty(),
+            "unresolved verification 不应输出逐 Claim 建议"
         );
         let calls = unresolved.evaluator.calls();
         unresolved
@@ -2089,6 +2143,118 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(evaluator.calls(), calls);
+    }
+
+    #[tokio::test]
+    async fn unresolved_outputs_reject_claim_change_advice_but_resolved_outputs_keep_it() {
+        let fixture = Fixture::new(ArbitrationMode::Shadow, ScriptedEvaluator::unresolved()).await;
+        fixture.seed_claims().await;
+        let job = fixture.report().await;
+        fixture
+            .service
+            .prepare_context(&job, &CancellationToken::new())
+            .await
+            .unwrap()
+            .unwrap();
+        let analysis = fixture.store.read_analysis(&job).await.unwrap();
+        let context = analysis.context.as_ref().unwrap();
+        let claim = &context.direct_claims[0];
+
+        let mut unresolved_proposal = fixture.evaluator.propose(context).await.unwrap();
+        assert!(validate_proposal(context, &unresolved_proposal).is_ok());
+        unresolved_proposal.claim_assessments.push(ClaimAssessment {
+            claim_id: claim.id.clone(),
+            recommended_status: ClaimStatus::Stale,
+            assessment: "等待验证".into(),
+            recommended_scope: None,
+            recommended_statement: None,
+            reason: "证据不足".into(),
+        });
+        assert!(validate_proposal(context, &unresolved_proposal)
+            .unwrap_err()
+            .to_string()
+            .contains("不能包含 Claim 修改建议"));
+        unresolved_proposal.claim_assessments.clear();
+
+        let mut unresolved_verification = fixture
+            .evaluator
+            .verify(context, &unresolved_proposal)
+            .await
+            .unwrap();
+        assert!(
+            validate_verification(context, &unresolved_proposal, &unresolved_verification).is_ok()
+        );
+        unresolved_verification
+            .claim_assessments
+            .push(ClaimAssessmentVerification {
+                claim_id: claim.id.clone(),
+                agreed: false,
+                reason: "等待人工".into(),
+            });
+        assert!(
+            validate_verification(context, &unresolved_proposal, &unresolved_verification)
+                .unwrap_err()
+                .to_string()
+                .contains("不能包含逐 Claim 建议")
+        );
+
+        let resolved_evaluator = ScriptedEvaluator::approved();
+        let resolved_proposal = resolved_evaluator.propose(context).await.unwrap();
+        let resolved_verification = resolved_evaluator
+            .verify(context, &resolved_proposal)
+            .await
+            .unwrap();
+        assert!(validate_proposal(context, &resolved_proposal).is_ok());
+        assert!(validate_verification(context, &resolved_proposal, &resolved_verification).is_ok());
+    }
+
+    #[tokio::test]
+    async fn proposal_evidence_refs_uniquely_cover_every_direct_claim() {
+        let fixture = Fixture::new(ArbitrationMode::Shadow, ScriptedEvaluator::approved()).await;
+        fixture.seed_claims().await;
+        let job = fixture.report().await;
+        fixture
+            .service
+            .prepare_context(&job, &CancellationToken::new())
+            .await
+            .unwrap()
+            .unwrap();
+        let analysis = fixture.store.read_analysis(&job).await.unwrap();
+        let context = analysis.context.as_ref().unwrap();
+        let mut proposal = fixture.evaluator.propose(context).await.unwrap();
+
+        proposal.evidence_refs.clear();
+        assert!(validate_proposal(context, &proposal)
+            .unwrap_err()
+            .to_string()
+            .contains("必须覆盖全部直接 Claim"));
+
+        proposal.evidence_refs = context
+            .direct_claims
+            .iter()
+            .map(|claim| claim.id.to_string())
+            .collect();
+        proposal.evidence_refs.push(context.dispute.id.to_string());
+        assert!(validate_proposal(context, &proposal).is_ok());
+
+        proposal
+            .evidence_refs
+            .push(context.direct_claims[0].id.to_string());
+        assert!(validate_proposal(context, &proposal)
+            .unwrap_err()
+            .to_string()
+            .contains("不能包含重复 ID"));
+
+        let mut unresolved = ScriptedEvaluator::unresolved()
+            .propose(context)
+            .await
+            .unwrap();
+        assert!(validate_proposal(context, &unresolved).is_ok());
+        unresolved.evidence_refs.clear();
+        assert!(validate_proposal(context, &unresolved)
+            .unwrap_err()
+            .to_string()
+            .contains("必须覆盖全部直接 Claim"));
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@ use crate::router::{CandidateClaim, DisputeRef};
 use crate::time::{serde_utc, serde_utc_opt};
 
 pub const ARBITRATION_SCHEMA_VERSION: u32 = 2;
-pub const ARBITRATION_PROMPT_VERSION: &str = "maintainer-dispute-arbitration-v6";
+pub const ARBITRATION_PROMPT_VERSION: &str = "maintainer-dispute-arbitration-v8";
 pub const CURRENT_SEMANTIC_PROJECTION_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
