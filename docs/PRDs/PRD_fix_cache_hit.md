@@ -757,3 +757,21 @@ D1～D16 均已落实。定向测试、完整 Rust 验证、TUI 验收及本地/
 通过；Responses、Chat 与 Anthropic 的精确前缀、ModelContext、WAL、compaction、resume、
 reasoning/media/tool history 与 consumer filtering 符合本文不变量。最终无未解决 P0/P1，
 也未发现实现遗漏或持久化兼容性倒退。
+
+### 16.3 空有效投影回归修正
+
+`ModelContext` 持久化后，原始 message range 非空不再等价于 recap/compaction 的有效
+transcript 非空。历史消费者必须先过滤 synthetic context，再决定是否存在模型工作；不得把
+空集合包装为 `Some([])` 发给 Provider。
+
+本修正保持 context message、journal 与缓存前缀设计不变，并补充以下语义：
+
+- 手动 `/compact` 选中范围过滤后为空时按 raw-tail no-op 处理，不调用模型、不推进 compact
+  frontier。
+- main committed、active-turn 与 child compaction 分别按有效投影判断；混合请求只跳过为空的
+  scope，另一 scope 可以继续压缩。强制 context recovery 没有可安全压缩内容时继续返回既有硬错误。
+- 普通自动压缩与 child compaction 的空投影静默跳过；下一次逻辑 Provider 请求在新增历史后照常
+  重新评估，不引入额外持久状态。
+- recap/finalize 的 transcript 与 background completion 同时为空时不调用模型，但通过既有
+  checkpoint 边界推进 `recapped_until`；存在 background completion 时仍执行 recap。
+- summary request 构造层拒绝空 transcript，作为所有调用方共享的最后一道不变量检查。

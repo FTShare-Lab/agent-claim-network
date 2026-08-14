@@ -1921,6 +1921,21 @@ fn test_message(
     }
 }
 
+fn new_model_context_message(
+    source: ModelContextSource,
+    fingerprint: &str,
+    text: impl Into<String>,
+) -> NewSessionMessage {
+    NewSessionMessage::new(
+        SessionMessageRole::User,
+        vec![SessionContentBlock::ModelContext {
+            source,
+            fingerprint: fingerprint.into(),
+            text: text.into(),
+        }],
+    )
+}
+
 #[tokio::test]
 async fn session_system_prompt_renders_configured_subagent_concurrency_limit() {
     let dir = tempfile::tempdir().unwrap();
@@ -5146,6 +5161,272 @@ async fn manual_compact_noop_reports_raw_tail_budget_when_new_history_is_preserv
 }
 
 #[tokio::test]
+async fn manual_compact_noops_when_selected_prefix_contains_only_model_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_face0010").await;
+    session
+        .append_messages(&[
+            new_model_context_message(
+                ModelContextSource::Runtime,
+                "runtime-v1",
+                "<runtime_context>old</runtime_context>",
+            ),
+            new_model_context_message(
+                ModelContextSource::BackgroundProcess,
+                "background-v1",
+                "<background_processes>old</background_processes>",
+            ),
+            new_model_context_message(
+                ModelContextSource::Delegation,
+                "delegation-v1",
+                "<delegation_summary>old</delegation_summary>",
+            ),
+            NewSessionMessage::text(SessionMessageRole::User, "real request kept in raw tail"),
+            NewSessionMessage::text(
+                SessionMessageRole::Assistant,
+                "real answer kept in raw tail",
+            ),
+        ])
+        .await
+        .unwrap();
+
+    let outcome = engine
+        .compact_session_checkpoint(&mut session, |_| {})
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        SessionCompactionResult::Noop(SessionCompactionNoopReason::RawTailWithinBudget)
+    ));
+    assert!(provider.requests().await.is_empty());
+    let metadata = session.read_metadata().await.unwrap();
+    assert!(metadata.compaction.is_none());
+    assert_eq!(metadata.recapped_until, 0);
+}
+
+#[tokio::test]
+async fn preflight_compact_skips_context_only_committed_projection_without_provider_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_face0011").await;
+    session
+        .append_messages(&[
+            new_model_context_message(
+                ModelContextSource::Runtime,
+                "runtime-v1",
+                "<runtime_context>old</runtime_context>",
+            ),
+            new_model_context_message(
+                ModelContextSource::BackgroundProcess,
+                "background-v1",
+                "<background_processes>old</background_processes>",
+            ),
+            NewSessionMessage::text(SessionMessageRole::User, "real request kept in raw tail"),
+            NewSessionMessage::text(
+                SessionMessageRole::Assistant,
+                "real answer kept in raw tail",
+            ),
+        ])
+        .await
+        .unwrap();
+
+    let projection = engine
+        .compact_provider_preflight(
+            &mut session,
+            PreflightCompactionRequest {
+                base_system_prompt: "system",
+                active_suffix: vec![SessionTurnMessage::user_text("current request")],
+                turn_id: "turn_1",
+                base_message_count: 4,
+                active_projection_compacted: false,
+                runtime_projection_tokens: 0,
+                protected_active_tail_segments: 0,
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+
+    assert!(projection.is_none());
+    assert!(provider.requests().await.is_empty());
+    let metadata = session.read_metadata().await.unwrap();
+    assert!(metadata.compaction.is_none());
+    assert_eq!(metadata.recapped_until, 0);
+}
+
+#[tokio::test]
+async fn main_forced_context_recovery_errors_when_only_model_context_is_compactable() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.context_window = 20_000;
+    engine.compaction.auto_compact_ctx_ratio = 0.5;
+    engine.compaction.tail_target_ctx_ratio = 0.001;
+    let mut session = create_test_session(&store, "session_face0015").await;
+    let marker = SessionTurnMessage::assistant_text("latest partial answer");
+    let mut provider_messages = vec![
+        SessionTurnMessage::user_text("current objective"),
+        SessionTurnMessage::model_context(ModelContextSource::Runtime, "R".repeat(2_000)),
+        SessionTurnMessage::model_context(ModelContextSource::BackgroundProcess, "B".repeat(2_000)),
+        marker.clone(),
+    ];
+    let mut preflight = PreflightCompactor {
+        engine: &engine,
+        session: &mut session,
+        active_start_index: 0,
+        turn_id: "turn_1".into(),
+        base_message_count: 0,
+        active_projection_compacted: false,
+        provider_context_anchor: None,
+        context_window_recovery_requested: true,
+        context_window_recovery_tail_marker: Some(marker),
+        history_replaced_since_last_check: false,
+        frozen_provider_history_prefix_len: 0,
+        capture_provider_history: false,
+        last_compacted_provider_history: None,
+        provider_replay_identity: None,
+    };
+
+    let error = preflight
+        .before_provider_request(
+            &mut "system".to_string(),
+            &mut provider_messages,
+            &mut |_| {},
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("没有可安全压缩的历史"));
+    assert!(provider.requests().await.is_empty());
+}
+
+#[tokio::test]
+async fn active_turn_compact_skips_context_only_effective_projection() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (engine, store) = build_test_engine(&dir, provider);
+    let session = create_test_session(&store, "session_face0012").await;
+    let metadata = session.read_metadata().await.unwrap();
+    let active = vec![
+        SessionTurnMessage::user_text("objective anchor"),
+        SessionTurnMessage::model_context(ModelContextSource::Runtime, "R".repeat(2_000)),
+        SessionTurnMessage::model_context(ModelContextSource::BackgroundProcess, "B".repeat(2_000)),
+        SessionTurnMessage::assistant_text("recent answer kept raw"),
+    ];
+    let tail_token_limit = estimate_session_turn_messages_tokens(&active[..1])
+        .saturating_add(estimate_session_turn_messages_tokens(&active[3..]));
+
+    let plan = engine
+        .build_active_turn_plan(&metadata, &active, "turn_1", 0, tail_token_limit, 0)
+        .unwrap();
+
+    assert!(plan.is_none());
+}
+
+#[tokio::test]
+async fn preflight_compact_keeps_active_scope_when_committed_projection_is_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        r#"{"committed_summary": null, "active_turn_summary": "active work summarized"}"#,
+        Vec::new(),
+    )]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.context_window = 20_000;
+    engine.compaction.tail_target_ctx_ratio = 0.001;
+    let mut session = create_test_session(&store, "session_face0013").await;
+    session
+        .append_messages(&[
+            new_model_context_message(
+                ModelContextSource::Runtime,
+                "runtime-v1",
+                "<runtime_context>old</runtime_context>",
+            ),
+            new_model_context_message(
+                ModelContextSource::BackgroundProcess,
+                "background-v1",
+                "<background_processes>old</background_processes>",
+            ),
+        ])
+        .await
+        .unwrap();
+    let active_suffix = vec![
+        SessionTurnMessage::user_text("current objective"),
+        SessionTurnMessage::assistant_text("older active detail ".repeat(1_000)),
+        SessionTurnMessage::assistant_text("recent active answer"),
+    ];
+
+    let projection = engine
+        .compact_provider_preflight(
+            &mut session,
+            PreflightCompactionRequest {
+                base_system_prompt: "system",
+                active_suffix,
+                turn_id: "turn_1",
+                base_message_count: 2,
+                active_projection_compacted: false,
+                runtime_projection_tokens: 0,
+                protected_active_tail_segments: 0,
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap()
+        .expect("active scope should still compact");
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 1);
+    let request_text = serde_json::to_string(&requests[0].messages).unwrap();
+    assert!(request_text.contains(r#"\"committed_transcript\": null"#));
+    assert!(request_text.contains("older active detail"));
+    let metadata = session.read_metadata().await.unwrap();
+    let compaction = metadata.compaction.expect("compaction state");
+    assert_eq!(compaction.committed_message_until(), 0);
+    assert_eq!(
+        compaction.active_turn_summary.as_deref(),
+        Some("active work summarized")
+    );
+    assert!(serde_json::to_string(&projection.messages)
+        .unwrap()
+        .contains("active work summarized"));
+}
+
+#[tokio::test]
+async fn finalize_context_only_segment_skips_recap_provider_and_advances_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_face0014").await;
+    session
+        .append_messages(&[
+            new_model_context_message(
+                ModelContextSource::Runtime,
+                "runtime-v1",
+                "<runtime_context>old</runtime_context>",
+            ),
+            new_model_context_message(
+                ModelContextSource::BackgroundProcess,
+                "background-v1",
+                "<background_processes>old</background_processes>",
+            ),
+        ])
+        .await
+        .unwrap();
+
+    let report = engine.finalize_session(&mut session, |_| {}).await.unwrap();
+
+    assert!(provider.requests().await.is_empty());
+    assert!(report.advanced_recapped_until);
+    assert!(report.finalized_unrecapped_messages);
+    let metadata = session.read_metadata().await.unwrap();
+    assert_eq!(metadata.recapped_until, metadata.message_count);
+    assert!(metadata.finalized_at.is_some());
+}
+
+#[tokio::test]
 async fn manual_compact_applied_checkpoint_preserves_report_and_clears_file_read_state() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(Vec::new()));
@@ -7440,14 +7721,18 @@ fn compaction_summary_projections_redact_memory_tool_input_and_output() {
 
 #[test]
 fn parse_compaction_summary_outcome_requires_committed_and_active_shape() {
+    let committed_transcript = vec![TurnMessage {
+        role: "user".into(),
+        content: "historical request".into(),
+    }];
     let inputs = CompactionSummaryInputs {
         audit: test_compaction_audit_context(CompactionAuditScope::Committed),
         committed_start_index: Some(0),
         committed_end_index: Some(2),
         prior_committed_summary: None,
-        committed_transcript: Some(&[]),
-        committed_transcript_with_large_tool_results_omitted: Some(&[]),
-        committed_transcript_with_tool_results_omitted: Some(&[]),
+        committed_transcript: Some(&committed_transcript),
+        committed_transcript_with_large_tool_results_omitted: Some(&committed_transcript),
+        committed_transcript_with_tool_results_omitted: Some(&committed_transcript),
         prior_active_turn_summary: None,
         active_turn_user_anchor: None,
         active_turn_start_segment: None,
@@ -7522,6 +7807,39 @@ fn parse_compaction_summary_outcome_requires_committed_and_active_shape() {
     assert!(err
         .to_string()
         .contains("active_turn_summary must not be empty"));
+}
+
+#[test]
+fn compaction_request_rejects_empty_transcript_before_provider_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (engine, _) = build_test_engine(&dir, provider);
+    let empty = Vec::<TurnMessage>::new();
+    let inputs = CompactionSummaryInputs {
+        audit: test_compaction_audit_context(CompactionAuditScope::Committed),
+        committed_start_index: Some(0),
+        committed_end_index: Some(2),
+        prior_committed_summary: None,
+        committed_transcript: Some(&empty),
+        committed_transcript_with_large_tool_results_omitted: Some(&empty),
+        committed_transcript_with_tool_results_omitted: Some(&empty),
+        prior_active_turn_summary: None,
+        active_turn_user_anchor: None,
+        active_turn_start_segment: None,
+        active_turn_end_segment: None,
+        active_turn_transcript: None,
+        active_turn_transcript_with_large_tool_results_omitted: None,
+        active_turn_transcript_with_tool_results_omitted: None,
+        summary_max_chars: 6000,
+    };
+
+    let error = engine
+        .prepare_compaction_summary_request(&inputs)
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("committed transcript must not be an empty collection"));
 }
 
 #[test]

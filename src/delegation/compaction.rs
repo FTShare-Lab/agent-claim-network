@@ -396,6 +396,14 @@ impl DelegationPreflightCompactor {
             .cloned()
             .map(project_compaction_input_media)
             .collect::<Vec<_>>();
+        if compact_source.is_empty() {
+            log::debug!(
+                target: "delegation",
+                "subagent {} compaction 跳过空有效投影: compact=[{compact_start_index}, {compact_end_index})",
+                self.metadata.id
+            );
+            return None;
+        }
         let compact_messages_with_large_tool_results_omitted =
             project_compaction_input_tool_results(
                 compact_source.clone(),
@@ -1320,6 +1328,85 @@ mod tests {
         ];
 
         assert!(compactor.build_plan(&provider_messages, 0, 2).is_none());
+    }
+
+    #[tokio::test]
+    async fn context_only_compaction_range_skips_provider_without_advancing_cursor() {
+        let (_dir, store, metadata, progress) = started_delegation().await;
+        let provider = Arc::new(JsonProvider::new(Vec::new()));
+        let mut compactor = compactor(metadata.clone(), progress, Arc::clone(&provider));
+        compactor.observe_provider_context_usage(
+            4,
+            ContextUsageSnapshot {
+                used_tokens: 1_000,
+                source: ContextUsageSource::Provider,
+            },
+        );
+        let mut provider_messages = vec![
+            SessionTurnMessage::user_text("objective anchor"),
+            SessionTurnMessage::model_context(
+                crate::api::ModelContextSource::Runtime,
+                "R".repeat(2_000),
+            ),
+            SessionTurnMessage::model_context(
+                crate::api::ModelContextSource::BackgroundProcess,
+                "B".repeat(2_000),
+            ),
+            SessionTurnMessage::assistant_text("recent answer kept raw"),
+        ];
+        let original_messages = provider_messages.clone();
+        let mut events = Vec::new();
+
+        compactor
+            .before_provider_request(
+                &mut "stable subagent system prompt".to_string(),
+                &mut provider_messages,
+                &mut |event| events.push(event),
+            )
+            .await
+            .unwrap();
+
+        assert!(provider.requests().await.is_empty());
+        assert_eq!(provider_messages, original_messages);
+        assert!(events.is_empty());
+        assert!(store
+            .read_compaction_state(&metadata.id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn forced_context_recovery_errors_when_only_model_context_is_compactable() {
+        let (_dir, _store, metadata, progress) = started_delegation().await;
+        let provider = Arc::new(JsonProvider::new(Vec::new()));
+        let mut compactor = compactor(metadata, progress, Arc::clone(&provider));
+        let marker = SessionTurnMessage::assistant_text("latest partial answer");
+        let mut provider_messages = vec![
+            SessionTurnMessage::user_text("objective anchor"),
+            SessionTurnMessage::model_context(
+                crate::api::ModelContextSource::Runtime,
+                "R".repeat(2_000),
+            ),
+            SessionTurnMessage::model_context(
+                crate::api::ModelContextSource::BackgroundProcess,
+                "B".repeat(2_000),
+            ),
+            marker.clone(),
+        ];
+        compactor.request_context_window_recovery(&marker).unwrap();
+
+        let error = compactor
+            .before_provider_request(
+                &mut "stable subagent system prompt".to_string(),
+                &mut provider_messages,
+                &mut |_| {},
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("没有可安全压缩的历史"));
+        assert!(provider.requests().await.is_empty());
     }
 
     #[tokio::test]

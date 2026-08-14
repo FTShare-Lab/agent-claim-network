@@ -3720,7 +3720,7 @@ impl SessionEngine {
             committed_tail_limit,
         );
         let committed_transcripts = if summary_end > summary_start {
-            Some(session_compaction_transcript_projection(
+            let projection = session_compaction_transcript_projection(
                 session_messages
                     .get(summary_start..summary_end)
                     .with_context(|| {
@@ -3729,7 +3729,8 @@ impl SessionEngine {
                         )
                     })?,
                 self.compaction.tool_result_raw_max_chars,
-            ))
+            );
+            (!projection.full.is_empty()).then_some(projection)
         } else {
             None
         };
@@ -3825,6 +3826,13 @@ impl SessionEngine {
             summary_messages.into_iter().cloned().collect(),
             self.compaction.tool_result_raw_max_chars,
         );
+        if transcript_projection.full.is_empty() {
+            log::debug!(
+                target: "agent",
+                "active-turn compaction 跳过空有效投影: turn_id={turn_id} segments=[{summary_start_segment}, {summary_end_segment})"
+            );
+            return Ok(None);
+        }
         let source_hash = active_segments_hash(active_suffix, &segments[..summary_end_segment])?;
         Ok(Some(ActiveTurnPlan {
             summary_start_segment,
@@ -4357,10 +4365,38 @@ impl SessionEngine {
             }
             _ => false,
         };
-        if ranges.summary_end_index <= ranges.summary_start_index && !has_recoverable_checkpoint {
-            return Ok(ManualCompactionOutcome::Noop(compaction_noop_reason(
-                &metadata, &ranges,
-            )));
+        if !has_recoverable_checkpoint {
+            let summary_transcript_is_empty =
+                if ranges.summary_end_index > ranges.summary_start_index {
+                    let segment = session_messages
+                        .get(ranges.summary_start_index..ranges.summary_end_index)
+                        .with_context(|| {
+                            format!(
+                                "session compact summary 范围越界: [{}, {})",
+                                ranges.summary_start_index, ranges.summary_end_index
+                            )
+                        })?;
+                    session_compaction_transcript_projection(
+                        segment,
+                        self.compaction.tool_result_raw_max_chars,
+                    )
+                    .full
+                    .is_empty()
+                } else {
+                    true
+                };
+            if summary_transcript_is_empty {
+                log::debug!(
+                    target: "agent",
+                    "session {} manual compaction 跳过空有效投影: compact=[{}, {})",
+                    metadata.id,
+                    ranges.summary_start_index,
+                    ranges.summary_end_index
+                );
+                return Ok(ManualCompactionOutcome::Noop(compaction_noop_reason(
+                    &metadata, &ranges,
+                )));
+            }
         }
         emit(SessionEvent::StatusChanged {
             status: SessionRuntimeStatus::Compacting,
@@ -4998,6 +5034,21 @@ impl SessionEngine {
         &self,
         inputs: &CompactionSummaryInputs<'_>,
     ) -> anyhow::Result<PreparedCompactionSummaryRequest> {
+        if inputs
+            .committed_transcript
+            .is_some_and(<[TurnMessage]>::is_empty)
+        {
+            anyhow::bail!("compaction committed transcript must not be an empty collection");
+        }
+        if inputs
+            .active_turn_transcript
+            .is_some_and(<[TurnMessage]>::is_empty)
+        {
+            anyhow::bail!("compaction active-turn transcript must not be an empty collection");
+        }
+        if inputs.committed_transcript.is_none() && inputs.active_turn_transcript.is_none() {
+            anyhow::bail!("compaction summary request requires at least one non-empty transcript");
+        }
         let system_prompt = self
             .prompt_registry
             .render(

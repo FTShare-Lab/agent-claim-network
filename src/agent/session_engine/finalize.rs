@@ -369,6 +369,14 @@ impl SessionEngine {
         fallback_scope: crate::api::ProviderRuntimeFallbackScope,
     ) -> anyhow::Result<(Vec<ClaimId>, Vec<Claim>, Vec<Dispute>)> {
         let transcript = session_messages_to_turn_transcript(session_messages);
+        if transcript.is_empty() && background_process_completions.items.is_empty() {
+            log::debug!(
+                target: "agent",
+                "agent {} recap/finalize 跳过空有效输入",
+                self.agent.agent_id
+            );
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
         let local_claims = llm_visible_claims(self.agent.claim_store.list_local_claims().await?);
         let local_by_id: FxHashMap<ClaimId, Claim> = local_claims
             .iter()
