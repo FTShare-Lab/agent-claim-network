@@ -823,7 +823,26 @@ struct CompactionRanges {
 struct SessionRecapPayload<'a> {
     instruction: &'a str,
     transcript: &'a [TurnMessage],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    background_process_completions: Option<&'a SessionRecapBackgroundProcessProjection>,
     local_claims: &'a [Claim],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SessionRecapBackgroundProcessProjection {
+    omitted_older_count: usize,
+    items: Vec<SessionRecapBackgroundProcessCompletion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SessionRecapBackgroundProcessCompletion {
+    turn_id: String,
+    tool_use_id: String,
+    process_id: String,
+    status: String,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    success: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1268,7 +1287,7 @@ impl SessionEngine {
         let completions = self
             .turn_loop
             .tool_registry()
-            .take_process_completions_for_root_session(&session.metadata.id)
+            .pending_process_completions_for_root_session(&session.metadata.id)
             .await;
         let mut events = Vec::with_capacity(lifecycle_events.len() + completions.len());
         for lifecycle_event in lifecycle_events {
@@ -1338,12 +1357,55 @@ impl SessionEngine {
                 .map(|signal| format!("signal={signal}"))
                 .or_else(|| completion.exit_code.map(|code| format!("exit_code={code}")))
                 .unwrap_or_else(|| "exit_code=unknown".into());
+            if completion.owner.subagent_id.is_none() {
+                if let (Some(turn_id), Some(tool_use_id)) = (
+                    completion.originating_turn_id.as_ref(),
+                    completion.originating_tool_use_id.as_ref(),
+                ) {
+                    let persisted = async {
+                        let mut writer = session.open_turn_journal_writer().await?;
+                        writer
+                            .append(
+                                turn_id.clone(),
+                                Utc::now(),
+                                TurnJournalEventKind::BackgroundProcessCompleted {
+                                    tool_use_id: tool_use_id.clone(),
+                                    process_id: completion.process_id.clone(),
+                                    instance_id: completion.instance_id,
+                                    status: completion.status.clone(),
+                                    exit_code: completion.exit_code,
+                                    signal: completion.signal,
+                                    success: completion.success,
+                                },
+                                TurnJournalFlush::Immediate,
+                            )
+                            .await
+                    }
+                    .await;
+                    if let Err(error) = persisted {
+                        log::warn!(
+                            target: "agent",
+                            "background completion journal 写入失败 session={} turn={} tool_use={} process={}: {}",
+                            session.metadata.id,
+                            turn_id,
+                            tool_use_id,
+                            completion.process_id,
+                            error
+                        );
+                        // root completion 必须在 durable journal 成功后才确认；本轮不更新
+                        // TUI，保留队列供下一个 heartbeat/finalize retry 再试。
+                        continue;
+                    }
+                }
+            }
             self.append_session_event_log(
                 session,
                 "INFO",
                 format!(
-                    "Background process completed: process_id={} owner_agent={} owner_root_session={} owner_subagent={} status={} {}",
+                    "Background process completed: process_id={} turn_id={} tool_use_id={} owner_agent={} owner_root_session={} owner_subagent={} status={} {}",
                     completion.process_id,
+                    completion.originating_turn_id.as_deref().unwrap_or("unknown"),
+                    completion.originating_tool_use_id.as_deref().unwrap_or("unknown"),
                     completion.owner.owner_agent_id,
                     completion.owner.root_session_id,
                     owner_subagent,
@@ -1354,13 +1416,23 @@ impl SessionEngine {
             .await;
             events.push(SessionEvent::BackgroundProcessCompleted {
                 process_id: completion.process_id,
+                originating_turn_id: completion.originating_turn_id,
+                originating_tool_use_id: completion.originating_tool_use_id,
                 owner_agent_id: completion.owner.owner_agent_id,
                 owner_root_session_id: completion.owner.root_session_id,
                 owner_subagent_id: completion.owner.subagent_id,
                 status: completion.status,
                 exit_code: completion.exit_code,
                 signal: completion.signal,
+                success: completion.success,
             });
+            self.turn_loop
+                .tool_registry()
+                .acknowledge_process_completion_for_root_session(
+                    &session.metadata.id,
+                    completion.instance_id,
+                )
+                .await;
         }
         events
     }
@@ -1385,7 +1457,43 @@ impl SessionEngine {
             .await;
     }
 
-    /// TUI/CLI runtime 退出时收束当前 engine 共享 registry 的全部受管 terminal。
+    async fn settle_processes_for_session_finalization<F>(
+        &self,
+        session: &SessionHandle,
+        emit: &mut F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(SessionEvent),
+    {
+        // 先持久化 watcher 已经登记但 heartbeat 尚未消费的终态，再终止 live entry。
+        for event in self.drain_background_process_completions(session).await {
+            emit(event);
+        }
+        self.turn_loop
+            .tool_registry()
+            .settle_processes_for_session(&session.metadata.id, Duration::from_secs(5))
+            .await;
+        for event in self.drain_background_process_completions(session).await {
+            emit(event);
+        }
+
+        let pending = self
+            .turn_loop
+            .tool_registry()
+            .pending_process_completions_for_root_session(&session.metadata.id)
+            .await;
+        if !pending.is_empty() {
+            anyhow::bail!(
+                "{} background process completion(s) are still awaiting durable journal persistence",
+                pending.len()
+            );
+        }
+        self.cleanup_processes_for_session(&session.metadata.id)
+            .await;
+        Ok(())
+    }
+
+    /// TUI/CLI runtime 退出时关闭全部受管 terminal，避免子进程泄漏到宿主退出之后。
     pub(crate) async fn shutdown_background_processes(&self) {
         self.turn_loop
             .tool_registry()
@@ -2322,6 +2430,24 @@ impl SessionEngine {
             },
         )
         .await?;
+        // recovery snapshot 必须排在独立 watcher 的 durable completion 之后。否则用户在
+        // 下一个 heartbeat 前立刻提交新 turn 时，本轮模型会冻结并看到陈旧的
+        // `ProcessRunning`，即使 completion 随后才写入上一 turn journal。
+        let background_events = self.drain_background_process_completions(session).await;
+        for event in background_events {
+            emit(event);
+        }
+        let pending_background_completions = self
+            .turn_loop
+            .tool_registry()
+            .pending_process_completions_for_root_session(&session.metadata.id)
+            .await;
+        if !pending_background_completions.is_empty() {
+            anyhow::bail!(
+                "cannot start a new turn while {} background process completion(s) await durable journal persistence",
+                pending_background_completions.len()
+            );
+        }
         let (
             turn_id,
             recovery_context,
@@ -2356,6 +2482,9 @@ impl SessionEngine {
         }
         let model_user_text =
             user_text_with_recovery_context(user_text.clone(), recovery_context.as_deref());
+        emit(SessionEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+        });
         emit(SessionEvent::UserMessageAccepted {
             text: visible_user_text,
         });
@@ -3620,7 +3749,7 @@ impl SessionEngine {
             committed_tail_limit,
         );
         let committed_transcripts = if summary_end > summary_start {
-            Some(session_compaction_transcript_projection(
+            let projection = session_compaction_transcript_projection(
                 session_messages
                     .get(summary_start..summary_end)
                     .with_context(|| {
@@ -3629,7 +3758,8 @@ impl SessionEngine {
                         )
                     })?,
                 self.compaction.tool_result_raw_max_chars,
-            ))
+            );
+            (!projection.full.is_empty()).then_some(projection)
         } else {
             None
         };
@@ -3725,6 +3855,13 @@ impl SessionEngine {
             summary_messages.into_iter().cloned().collect(),
             self.compaction.tool_result_raw_max_chars,
         );
+        if transcript_projection.full.is_empty() {
+            log::debug!(
+                target: "agent",
+                "active-turn compaction 跳过空有效投影: turn_id={turn_id} segments=[{summary_start_segment}, {summary_end_segment})"
+            );
+            return Ok(None);
+        }
         let source_hash = active_segments_hash(active_suffix, &segments[..summary_end_segment])?;
         Ok(Some(ActiveTurnPlan {
             summary_start_segment,
@@ -4257,10 +4394,38 @@ impl SessionEngine {
             }
             _ => false,
         };
-        if ranges.summary_end_index <= ranges.summary_start_index && !has_recoverable_checkpoint {
-            return Ok(ManualCompactionOutcome::Noop(compaction_noop_reason(
-                &metadata, &ranges,
-            )));
+        if !has_recoverable_checkpoint {
+            let summary_transcript_is_empty =
+                if ranges.summary_end_index > ranges.summary_start_index {
+                    let segment = session_messages
+                        .get(ranges.summary_start_index..ranges.summary_end_index)
+                        .with_context(|| {
+                            format!(
+                                "session compact summary 范围越界: [{}, {})",
+                                ranges.summary_start_index, ranges.summary_end_index
+                            )
+                        })?;
+                    session_compaction_transcript_projection(
+                        segment,
+                        self.compaction.tool_result_raw_max_chars,
+                    )
+                    .full
+                    .is_empty()
+                } else {
+                    true
+                };
+            if summary_transcript_is_empty {
+                log::debug!(
+                    target: "agent",
+                    "session {} manual compaction 跳过空有效投影: compact=[{}, {})",
+                    metadata.id,
+                    ranges.summary_start_index,
+                    ranges.summary_end_index
+                );
+                return Ok(ManualCompactionOutcome::Noop(compaction_noop_reason(
+                    &metadata, &ranges,
+                )));
+            }
         }
         emit(SessionEvent::StatusChanged {
             status: SessionRuntimeStatus::Compacting,
@@ -4676,7 +4841,7 @@ impl SessionEngine {
             })?;
         let report = self
             .apply_prepared_finalize_batch(
-                recap_segment,
+                finalize::FinalizeTraceInput::Messages(recap_segment),
                 checkpoint.used_claim_ids.clone(),
                 checkpoint.prepared_claims.clone(),
                 checkpoint.prepared_disputes.clone(),
@@ -4899,6 +5064,21 @@ impl SessionEngine {
         &self,
         inputs: &CompactionSummaryInputs<'_>,
     ) -> anyhow::Result<PreparedCompactionSummaryRequest> {
+        if inputs
+            .committed_transcript
+            .is_some_and(<[TurnMessage]>::is_empty)
+        {
+            anyhow::bail!("compaction committed transcript must not be an empty collection");
+        }
+        if inputs
+            .active_turn_transcript
+            .is_some_and(<[TurnMessage]>::is_empty)
+        {
+            anyhow::bail!("compaction active-turn transcript must not be an empty collection");
+        }
+        if inputs.committed_transcript.is_none() && inputs.active_turn_transcript.is_none() {
+            anyhow::bail!("compaction summary request requires at least one non-empty transcript");
+        }
         let system_prompt = self
             .prompt_registry
             .render(

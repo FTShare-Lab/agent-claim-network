@@ -1038,7 +1038,16 @@ fn spawn_finalize_enqueue_worker(
             if !finalize_needs_background_job(&metadata) {
                 return anyhow::Ok(None);
             }
-            engine.mark_session_finalizing(&mut session).await?;
+            let event_tx = worker_tx.clone();
+            let mut emit = move |event| {
+                let _ = event_tx.send(WorkerEvent::Session {
+                    task_id: Some(task_id),
+                    event,
+                });
+            };
+            engine
+                .mark_session_finalizing(&mut session, &mut emit)
+                .await?;
             let job_id =
                 crate::supervisor::enqueue_finalize(&supervisor, session.metadata.id.clone())
                     .await?;
@@ -1622,6 +1631,7 @@ mod tests {
     #[test]
     fn ambiguous_duplicate_user_text_keeps_journal_diff_separate() {
         let canonical_turn = || crate::session::HistoricalTimelineTurn {
+            turn_id: None,
             user_text: "重试".into(),
             canonical_user_content_hash: None,
             assistant_text: None,
@@ -1656,8 +1666,10 @@ mod tests {
             output_preview: None,
             output_truncated: false,
             file_change: Some(change),
+            background_completion: None,
         };
         let journal = crate::session::HistoricalTimelineTurn {
+            turn_id: Some("turn_1".into()),
             user_text: "重试".into(),
             canonical_user_content_hash: None,
             assistant_text: None,
@@ -1688,6 +1700,7 @@ mod tests {
     #[test]
     fn missing_journal_assistant_is_explicit_recovery_content_without_fabricated_timeline_order() {
         let canonical = crate::session::HistoricalTimelineTurn {
+            turn_id: None,
             user_text: "改文件".into(),
             canonical_user_content_hash: None,
             assistant_text: Some("canonical 最终回复".into()),
@@ -1714,8 +1727,10 @@ mod tests {
             output_preview: None,
             output_truncated: false,
             file_change: None,
+            background_completion: None,
         };
         let journal = crate::session::HistoricalTimelineTurn {
+            turn_id: Some("turn_1".into()),
             user_text: "改文件".into(),
             canonical_user_content_hash: None,
             assistant_text: None,
@@ -1758,6 +1773,7 @@ mod tests {
     #[test]
     fn missing_journal_assistant_without_timeline_renders_canonical_once() {
         let canonical = crate::session::HistoricalTimelineTurn {
+            turn_id: None,
             user_text: "恢复请求".into(),
             canonical_user_content_hash: None,
             assistant_text: Some("canonical 完整回复".into()),
@@ -1770,6 +1786,7 @@ mod tests {
             turn_status_detail: None,
         };
         let journal = crate::session::HistoricalTimelineTurn {
+            turn_id: Some("turn_1".into()),
             user_text: "恢复请求".into(),
             canonical_user_content_hash: None,
             assistant_text: None,
@@ -1804,6 +1821,7 @@ mod tests {
     #[test]
     fn missing_journal_assistant_with_incomplete_tool_keeps_recovery_in_scrollback() {
         let canonical = crate::session::HistoricalTimelineTurn {
+            turn_id: None,
             user_text: "恢复请求".into(),
             canonical_user_content_hash: None,
             assistant_text: Some("canonical 工具后回复".into()),
@@ -1830,8 +1848,10 @@ mod tests {
             output_preview: None,
             output_truncated: false,
             file_change: None,
+            background_completion: None,
         };
         let journal = crate::session::HistoricalTimelineTurn {
+            turn_id: Some("turn_1".into()),
             user_text: "恢复请求".into(),
             canonical_user_content_hash: None,
             assistant_text: None,
@@ -1872,6 +1892,7 @@ mod tests {
         let canonical = ["canonical 回复一", "canonical 回复二"]
             .into_iter()
             .map(|assistant| crate::session::HistoricalTimelineTurn {
+                turn_id: None,
                 user_text: "重试".into(),
                 canonical_user_content_hash: None,
                 assistant_text: Some(assistant.into()),
@@ -1886,6 +1907,7 @@ mod tests {
             .collect::<Vec<_>>();
         let journal = (0..2)
             .map(|_| crate::session::HistoricalTimelineTurn {
+                turn_id: Some("turn_journal".into()),
                 user_text: "重试".into(),
                 canonical_user_content_hash: None,
                 assistant_text: None,

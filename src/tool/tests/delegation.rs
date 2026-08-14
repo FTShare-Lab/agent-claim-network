@@ -4,6 +4,42 @@
 
 use super::*;
 
+const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn wait_for_delegation_status(
+    store: &DelegationStore,
+    id: &str,
+    expected: DelegationStatus,
+) -> crate::delegation::DelegationMetadata {
+    let id = id.parse().expect("fixture subagent id should be valid");
+    tokio::time::timeout(TEST_EVENT_TIMEOUT, async {
+        loop {
+            let metadata = store.load(&id).await.expect("load fixture subagent");
+            if metadata.status == expected || metadata.status.is_terminal() {
+                return metadata;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("subagent {id} should reach {expected:?}"))
+}
+
+async fn complete_wait_test_subagent(
+    executor: &WaitingDelegationExecutor,
+    store: &DelegationStore,
+    id: &str,
+) {
+    executor.progress_gate.notify_one();
+    executor.release.notify_one();
+    let metadata = wait_for_delegation_status(store, id, DelegationStatus::Completed).await;
+    assert_eq!(
+        metadata.status,
+        DelegationStatus::Completed,
+        "fixture subagent should complete successfully: {metadata:?}"
+    );
+}
+
 #[test]
 fn registry_exposes_core_file_tools() {
     let dir = tempfile::tempdir().unwrap();
@@ -116,7 +152,6 @@ async fn parent_registry_exposes_delegation_tools_and_can_create_list() {
         .unwrap();
     assert_eq!(created.output["subagent"]["title"], "scan files");
 
-    tokio::time::sleep(Duration::from_millis(20)).await;
     let listed = registry
         .dispatch_with_context(
             "list_subagents",
@@ -333,7 +368,8 @@ fn code_run_yield_uses_configured_default_and_bounds() {
 
 #[tokio::test]
 async fn wait_subagents_returns_no_active_and_rejects_invalid_explicit_ids() {
-    let (dir, registry, session_id, _executor) = wait_test_registry().await;
+    let (dir, registry, session_id, _executor, _store, _snapshot, _blocking) =
+        wait_test_registry().await;
     let no_active = registry
         .dispatch_with_context("wait_subagents", json!({}), wait_test_context(&session_id))
         .await
@@ -389,19 +425,19 @@ async fn wait_subagents_returns_no_active_and_rejects_invalid_explicit_ids() {
 
 #[tokio::test]
 async fn wait_subagents_any_terminal_reports_pending_and_all_terminal_accepts_abandoned() {
-    let (_dir, registry, session_id, executor) = wait_test_registry().await;
+    let (_dir, registry, session_id, executor, _store, _snapshot, _blocking) =
+        wait_test_registry().await;
     let slow_started = executor.slow_started.notified();
     let slow_id = create_wait_test_subagent(&registry, &session_id, "slow").await;
-    tokio::time::timeout(Duration::from_millis(200), slow_started)
+    tokio::time::timeout(TEST_EVENT_TIMEOUT, slow_started)
         .await
         .expect("slow subagent should start");
     let fast_id = create_wait_test_subagent(&registry, &session_id, "fast").await;
-    tokio::time::sleep(Duration::from_millis(30)).await;
 
     let any = registry
         .dispatch_with_context(
             "wait_subagents",
-            json!({"subagent_ids": [fast_id, slow_id], "until": "any_terminal", "timeout_secs": 1}),
+            json!({"subagent_ids": [fast_id, slow_id], "until": "any_terminal", "timeout_secs": 5}),
             wait_test_context(&session_id),
         )
         .await
@@ -441,10 +477,58 @@ async fn wait_subagents_any_terminal_reports_pending_and_all_terminal_accepts_ab
 
 #[tokio::test]
 async fn wait_subagents_progress_wakes_check_without_early_return() {
-    let (_dir, registry, session_id, executor) = wait_test_registry().await;
+    let (_dir, registry, session_id, executor, store, _snapshot, wait_blocking) =
+        wait_test_registry().await;
     let slow_started = executor.slow_started.notified();
     let slow_id = create_wait_test_subagent(&registry, &session_id, "slow").await;
-    tokio::time::timeout(Duration::from_millis(200), slow_started)
+    tokio::time::timeout(TEST_EVENT_TIMEOUT, slow_started)
+        .await
+        .expect("slow subagent should start");
+
+    let wait_registry = Arc::clone(&registry);
+    let wait_session_id = session_id.clone();
+    let wait_slow_id = slow_id.clone();
+    let wait_task = tokio::spawn(async move {
+        wait_registry
+            .dispatch_with_context(
+                "wait_subagents",
+                json!({"subagent_ids": [wait_slow_id], "until": "all_terminal", "timeout_secs": 10}),
+                wait_test_context(&wait_session_id),
+            )
+            .await
+    });
+    tokio::time::timeout(TEST_EVENT_TIMEOUT, wait_blocking.notified())
+        .await
+        .expect("wait should block on delegation activity");
+    let progress_recorded = executor.progress_recorded.notified();
+    executor.progress_gate.notify_one();
+    tokio::time::timeout(TEST_EVENT_TIMEOUT, progress_recorded)
+        .await
+        .expect("progress should persist");
+    assert!(
+        !wait_task.is_finished(),
+        "ordinary progress must not resolve terminal wait"
+    );
+
+    executor.release.notify_one();
+    let waited = tokio::time::timeout(TEST_EVENT_TIMEOUT, wait_task)
+        .await
+        .expect("terminal state should wake wait")
+        .unwrap()
+        .unwrap();
+    assert_eq!(waited.output["outcome"], "condition_met");
+    assert_eq!(waited.output["pending_subagent_ids"], json!([]));
+    let completed = wait_for_delegation_status(&store, &slow_id, DelegationStatus::Completed).await;
+    assert_eq!(completed.status, DelegationStatus::Completed);
+}
+
+#[tokio::test]
+async fn wait_subagents_omitted_ids_are_fixed_at_call_start() {
+    let (_dir, registry, session_id, executor, store, snapshot_resolved, _blocking) =
+        wait_test_registry().await;
+    let slow_started = executor.slow_started.notified();
+    let slow_id = create_wait_test_subagent(&registry, &session_id, "slow").await;
+    tokio::time::timeout(TEST_EVENT_TIMEOUT, slow_started)
         .await
         .expect("slow subagent should start");
 
@@ -454,39 +538,42 @@ async fn wait_subagents_progress_wakes_check_without_early_return() {
         wait_registry
             .dispatch_with_context(
                 "wait_subagents",
-                json!({"subagent_ids": [slow_id], "until": "all_terminal", "timeout_secs": 1}),
+                json!({"until": "all_terminal", "timeout_secs": 10}),
                 wait_test_context(&wait_session_id),
             )
             .await
     });
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    let progress_recorded = executor.progress_recorded.notified();
-    executor.progress_gate.notify_one();
-    tokio::time::timeout(Duration::from_millis(200), progress_recorded)
+    tokio::time::timeout(TEST_EVENT_TIMEOUT, snapshot_resolved.notified())
         .await
-        .expect("progress should persist");
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    assert!(
-        !wait_task.is_finished(),
-        "ordinary progress must not resolve terminal wait"
-    );
+        .expect("wait should freeze the omitted-id snapshot");
 
-    executor.release.notify_one();
-    let waited = tokio::time::timeout(Duration::from_millis(500), wait_task)
+    let late_started = executor.late_started.notified();
+    let late_id = create_wait_test_subagent(&registry, &session_id, "late").await;
+    tokio::time::timeout(TEST_EVENT_TIMEOUT, late_started)
         .await
-        .expect("terminal state should wake wait")
+        .expect("late subagent should start");
+
+    complete_wait_test_subagent(&executor, &store, &slow_id).await;
+    let waited = tokio::time::timeout(TEST_EVENT_TIMEOUT, wait_task)
+        .await
+        .expect("the fixed snapshot should finish without the late subagent")
         .unwrap()
         .unwrap();
     assert_eq!(waited.output["outcome"], "condition_met");
-    assert_eq!(waited.output["pending_subagent_ids"], json!([]));
+    assert_eq!(waited.output["waited_subagent_ids"], json!([slow_id]));
+
+    executor.late_release.notify_one();
+    let late = wait_for_delegation_status(&store, &late_id, DelegationStatus::Completed).await;
+    assert_eq!(late.status, DelegationStatus::Completed);
 }
 
 #[tokio::test]
-async fn wait_subagents_omitted_ids_are_fixed_at_call_start_and_support_cancellation() {
-    let (_dir, registry, session_id, executor) = wait_test_registry().await;
+async fn wait_subagents_supports_cancellation() {
+    let (_dir, registry, session_id, executor, store, _snapshot, wait_blocking) =
+        wait_test_registry().await;
     let slow_started = executor.slow_started.notified();
-    let _slow_id = create_wait_test_subagent(&registry, &session_id, "slow").await;
-    tokio::time::timeout(Duration::from_millis(200), slow_started)
+    let slow_id = create_wait_test_subagent(&registry, &session_id, "slow").await;
+    tokio::time::timeout(TEST_EVENT_TIMEOUT, slow_started)
         .await
         .expect("slow subagent should start");
 
@@ -494,11 +581,12 @@ async fn wait_subagents_omitted_ids_are_fixed_at_call_start_and_support_cancella
     let wait_registry = Arc::clone(&registry);
     let wait_session_id = session_id.clone();
     let wait_cancellation = cancellation.clone();
+    let wait_slow_id = slow_id.clone();
     let wait_task = tokio::spawn(async move {
         wait_registry
             .dispatch_with_context(
                 "wait_subagents",
-                json!({"until": "all_terminal", "timeout_secs": 1}),
+                json!({"subagent_ids": [wait_slow_id], "until": "all_terminal", "timeout_secs": 10}),
                 ToolDispatchContext {
                     current_session_id: Some(wait_session_id),
                     cancellation: Some(wait_cancellation),
@@ -507,35 +595,27 @@ async fn wait_subagents_omitted_ids_are_fixed_at_call_start_and_support_cancella
             )
             .await
     });
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    let _fast_id = create_wait_test_subagent(&registry, &session_id, "fast").await;
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    assert!(
-        !wait_task.is_finished(),
-        "a subagent created after the call must not satisfy the fixed snapshot"
-    );
+    tokio::time::timeout(TEST_EVENT_TIMEOUT, wait_blocking.notified())
+        .await
+        .expect("wait should enter its blocking loop before cancellation");
     cancellation.cancel();
-    let error = tokio::time::timeout(Duration::from_millis(500), wait_task)
+    let error = tokio::time::timeout(TEST_EVENT_TIMEOUT, wait_task)
         .await
         .expect("cancellation should wake wait")
         .unwrap()
         .expect_err("cancelled wait must not return a normal tool result");
     assert!(matches!(error, ToolError::Interrupted));
 
-    let progress_recorded = executor.progress_recorded.notified();
-    executor.progress_gate.notify_one();
-    tokio::time::timeout(Duration::from_millis(200), progress_recorded)
-        .await
-        .expect("progress should persist before cleanup");
-    executor.release.notify_one();
+    complete_wait_test_subagent(&executor, &store, &slow_id).await;
 }
 
 #[tokio::test]
 async fn wait_subagents_times_out_with_bounded_status_only() {
-    let (_dir, registry, session_id, executor) = wait_test_registry().await;
+    let (_dir, registry, session_id, executor, store, _snapshot, _blocking) =
+        wait_test_registry().await;
     let slow_started = executor.slow_started.notified();
     let slow_id = create_wait_test_subagent(&registry, &session_id, "slow").await;
-    tokio::time::timeout(Duration::from_millis(200), slow_started)
+    tokio::time::timeout(TEST_EVENT_TIMEOUT, slow_started)
         .await
         .expect("slow subagent should start");
 
@@ -555,12 +635,7 @@ async fn wait_subagents_times_out_with_bounded_status_only() {
         .unwrap()
         .is_empty());
 
-    let progress_recorded = executor.progress_recorded.notified();
-    executor.progress_gate.notify_one();
-    tokio::time::timeout(Duration::from_millis(200), progress_recorded)
-        .await
-        .expect("progress should persist before cleanup");
-    executor.release.notify_one();
+    complete_wait_test_subagent(&executor, &store, &slow_id).await;
 }
 
 #[tokio::test]

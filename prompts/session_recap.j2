@@ -7,6 +7,7 @@
   - `instruction`：触发复盘输出的指令
   - `transcript`：上一阶段自然语言推理的完整消息记录
     - transcript 中可能包含 router 工具调用结果，其中 `candidate_claims` 是候选 claim，`disputes` 是候选 claim 相关的 dispute 摘要；仅当候选中存在冲突时，disputes 才会被提供。
+  - `background_process_completions`（可选）：transcript 中 main agent `code_run` 曾返回后台运行后，由独立 watcher 确认的最终 exit / signal 事实；它只补充对应工具的终态，不是新的用户请求或第二个工具结果
   - `local_claims`：你当前持有的完整本地 claim
 - 复盘阶段只输出 claim / dispute JSON；不要提出或执行其他动作
 - 不引用用户身份 / 私密 / 偏好/ 喜好 / 爱好
@@ -25,7 +26,7 @@ claim / dispute 是团队可共享知识，必须与私有 memory 脱敏和解�
 - `USER.md` 相关更新内容绝对不能生成 claim/dispute。
 - `MEMORY.md` 相关更新不能单独作为证据；但可以结合 transcript 中的当前任务内容一起评估，若脱敏、泛化后适合作为团队知识，则可以生成 claim/dispute。
 
-claim/dispute 的生成应基于 transcript 或 local_claims 中的当前任务证据；如果 transcript 中包含 router 工具结果，可以参考其中的 `candidate_claims` 与 `disputes`。
+claim/dispute 的生成应基于 transcript、`background_process_completions` 或 local_claims 中的当前任务证据；如果 transcript 中包含 router 工具结果，可以参考其中的 `candidate_claims` 与 `disputes`。后台进程终态只能用于修正 transcript 中对应 `code_run` 的实际完成结果，不能脱离原任务单独推断无关结论。
 
 不要把 local_claims 或 transcript 中已有的 claim，包括 router `candidate_claims`，原样复制为 `new_claim`。如果只是参考、采用或复述已有 claim，请只把真实 claim id 放入 `used_claim_ids`，不要生成新的 claim。
 如果本 session 为某条 local claim 带来了实质性的新证据、语义修订或生命周期判断，请在 `updated_claims` 中按原 id 输出更新后的完整属性；不要为同一语义另建 claim。

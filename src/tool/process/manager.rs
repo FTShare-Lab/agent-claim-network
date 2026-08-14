@@ -99,6 +99,13 @@ pub(crate) enum TerminateRequestResult {
     AlreadyExited,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservedRootExit {
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    success: bool,
+}
+
 /// 受管 terminal 的非 tool-result 生命周期事件。输出事件只表示“有新 output 可刷新”，
 /// 不携带字节正文，避免把高频数据写入 journal。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,12 +132,18 @@ pub(crate) struct ProcessCompletion {
     pub(crate) root_session_id: String,
     pub(crate) owner: ProcessOwner,
     pub(crate) process_id: String,
+    /// 创建该进程的 turn；与 tool_use_id 组合后才是 session 内稳定的展示关联键。
+    pub(crate) originating_turn_id: Option<String>,
+    /// 创建该进程的原始 code_run tool_use，仅供 TUI 把终态投影回对应 cell；
+    /// 它不是模型可见的 process 标识，也不进入后台进程协议。
+    pub(crate) originating_tool_use_id: Option<String>,
     /// 区分被容量淘汰后重用同一 logical process_id 的两次 allocation；不是 OS PID。
     /// lifecycle context 会把它作为稳定语义字段提供给模型。
     pub(crate) instance_id: u64,
     pub(crate) status: String,
     pub(crate) exit_code: Option<i32>,
     pub(crate) signal: Option<i32>,
+    pub(crate) success: bool,
     pub(crate) finished_at: SystemTime,
     /// 终态运行时长必须在完成瞬间固定；不能在动态上下文投影时继续按 wall clock 增长。
     pub(crate) elapsed_minutes: u64,
@@ -297,15 +310,20 @@ pub(crate) struct ManagedProcess {
     pub(crate) id: ProcessId,
     pub(crate) instance_id: u64,
     pub(crate) owner: ProcessOwner,
-    /// 创建此终端 session 的 tool_use。它只用于 explicit cancel 强制 abort 后，
-    /// 将仍存活的受管进程精确回写到对应的 Interrupted cell，不能作为模型可见 ID。
+    /// 创建此终端 session 的 tool_use。它用于 explicit cancel 强制 abort 后找回仍存活
+    /// 的进程，以及在 watcher 收到终态后精确更新对应 TUI cell；不能作为模型可见 ID。
     originating_tool_use_id: Option<String>,
+    /// tool_use_id 只保证单 turn 唯一，必须保留其 turn 才能安全关联历史展示。
+    originating_turn_id: Option<String>,
     pub(crate) command: String,
     pub(crate) code_type: String,
     pub(crate) cwd: String,
     pub(crate) tty: bool,
     pub(crate) started_at: SystemTime,
     finished_at: Mutex<Option<SystemTime>>,
+    /// root child 已由 watcher reap、但输出 reader 仍处于 drain grace 时，先保存真实
+    /// ExitStatus。finalize 的较短 settle deadline 不能把这个窗口伪造成 SIGKILL。
+    observed_root_exit: Mutex<Option<ObservedRootExit>>,
     pub(crate) state: Mutex<ProcessState>,
     pub(crate) stdout: Mutex<BoundedOutput>,
     pub(crate) stderr: Mutex<BoundedOutput>,
@@ -328,7 +346,7 @@ pub(crate) struct ManagedProcess {
 
 impl ManagedProcess {
     fn new(
-        identity: (ProcessId, u64, Option<i32>, Option<String>),
+        identity: (ProcessId, u64, Option<i32>, Option<String>, Option<String>),
         owner: ProcessOwner,
         command: String,
         code_type: String,
@@ -336,18 +354,21 @@ impl ManagedProcess {
         tty: bool,
         output_buffer_bytes: (usize, usize),
     ) -> Self {
-        let (id, instance_id, process_group_id, originating_tool_use_id) = identity;
+        let (id, instance_id, process_group_id, originating_turn_id, originating_tool_use_id) =
+            identity;
         Self {
             id,
             instance_id,
             owner,
             originating_tool_use_id,
+            originating_turn_id,
             command,
             code_type,
             cwd,
             tty,
             started_at: SystemTime::now(),
             finished_at: Mutex::new(None),
+            observed_root_exit: Mutex::new(None),
             state: Mutex::new(ProcessState::Starting),
             stdout: Mutex::new(BoundedOutput::new(output_buffer_bytes.0)),
             stderr: Mutex::new(BoundedOutput::new(output_buffer_bytes.1)),
@@ -633,6 +654,34 @@ impl ManagedProcess {
         self.terminal.notify_waiters();
     }
 
+    /// watcher 在 reap root 后、等待输出 drain 前保存权威退出事实。此时 state 仍保持
+    /// live，避免模型在输出完整前消费 final result；finalize 超时可据此诚实定案。
+    pub(crate) async fn record_observed_root_exit(
+        &self,
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        success: bool,
+    ) {
+        *self.observed_root_exit.lock().await = Some(ObservedRootExit {
+            exit_code,
+            signal,
+            success,
+        });
+    }
+
+    async fn finish_from_observed_root_exit(&self) -> bool {
+        let observed = *self.observed_root_exit.lock().await;
+        let Some(observed) = observed else {
+            return false;
+        };
+        // settle deadline 比配置的 output drain grace 短时，未知的 reader 尾部不能再被
+        // 当作完整 EOF；终态本身仍必须采用已经 reap 到的真实 ExitStatus。
+        self.mark_output_incomplete().await;
+        self.mark_finished(observed.exit_code, observed.signal, observed.success)
+            .await;
+        true
+    }
+
     pub(crate) async fn mark_error(&self, message: &str) {
         // PTY 的 stdout/stderr 已在 master stream 合流，且其 stderr quota 为 0；错误必须
         // 写入同一 master 输出，否则模型只能看到 Error 状态而读不到诊断。
@@ -713,6 +762,9 @@ impl ManagedProcess {
         signal: i32,
     ) -> Result<TerminateRequestResult, String> {
         let _signal_gate = self.process_group_signal_gate.lock().await;
+        if self.observed_root_exit.lock().await.is_some() {
+            return Ok(TerminateRequestResult::AlreadyExited);
+        }
         let mut state = self.state.lock().await;
         let process_group_id = {
             let control = self.control.lock().await;
@@ -849,6 +901,9 @@ pub(crate) struct ProcessManager {
     /// 已从容量表撤下、但还未向 live PGID 发出终止请求的 entry。它们不再对模型可见，
     /// 但在 cleanup request 真正线性化前仍属于 runtime 的资源所有权，shutdown 必须 drain。
     pending_eviction_cleanup: Mutex<BTreeMap<ProcessId, Arc<ManagedProcess>>>,
+    /// main-owned、可关联原 tool cell 的 completion durability obligation。
+    /// SessionEngine 写入 turn journal 后逐条 ack；subagent completion 不进入 main transcript，
+    /// 因而不占用这条队列。
     completion_notifications: Mutex<BTreeMap<String, VecDeque<ProcessCompletion>>>,
     background_events: Mutex<BTreeMap<String, VecDeque<BackgroundProcessEvent>>>,
     provider_completion_notifications:
@@ -868,9 +923,6 @@ pub(crate) struct ProcessManager {
     /// TUI/journal fanout 只是一份可丢弃的观察投影；容量按单 owner entry 上限推导，
     /// 因此即使 root session 长时间没有前台 consumer 也不会无界积累。
     root_background_event_capacity: usize,
-    /// completion 的可靠模型投递由 `provider_completion_notifications` 单独保证；
-    /// 此队列只是 root 控制面的有界 fanout。
-    root_completion_notification_capacity: usize,
     #[cfg(test)]
     test_id_candidates: std::sync::Mutex<VecDeque<ProcessId>>,
 }
@@ -923,7 +975,6 @@ impl ProcessManager {
             // StateChanged fanout；这为单 owner 的完整短命令批次保留空间，同时仍是
             // 与 subagent 数量无关的 root-session 硬上限。
             root_background_event_capacity: max_entries_per_owner.saturating_mul(4).max(1),
-            root_completion_notification_capacity: max_entries_per_owner,
             max_entries_per_owner,
             protected_recent_entries,
             #[cfg(test)]
@@ -1088,7 +1139,7 @@ impl ProcessManager {
         cwd: String,
         tty: bool,
     ) -> Result<Arc<ManagedProcess>, String> {
-        self.reserve_with_process_group(owner, command, code_type, cwd, tty, None, None)
+        self.reserve_with_process_group(owner, command, code_type, cwd, tty, None, None, None)
             .await
     }
 
@@ -1106,6 +1157,7 @@ impl ProcessManager {
         cwd: String,
         tty: bool,
         process_group_id: Option<i32>,
+        originating_turn_id: Option<String>,
         originating_tool_use_id: Option<String>,
     ) -> Result<Arc<ManagedProcess>, String> {
         #[cfg(test)]
@@ -1221,6 +1273,7 @@ impl ProcessManager {
                         id.clone(),
                         self.next_instance_id.fetch_add(1, Ordering::Relaxed),
                         process_group_id,
+                        originating_turn_id.clone(),
                         originating_tool_use_id.clone(),
                     ),
                     owner.clone(),
@@ -1382,6 +1435,7 @@ impl ProcessManager {
     pub(crate) async fn live_ids_for_owner_and_tool_use(
         &self,
         owner: &ProcessOwner,
+        turn_id: Option<&str>,
         tool_use_id: &str,
     ) -> Vec<String> {
         let entries = self.entries.lock().await;
@@ -1389,6 +1443,7 @@ impl ProcessManager {
             .values()
             .filter(|entry| {
                 &entry.owner == owner
+                    && entry.originating_turn_id.as_deref() == turn_id
                     && entry.originating_tool_use_id.as_deref() == Some(tool_use_id)
             })
             .cloned()
@@ -1547,6 +1602,9 @@ impl ProcessManager {
         let mut terminal_to_remove = Vec::new();
         for (entry, receipt) in selected {
             if entry.commit_delivery(&receipt).await && !entry.state().await.is_live() {
+                // provider 已看到 final output 仍不能替代 TUI/journal fanout；在 entry 从表中
+                // 移除前同步登记 root completion，避免 finalize 与迟到 watcher 竞争时丢失。
+                self.record_completion(&entry).await;
                 entry.mark_final_output_delivered().await;
                 terminal_to_remove.push((entry.id.clone(), entry));
             }
@@ -1780,6 +1838,71 @@ impl ProcessManager {
         }
     }
 
+    /// finalize 先把 root 下所有进程收束到 terminal 并登记 completion，随后由 SessionEngine
+    /// 完成 durable journal ack，最后才允许 cleanup 关闭 lifecycle。
+    pub(crate) async fn settle_root_session(&self, root_session_id: &str, wait: Duration) {
+        let mut root_entries = {
+            let entries = self.entries.lock().await;
+            let pending = self.pending_eviction_cleanup.lock().await;
+            entries
+                .values()
+                .chain(pending.values())
+                .filter(|entry| entry.owner.root_session_id == root_session_id)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        root_entries.sort_by_key(|entry| entry.instance_id);
+        root_entries.dedup_by_key(|entry| entry.instance_id);
+
+        let mut termination_delivered = BTreeSet::new();
+        for entry in &root_entries {
+            if entry.state().await.is_live() {
+                match entry.request_terminate(libc::SIGKILL).await {
+                    Ok(
+                        TerminateRequestResult::Requested
+                        | TerminateRequestResult::AlreadyTerminating,
+                    ) => {
+                        termination_delivered.insert(entry.instance_id);
+                    }
+                    Ok(TerminateRequestResult::AlreadyExited) => {}
+                    Err(error) => {
+                        entry
+                            .mark_error(&format!("session finalize termination failed: {error}\n"))
+                            .await;
+                    }
+                }
+            }
+        }
+
+        let deadline = tokio::time::Instant::now() + wait;
+        for entry in root_entries {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if !entry.wait_for_terminal(remaining).await
+                && !entry.finish_from_observed_root_exit().await
+            {
+                if termination_delivered.contains(&entry.instance_id) {
+                    // SIGKILL 已在线性化的 request_terminate 中送出；即使 watcher/reap
+                    // 被异常卡住，finalize journal 仍需保存这次人工收束事实。
+                    entry.mark_finished(None, Some(libc::SIGKILL), false).await;
+                } else {
+                    // PGID 已消失但 watcher 尚未提供 ExitStatus 时，不能声称发送过
+                    // SIGKILL。保留诚实的 error 终态并让 journal/TUI 可见。
+                    entry
+                        .mark_error("session finalize could not observe the process exit status\n")
+                        .await;
+                }
+            }
+            self.record_state_changed(&entry).await;
+            let needs_registration = matches!(
+                *entry.completion_registration.lock().await,
+                CompletionRegistration::Unrecorded
+            );
+            if needs_registration {
+                self.record_completion(&entry).await;
+            }
+        }
+    }
+
     /// ACN runtime 正常退出时收束当前 registry 下全部 root session 的受管进程。
     ///
     /// 这里先撤下 entries，避免迟到 watcher 把 completion 重新投递给已经关闭的 runtime；
@@ -1817,8 +1940,39 @@ impl ProcessManager {
         }
     }
 
-    /// 抽取当前 root session 尚未交给控制面的完成通知。每个 root queue 有界，overflow
-    /// 时宁可由动态 `Recently completed` 投影恢复，也不无界保留通知。
+    /// 查看当前 root session 尚未由 durable consumer 确认的完成通知。
+    pub(crate) async fn pending_completions_for_root(
+        &self,
+        root_session_id: &str,
+    ) -> Vec<ProcessCompletion> {
+        self.completion_notifications
+            .lock()
+            .await
+            .get(root_session_id)
+            .map(|queue| queue.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// durable journal 写入成功后确认单次 allocation；失败时不调用即可由下个 heartbeat 重试。
+    pub(crate) async fn acknowledge_completion_for_root(
+        &self,
+        root_session_id: &str,
+        instance_id: u64,
+    ) {
+        let mut notifications = self.completion_notifications.lock().await;
+        let should_remove_root = if let Some(queue) = notifications.get_mut(root_session_id) {
+            queue.retain(|completion| completion.instance_id != instance_id);
+            queue.is_empty()
+        } else {
+            false
+        };
+        if should_remove_root {
+            notifications.remove(root_session_id);
+        }
+    }
+
+    /// 测试与少数一次性消费者使用的破坏性抽取；SessionEngine 必须走 pending + ack。
+    #[cfg(test)]
     pub(crate) async fn take_completions_for_root(
         &self,
         root_session_id: &str,
@@ -1840,26 +1994,21 @@ impl ProcessManager {
         if state.is_live() {
             return;
         }
-        // watcher 的 completion registration 与 final output delivery 需要串行；不能让
-        // `write_stdin` 已确认交付且 entry 已移除后，迟到 watcher 重新注入 notification。
+        // watcher 的 provider completion registration 与 final output delivery 需要串行；
+        // 不能让 `write_stdin` 已确认交付且 entry 已移除后，迟到 watcher 重新注入模型
+        // notification。root 控制面 fanout 则始终保留，用于让 TUI 更新原 tool cell。
         let mut registration = process.completion_registration.lock().await;
-        if !matches!(*registration, CompletionRegistration::Unrecorded) {
-            // eviction cleanup 可能在 watcher 已完成登记后才得到调度。虽然不用再次写入
-            // notification，但这次 terminal observation 已经证明 eviction 的可靠投递前提
-            // 成立，必须撤下 reservation 留下的 pending marker；否则 owner 会永久背压。
-            drop(registration);
-            self.remove_pending_eviction_cleanup(process).await;
-            return;
-        }
-        let (exit_code, signal) = match state {
+        let (exit_code, signal, success) = match state {
             ProcessState::Finished {
-                exit_code, signal, ..
-            }
-            | ProcessState::Terminated { exit_code, signal } => (exit_code, signal),
+                exit_code,
+                signal,
+                success,
+            } => (exit_code, signal, success),
+            ProcessState::Terminated { exit_code, signal } => (exit_code, signal, false),
             ProcessState::Starting
             | ProcessState::Running
             | ProcessState::Terminating
-            | ProcessState::Error => (None, None),
+            | ProcessState::Error => (None, None, false),
         };
         let finished_at = process.finished_at().await.unwrap_or_else(SystemTime::now);
         let elapsed_minutes = finished_at
@@ -1870,10 +2019,13 @@ impl ProcessManager {
             root_session_id: process.owner.root_session_id.clone(),
             owner: process.owner.clone(),
             process_id: process.id.as_str().to_string(),
+            originating_turn_id: process.originating_turn_id.clone(),
+            originating_tool_use_id: process.originating_tool_use_id.clone(),
             instance_id: process.instance_id,
             status: state.label().to_string(),
             exit_code,
             signal,
+            success,
             finished_at,
             elapsed_minutes,
         };
@@ -1885,23 +2037,33 @@ impl ProcessManager {
         {
             return;
         }
-        let mut notifications = self.completion_notifications.lock().await;
-        let queue = notifications
-            .entry(completion.root_session_id.clone())
-            .or_default();
-        if !queue
-            .iter()
-            .any(|existing| existing.instance_id == completion.instance_id)
-        {
-            // 根控制面的完成 fanout 在 headless session 中没有 consumer 时也必须有界。
-            // 不丢 D21 的可靠投递：同一 completion 随后会进入独立的 per-owner provider
-            // queue，直到一次 provider request 成功确认。
-            while queue.len() >= self.root_completion_notification_capacity {
-                queue.pop_front();
-            }
-            queue.push_back(completion.clone());
+        if !matches!(*registration, CompletionRegistration::Unrecorded) {
+            // eviction cleanup 可能在 watcher 已完成登记后才得到调度。虽然不用再次写入
+            // root/provider notification，但这次 terminal observation 已经证明 eviction 的
+            // 可靠投递前提成立，必须撤下 reservation 留下的 pending marker；否则 owner
+            // 会永久背压。root notification 即使已被 durable consumer ack，也不能复活。
+            drop(lifecycle);
+            drop(registration);
+            self.remove_pending_eviction_cleanup(process).await;
+            return;
         }
-        drop(notifications);
+        if completion.owner.subagent_id.is_none()
+            && completion.originating_turn_id.is_some()
+            && completion.originating_tool_use_id.is_some()
+        {
+            let mut notifications = self.completion_notifications.lock().await;
+            let queue = notifications
+                .entry(completion.root_session_id.clone())
+                .or_default();
+            if !queue
+                .iter()
+                .any(|existing| existing.instance_id == completion.instance_id)
+            {
+                // 这是 turn journal 尚未履行的 durable obligation，不能像 UI lifecycle
+                // fanout 一样按容量 pop；新 turn 与 finalize 都会同步 drain 它。
+                queue.push_back(completion.clone());
+            }
+        }
         let mut provider_notifications = self.provider_completion_notifications.lock().await;
         let queue = provider_notifications
             .entry(completion.owner.clone())
@@ -1974,6 +2136,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finalize_timeout_preserves_observed_root_exit_instead_of_fabricating_sigkill() {
+        let manager = manager();
+        let process = manager
+            .reserve_with_process_group(
+                ProcessOwner::main("session"),
+                "escaped descendant fixture".into(),
+                "bash".into(),
+                "/tmp".into(),
+                false,
+                None,
+                Some("turn_1".into()),
+                Some("toolu_1".into()),
+            )
+            .await
+            .unwrap();
+        process.mark_running().await;
+        process.record_observed_root_exit(Some(0), None, true).await;
+
+        manager.settle_root_session("session", Duration::ZERO).await;
+
+        assert_eq!(
+            process.state().await,
+            ProcessState::Finished {
+                exit_code: Some(0),
+                signal: None,
+                success: true,
+            }
+        );
+        let completions = manager.pending_completions_for_root("session").await;
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].exit_code, Some(0));
+        assert_eq!(completions[0].signal, None);
+        assert!(completions[0].success);
+    }
+
+    #[tokio::test]
     async fn reserve_mints_distinct_ids_across_owners() {
         let manager = manager();
         let main = manager
@@ -2006,12 +2204,15 @@ mod tests {
         let manager = manager();
         let owner = ProcessOwner::main_for_agent("agent-a", "session");
         let process = manager
-            .reserve(
+            .reserve_with_process_group(
                 owner.clone(),
                 "printf lifecycle".into(),
                 "bash".into(),
                 "/tmp".into(),
                 false,
+                None,
+                Some("turn-lifecycle".into()),
+                Some("toolu-lifecycle".into()),
             )
             .await
             .expect("process fixture should reserve");
@@ -2048,19 +2249,31 @@ mod tests {
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].owner, owner);
         assert_eq!(completions[0].status, "finished");
+        assert_eq!(
+            completions[0].originating_turn_id.as_deref(),
+            Some("turn-lifecycle")
+        );
+        assert_eq!(
+            completions[0].originating_tool_use_id.as_deref(),
+            Some("toolu-lifecycle")
+        );
+        assert!(completions[0].success);
     }
 
     #[tokio::test]
-    async fn final_output_delivery_blocks_late_completion_reinjection() {
+    async fn final_output_delivery_blocks_provider_reinjection_but_preserves_root_completion() {
         let manager = manager();
         let owner = ProcessOwner::main("session");
         let process = manager
-            .reserve(
+            .reserve_with_process_group(
                 owner.clone(),
                 "printf final".into(),
                 "bash".into(),
                 "/tmp".into(),
                 false,
+                None,
+                Some("turn-final".into()),
+                Some("toolu-final".into()),
             )
             .await
             .expect("fixture should reserve");
@@ -2076,13 +2289,25 @@ mod tests {
             .commit_deliveries(std::slice::from_ref(&receipt))
             .await;
 
-        // 模拟 watcher 在 final tool result 已获 provider 成功确认、entry 已移除之后才
-        // 继续到 record_completion。它不能把同一 instance 重新送进动态上下文。
+        // commit 本身必须先登记 root completion，否则原 code_run cell 会永久停在 running。
+        // durable consumer ack 之后，即使迟到 watcher 再次观察到终态也不能把它复活。
+        let completions = manager.take_completions_for_root("session").await;
+        assert_eq!(completions.len(), 1);
         manager.record_completion(&process).await;
         assert!(manager
             .pending_completion_notifications_for_owner(&owner)
             .await
             .is_empty());
+        assert!(manager
+            .take_completions_for_root("session")
+            .await
+            .is_empty());
+        assert_eq!(
+            completions[0].originating_tool_use_id.as_deref(),
+            Some("toolu-final")
+        );
+        assert_eq!(completions[0].exit_code, Some(0));
+        assert!(completions[0].success);
         assert!(manager
             .find_for_owner(&owner, process.id.as_str())
             .await
@@ -2141,25 +2366,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unconsumed_root_fanout_queues_stay_bounded_across_short_processes() {
-        // 以最小 owner entry 上限构造 manager，模拟没有 TUI/session-engine drain 的
-        // headless root session 连续完成多个短命令。可靠 provider notification 每轮确认，
-        // 此处只断言可丢弃的 root fanout 不会绕过 entry 上限而长期增长。
+    async fn main_completion_obligations_are_not_evicted_by_capacity_or_subagents() {
+        // 以最小 owner entry 上限构造 manager，先积累多个可持久化的 main completion，
+        // 再制造多个 subagent completion。前者不能按 fanout 容量淘汰，后者不属于 main
+        // transcript，不应进入 durable root queue。
         let manager = Arc::new(ProcessManager::new(32, 4, 1, 0));
         let mut owners = Vec::new();
         let mut latest_id = String::new();
 
         for index in 0..6 {
-            // root session 可以有任意多个 subagent；每个 owner 都在自己的 1-entry
-            // 限制内，因此这个 fixture 直接覆盖此前会无界增长的 root fanout 路径。
-            let owner = ProcessOwner::subagent("session", format!("child-{index}"));
+            let owner = ProcessOwner::main("session");
             let process = manager
-                .reserve(
+                .reserve_with_process_group(
                     owner.clone(),
                     format!("printf {index}"),
                     "bash".into(),
                     "/tmp".into(),
                     false,
+                    None,
+                    Some(format!("turn-{index}")),
+                    Some(format!("toolu-main-{index}")),
                 )
                 .await
                 .expect("short-process fixture should reserve");
@@ -2173,6 +2399,49 @@ mod tests {
             manager.record_state_changed(&process).await;
             manager.record_completion(&process).await;
 
+            let (receipts, _) = manager
+                .begin_completion_notification_delivery_snapshot(&owner)
+                .await;
+            manager
+                .commit_completion_notification_delivery(&owner, &receipts)
+                .await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if !manager
+                        .pending_eviction_cleanup
+                        .lock()
+                        .await
+                        .values()
+                        .any(|entry| entry.owner == owner)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("terminal eviction cleanup must settle before the next reservation");
+            owners.push(owner);
+        }
+
+        for index in 0..6 {
+            let owner = ProcessOwner::subagent("session", format!("child-{index}"));
+            let process = manager
+                .reserve_with_process_group(
+                    owner.clone(),
+                    format!("printf child-{index}"),
+                    "bash".into(),
+                    "/tmp".into(),
+                    false,
+                    None,
+                    Some(format!("turn-child-{index}")),
+                    Some(format!("toolu-child-{index}")),
+                )
+                .await
+                .expect("subagent short-process fixture should reserve");
+            process.mark_running().await;
+            process.mark_finished(Some(0), None, true).await;
+            manager.record_completion(&process).await;
             let (receipts, _) = manager
                 .begin_completion_notification_delivery_snapshot(&owner)
                 .await;
@@ -2197,10 +2466,16 @@ mod tests {
         let completions = manager.take_completions_for_root("session").await;
         assert_eq!(
             completions.len(),
-            manager.root_completion_notification_capacity,
-            "root completion fanout must not accumulate after its consumers stop draining"
+            6,
+            "每个尚未 journal/ack 的 main completion 都必须保留"
         );
-        assert_eq!(completions[0].process_id, latest_id);
+        assert_eq!(
+            completions
+                .iter()
+                .filter(|completion| completion.owner.subagent_id.is_some())
+                .count(),
+            0
+        );
         for owner in owners {
             assert!(manager
                 .pending_completion_notifications_for_owner(&owner)
@@ -2292,6 +2567,7 @@ mod tests {
                 "/tmp".into(),
                 false,
                 None,
+                Some("turn-selected".into()),
                 Some("toolu_selected".into()),
             )
             .await
@@ -2304,6 +2580,7 @@ mod tests {
                 "/tmp".into(),
                 false,
                 None,
+                Some("turn-other".into()),
                 Some("toolu_other".into()),
             )
             .await
@@ -2311,7 +2588,7 @@ mod tests {
 
         assert_eq!(
             manager
-                .live_ids_for_owner_and_tool_use(&owner, "toolu_selected")
+                .live_ids_for_owner_and_tool_use(&owner, Some("turn-selected"), "toolu_selected",)
                 .await,
             vec![selected.id.as_str().to_string()]
         );
@@ -2352,6 +2629,7 @@ mod tests {
                 "/tmp".into(),
                 false,
                 Some(42),
+                None,
                 None,
             )
             .await
@@ -2545,7 +2823,7 @@ mod tests {
                 .await
         });
 
-        let replacement = tokio::time::timeout(Duration::from_millis(200), reservation)
+        let replacement = tokio::time::timeout(Duration::from_secs(5), reservation)
             .await
             .expect("new reservation must not await evicted entry cleanup")
             .expect("reservation task should not panic")
@@ -2555,12 +2833,9 @@ mod tests {
             .find_for_owner(&ProcessOwner::main("session"), replacement.id.as_str())
             .await
             .is_some());
-        tokio::time::timeout(
-            Duration::from_millis(200),
-            cleanup_gate.wait_until_entered(),
-        )
-        .await
-        .expect("eviction cleanup must run detached from the successful reservation");
+        tokio::time::timeout(Duration::from_secs(5), cleanup_gate.wait_until_entered())
+            .await
+            .expect("eviction cleanup must run detached from the successful reservation");
         cleanup_gate.release();
     }
 
@@ -2663,6 +2938,7 @@ mod tests {
                 "/tmp".into(),
                 false,
                 Some(process_group_id),
+                None,
                 None,
             )
             .await
@@ -3044,6 +3320,7 @@ mod tests {
                 // macOS/Linux PID upper bounds are below i32::MAX, so this cannot target a
                 // real process group and kill(-pgid, SIGKILL) deterministically returns ESRCH.
                 Some(i32::MAX),
+                None,
                 None,
             )
             .await

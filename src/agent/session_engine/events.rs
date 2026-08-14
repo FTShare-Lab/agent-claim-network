@@ -59,6 +59,10 @@ pub enum SessionEvent {
     StatusChanged {
         status: SessionRuntimeStatus,
     },
+    /// 当前可见 turn 的 journal 标识；tool_use_id 只在该 turn 内唯一。
+    TurnStarted {
+        turn_id: String,
+    },
     Warning {
         message: String,
     },
@@ -132,12 +136,17 @@ pub enum SessionEvent {
     /// 独立 watcher 的后台 terminal 完成通知，不对应第二个 tool result。
     BackgroundProcessCompleted {
         process_id: String,
+        /// 与 originating_tool_use_id 组合成 session 内稳定的展示关联键。
+        originating_turn_id: Option<String>,
+        /// 创建该后台进程的 code_run tool_use。仅供控制面更新原展示 cell。
+        originating_tool_use_id: Option<String>,
         owner_agent_id: String,
         owner_root_session_id: String,
         owner_subagent_id: Option<String>,
         status: String,
         exit_code: Option<i32>,
         signal: Option<i32>,
+        success: bool,
     },
     UserShellCommandStarted {
         command: String,

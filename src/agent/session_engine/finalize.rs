@@ -14,7 +14,8 @@ use crate::agent::runner_trace::trace_name_from_task;
 use crate::api::SessionTurnMessage;
 use crate::claim::{Claim, ClaimId, Dispute, SessionId, SourceId, TraceId};
 use crate::session::{
-    FinalizeCheckpoint, FinalizeCheckpointStatus, SessionHandle, SessionMessage, SessionStatus,
+    replay_turn_journal, FinalizeCheckpoint, FinalizeCheckpointStatus, SessionHandle,
+    SessionMessage, SessionStatus,
 };
 use crate::storage::FileLockGuard;
 
@@ -23,13 +24,68 @@ use super::events::emit_warnings;
 use super::transcript::{session_messages_to_turn_transcript, session_trace_text};
 use super::{
     checkpoint_trace_id, hash_session_segment, merge_finalize_reports,
-    report_from_finalize_checkpoint, validate_finalize_checkpoint_segment,
+    report_from_finalize_checkpoint, stable_hash_json, validate_finalize_checkpoint_segment,
     RecoverableCompactionPreparationError, SessionEngine, SessionEvent, SessionFinalizeReport,
+    SessionRecapBackgroundProcessCompletion, SessionRecapBackgroundProcessProjection,
     SessionRecapPayload, SessionRuntimeStatus, PROMPT_SESSION_RECAP, RECAP_INSTRUCTION,
+    STABLE_HASH_OFFSET,
 };
 
+const FINALIZE_BACKGROUND_COMPLETION_MAX_ITEMS: usize = 64;
+const FINALIZE_BACKGROUND_COMPLETION_ID_MAX_CHARS: usize = 256;
+
+pub(super) enum FinalizeTraceInput<'a> {
+    Messages(&'a [SessionMessage]),
+    Frozen(&'a str),
+}
+
+fn bounded_completion_id(value: &str) -> String {
+    value
+        .chars()
+        .take(FINALIZE_BACKGROUND_COMPLETION_ID_MAX_CHARS)
+        .collect()
+}
+
+fn hash_finalize_recap_input(
+    messages: &[SessionMessage],
+    background: &SessionRecapBackgroundProcessProjection,
+) -> anyhow::Result<String> {
+    if background.items.is_empty() {
+        return hash_session_segment(messages);
+    }
+    let mut hash = STABLE_HASH_OFFSET;
+    for message in messages {
+        stable_hash_json(&mut hash, message)?;
+    }
+    stable_hash_json(&mut hash, background)?;
+    Ok(format!("{hash:016x}"))
+}
+
+fn finalize_trace_text(
+    messages: &[SessionMessage],
+    background: &SessionRecapBackgroundProcessProjection,
+) -> anyhow::Result<String> {
+    let mut text = session_trace_text(messages);
+    if !background.items.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str("<background_process_completions>\n");
+        text.push_str(&serde_json::to_string(background)?);
+        text.push_str("\n</background_process_completions>");
+    }
+    Ok(text)
+}
+
 impl SessionEngine {
-    pub async fn mark_session_finalizing(&self, session: &mut SessionHandle) -> anyhow::Result<()> {
+    pub async fn mark_session_finalizing<F>(
+        &self,
+        session: &mut SessionHandle,
+        emit: &mut F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(SessionEvent),
+    {
         let metadata = session.read_metadata().await?;
         if metadata.finalized_at.is_some()
             || metadata.status == SessionStatus::Closed
@@ -42,8 +98,8 @@ impl SessionEngine {
             .await;
         // root session 进入 finalizing 后必须立刻回收其受管 terminal；delegation store
         // 持久化失败不能把本地进程清理短路掉。
-        self.cleanup_processes_for_session(&session.metadata.id)
-            .await;
+        self.settle_processes_for_session_finalization(session, emit)
+            .await?;
         self.abandon_session_delegations(session, "session finalizing")
             .await?;
         Ok(())
@@ -57,13 +113,15 @@ impl SessionEngine {
     where
         F: FnMut(SessionEvent),
     {
+        let mut emit = emit;
         let mut session = self.load_existing_session(session_id).await?;
         let metadata = session.read_metadata().await?;
         if metadata.finalized_at.is_some() {
             return Ok(SessionFinalizeReport::default());
         }
         if metadata.status == SessionStatus::Open {
-            self.mark_session_finalizing(&mut session).await?;
+            self.mark_session_finalizing(&mut session, &mut emit)
+                .await?;
         }
         self.finalize_session(&mut session, emit).await
     }
@@ -82,12 +140,12 @@ impl SessionEngine {
             return Ok(SessionFinalizeReport::default());
         }
         if metadata.status == SessionStatus::Open {
-            self.mark_session_finalizing(session).await?;
+            self.mark_session_finalizing(session, &mut emit).await?;
         } else {
             // 旧的 finalizing session 可能来自一次中断/失败的 finalize；它不会再次经过
             // mark_session_finalizing，仍要保证 retry 时收回 root-session 进程。
-            self.cleanup_processes_for_session(&session.metadata.id)
-                .await;
+            self.settle_processes_for_session_finalization(session, &mut emit)
+                .await?;
             self.abandon_session_delegations(session, "session finalizing")
                 .await?;
         }
@@ -189,7 +247,10 @@ impl SessionEngine {
             }
         }
         let metadata = session.read_metadata().await?;
-        if metadata.message_count == 0 {
+        let background_process_completions = self
+            .session_recap_background_process_completions(session)
+            .await;
+        if metadata.message_count == 0 && background_process_completions.items.is_empty() {
             session.mark_finalized(Utc::now()).await?;
             if let Err(e) = self.delete_empty_session(&metadata.id).await {
                 log::warn!(
@@ -204,7 +265,9 @@ impl SessionEngine {
         let session_messages = session.read_messages().await?;
         validate_session_compaction_state(&metadata, session_messages.len())?;
         let recapped_until = metadata.recapped_until;
-        if recapped_until == metadata.message_count {
+        if recapped_until == metadata.message_count
+            && background_process_completions.items.is_empty()
+        {
             session.mark_finalized(Utc::now()).await?;
             recovered_report.finalized_unrecapped_messages = started_with_unrecapped_messages;
             return Ok(recovered_report);
@@ -215,6 +278,7 @@ impl SessionEngine {
                 &session_messages,
                 recapped_until,
                 metadata.message_count,
+                &background_process_completions,
             )
             .await?;
         report = merge_finalize_reports(recovered_report, report);
@@ -225,12 +289,94 @@ impl SessionEngine {
         report.finalized_unrecapped_messages = true;
         Ok(std::mem::take(&mut report))
     }
+
+    async fn session_recap_background_process_completions(
+        &self,
+        session: &SessionHandle,
+    ) -> SessionRecapBackgroundProcessProjection {
+        let read = session.read_turn_journal().await;
+        for warning in &read.warnings {
+            log::warn!(
+                target: "agent",
+                "finalize background completion journal 读取降级 session={} line={:?}: {}",
+                session.metadata.id,
+                warning.line,
+                warning.message
+            );
+        }
+        let projection = replay_turn_journal(read);
+        let mut items = projection
+            .turns
+            .into_iter()
+            // 只有已进入 canonical transcript 的 turn 才属于 recap 证据边界；journal-only
+            // interrupted tail 仍由 recovery 处理，不能旁路原有私有/未提交内容约束。
+            .filter(|turn| {
+                matches!(
+                    turn.status,
+                    Some(crate::session::TurnJournalStatus::Committed)
+                ) && turn.canonical_user_content_hash.is_some()
+            })
+            .flat_map(|turn| {
+                let turn_id = bounded_completion_id(&turn.turn_id);
+                turn.tool_calls.into_iter().filter_map(move |tool| {
+                    tool.background_completion.map(|completion| {
+                        SessionRecapBackgroundProcessCompletion {
+                            turn_id: turn_id.clone(),
+                            tool_use_id: bounded_completion_id(&tool.tool_use_id),
+                            process_id: bounded_completion_id(&completion.process_id),
+                            status: bounded_completion_id(&completion.status),
+                            exit_code: completion.exit_code,
+                            signal: completion.signal,
+                            success: completion.success,
+                        }
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let omitted_older_count = items
+            .len()
+            .saturating_sub(FINALIZE_BACKGROUND_COMPLETION_MAX_ITEMS);
+        if omitted_older_count > 0 {
+            items.drain(..omitted_older_count);
+        }
+        SessionRecapBackgroundProcessProjection {
+            omitted_older_count,
+            items,
+        }
+    }
+
     pub(super) async fn prepare_finalize_segment(
         &self,
         session_messages: &[SessionMessage],
         fallback_scope: crate::api::ProviderRuntimeFallbackScope,
     ) -> anyhow::Result<(Vec<ClaimId>, Vec<Claim>, Vec<Dispute>)> {
+        let background_process_completions = SessionRecapBackgroundProcessProjection {
+            omitted_older_count: 0,
+            items: Vec::new(),
+        };
+        self.prepare_finalize_segment_with_background(
+            session_messages,
+            &background_process_completions,
+            fallback_scope,
+        )
+        .await
+    }
+
+    async fn prepare_finalize_segment_with_background(
+        &self,
+        session_messages: &[SessionMessage],
+        background_process_completions: &SessionRecapBackgroundProcessProjection,
+        fallback_scope: crate::api::ProviderRuntimeFallbackScope,
+    ) -> anyhow::Result<(Vec<ClaimId>, Vec<Claim>, Vec<Dispute>)> {
         let transcript = session_messages_to_turn_transcript(session_messages);
+        if transcript.is_empty() && background_process_completions.items.is_empty() {
+            log::debug!(
+                target: "agent",
+                "agent {} recap/finalize 跳过空有效输入",
+                self.agent.agent_id
+            );
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
         let local_claims = llm_visible_claims(self.agent.claim_store.list_local_claims().await?);
         let local_by_id: FxHashMap<ClaimId, Claim> = local_claims
             .iter()
@@ -240,6 +386,8 @@ impl SessionEngine {
         let payload = SessionRecapPayload {
             instruction: RECAP_INSTRUCTION,
             transcript: &transcript,
+            background_process_completions: (!background_process_completions.items.is_empty())
+                .then_some(background_process_completions),
             local_claims: &local_claims,
         };
         let system_prompt = self
@@ -271,13 +419,14 @@ impl SessionEngine {
         all_messages: &[SessionMessage],
         recap_start_index: usize,
         recap_end_index: usize,
+        background_process_completions: &SessionRecapBackgroundProcessProjection,
     ) -> anyhow::Result<SessionFinalizeReport> {
         let segment = all_messages
             .get(recap_start_index..recap_end_index)
             .with_context(|| {
                 format!("session finalize 范围越界: [{recap_start_index}, {recap_end_index})")
             })?;
-        let segment_hash = hash_session_segment(segment)?;
+        let segment_hash = hash_finalize_recap_input(segment, background_process_completions)?;
         match session.read_finalize_checkpoint().await? {
             Some(checkpoint)
                 if checkpoint.recap_start_index == recap_start_index
@@ -286,8 +435,7 @@ impl SessionEngine {
                 validate_finalize_checkpoint_segment(&checkpoint, &segment_hash)?;
                 match checkpoint.status {
                     FinalizeCheckpointStatus::Prepared => {
-                        self.apply_finalize_checkpoint(session, checkpoint, segment)
-                            .await
+                        self.apply_finalize_checkpoint(session, checkpoint).await
                     }
                     FinalizeCheckpointStatus::Applied => {
                         Ok(report_from_finalize_checkpoint(&checkpoint, Vec::new()))
@@ -296,9 +444,13 @@ impl SessionEngine {
             }
             _ => {
                 let (used_claim_ids, prepared_claims, prepared_disputes) = self
-                    .prepare_finalize_segment(segment, session.runtime_fallback_scope())
+                    .prepare_finalize_segment_with_background(
+                        segment,
+                        background_process_completions,
+                        session.runtime_fallback_scope(),
+                    )
                     .await?;
-                let trace_text = session_trace_text(segment);
+                let trace_text = finalize_trace_text(segment, background_process_completions)?;
                 let trace_created_at = Utc::now();
                 let trace_id = checkpoint_trace_id(
                     &trace_text,
@@ -319,8 +471,7 @@ impl SessionEngine {
                     status: FinalizeCheckpointStatus::Prepared,
                 };
                 session.write_finalize_checkpoint(&checkpoint).await?;
-                self.apply_finalize_checkpoint(session, checkpoint, segment)
-                    .await
+                self.apply_finalize_checkpoint(session, checkpoint).await
             }
         }
     }
@@ -329,11 +480,10 @@ impl SessionEngine {
         &self,
         session: &SessionHandle,
         checkpoint: FinalizeCheckpoint,
-        session_messages: &[SessionMessage],
     ) -> anyhow::Result<SessionFinalizeReport> {
         let report = self
             .apply_prepared_finalize_batch(
-                session_messages,
+                FinalizeTraceInput::Frozen(&checkpoint.trace_text),
                 checkpoint.used_claim_ids.clone(),
                 checkpoint.prepared_claims.clone(),
                 checkpoint.prepared_disputes.clone(),
@@ -353,7 +503,7 @@ impl SessionEngine {
 
     pub(super) async fn apply_prepared_finalize_batch(
         &self,
-        session_messages: &[SessionMessage],
+        trace_input: FinalizeTraceInput<'_>,
         used_claim_ids: Vec<ClaimId>,
         prepared_claims: Vec<Claim>,
         prepared_disputes: Vec<Dispute>,
@@ -375,7 +525,10 @@ impl SessionEngine {
             claims_to_upload.push(claim);
         }
 
-        let trace_text = session_trace_text(session_messages);
+        let trace_text = match trace_input {
+            FinalizeTraceInput::Messages(messages) => session_trace_text(messages),
+            FinalizeTraceInput::Frozen(text) => text.to_string(),
+        };
         let trace_id = if !output_claim_ids.is_empty() || !used_claim_ids.is_empty() {
             let trace_name = trace_name_from_task(&trace_text);
             let input_claims = used_claim_ids

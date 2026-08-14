@@ -361,14 +361,24 @@ impl SessionTuiApp {
                     }
                     _ = heartbeat_tick.tick() => {
                         self.refresh_delegation_snapshot().await?;
-                        self.refresh_background_process_completions().await;
+                        let rewrite_scrollback = self.refresh_background_process_completions().await;
                         // 底栏的 `Processes:` 与 `/ps` 共用同一份 snapshot；即使面板关闭也要
                         // 刷新，避免后台 entry 的数量在用户重新打开前一直陈旧。
                         self.refresh_process_snapshot();
                         self.refresh_mcp_panel();
                         // 时间型 UI（如 `/ps` ELAPSED 与底栏 focus）不一定改变 snapshot；
                         // heartbeat 仍需请求一帧，避免 turn idle 后画面冻结。
-                        self.tui.render_requester().schedule_render();
+                        if rewrite_scrollback {
+                            // 已提交 turn 的 cell 位于终端原生 scrollback，普通增量帧只能
+                            // 重画底部 live region；复用 resize 的 Purge + 全历史 reflow 才能
+                            // 原位替换旧的 `Process running in background` 投影。
+                            self.tui.draw_after_state_reload(
+                                &mut self.chat_widget,
+                                self.session_picker.as_ref(),
+                            )?;
+                        } else {
+                            self.tui.render_requester().schedule_render();
+                        }
                     }
                     maybe_worker_event = self.worker_rx.recv() => {
                         if let Some(worker_event) = maybe_worker_event {
@@ -568,6 +578,19 @@ impl SessionTuiApp {
                 ) || self.session.is_some()
                 {
                     self.chat_widget.handle_session_event(event);
+                }
+                if self
+                    .chat_widget
+                    .state_mut()
+                    .take_scrollback_rewrite_required()
+                {
+                    // completion 也可能由新 turn 的持久化屏障或 `/exit` finalize worker
+                    // 送达，而不是 1 秒 heartbeat；这些路径同样必须重写原生 scrollback。
+                    self.tui.draw_after_state_reload(
+                        &mut self.chat_widget,
+                        self.session_picker.as_ref(),
+                    )?;
+                    return Ok(false);
                 }
                 if should_restore_late_async_inputs {
                     self.mark_pending_async_inputs_for_restore();
@@ -1537,11 +1560,12 @@ impl SessionTuiApp {
             .engine
             .drain_background_process_completions(session)
             .await;
-        let changed = !events.is_empty();
         for event in events {
             self.chat_widget.state_mut().apply_event(event);
         }
-        changed
+        self.chat_widget
+            .state_mut()
+            .take_scrollback_rewrite_required()
     }
 
     fn terminate_process_from_panel(&mut self, target: ProcessTerminationTarget) {

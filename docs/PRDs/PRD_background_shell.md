@@ -345,6 +345,8 @@ code_run tool_use
 
 原 `code_run` 在返回 `process_id` 时仍产生自己的 `ToolCallCompleted`，其 outcome 为运行中。后台进程最终完成是独立生命周期事件。
 
+main-owned completion 同时保留创建进程的原始 `turn_id + tool_use_id`，但仍不得伪造第二个工具结果。该终态作为 durable obligation 保留到写入对应 turn journal 并确认，不能按 TUI fanout 容量淘汰；新 turn 在冻结 recovery context 前也必须先完成这一步，因此正常 `ProcessRunning` 与强制中断后继续运行的进程都能在 recovery 中携带后续终态。TUI 每秒独立抽取 watcher 事件，并用组合键把原 `code_run` cell 的 `Process running in background` 展示投影替换为 exit code 或 signal 终态：活动 turn 的虚线框走普通重绘，已提交到终端 scrollback 的历史 cell 走完整历史 reflow；`/exit` 收束 live process 时也必须在退出前发送相同事件并完成 reflow。completion 不在 transcript 末尾追加独立的 `Background process ID=...` 通知行；找不到原 tool cell 时保持静默。subagent-owned completion 不改写 main transcript 中不存在的 child tool cell，也不向 main transcript 插入通知行。finalize recap 额外接收有界的 main completion 投影，避免 canonical transcript 中旧的 running tool result 掩盖实际 exit / signal；该投影同时进入 finalize checkpoint hash 与 trace 证据。
+
 事件至少服务于：
 
 - TUI 状态更新；
@@ -657,6 +659,8 @@ write_stdin_max_poll_timeout_ms = 300000
 59. MCP disable / reconnect 只按共享 MCP generation 语义收束旧连接及其 in-flight request，不会终止任何 `code_run` 进程；后台进程 terminate 也不会改变 MCP server generation 或 ready 状态。
 60. turn 运行期间通过 `/mcp` 主动 Reconnect / Disable 时，该 server 上 main 与 subagent 的全部in-flight MCP 调用都以 `dispatch_failure` 收束且不自动重试；当前 turn 不取消并继续推进，其他 MCP server、后台进程和 agent runtime 继续运行，生命周期切换后的新 generation 不受旧调用迟到结果污染。
 61. active turn 尚未达到自动 compact 触发阈值时，即使其原始工具轨迹大于 compact 后 raw-tail hard limit，也不会因存在后台 runtime projection 而提前失败；实际 compact 时为 runtime projection 预留 soft/hard tail 预算，合并后的投影不越界。
+62. main-owned `code_run` 返回 `ProcessRunning` 后，无论进程自然退出、被 `/ps` 终止或从外部收到信号，TUI heartbeat 都把原 cell 更新为对应 exit / signal 终态；活动虚线框与已提交历史都不残留 `Process running in background`。subagent 进程不改写 main transcript 的 tool cell。
+63. session finalize 会在 recap 前收束并持久化全部 main-owned 后台终态；`/exit` 的最后一帧先更新原 tool cell，再退出 TUI。recap 与 trace 使用至多 64 条最新 completion 事实，并显式记录更早事实的省略数量。
 
 ---
 

@@ -12,7 +12,7 @@
 <p align="center">
   <img alt="license: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg">
   <img alt="rust 1.90" src="https://img.shields.io/badge/rust-1.90-orange.svg">
-  <img alt="version 0.2.2" src="https://img.shields.io/badge/version-0.2.2-brightgreen.svg">
+  <img alt="version 0.2.3" src="https://img.shields.io/badge/version-0.2.3-brightgreen.svg">
   <a href="README_EN.md"><img alt="English README" src="https://img.shields.io/badge/README-English-blue.svg"></a>
 </p>
 

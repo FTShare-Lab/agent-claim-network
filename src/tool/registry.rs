@@ -150,6 +150,22 @@ impl ToolRegistry {
         self
     }
 
+    #[cfg(test)]
+    pub(super) fn with_wait_subagents_snapshot_notify(
+        mut self,
+        snapshot_resolved: Arc<tokio::sync::Notify>,
+        blocking: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        let host = self
+            .delegation_host
+            .as_mut()
+            .and_then(Arc::get_mut)
+            .expect("test registry should own its delegation host exclusively");
+        host.wait_subagents_snapshot_resolved = Some(snapshot_resolved);
+        host.wait_subagents_blocking = Some(blocking);
+        self
+    }
+
     pub fn for_delegation(mut self, progress: Option<DelegationProgressSink>) -> Self {
         self.access = ToolAccessProfile::delegation();
         self.delegation_host = None;

@@ -2141,7 +2141,24 @@ mod tests {
             0,
         )
         .await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let invalidated_or_removed = {
+                    let inner = transport.pool.inner.lock().await;
+                    inner.idle.is_empty()
+                        || inner
+                            .idle
+                            .first()
+                            .is_some_and(|connection| connection.invalid.load(Ordering::Acquire))
+                };
+                if invalidated_or_removed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("trailing response data should invalidate the idle connection");
         let _ = send_transport(
             &transport,
             &request(vec![json!({"type":"message","n":2})]),

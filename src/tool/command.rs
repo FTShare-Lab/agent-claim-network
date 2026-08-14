@@ -65,14 +65,24 @@ impl ToolRegistry {
         snapshots
     }
 
-    /// 供 SessionEngine/TUI 独立消费的后台完成事件；它不属于原始 tool call 的回包。
-    pub(crate) async fn take_process_completions_for_root_session(
+    /// 供 SessionEngine/TUI durable 消费的后台完成事件；成功写 journal 后再 ack。
+    pub(crate) async fn pending_process_completions_for_root_session(
         &self,
         session_id: &SessionId,
     ) -> Vec<ProcessCompletion> {
         self.process_manager
-            .take_completions_for_root(session_id.as_str())
+            .pending_completions_for_root(session_id.as_str())
             .await
+    }
+
+    pub(crate) async fn acknowledge_process_completion_for_root_session(
+        &self,
+        session_id: &SessionId,
+        instance_id: u64,
+    ) {
+        self.process_manager
+            .acknowledge_completion_for_root(session_id.as_str(), instance_id)
+            .await;
     }
 
     /// 供 SessionEngine 消费的后台 terminal 生命周期事件。它们仅用于 runtime / TUI
@@ -288,6 +298,16 @@ impl ToolRegistry {
             .await;
     }
 
+    pub(crate) async fn settle_processes_for_session(
+        &self,
+        session_id: &SessionId,
+        wait: Duration,
+    ) {
+        self.process_manager
+            .settle_root_session(session_id.as_str(), wait)
+            .await;
+    }
+
     /// 当前 ACN runtime 正常退出时收束其注册的所有后台 terminal。
     pub(crate) async fn shutdown_background_processes(&self) {
         self.process_manager.shutdown_all().await;
@@ -376,6 +396,7 @@ impl ToolRegistry {
                     cwd_display,
                     true,
                     spawned.process_group_id,
+                    context.current_turn_id.clone(),
                     context.tool_use_id.clone(),
                 )
                 .await
@@ -460,6 +481,7 @@ impl ToolRegistry {
                     cwd_display,
                     false,
                     process_group_id,
+                    context.current_turn_id.clone(),
                     context.tool_use_id.clone(),
                 )
                 .await
@@ -756,7 +778,11 @@ impl ToolRegistry {
         };
         let owner = self.process_owner(context);
         self.process_manager
-            .live_ids_for_owner_and_tool_use(&owner, tool_use_id)
+            .live_ids_for_owner_and_tool_use(
+                &owner,
+                context.current_turn_id.as_deref(),
+                tool_use_id,
+            )
             .await
     }
 
@@ -1196,6 +1222,11 @@ fn spawn_pipe_watcher(
         }
         let root_reap_gate = process.acquire_root_reap_gate().await;
         let child_status = child.wait().await;
+        if let Ok(status) = &child_status {
+            process
+                .record_observed_root_exit(status.code(), exit_signal(status), status.success())
+                .await;
+        }
         process.retire_process_group_after_root_reap().await;
         drop(root_reap_gate);
         match child_status {
@@ -1450,6 +1481,17 @@ fn spawn_pty_watcher(
         }
         let root_reap_gate = process.acquire_root_reap_gate().await;
         let waited = tokio::task::spawn_blocking(move || child.wait()).await;
+        if let Ok(Ok(status)) = &waited {
+            let signal = status.signal().and_then(pty_signal_number);
+            let exit_code = if signal.is_some() {
+                None
+            } else {
+                i32::try_from(status.exit_code()).ok()
+            };
+            process
+                .record_observed_root_exit(exit_code, signal, status.success())
+                .await;
+        }
         process.retire_process_group_after_root_reap().await;
         drop(root_reap_gate);
         // root 已终态后主动关 master，确保 reader 不会被逃离 terminal 的后代无限挂住。

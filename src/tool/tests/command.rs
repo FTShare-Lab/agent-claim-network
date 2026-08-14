@@ -1453,6 +1453,68 @@ async fn signal_exit_is_exposed_without_fabricating_an_exit_code() {
 
 #[tokio::test]
 #[cfg(unix)]
+async fn external_signal_completion_preserves_originating_tool_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_path = dir.path().join("external-signal.pid");
+    let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
+    let session = SessionId::from_str("session_aaaaaaaa").unwrap();
+    let context = ToolDispatchContext {
+        current_session_id: Some(session.clone()),
+        current_turn_id: Some("turn_external_signal".into()),
+        tool_use_id: Some("toolu_external_signal".into()),
+        ..ToolDispatchContext::default()
+    };
+    let initial = registry
+        .dispatch_with_context(
+            "code_run",
+            json!({
+                "script": format!(
+                    "echo $$ > {}; sleep 30",
+                    shell_quote_path(&pid_path)
+                ),
+                "yield_time_ms": 50,
+            }),
+            context,
+        )
+        .await
+        .unwrap();
+    assert_eq!(initial.outcome, ToolExecutionOutcome::ProcessRunning);
+    let pid = wait_for_test_pid(&pid_path).await;
+
+    // SAFETY: PID 由本测试刚启动、且仍由 registry 持有的进程组 leader 写入。
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let completion = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(completion) = registry
+                .pending_process_completions_for_root_session(&session)
+                .await
+                .into_iter()
+                .next()
+            {
+                break completion;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("external signal must be observed by the independent watcher");
+
+    assert_eq!(completion.status, "finished");
+    assert_eq!(completion.exit_code, None);
+    assert_eq!(completion.signal, Some(libc::SIGTERM));
+    assert!(!completion.success);
+    assert_eq!(
+        completion.originating_turn_id.as_deref(),
+        Some("turn_external_signal")
+    );
+    assert_eq!(
+        completion.originating_tool_use_id.as_deref(),
+        Some("toolu_external_signal")
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
 async fn code_run_cleans_background_process_group_after_parent_exits() {
     let dir = tempfile::tempdir().unwrap();
     let child_pid_path = dir.path().join("background-child.pid");

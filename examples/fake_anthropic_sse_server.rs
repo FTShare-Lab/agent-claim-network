@@ -105,6 +105,9 @@ async fn messages(State(state): State<ServerState>, Json(request): Json<Value>) 
     if request.get("stream").and_then(Value::as_bool) == Some(true) {
         return match state.response_mode {
             ResponseMode::StreamingText => streaming_messages().into_response(),
+            ResponseMode::BackgroundProcess if request_is_session_recap(&request) => {
+                session_recap_messages().into_response()
+            }
             ResponseMode::BackgroundProcess if request_contains_tool_result(&request) => {
                 background_process_completed_messages().into_response()
             }
@@ -145,6 +148,12 @@ fn request_contains_tool_result(request: &Value) -> bool {
         .filter_map(|message| message.get("content").and_then(Value::as_array))
         .flatten()
         .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+}
+
+fn request_is_session_recap(request: &Value) -> bool {
+    request
+        .get("system")
+        .is_some_and(|system| system.to_string().contains("复盘阶段"))
 }
 
 fn tool_result_content<'a>(request: &'a Value, tool_use_id: &str) -> Option<&'a str> {
@@ -326,6 +335,41 @@ fn background_process_completed_messages() -> Sse<impl Stream<Item = SseItem>> {
             "delta": {
                 "type": "text_delta",
                 "text": "Background process started."
+            }
+        }),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 1}
+        }),
+        json!({"type": "message_stop"}),
+    ])
+}
+
+fn session_recap_messages() -> Sse<impl Stream<Item = SseItem>> {
+    let recap = json!({
+        "new_claims": [],
+        "updated_claims": [],
+        "used_claim_ids": [],
+        "new_disputes": [],
+    });
+    sse_from_events(vec![
+        json!({
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 1}}
+        }),
+        json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""}
+        }),
+        json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "text_delta",
+                "text": recap.to_string()
             }
         }),
         json!({"type": "content_block_stop", "index": 0}),
