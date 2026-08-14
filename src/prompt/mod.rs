@@ -428,6 +428,22 @@ mod tests {
     }
 
     #[test]
+    fn repository_agent_system_uses_runtime_context_for_relative_dates() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let reg = PromptRegistry::new(&root).unwrap();
+        let out = reg
+            .render("agent_system", agent_system_test_context())
+            .unwrap();
+
+        assert!(out.contains("以最新 runtime context 为基准"));
+        assert!(out.contains("不要仅为确认其中已有的日期、星期或时区而调用 `code_run`"));
+        assert!(out.contains("runtime context 不提供小时、分钟或秒"));
+        assert!(out.contains("应直接查证相关事实来源，而不是先机械查询系统时间"));
+        assert!(!out.contains("本 prompt 不提供可靠的当前日期"));
+        assert!(!out.contains("务必先单独使用 `code_run` 获取当前时间与时区"));
+    }
+
+    #[test]
     fn repository_memory_review_system_uses_own_prompt_and_memory_snapshot() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
         let reg = PromptRegistry::new(&root).unwrap();
