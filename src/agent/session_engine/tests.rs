@@ -1253,6 +1253,580 @@ async fn create_test_session(store: &SessionStore, id: &str) -> crate::session::
 }
 
 #[tokio::test]
+#[cfg(unix)]
+async fn finalize_journals_queued_and_live_background_process_completions() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
+        Vec::new(),
+    )]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_ba11c001").await;
+    let tools = engine.turn_loop.tool_registry();
+    let turn_id = "turn_1";
+    let user_content = vec![SessionContentBlock::text("run two background jobs")];
+    let canonical_hash = canonical_user_content_hash(&user_content).unwrap();
+    let now = Utc::now();
+    session
+        .append_messages(&[
+            NewSessionMessage::with_created_at_and_model(
+                SessionMessageRole::User,
+                user_content,
+                now,
+                "test-model",
+            ),
+            NewSessionMessage::with_created_at_and_model(
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::text("both jobs are running")],
+                now,
+                "test-model",
+            ),
+        ])
+        .await
+        .unwrap();
+
+    let mut writer = session.open_turn_journal_writer().await.unwrap();
+    writer
+        .append(
+            turn_id,
+            Utc::now(),
+            TurnJournalEventKind::TurnStarted,
+            TurnJournalFlush::Immediate,
+        )
+        .await
+        .unwrap();
+    writer
+        .append(
+            turn_id,
+            Utc::now(),
+            TurnJournalEventKind::UserInputAccepted {
+                text: "run two background jobs".into(),
+            },
+            TurnJournalFlush::Immediate,
+        )
+        .await
+        .unwrap();
+    writer
+        .append(
+            turn_id,
+            Utc::now(),
+            TurnJournalEventKind::CanonicalUserMessage {
+                content_hash: Some(canonical_hash),
+                content: None,
+            },
+            TurnJournalFlush::Immediate,
+        )
+        .await
+        .unwrap();
+    for tool_use_id in ["toolu_finished", "toolu_live"] {
+        writer
+            .append(
+                turn_id,
+                Utc::now(),
+                TurnJournalEventKind::ToolCallStarted {
+                    tool_use_id: tool_use_id.into(),
+                    name: "code_run".into(),
+                    summary: "tool code_run".into(),
+                    input_preview: String::new(),
+                    input_truncated: false,
+                },
+                TurnJournalFlush::Immediate,
+            )
+            .await
+            .unwrap();
+        writer
+            .append(
+                turn_id,
+                Utc::now(),
+                TurnJournalEventKind::ToolCallCompleted {
+                    tool_use_id: tool_use_id.into(),
+                    summary: "tool code_run process_running".into(),
+                    outcome: Some(crate::api::ToolExecutionOutcome::ProcessRunning),
+                    output_preview: String::new(),
+                    output_truncated: false,
+                    file_change: None,
+                },
+                TurnJournalFlush::Immediate,
+            )
+            .await
+            .unwrap();
+    }
+    writer
+        .append(
+            turn_id,
+            Utc::now(),
+            TurnJournalEventKind::TurnFinished {
+                status: TurnJournalStatus::Committed,
+            },
+            TurnJournalFlush::Immediate,
+        )
+        .await
+        .unwrap();
+    drop(writer);
+
+    let context = |tool_use_id: &str| ToolDispatchContext {
+        current_session_id: Some(session.metadata.id.clone()),
+        current_turn_id: Some(turn_id.into()),
+        tool_use_id: Some(tool_use_id.into()),
+        ..ToolDispatchContext::default()
+    };
+    let finished = tools
+        .dispatch_with_context(
+            "code_run",
+            json!({"script": "sleep 1", "yield_time_ms": 50}),
+            context("toolu_finished"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        finished.outcome,
+        crate::api::ToolExecutionOutcome::ProcessRunning
+    );
+    let live = tools
+        .dispatch_with_context(
+            "code_run",
+            json!({"script": "sleep 30", "yield_time_ms": 50}),
+            context("toolu_live"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        live.outcome,
+        crate::api::ToolExecutionOutcome::ProcessRunning
+    );
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if tools
+                .pending_process_completions_for_root_session(&session.metadata.id)
+                .await
+                .iter()
+                .any(|completion| {
+                    completion.originating_tool_use_id.as_deref() == Some("toolu_finished")
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("自然完成的进程必须先进入 root completion 队列");
+
+    let mut completion_events = Vec::new();
+    engine
+        .finalize_session(&mut session, |event| completion_events.push(event))
+        .await
+        .unwrap();
+    assert_eq!(
+        completion_events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::BackgroundProcessCompleted { .. }))
+            .count(),
+        2
+    );
+
+    let read = session.read_turn_journal().await;
+    let completions = read
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TurnJournalEventKind::BackgroundProcessCompleted {
+                tool_use_id,
+                exit_code,
+                signal,
+                success,
+                ..
+            } => Some((tool_use_id.as_str(), *exit_code, *signal, *success)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(completions.len(), 2);
+    assert!(completions.contains(&("toolu_finished", Some(0), None, true)));
+    assert!(completions.contains(&("toolu_live", None, Some(libc::SIGKILL), false)));
+    assert!(tools
+        .pending_process_completions_for_root_session(&session.metadata.id)
+        .await
+        .is_empty());
+    assert!(tools
+        .process_snapshots_for_root_session(&session.metadata.id)
+        .await
+        .is_empty());
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 1);
+    let recap_payload = last_user_text(&requests[0]);
+    assert!(recap_payload.contains(r#""background_process_completions""#));
+    assert!(recap_payload.contains(r#""tool_use_id": "toolu_finished""#));
+    assert!(recap_payload.contains(r#""exit_code": 0"#));
+    assert!(recap_payload.contains(r#""tool_use_id": "toolu_live""#));
+    assert!(recap_payload.contains(r#""signal": 9"#));
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn mark_finalizing_emits_durable_completion_before_later_delegation_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (engine, store) = build_test_engine_with_delegation_host(&dir, provider);
+    let mut session = create_test_session(&store, "session_ba11c004").await;
+    let tools = engine.turn_loop.tool_registry();
+    let turn_id = "turn_1";
+    let tool_use_id = "toolu_emit_before_failure";
+
+    let mut writer = session.open_turn_journal_writer().await.unwrap();
+    writer
+        .append(
+            turn_id,
+            Utc::now(),
+            TurnJournalEventKind::ToolCallStarted {
+                tool_use_id: tool_use_id.into(),
+                name: "code_run".into(),
+                summary: "tool code_run".into(),
+                input_preview: String::new(),
+                input_truncated: false,
+            },
+            TurnJournalFlush::Immediate,
+        )
+        .await
+        .unwrap();
+    writer
+        .append(
+            turn_id,
+            Utc::now(),
+            TurnJournalEventKind::ToolCallCompleted {
+                tool_use_id: tool_use_id.into(),
+                summary: "tool code_run process_running".into(),
+                outcome: Some(crate::api::ToolExecutionOutcome::ProcessRunning),
+                output_preview: String::new(),
+                output_truncated: false,
+                file_change: None,
+            },
+            TurnJournalFlush::Immediate,
+        )
+        .await
+        .unwrap();
+    drop(writer);
+
+    let result = tools
+        .dispatch_with_context(
+            "code_run",
+            json!({"script": "sleep 30", "yield_time_ms": 50}),
+            ToolDispatchContext {
+                current_session_id: Some(session.metadata.id.clone()),
+                current_turn_id: Some(turn_id.into()),
+                tool_use_id: Some(tool_use_id.into()),
+                ..ToolDispatchContext::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.outcome,
+        crate::api::ToolExecutionOutcome::ProcessRunning
+    );
+
+    let delegation_store =
+        DelegationStore::new_for_session(session.paths.dir.clone(), session.metadata.id.clone());
+    let corrupt_dir = delegation_store
+        .delegations_dir()
+        .join("subagent_badbadbad");
+    tokio::fs::create_dir_all(&corrupt_dir).await.unwrap();
+    tokio::fs::write(corrupt_dir.join("delegation.yaml"), "{not yaml")
+        .await
+        .unwrap();
+
+    let mut completion_events = Vec::new();
+    let mut emit = |event| completion_events.push(event);
+    let error = engine
+        .mark_session_finalizing(&mut session, &mut emit)
+        .await
+        .expect_err("delegation cleanup failure should abort finalization");
+    assert!(error.to_string().contains("subagent"));
+    assert!(completion_events.iter().any(|event| matches!(
+        event,
+        SessionEvent::BackgroundProcessCompleted {
+            originating_tool_use_id: Some(completed_tool_use_id),
+            signal: Some(signal),
+            ..
+        } if completed_tool_use_id == tool_use_id && *signal == libc::SIGKILL
+    )));
+
+    let read = session.read_turn_journal().await;
+    assert_eq!(
+        read.events
+            .iter()
+            .filter(|event| matches!(
+                event.kind,
+                TurnJournalEventKind::BackgroundProcessCompleted { .. }
+            ))
+            .count(),
+        1
+    );
+    assert!(tools
+        .pending_process_completions_for_root_session(&session.metadata.id)
+        .await
+        .is_empty());
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn failed_background_completion_journal_append_retries_on_next_drain() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (engine, store) = build_test_engine(&dir, provider);
+    let session = create_test_session(&store, "session_ba11c002").await;
+    let tools = engine.turn_loop.tool_registry();
+    let turn_id = "turn_1";
+    let tool_use_id = "toolu_retry";
+
+    let mut writer = session.open_turn_journal_writer().await.unwrap();
+    writer
+        .append(
+            turn_id,
+            Utc::now(),
+            TurnJournalEventKind::ToolCallStarted {
+                tool_use_id: tool_use_id.into(),
+                name: "code_run".into(),
+                summary: "tool code_run".into(),
+                input_preview: String::new(),
+                input_truncated: false,
+            },
+            TurnJournalFlush::Immediate,
+        )
+        .await
+        .unwrap();
+    writer
+        .append(
+            turn_id,
+            Utc::now(),
+            TurnJournalEventKind::ToolCallCompleted {
+                tool_use_id: tool_use_id.into(),
+                summary: "tool code_run process_running".into(),
+                outcome: Some(crate::api::ToolExecutionOutcome::ProcessRunning),
+                output_preview: String::new(),
+                output_truncated: false,
+                file_change: None,
+            },
+            TurnJournalFlush::Immediate,
+        )
+        .await
+        .unwrap();
+    drop(writer);
+
+    let result = tools
+        .dispatch_with_context(
+            "code_run",
+            json!({"script": "sleep 1", "yield_time_ms": 50}),
+            ToolDispatchContext {
+                current_session_id: Some(session.metadata.id.clone()),
+                current_turn_id: Some(turn_id.into()),
+                tool_use_id: Some(tool_use_id.into()),
+                ..ToolDispatchContext::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.outcome,
+        crate::api::ToolExecutionOutcome::ProcessRunning
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if !tools
+                .pending_process_completions_for_root_session(&session.metadata.id)
+                .await
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("watcher 必须登记 completion");
+
+    let journal_path = session.paths.turn_events_jsonl.clone();
+    let backup_path = session.paths.dir.join("turn_events.backup.jsonl");
+    tokio::fs::rename(&journal_path, &backup_path)
+        .await
+        .unwrap();
+    tokio::fs::create_dir(&journal_path).await.unwrap();
+
+    let first_events = engine.drain_background_process_completions(&session).await;
+    assert!(!first_events
+        .iter()
+        .any(|event| matches!(event, SessionEvent::BackgroundProcessCompleted { .. })));
+    assert_eq!(
+        tools
+            .pending_process_completions_for_root_session(&session.metadata.id)
+            .await
+            .len(),
+        1
+    );
+
+    tokio::fs::remove_dir(&journal_path).await.unwrap();
+    tokio::fs::rename(&backup_path, &journal_path)
+        .await
+        .unwrap();
+    let second_events = engine.drain_background_process_completions(&session).await;
+    assert_eq!(
+        second_events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::BackgroundProcessCompleted { .. }))
+            .count(),
+        1
+    );
+    assert!(tools
+        .pending_process_completions_for_root_session(&session.metadata.id)
+        .await
+        .is_empty());
+    let read = session.read_turn_journal().await;
+    assert_eq!(
+        read.events
+            .iter()
+            .filter(|event| matches!(
+                event.kind,
+                TurnJournalEventKind::BackgroundProcessCompleted { .. }
+            ))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn new_turn_persists_pending_background_completion_before_recovery_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        "continued",
+        vec![ProviderEvent::AssistantMessageCompleted {
+            text: "continued".into(),
+        }],
+    )]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_ba11c003").await;
+    let tools = engine.turn_loop.tool_registry();
+    let turn_id = "turn_1";
+    let tool_use_id = "toolu_pending_completion";
+
+    let mut writer = session.open_turn_journal_writer().await.unwrap();
+    for kind in [
+        TurnJournalEventKind::TurnStarted,
+        TurnJournalEventKind::UserInputAccepted {
+            text: "start background work".into(),
+        },
+        TurnJournalEventKind::ToolCallStarted {
+            tool_use_id: tool_use_id.into(),
+            name: "code_run".into(),
+            summary: "tool code_run".into(),
+            input_preview: String::new(),
+            input_truncated: false,
+        },
+        TurnJournalEventKind::ToolCallCompleted {
+            tool_use_id: tool_use_id.into(),
+            summary: "tool code_run process_running".into(),
+            outcome: Some(crate::api::ToolExecutionOutcome::ProcessRunning),
+            output_preview: String::new(),
+            output_truncated: false,
+            file_change: None,
+        },
+        TurnJournalEventKind::TurnFinished {
+            status: TurnJournalStatus::InterruptedByUser,
+        },
+    ] {
+        writer
+            .append(turn_id, Utc::now(), kind, TurnJournalFlush::Immediate)
+            .await
+            .unwrap();
+    }
+    drop(writer);
+
+    let initial = tools
+        .dispatch_with_context(
+            "code_run",
+            json!({"script": "sleep 1", "yield_time_ms": 50}),
+            ToolDispatchContext {
+                current_session_id: Some(session.metadata.id.clone()),
+                current_turn_id: Some(turn_id.into()),
+                tool_use_id: Some(tool_use_id.into()),
+                ..ToolDispatchContext::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        initial.outcome,
+        crate::api::ToolExecutionOutcome::ProcessRunning
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if !tools
+                .pending_process_completions_for_root_session(&session.metadata.id)
+                .await
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("watcher completion must be pending before the next turn starts");
+
+    let mut events = Vec::new();
+    engine
+        .run_turn(&mut session, "continue now", |event| events.push(event))
+        .await
+        .unwrap();
+
+    let completion_index = events
+        .iter()
+        .position(|event| matches!(event, SessionEvent::BackgroundProcessCompleted { .. }))
+        .expect("pending completion must be emitted to the TUI");
+    let turn_started_index = events
+        .iter()
+        .position(
+            |event| matches!(event, SessionEvent::TurnStarted { turn_id } if turn_id == "turn_2"),
+        )
+        .expect("the next turn must start");
+    assert!(completion_index < turn_started_index);
+    assert!(tools
+        .pending_process_completions_for_root_session(&session.metadata.id)
+        .await
+        .is_empty());
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 1);
+    let recovery_user = last_user_text(&requests[0]);
+    assert!(recovery_user.contains("<interrupted_turn_context>"));
+    assert!(recovery_user.contains(r#""background_completion":{"exit_code":0"#));
+    assert!(recovery_user.contains(r#""status":"finished""#));
+
+    let journal = session.read_turn_journal().await;
+    let completion_seq = journal
+        .events
+        .iter()
+        .find(|event| {
+            matches!(
+                &event.kind,
+                TurnJournalEventKind::BackgroundProcessCompleted { tool_use_id: id, .. }
+                    if id == tool_use_id
+            )
+        })
+        .map(|event| event.seq)
+        .expect("completion must be durable");
+    let next_turn_seq = journal
+        .events
+        .iter()
+        .find(|event| {
+            event.turn_id == "turn_2" && matches!(event.kind, TurnJournalEventKind::TurnStarted)
+        })
+        .map(|event| event.seq)
+        .expect("next turn start must be durable");
+    assert!(completion_seq < next_turn_seq);
+}
+
+#[tokio::test]
 async fn manual_inbox_rejects_solo_mode_without_changing_session_to_error() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(Vec::new()));
@@ -4164,6 +4738,165 @@ async fn finalize_without_unrecapped_messages_does_not_request_success_notificat
         .unwrap()
         .finalized_at
         .is_some());
+    assert!(provider.requests().await.is_empty());
+}
+
+#[tokio::test]
+async fn finalize_recaps_background_completion_after_messages_were_already_recapped() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
+        Vec::new(),
+    )]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_face0004").await;
+    let user_content = vec![SessionContentBlock::text("start background job")];
+    let canonical_hash = canonical_user_content_hash(&user_content).unwrap();
+    let now = Utc::now();
+    session
+        .append_messages(&[
+            NewSessionMessage::with_created_at_and_model(
+                SessionMessageRole::User,
+                user_content,
+                now,
+                "test-model",
+            ),
+            NewSessionMessage::with_created_at_and_model(
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::text("job is running")],
+                now,
+                "test-model",
+            ),
+        ])
+        .await
+        .unwrap();
+    session.advance_recapped_until(2).await.unwrap();
+
+    let mut writer = session.open_turn_journal_writer().await.unwrap();
+    for kind in [
+        TurnJournalEventKind::TurnStarted,
+        TurnJournalEventKind::CanonicalUserMessage {
+            content_hash: Some(canonical_hash),
+            content: None,
+        },
+        TurnJournalEventKind::ToolCallStarted {
+            tool_use_id: "toolu_late_completion".into(),
+            name: "code_run".into(),
+            summary: "tool code_run".into(),
+            input_preview: String::new(),
+            input_truncated: false,
+        },
+        TurnJournalEventKind::ToolCallCompleted {
+            tool_use_id: "toolu_late_completion".into(),
+            summary: "tool code_run process_running".into(),
+            outcome: Some(crate::api::ToolExecutionOutcome::ProcessRunning),
+            output_preview: String::new(),
+            output_truncated: false,
+            file_change: None,
+        },
+        TurnJournalEventKind::TurnFinished {
+            status: TurnJournalStatus::Committed,
+        },
+        TurnJournalEventKind::BackgroundProcessCompleted {
+            tool_use_id: "toolu_late_completion".into(),
+            process_id: "deadbeef".into(),
+            instance_id: 7,
+            status: "finished".into(),
+            exit_code: Some(7),
+            signal: None,
+            success: false,
+        },
+    ] {
+        writer
+            .append("turn_1", Utc::now(), kind, TurnJournalFlush::Immediate)
+            .await
+            .unwrap();
+    }
+    drop(writer);
+
+    let report = engine.finalize_session(&mut session, |_| {}).await.unwrap();
+
+    assert!(report.finalized_unrecapped_messages);
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 1);
+    let recap_payload = last_user_text(&requests[0]);
+    assert!(recap_payload.contains(r#""tool_use_id": "toolu_late_completion""#));
+    assert!(recap_payload.contains(r#""exit_code": 7"#));
+}
+
+#[tokio::test]
+async fn finalize_excludes_failed_journal_only_turn_background_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_face0005").await;
+    let now = Utc::now();
+    session
+        .append_messages(&[
+            NewSessionMessage::with_created_at_and_model(
+                SessionMessageRole::User,
+                vec![SessionContentBlock::text("committed request")],
+                now,
+                "test-model",
+            ),
+            NewSessionMessage::with_created_at_and_model(
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::text("committed answer")],
+                now,
+                "test-model",
+            ),
+        ])
+        .await
+        .unwrap();
+    session.advance_recapped_until(2).await.unwrap();
+
+    let failed_content = vec![SessionContentBlock::text("journal-only private request")];
+    let failed_hash = canonical_user_content_hash(&failed_content).unwrap();
+    let mut writer = session.open_turn_journal_writer().await.unwrap();
+    for kind in [
+        TurnJournalEventKind::TurnStarted,
+        TurnJournalEventKind::CanonicalUserMessage {
+            content_hash: Some(failed_hash),
+            content: None,
+        },
+        TurnJournalEventKind::ToolCallStarted {
+            tool_use_id: "toolu_private".into(),
+            name: "code_run".into(),
+            summary: "tool code_run".into(),
+            input_preview: String::new(),
+            input_truncated: false,
+        },
+        TurnJournalEventKind::ToolCallCompleted {
+            tool_use_id: "toolu_private".into(),
+            summary: "tool code_run process_running".into(),
+            outcome: Some(crate::api::ToolExecutionOutcome::ProcessRunning),
+            output_preview: String::new(),
+            output_truncated: false,
+            file_change: None,
+        },
+        TurnJournalEventKind::TurnFinished {
+            status: TurnJournalStatus::Failed,
+        },
+        TurnJournalEventKind::BackgroundProcessCompleted {
+            tool_use_id: "toolu_private".into(),
+            process_id: "private1".into(),
+            instance_id: 8,
+            status: "finished".into(),
+            exit_code: Some(0),
+            signal: None,
+            success: true,
+        },
+    ] {
+        writer
+            .append("turn_failed", Utc::now(), kind, TurnJournalFlush::Immediate)
+            .await
+            .unwrap();
+    }
+    drop(writer);
+
+    let report = engine.finalize_session(&mut session, |_| {}).await.unwrap();
+
+    assert!(!report.finalized_unrecapped_messages);
     assert!(provider.requests().await.is_empty());
 }
 

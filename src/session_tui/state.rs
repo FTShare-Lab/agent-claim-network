@@ -16,7 +16,7 @@ use crate::session::{HistoricalTimelineTurn, TurnJournalStatus, TurnJournalTimel
 use chrono::Local;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,7 +32,9 @@ use super::mcp_panel::{McpPanelKeyAction, McpPanelRequest, McpPanelState};
 use super::process_panel::{ProcessPanelKeyAction, ProcessPanelState, ProcessTerminationTarget};
 use super::runtime::McpOperationOutcome;
 use super::theme::{blue_style, muted_style, surface_style};
-use super::transcript::{ScrollbackLines, ShellCommandCompletion, TranscriptState};
+use super::transcript::{
+    BackgroundToolUpdate, ScrollbackLines, ShellCommandCompletion, TranscriptState,
+};
 use super::turn_animation::TurnAnimationState;
 
 const FOCUS_INPUT_GRACE: Duration = Duration::from_secs(90);
@@ -62,8 +64,11 @@ pub struct SessionTuiState {
     focus_last_user_activity: Option<Instant>,
     turn_animation: TurnAnimationState,
     pending_user_echo: Option<String>,
+    active_turn_id: Option<String>,
     pending_tool_boundary_steer: Option<String>,
     interrupted_background_processes: BTreeSet<String>,
+    pending_background_tool_completions: BTreeMap<(String, String), BackgroundToolCompletion>,
+    scrollback_rewrite_required: bool,
     turn_in_flight: bool,
     committed_turn_finishing: bool,
     shell_in_flight: bool,
@@ -120,6 +125,29 @@ pub(super) enum ContributionKind {
     Finalize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BackgroundToolCompletion {
+    status: String,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    success: bool,
+}
+
+impl BackgroundToolCompletion {
+    fn outcome(&self) -> ToolExecutionOutcome {
+        if self.status == "terminated" || self.signal.is_some() {
+            ToolExecutionOutcome::ProcessTerminated {
+                signal: self.signal,
+            }
+        } else {
+            ToolExecutionOutcome::ProcessExit {
+                exit_code: self.exit_code,
+                success: self.success,
+            }
+        }
+    }
+}
+
 fn is_elapsed_title_status(status: SessionRuntimeStatus) -> bool {
     matches!(
         status,
@@ -156,8 +184,11 @@ impl Default for SessionTuiState {
             focus_last_user_activity: None,
             turn_animation: TurnAnimationState::default(),
             pending_user_echo: None,
+            active_turn_id: None,
             pending_tool_boundary_steer: None,
             interrupted_background_processes: BTreeSet::new(),
+            pending_background_tool_completions: BTreeMap::new(),
+            scrollback_rewrite_required: false,
             turn_in_flight: false,
             committed_turn_finishing: false,
             shell_in_flight: false,
@@ -264,6 +295,9 @@ impl SessionTuiState {
                     }
                 }
             }
+            SessionEvent::TurnStarted { turn_id } => {
+                self.active_turn_id = Some(turn_id);
+            }
             SessionEvent::Warning { message } => {
                 self.transcript.push_warning(format!("Warning: {message}"));
             }
@@ -306,7 +340,8 @@ impl SessionTuiState {
             }
             SessionEvent::ToolCallStarted { id, name, summary } => {
                 self.transcript.set_activity(None);
-                self.transcript.push_tool_started(id, name, summary);
+                self.transcript
+                    .push_tool_started(self.active_turn_id.clone(), id, name, summary);
             }
             SessionEvent::ToolCallSkipped {
                 id,
@@ -328,38 +363,51 @@ impl SessionTuiState {
             } => {
                 self.network.record_tool_summary(&summary);
                 self.transcript
-                    .complete_tool(id, summary, file_change, outcome);
+                    .complete_tool(id.clone(), summary, file_change, outcome);
+                self.apply_pending_background_tool_completion(&id);
                 if self.status == SessionRuntimeStatus::Running {
                     self.transcript.set_activity(Some("thinking...".into()));
                 }
             }
             SessionEvent::ToolCallInterrupted { id, summary } => {
                 self.capture_interrupted_background_process(&summary);
-                self.transcript.interrupt_tool(id, summary);
+                self.transcript.interrupt_tool(id.clone(), summary);
+                self.apply_pending_background_tool_completion(&id);
             }
             SessionEvent::BackgroundProcessCompleted {
-                process_id,
+                process_id: _,
+                originating_turn_id,
+                originating_tool_use_id,
                 owner_agent_id: _,
                 owner_root_session_id: _,
                 owner_subagent_id,
                 status,
                 exit_code,
                 signal,
+                success,
             } => {
-                let owner = owner_subagent_id.as_deref().unwrap_or("main");
-                let terminal_status = signal
-                    .map(|signal| format!("signal {signal}"))
-                    .or_else(|| exit_code.map(|code| format!("exit {code}")))
-                    .unwrap_or_else(|| "exit unknown".into());
-                self.push_system(format!(
-                    "Background process ID={process_id} owner={owner} {status} ({terminal_status})"
-                ));
+                if owner_subagent_id.is_none() {
+                    if let (Some(turn_id), Some(tool_use_id)) =
+                        (originating_turn_id, originating_tool_use_id)
+                    {
+                        self.apply_background_tool_completion(
+                            turn_id,
+                            tool_use_id,
+                            BackgroundToolCompletion {
+                                status,
+                                exit_code,
+                                signal,
+                                success,
+                            },
+                        );
+                    }
+                }
             }
             SessionEvent::BackgroundProcessStarted { .. }
             | SessionEvent::BackgroundProcessOutput { .. }
             | SessionEvent::BackgroundProcessStateChanged { .. } => {
-                // 生命周期信号用于 journal / 外部控制面；TUI 仅在 terminal completion 时写入
-                // 一行稳定的 transcript，避免后台输出触发滚动噪声。
+                // 生命周期信号用于 journal / 外部控制面；TUI 不把它们写进 transcript，
+                // 避免后台输出与状态变化产生滚动噪声。
             }
             SessionEvent::UserShellCommandStarted { command } => {
                 self.network.clear_last_contribution();
@@ -1260,8 +1308,11 @@ impl SessionTuiState {
         self.context_used_tokens = None;
         self.turn_animation.reset();
         self.pending_user_echo = None;
+        self.active_turn_id = None;
         self.clear_pending_tool_boundary_steer();
         self.interrupted_background_processes.clear();
+        self.pending_background_tool_completions.clear();
+        self.scrollback_rewrite_required = false;
         self.clear_status_notice();
         self.turn_in_flight = false;
         self.committed_turn_finishing = false;
@@ -1271,6 +1322,46 @@ impl SessionTuiState {
         self.start_separator_flushed = false;
         self.delegation_panel = DelegationPanelState::default();
         self.process_panel = ProcessPanelState::default();
+    }
+
+    fn apply_background_tool_completion(
+        &mut self,
+        turn_id: String,
+        tool_use_id: String,
+        completion: BackgroundToolCompletion,
+    ) {
+        let key = (turn_id.clone(), tool_use_id.clone());
+        match self
+            .transcript
+            .complete_background_tool(&turn_id, &tool_use_id, completion.outcome())
+        {
+            BackgroundToolUpdate::Updated { was_flushed } => {
+                self.scrollback_rewrite_required |= was_flushed;
+                self.pending_background_tool_completions.remove(&key);
+            }
+            BackgroundToolUpdate::AwaitingToolResult => {
+                self.pending_background_tool_completions
+                    .insert(key, completion);
+            }
+            BackgroundToolUpdate::Ignored => {
+                self.pending_background_tool_completions.remove(&key);
+            }
+        }
+    }
+
+    fn apply_pending_background_tool_completion(&mut self, tool_use_id: &str) {
+        let Some(turn_id) = self.active_turn_id.clone() else {
+            return;
+        };
+        let key = (turn_id.clone(), tool_use_id.to_string());
+        let Some(completion) = self.pending_background_tool_completions.remove(&key) else {
+            return;
+        };
+        self.apply_background_tool_completion(turn_id, tool_use_id.to_string(), completion);
+    }
+
+    pub(super) fn take_scrollback_rewrite_required(&mut self) -> bool {
+        std::mem::take(&mut self.scrollback_rewrite_required)
     }
 
     #[cfg(test)]
@@ -1301,7 +1392,7 @@ impl SessionTuiState {
                             }
                         }
                         TurnJournalTimelineItem::ToolCall(tool) => {
-                            self.push_historical_tool_call(tool);
+                            self.push_historical_tool_call(turn.turn_id.as_deref(), tool);
                         }
                     }
                 }
@@ -1336,7 +1427,7 @@ impl SessionTuiState {
             }
         }
         for tool in &turn.tool_calls {
-            self.push_historical_tool_call(tool);
+            self.push_historical_tool_call(turn.turn_id.as_deref(), tool);
         }
         if assistant_after_tools {
             if let Some(text) = &turn.assistant_text {
@@ -1346,7 +1437,11 @@ impl SessionTuiState {
         }
     }
 
-    fn push_historical_tool_call(&mut self, tool: &crate::session::TurnJournalToolCall) {
+    fn push_historical_tool_call(
+        &mut self,
+        turn_id: Option<&str>,
+        tool: &crate::session::TurnJournalToolCall,
+    ) {
         if let Some(skipped) = &tool.skipped_summary {
             self.transcript.push_tool_skipped(
                 tool.tool_use_id.clone(),
@@ -1358,6 +1453,7 @@ impl SessionTuiState {
             return;
         }
         self.transcript.push_tool_started(
+            turn_id.map(str::to_string),
             tool.tool_use_id.clone(),
             tool.name.clone(),
             tool.started_summary.clone(),
@@ -1388,6 +1484,18 @@ impl SessionTuiState {
                 None,
                 ToolExecutionOutcome::DispatchFailure,
             );
+        }
+        if let (Some(turn_id), Some(completion)) = (turn_id, &tool.background_completion) {
+            let outcome = BackgroundToolCompletion {
+                status: completion.status.clone(),
+                exit_code: completion.exit_code,
+                signal: completion.signal,
+                success: completion.success,
+            }
+            .outcome();
+            let _ = self
+                .transcript
+                .complete_background_tool(turn_id, &tool.tool_use_id, outcome);
         }
     }
 

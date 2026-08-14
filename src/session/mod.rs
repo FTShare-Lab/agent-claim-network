@@ -38,10 +38,11 @@ pub use cleanup::{
 pub use turn_journal::{
     canonical_user_content_hash, replay_turn_journal, turn_journal_recovery_context,
     turn_journal_recovery_context_for_chain, CompactionAssetKind, CompactionAssetReference,
-    RecoveryContextLimits, TurnJournalEvent, TurnJournalEventKind, TurnJournalFlush,
-    TurnJournalModelContext, TurnJournalNonStreamingFallback, TurnJournalNonStreamingFallbackState,
-    TurnJournalProjection, TurnJournalRead, TurnJournalStatus, TurnJournalTimelineItem,
-    TurnJournalToolCall, TurnJournalTurn, TurnJournalWarning, TurnJournalWriter,
+    RecoveryContextLimits, TurnJournalBackgroundProcessCompletion, TurnJournalEvent,
+    TurnJournalEventKind, TurnJournalFlush, TurnJournalModelContext,
+    TurnJournalNonStreamingFallback, TurnJournalNonStreamingFallbackState, TurnJournalProjection,
+    TurnJournalRead, TurnJournalStatus, TurnJournalTimelineItem, TurnJournalToolCall,
+    TurnJournalTurn, TurnJournalWarning, TurnJournalWriter,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -655,6 +656,8 @@ pub struct HistoricalTurn {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoricalTimelineTurn {
+    /// journal turn 的稳定标识；仅有 canonical messages 的旧历史没有该字段。
+    pub turn_id: Option<String>,
     pub user_text: String,
     /// canonical user content 的稳定哈希；新 journal 用它与 `messages.jsonl` 精确对齐。
     pub canonical_user_content_hash: Option<String>,
@@ -673,6 +676,7 @@ pub struct HistoricalTimelineTurn {
 impl From<HistoricalTurn> for HistoricalTimelineTurn {
     fn from(turn: HistoricalTurn) -> Self {
         Self {
+            turn_id: None,
             user_text: turn.user_text,
             canonical_user_content_hash: None,
             assistant_completed: turn.assistant_text.is_some(),
@@ -1124,6 +1128,7 @@ pub fn extract_last_n_timeline_turns_from_journal(
             let assistant_text =
                 (!turn.assistant_text.trim().is_empty()).then(|| turn.assistant_text.clone());
             Some(HistoricalTimelineTurn {
+                turn_id: Some(turn.turn_id.clone()),
                 user_text,
                 canonical_user_content_hash: turn.canonical_user_content_hash.clone(),
                 assistant_text,

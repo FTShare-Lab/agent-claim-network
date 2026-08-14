@@ -137,22 +137,229 @@ fn startup_welcome_renders_latest_team_service_status() {
 }
 
 #[test]
-fn background_completion_preserves_subagent_owner_and_signal_in_tui_event() {
+fn subagent_background_completion_stays_out_of_main_tui() {
     let mut state = super::TuiState::new();
     state.apply_event(SessionEvent::BackgroundProcessCompleted {
         process_id: "deadbeef".into(),
+        originating_turn_id: Some("turn-child".into()),
+        originating_tool_use_id: Some("toolu-child".into()),
         owner_agent_id: "agent-1".into(),
         owner_root_session_id: "session_1234abcd".into(),
         owner_subagent_id: Some("child-a".into()),
         status: "terminated".into(),
         exit_code: None,
         signal: Some(9),
+        success: false,
     });
 
     let transcript = state.transcript_text();
-    assert!(transcript.contains("owner=child-a"));
-    assert!(transcript.contains("signal 9"));
-    assert!(!transcript.contains("exit unknown"));
+    assert!(!transcript.contains("Background process ID="));
+    assert!(!transcript.contains("owner=child-a"));
+    assert!(!transcript.contains("signal 9"));
+}
+
+#[test]
+fn unassociated_main_background_completion_stays_out_of_tui() {
+    let mut state = super::TuiState::new();
+    state.apply_event(SessionEvent::BackgroundProcessCompleted {
+        process_id: "deadbeef".into(),
+        originating_turn_id: None,
+        originating_tool_use_id: None,
+        owner_agent_id: "agent-1".into(),
+        owner_root_session_id: "session_1234abcd".into(),
+        owner_subagent_id: None,
+        status: "finished".into(),
+        exit_code: Some(0),
+        signal: None,
+        success: true,
+    });
+
+    assert!(!state.transcript_text().contains("Background process ID="));
+}
+
+#[test]
+fn main_background_completion_updates_running_code_run_in_live_timeline() {
+    let mut state = super::TuiState::new();
+    state.begin_pending_turn("启动后台任务".into());
+    state.apply_event(SessionEvent::TurnStarted {
+        turn_id: "turn-background".into(),
+    });
+    state.apply_event(SessionEvent::ToolCallStarted {
+        id: "toolu-background".into(),
+        name: "code_run".into(),
+        summary: r#"tool code_run {"script":"sleep 1"}"#.into(),
+    });
+    state.apply_event(SessionEvent::ToolCallCompleted {
+        id: "toolu-background".into(),
+        summary: "tool code_run process_running".into(),
+        file_change: None,
+        outcome: ToolExecutionOutcome::ProcessRunning,
+    });
+    assert!(state
+        .transcript_text()
+        .contains("Process running in background"));
+
+    state.apply_event(SessionEvent::BackgroundProcessCompleted {
+        process_id: "deadbeef".into(),
+        originating_turn_id: Some("turn-background".into()),
+        originating_tool_use_id: Some("toolu-background".into()),
+        owner_agent_id: "agent-1".into(),
+        owner_root_session_id: "session_1234abcd".into(),
+        owner_subagent_id: None,
+        status: "finished".into(),
+        exit_code: Some(0),
+        signal: None,
+        success: true,
+    });
+
+    let transcript = state.transcript_text();
+    assert!(transcript.contains("Process exit code: 0"));
+    assert!(!transcript.contains("Process running in background"));
+    assert!(!transcript.contains("Background process ID="));
+    assert!(!state.take_scrollback_rewrite_required());
+}
+
+#[test]
+fn main_background_completion_marks_flushed_history_for_full_reflow() {
+    let mut state = super::TuiState::new();
+    state.begin_pending_turn("启动后台任务".into());
+    state.apply_event(SessionEvent::TurnStarted {
+        turn_id: "turn-background".into(),
+    });
+    state.apply_event(SessionEvent::ToolCallStarted {
+        id: "toolu-background".into(),
+        name: "code_run".into(),
+        summary: r#"tool code_run {"script":"sleep 1"}"#.into(),
+    });
+    state.apply_event(SessionEvent::ToolCallCompleted {
+        id: "toolu-background".into(),
+        summary: "tool code_run process_running".into(),
+        file_change: None,
+        outcome: ToolExecutionOutcome::ProcessRunning,
+    });
+    state.apply_event(SessionEvent::AssistantMessageCompleted {
+        text: "任务已转入后台。".into(),
+    });
+    state.apply_event(SessionEvent::TurnCommitted { message_count: 3 });
+    let initial = state.scrollback_lines(96);
+    assert!(lines_plain_text(&initial.lines)
+        .join("\n")
+        .contains("Process running in background"));
+    state.mark_scrollback_flushed(initial.entry_count);
+
+    state.apply_event(SessionEvent::BackgroundProcessCompleted {
+        process_id: "deadbeef".into(),
+        originating_turn_id: Some("turn-background".into()),
+        originating_tool_use_id: Some("toolu-background".into()),
+        owner_agent_id: "agent-1".into(),
+        owner_root_session_id: "session_1234abcd".into(),
+        owner_subagent_id: None,
+        status: "finished".into(),
+        exit_code: Some(7),
+        signal: None,
+        success: false,
+    });
+
+    assert!(state.take_scrollback_rewrite_required());
+    assert_eq!(state.scrollback_lines(96).entry_count, 0);
+    state.reset_flushed_for_hard_clear();
+    let rewritten = lines_plain_text(&state.scrollback_lines(96).lines).join("\n");
+    assert!(rewritten.contains("Process exit code: 7"));
+    assert!(!rewritten.contains("Process running in background"));
+}
+
+#[test]
+fn background_completion_before_tool_result_is_applied_after_running_result_arrives() {
+    let mut state = super::TuiState::new();
+    state.begin_pending_turn("启动后台任务".into());
+    state.apply_event(SessionEvent::TurnStarted {
+        turn_id: "turn-race".into(),
+    });
+    state.apply_event(SessionEvent::ToolCallStarted {
+        id: "toolu-race".into(),
+        name: "code_run".into(),
+        summary: r#"tool code_run {"script":"sleep 1"}"#.into(),
+    });
+    state.apply_event(SessionEvent::BackgroundProcessCompleted {
+        process_id: "feedface".into(),
+        originating_turn_id: Some("turn-race".into()),
+        originating_tool_use_id: Some("toolu-race".into()),
+        owner_agent_id: "agent-1".into(),
+        owner_root_session_id: "session_1234abcd".into(),
+        owner_subagent_id: None,
+        status: "finished".into(),
+        exit_code: None,
+        signal: Some(15),
+        success: false,
+    });
+    state.apply_event(SessionEvent::ToolCallCompleted {
+        id: "toolu-race".into(),
+        summary: "tool code_run process_running".into(),
+        file_change: None,
+        outcome: ToolExecutionOutcome::ProcessRunning,
+    });
+
+    let transcript = state.transcript_text();
+    assert!(transcript.contains("Process terminated: signal 15"));
+    assert!(!transcript.contains("Process running in background"));
+}
+
+#[test]
+fn background_completion_does_not_cross_turns_when_tool_use_id_is_reused() {
+    let mut state = super::TuiState::new();
+    state.begin_pending_turn("first".into());
+    state.apply_event(SessionEvent::TurnStarted {
+        turn_id: "turn_1".into(),
+    });
+    state.apply_event(SessionEvent::ToolCallStarted {
+        id: "toolu_reused".into(),
+        name: "code_run".into(),
+        summary: "tool code_run first".into(),
+    });
+    state.apply_event(SessionEvent::ToolCallCompleted {
+        id: "toolu_reused".into(),
+        summary: "tool code_run process_running".into(),
+        file_change: None,
+        outcome: ToolExecutionOutcome::ProcessRunning,
+    });
+    state.apply_event(SessionEvent::TurnCommitted { message_count: 2 });
+
+    state.begin_pending_turn("second".into());
+    state.apply_event(SessionEvent::TurnStarted {
+        turn_id: "turn_2".into(),
+    });
+    state.apply_event(SessionEvent::ToolCallStarted {
+        id: "toolu_reused".into(),
+        name: "code_run".into(),
+        summary: "tool code_run second".into(),
+    });
+    state.apply_event(SessionEvent::ToolCallCompleted {
+        id: "toolu_reused".into(),
+        summary: "tool code_run process_running".into(),
+        file_change: None,
+        outcome: ToolExecutionOutcome::ProcessRunning,
+    });
+
+    state.apply_event(SessionEvent::BackgroundProcessCompleted {
+        process_id: "deadbeef".into(),
+        originating_turn_id: Some("turn_1".into()),
+        originating_tool_use_id: Some("toolu_reused".into()),
+        owner_agent_id: "agent-1".into(),
+        owner_root_session_id: "session_1234abcd".into(),
+        owner_subagent_id: None,
+        status: "finished".into(),
+        exit_code: Some(0),
+        signal: None,
+        success: true,
+    });
+
+    let transcript = state.transcript_text();
+    assert_eq!(transcript.matches("Process exit code: 0").count(), 1);
+    assert_eq!(
+        transcript.matches("Process running in background").count(),
+        1,
+        "turn_2 的同名 tool_use cell 不得被 turn_1 的终态覆盖"
+    );
 }
 
 #[test]
@@ -2405,6 +2612,7 @@ fn resume_reset_drops_temporary_command_echo_before_restored_history() {
 fn journal_timeline_replay_renders_status_steer_and_tool_state() {
     let mut state = super::TuiState::new();
     state.push_historical_timeline_turns(&[HistoricalTimelineTurn {
+        turn_id: Some("turn_1".into()),
         user_text: "恢复的用户消息".into(),
         canonical_user_content_hash: None,
         assistant_text: Some("半截回复".into()),
@@ -2425,6 +2633,7 @@ fn journal_timeline_replay_renders_status_steer_and_tool_state() {
             output_preview: Some(r#"{"bytes":12}"#.into()),
             output_truncated: false,
             file_change: None,
+            background_completion: None,
         }],
         timeline_items: Vec::new(),
         user_steers: vec!["换个方向".into()],
@@ -2442,9 +2651,56 @@ fn journal_timeline_replay_renders_status_steer_and_tool_state() {
 }
 
 #[test]
+fn journal_timeline_replay_applies_background_completion_projection() {
+    let mut state = super::TuiState::new();
+    state.push_historical_timeline_turns(&[HistoricalTimelineTurn {
+        turn_id: Some("turn_background".into()),
+        user_text: "启动后台任务".into(),
+        canonical_user_content_hash: None,
+        assistant_text: Some("已放到后台。".into()),
+        assistant_completed: true,
+        status: Some(TurnJournalStatus::Committed),
+        tool_calls: vec![TurnJournalToolCall {
+            tool_use_id: "toolu_background".into(),
+            name: "code_run".into(),
+            started_summary: "tool code_run".into(),
+            input_preview: r#"{"script":"sleep 1"}"#.into(),
+            input_truncated: false,
+            latest_progress: None,
+            completed_summary: Some("tool code_run process_running".into()),
+            interrupted_summary: None,
+            skipped_summary: None,
+            skip_reason: None,
+            outcome: Some(ToolExecutionOutcome::ProcessRunning),
+            output_preview: Some(r#"{"process_id":"deadbeef"}"#.into()),
+            output_truncated: false,
+            file_change: None,
+            background_completion: Some(crate::session::TurnJournalBackgroundProcessCompletion {
+                process_id: "deadbeef".into(),
+                instance_id: 7,
+                status: "finished".into(),
+                exit_code: Some(0),
+                signal: None,
+                success: true,
+            }),
+        }],
+        timeline_items: Vec::new(),
+        user_steers: Vec::new(),
+        recovery_notice: None,
+        turn_status_detail: None,
+    }]);
+
+    let text = state.transcript_text();
+    assert!(text.contains("Process exit code: 0"));
+    assert!(!text.contains("Process running in background"));
+    assert!(!text.contains("Background process ID="));
+}
+
+#[test]
 fn journal_timeline_replay_finalizes_partial_assistant_before_status_lines() {
     let mut state = super::TuiState::new();
     state.push_historical_timeline_turns(&[HistoricalTimelineTurn {
+        turn_id: Some("turn_1".into()),
         user_text: "恢复的用户消息".into(),
         canonical_user_content_hash: None,
         assistant_text: Some("半截回复".into()),
@@ -2473,6 +2729,7 @@ fn journal_timeline_replay_finalizes_partial_assistant_before_status_lines() {
 fn resumed_fallback_turn_uses_persisted_exhausted_or_interrupted_detail() {
     let mut exhausted = super::TuiState::new();
     exhausted.push_historical_timeline_turns(&[HistoricalTimelineTurn {
+        turn_id: Some("turn_1".into()),
         user_text: "question".into(),
         canonical_user_content_hash: None,
         assistant_text: Some("partial".into()),
@@ -2495,6 +2752,7 @@ fn resumed_fallback_turn_uses_persisted_exhausted_or_interrupted_detail() {
 
     let mut interrupted = super::TuiState::new();
     interrupted.push_historical_timeline_turns(&[HistoricalTimelineTurn {
+        turn_id: Some("turn_2".into()),
         user_text: "question".into(),
         canonical_user_content_hash: None,
         assistant_text: Some("partial".into()),
@@ -2522,6 +2780,7 @@ fn resumed_fallback_turn_uses_persisted_exhausted_or_interrupted_detail() {
 fn journal_timeline_replay_renders_recovery_notice_explicitly() {
     let mut state = super::TuiState::new();
     state.push_historical_timeline_turns(&[HistoricalTimelineTurn {
+        turn_id: Some("turn_1".into()),
         user_text: "恢复请求".into(),
         canonical_user_content_hash: None,
         assistant_text: None,
@@ -2546,6 +2805,7 @@ fn journal_timeline_replay_renders_recovery_notice_explicitly() {
 fn committed_journal_timeline_renders_tools_before_final_assistant() {
     let mut state = super::TuiState::new();
     state.push_historical_timeline_turns(&[HistoricalTimelineTurn {
+        turn_id: Some("turn_1".into()),
         user_text: "运行工具".into(),
         canonical_user_content_hash: None,
         assistant_text: Some("最终回复".into()),
@@ -2566,6 +2826,7 @@ fn committed_journal_timeline_renders_tools_before_final_assistant() {
             output_preview: Some(r#"{"bytes":12}"#.into()),
             output_truncated: false,
             file_change: None,
+            background_completion: None,
         }],
         timeline_items: Vec::new(),
         user_steers: Vec::new(),
@@ -2597,8 +2858,10 @@ fn journal_timeline_replay_preserves_assistant_tool_assistant_order() {
         output_preview: Some(r#"{"bytes":12}"#.into()),
         output_truncated: false,
         file_change: None,
+        background_completion: None,
     };
     state.push_historical_timeline_turns(&[HistoricalTimelineTurn {
+        turn_id: Some("turn_1".into()),
         user_text: "运行工具".into(),
         canonical_user_content_hash: None,
         assistant_text: Some("我先读一下。最终回复".into()),
@@ -3083,8 +3346,10 @@ fn resumed_skipped_tool_does_not_degrade_to_journal_replay_failure() {
         output_preview: None,
         output_truncated: false,
         file_change: None,
+        background_completion: None,
     };
     state.push_historical_timeline_turns(&[HistoricalTimelineTurn {
+        turn_id: Some("turn_1".into()),
         user_text: "读取文件".into(),
         canonical_user_content_hash: None,
         assistant_text: None,
@@ -5656,6 +5921,7 @@ fn resumed_journal_timeline_renders_file_diff() {
     )
     .expect("需产出 diff");
     state.push_historical_timeline_turns(&[HistoricalTimelineTurn {
+        turn_id: Some("turn_1".into()),
         user_text: "改文件".into(),
         canonical_user_content_hash: None,
         assistant_text: Some("改完了".into()),
@@ -5676,6 +5942,7 @@ fn resumed_journal_timeline_renders_file_diff() {
             output_preview: Some(r#"{"ok":true}"#.into()),
             output_truncated: false,
             file_change: Some(change),
+            background_completion: None,
         }],
         timeline_items: Vec::new(),
         user_steers: Vec::new(),
