@@ -1,4 +1,4 @@
-"""评测三臂共同注入的冻结静态资产。"""
+"""评测四臂共同注入的冻结静态资产。"""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ class FrozenSkillAsset:
 
 
 def frozen_coding_benchmark_skill() -> FrozenSkillAsset:
-    """返回三臂共同使用的最小通用 coding skill 及其内容哈希。"""
+    """返回四臂共同使用的最小通用 coding skill 及其内容哈希。"""
     source = Path(__file__).resolve().parents[2] / "assets" / "coding-benchmark"
     if not (source / "SKILL.md").is_file():
         raise FileNotFoundError(f"缺少 coding-benchmark skill: {source}")

@@ -183,6 +183,7 @@ async fn consult_router_tool_is_exposed_only_when_router_is_configured() {
         .map(|tool| tool.name.clone())
         .collect::<Vec<_>>();
     assert!(names.iter().any(|name| name == "consult_router"));
+    assert!(!names.iter().any(|name| name == "submit_task"));
     let consult_router = tools
         .iter()
         .find(|tool| tool.name == "consult_router")
@@ -191,6 +192,56 @@ async fn consult_router_tool_is_exposed_only_when_router_is_configured() {
         consult_router.input_schema["required"],
         serde_json::json!(["mode"])
     );
+}
+
+#[tokio::test]
+async fn evaluation_submit_task_is_explicit_and_scoped_to_one_registry() {
+    let dir = tempfile::tempdir().unwrap();
+    let submission = EvaluationSubmission::new();
+    let registry = ToolRegistry::new(&test_tool_config(dir.path()))
+        .unwrap()
+        .for_evaluation("ACN_TEST_EVALUATION_SECRET".into())
+        .with_evaluation_submission(submission.clone());
+
+    assert!(registry.evaluation_submission_enabled());
+    assert!(registry
+        .definitions()
+        .iter()
+        .any(|definition| definition.name == "submit_task"));
+    assert!(!submission.was_submitted());
+    let result = registry.dispatch("submit_task", json!({})).await.unwrap();
+    assert_eq!(result.outcome, ToolExecutionOutcome::Completed);
+    assert_eq!(result.output["submitted"], true);
+    assert!(submission.was_submitted());
+
+    let ordinary = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
+    assert!(!ordinary.evaluation_submission_enabled());
+    assert!(!ordinary
+        .definitions()
+        .iter()
+        .any(|definition| definition.name == "submit_task"));
+    let error = ordinary
+        .dispatch("submit_task", json!({}))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ToolError::UnknownTool(_)));
+}
+
+#[tokio::test]
+async fn evaluation_submit_task_rejects_arguments_without_marking_submission() {
+    let dir = tempfile::tempdir().unwrap();
+    let submission = EvaluationSubmission::new();
+    let registry = ToolRegistry::new(&test_tool_config(dir.path()))
+        .unwrap()
+        .for_evaluation("ACN_TEST_EVALUATION_SECRET".into())
+        .with_evaluation_submission(submission.clone());
+
+    let error = registry
+        .dispatch("submit_task", json!({"summary": "done"}))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ToolError::InvalidArgs(_)));
+    assert!(!submission.was_submitted());
 }
 
 #[tokio::test]

@@ -25,10 +25,11 @@
 - 每题都有明确判卷，结果比主观体验更容易对齐；
 - 官方和 Artificial Analysis 已有模型、harness、成本和 step 数据。
 
-首轮固定使用 DeepSWE revision
-`e016041a6ccf8da29906afc9a3f5a8df940a1f78` 与 Pier revision
-`fefa7475a32bb05271abdea378e8083c83eb5c35`。任务清单、verifier 和容器镜像 digest
-随实验 manifest 一起冻结，避免不同版本混算。
+当前官方对齐组从 DeepSWE revision
+`435ee89ec2f2e2289f33b0da4f992f0b7b7266b9` 与 Pier revision
+`0daf53d3599e58c4506cf0bcff5e12c77dc282d2` 新建冻结 manifest。任务清单、verifier、
+`[[verifier.collect]]` 钩子和容器镜像 digest 随该 manifest 一起冻结，避免不同版本混算。仓库内
+旧 revision 的 manifest 仅为历史 run artifact，不得混入此对齐组。
 
 ## 2. 公开数据直接复用
 
@@ -54,7 +55,7 @@
 
 ### 3.1 DeepSWE 官方运行条件
 
-以下配置来自 2026-07-23 检查的 DeepSWE 113 个 `task.toml` 及 Pier 的
+以下配置来自当前冻结的 DeepSWE 113 个 `task.toml` 及 Pier 的
 `mini-swe-agent` adapter。正式评测需重新冻结实际使用的 revision，不得只记录“DeepSWE v1.1”。
 
 | 项目 | 官方配置 | 含义 |
@@ -78,16 +79,16 @@
 5,000 字符。提示词中即使允许“安装缺失工具”，任务期普通公网仍被拦截，因此只能使用镜像内已有
 依赖。
 
-Pinned Pier 不识别 DeepSWE `task.toml` 中的 `agent.network_mode` /
-`verifier.network_mode`。runner 必须在运行前做 fail-closed 转换：仅当两者均为
-`"no-network"` 时，生成 Pier 兼容副本，并显式写入
+DeepSWE 的 `network_mode` 与 Pier 的 `allow_internet` 表达不同。runner 必须在运行前做
+fail-closed 转换：仅当 agent / verifier 两者均为 `"no-network"` 时，生成 Pier 兼容副本，并显式写入
 `environment.allow_internet = false` 与 `verifier.environment.allow_internet = false`。
-原始和转换后配置的 SHA-256 都写入 manifest；未经转换的任务禁止运行。
+原始和转换后配置的 SHA-256 都写入 manifest；转换必须保留 `[[verifier.collect]]`，未经转换的任务
+禁止运行。
 
 ### 3.2 ACN 对齐配置
 
 ACN 不要求伪装成 `mini-swe-agent`，其原生文件、命令和 router 工具属于待测 harness；但环境边界
-必须对齐，且 A、`B_empty`、`B_claim` 除 claim 可见性外完全相同。
+必须对齐，且 A、`B_empty`、`B_claim`、`B_forced_claim` 除明确的 claim 交付方式外完全相同。
 
 | 项目 | ACN 评测配置 |
 | --- | --- |
@@ -99,47 +100,62 @@ ACN 不要求伪装成 `mini-swe-agent`，其原生文件、命令和 router 工
 | Session | 不 resume；每题、每组使用新的 agent id、session id 和 session 目录 |
 | Workspace | 从同一 base commit / image digest 创建 pristine 副本；组间不共享 git 对象外的运行产物 |
 | Claim | 按 3.3 的组别矩阵配置；只要 A 在 freeze barrier 前产生 claim，就同时运行两个干净 B 臂；B 不能看到 A 的 patch、session、trace、日志或私有文件 |
-| Skill | 三组注入完全相同的 `coding-benchmark` skill，记录全文 SHA-256 |
-| Prompt | 相同 system prompt、首条任务 prompt 和注入顺序；禁止中途人工补充提示 |
-| 工具 | 三组工具 schema、权限、并发上限和输出截断相同；除 router 返回内容外不得因组别变化 |
-| 人工交互 | 关闭 `ask_user` 和 TUI user shell；一次性提交任务，agent 自主结束 |
+| Skill | 四臂注入完全相同的 `coding-benchmark` skill，记录全文 SHA-256 |
+| Prompt | 相同 system prompt、首条任务 prompt 和注入顺序；每个 runtime 的 `ACN.md` 只包含相同的 Claim 使用引导：有相关 scope 时查询 Router，候选 Claim 仅是历史经验线索，须以当前证据独立验证；禁止中途人工补充提示 |
+| 工具 | 四臂工具 schema、权限、并发上限和输出截断相同；除 router 返回内容外不得因组别变化 |
+| 人工交互 / 终止 | 关闭 `ask_user` 和 TUI user shell；完成后应调用无参数 `submit_task`；只有正常、可消费的 assistant 最终回复可在遗漏该调用时作为隐式完成 |
 | Subagent | 首期关闭，避免引入额外模型实例和未计量的共享状态 |
-| 超时 / 资源 | 官方对齐组：agent 5400 秒、verifier 1800 秒；扩展预算组：agent 7200 秒、verifier 1800 秒；均为 2 CPU / 8 GiB / 20 GiB / 0 GPU |
+| 超时 / 资源 | 官方对齐组：agent 5400 秒、verifier 1800 秒，ACN 工作 deadline 5280 秒（收尾预留 120 秒）；均为 2 CPU / 8 GiB / 20 GiB / 0 GPU |
 | step / cost limit | 不设置早于所属 agent timeout 的停止线；若实现要求正数上限，设为不会在 Smoke 中触发的固定值 |
 | verifier | 与 agent 分离；只应用最终 patch，在 pristine 容器中离线判卷 |
 
 网络必须由 runner/sandbox 强制执行，不能只在 prompt 中要求模型“不要联网”。模型 broker
 记录每条请求；白名单外请求写入审计日志并拒绝。
 
-扩展预算组只用于诊断模型在官方 90 分钟墙钟外的完成行为，不与官方榜单或官方对齐组混算。它通过
-独立配置把 `agent_seconds` 设为 7200；该值同时驱动 Pier 的 `override_timeout_sec`、ACN 单次
-请求 timeout 与 attempt 自有 deadline，后者固定预留 30 秒收尾。配置、hash 与 timeout 均写入
-每次运行的 provenance。
+`submit_task` 只在 evaluation profile 注册，且必须是一个 assistant 响应中的唯一工具调用。其成功执行后
+turn loop 立即结束，不再把 tool result 回灌给模型或发起下一次 provider request；之后才开始 session
+finalize 与 verifier。它是首选的明确终止信号，但不是 claim 收尾的硬门槛：`run_turn` 正常结束而未提交时，
+评测记录 `evaluation_completion.mode=implicit_assistant_done`，再进入相同的 finalize 与 verifier 路径；显式
+提交记录 `mode=explicit_submit_task`，并保留 `evaluation_submitted` 事件。provider 截断、无可消费输出、
+中断、请求错误和 deadline 都不能走隐式完成，仍记为 agent failure。该设计保留与官方 mini-swe-agent
+sentinel 相近的明确边界，同时适配部分模型仅以最终文本报告完成的行为，且不把 ACN 伪装为 Bash-only
+baseline。
+
+任何扩展预算仅用于后续诊断，不与官方榜单或本 PRD 的官方对齐组混算。`agent_seconds` 同时驱动
+Pier 的 `override_timeout_sec`、ACN 单次请求 timeout 与 attempt 自有 deadline；后者必须预留至少
+120 秒给 session finalize、事件账本与 result 写入。配置、hash 与 timeout 均写入每次运行的
+provenance。
+
+宿主在 attempt 运行期间只读轮询 session `turn_events.jsonl`，把最后活动时间、最近事件和
+疑似停滞状态写入 attempt 的 `progress.json`。该监控不提前停止 agent：模型长推理、上游排队或
+工具运行都必须继续到原有 deadline。运行被人为中止时，manifest 和 progress 记录
+`INTERRUPTED_BY_OPERATOR`；缺少最终 result 不能单独作为“模型无响应”或 claim 逻辑失败的证据。
 
 ### 3.3 Claim 可见性矩阵
 
-| 状态 | A：producer | `B_empty` | `B_claim` |
+| 状态 | A：producer | `B_empty` | `B_claim` | `B_forced_claim` |
 | --- | --- | --- | --- |
-| 历史 Memory / Session | 空 | 空 | 空 |
-| 初始本地 Claim | 空 | 空 | 空 |
-| Router | 进程内空 bundle | 进程内空 bundle | 进程内只读 bundle，仅含 A 本题 freeze barrier 前的 claim |
-| A 的 workspace / patch / log / trace | 自身运行可见 | 不可见 | 不可见 |
-| 运行中团队数据变化 | 不读取历史 claim | 禁止 | 禁止；开始前生成只读快照 |
+| 历史 Memory / Session | 空 | 空 | 空 | 空 |
+| 初始本地 Claim | 空 | 空 | 空 | 空 |
+| Router | 进程内空 bundle | 进程内空 bundle | 进程内只读 bundle，仅含 A 本题 freeze barrier 前的 claim | 同 `B_claim` |
+| 首轮任务上下文 | 无 claim | 无 claim | 无 claim（模型自主调用 `consult_router`） | 同一冻结 router 查询所得完整 claim；明确标为需独立验证的前序信息 |
+| A 的 workspace / patch / log / trace | 自身运行可见 | 不可见 | 不可见 | 不可见 |
+| 运行中团队数据变化 | 不读取历史 claim | 禁止 | 禁止；开始前生成只读快照 | 禁止；开始前生成只读快照 |
 
 A 完成并退出后，由宿主写入不可变 freeze barrier；claim 资格检查只采信 barrier 前的宿主事件
-账本，不采信 claim 文件自报的时间或 attempt id。只要快照非空，`B_claim` 就使用通过检查的只读
+账本，不采信 claim 文件自报的时间或 attempt id。只要快照非空，两个带 claim 的 B 臂就使用通过检查的只读
 快照；A 是否通过 verifier 不影响 claim 是否可被注入。B 运行期间不得继续接收 A 的新 claim、policy
 或 dispute 更新。
 
 ### 3.3.1 成功效率与失败恢复的分层
 
 每题先运行 A，再从 pristine workspace 启动 B。A 的 verifier 结果只决定统计分层，不决定
-`B_claim` 是否启动：
+两个带 claim 的 B 臂是否启动：
 
 | 分层 | 入组条件 | B 臂 | 主要问题 |
 | --- | --- | --- | --- |
-| `success_efficiency` | A verifier 通过，且 freeze snapshot 非空 | `B_empty` 与 `B_claim` | claim 能否减少 agent step、成功响应观测 token 和耗时，同时维持完成质量？ |
-| `failure_recovery` | A verifier 未通过，且 freeze snapshot 非空 | `B_empty` 与 `B_claim` | 失败中的观察、已排除路径和测试结果能否让 `B_claim` 比干净重试更常通过 verifier？ |
+| `success_efficiency` | A verifier 通过，且 freeze snapshot 非空 | `B_empty`、`B_claim`、`B_forced_claim` | 分别测量自主检索与强制交付的 claim 能否减少 agent step、成功响应观测 token 和耗时，同时维持完成质量？ |
+| `failure_recovery` | A verifier 未通过，且 freeze snapshot 非空 | `B_empty`、`B_claim`、`B_forced_claim` | 失败中的观察、已排除路径和测试结果能否让两个 claim 臂比干净重试更常通过 verifier？ |
 | `unpaired_no_claim` | freeze snapshot 为空 | 仅 `B_empty` | 记录 claim 产出覆盖率，不进入 claim 对照统计。 |
 
 失败 claim 不被当作已验证事实：它们只能作为带 provenance 的冻结观察供 B 自主判断。B 不得获得
@@ -167,16 +183,18 @@ A 的 patch、workspace、session、trace 或日志，因此失败恢复衡量�
 
 ## 4. ACN 怎么跑
 
-每道题先运行 A；当且仅当 A freeze 后存在 claim 时，再运行两个彼此隔离的 B agent：
+每道题先运行 A；当且仅当 A freeze 后存在 claim 时，再运行三个彼此隔离的 B agent：
 
 | 组别 | 作用 | 可见信息 |
 | --- | --- | --- |
 | A：producer | 第一次正常运行，同时产出 claim | 无历史 claim |
 | B_empty | 全新 agent，对照组 | router 可用，但 team store 为空 |
 | B_claim | 另一个全新 agent，实验组 | 只能通过 router 获取 A 产出的 freeze claim；A 成功和失败两种情况均可注入 |
+| B_forced_claim | 另一个全新 agent，受控交付组 | 首轮任务上下文附有同一冻结 router 检索的完整 claim；仍不能看到 A 的 patch、session、日志或 private memory |
 
-三个 agent 都从同一仓库快照开始，使用相同模型、system prompt、skill、工具、预算和 verifier。
-`B_empty` 与 `B_claim` 的唯一差别是 router 中有没有 A 的 claim。
+三个 B agent 都从同一仓库快照开始，使用相同模型、system prompt、skill、工具、预算和 verifier。
+`B_claim` 与 `B_forced_claim` 的唯一差别是 claim 是否由模型自主检索；两者均必须由同一冻结 router
+产生可校验的 content hash 归因。
 
 B_claim 不得获得 A 的 patch、工作区、session、日志或 private memory；这些内容如果被带过去，
 测到的就不是 claim 价值。A 通过 verifier 的题归入效率分层；A 未通过但有 claim 的题归入失败恢复
@@ -184,7 +202,7 @@ B_claim 不得获得 A 的 patch、工作区、session、日志或 private memor
 
 ## 5. 统一 Skill
 
-三组使用同一份 `coding-benchmark` skill，主要补足轻量 harness 缺少的通用工作流：
+四组使用同一份 `coding-benchmark` skill，主要补足轻量 harness 缺少的通用工作流：
 
 > 阅读任务和仓库 → 复现问题 → 定位原因 → 实现修复 → 跑针对性测试 → 按错误返工 → 检查 diff → 最终验证。
 
@@ -207,12 +225,12 @@ input/output/cache token，避免路由换模或缓存差异无法解释。
 
 | 指标 | 用途 | 来源 |
 | --- | --- | --- |
-| 成功效率 | `B_claim` 相对 `B_empty` 的 agent step、成功响应观测 token、耗时差 | `success_efficiency` 的按题配对结果 |
-| 失败恢复 uplift | `pass(B_claim) - pass(B_empty)` | `failure_recovery` 的按题配对结果 |
+| 成功效率 | `B_claim`、`B_forced_claim` 分别相对 `B_empty` 的 agent step、成功响应观测 token、耗时差 | `success_efficiency` 的按题配对结果 |
+| 失败恢复 uplift | `pass(B_claim) - pass(B_empty)` 与 `pass(B_forced_claim) - pass(B_empty)` | `failure_recovery` 的按题配对结果 |
 | token | 成功响应返回的原始 usage；中断请求单列计数，不补零 | 模型服务原始 usage |
 | 标准化费用 | 按冻结官方费率换算，缓存单独计价 | token usage + 价目表 |
 | agent step | 看完成任务需要多少轮决策 | ACN session JSONL |
-| claim retrieved / used | 确认 B 是否真的检索和引用 claim | router 记录 + trace |
+| claim funnel | B_claim / B_forced_claim 的 bundle 可用、router 检索、内容注入、模型报告使用及 claim 数 | attempt 记录 + aggregate manifest |
 
 `agent step` 统一定义为一次完整的模型响应；tool call 数另记。实际本地 GPU 成本如果模型服务
 能够提供则单列，不能和按官方费率换算的费用混成一个数。
@@ -225,15 +243,15 @@ input/output/cache token，避免路由换模或缓存差异无法解释。
 
 | 阶段 | 规模 | 目的 |
 | --- | ---: | --- |
-| Pre-smoke | 5 题 × 3 组 = 15 attempts | 先验证端到端协议、隔离、计量和 claim 归因 |
-| Smoke | 30 题 × 3 组 = 90 attempts | 验证预算、无 claim 基线和 claim 方向 |
-| Full | 113 题 × 3 组 = 339 attempts | 形成全量结果 |
+| Pre-smoke | 5 题 × 4 组 = 20 attempts | 先验证端到端协议、隔离、计量和 claim 归因 |
+| Smoke | 30 题 × 4 组 = 120 attempts | 验证预算、无 claim 基线、自主检索和强制交付方向 |
+| Full | 113 题 × 4 组 = 452 attempts | 形成全量结果 |
 
 5 题和 30 题都从完整任务清单按固定 seed 无放回抽取并冻结。Pre-smoke 的第 1 题必须先完成
-A、`B_empty`、`B_claim` 三臂硬门禁，确认 schema、verifier、artifact hash、broker
+A、`B_empty`、`B_claim`、`B_forced_claim` 四臂硬门禁，确认 schema、verifier、artifact hash、broker
 request/step nonce、usage、claim/router 证据和隔离检查全部闭合，才允许运行余下 4 题。
-硬门禁通过后，余下 4 题可按平台限流并发；每题内部仍保持 A → freeze → 两个 B 臂串行。若
-freeze snapshot 为空，`B_claim` 记为 `NO_ELIGIBLE_CLAIM` 而不运行。broker 必须使用独立随机端口，
+硬门禁通过后，余下 4 题可按平台限流并发；每题内部仍保持 A → freeze → 三个 B 臂串行。若
+freeze snapshot 为空，两个带 claim 的 B 臂记为 `NO_ELIGIBLE_CLAIM` 而不运行。broker 必须使用独立随机端口，
 避免并发 task 共享连接或抢占固定端口。
 
 每个 task/arm 只允许一次解题运行；verifier 0 分是有效结果，不得重跑刷分。单次可重试模型请求的
@@ -241,8 +259,13 @@ freeze snapshot 为空，`B_claim` 记为 `NO_ELIGIBLE_CLAIM` 而不运行。bro
 故障可以原配置重试一次，并保留失败 attempt。若 Pre-smoke 后模型、skill、
 预算和执行协议不变，结果可并入 Smoke。
 
+上游若以 HTTP 429 并明确返回“并发容量耗尽”的机器可读代码，Rust result 必须写入稳定的
+`failure_kind`。宿主将其记为基础设施失败，保留 result、event ledger 和运行进度，但不经过
+Gate、freeze 或后续 B 臂，也不混入 agent、claim、verifier 指标；不能只凭 HTTP 429 泛化该归因，
+以免把普通限流或 agent 侧失败错误排除。
+
 若 Smoke 后模型、skill、预算和执行协议不变，**保留这 30 题结果，
-Full 只补剩余 83 题，即新增 83 × 3 = 249 attempts**，不重复花钱。
+Full 只补剩余 83 题，即新增 83 × 4 = 332 attempts**，不重复花钱。
 
 只有 Smoke 暴露出协议错误并导致配置修改时，受影响的 30 题才需要重跑。
 
@@ -268,8 +291,9 @@ agent 自身失败按未通过计分；runner、网络或 proxy 故障修复后�
 
 ### 图二：ACN Claim 增益
 
-分两栏展示 `B_empty` 与 `B_claim`：成功效率栏只比较 A 已通过题的 step/token/耗时；失败恢复栏
-比较 A 未通过题的 verifier pass rate。两栏都报告不完整请求比例。
+分两栏展示 `B_empty`、`B_claim` 与 `B_forced_claim`：成功效率栏只比较 A 已通过题的
+step/token/耗时；失败恢复栏比较 A 未通过题的 verifier pass rate。两栏都报告不完整请求比例，
+并把自主检索与强制交付分开呈现。
 
 成功效率栏展示：
 
@@ -277,8 +301,9 @@ agent 自身失败按未通过计分；runner、网络或 proxy 故障修复后�
 - 标准化费用 / task；
 - 平均 agent step / task。
 
-失败恢复栏展示 `pass(B_claim) - pass(B_empty)` 及其置信区间。另画“横轴成功响应观测费用、纵轴
-通过率”的散点图，并明确费用为下界；B_claim 相比 B_empty 越向左上移动，说明 claim 带来的净收益越好。
+失败恢复栏分别展示 `pass(B_claim) - pass(B_empty)`、
+`pass(B_forced_claim) - pass(B_empty)` 及其置信区间。另画“横轴成功响应观测费用、纵轴通过率”的
+散点图，并明确费用为下界；任一 claim 臂相比 B_empty 越向左上移动，说明 claim 带来的净收益越好。
 
 ## 11. 组会待拍板
 
@@ -292,8 +317,8 @@ agent 自身失败按未通过计分；runner、网络或 proxy 故障修复后�
 
 - [DeepSWE 官方页面](https://deepswe.datacurve.ai/)
 - [DeepSWE GitHub](https://github.com/datacurve-ai/deep-swe)
-- [DeepSWE task.toml 配置示例](https://github.com/datacurve-ai/deep-swe/blob/e016041a6ccf8da29906afc9a3f5a8df940a1f78/tasks/abs-module-cache-flags/task.toml)
-- [Pier mini-swe-agent adapter](https://github.com/datacurve-ai/pier/blob/fefa7475a32bb05271abdea378e8083c83eb5c35/src/pier/agents/installed/mini_swe_agent.py)
+- [DeepSWE task.toml 配置示例](https://github.com/datacurve-ai/deep-swe/blob/435ee89ec2f2e2289f33b0da4f992f0b7b7266b9/tasks/true-myth-iterable-collection-combinators/task.toml)
+- [Pier mini-swe-agent adapter](https://github.com/datacurve-ai/pier/blob/0daf53d3599e58c4506cf0bcff5e12c77dc282d2/src/pier/agents/installed/mini_swe_agent.py)
 - [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent)
 - [mini-swe-agent mini.yaml](https://github.com/SWE-agent/mini-swe-agent/blob/a83fcae82d2a08f0ee0c688f9d137b3566c097f8/src/minisweagent/config/mini.yaml)
 - [Codex vs OpenCode](https://artificialanalysis.ai/agents/coding-agents/comparisons/codex-vs-opencode)

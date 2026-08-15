@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from acn_deepswe.presmoke_cli import (
     PresmokeCliError,
+    _ensure_frozen_task_images_available,
     _effective_config_hash,
     build_task_specs,
     load_config,
@@ -18,6 +19,7 @@ from acn_deepswe.presmoke_cli import (
     verify_checkout_revision,
     verify_pier_executable_binding,
 )
+from acn_deepswe.presmoke import PresmokeTaskResult
 from acn_deepswe.provenance import TASK_DIRECTORY_HASH_ALGORITHM, sha256_directory_tree
 
 TASK_IDS = (
@@ -132,7 +134,7 @@ class PresmokeCliTests(unittest.TestCase):
         self.assertEqual(specs[0].experiment.provenance.dataset_seed, 20260726)
         self.assertEqual(
             tuple(attempt.variant for attempt in specs[0].experiment.attempts),
-            ("A", "B_empty", "B_claim"),
+            ("A", "B_empty", "B_claim", "B_forced_claim"),
         )
         self.assertTrue(
             all(spec.execution is None or not spec.execution.require_eligible_claim for spec in specs)
@@ -179,6 +181,31 @@ class PresmokeCliTests(unittest.TestCase):
 
             self.assertEqual(staged_pier.read_text(encoding="utf-8"), before)
             self.assertFalse(staged_pier.stat().st_mode & 0o222)
+
+    def test_resume_reuses_frozen_runtime_and_relocates_pending_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(write_fixture(Path(directory)))
+            original_runtime = stage_python_runtime(config)
+            resumed_runtime = stage_python_runtime(config, allow_existing=True)
+            resume_root = config.output_dir / "resumes" / "resume-001"
+            with patch("acn_deepswe.presmoke_cli.verify_checkout_revision"):
+                specs, _ = build_task_specs(
+                    config,
+                    "https://upstream.invalid",
+                    frozen_runtime=resumed_runtime,
+                    selected_task_ids={TASK_IDS[1]},
+                    attempt_output_root=resume_root,
+                )
+
+        self.assertEqual(resumed_runtime.acn_package_tree_hash, original_runtime.acn_package_tree_hash)
+        self.assertEqual(tuple(spec.task_id for spec in specs), (TASK_IDS[1],))
+        self.assertTrue(
+            all(
+                Path(attempt.output_path).is_relative_to(resume_root / "attempts")
+                for attempt in specs[0].experiment.attempts
+            )
+        )
+        self.assertTrue(specs[0].manifest_path.is_relative_to(resume_root / "tasks"))
 
     def test_pier_executable_binding_requires_checkout_source_install(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -306,6 +333,21 @@ class PresmokeCliTests(unittest.TestCase):
         self.assertNotEqual(_effective_config_hash(config), _effective_config_hash(changed))
         changed_effort = replace(config, reasoning_effort="high")
         self.assertNotEqual(_effective_config_hash(config), _effective_config_hash(changed_effort))
+        changed_progress = replace(
+            config, progress={"poll_secs": 15, "stall_after_secs": 600}
+        )
+        self.assertNotEqual(_effective_config_hash(config), _effective_config_hash(changed_progress))
+
+    def test_progress_defaults_are_loaded_and_stall_threshold_is_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            config = load_config(config_path)
+            self.assertEqual(config.progress, {"poll_secs": 30, "stall_after_secs": 600})
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw["progress"] = {"poll_secs": 60, "stall_after_secs": 30}
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(PresmokeCliError, "stall_after_secs"):
+                load_config(config_path)
 
     def test_rejects_removed_root_tool_loop_budget(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -363,6 +405,39 @@ class PresmokeCliTests(unittest.TestCase):
         specs = runner.call_args.args[0]
         self.assertEqual(tuple(spec.task_id for spec in specs), TASK_IDS)
         self.assertEqual(fake_runner.calls, [True])
+
+    def test_resume_rejects_a_recorded_gate_or_protocol_failure_without_starting_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_fixture(Path(directory))
+            failure = PresmokeTaskResult(
+                TASK_IDS[0], "failed", str(Path(directory) / "failed-manifest.json"), "GATE_FAILED"
+            )
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "ACN_EVAL_UPSTREAM_KEY": "test-key",
+                        "ACN_EVAL_UPSTREAM_BASE_URL": "https://upstream.invalid",
+                    },
+                    clear=True,
+                ),
+                patch(
+                    "acn_deepswe.presmoke_cli.load_terminal_task_results", return_value=(failure,)
+                ),
+                patch("acn_deepswe.presmoke_cli.PresmokeHostRunner") as runner,
+                patch("acn_deepswe.presmoke_cli.verify_acn_revision"),
+                patch("acn_deepswe.presmoke_cli.verify_checkout_revision"),
+                patch("acn_deepswe.presmoke_cli.os.access", return_value=True),
+                patch(
+                    "acn_deepswe.presmoke_cli.subprocess.run",
+                    side_effect=successful_preflight_commands(config.parent),
+                ),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                main(["--config", str(config), "--resume"])
+
+        self.assertNotEqual(raised.exception.code, 0)
+        runner.assert_not_called()
 
     def test_existing_upstream_key_takes_priority_over_stdin_input(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -493,6 +568,22 @@ class PresmokeCliTests(unittest.TestCase):
         self.assertNotEqual(raised.exception.code, 0)
         runner.assert_not_called()
 
+    def test_preflight_pulls_each_missing_task_image_once_before_freezing_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(write_fixture(Path(directory)))
+            missing = completed(["docker", "image", "inspect"], returncode=1)
+            pulled = completed(["docker", "pull"])
+            digest = completed(["docker", "image", "inspect"], stdout="sha256:" + "d" * 64)
+            with patch(
+                "acn_deepswe.presmoke_cli.subprocess.run", side_effect=[missing, pulled, digest]
+            ) as run:
+                _ensure_frozen_task_images_available(config)
+
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(
+            run.call_args_list[1].args[0], ["docker", "pull", "registry.example/task:1"]
+        )
+
 
 class _FakeRunner:
     def __init__(self) -> None:
@@ -550,7 +641,7 @@ def write_fixture(root: Path, *, output_dir: str | None = None) -> Path:
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     attempts = []
     for task_id in TASK_IDS:
-        for variant in ("A", "B_empty", "B_claim"):
+        for variant in ("A", "B_empty", "B_claim", "B_forced_claim"):
             base = root / "attempts" / f"{task_id}-{variant}"
             attempts.append(
                 {
@@ -596,6 +687,7 @@ def write_fixture(root: Path, *, output_dir: str | None = None) -> Path:
         },
         "timeouts": {"agent_seconds": 60, "deadline_reserve_seconds": 30},
         "llm_retry": {"retry_count": 3, "retry_base_delay_ms": 1000, "retry_max_delay_ms": 30000},
+        "progress": {"poll_secs": 30, "stall_after_secs": 600},
     }
     path = root / "config.json"
     path.write_text(json.dumps(config), encoding="utf-8")
@@ -657,7 +749,7 @@ def successful_preflight_commands(root: Path) -> list[object]:
                 ],
                 stdout="sha256:" + "d" * 64,
             )
-            for _ in TASK_IDS
+            for _ in range(len(TASK_IDS) + 1)
         ],
     ]
 
@@ -678,7 +770,7 @@ def insufficient_resource_commands(root: Path) -> list[object]:
     ]
 
 
-def completed(command: list[str], *, stdout: str = "") -> object:
+def completed(command: list[str], *, stdout: str = "", returncode: int = 0) -> object:
     from subprocess import CompletedProcess
 
-    return CompletedProcess(command, 0, stdout=stdout, stderr="")
+    return CompletedProcess(command, returncode, stdout=stdout, stderr="")

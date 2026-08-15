@@ -1,6 +1,6 @@
-"""单题三臂链路验证入口：复用 pre-smoke 的全部冻结校验，只执行其中一题。
+"""单题四臂链路验证入口：复用 pre-smoke 的全部冻结校验，只执行其中一题。
 
-用途是在拉到五题规模之前，确认 A → freeze → B_empty/B_claim 的证据链闭合，
+用途是在拉到五题规模之前，确认 A → freeze → B_empty/B_claim/B_forced_claim 的证据链闭合，
 而不是产出 pass rate。任务必须来自冻结 manifest，配置字段与 pre-smoke 完全一致。
 """
 
@@ -28,7 +28,7 @@ from .presmoke_cli import (
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="acn-deepswe-single-task",
-        description="按冻结 manifest 执行单个 task 的三臂链路验证。",
+        description="按冻结 manifest 执行单个 task 的四臂链路验证。",
     )
     parser.add_argument(
         "--config", type=Path, required=True, help="绝对路径 JSON 配置（不含 credential）"

@@ -38,16 +38,16 @@ class DatasetAndPlanTests(unittest.TestCase):
         self.assertEqual(manifest.task_ids, again.task_ids)
         self.assertEqual(len(manifest.task_ids), 5)
         self.assertEqual(stored_algorithm, "random.sample_without_replacement_v1")
-        self.assertEqual(len(plan.attempts), 15)
-        for offset in range(0, 15, 3):
-            variants = [attempt.variant for attempt in plan.attempts[offset : offset + 3]]
+        self.assertEqual(len(plan.attempts), 20)
+        for offset in range(0, 20, 4):
+            variants = [attempt.variant for attempt in plan.attempts[offset : offset + 4]]
             self.assertEqual(variants[0], "A")
-            self.assertEqual(set(variants[1:]), {"B_empty", "B_claim"})
+            self.assertEqual(set(variants[1:]), {"B_empty", "B_claim", "B_forced_claim"})
         output_paths = [attempt.output_path for attempt in plan.attempts]
         self.assertEqual(len(output_paths), len(set(output_paths)))
         self.assertEqual(
             {attempt.variant for attempt in plan.attempts if attempt.variant != "A"},
-            {"B_empty", "B_claim"},
+            {"B_empty", "B_claim", "B_forced_claim"},
         )
 
     def test_frozen_manifest_rejects_unknown_schema_or_algorithm(self) -> None:
@@ -150,7 +150,7 @@ class DatasetAndPlanTests(unittest.TestCase):
                 self.assertEqual(
                     raw["task_directory_hash_algorithm"], TASK_DIRECTORY_HASH_ALGORITHM
                 )
-                self.assertEqual(len(plan.attempts), len(manifest.task_ids) * 3)
+                self.assertEqual(len(plan.attempts), len(manifest.task_ids) * 4)
 
 
 def _commit_checkout(checkout: Path) -> None:

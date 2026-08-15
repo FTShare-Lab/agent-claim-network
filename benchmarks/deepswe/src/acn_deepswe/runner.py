@@ -107,10 +107,12 @@ def build_task1_dry_run(experiment: ExperimentManifest) -> Task1DryRunPlan:
         if (
             not variants
             or variants[0] != "A"
-            or set(variants[1:]) != {"B_empty", "B_claim"}
-            or len(variants) != 3
+            or set(variants[1:]) != {"B_empty", "B_claim", "B_forced_claim"}
+            or len(variants) != 4
         ):
-            raise AttemptDirectoryError(f"task {task_id} 必须先 A，且 B_empty/B_claim 各一次")
+            raise AttemptDirectoryError(
+                f"task {task_id} 必须先 A，且 B_empty/B_claim/B_forced_claim 各一次"
+            )
         steps.extend(Task1DryRunStep(item.attempt_id, item.variant, 1, False) for item in group)
     return Task1DryRunPlan(experiment.experiment_id, tuple(steps))
 

@@ -1882,6 +1882,14 @@ impl AgentTurnLoop {
                     messages: committed,
                 });
             }
+            if self.tools.evaluation_submission_enabled()
+                && tool_uses
+                    .iter()
+                    .any(|tool_use| tool_use.name == "submit_task")
+                && (tool_uses.len() != 1 || tool_uses[0].name != "submit_task")
+            {
+                anyhow::bail!("evaluation submit_task 必须是 assistant 响应中的唯一工具调用");
+            }
             if let Some(max_turns) = self.max_tool_loop_turns {
                 if turn_idx.saturating_add(1) == max_turns {
                     anyhow::bail!("run_session_turn 达到最大 tool 循环轮数: {max_turns}");
@@ -1902,6 +1910,15 @@ impl AgentTurnLoop {
             else {
                 return Err(SessionTurnInterrupted.into());
             };
+
+            // `submit_task` 是评测专用的显式终止协议。它成功执行后不能再向 provider
+            // 发送 tool result 或发起下一轮请求；否则模型可能在提交后继续改动，导致
+            // verifier 看到的工作区与“提交”语义不一致。
+            if self.tools.evaluation_submission_requested() {
+                return Ok(SessionTurn {
+                    messages: committed,
+                });
+            }
 
             let mut tool_results = Vec::with_capacity(tool_uses.len());
             let mut canonical_tool_results = Vec::with_capacity(tool_uses.len());
@@ -3596,7 +3613,9 @@ mod tests {
     };
     use crate::attachment::AttachmentLimits;
     use crate::config::ToolConfig;
-    use crate::tool::{ToolDispatchContext, ToolError, ToolProgressUpdate, ToolRegistry};
+    use crate::tool::{
+        EvaluationSubmission, ToolDispatchContext, ToolError, ToolProgressUpdate, ToolRegistry,
+    };
 
     #[test]
     fn resource_and_watchdog_failures_expose_machine_readable_codes() {
@@ -3616,7 +3635,6 @@ mod tests {
         );
         assert_eq!(watchdog_payload["code"], "code_run_internal_timeout");
     }
-
     struct FakeProvider {
         responses: Mutex<VecDeque<ProviderResponse>>,
         requests: Mutex<Vec<ProviderRequest>>,
@@ -9910,6 +9928,66 @@ mod tests {
         assert_eq!(result["ok"], false);
         assert_eq!(result["outcome"]["kind"], "dispatch_failure");
         assert!(result["error"].as_str().unwrap().contains("工具不存在"));
+    }
+
+    #[tokio::test]
+    async fn evaluation_submit_task_ends_the_turn_without_another_provider_request() {
+        let provider = Arc::new(FakeProvider::new(vec![response(
+            vec![tool_use("toolu_submit", "submit_task", json!({}))],
+            ProviderStop::ToolUse,
+        )]));
+        let submission = EvaluationSubmission::new();
+        let tools = Arc::new(
+            ToolRegistry::new(&ToolConfig::default())
+                .unwrap()
+                .for_evaluation("ACN_TEST_EVALUATION_SECRET".into())
+                .with_evaluation_submission(submission.clone()),
+        );
+        let turn_loop = tool_loop_with_tools(provider.clone(), tools);
+
+        let turn = turn_loop
+            .run_session_turn(request(), &mut |_| {})
+            .await
+            .unwrap();
+
+        assert!(submission.was_submitted());
+        assert_eq!(provider.requests.lock().await.len(), 1);
+        // 用户请求 + 发出 submit_task 的 assistant message；提交 tool result 不会被回灌。
+        // runtime context snapshot 属于持久化元数据，不计入对话消息。
+        assert_eq!(non_context_messages(&turn).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn evaluation_submit_task_rejects_mixed_tool_batches_before_dispatch() {
+        let provider = Arc::new(FakeProvider::new(vec![response(
+            vec![
+                tool_use("toolu_submit", "submit_task", json!({})),
+                tool_use(
+                    "toolu_note",
+                    "working_note",
+                    json!({"action": "add", "note": "late"}),
+                ),
+            ],
+            ProviderStop::ToolUse,
+        )]));
+        let submission = EvaluationSubmission::new();
+        let tools = Arc::new(
+            ToolRegistry::new(&ToolConfig::default())
+                .unwrap()
+                .for_evaluation("ACN_TEST_EVALUATION_SECRET".into())
+                .with_evaluation_submission(submission.clone()),
+        );
+        let turn_loop = tool_loop_with_tools(provider, tools);
+
+        let error = turn_loop
+            .run_session_turn(request(), &mut |_| {})
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("submit_task 必须是 assistant 响应中的唯一工具调用"));
+        assert!(!submission.was_submitted());
     }
 
     #[tokio::test]

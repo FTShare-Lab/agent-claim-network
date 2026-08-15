@@ -13,6 +13,7 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
 from .assets import frozen_coding_benchmark_skill
 
@@ -39,6 +40,8 @@ CONTAINER_ACN_CONFIG = f"{CONTAINER_ROOT}/acn.toml"
 CONTAINER_CLAIM_BUNDLE = f"{CONTAINER_ROOT}/claims.json"
 CONTAINER_MODEL_KEY_FILE = f"{CONTAINER_ROOT}/model-key"
 CONTAINER_SKILL_PATH = "/logs/agent/runtime/skills/coding-benchmark"
+CONTAINER_MODEL_EGRESS_ENV = "ACN_EVAL_MODEL_EGRESS"
+CONTAINER_MODEL_PROXY_ENV = "ACN_EVAL_CONTAINER_MODEL_PROXY"
 
 
 @dataclass(frozen=True)
@@ -92,18 +95,20 @@ class AcnPierAdapter:
             if not artifact.is_absolute() or not artifact.exists():
                 raise ValueError(f"预构建上传物必须存在且为绝对路径: {artifact}")
         variant = self._validate_container_attempt_config(attempt_config)
-        if variant == "B_claim" and (not claim_bundle.is_absolute() or not claim_bundle.exists()):
-            raise ValueError("B_claim 的冻结 claim bundle 必须存在且为绝对路径")
+        if variant in {"B_claim", "B_forced_claim"} and (
+            not claim_bundle.is_absolute() or not claim_bundle.exists()
+        ):
+            raise ValueError(f"{variant} 的冻结 claim bundle 必须存在且为绝对路径")
         frozen_asset = frozen_coding_benchmark_skill()
         if frozen_skill.resolve() != frozen_asset.source_path.resolve():
-            raise ValueError("三臂只能注入冻结的 coding-benchmark skill")
+            raise ValueError("所有评测臂只能注入冻结的 coding-benchmark skill")
         uploads = [
             Upload(acn_eval, f"{CONTAINER_ROOT}/acn_eval"),
             Upload(attempt_config, CONTAINER_ATTEMPT_CONFIG),
             Upload(acn_config, CONTAINER_ACN_CONFIG),
             Upload(frozen_skill, CONTAINER_SKILL_PATH),
         ]
-        if variant == "B_claim":
+        if variant in {"B_claim", "B_forced_claim"}:
             uploads.append(Upload(claim_bundle, CONTAINER_CLAIM_BUNDLE))
         return SetupPlan(tuple(uploads), frozen_asset.content_hash)
 
@@ -122,6 +127,84 @@ class AcnPierAdapter:
         environment.pop(self.host_model_key_env, None)
         environment.pop(self.container_model_key_env, None)
         return environment
+
+    def direct_model_proxy_env(self) -> dict[str, str]:
+        """返回供容器进程直连模型的可选代理覆盖。
+
+        仅当冻结 attempt TOML 选择 ``model_egress_mode = "direct"`` 时调用。
+        宿主若只能经本地代理访问模型，可提供容器可达的 HTTP 代理地址；这类运行
+        会被 Formal Gate 标为非正式，不能用于正式得分。
+        """
+        proxy_url = os.environ.get(CONTAINER_MODEL_PROXY_ENV)
+        if proxy_url is None or not proxy_url.strip():
+            return {}
+        proxy_url = proxy_url.strip()
+        parsed = urlparse(proxy_url)
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise ValueError(
+                f"{CONTAINER_MODEL_PROXY_ENV} 必须是无凭据的 http://host:port"
+            ) from error
+        if (
+            parsed.scheme != "http"
+            or not parsed.hostname
+            or port is None
+            or port < 1
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in ("", "/")
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                f"{CONTAINER_MODEL_PROXY_ENV} 必须是无凭据的 http://host:port"
+            )
+        return {
+            "HTTP_PROXY": proxy_url,
+            "HTTPS_PROXY": proxy_url,
+            "http_proxy": proxy_url,
+            "https_proxy": proxy_url,
+        }
+
+    def model_egress_env(self, attempt_config: Path) -> dict[str, str]:
+        """只按冻结 attempt TOML 决定模型出口，拒绝环境变量隐式覆盖。"""
+        if os.environ.get(CONTAINER_MODEL_EGRESS_ENV) is not None:
+            raise ValueError(
+                f"{CONTAINER_MODEL_EGRESS_ENV} 不允许覆盖冻结的 model_egress_mode"
+            )
+        mode = self._model_egress_mode(attempt_config)
+        if mode == "pier":
+            if os.environ.get(CONTAINER_MODEL_PROXY_ENV):
+                raise ValueError(
+                    f"{CONTAINER_MODEL_PROXY_ENV} 只能与 model_egress_mode=direct 一起使用"
+                )
+            return {}
+        direct_proxy = self.direct_model_proxy_env()
+        if direct_proxy:
+            return direct_proxy
+        # 覆盖 Pier 注入的 proxy。NO_PROXY=* 同时覆盖经由 Python、Rust HTTP client
+        # 的实现差异；该环境只传给运行 ACN 的第一个容器进程。
+        return {
+            "HTTP_PROXY": "",
+            "HTTPS_PROXY": "",
+            "http_proxy": "",
+            "https_proxy": "",
+            "NO_PROXY": "*",
+            "no_proxy": "*",
+        }
+
+    @staticmethod
+    def _model_egress_mode(path: Path) -> str:
+        try:
+            raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            raise ValueError(f"无法解析 attempt config: {path}") from error
+        mode = raw.get("model_egress_mode")
+        if mode not in {"pier", "direct"}:
+            raise ValueError("attempt config model_egress_mode 必须为 pier 或 direct")
+        return mode
 
     def build_run_command(self) -> str:
         return (
@@ -164,13 +247,16 @@ class AcnPierAdapter:
             if raw.get(field) != expected:
                 raise ValueError(f"attempt config {field} 必须为 {expected}")
         variant = raw.get("variant")
+        model_egress_mode = raw.get("model_egress_mode")
+        if model_egress_mode not in {"pier", "direct"}:
+            raise ValueError("attempt config model_egress_mode 必须为 pier 或 direct")
         bundle = raw.get("claim_bundle")
-        if variant == "B_claim" and bundle != CONTAINER_CLAIM_BUNDLE:
-            raise ValueError(f"B_claim 的 claim_bundle 必须为 {CONTAINER_CLAIM_BUNDLE}")
+        if variant in {"B_claim", "B_forced_claim"} and bundle != CONTAINER_CLAIM_BUNDLE:
+            raise ValueError(f"{variant} 的 claim_bundle 必须为 {CONTAINER_CLAIM_BUNDLE}")
         if variant in {"A", "B_empty"} and bundle is not None:
             raise ValueError(f"{variant} 不得设置 claim_bundle")
-        if variant not in {"A", "B_empty", "B_claim"}:
-            raise ValueError("attempt config variant 必须为 A/B_empty/B_claim")
+        if variant not in {"A", "B_empty", "B_claim", "B_forced_claim"}:
+            raise ValueError("attempt config variant 必须为 A/B_empty/B_claim/B_forced_claim")
         return variant
 
 
@@ -257,15 +343,20 @@ class AcnEvalPierAgent(BaseAgent):
         self, instruction: str, environment: BaseEnvironment, context: AgentContext
     ) -> None:
         del instruction  # attempt TOML 是唯一任务输入，避免把任务文本另行放入 argv。
+        model_egress_env = self.adapter.model_egress_env(self.attempt_config) or None
         result = await environment.exec(
             self.adapter.build_run_command(),
             cwd="/app",
-            env=self.adapter.container_process_env(environment.agent_process_env(None)),
+            env=self.adapter.container_process_env(
+                environment.agent_process_env(model_egress_env)
+            ),
         )
         await environment.exec(
             self.adapter.build_commit_command("attempt"),
             cwd="/app",
-            env=self.adapter.container_post_run_env(environment.agent_process_env(None)),
+            env=self.adapter.container_post_run_env(
+                environment.agent_process_env(None)
+            ),
         )
         context.metadata = {"acn_eval_exit_code": result.return_code}
 

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -40,6 +41,7 @@ mcp_servers = []
 class NetworkNormalizationTests(unittest.TestCase):
     def test_offline_task_gets_allow_internet_false_on_both_environments(self) -> None:
         rendered = normalize_task_toml(OFFLINE_TASK)
+        parsed = tomllib.loads(rendered)
 
         self.assertIn("[environment]\n", rendered)
         self.assertEqual(rendered.count("allow_internet = false"), 2)
@@ -48,6 +50,7 @@ class NetworkNormalizationTests(unittest.TestCase):
         verifier_block = rendered.split("[verifier.environment]\n", 1)[1].split("\n[", 1)[0]
         self.assertIn("allow_internet = false", environment_block)
         self.assertIn("allow_internet = false", verifier_block)
+        self.assertEqual(parsed["environment"]["mcp_servers"], [])
 
     def test_any_non_offline_network_mode_fails_closed(self) -> None:
         for original, replacement in (
@@ -65,6 +68,27 @@ class NetworkNormalizationTests(unittest.TestCase):
             normalize_task_toml('[agent]\nnetwork_mode = "no-network"\n')
         with self.assertRaises(NetworkNormalizationError):
             normalize_task_toml("not = [toml")
+
+    def test_verifier_collect_array_table_survives_normalization(self) -> None:
+        source = OFFLINE_TASK + """
+[[verifier.collect]]
+command = "mkdir -p /logs/artifacts && git diff > /logs/artifacts/model.patch"
+timeout_sec = 300.0
+"""
+
+        rendered = normalize_task_toml(source)
+        parsed = tomllib.loads(rendered)
+
+        self.assertIn("[[verifier.collect]]", rendered)
+        self.assertEqual(
+            parsed["verifier"]["collect"],
+            [
+                {
+                    "command": "mkdir -p /logs/artifacts && git diff > /logs/artifacts/model.patch",
+                    "timeout_sec": 300.0,
+                }
+            ],
+        )
 
     @unittest.skipUnless(
         FROZEN_TASKS_DIR

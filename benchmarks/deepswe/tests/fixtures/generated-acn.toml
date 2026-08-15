@@ -39,7 +39,7 @@ retry_max_delay_ms = 30000
 id_mint_max_retries = 3
 notify_on_finalize_completion = false
 [agent.session.compaction]
-auto_compact_ctx_ratio = 0.25
+auto_compact_ctx_ratio = 0.8
 [agent.tool]
 file_read_max_chars = 20000
 file_diff_max_changed_lines = 20

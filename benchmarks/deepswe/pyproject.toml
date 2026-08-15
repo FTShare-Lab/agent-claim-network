@@ -15,6 +15,7 @@ pier = ["datacurve-pier==0.3.0"]
 [project.scripts]
 acn-deepswe = "acn_deepswe.cli:main"
 acn-deepswe-presmoke = "acn_deepswe.presmoke_cli:main"
+acn-deepswe-auto = "acn_deepswe.auto_run:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

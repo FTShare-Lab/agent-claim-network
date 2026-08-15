@@ -92,6 +92,7 @@ class RustEvaluationResult:
     router_evidence_incomplete: bool
     usage: RustUsage
     event_ledger_path: str
+    failure_kind: str | None
 
 
 def read_rust_event_ledger(path: Path) -> tuple[EventLedger, ...]:
@@ -135,6 +136,7 @@ def read_rust_result(path: Path) -> RustEvaluationResult:
             router_evidence_incomplete=_boolean(raw, "router_evidence_incomplete"),
             usage=_usage(raw),
             event_ledger_path=_absolute(_string(raw, "event_ledger_path")),
+            failure_kind=_failure_kind(raw),
         )
     except ValueError as error:
         raise RustContractError(f"Rust result 无效: {error}") from error
@@ -195,6 +197,15 @@ def _boolean(data: Mapping[str, object], field: str) -> bool:
     value = data.get(field)
     if not isinstance(value, bool):
         raise RustContractError(f"{field} 必须是布尔值")
+    return value
+
+
+def _failure_kind(data: Mapping[str, object]) -> str | None:
+    value = data.get("failure_kind")
+    if value is None:
+        return None
+    if value != "upstream_concurrency_exhausted":
+        raise RustContractError("failure_kind 不支持")
     return value
 
 
