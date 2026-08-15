@@ -169,6 +169,20 @@ impl OpenAiCompatibleResponsesProviderAdapter {
 
         for round in 0..=MAX_CONTINUATION_TURNS {
             if recovery_interrupt.is_some_and(ProviderRecoveryInterrupt::is_cancelled) {
+                if last_terminal == ResponsesTerminal::MaxOutputTokens
+                    && last_function_calls.is_empty()
+                {
+                    discard_pending_responses_continuation(
+                        &mut input,
+                        &mut replay_items,
+                        &mut provider_messages,
+                    )?;
+                    recovery_interrupt
+                        .expect("cancelled recovery interrupt must be present")
+                        .preserve_successful_response();
+                    last_terminal = ResponsesTerminal::Completed;
+                    break;
+                }
                 return Err(ResponsesError::RecoveryInterrupted.into());
             }
             observer
@@ -178,6 +192,26 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                     reason: format!("{error:#}"),
                 })?;
             if recovery_interrupt.is_some_and(ProviderRecoveryInterrupt::is_cancelled) {
+                if last_terminal == ResponsesTerminal::MaxOutputTokens
+                    && last_function_calls.is_empty()
+                {
+                    observer
+                        .provider_request_abandoned_before_send(&provider_messages)
+                        .await
+                        .map_err(|error| OpenAiCompatibleResponsesError::RequestPreparation {
+                            reason: format!("{error:#}"),
+                        })?;
+                    discard_pending_responses_continuation(
+                        &mut input,
+                        &mut replay_items,
+                        &mut provider_messages,
+                    )?;
+                    recovery_interrupt
+                        .expect("cancelled recovery interrupt must be present")
+                        .preserve_successful_response();
+                    last_terminal = ResponsesTerminal::Completed;
+                    break;
+                }
                 return Err(ResponsesError::RecoveryInterrupted.into());
             }
             let request = self.request_for(
@@ -187,37 +221,79 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                 max_tokens,
                 stream,
             );
-            let (response, transport) = if stream {
-                let mut responses_emit = |event| match event {
-                    ResponsesStreamEvent::TextDelta { text } => {
-                        emit(ProviderEvent::AssistantTextDelta { text });
+            let mut request_start_recorded = false;
+            let response_result = {
+                let mut request_started = || {
+                    if request_start_recorded {
+                        return Ok(());
                     }
+                    observer
+                        .provider_request_started(&provider_messages)
+                        .map_err(|error| ResponsesError::RequestPreparation {
+                            reason: format!("{error:#}"),
+                        })?;
+                    request_start_recorded = true;
+                    Ok(())
                 };
-                self.client
-                    .send_with_retry_count_for_runtime_scope_and_transport(
-                        &request,
-                        retry_count,
-                        runtime_chain_id,
-                        runtime_fallback_scope,
-                        retry_after_partial,
-                        recovery_interrupt,
-                        &mut responses_emit,
-                    )
-                    .await?
-            } else {
-                let mut noop = |_event: ResponsesStreamEvent| {};
-                (
+                if stream {
+                    let mut responses_emit = |event| match event {
+                        ResponsesStreamEvent::TextDelta { text } => {
+                            emit(ProviderEvent::AssistantTextDelta { text });
+                        }
+                    };
                     self.client
-                        .send_with_retry_count_for_runtime_chain(
+                        .send_with_retry_count_for_runtime_scope_and_transport_and_start_hook(
+                            &request,
+                            retry_count,
+                            runtime_chain_id,
+                            runtime_fallback_scope,
+                            retry_after_partial,
+                            recovery_interrupt,
+                            &mut responses_emit,
+                            &mut request_started,
+                        )
+                        .await
+                } else {
+                    let mut noop = |_event: ResponsesStreamEvent| {};
+                    self.client
+                        .send_with_retry_count_for_runtime_scope_and_transport_and_start_hook(
                             &request,
                             retry_count,
                             None,
+                            None,
+                            false,
                             recovery_interrupt,
                             &mut noop,
+                            &mut request_started,
                         )
-                        .await?,
-                    ProviderTransport::ResponsesNonStreaming,
-                )
+                        .await
+                }
+            };
+            let (response, transport) = match response_result {
+                Ok(response) => response,
+                Err(ResponsesError::RecoveryInterrupted)
+                    if !request_start_recorded
+                        && last_terminal == ResponsesTerminal::MaxOutputTokens
+                        && last_function_calls.is_empty() =>
+                {
+                    observer
+                        .provider_request_abandoned_before_send(&provider_messages)
+                        .await
+                        .map_err(|error| OpenAiCompatibleResponsesError::RequestPreparation {
+                            reason: format!("{error:#}"),
+                        })?;
+                    discard_pending_responses_continuation(
+                        &mut input,
+                        &mut replay_items,
+                        &mut provider_messages,
+                    )?;
+                    recovery_interrupt
+                        .expect("RecoveryInterrupted requires a recovery interrupt")
+                        .preserve_successful_response();
+                    last_terminal = ResponsesTerminal::Completed;
+                    break;
+                }
+                Err(error) => return Err(error.into()),
             };
             last_transport = transport;
             if let Some(usage) = response
@@ -238,7 +314,16 @@ impl OpenAiCompatibleResponsesProviderAdapter {
             if response.terminal != ResponsesTerminal::MaxOutputTokens {
                 break;
             }
-            if !last_function_calls.is_empty() || round == MAX_CONTINUATION_TURNS {
+            if !last_function_calls.is_empty() {
+                break;
+            }
+            if let Some(interrupt) = recovery_interrupt.filter(|interrupt| interrupt.is_cancelled())
+            {
+                interrupt.preserve_successful_response();
+                last_terminal = ResponsesTerminal::Completed;
+                break;
+            }
+            if round == MAX_CONTINUATION_TURNS {
                 break;
             }
             let continuation = user_text_item(CONTINUATION_TRIGGER);
@@ -268,6 +353,29 @@ impl OpenAiCompatibleResponsesProviderAdapter {
             transport: last_transport,
         })
     }
+}
+
+fn discard_pending_responses_continuation(
+    input: &mut Vec<Value>,
+    replay_items: &mut Vec<Value>,
+    provider_messages: &mut Vec<SessionTurnMessage>,
+) -> Result<(), OpenAiCompatibleResponsesError> {
+    input
+        .pop()
+        .ok_or_else(|| OpenAiCompatibleResponsesError::OutputShape {
+            reason: "safe steer 收束时缺少未发送的 Responses continuation".into(),
+        })?;
+    replay_items
+        .pop()
+        .ok_or_else(|| OpenAiCompatibleResponsesError::OutputShape {
+            reason: "safe steer 收束时缺少未发送的 Responses replay item".into(),
+        })?;
+    provider_messages
+        .pop()
+        .ok_or_else(|| OpenAiCompatibleResponsesError::OutputShape {
+            reason: "safe steer 收束时缺少未发送的 Responses neutral replay".into(),
+        })?;
+    Ok(())
 }
 
 #[async_trait]
@@ -406,7 +514,8 @@ fn responses_adapter_terminal_failure(error: &OpenAiCompatibleResponsesError) ->
             ResponsesError::Auth(_)
             | ResponsesError::InvalidEndpoint(_)
             | ResponsesError::Failed { .. }
-            | ResponsesError::Incomplete { .. },
+            | ResponsesError::Incomplete { .. }
+            | ResponsesError::RequestPreparation { .. },
         )
         | OpenAiCompatibleResponsesError::MediaRejected { .. }
         | OpenAiCompatibleResponsesError::RequestPreparation { .. } => true,
@@ -784,6 +893,19 @@ mod tests {
         requests: Vec<Vec<SessionTurnMessage>>,
     }
 
+    struct CancellingStartedObserver {
+        interrupt: ProviderRecoveryInterrupt,
+        requests: Vec<Vec<SessionTurnMessage>>,
+        started: usize,
+    }
+
+    struct CancellingContinuationPreflightObserver {
+        interrupt: ProviderRecoveryInterrupt,
+        requests: Vec<Vec<SessionTurnMessage>>,
+        started: usize,
+        abandoned: usize,
+    }
+
     #[derive(Default)]
     struct FailingInternalRequestPreflight {
         ready_calls: usize,
@@ -820,6 +942,57 @@ mod tests {
             messages: &[SessionTurnMessage],
         ) -> anyhow::Result<()> {
             self.requests.push(messages.to_vec());
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ProviderRequestObserver for CancellingStartedObserver {
+        async fn before_provider_request(
+            &mut self,
+            messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            self.requests.push(messages.to_vec());
+            Ok(())
+        }
+
+        fn provider_request_started(
+            &mut self,
+            _messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            self.started += 1;
+            self.interrupt.cancel();
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ProviderRequestObserver for CancellingContinuationPreflightObserver {
+        async fn before_provider_request(
+            &mut self,
+            messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            self.requests.push(messages.to_vec());
+            if self.requests.len() == 2 {
+                self.interrupt.cancel();
+            }
+            Ok(())
+        }
+
+        fn provider_request_started(
+            &mut self,
+            _messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            self.started += 1;
+            Ok(())
+        }
+
+        async fn provider_request_abandoned_before_send(
+            &mut self,
+            messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            assert_eq!(Some(messages), self.requests.last().map(Vec::as_slice));
+            self.abandoned += 1;
             Ok(())
         }
     }
@@ -1343,6 +1516,132 @@ mod tests {
             event,
             ProviderEvent::AssistantMessageCompleted { text } if text == "hello world"
         )));
+    }
+
+    #[tokio::test]
+    async fn safe_steer_after_send_keeps_successful_incomplete_response_without_continuation() {
+        let output = json!({
+            "type":"message","id":"msg_1","role":"assistant","status":"incomplete",
+            "content":[{"type":"output_text","text":"partial-answer"}]
+        });
+        let (endpoint, requests) = spawn_json_sequence(vec![json!({
+            "status":"incomplete",
+            "incomplete_details":{"reason":"max_output_tokens"},
+            "output":[output]
+        })])
+        .await;
+        let adapter = OpenAiCompatibleResponsesProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            Duration::from_secs(5),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let interrupt = ProviderRecoveryInterrupt::new();
+        let mut observer = CancellingStartedObserver {
+            interrupt: interrupt.clone(),
+            requests: Vec::new(),
+            started: 0,
+        };
+
+        let response = adapter
+            .send_with_request_observer(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 32,
+                    stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: Some(interrupt),
+                    retry_count_override: None,
+                },
+                &mut |_| {},
+                &mut observer,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.stop, ProviderStop::Done);
+        assert!(matches!(
+            response.assistant_message.content.as_slice(),
+            [SessionTurnContentBlock::Text { text }] if text == "partial-answer"
+        ));
+        assert_eq!(observer.started, 1);
+        assert_eq!(observer.requests.len(), 1);
+        assert_eq!(requests.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn safe_steer_during_continuation_wal_keeps_responses_partial() {
+        let first_output = json!({
+            "type":"message","id":"msg_1","role":"assistant","status":"incomplete",
+            "content":[{"type":"output_text","text":"partial-answer"}]
+        });
+        let (endpoint, requests) = spawn_json_sequence(vec![json!({
+            "status":"incomplete",
+            "incomplete_details":{"reason":"max_output_tokens"},
+            "output":[first_output.clone()],
+            "usage":{"total_tokens":10}
+        })])
+        .await;
+        let adapter = OpenAiCompatibleResponsesProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            Duration::from_secs(5),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let interrupt = ProviderRecoveryInterrupt::new();
+        let mut observer = CancellingContinuationPreflightObserver {
+            interrupt: interrupt.clone(),
+            requests: Vec::new(),
+            started: 0,
+            abandoned: 0,
+        };
+
+        let response = adapter
+            .send_with_request_observer(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 32,
+                    stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: Some(interrupt.clone()),
+                    retry_count_override: None,
+                },
+                &mut |_| {},
+                &mut observer,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.stop, ProviderStop::Done);
+        assert!(matches!(
+            response.assistant_message.content.as_slice(),
+            [SessionTurnContentBlock::Text { text }] if text == "partial-answer"
+        ));
+        assert!(matches!(
+            response.assistant_message.provider_replay,
+            Some(ProviderReplayState::OpenAiResponses { items, .. }) if items == vec![first_output]
+        ));
+        assert!(interrupt.should_preserve_successful_response());
+        assert_eq!(observer.requests.len(), 2);
+        assert_eq!(observer.started, 1);
+        assert_eq!(observer.abandoned, 1);
+        assert_eq!(requests.await.unwrap().len(), 1);
     }
 
     #[tokio::test]

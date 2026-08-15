@@ -501,6 +501,11 @@ assistant，破坏跨多个普通 turn 的前缀稳定性。方案 B 保留已�
 实现选择 B。该窗口仍只保存一份当前 context-window 投影；成功终态按 D8 提升 cursor，
 失败、取消或 crash 按 D9 对账，不新增第二个恢复事实源。
 
+后续发布将完整窗口从 `session.yaml` 拆到同一 session 目录内的独立原子 JSON WAL。
+`session.yaml` 只保留轻量 compaction/cursor 状态，`/resume` 列表也只持有轻量摘要；旧内嵌窗口只在
+用户实际打开对应 session 时迁移。独立 WAL 缺失或损坏时放弃精确 replay，并从 canonical transcript
+与 compaction summary 重建，以保证会话可以继续。
+
 选择原因：未压缩 session 同样会在 tool loop、失败或取消前向 Provider 送出尚未进入
 canonical transcript 的 user/context/tool suffix。方案 A 会让恢复后的下一请求退回重建表示，
 破坏 D2/D6 对“最后一次实际请求”的不变量。方案 B 使是否曾触发压缩不再决定
@@ -519,6 +524,12 @@ canonical transcript 的 user/context/tool suffix。方案 A 会让恢复后的�
 实现选择 B。相同 HTTP request 的 transport retry 复用同一 snapshot，不重复推进 WAL；
 只有 input/messages 真实追加了 continuation suffix 才写入。observer 写入失败是请求准备失败，
 不得被误判为 streaming 故障而绕过 WAL。
+
+request WAL 完成后，adapter 还必须在真正开始 transport 前确认一次 send-started 边界。若 cancel/steer
+发生在该边界之前，则对应请求可确定从未发送，必须回滚刚准备的 WAL；一旦发送已经开始或 crash 后
+无法判断，则保守保留 WAL。该规则同时适用于首次请求和内部 continuation。
+WebSocket 由 connection actor 先确认已准备发送，再由调用方完成 send-started，actor 获得许可后才
+发送 request frame；actor 已退出或许可前准备失败都不能提前越过该边界。
 
 选择原因：adapter 内部的第二次及后续 continuation 也是 Provider 真实接收的新请求。
 方案 A 在后续请求失败、取消或进程中断时会丢失已发送的 partial/reasoning/trigger，
@@ -742,6 +753,10 @@ projection 逻辑应与 compactor 解耦：
 - continuation observer/WAL 纳入 Provider 总 deadline 的显式准备阶段；WAL 未成功时不发送新请求、
   不从旧 prefix fallback。context-window recovery 使用真实 continuation wire chain 的最早消息作为
   marker，保护整条未完成 replay。
+- Chat、Responses 与 Anthropic 都在 safe steering 后停止尚未开始的 transport retry、退避等待和
+  max-token continuation；当前已经开始的请求仍可自然收束到安全边界。若该请求已成功返回
+  max-token partial，则 adapter、公共 turn loop 与 session commit 屏障共同保留这份成功响应并按
+  正常终态提交，只取消尚未开始的 continuation；后到的显式取消仍然优先。
 - WebSocket 增量传输与同一稳定窗口共享语义：WAL 保存可完整重建的逻辑
   Provider history，而 wire 层可在精确前缀命中时使用 `previous_response_id`
   只发送物理 suffix。response ID、物理 suffix 和 connection lease 不进入 WAL 或 session。

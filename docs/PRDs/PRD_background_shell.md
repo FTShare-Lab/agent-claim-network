@@ -493,6 +493,8 @@ subagent 到达 completed / failed / abandoned、执行 future 被取消，或 p
 - 模型仅看到 `Recently completed` 元数据不算已经读取最终结果，也不能触发 entry 移除。
 - `Recently completed` 的容量和寿命直接复用现有 entry 规则：最终结果成功交付 provider 后移除；尚未确认交付的 entry 受每 owner `64` 个总 entry 上限、最近使用 `8` 个 entry 保护、LRU 淘汰和owner shutdown 约束。因此它有明确容量上限但没有独立时间范围或额外无界历史。
 - `BackgroundProcessCompleted` 产生的最小 completion notification 至少保留到它被包含在一次成功完成的 provider request 中；provider 失败或 turn 在响应前中断时不能视为已投递。若完整 entry在首次成功投递前已因容量压力被淘汰，notification 仍提供 ID、终态、exit code / signal、完成时间和 `final_output_available=false`，但不虚构已丢失的最终输出。
+- main-owned completion 必须先在 turn journal 获得稳定 seq，之后才允许进入 Provider ModelContext；heartbeat 与 request preflight 通过同一线性化边界查重并确认 durable obligation。两个独立 journal seq 游标分别记录“已被一次成功 provider response 接受”和“已被 recap/finalize 消费”。runtime 重启后，尚未越过 provider 游标的新终态会作为新的 ModelContext suffix 投递，不改写既有冻结 Provider 前缀；recap 只消费尚未越过 recap 游标的终态。completion 是已实际启动进程的独立终态，不依赖 originating turn 最终是否 committed；投影只携带有界终态字段，不带回 failed/cancelled turn 的用户输入。旧 session 首次升级时把缺失游标初始化到既有 completion 尾端，不回放升级前历史。
+- TUI 退出时，只要 message cursor 或 completion recap cursor 任一尚未追上，都把 finalize 交给 supervisor；不能因 canonical message 已全部 recap 而在前台执行 completion-only recap。
 - compaction summary 仍负责保留“为什么启动该任务、预期如何使用结果”的会话意图；动态上下文负责提供当前 ID 和状态。两者职责不能互相替代。
 - 最终结果成功交付 provider 后，该终态 entry 无论之后是否发生 compact，都不再重新出现在runtime context。此后它属于历史会话信息：compaction prompt 必须保留仍会影响后续工作的任务目的、最终成功/失败状态、关键输出、生成或修改的文件以及剩余动作；已经失效的 `process_id`除非仍有审计价值，否则不要求继续保留。
 

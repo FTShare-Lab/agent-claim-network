@@ -2304,6 +2304,8 @@ mod tests {
             message_count: 0,
             finalized_at: None,
             recapped_until: 0,
+            provider_background_completion_until_seq: Some(0),
+            recap_background_completion_until_seq: Some(0),
             compaction: None,
         }
     }

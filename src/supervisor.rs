@@ -2693,6 +2693,8 @@ mod tests {
             message_count: 0,
             finalized_at: terminal_at,
             recapped_until: 0,
+            provider_background_completion_until_seq: Some(0),
+            recap_background_completion_until_seq: Some(0),
             compaction: None,
         };
         write_yaml_atomic(&session_paths.session_yaml, &metadata).await?;

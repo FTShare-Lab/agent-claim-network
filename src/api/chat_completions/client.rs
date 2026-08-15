@@ -6,6 +6,7 @@ use rand::Rng;
 
 use crate::api::endpoint::{resolve_llm_endpoint, LlmEndpointKind};
 use crate::api::llm_http::{read_llm_error_body, LlmHttpError, LlmHttpPhase};
+use crate::api::ProviderRecoveryInterrupt;
 
 use super::protocol::{ChatCompletionRequest, ChatCompletionResponse};
 use super::streaming::{drain_sse_frames, sse_frame_data, ChatStreamAccumulator};
@@ -31,6 +32,10 @@ pub enum ChatCompletionsError {
     OutputShape { reason: String, raw: String },
     #[error("Chat Completions streaming 响应损坏或未完整结束: {reason}")]
     StreamFailure { reason: String, raw: String },
+    #[error("Chat Completions recovery interrupted")]
+    RecoveryInterrupted,
+    #[error("Chat Completions request preparation failed: {reason}")]
+    RequestPreparation { reason: String },
 }
 
 pub struct ChatCompletionsClient {
@@ -113,11 +118,62 @@ impl ChatCompletionsClient {
         retry_after_partial: bool,
         emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
     ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
+        self.send_with_retry_count_and_mode_and_interrupt(
+            request,
+            retry_count,
+            retry_after_partial,
+            None,
+            emit,
+        )
+        .await
+    }
+
+    pub(crate) async fn send_with_retry_count_and_mode_and_interrupt(
+        &self,
+        request: &ChatCompletionRequest,
+        retry_count: u32,
+        retry_after_partial: bool,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+        emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
+    ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
+        let mut noop = || Ok(());
+        self.send_with_retry_count_and_mode_and_interrupt_and_start_hook(
+            request,
+            retry_count,
+            retry_after_partial,
+            recovery_interrupt,
+            emit,
+            &mut noop,
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "请求发送边界需同时携带 retry、恢复中断与 WAL start hook"
+    )]
+    pub(crate) async fn send_with_retry_count_and_mode_and_interrupt_and_start_hook(
+        &self,
+        request: &ChatCompletionRequest,
+        retry_count: u32,
+        retry_after_partial: bool,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+        emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
+        request_started: &mut (dyn FnMut() -> Result<(), ChatCompletionsError> + Send),
+    ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
         if request.stream {
-            self.send_streaming_with_retry(request, retry_count, retry_after_partial, emit)
-                .await
+            self.send_streaming_with_retry(
+                request,
+                retry_count,
+                retry_after_partial,
+                recovery_interrupt,
+                emit,
+                request_started,
+            )
+            .await
         } else {
-            self.send_json_with_retry(request, retry_count).await
+            self.send_json_with_retry(request, retry_count, recovery_interrupt, request_started)
+                .await
         }
     }
 
@@ -125,10 +181,13 @@ impl ChatCompletionsClient {
         &self,
         request: &ChatCompletionRequest,
         retry_count: u32,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+        request_started: &mut (dyn FnMut() -> Result<(), ChatCompletionsError> + Send),
     ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
         let mut last_retryable = None;
         for attempt in 0..=retry_count {
-            match self.send_json_once(request).await {
+            ensure_recovery_active(recovery_interrupt)?;
+            match self.send_json_once(request, request_started).await {
                 Ok(value) => return Ok(value),
                 Err(e) if is_retryable(&e) && attempt < retry_count => {
                     let backoff =
@@ -142,7 +201,7 @@ impl ChatCompletionsClient {
                         e
                     );
                     last_retryable = Some(e);
-                    tokio::time::sleep(backoff).await;
+                    wait_for_backoff(backoff, recovery_interrupt).await?;
                 }
                 Err(e) => return Err(e),
             }
@@ -158,13 +217,16 @@ impl ChatCompletionsClient {
     async fn send_json_once(
         &self,
         request: &ChatCompletionRequest,
+        request_started: &mut (dyn FnMut() -> Result<(), ChatCompletionsError> + Send),
     ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
-        let resp = self
+        let pending = self
             .http
             .post(self.endpoint.as_str())
             .bearer_auth(self.api_key.as_str())
             .header("content-type", "application/json")
-            .json(request)
+            .json(request);
+        request_started()?;
+        let resp = pending
             .send()
             .await
             .map_err(|error| self.http_error(error, LlmHttpPhase::SendRequest))?;
@@ -176,17 +238,21 @@ impl ChatCompletionsClient {
         request: &ChatCompletionRequest,
         retry_count: u32,
         retry_after_partial: bool,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
+        request_started: &mut (dyn FnMut() -> Result<(), ChatCompletionsError> + Send),
     ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
         let mut last_retryable = None;
         for attempt in 0..=retry_count {
+            ensure_recovery_active(recovery_interrupt)?;
             let mut emitted = false;
             let result = {
                 let mut tracking_emit = |event| {
                     emitted = true;
                     emit(event);
                 };
-                self.send_streaming_once(request, &mut tracking_emit).await
+                self.send_streaming_once(request, &mut tracking_emit, request_started)
+                    .await
             };
             match result {
                 Ok(value) => return Ok(value),
@@ -206,7 +272,7 @@ impl ChatCompletionsClient {
                         e
                     );
                     last_retryable = Some(e);
-                    tokio::time::sleep(backoff).await;
+                    wait_for_backoff(backoff, recovery_interrupt).await?;
                 }
                 Err(e) => return Err(e),
             }
@@ -223,14 +289,17 @@ impl ChatCompletionsClient {
         &self,
         request: &ChatCompletionRequest,
         emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
+        request_started: &mut (dyn FnMut() -> Result<(), ChatCompletionsError> + Send),
     ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
-        let resp = self
+        let pending = self
             .http
             .post(self.endpoint.as_str())
             .bearer_auth(self.api_key.as_str())
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
-            .json(request)
+            .json(request);
+        request_started()?;
+        let resp = pending
             .send()
             .await
             .map_err(|error| self.http_error(error, LlmHttpPhase::SendRequest))?;
@@ -307,7 +376,39 @@ fn is_retryable(error: &ChatCompletionsError) -> bool {
         ChatCompletionsError::Auth(_)
         | ChatCompletionsError::ResponseJson(_)
         | ChatCompletionsError::InvalidEndpoint(_)
-        | ChatCompletionsError::OutputShape { .. } => false,
+        | ChatCompletionsError::OutputShape { .. }
+        | ChatCompletionsError::RecoveryInterrupted
+        | ChatCompletionsError::RequestPreparation { .. } => false,
+    }
+}
+
+fn ensure_recovery_active(
+    recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+) -> Result<(), ChatCompletionsError> {
+    if recovery_interrupt.is_some_and(ProviderRecoveryInterrupt::is_cancelled) {
+        return Err(ChatCompletionsError::RecoveryInterrupted);
+    }
+    Ok(())
+}
+
+async fn wait_for_backoff(
+    delay: Duration,
+    recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+) -> Result<(), ChatCompletionsError> {
+    if delay.is_zero() {
+        return ensure_recovery_active(recovery_interrupt);
+    }
+    match recovery_interrupt {
+        Some(interrupt) => {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => Ok(()),
+                _ = interrupt.cancelled() => Err(ChatCompletionsError::RecoveryInterrupted),
+            }
+        }
+        None => {
+            tokio::time::sleep(delay).await;
+            Ok(())
+        }
     }
 }
 
@@ -389,6 +490,47 @@ mod tests {
             Some("hello")
         );
         assert!(response.choices[0].message.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovery_interrupt_stops_chat_retry_backoff_and_future_attempts() {
+        let interrupt = ProviderRecoveryInterrupt::new();
+        let cancel = interrupt.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel.cancel();
+        });
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_backoff(Duration::from_secs(60), Some(&interrupt)),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+
+        assert!(matches!(error, ChatCompletionsError::RecoveryInterrupted));
+    }
+
+    #[tokio::test]
+    async fn cancelled_recovery_does_not_start_chat_transport() {
+        let interrupt = ProviderRecoveryInterrupt::new();
+        interrupt.cancel();
+        let client = test_client("http://127.0.0.1:9".into());
+
+        for stream in [false, true] {
+            let error = client
+                .send_with_retry_count_and_mode_and_interrupt(
+                    &request(stream),
+                    1,
+                    false,
+                    Some(&interrupt),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ChatCompletionsError::RecoveryInterrupted));
+        }
     }
 
     #[tokio::test]

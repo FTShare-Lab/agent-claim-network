@@ -68,11 +68,11 @@ use diff::{attach_file_change, compute_file_change, FileChange, FileChangeKind};
 pub(crate) use process::{
     configure_process_group, reap_direct_child_blocking, spawn_direct_child_reaper,
     terminate_process_group, wait_for_child_exit_without_reap, BackgroundProcessEvent,
-    ProcessCompletionDeliveryReceipt, ProcessDeliveryReceipt, ProcessOwner,
+    ProcessCompletion, ProcessCompletionDeliveryReceipt, ProcessDeliveryReceipt, ProcessOwner,
 };
 use process::{
-    spawn_pty, ManagedProcess, OutputCursor, ProcessCompletion, ProcessManager, ProcessState,
-    PtyInput, PtySpawned, PtyWatcherParts, TerminateRequestResult,
+    spawn_pty, ManagedProcess, OutputCursor, ProcessManager, ProcessState, PtyInput, PtySpawned,
+    PtyWatcherParts, TerminateRequestResult,
 };
 use read_state::{
     ContentRevision, LineRange, ReadAuthority, ReadEvidence, ReadStateScope, ReadStateStore,

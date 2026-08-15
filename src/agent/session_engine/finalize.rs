@@ -14,8 +14,7 @@ use crate::agent::runner_trace::trace_name_from_task;
 use crate::api::SessionTurnMessage;
 use crate::claim::{Claim, ClaimId, Dispute, SessionId, SourceId, TraceId};
 use crate::session::{
-    replay_turn_journal, FinalizeCheckpoint, FinalizeCheckpointStatus, SessionHandle,
-    SessionMessage, SessionStatus,
+    FinalizeCheckpoint, FinalizeCheckpointStatus, SessionHandle, SessionMessage, SessionStatus,
 };
 use crate::storage::FileLockGuard;
 
@@ -249,7 +248,7 @@ impl SessionEngine {
         let metadata = session.read_metadata().await?;
         let background_process_completions = self
             .session_recap_background_process_completions(session)
-            .await;
+            .await?;
         if metadata.message_count == 0 && background_process_completions.items.is_empty() {
             session.mark_finalized(Utc::now()).await?;
             if let Err(e) = self.delete_empty_session(&metadata.id).await {
@@ -283,17 +282,21 @@ impl SessionEngine {
             .await?;
         report = merge_finalize_reports(recovered_report, report);
         session
-            .recap_and_mark_finalized(metadata.message_count, Utc::now())
+            .recap_and_mark_finalized_with_background_cursor(
+                metadata.message_count,
+                background_process_completions.consumed_through_seq,
+                Utc::now(),
+            )
             .await?;
         report.advanced_recapped_until = true;
         report.finalized_unrecapped_messages = true;
         Ok(std::mem::take(&mut report))
     }
 
-    async fn session_recap_background_process_completions(
+    pub(super) async fn session_recap_background_process_completions(
         &self,
         session: &SessionHandle,
-    ) -> SessionRecapBackgroundProcessProjection {
+    ) -> anyhow::Result<SessionRecapBackgroundProcessProjection> {
         let read = session.read_turn_journal().await;
         for warning in &read.warnings {
             log::warn!(
@@ -304,45 +307,51 @@ impl SessionEngine {
                 warning.message
             );
         }
-        let projection = replay_turn_journal(read);
-        let mut items = projection
-            .turns
-            .into_iter()
-            // 只有已进入 canonical transcript 的 turn 才属于 recap 证据边界；journal-only
-            // interrupted tail 仍由 recovery 处理，不能旁路原有私有/未提交内容约束。
-            .filter(|turn| {
-                matches!(
-                    turn.status,
-                    Some(crate::session::TurnJournalStatus::Committed)
-                ) && turn.canonical_user_content_hash.is_some()
-            })
-            .flat_map(|turn| {
-                let turn_id = bounded_completion_id(&turn.turn_id);
-                turn.tool_calls.into_iter().filter_map(move |tool| {
-                    tool.background_completion.map(|completion| {
-                        SessionRecapBackgroundProcessCompletion {
-                            turn_id: turn_id.clone(),
-                            tool_use_id: bounded_completion_id(&tool.tool_use_id),
-                            process_id: bounded_completion_id(&completion.process_id),
-                            status: bounded_completion_id(&completion.status),
-                            exit_code: completion.exit_code,
-                            signal: completion.signal,
-                            success: completion.success,
-                        }
-                    })
-                })
-            })
-            .collect::<Vec<_>>();
+        let consumed_cursor = session
+            .read_metadata()
+            .await?
+            .recap_background_completion_until_seq
+            .unwrap_or(0);
+        let mut consumed_through_seq = consumed_cursor;
+        let mut items = Vec::new();
+        for event in read.events {
+            if event.seq <= consumed_cursor {
+                continue;
+            }
+            let crate::session::TurnJournalEventKind::BackgroundProcessCompleted {
+                tool_use_id,
+                process_id,
+                status,
+                exit_code,
+                signal,
+                success,
+                ..
+            } = event.kind
+            else {
+                continue;
+            };
+            consumed_through_seq = consumed_through_seq.max(event.seq);
+            items.push(SessionRecapBackgroundProcessCompletion {
+                turn_id: bounded_completion_id(&event.turn_id),
+                tool_use_id: bounded_completion_id(&tool_use_id),
+                process_id: bounded_completion_id(&process_id),
+                status: bounded_completion_id(&status),
+                exit_code,
+                signal,
+                success,
+            });
+        }
         let omitted_older_count = items
             .len()
             .saturating_sub(FINALIZE_BACKGROUND_COMPLETION_MAX_ITEMS);
         if omitted_older_count > 0 {
             items.drain(..omitted_older_count);
         }
-        SessionRecapBackgroundProcessProjection {
+        Ok(SessionRecapBackgroundProcessProjection {
+            consumed_through_seq,
             omitted_older_count,
             items,
-        }
+        })
     }
 
     pub(super) async fn prepare_finalize_segment(
@@ -351,6 +360,7 @@ impl SessionEngine {
         fallback_scope: crate::api::ProviderRuntimeFallbackScope,
     ) -> anyhow::Result<(Vec<ClaimId>, Vec<Claim>, Vec<Dispute>)> {
         let background_process_completions = SessionRecapBackgroundProcessProjection {
+            consumed_through_seq: 0,
             omitted_older_count: 0,
             items: Vec::new(),
         };

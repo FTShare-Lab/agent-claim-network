@@ -5,10 +5,11 @@
 //! maintainer 与 inbox 能力，但交互式 session 的 LLM 调用只走 provider-neutral 组件。
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -44,15 +45,17 @@ use crate::delegation::{DelegationId, DelegationStatus, DelegationStore, Delegat
 use crate::mcp::connection_manager::McpConnectionManager;
 use crate::prompt::PromptRegistry;
 use crate::session::{
-    canonical_user_content_hash, replay_turn_journal, turn_journal_recovery_context_for_chain,
-    ActiveTurnCompactionCursor, CompactedProviderHistory, CompactionAppliedReport,
-    CompactionCheckpoint, CompactionCheckpointStatus, FinalizeCheckpoint, NewSessionMessage,
-    PendingProviderHistoryTurn, RecoveryContextLimits, SessionCompactionState, SessionContentBlock,
-    SessionHandle, SessionMessage, SessionMessageRole, SessionStatus, SessionStore,
-    SessionStoreError, TurnJournalEventKind, TurnJournalFlush, TurnJournalStatus, TurnJournalTurn,
+    canonical_user_content_hash, read_session_turn_journal, replay_turn_journal,
+    turn_journal_recovery_context_for_chain, ActiveTurnCompactionCursor, CompactedProviderHistory,
+    CompactionAppliedReport, CompactionCheckpoint, CompactionCheckpointStatus, FinalizeCheckpoint,
+    NewSessionMessage, PendingProviderHistoryTurn, RecoveryContextLimits, SessionCompactionState,
+    SessionContentBlock, SessionHandle, SessionMessage, SessionMessageRole, SessionStatus,
+    SessionStore, SessionStoreError, TurnJournalEventKind, TurnJournalFlush, TurnJournalStatus,
+    TurnJournalTurn,
 };
 use crate::skill::{resolve_explicit_skill_instructions, SkillInjectionLimits, SkillInstructions};
-use crate::tool::{BackgroundProcessEvent, ToolRegistry};
+use crate::storage::FileLockGuard;
+use crate::tool::{BackgroundProcessEvent, ProcessCompletion, ToolRegistry};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -356,6 +359,8 @@ struct PreflightCompactor<'a> {
     frozen_provider_history_prefix_len: usize,
     capture_provider_history: bool,
     last_compacted_provider_history: Option<Vec<SessionTurnMessage>>,
+    provider_compaction_before_pending_request: Option<Option<SessionCompactionState>>,
+    background_completion_delivery_seq: Arc<AtomicU64>,
     provider_replay_identity: Option<ProviderReplayIdentity>,
 }
 
@@ -367,6 +372,8 @@ struct MainModelContextAppender {
     delegation_projection_baselines: Arc<Mutex<HashMap<SessionId, DelegationProjectionBaseline>>>,
     observed_delegation_baseline: Option<DelegationProjectionBaseline>,
     background_completion_delivery_ids: Vec<crate::tool::ProcessCompletionDeliveryReceipt>,
+    background_completion_until_seq: u64,
+    background_completion_delivery_seq: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -386,11 +393,78 @@ impl SessionTurnContextAppender for MainModelContextAppender {
         self.tools
             .rollback_process_deliveries_for_owner(&self.session_id, None)
             .await;
-        let (background, delivery_ids) = self
+        let (delivery_ids, frozen_completions) = self
             .tools
-            .begin_background_process_projection_delivery_for_owner(&self.session_id, None)
+            .begin_background_completion_delivery_for_owner(&self.session_id, None)
             .await;
         self.background_completion_delivery_ids = delivery_ids;
+        persist_main_background_process_completions(
+            self.tools.as_ref(),
+            &self.session_id,
+            &self.session_dir,
+            &frozen_completions,
+        )
+        .await?;
+        let journal = read_session_turn_journal(&self.session_dir.join("turn_events.jsonl")).await;
+        for warning in &journal.warnings {
+            log::warn!(
+                target: "agent",
+                "background completion journal 读取降级 session={} line={:?}: {}",
+                self.session_id,
+                warning.line,
+                warning.message
+            );
+        }
+        let owner = self.tools.process_owner_for_session(&self.session_id, None);
+        let mut persisted_completions = Vec::new();
+        let mut journaled_terminal_instances = BTreeSet::new();
+        let mut delivered_through = self.background_completion_until_seq;
+        for event in journal.events {
+            let TurnJournalEventKind::BackgroundProcessCompleted {
+                tool_use_id,
+                process_id,
+                instance_id,
+                status,
+                exit_code,
+                signal,
+                success,
+            } = event.kind
+            else {
+                continue;
+            };
+            journaled_terminal_instances.insert((process_id.clone(), instance_id));
+            if event.seq <= self.background_completion_until_seq {
+                continue;
+            }
+            delivered_through = delivered_through.max(event.seq);
+            persisted_completions.push(ProcessCompletion {
+                root_session_id: self.session_id.to_string(),
+                owner: owner.clone(),
+                process_id,
+                originating_turn_id: Some(event.turn_id),
+                originating_tool_use_id: Some(tool_use_id),
+                instance_id,
+                status,
+                exit_code,
+                signal,
+                success,
+                finished_at: SystemTime::now(),
+                elapsed_minutes: 0,
+            });
+        }
+        let background = self
+            .tools
+            .background_process_projection_for_owner_with_journaled_terminals(
+                &self.session_id,
+                None,
+                persisted_completions,
+                &journaled_terminal_instances,
+            )
+            .await;
+        if delivered_through > self.background_completion_until_seq {
+            self.background_completion_delivery_seq
+                .store(delivered_through, Ordering::Release);
+        }
         match background {
             Some(text) => pending.push(SessionTurnMessage::model_context(
                 ModelContextSource::BackgroundProcess,
@@ -457,8 +531,78 @@ impl SessionTurnContextAppender for MainModelContextAppender {
                 .await;
             self.background_completion_delivery_ids.clear();
         }
+        let delivered_through = self
+            .background_completion_delivery_seq
+            .swap(0, Ordering::AcqRel);
+        self.background_completion_until_seq =
+            self.background_completion_until_seq.max(delivered_through);
         Ok(())
     }
+}
+
+/// completion 只有在 journal 获得稳定 seq 后才允许进入 main provider projection。
+/// 独立锁把 TUI heartbeat 与 provider preflight 的“查重 + append + ack”线性化。
+async fn persist_main_background_process_completions(
+    tools: &ToolRegistry,
+    session_id: &SessionId,
+    session_dir: &Path,
+    completions: &[ProcessCompletion],
+) -> anyhow::Result<()> {
+    if completions.is_empty() {
+        return Ok(());
+    }
+    let _guard = FileLockGuard::lock_exclusive(session_dir.join("background_completion.lock"))
+        .await
+        .context("获取 background completion journal 锁失败")?;
+    let journal_path = session_dir.join("turn_events.jsonl");
+    let journal = read_session_turn_journal(&journal_path).await;
+    let mut journaled_instances = journal
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TurnJournalEventKind::BackgroundProcessCompleted {
+                process_id,
+                instance_id,
+                ..
+            } => Some((process_id.clone(), *instance_id)),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut writer = crate::session::TurnJournalWriter::open(journal_path).await?;
+    for completion in completions {
+        let allocation = (completion.process_id.clone(), completion.instance_id);
+        if !journaled_instances.contains(&allocation) {
+            let turn_id = completion
+                .originating_turn_id
+                .as_ref()
+                .context("main background completion 缺少 originating turn")?;
+            let tool_use_id = completion
+                .originating_tool_use_id
+                .as_ref()
+                .context("main background completion 缺少 originating tool use")?;
+            writer
+                .append(
+                    turn_id.clone(),
+                    Utc::now(),
+                    TurnJournalEventKind::BackgroundProcessCompleted {
+                        tool_use_id: tool_use_id.clone(),
+                        process_id: completion.process_id.clone(),
+                        instance_id: completion.instance_id,
+                        status: completion.status.clone(),
+                        exit_code: completion.exit_code,
+                        signal: completion.signal,
+                        success: completion.success,
+                    },
+                    TurnJournalFlush::Immediate,
+                )
+                .await?;
+            journaled_instances.insert(allocation);
+        }
+        tools
+            .acknowledge_process_completion_for_root_session(session_id, completion.instance_id)
+            .await;
+    }
+    Ok(())
 }
 
 fn latest_model_context_matches(
@@ -706,6 +850,45 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
         )
         .await
     }
+
+    fn provider_request_started(
+        &mut self,
+        _provider_messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<()> {
+        // 网络发送一旦开始，结果在 crash/cancel 下就可能已被上游接受；保守保留 WAL。
+        self.provider_compaction_before_pending_request = None;
+        Ok(())
+    }
+
+    async fn provider_request_abandoned_before_send(&mut self) -> anyhow::Result<()> {
+        let Some(previous) = self.provider_compaction_before_pending_request.take() else {
+            return Ok(());
+        };
+        match previous {
+            Some(compaction) => self.session.update_compaction(compaction).await?,
+            None => self.session.clear_compaction().await?,
+        }
+        self.last_compacted_provider_history = self
+            .session
+            .read_metadata()
+            .await?
+            .compaction
+            .and_then(|state| state.provider_history)
+            .map(|history| history.messages);
+        Ok(())
+    }
+
+    async fn after_provider_response_success(&mut self) -> anyhow::Result<()> {
+        let delivered_through = self
+            .background_completion_delivery_seq
+            .load(Ordering::Acquire);
+        if delivered_through > 0 {
+            self.session
+                .advance_provider_background_completion_until(delivered_through)
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 impl PreflightCompactor<'_> {
@@ -734,6 +917,7 @@ impl PreflightCompactor<'_> {
         // “是否曾发生过语义 compaction”当成恢复正确性的开关。
         // 尚无 compaction state 时复用空 summary 的同一有界窗口，
         // 不建立另一个持久化事实源。
+        self.provider_compaction_before_pending_request = Some(metadata.compaction.clone());
         let mut compaction = metadata.compaction.unwrap_or_else(|| {
             SessionCompactionState::from_committed_summary(0, String::new(), Utc::now())
         });
@@ -821,6 +1005,8 @@ struct SessionRecapPayload<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct SessionRecapBackgroundProcessProjection {
+    #[serde(skip)]
+    consumed_through_seq: u64,
     omitted_older_count: usize,
     items: Vec<SessionRecapBackgroundProcessCompletion>,
 }
@@ -1340,6 +1526,23 @@ impl SessionEngine {
                 }
             }
         }
+        if let Err(error) = persist_main_background_process_completions(
+            self.turn_loop.tool_registry().as_ref(),
+            &session.metadata.id,
+            &session.paths.dir,
+            &completions,
+        )
+        .await
+        {
+            log::warn!(
+                target: "agent",
+                "background completion journal 写入失败 session={}: {error:#}",
+                session.metadata.id,
+            );
+            // durable obligation 原样保留；下个 heartbeat、provider preflight 或 finalize
+            // 会在同一把 completion lock 下重试。
+            return events;
+        }
         for completion in completions {
             let owner_subagent = completion.owner.subagent_id.as_deref().unwrap_or("main");
             let termination = completion
@@ -1347,47 +1550,6 @@ impl SessionEngine {
                 .map(|signal| format!("signal={signal}"))
                 .or_else(|| completion.exit_code.map(|code| format!("exit_code={code}")))
                 .unwrap_or_else(|| "exit_code=unknown".into());
-            if completion.owner.subagent_id.is_none() {
-                if let (Some(turn_id), Some(tool_use_id)) = (
-                    completion.originating_turn_id.as_ref(),
-                    completion.originating_tool_use_id.as_ref(),
-                ) {
-                    let persisted = async {
-                        let mut writer = session.open_turn_journal_writer().await?;
-                        writer
-                            .append(
-                                turn_id.clone(),
-                                Utc::now(),
-                                TurnJournalEventKind::BackgroundProcessCompleted {
-                                    tool_use_id: tool_use_id.clone(),
-                                    process_id: completion.process_id.clone(),
-                                    instance_id: completion.instance_id,
-                                    status: completion.status.clone(),
-                                    exit_code: completion.exit_code,
-                                    signal: completion.signal,
-                                    success: completion.success,
-                                },
-                                TurnJournalFlush::Immediate,
-                            )
-                            .await
-                    }
-                    .await;
-                    if let Err(error) = persisted {
-                        log::warn!(
-                            target: "agent",
-                            "background completion journal 写入失败 session={} turn={} tool_use={} process={}: {}",
-                            session.metadata.id,
-                            turn_id,
-                            tool_use_id,
-                            completion.process_id,
-                            error
-                        );
-                        // root completion 必须在 durable journal 成功后才确认；本轮不更新
-                        // TUI，保留队列供下一个 heartbeat/finalize retry 再试。
-                        continue;
-                    }
-                }
-            }
             self.append_session_event_log(
                 session,
                 "INFO",
@@ -1416,13 +1578,6 @@ impl SessionEngine {
                 signal: completion.signal,
                 success: completion.success,
             });
-            self.turn_loop
-                .tool_registry()
-                .acknowledge_process_completion_for_root_session(
-                    &session.metadata.id,
-                    completion.instance_id,
-                )
-                .await;
         }
         events
     }
@@ -2626,6 +2781,9 @@ impl SessionEngine {
                     if tool_boundary_control
                         .as_ref()
                         .is_some_and(ToolBoundaryControl::is_cancelled)
+                        && !tool_boundary_control
+                            .as_ref()
+                            .is_some_and(ToolBoundaryControl::should_commit_successful_response)
                     {
                         Err(SessionTurnInterrupted.into())
                     } else {
@@ -3136,6 +3294,7 @@ impl SessionEngine {
         let delegation_activity = tools
             .subscribe_delegation_activity_for_session(&metadata.id)
             .context("订阅 subagent activity 失败")?;
+        let background_completion_delivery_seq = Arc::new(AtomicU64::new(0));
         let mut context_appender = MainModelContextAppender {
             tools,
             session_id: metadata.id.clone(),
@@ -3144,6 +3303,10 @@ impl SessionEngine {
             delegation_projection_baselines: Arc::clone(&self.delegation_projection_baselines),
             observed_delegation_baseline: None,
             background_completion_delivery_ids: Vec::new(),
+            background_completion_until_seq: metadata
+                .provider_background_completion_until_seq
+                .unwrap_or(0),
+            background_completion_delivery_seq: Arc::clone(&background_completion_delivery_seq),
         };
         let mut preflight = PreflightCompactor {
             engine: self,
@@ -3159,6 +3322,8 @@ impl SessionEngine {
             frozen_provider_history_prefix_len,
             capture_provider_history,
             last_compacted_provider_history: None,
+            provider_compaction_before_pending_request: None,
+            background_completion_delivery_seq,
             provider_replay_identity: provider_replay_identity.clone(),
         };
         let turn = self

@@ -45,6 +45,10 @@ pub use turn_journal::{
     TurnJournalTurn, TurnJournalWarning, TurnJournalWriter,
 };
 
+pub(crate) async fn read_session_turn_journal(path: &Path) -> TurnJournalRead {
+    turn_journal::read_turn_journal(path).await
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SessionStoreError {
     #[error("session 存储 I/O 失败 ({path:?}): {source}")]
@@ -57,6 +61,8 @@ pub enum SessionStoreError {
     Storage(#[from] StorageError),
     #[error("session JSONL 序列化失败: {0}")]
     JsonEncode(#[from] serde_json::Error),
+    #[error("provider history WAL 编解码失败: {0}")]
+    ProviderHistoryCodec(String),
     #[error("session JSONL 第 {line} 行解析失败: {source}")]
     JsonLine {
         line: usize,
@@ -242,7 +248,9 @@ pub struct SessionCompactionState {
     /// 最近一次实际发送的 provider-neutral 历史窗口。
     /// 普通 main request 与 compaction 后请求共用该有界 WAL；后续请求
     /// 从稳定基线与 canonical cursor 继续追加，禁止重新投影旧前缀。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // 旧 session.yaml 仍可反序列化该字段；新写入统一落到独立
+    // provider_history.json，避免媒体窗口放大所有 metadata 更新。
+    #[serde(skip_serializing)]
     pub provider_history: Option<Box<CompactedProviderHistory>>,
 }
 
@@ -386,6 +394,12 @@ pub struct SessionMetadata {
     pub finalized_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub recapped_until: usize,
+    /// 已成功交给主模型的后台进程终态 journal seq。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_background_completion_until_seq: Option<u64>,
+    /// 已进入 recap/finalize 的后台进程终态 journal seq。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recap_background_completion_until_seq: Option<u64>,
     #[serde(default)]
     pub compaction: Option<SessionCompactionState>,
 }
@@ -412,6 +426,7 @@ pub struct SessionPaths {
     /// compact 超限降级使用的不可变内容寻址资产；跟随 session 生命周期清理。
     pub compaction_assets_dir: PathBuf,
     pub session_yaml: PathBuf,
+    pub provider_history_json: PathBuf,
     pub system_prompt: PathBuf,
     pub messages_jsonl: PathBuf,
     pub turn_events_jsonl: PathBuf,
@@ -429,6 +444,7 @@ impl SessionPaths {
         Self {
             compaction_assets_dir: dir.join("compaction_assets"),
             session_yaml: dir.join("session.yaml"),
+            provider_history_json: dir.join("provider_history.json"),
             system_prompt: dir.join("system_prompt.md"),
             messages_jsonl: dir.join("messages.jsonl"),
             turn_events_jsonl: dir.join("turn_events.jsonl"),
@@ -644,14 +660,32 @@ pub struct NewSessionMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumedSessionSummary {
-    pub metadata: SessionMetadata,
+    pub id: SessionId,
+    pub status: SessionStatus,
+    pub updated_at: DateTime<Utc>,
+    pub closed_at: Option<DateTime<Utc>>,
     pub last_user_text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResumableSessionMetadata {
+    id: SessionId,
+    agent_id: AgentId,
+    status: SessionStatus,
+    updated_at: DateTime<Utc>,
+    closed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoricalTurn {
     pub user_text: String,
     pub assistant_text: Option<String>,
+}
+
+enum ProviderHistoryFile {
+    Missing,
+    Loaded(CompactedProviderHistory),
+    Invalid(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -842,6 +876,8 @@ impl SessionStore {
                         message_count: 0,
                         finalized_at: None,
                         recapped_until: 0,
+                        provider_background_completion_until_seq: Some(0),
+                        recap_background_completion_until_seq: Some(0),
                         compaction: None,
                     };
                     write_yaml_atomic(&paths.session_yaml, &metadata).await?;
@@ -904,7 +940,7 @@ impl SessionStore {
                 continue;
             };
             let paths = SessionPaths::new(&agent_home, &session_id);
-            let metadata: SessionMetadata = match read_yaml(&paths.session_yaml).await {
+            let metadata: ResumableSessionMetadata = match read_yaml(&paths.session_yaml).await {
                 Ok(metadata) => metadata,
                 Err(StorageError::Io { source, .. }) if source.kind() == ErrorKind::NotFound => {
                     log::warn!(
@@ -919,26 +955,31 @@ impl SessionStore {
             if metadata.status != SessionStatus::Closed || metadata.agent_id != *agent_id {
                 continue;
             }
-            let handle = SessionHandle::new(metadata, paths);
-            let messages = handle.read_messages().await?;
+            let id = metadata.id;
+            let status = metadata.status;
+            let updated_at = metadata.updated_at;
+            let closed_at = metadata.closed_at;
+            let messages = read_messages_file(&paths.messages_jsonl).await?;
             let last_user_text = match extract_last_user_text(&messages) {
                 Some(text) => Some(text),
-                None => resumable_journal_last_user_text(&handle.paths).await,
+                None => resumable_journal_last_user_text(&paths).await,
             };
             let Some(last_user_text) = last_user_text else {
                 continue;
             };
             sessions.push(ResumedSessionSummary {
+                id,
+                status,
+                updated_at,
+                closed_at,
                 last_user_text: Some(last_user_text),
-                metadata: handle.metadata,
             });
         }
         sessions.sort_by(|a, b| {
-            b.metadata
-                .closed_at
-                .cmp(&a.metadata.closed_at)
-                .then_with(|| b.metadata.updated_at.cmp(&a.metadata.updated_at))
-                .then_with(|| b.metadata.id.as_str().cmp(a.metadata.id.as_str()))
+            b.closed_at
+                .cmp(&a.closed_at)
+                .then_with(|| b.updated_at.cmp(&a.updated_at))
+                .then_with(|| b.id.as_str().cmp(a.id.as_str()))
         });
         Ok(sessions)
     }
@@ -1009,6 +1050,8 @@ impl SessionStore {
             });
         }
         let mut handle = SessionHandle::new(metadata, paths);
+        handle.hydrate_provider_history().await?;
+        handle.initialize_background_completion_cursors().await?;
         let messages = handle.read_messages().await?;
         validate_and_reconcile_resume_metadata(&mut handle, &messages).await?;
         Ok(handle)
@@ -1400,6 +1443,39 @@ fn truncate_for_resume_table(text: &str, max_chars: usize) -> String {
     out
 }
 
+async fn read_messages_file(path: &Path) -> Result<Vec<SessionMessage>, SessionStoreError> {
+    let raw = fs::read(path)
+        .await
+        .map_err(|error| SessionStoreError::io(path, error))?;
+    let mut messages = Vec::new();
+    let has_unterminated_tail = !raw.is_empty() && !raw.ends_with(b"\n");
+    let mut lines = raw.split(|byte| *byte == b'\n').enumerate().peekable();
+    while let Some((line_no, line)) = lines.next() {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let message = match serde_json::from_slice(line) {
+            Ok(message) => message,
+            Err(_) if has_unterminated_tail && lines.peek().is_none() => {
+                log::warn!(
+                    target: "session",
+                    "忽略 messages.jsonl 未完整写入的末尾残行: path={path:?} line={}",
+                    line_no + 1
+                );
+                break;
+            }
+            Err(source) => {
+                return Err(SessionStoreError::JsonLine {
+                    line: line_no + 1,
+                    source,
+                });
+            }
+        };
+        messages.push(message);
+    }
+    Ok(messages)
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionHandle {
     pub metadata: SessionMetadata,
@@ -1462,41 +1538,153 @@ impl SessionHandle {
     }
 
     pub async fn read_metadata(&self) -> Result<SessionMetadata, SessionStoreError> {
+        let mut metadata: SessionMetadata = read_yaml(&self.paths.session_yaml).await?;
+        let inline_history = metadata
+            .compaction
+            .as_mut()
+            .and_then(|compaction| compaction.provider_history.take());
+        let provider_history = match self.read_provider_history_file().await {
+            ProviderHistoryFile::Loaded(history) => Some(Box::new(history)),
+            ProviderHistoryFile::Missing => inline_history,
+            ProviderHistoryFile::Invalid(error) => {
+                log::warn!(
+                    target: "session",
+                    "忽略损坏的 provider history WAL，后续将从 canonical history 重建: session={} error={error}",
+                    metadata.id
+                );
+                None
+            }
+        };
+        if let Some(compaction) = metadata.compaction.as_mut() {
+            compaction.provider_history = provider_history;
+        }
+        Ok(metadata)
+    }
+
+    async fn read_metadata_light(&self) -> Result<SessionMetadata, SessionStoreError> {
         Ok(read_yaml(&self.paths.session_yaml).await?)
     }
 
-    pub async fn read_messages(&self) -> Result<Vec<SessionMessage>, SessionStoreError> {
-        let raw = fs::read(&self.paths.messages_jsonl)
-            .await
-            .map_err(|e| SessionStoreError::io(&self.paths.messages_jsonl, e))?;
-        let mut messages = Vec::new();
-        let has_unterminated_tail = !raw.is_empty() && !raw.ends_with(b"\n");
-        let mut lines = raw.split(|byte| *byte == b'\n').enumerate().peekable();
-        while let Some((line_no, line)) = lines.next() {
-            if line.iter().all(u8::is_ascii_whitespace) {
-                continue;
+    async fn hydrate_provider_history(&mut self) -> Result<(), SessionStoreError> {
+        let inline_history = self
+            .metadata
+            .compaction
+            .as_mut()
+            .and_then(|compaction| compaction.provider_history.take());
+        let provider_history = match self.read_provider_history_file().await {
+            ProviderHistoryFile::Loaded(history) => Some(Box::new(history)),
+            ProviderHistoryFile::Missing => {
+                if let Some(history) = inline_history {
+                    self.write_provider_history_file(Some(history.as_ref()))
+                        .await?;
+                    // SessionCompactionState 新格式不再序列化 history；重写一次即完成迁移。
+                    write_yaml_atomic(&self.paths.session_yaml, &self.metadata).await?;
+                    Some(history)
+                } else {
+                    None
+                }
             }
-            let message: SessionMessage = match serde_json::from_slice(line) {
-                Ok(message) => message,
-                Err(_) if has_unterminated_tail && lines.peek().is_none() => {
-                    log::warn!(
-                        target: "session",
-                        "忽略 messages.jsonl 未完整写入的末尾残行: path={:?} line={}",
-                        self.paths.messages_jsonl,
-                        line_no + 1
-                    );
-                    break;
-                }
-                Err(source) => {
-                    return Err(SessionStoreError::JsonLine {
-                        line: line_no + 1,
-                        source,
-                    });
-                }
-            };
-            messages.push(message);
+            ProviderHistoryFile::Invalid(error) => {
+                log::warn!(
+                    target: "session",
+                    "忽略损坏的 provider history WAL，后续将从 canonical history 重建: session={} error={error}",
+                    self.metadata.id
+                );
+                let _ = fs::remove_file(&self.paths.provider_history_json).await;
+                // 即使旧 YAML 仍带内嵌副本，也遵循可用性优先：损坏 WAL 不做精确恢复。
+                write_yaml_atomic(&self.paths.session_yaml, &self.metadata).await?;
+                None
+            }
+        };
+        if let Some(compaction) = self.metadata.compaction.as_mut() {
+            compaction.provider_history = provider_history;
         }
-        Ok(messages)
+        Ok(())
+    }
+
+    async fn initialize_background_completion_cursors(&mut self) -> Result<(), SessionStoreError> {
+        if self
+            .metadata
+            .provider_background_completion_until_seq
+            .is_some()
+            && self
+                .metadata
+                .recap_background_completion_until_seq
+                .is_some()
+        {
+            return Ok(());
+        }
+        let max_historical_seq = self
+            .read_turn_journal()
+            .await
+            .events
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    TurnJournalEventKind::BackgroundProcessCompleted { .. }
+                )
+            })
+            .map(|event| event.seq)
+            .max()
+            .unwrap_or(0);
+        self.metadata
+            .provider_background_completion_until_seq
+            .get_or_insert(max_historical_seq);
+        self.metadata
+            .recap_background_completion_until_seq
+            .get_or_insert(max_historical_seq);
+        write_yaml_atomic(&self.paths.session_yaml, &self.metadata).await?;
+        Ok(())
+    }
+
+    async fn read_provider_history_file(&self) -> ProviderHistoryFile {
+        let bytes = match fs::read(&self.paths.provider_history_json).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return ProviderHistoryFile::Missing;
+            }
+            Err(error) => return ProviderHistoryFile::Invalid(error.to_string()),
+        };
+        match tokio::task::spawn_blocking(move || {
+            serde_json::from_slice::<CompactedProviderHistory>(&bytes)
+        })
+        .await
+        {
+            Ok(Ok(history)) => ProviderHistoryFile::Loaded(history),
+            Ok(Err(error)) => ProviderHistoryFile::Invalid(error.to_string()),
+            Err(error) => ProviderHistoryFile::Invalid(error.to_string()),
+        }
+    }
+
+    async fn write_provider_history_file(
+        &self,
+        history: Option<&CompactedProviderHistory>,
+    ) -> Result<(), SessionStoreError> {
+        let Some(history) = history else {
+            match fs::remove_file(&self.paths.provider_history_json).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(SessionStoreError::io(
+                        &self.paths.provider_history_json,
+                        error,
+                    ));
+                }
+            }
+            return Ok(());
+        };
+        let history = history.clone();
+        let encoded = tokio::task::spawn_blocking(move || serde_json::to_vec(&history))
+            .await
+            .map_err(|error| SessionStoreError::ProviderHistoryCodec(error.to_string()))?
+            .map_err(|error| SessionStoreError::ProviderHistoryCodec(error.to_string()))?;
+        write_text_atomic(&self.paths.provider_history_json, &encoded).await?;
+        Ok(())
+    }
+
+    pub async fn read_messages(&self) -> Result<Vec<SessionMessage>, SessionStoreError> {
+        read_messages_file(&self.paths.messages_jsonl).await
     }
 
     /// 为增量追加规范化 JSONL 尾部。
@@ -1636,7 +1824,7 @@ impl SessionHandle {
         }
 
         let _guard = self.lock_session().await?;
-        self.metadata = self.read_metadata().await?;
+        self.metadata = self.read_metadata_light().await?;
         if self.metadata.status != SessionStatus::Open || self.metadata.closed_at.is_some() {
             return Err(SessionStoreError::Closed(self.metadata.id.to_string()));
         }
@@ -1687,7 +1875,7 @@ impl SessionHandle {
 
         let message_count = start_index + messages.len();
         let metadata_result = async {
-            self.metadata = self.read_metadata().await?;
+            self.metadata = self.read_metadata_light().await?;
             self.metadata.message_count = message_count;
             if let Some(message) = messages.last() {
                 self.metadata.model = message.model.clone();
@@ -1716,7 +1904,7 @@ impl SessionHandle {
         model: impl Into<String>,
     ) -> Result<(), SessionStoreError> {
         let _guard = self.lock_session().await?;
-        self.metadata = self.read_metadata().await?;
+        self.metadata = self.read_metadata_light().await?;
         self.metadata.message_count = message_count;
         self.metadata.model = model.into();
         self.metadata.updated_at = Utc::now();
@@ -1798,8 +1986,20 @@ impl SessionHandle {
         let _guard = self.lock_session().await?;
         let mut compaction = compaction;
         compaction.normalize_active_turn();
-        self.metadata = self.read_metadata().await?;
+        self.write_provider_history_file(compaction.provider_history.as_deref())
+            .await?;
+        self.metadata = self.read_metadata_light().await?;
         self.metadata.compaction = Some(compaction);
+        self.metadata.updated_at = Utc::now();
+        write_yaml_atomic(&self.paths.session_yaml, &self.metadata).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn clear_compaction(&mut self) -> Result<(), SessionStoreError> {
+        let _guard = self.lock_session().await?;
+        self.write_provider_history_file(None).await?;
+        self.metadata = read_yaml(&self.paths.session_yaml).await?;
+        self.metadata.compaction = None;
         self.metadata.updated_at = Utc::now();
         write_yaml_atomic(&self.paths.session_yaml, &self.metadata).await?;
         Ok(())
@@ -1813,7 +2013,9 @@ impl SessionHandle {
         let _guard = self.lock_session().await?;
         let mut compaction = compaction;
         compaction.normalize_active_turn();
-        self.metadata = self.read_metadata().await?;
+        self.write_provider_history_file(compaction.provider_history.as_deref())
+            .await?;
+        self.metadata = self.read_metadata_light().await?;
         self.metadata.compaction = Some(compaction);
         self.metadata.recapped_until = self.metadata.recapped_until.max(recapped_until);
         self.metadata.updated_at = Utc::now();
@@ -1826,8 +2028,24 @@ impl SessionHandle {
         recapped_until: usize,
     ) -> Result<(), SessionStoreError> {
         let _guard = self.lock_session().await?;
-        self.metadata = self.read_metadata().await?;
+        self.metadata = self.read_metadata_light().await?;
         self.metadata.recapped_until = self.metadata.recapped_until.max(recapped_until);
+        self.metadata.updated_at = Utc::now();
+        write_yaml_atomic(&self.paths.session_yaml, &self.metadata).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn advance_provider_background_completion_until(
+        &mut self,
+        seq: u64,
+    ) -> Result<(), SessionStoreError> {
+        let _guard = self.lock_session().await?;
+        self.metadata = self.read_metadata_light().await?;
+        let current = self
+            .metadata
+            .provider_background_completion_until_seq
+            .unwrap_or(0);
+        self.metadata.provider_background_completion_until_seq = Some(current.max(seq));
         self.metadata.updated_at = Utc::now();
         write_yaml_atomic(&self.paths.session_yaml, &self.metadata).await?;
         Ok(())
@@ -1839,8 +2057,31 @@ impl SessionHandle {
         finalized_at: DateTime<Utc>,
     ) -> Result<(), SessionStoreError> {
         let _guard = self.lock_session().await?;
-        self.metadata = self.read_metadata().await?;
+        self.metadata = self.read_metadata_light().await?;
         self.metadata.recapped_until = self.metadata.recapped_until.max(recapped_until);
+        self.metadata.status = SessionStatus::Closed;
+        self.metadata.finalized_at = Some(finalized_at);
+        self.metadata.closed_at = Some(finalized_at);
+        self.metadata.updated_at = finalized_at;
+        write_yaml_atomic(&self.paths.session_yaml, &self.metadata).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn recap_and_mark_finalized_with_background_cursor(
+        &mut self,
+        recapped_until: usize,
+        background_completion_until_seq: u64,
+        finalized_at: DateTime<Utc>,
+    ) -> Result<(), SessionStoreError> {
+        let _guard = self.lock_session().await?;
+        self.metadata = self.read_metadata_light().await?;
+        self.metadata.recapped_until = self.metadata.recapped_until.max(recapped_until);
+        let current = self
+            .metadata
+            .recap_background_completion_until_seq
+            .unwrap_or(0);
+        self.metadata.recap_background_completion_until_seq =
+            Some(current.max(background_completion_until_seq));
         self.metadata.status = SessionStatus::Closed;
         self.metadata.finalized_at = Some(finalized_at);
         self.metadata.closed_at = Some(finalized_at);
@@ -1854,7 +2095,7 @@ impl SessionHandle {
         finalized_at: DateTime<Utc>,
     ) -> Result<(), SessionStoreError> {
         let _guard = self.lock_session().await?;
-        self.metadata = self.read_metadata().await?;
+        self.metadata = self.read_metadata_light().await?;
         self.metadata.status = SessionStatus::Closed;
         self.metadata.finalized_at = Some(finalized_at);
         self.metadata.closed_at = Some(finalized_at);
@@ -1868,7 +2109,7 @@ impl SessionHandle {
         updated_at: DateTime<Utc>,
     ) -> Result<(), SessionStoreError> {
         let _guard = self.lock_session().await?;
-        self.metadata = self.read_metadata().await?;
+        self.metadata = self.read_metadata_light().await?;
         if self.metadata.finalized_at.is_some()
             || self.metadata.closed_at.is_some()
             || self.metadata.status != SessionStatus::Open
@@ -1883,7 +2124,7 @@ impl SessionHandle {
 
     pub async fn mark_open(&mut self, updated_at: DateTime<Utc>) -> Result<(), SessionStoreError> {
         let _guard = self.lock_session().await?;
-        self.metadata = self.read_metadata().await?;
+        self.metadata = self.read_metadata_light().await?;
         if self.metadata.status == SessionStatus::Finalizing {
             return Err(SessionStoreError::Closed(self.metadata.id.to_string()));
         }
@@ -1900,7 +2141,7 @@ impl SessionHandle {
 
     pub async fn mark_closed(&mut self, closed_at: DateTime<Utc>) -> Result<(), SessionStoreError> {
         let _guard = self.lock_session().await?;
-        self.metadata = self.read_metadata().await?;
+        self.metadata = self.read_metadata_light().await?;
         self.metadata.status = SessionStatus::Closed;
         self.metadata.closed_at = Some(closed_at);
         self.metadata.updated_at = closed_at;
@@ -2011,6 +2252,173 @@ frontier:
         .unwrap();
         assert!(cursor_without_summary.active_turn_summary.is_none());
         assert!(cursor_without_summary.frontier.active_turn.is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_history_uses_independent_json_wal_and_stays_out_of_session_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().join("agents"));
+        let agent = agent_id("agent-a");
+        let mut session = store
+            .create_with_id_factory(&agent, "system", || session_id("session_1111aaaa"), 1)
+            .await
+            .unwrap();
+        let mut compaction =
+            SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
+        let expected = CompactedProviderHistory {
+            replay_identity: Some(ProviderReplayIdentity {
+                protocol: crate::api::ProviderReplayProtocol::OpenAiResponses,
+                model: "test-model".into(),
+            }),
+            pending_turn: None,
+            canonical_message_until: 0,
+            messages: vec![SessionTurnMessage::user_text("hello")],
+        };
+        compaction.provider_history = Some(Box::new(expected.clone()));
+
+        session.update_compaction(compaction).await.unwrap();
+
+        let yaml = fs::read_to_string(&session.paths.session_yaml)
+            .await
+            .unwrap();
+        assert!(!yaml.contains("provider_history"));
+        let wal = fs::read_to_string(&session.paths.provider_history_json)
+            .await
+            .unwrap();
+        assert!(wal.contains("hello"));
+        let loaded = session
+            .read_metadata()
+            .await
+            .unwrap()
+            .compaction
+            .and_then(|state| state.provider_history)
+            .map(|history| *history)
+            .unwrap();
+        assert_eq!(loaded, expected);
+    }
+
+    #[tokio::test]
+    async fn corrupt_provider_history_wal_is_discarded_for_canonical_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().join("agents"));
+        let agent = agent_id("agent-a");
+        let session = store
+            .create_with_id_factory(&agent, "system", || session_id("session_2222bbbb"), 1)
+            .await
+            .unwrap();
+        write_text_atomic(&session.paths.provider_history_json, b"{broken")
+            .await
+            .unwrap();
+
+        let metadata = session.read_metadata().await.unwrap();
+
+        assert!(metadata
+            .compaction
+            .and_then(|state| state.provider_history)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_session_initializes_background_completion_cursors_at_historical_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().join("agents"));
+        let agent = agent_id("agent-a");
+        let mut session = store
+            .create_with_id_factory(&agent, "system", || session_id("session_3333cccc"), 1)
+            .await
+            .unwrap();
+        let mut writer = session.open_turn_journal_writer().await.unwrap();
+        writer
+            .append(
+                "turn_1",
+                Utc::now(),
+                TurnJournalEventKind::BackgroundProcessCompleted {
+                    tool_use_id: "toolu_old".into(),
+                    process_id: "oldproc1".into(),
+                    instance_id: 1,
+                    status: "finished".into(),
+                    exit_code: Some(0),
+                    signal: None,
+                    success: true,
+                },
+                TurnJournalFlush::Immediate,
+            )
+            .await
+            .unwrap();
+        drop(writer);
+        let historical_tail = session.read_turn_journal().await.events.last().unwrap().seq;
+        session.metadata.provider_background_completion_until_seq = None;
+        session.metadata.recap_background_completion_until_seq = None;
+        write_yaml_atomic(&session.paths.session_yaml, &session.metadata)
+            .await
+            .unwrap();
+
+        let loaded = store
+            .load_existing_session(&agent, &session.metadata.id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            loaded.metadata.provider_background_completion_until_seq,
+            Some(historical_tail)
+        );
+        assert_eq!(
+            loaded.metadata.recap_background_completion_until_seq,
+            Some(historical_tail)
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_legacy_session_migrates_inline_provider_history_to_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().join("agents"));
+        let agent = agent_id("agent-a");
+        let mut session = store
+            .create_with_id_factory(&agent, "system", || session_id("session_4444dddd"), 1)
+            .await
+            .unwrap();
+        let expected = CompactedProviderHistory {
+            replay_identity: None,
+            pending_turn: None,
+            canonical_message_until: 0,
+            messages: vec![SessionTurnMessage::user_text("legacy exact window")],
+        };
+        session.metadata.compaction = Some(SessionCompactionState::from_committed_summary(
+            0,
+            String::new(),
+            Utc::now(),
+        ));
+        let mut legacy_yaml = serde_yaml_ng::to_string(&session.metadata).unwrap();
+        legacy_yaml.push_str("  provider_history:\n");
+        for line in serde_yaml_ng::to_string(&expected).unwrap().lines() {
+            legacy_yaml.push_str("    ");
+            legacy_yaml.push_str(line);
+            legacy_yaml.push('\n');
+        }
+        write_text_atomic(&session.paths.session_yaml, legacy_yaml.as_bytes())
+            .await
+            .unwrap();
+
+        let loaded = store
+            .load_existing_session(&agent, &session.metadata.id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            loaded
+                .metadata
+                .compaction
+                .as_ref()
+                .and_then(|state| state.provider_history.as_deref()),
+            Some(&expected)
+        );
+        assert!(fs::try_exists(&loaded.paths.provider_history_json)
+            .await
+            .unwrap());
+        let migrated_yaml = fs::read_to_string(&loaded.paths.session_yaml)
+            .await
+            .unwrap();
+        assert!(!migrated_yaml.contains("provider_history"));
     }
 
     #[test]
@@ -2758,7 +3166,7 @@ frontier:
 
         let session_ids = sessions
             .iter()
-            .map(|session| session.metadata.id.clone())
+            .map(|session| session.id.clone())
             .collect::<Vec<_>>();
         assert_eq!(
             session_ids,
@@ -2804,7 +3212,7 @@ frontier:
         let sessions = store.list_resumable_sessions(&agent).await.unwrap();
 
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].metadata.id, resumable_id);
+        assert_eq!(sessions[0].id, resumable_id);
     }
 
     #[tokio::test]
@@ -2826,6 +3234,44 @@ frontier:
             error,
             SessionStoreError::Storage(StorageError::Decode { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn list_resumable_sessions_does_not_decode_legacy_inline_provider_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let agent = agent_id("agent-a");
+        let mut session = create_session(
+            &store,
+            &agent,
+            session_id("session_aaaaaaaa"),
+            Utc::now(),
+            &[NewSessionMessage::text(
+                SessionMessageRole::User,
+                "legacy resumable",
+            )],
+            true,
+        )
+        .await;
+        session.metadata.compaction = Some(SessionCompactionState::from_committed_summary(
+            0,
+            String::new(),
+            Utc::now(),
+        ));
+        let mut legacy_yaml = serde_yaml_ng::to_string(&session.metadata).unwrap();
+        legacy_yaml.push_str("  provider_history: not-a-valid-provider-history\n");
+        write_text_atomic(&session.paths.session_yaml, legacy_yaml.as_bytes())
+            .await
+            .unwrap();
+
+        let sessions = store.list_resumable_sessions(&agent).await.unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session.metadata.id);
+        assert_eq!(
+            sessions[0].last_user_text.as_deref(),
+            Some("legacy resumable")
+        );
     }
 
     #[tokio::test]
@@ -2879,7 +3325,7 @@ frontier:
         let sessions = store.list_resumable_sessions(&agent).await.unwrap();
 
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].metadata.id, session_id("session_aaaaaaaa"));
+        assert_eq!(sessions[0].id, session_id("session_aaaaaaaa"));
         assert_eq!(
             sessions[0].last_user_text.as_deref(),
             Some("journal only request")
@@ -2962,8 +3408,8 @@ frontier:
 
         let sessions = store.list_resumable_sessions(&agent).await.unwrap();
 
-        assert_eq!(sessions[0].metadata.id, session_id("session_bbbbbbbb"));
-        assert_eq!(sessions[1].metadata.id, session_id("session_aaaaaaaa"));
+        assert_eq!(sessions[0].id, session_id("session_bbbbbbbb"));
+        assert_eq!(sessions[1].id, session_id("session_aaaaaaaa"));
     }
 
     #[tokio::test]
@@ -3341,7 +3787,7 @@ frontier:
         let sessions = store.list_resumable_sessions(&agent).await.unwrap();
 
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].metadata.id, session_id("session_cccccccc"));
+        assert_eq!(sessions[0].id, session_id("session_cccccccc"));
         assert_eq!(sessions[0].last_user_text.as_deref(), Some("real user"));
     }
 

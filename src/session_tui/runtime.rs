@@ -13,6 +13,7 @@ use crate::agent::{
 };
 use crate::claim::SessionId;
 use crate::mcp::connection_manager::McpRuntimeState;
+use crate::session::TurnJournalEventKind;
 
 use super::input_queue::QueuedInput;
 
@@ -1034,10 +1035,6 @@ fn spawn_finalize_enqueue_worker(
 ) {
     tokio::spawn(async move {
         match async {
-            let metadata = session.read_metadata().await?;
-            if !finalize_needs_background_job(&metadata) {
-                return anyhow::Ok(None);
-            }
             let event_tx = worker_tx.clone();
             let mut emit = move |event| {
                 let _ = event_tx.send(WorkerEvent::Session {
@@ -1048,6 +1045,12 @@ fn spawn_finalize_enqueue_worker(
             engine
                 .mark_session_finalizing(&mut session, &mut emit)
                 .await?;
+            // 先收束 live/pending process 并持久化终态，再判断是否需要后台 recap；
+            // 否则 completion 尚未进入 journal 时会误走 TUI 前台 finalize。
+            let metadata = session.read_metadata().await?;
+            if !finalize_needs_background_job(&session.paths.turn_events_jsonl, &metadata).await {
+                return anyhow::Ok(None);
+            }
             let job_id =
                 crate::supervisor::enqueue_finalize(&supervisor, session.metadata.id.clone())
                     .await?;
@@ -1086,8 +1089,25 @@ fn spawn_finalize_enqueue_worker(
     });
 }
 
-fn finalize_needs_background_job(metadata: &crate::session::SessionMetadata) -> bool {
-    metadata.message_count > metadata.recapped_until
+async fn finalize_needs_background_job(
+    turn_journal_path: &std::path::Path,
+    metadata: &crate::session::SessionMetadata,
+) -> bool {
+    if metadata.message_count > metadata.recapped_until {
+        return true;
+    }
+    let recap_until = metadata.recap_background_completion_until_seq.unwrap_or(0);
+    crate::session::read_session_turn_journal(turn_journal_path)
+        .await
+        .events
+        .iter()
+        .any(|event| {
+            event.seq > recap_until
+                && matches!(
+                    event.kind,
+                    TurnJournalEventKind::BackgroundProcessCompleted { .. }
+                )
+        })
 }
 
 #[cfg(test)]
@@ -2035,8 +2055,9 @@ mod tests {
         assert!(interrupted.tool_calls[0].file_change.is_some());
     }
 
-    #[test]
-    fn finalize_background_job_only_needed_for_unrecapped_messages() {
+    #[tokio::test]
+    async fn finalize_background_job_covers_unrecapped_messages_and_completions() {
+        let temp = tempfile::tempdir().unwrap();
         let mut metadata = crate::session::SessionMetadata {
             id: SessionId::from_str("session_1234abcd").unwrap(),
             agent_id: AgentId::new("agent-a").unwrap(),
@@ -2050,17 +2071,46 @@ mod tests {
             message_count: 2,
             finalized_at: None,
             recapped_until: 2,
+            provider_background_completion_until_seq: Some(0),
+            recap_background_completion_until_seq: Some(0),
             compaction: None,
         };
+        let paths = crate::session::SessionPaths::new(temp.path(), &metadata.id);
+        tokio::fs::create_dir_all(&paths.dir).await.unwrap();
 
-        assert!(!finalize_needs_background_job(&metadata));
+        assert!(!finalize_needs_background_job(&paths.turn_events_jsonl, &metadata).await);
 
         metadata.recapped_until = 1;
-        assert!(finalize_needs_background_job(&metadata));
+        assert!(finalize_needs_background_job(&paths.turn_events_jsonl, &metadata).await);
 
         metadata.message_count = 0;
         metadata.recapped_until = 0;
-        assert!(!finalize_needs_background_job(&metadata));
+        assert!(!finalize_needs_background_job(&paths.turn_events_jsonl, &metadata).await);
+
+        let mut writer = crate::session::TurnJournalWriter::open(paths.turn_events_jsonl.clone())
+            .await
+            .unwrap();
+        let completion = writer
+            .append(
+                "turn-background",
+                Utc::now(),
+                TurnJournalEventKind::BackgroundProcessCompleted {
+                    tool_use_id: "tool-background".into(),
+                    process_id: "process-background".into(),
+                    instance_id: 7,
+                    status: "finished".into(),
+                    exit_code: Some(0),
+                    signal: None,
+                    success: true,
+                },
+                crate::session::TurnJournalFlush::Immediate,
+            )
+            .await
+            .unwrap();
+        assert!(finalize_needs_background_job(&paths.turn_events_jsonl, &metadata).await);
+
+        metadata.recap_background_completion_until_seq = Some(completion.seq);
+        assert!(!finalize_needs_background_job(&paths.turn_events_jsonl, &metadata).await);
     }
 
     #[tokio::test]

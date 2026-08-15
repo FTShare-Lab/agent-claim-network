@@ -103,11 +103,34 @@ impl ToolRegistry {
         session_id: &SessionId,
         subagent_id: Option<&str>,
     ) -> (Option<String>, Vec<ProcessCompletionDeliveryReceipt>) {
+        self.begin_background_process_projection_delivery_for_owner_with_persisted(
+            session_id,
+            subagent_id,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub(crate) async fn begin_background_process_projection_delivery_for_owner_with_persisted(
+        &self,
+        session_id: &SessionId,
+        subagent_id: Option<&str>,
+        persisted_completions: Vec<ProcessCompletion>,
+    ) -> (Option<String>, Vec<ProcessCompletionDeliveryReceipt>) {
         let owner = self.process_owner_for_session(session_id, subagent_id);
-        let (delivery_ids, completion_notifications) = self
+        let (delivery_ids, mut completion_notifications) = self
             .process_manager
             .begin_completion_notification_delivery_snapshot(&owner)
             .await;
+        completion_notifications.extend(persisted_completions);
+        completion_notifications.sort_by(|left, right| {
+            left.process_id
+                .cmp(&right.process_id)
+                .then_with(|| left.instance_id.cmp(&right.instance_id))
+        });
+        completion_notifications.dedup_by(|left, right| {
+            left.process_id == right.process_id && left.instance_id == right.instance_id
+        });
         let projection = self
             .background_process_projection_for_owner_with_notifications(
                 &owner,
@@ -117,10 +140,56 @@ impl ToolRegistry {
         (projection, delivery_ids)
     }
 
+    /// Main session 先冻结本 request 可见的 completion，再由 SessionEngine 将同一批次
+    /// 写入 turn journal。冻结后到 projection 之间新完成的进程留到下一次 request。
+    pub(crate) async fn begin_background_completion_delivery_for_owner(
+        &self,
+        session_id: &SessionId,
+        subagent_id: Option<&str>,
+    ) -> (
+        Vec<ProcessCompletionDeliveryReceipt>,
+        Vec<ProcessCompletion>,
+    ) {
+        let owner = self.process_owner_for_session(session_id, subagent_id);
+        self.process_manager
+            .begin_completion_notification_delivery_snapshot(&owner)
+            .await
+    }
+
+    pub(crate) async fn background_process_projection_for_owner_with_journaled_terminals(
+        &self,
+        session_id: &SessionId,
+        subagent_id: Option<&str>,
+        completion_notifications: Vec<ProcessCompletion>,
+        journaled_terminal_instances: &BTreeSet<(String, u64)>,
+    ) -> Option<String> {
+        let owner = self.process_owner_for_session(session_id, subagent_id);
+        self.background_process_projection_for_owner_with_notifications_inner(
+            &owner,
+            completion_notifications,
+            Some(journaled_terminal_instances),
+        )
+        .await
+    }
+
     pub(super) async fn background_process_projection_for_owner_with_notifications(
         &self,
         owner: &ProcessOwner,
         completion_notifications: Vec<ProcessCompletion>,
+    ) -> Option<String> {
+        self.background_process_projection_for_owner_with_notifications_inner(
+            owner,
+            completion_notifications,
+            None,
+        )
+        .await
+    }
+
+    async fn background_process_projection_for_owner_with_notifications_inner(
+        &self,
+        owner: &ProcessOwner,
+        completion_notifications: Vec<ProcessCompletion>,
+        journaled_terminal_instances: Option<&BTreeSet<(String, u64)>>,
     ) -> Option<String> {
         let entries = self.process_manager.retained_for_owner(owner).await;
         if entries.is_empty() && completion_notifications.is_empty() {
@@ -129,6 +198,13 @@ impl ToolRegistry {
         let mut rows = Vec::new();
         for entry in entries {
             let state = entry.state().await;
+            if !state.is_live()
+                && journaled_terminal_instances.is_some_and(|instances| {
+                    !instances.contains(&(entry.id.as_str().to_string(), entry.instance_id))
+                })
+            {
+                continue;
+            }
             let final_output_available = !state.is_live();
             let command = truncate_chars(&entry.command, 400).0;
             let cwd = truncate_chars(&entry.cwd, 200).0;
@@ -748,7 +824,7 @@ impl ToolRegistry {
         }
     }
 
-    pub(super) fn process_owner_for_session(
+    pub(crate) fn process_owner_for_session(
         &self,
         session_id: &SessionId,
         subagent_id: Option<&str>,

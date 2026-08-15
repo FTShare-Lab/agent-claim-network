@@ -40,6 +40,8 @@ pub enum ResponsesError {
     Incomplete { reason: String },
     #[error("Responses recovery interrupted")]
     RecoveryInterrupted,
+    #[error("Responses request preparation failed: {reason}")]
+    RequestPreparation { reason: String },
 }
 
 pub struct ResponsesClient {
@@ -196,11 +198,40 @@ impl ResponsesClient {
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
     ) -> Result<(ReducedResponses, ProviderTransport), ResponsesError> {
+        let mut noop = || Ok(());
+        self.send_with_retry_count_for_runtime_scope_and_transport_and_start_hook(
+            request,
+            retry_count,
+            runtime_chain_id,
+            runtime_fallback_scope,
+            retry_after_partial,
+            recovery_interrupt,
+            emit,
+            &mut noop,
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Responses transport 需显式携带 continuation、fallback、恢复中断与 WAL start hook"
+    )]
+    pub(crate) async fn send_with_retry_count_for_runtime_scope_and_transport_and_start_hook(
+        &self,
+        request: &ResponsesRequest,
+        retry_count: u32,
+        runtime_chain_id: Option<ProviderRuntimeChainId>,
+        runtime_fallback_scope: Option<&ProviderRuntimeFallbackScope>,
+        retry_after_partial: bool,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+        emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
+        request_started: &mut (dyn FnMut() -> Result<(), ResponsesError> + Send),
+    ) -> Result<(ReducedResponses, ProviderTransport), ResponsesError> {
         ensure_recovery_active(recovery_interrupt)?;
         if request.stream {
             if let (Some(websocket), Some(runtime_chain_id)) = (&self.websocket, runtime_chain_id) {
                 match websocket
-                    .send_with_retry_count_for_scope(
+                    .send_with_retry_count_for_scope_and_start_hook(
                         request,
                         runtime_chain_id,
                         runtime_fallback_scope,
@@ -210,6 +241,7 @@ impl ResponsesClient {
                         recovery_interrupt,
                         retry_after_partial,
                         emit,
+                        request_started,
                     )
                     .await?
                 {
@@ -227,11 +259,12 @@ impl ResponsesClient {
                 retry_after_partial,
                 recovery_interrupt,
                 emit,
+                request_started,
             )
             .await
             .map(|response| (response, ProviderTransport::ResponsesSse))
         } else {
-            self.send_json_with_retry(request, retry_count, recovery_interrupt)
+            self.send_json_with_retry(request, retry_count, recovery_interrupt, request_started)
                 .await
                 .map(|response| (response, ProviderTransport::ResponsesNonStreaming))
         }
@@ -242,11 +275,12 @@ impl ResponsesClient {
         request: &ResponsesRequest,
         retry_count: u32,
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+        request_started: &mut (dyn FnMut() -> Result<(), ResponsesError> + Send),
     ) -> Result<ReducedResponses, ResponsesError> {
         let mut last_retryable = None;
         for attempt in 0..=retry_count {
             ensure_recovery_active(recovery_interrupt)?;
-            match self.send_json_once(request).await {
+            match self.send_json_once(request, request_started).await {
                 Ok(value) => return Ok(value),
                 Err(error) if is_retryable(&error) && attempt < retry_count => {
                     let backoff =
@@ -275,13 +309,16 @@ impl ResponsesClient {
     async fn send_json_once(
         &self,
         request: &ResponsesRequest,
+        request_started: &mut (dyn FnMut() -> Result<(), ResponsesError> + Send),
     ) -> Result<ReducedResponses, ResponsesError> {
-        let response = self
+        let pending = self
             .http
             .post(self.endpoint.as_str())
             .bearer_auth(self.api_key.as_str())
             .header("content-type", "application/json")
-            .json(request)
+            .json(request);
+        request_started()?;
+        let response = pending
             .send()
             .await
             .map_err(|error| self.http_error(error, LlmHttpPhase::SendRequest))?;
@@ -295,6 +332,7 @@ impl ResponsesClient {
         retry_after_partial: bool,
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
+        request_started: &mut (dyn FnMut() -> Result<(), ResponsesError> + Send),
     ) -> Result<ReducedResponses, ResponsesError> {
         let mut last_retryable = None;
         for attempt in 0..=retry_count {
@@ -305,7 +343,8 @@ impl ResponsesClient {
                     emitted_visible_text = true;
                     emit(event);
                 };
-                self.send_streaming_once(request, &mut tracking_emit).await
+                self.send_streaming_once(request, &mut tracking_emit, request_started)
+                    .await
             };
             match result {
                 Ok(value) => return Ok(value),
@@ -341,14 +380,17 @@ impl ResponsesClient {
         &self,
         request: &ResponsesRequest,
         emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
+        request_started: &mut (dyn FnMut() -> Result<(), ResponsesError> + Send),
     ) -> Result<ReducedResponses, ResponsesError> {
-        let response = self
+        let pending = self
             .http
             .post(self.endpoint.as_str())
             .bearer_auth(self.api_key.as_str())
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
-            .json(request)
+            .json(request);
+        request_started()?;
+        let response = pending
             .send()
             .await
             .map_err(|error| self.http_error(error, LlmHttpPhase::SendRequest))?;
@@ -417,7 +459,8 @@ fn is_retryable(error: &ResponsesError) -> bool {
         | ResponsesError::OutputShape { .. }
         | ResponsesError::Failed { .. }
         | ResponsesError::Incomplete { .. }
-        | ResponsesError::RecoveryInterrupted => false,
+        | ResponsesError::RecoveryInterrupted
+        | ResponsesError::RequestPreparation { .. } => false,
     }
 }
 
