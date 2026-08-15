@@ -44,7 +44,7 @@ use crate::session::SessionStore;
 use crate::session_search::{SessionSearchConfig, SessionSearchService, SessionSearchSummarizer};
 use crate::skill::SkillRegistry;
 use crate::storage::paths;
-use crate::tool::ToolRegistry;
+use crate::tool::{EvaluationSubmission, ToolRegistry};
 
 const ROUTER_VECTOR_WORKER_TASK_NAME: &str = "router_vector_worker";
 const ROUTER_REFRESH_WORKER_TASK_NAME: &str = "router_refresh_worker";
@@ -243,11 +243,13 @@ pub fn build_agent_cli_session_engine_with_mcp(
     Ok(engine)
 }
 
-/// 构造非交互评测 session engine。评测使用冻结 router，但不读取 inbox、私有 memory 或 ACN.md。
-pub fn build_evaluation_session_engine(
+/// 构造非交互评测 session engine。评测使用冻结 router，不读取 inbox 或私有 memory，
+/// 只读取 runtime 写入的固定 ACN.md Claim 使用引导。
+pub(crate) fn build_evaluation_session_engine(
     cfg: &Config,
     upstream: &ResolvedUpstream,
     router: Arc<dyn RouterClient>,
+    submission: EvaluationSubmission,
 ) -> anyhow::Result<SessionEngine> {
     if !matches!(
         cfg.agent.llm.provider,
@@ -300,6 +302,7 @@ pub fn build_evaluation_session_engine(
             .with_process_owner_agent_id(upstream.agent_id.clone())
             .with_router_client(router)
             .for_evaluation(cfg.agent.llm.api_key_env.clone())
+            .with_evaluation_submission(submission)
             .with_attachment_limits(attachment_limits),
     );
     let turn_loop = Arc::new(
@@ -318,6 +321,9 @@ pub fn build_evaluation_session_engine(
         Arc::new(tools.as_ref().clone().for_memory_review()),
         MEMORY_REVIEW_MAX_TOOL_LOOP_TURNS,
         chat.max_tokens,
+        chat.retry_count,
+        Duration::from_millis(chat.retry_base_delay_ms),
+        Duration::from_millis(chat.retry_max_delay_ms),
     ));
     Ok(SessionEngine::new(
         runner,
@@ -337,6 +343,7 @@ pub fn build_evaluation_session_engine(
             runtime_profile: crate::agent::SessionRuntimeProfile::Evaluation,
         },
     )
+    .with_acn_md_path(cfg.storage.acn_md_path())
     .with_session_metadata("evaluation", cfg.agent.llm.model.clone())
     .with_session_search_sqlite_busy_timeout(std::time::Duration::from_millis(
         cfg.agent.tool.session_search_sqlite_busy_timeout_ms,
@@ -952,8 +959,8 @@ mod tests {
         assert!(engine.is_ok());
     }
 
-    #[test]
-    fn evaluation_engine_uses_skills_from_evaluation_runtime() {
+    #[tokio::test]
+    async fn evaluation_engine_uses_runtime_skills_and_acn_md_guidance() {
         let team = tempfile::tempdir().unwrap();
         let hosts = tempfile::tempdir().unwrap();
         let prompts = tempfile::tempdir().unwrap();
@@ -977,6 +984,7 @@ mod tests {
         )
         .unwrap();
         c.activate_evaluation_runtime(runtime.path()).unwrap();
+        std::fs::write(c.storage.acn_md_path(), "Claim guidance marker").unwrap();
         let runtime_skills = c.storage.skills_root();
         std::fs::create_dir_all(runtime_skills.join("coding-benchmark")).unwrap();
         std::fs::write(
@@ -996,7 +1004,9 @@ mod tests {
             )
             .unwrap(),
         );
-        let engine = build_evaluation_session_engine(&c, &upstream, router).unwrap();
+        let engine =
+            build_evaluation_session_engine(&c, &upstream, router, EvaluationSubmission::new())
+                .unwrap();
         let names: Vec<_> = engine
             .available_skills()
             .iter()
@@ -1004,6 +1014,15 @@ mod tests {
             .collect();
 
         assert_eq!(names, vec!["coding-benchmark"]);
+
+        let start = engine
+            .start_session_with_id_factory(|| "session_abcdef01".parse().unwrap(), 1, |_| {})
+            .await
+            .unwrap();
+        let system_prompt = tokio::fs::read_to_string(start.session.paths.system_prompt)
+            .await
+            .unwrap();
+        assert!(system_prompt.contains("Claim guidance marker"));
     }
 
     #[test]

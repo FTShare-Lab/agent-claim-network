@@ -20,6 +20,8 @@ from urllib.parse import unquote, urlparse
 
 from .dataset import FrozenDatasetManifest
 from .host_runner import (
+    DEFAULT_PROGRESS_POLL_SECS,
+    DEFAULT_PROGRESS_STALL_AFTER_SECS,
     EVALUATION_AUTO_COMPACT_CTX_RATIO,
     EVALUATION_CODE_RUN_MAX_OUTPUT_CHARS,
     EVALUATION_FILE_READ_MAX_CHARS,
@@ -30,7 +32,10 @@ from .plan import AttemptPlan
 from .presmoke import (
     PresmokeExecutionError,
     PresmokeHostRunner,
+    PresmokeTaskResult,
     PresmokeTaskSpec,
+    load_terminal_task_results,
+    reserve_interrupted_retries,
 )
 from .provenance import (
     TASK_DIRECTORY_HASH_ALGORITHM,
@@ -38,6 +43,7 @@ from .provenance import (
     sha256_directory_tree,
 )
 from .runner import build_experiment_manifest
+from .run_lock import exclusive_run_lock
 from .schemas import AttemptManifest
 
 
@@ -45,7 +51,6 @@ class PresmokeCliError(ValueError):
     """pre-smoke 启动配置、冻结输入或环境不满足要求。"""
 
 
-PIER_PACKAGE_VERSION = "0.3.0"
 ACN_REPOSITORY = Path(__file__).resolve().parents[4]
 ACN_SOURCE_ROOT = Path(__file__).resolve().parents[1]
 _PIER_INSTALL_EVIDENCE_SCRIPT = (
@@ -71,11 +76,14 @@ class PresmokeConfig:
     model: str
     response_model: str
     reasoning_effort: str
+    model_egress_mode: str
     resources: dict[str, int]
     timeouts: dict[str, int]
     llm_retry: dict[str, int]
+    progress: dict[str, int]
     acn_revision: str
     task_workers: int = 1
+    run_all_variants_without_claims: bool = False
 
 
 @dataclass(frozen=True)
@@ -106,7 +114,19 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="真实执行且环境未提供 key 时，通过隐藏输入读取 ACN_EVAL_UPSTREAM_KEY",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="仅续跑尚未产生终态的 task；不会重跑 Gate 或协议失败",
+    )
+    parser.add_argument(
+        "--retry-interrupted",
+        action="store_true",
+        help="与 --resume 一起使用：显式授权一次中断 task 的重新执行",
+    )
     args = parser.parse_args(argv)
+    if args.retry_interrupted and not args.resume:
+        parser.error("--retry-interrupted 必须与 --resume 一起使用")
     injected_upstream_key = False
     try:
         config = load_config(args.config)
@@ -122,41 +142,86 @@ def main(argv: list[str] | None = None) -> int:
             os.environ["ACN_EVAL_UPSTREAM_KEY"] = upstream_key
             injected_upstream_key = True
         verify_acn_revision(config.acn_revision)
-        if not args.dry_run:
-            preflight_execution(config)
-        frozen_runtime = None if args.dry_run else stage_python_runtime(config)
-        specs, frozen_task_ids = build_task_specs(
-            config,
-            upstream_base_url,
-            resolve_image_digests=not args.dry_run,
-            frozen_runtime=frozen_runtime,
-        )
         if args.dry_run:
+            all_specs, frozen_task_ids = build_task_specs(
+                config,
+                upstream_base_url,
+                resolve_image_digests=False,
+                frozen_runtime=None,
+            )
             print(
                 json.dumps(
-                    dry_run_summary(config, specs, frozen_task_ids), ensure_ascii=False, indent=2
+                    dry_run_summary(config, all_specs, frozen_task_ids), ensure_ascii=False, indent=2
                 )
             )
             return 0
-        runner = PresmokeHostRunner(
-            specs,
-            config.output_dir / "presmoke-aggregate.json",
-            task_workers=config.task_workers,
-            frozen_task_ids=frozen_task_ids,
-        )
-        results = runner.run(execute=True)
-        status = (
-            "completed_with_no_eligible_claim"
-            if any(item.status == "no_eligible_claim" for item in results)
-            else "passed"
-        )
-        print(
-            json.dumps(
-                {"status": status, "tasks": [item.to_dict() for item in results]},
-                ensure_ascii=False,
+        with exclusive_run_lock(config.output_dir / ".presmoke.lock", "pre-smoke 阶段"):
+            preflight_execution(config)
+            frozen_runtime = stage_python_runtime(config, allow_existing=args.resume)
+            all_specs, frozen_task_ids = build_task_specs(
+                config,
+                upstream_base_url,
+                resolve_image_digests=True,
+                frozen_runtime=frozen_runtime,
             )
-        )
-        return 0
+            completion_manifest_path = config.output_dir / "task-completions.json"
+            completed = (
+                load_terminal_task_results(all_specs, completion_manifest_path)
+                if args.resume
+                else ()
+            )
+            failed = [result.task_id for result in completed if result.status == "failed"]
+            if failed:
+                raise PresmokeCliError(
+                    "续跑拒绝覆盖已有失败终态（包括 Gate/协议失败）: " + ",".join(failed)
+                )
+            completed_ids = {result.task_id for result in completed}
+            pending_ids = tuple(task_id for task_id in frozen_task_ids if task_id not in completed_ids)
+            specs = all_specs
+            if args.resume and pending_ids:
+                interrupted_ids = tuple(
+                    spec.task_id
+                    for spec in all_specs
+                    if spec.task_id in pending_ids and _task_has_partial_artifacts(spec)
+                )
+                if interrupted_ids and not args.retry_interrupted:
+                    raise PresmokeCliError(
+                        "检测到中断 task；请显式传 --resume --retry-interrupted（每题最多一次）: "
+                        + ",".join(interrupted_ids)
+                    )
+                if interrupted_ids:
+                    reserve_interrupted_retries(completion_manifest_path, interrupted_ids)
+                resume_root = _next_resume_root(config.output_dir)
+                specs, _ = build_task_specs(
+                    config,
+                    upstream_base_url,
+                    resolve_image_digests=True,
+                    frozen_runtime=frozen_runtime,
+                    selected_task_ids=set(pending_ids),
+                    attempt_output_root=resume_root,
+                )
+                _write_resume_descriptor(resume_root, config, completed, specs)
+            runner = PresmokeHostRunner(
+                specs,
+                config.output_dir / "presmoke-aggregate.json",
+                task_workers=config.task_workers,
+                frozen_task_ids=frozen_task_ids,
+                completed_task_results=completed,
+                completion_manifest_path=completion_manifest_path,
+            )
+            results = runner.run(execute=True)
+            status = (
+                "completed_with_no_eligible_claim"
+                if any(item.status == "no_eligible_claim" for item in results)
+                else "passed"
+            )
+            print(
+                json.dumps(
+                    {"status": status, "tasks": [item.to_dict() for item in results]},
+                    ensure_ascii=False,
+                )
+            )
+            return 0
     except (OSError, ValueError, subprocess.SubprocessError, PresmokeExecutionError) as error:
         parser.error(str(error))
     finally:
@@ -205,6 +270,13 @@ def load_config(path: Path) -> PresmokeConfig:
     resources = _positive_int_mapping(raw, "resources")
     timeouts = _positive_int_mapping(raw, "timeouts")
     llm_retry = _positive_int_mapping(raw, "llm_retry")
+    progress_raw = raw.get("progress", {})
+    if not isinstance(progress_raw, Mapping):
+        raise PresmokeCliError("config.progress 必须是整数对象")
+    progress = {
+        str(key): _positive_int(value, f"config.progress.{key}")
+        for key, value in progress_raw.items()
+    }
     for required in (
         "cpus",
         "memory_mb",
@@ -222,16 +294,30 @@ def load_config(path: Path) -> PresmokeConfig:
     for required in ("retry_count", "retry_base_delay_ms", "retry_max_delay_ms"):
         if required not in llm_retry:
             raise PresmokeCliError(f"llm_retry 缺少字段: {required}")
+    progress = {
+        "poll_secs": progress.get("poll_secs", DEFAULT_PROGRESS_POLL_SECS),
+        "stall_after_secs": progress.get(
+            "stall_after_secs", DEFAULT_PROGRESS_STALL_AFTER_SECS
+        ),
+    }
+    if progress["stall_after_secs"] < progress["poll_secs"]:
+        raise PresmokeCliError("config.progress.stall_after_secs 不得小于 poll_secs")
     return PresmokeConfig(
         **paths,
         model=_nonempty_string(raw, "model"),
         response_model=_nonempty_string(raw, "response_model"),
         reasoning_effort=_nonempty_string(raw, "reasoning_effort"),
+        model_egress_mode=_model_egress_mode(raw),
         resources=resources,
         timeouts=timeouts,
         llm_retry=llm_retry,
+        progress=progress,
         acn_revision=_nonempty_string(raw, "acn_revision"),
         task_workers=_positive_int(raw.get("task_workers", 1), "task_workers"),
+        run_all_variants_without_claims=_boolean(
+            raw.get("run_all_variants_without_claims", False),
+            "run_all_variants_without_claims",
+        ),
     )
 
 
@@ -241,6 +327,8 @@ def build_task_specs(
     *,
     resolve_image_digests: bool = False,
     frozen_runtime: FrozenPythonRuntime | None = None,
+    selected_task_ids: set[str] | None = None,
+    attempt_output_root: Path | None = None,
 ) -> tuple[tuple[PresmokeTaskSpec, ...], tuple[str, ...]]:
     """验证冻结版本与 hash，并为每个 task 装配现有 HostRunner 输入。"""
     _require_file(config.frozen_manifest, "frozen_manifest")
@@ -284,6 +372,10 @@ def build_task_specs(
     verify_checkout_revision(config.deepswe_checkout, deepswe_revision)
     verify_checkout_revision(config.pier_checkout, pier_revision)
     frozen_task_ids = frozen_dataset.task_ids
+    if selected_task_ids is not None and not selected_task_ids <= set(frozen_task_ids):
+        raise PresmokeCliError("续跑 task 不属于冻结 manifest")
+    if attempt_output_root is not None and not attempt_output_root.is_absolute():
+        raise PresmokeCliError("续跑 attempt 输出根目录必须为绝对路径")
     plan = AttemptPlan.from_dict(_read_object(config.attempt_plan, "attempt plan"))
     if plan.freeze_candidates_hash != frozen_dataset.candidates_hash:
         raise PresmokeCliError("attempt plan.freeze_candidates_hash 不匹配冻结 manifest")
@@ -305,6 +397,8 @@ def build_task_specs(
     config_hash = _effective_config_hash(config)
     specs: list[PresmokeTaskSpec] = []
     for task_id in frozen_task_ids:
+        if selected_task_ids is not None and task_id not in selected_task_ids:
+            continue
         source_dir = config.source_tasks_root / task_id
         normalized_dir = config.normalized_root / task_id
         source = source_dir / "task.toml"
@@ -361,14 +455,32 @@ def build_task_specs(
             llm_retry=config.llm_retry,
             network_translation_warning="frozen normalized task directory validated by SHA-256",
         )
-        task_plan = AttemptPlan(1, plan.freeze_candidates_hash, plan.seed, by_task[task_id])
+        attempts = by_task[task_id]
+        if attempt_output_root is not None:
+            attempts = tuple(
+                AttemptManifest(
+                    attempt.schema_version,
+                    attempt.attempt_id,
+                    attempt.task_id,
+                    attempt.variant,
+                    str(
+                        attempt_output_root
+                        / "attempts"
+                        / attempt.attempt_id
+                        / "output"
+                    ),
+                )
+                for attempt in attempts
+            )
+        task_plan = AttemptPlan(1, plan.freeze_candidates_hash, plan.seed, attempts)
         experiment = build_experiment_manifest(
             f"{config.frozen_manifest.stem}-{task_id}",
             task_plan,
             None,
             provenance,
         )
-        task_output = config.output_dir / "tasks" / task_id
+        task_output_root = attempt_output_root if attempt_output_root is not None else config.output_dir
+        task_output = task_output_root / "tasks" / task_id
         specs.append(
             PresmokeTaskSpec(
                 task_id=task_id,
@@ -387,7 +499,11 @@ def build_task_specs(
                     expected_response_model=config.response_model,
                     frozen_acn_source_root=acn_source_root,
                     frozen_pier_source_root=pier_source_root,
+                    model_egress_mode=config.model_egress_mode,
                     require_eligible_claim=False,
+                    run_all_variants_without_claims=config.run_all_variants_without_claims,
+                    progress_poll_secs=config.progress["poll_secs"],
+                    progress_stall_after_secs=config.progress["stall_after_secs"],
                 ),
                 jobs_directory=task_output / "jobs",
                 manifest_path=task_output / "manifest.json",
@@ -443,7 +559,7 @@ def _run_checkout_git(
 
 
 def preflight_execution(config: PresmokeConfig) -> None:
-    """真实执行前检查 Pier 与 Docker；不创建任何 attempt 目录。"""
+    """真实执行前检查 Pier、Docker 和本阶段所需的官方任务镜像。"""
     verify_pier_executable_binding(config.pier_checkout, config.pier_executable)
     pier_help = _run_preflight_command([str(config.pier_executable), "--help"], "pier --help")
     if pier_help.returncode != 0:
@@ -455,10 +571,36 @@ def preflight_execution(config: PresmokeConfig) -> None:
     if docker_info.returncode != 0:
         raise PresmokeCliError("Docker daemon 不可用: docker info 失败")
     _verify_docker_capacity(docker_info.stdout, config)
+    _ensure_frozen_task_images_available(config)
 
 
-def stage_python_runtime(config: PresmokeConfig) -> FrozenPythonRuntime:
-    """把本次执行会 import 的 ACN/Pier 源码与 skill 冻结到输出目录。"""
+def _ensure_frozen_task_images_available(config: PresmokeConfig) -> None:
+    """预拉取本阶段去重后的官方镜像，再冻结其不可变 content digest。"""
+    manifest = FrozenDatasetManifest.from_dict(
+        _read_object(config.frozen_manifest, "冻结 manifest")
+    )
+    images = {
+        _task_image(config.normalized_root / task_id / "task.toml", task_id)
+        for task_id in manifest.task_ids
+    }
+    for image in sorted(images):
+        try:
+            _docker_image_content_digest(image)
+            continue
+        except PresmokeCliError:
+            pass
+        pulled = subprocess.run(
+            ["docker", "pull", image], check=False, capture_output=True, text=True
+        )
+        if pulled.returncode != 0:
+            raise PresmokeCliError(f"无法拉取官方 Docker image: {image}")
+        _docker_image_content_digest(image)
+
+
+def stage_python_runtime(
+    config: PresmokeConfig, *, allow_existing: bool = False
+) -> FrozenPythonRuntime:
+    """把本次执行会 import 的 ACN/Pier 源码冻结；续跑只能复用既有定版。"""
     sources = (
         (ACN_SOURCE_ROOT / "acn_deepswe", "ACN evaluation package"),
         (config.pier_checkout / "src" / "pier", "Pier package"),
@@ -470,6 +612,8 @@ def stage_python_runtime(config: PresmokeConfig) -> FrozenPythonRuntime:
 
     target = config.output_dir / "frozen-python"
     if target.exists():
+        if allow_existing:
+            return _load_frozen_python_runtime(target)
         raise PresmokeCliError(f"冻结 Python runtime 已存在，拒绝复用: {target}")
     config.output_dir.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=".frozen-python.", dir=config.output_dir))
@@ -501,6 +645,87 @@ def stage_python_runtime(config: PresmokeConfig) -> FrozenPythonRuntime:
     )
 
 
+def _load_frozen_python_runtime(target: Path) -> FrozenPythonRuntime:
+    """续跑使用第一次运行留下的只读 runtime，不能混入当前工作树。"""
+    acn_source_root = target / "acn-deepswe" / "src"
+    pier_source_root = target / "pier" / "src"
+    frozen_skill = target / "acn-deepswe" / "assets" / "coding-benchmark"
+    pier_executable = target / "pier" / "bin" / "pier"
+    _require_directory(acn_source_root / "acn_deepswe", "冻结 ACN evaluation package")
+    _require_directory(pier_source_root / "pier", "冻结 Pier package")
+    _require_file(frozen_skill / "SKILL.md", "冻结 frozen_skill/SKILL.md")
+    _require_file(pier_executable, "冻结 pier executable")
+    if pier_executable.stat().st_mode & stat.S_IWUSR:
+        raise PresmokeCliError("冻结 pier executable 不可写保护")
+    return FrozenPythonRuntime(
+        acn_source_root=acn_source_root,
+        pier_source_root=pier_source_root,
+        frozen_skill=frozen_skill,
+        pier_executable=pier_executable,
+        acn_package_tree_hash=sha256_directory_tree(acn_source_root),
+        pier_package_tree_hash=sha256_directory_tree(pier_source_root),
+    )
+
+
+def _next_resume_root(output_dir: Path) -> Path:
+    """每次续跑使用新目录，保留中断 task 的半成品供审计。"""
+    parent = output_dir / "resumes"
+    for index in range(1, 10_000):
+        candidate = parent / f"resume-{index:03d}"
+        if not candidate.exists():
+            return candidate
+    raise PresmokeCliError("续跑目录编号耗尽")
+
+
+def _task_has_partial_artifacts(spec: PresmokeTaskSpec) -> bool:
+    """原 task 目录或任一 arm 输出已出现，即视为中断而非尚未调度。"""
+    return spec.manifest_path.exists() or any(
+        Path(attempt.output_path).exists() for attempt in spec.experiment.attempts
+    )
+
+
+def _write_resume_descriptor(
+    resume_root: Path,
+    config: PresmokeConfig,
+    completed: tuple[PresmokeTaskResult, ...],
+    specs: tuple[PresmokeTaskSpec, ...],
+) -> None:
+    """将跳过与重跑的 task 边界落盘，避免最终汇总误把半成品当结果。"""
+    _atomic_write_json(
+        resume_root / "resume.json",
+        {
+            "schema_version": 1,
+            "source_attempt_plan": str(config.attempt_plan),
+            "completed_task_ids": [result.task_id for result in completed],
+            "rerun_task_ids": [spec.task_id for spec in specs],
+            "attempts": [
+                attempt.to_dict()
+                for spec in specs
+                for attempt in spec.experiment.attempts
+            ],
+        },
+    )
+
+
+def _atomic_write_json(path: Path, payload: object) -> None:
+    """续跑元数据也使用原子替换，避免再次中断时写出半个 JSON。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, delete=False
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            json.dump(payload, temporary, ensure_ascii=False, indent=2, sort_keys=True)
+            temporary.write("\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        temporary_path.replace(path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+
+
 def _copy_runtime_tree(source: Path, target: Path) -> None:
     shutil.copytree(
         source,
@@ -519,7 +744,7 @@ def _make_files_read_only(root: Path) -> None:
 
 
 def verify_pier_executable_binding(pier_checkout: Path, pier_executable: Path) -> None:
-    """将实际执行的 Pier 限定为冻结 checkout 内 source-installed 的 pinned 包。"""
+    """将实际执行的 Pier 限定为冻结 checkout 内 source-installed 的当前源码。"""
     checkout = pier_checkout.resolve()
     executable = pier_executable
     if executable.is_symlink() or not executable.is_file():
@@ -551,10 +776,11 @@ def verify_pier_executable_binding(pier_checkout: Path, pier_executable: Path) -
         raise PresmokeCliError("pier 安装版本与来源证据不是 JSON") from error
     if not isinstance(raw, Mapping):
         raise PresmokeCliError("pier 安装版本与来源证据必须是对象")
-    if raw.get("version") != PIER_PACKAGE_VERSION:
-        raise PresmokeCliError(
-            f"pier 安装版本不匹配: expected={PIER_PACKAGE_VERSION}, actual={raw.get('version')!r}"
-        )
+    # PyPI metadata 的 version 可能滞后于 DeepSWE 所需的 Pier main revision；可复现性
+    # 由 manifest 中的精确 checkout SHA 与下面的 PEP 610 editable 来源共同保证，而非
+    # 用一个发布版本号错误地拒绝已冻结的新源码。
+    if not isinstance(raw.get("version"), str) or not raw["version"]:
+        raise PresmokeCliError("pier 安装来源证据缺少非空 package version")
     direct_url = raw.get("direct_url")
     if not isinstance(direct_url, str):
         raise PresmokeCliError("pier 安装缺少 PEP 610 direct_url 来源证据")
@@ -622,7 +848,10 @@ def dry_run_summary(
         "model": config.model,
         "response_model": config.response_model,
         "reasoning_effort": config.reasoning_effort,
+        "model_egress_mode": config.model_egress_mode,
         "task_workers": config.task_workers,
+        "run_all_variants_without_claims": config.run_all_variants_without_claims,
+        "progress": config.progress,
         "task_order": list(frozen_task_ids),
         "tasks": [
             {
@@ -646,8 +875,12 @@ def _attempts_by_task(
     for task_id in task_ids:
         attempts = tuple(grouped[task_id])
         variants = tuple(item.variant for item in attempts)
-        if len(attempts) != 3 or variants[0] != "A" or set(variants[1:]) != {"B_empty", "B_claim"}:
-            raise PresmokeCliError(f"attempt plan task 三臂无效: {task_id}")
+        if (
+            len(attempts) != 4
+            or variants[0] != "A"
+            or set(variants[1:]) != {"B_empty", "B_claim", "B_forced_claim"}
+        ):
+            raise PresmokeCliError(f"attempt plan task 四臂无效: {task_id}")
         typed[task_id] = attempts
     return typed
 
@@ -679,6 +912,14 @@ def _nonempty_string(raw: Mapping[str, object], field: str) -> str:
     return value
 
 
+def _model_egress_mode(raw: Mapping[str, object]) -> str:
+    """默认使用 Pier allowlist；direct 仅能从冻结 config 显式选择。"""
+    value = raw.get("model_egress_mode", "pier")
+    if value not in {"pier", "direct"}:
+        raise PresmokeCliError("config.model_egress_mode 仅支持 pier 或 direct")
+    return value
+
+
 def _positive_int_mapping(raw: Mapping[str, object], field: str) -> dict[str, int]:
     value = raw.get(field)
     if not isinstance(value, Mapping):
@@ -689,6 +930,12 @@ def _positive_int_mapping(raw: Mapping[str, object], field: str) -> dict[str, in
 def _positive_int(value: object, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise PresmokeCliError(f"{field} 必须为正整数")
+    return value
+
+
+def _boolean(value: object, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise PresmokeCliError(f"{field} 必须为布尔值")
     return value
 
 
@@ -761,9 +1008,12 @@ def _effective_config_hash(config: PresmokeConfig) -> str:
         "model": config.model,
         "response_model": config.response_model,
         "reasoning_effort": config.reasoning_effort,
+        "model_egress_mode": config.model_egress_mode,
         "resources": config.resources,
         "timeouts": config.timeouts,
         "llm_retry": config.llm_retry,
+        "progress": config.progress,
+        "run_all_variants_without_claims": config.run_all_variants_without_claims,
         "auto_compact_ctx_ratio": EVALUATION_AUTO_COMPACT_CTX_RATIO,
         "file_read_max_chars": EVALUATION_FILE_READ_MAX_CHARS,
         "code_run_max_output_chars": EVALUATION_CODE_RUN_MAX_OUTPUT_CHARS,

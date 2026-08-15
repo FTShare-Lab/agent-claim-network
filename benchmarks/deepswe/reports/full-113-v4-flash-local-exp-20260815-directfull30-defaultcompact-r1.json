@@ -1,0 +1,60 @@
+{
+  "schema_version": 2,
+  "run_id": "deepswe-113-four-arm-v4-flash-local-exp-20260815-directfull30-defaultcompact-r1",
+  "status": "completed_with_same_config_resume",
+  "provenance": {
+    "acn_main_revision": "70473898468c1cfbd036d350a70cae4de12afdce",
+    "acn_evaluation_revision": "992b039c0805b4032d33a513f6959cca703d8d1a+evaluation-worktree",
+    "acn_config_hash": "05586a7ca5ae50d3d5ae668b3de9bbf526895df02dee8a9e0994e8fe613c9625",
+    "deepswe_revision": "435ee89ec2f2e2289f33b0da4f992f0b7b7266b9",
+    "pier_revision": "0daf53d3599e58c4506cf0bcff5e12c77dc282d2",
+    "model": "deepseek-v4-flash-local-exp",
+    "expected_response_model": "deepseek-v4-flash",
+    "provider": "openai_responses",
+    "reasoning_effort": "max"
+  },
+  "configuration": {
+    "task_count": 113,
+    "variants": ["A", "B_empty", "B_claim", "B_forced_claim"],
+    "rollouts_per_task_arm": 1,
+    "task_workers": 30,
+    "run_all_variants_without_claims": true,
+    "smoke_size": 0,
+    "context_window": 1000000,
+    "max_tokens": 65536,
+    "recap_compact_ratio": 0.8,
+    "resources_per_task": {"cpus": 2, "memory_mb": 8192, "storage_mb": 20480},
+    "timeouts": {"agent_seconds": 5400, "deadline_reserve_seconds": 120, "verifier_seconds": 1800},
+    "llm_retry": {"retry_count": 2, "retry_base_delay_ms": 1000, "retry_max_delay_ms": 30000},
+    "network": {
+      "agent": "no-network",
+      "verifier": "no-network",
+      "model_egress_mode": "not_frozen_in_historical_attempt_config",
+      "current_formal_eligibility": "not_recertifiable_without_model_egress_mode=pier"
+    },
+    "progress": {"poll_secs": 30, "stall_after_secs": 600, "automatic_termination": false}
+  },
+  "scoring_selection": {
+    "rule": "Historical selection: keep the original task-arm whenever its then-current formal gate passed; replace only historical formal failures or a missing arm with the same-config resume result. Never select by verifier outcome.",
+    "gate_definition": "historical; model egress was not frozen in attempt TOML",
+    "scored_task_arms": 452,
+    "formal_gate_pass": 452,
+    "formal_gate_fail": 0,
+    "original_attempts": 451,
+    "resume_attempts": 8,
+    "selected_resume_replacements": 3,
+    "unscored_duplicate_resume_attempts": 5
+  },
+  "results_by_variant": [
+    {"variant": "A", "tasks": 113, "verifier_pass": 46, "verifier_rate_pct": 40.708, "mean_steps": 124.22, "median_steps": 112, "p90_steps": 197, "max_steps": 357, "input_tokens": 2185180145, "cache_read_tokens": 2148729088, "cache_hit_rate_pct": 98.3319, "output_tokens": 13948068, "reasoning_tokens": 9432581, "model_requests": 14038},
+    {"variant": "B_empty", "tasks": 113, "verifier_pass": 48, "verifier_rate_pct": 42.478, "mean_steps": 123.79, "median_steps": 116, "p90_steps": 181, "max_steps": 455, "input_tokens": 2149188811, "cache_read_tokens": 2116013568, "cache_hit_rate_pct": 98.4564, "output_tokens": 13639337, "reasoning_tokens": 9387699, "model_requests": 13988},
+    {"variant": "B_claim", "tasks": 113, "verifier_pass": 46, "verifier_rate_pct": 40.708, "mean_steps": 117.62, "median_steps": 105, "p90_steps": 179, "max_steps": 337, "input_tokens": 1978571086, "cache_read_tokens": 1945239296, "cache_hit_rate_pct": 98.3154, "output_tokens": 13700243, "reasoning_tokens": 9405192, "model_requests": 13291},
+    {"variant": "B_forced_claim", "tasks": 113, "verifier_pass": 50, "verifier_rate_pct": 44.248, "mean_steps": 116.68, "median_steps": 99, "p90_steps": 181, "max_steps": 374, "input_tokens": 1951971019, "cache_read_tokens": 1920224256, "cache_hit_rate_pct": 98.3736, "output_tokens": 13356510, "reasoning_tokens": 9121403, "model_requests": 13185}
+  ],
+  "task_level_summary": {"all_four_pass": 15, "at_least_one_pass": 79, "success_arm_distribution": {"0": 34, "1": 20, "2": 22, "3": 22, "4": 15}},
+  "resource_ledgers": {
+    "scored_selection": {"input_tokens": 8264911061, "cache_read_tokens": 8130206208, "output_tokens": 54644158, "reasoning_tokens": 37346875, "model_requests": 54502},
+    "all_executed_attempts": {"task_arms": 459, "input_tokens": 8453917008, "cache_read_tokens": 8316997888, "cache_hit_rate_pct": 98.38, "output_tokens": 55607317, "reasoning_tokens": 37978981, "model_requests": 55480}
+  },
+  "comparison_caveat": "The external 54.4 figure is not a directly comparable scorecard without matching task revision, agent harness, prompt, sampling, retry policy and service checkpoint. The highest local arm is 44.248%, a 10.152 percentage point difference from 54.4%."
+}

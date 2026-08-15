@@ -1,4 +1,4 @@
-"""三臂 attempt 的机器可判定硬门禁。
+"""四臂 attempt 的机器可判定硬门禁。
 
 只检查基础设施、claim 归因与隔离是否成立。verifier 判 0 分是有效实验结果，
 不算门禁失败；agent 自身失败同理，由调用方按未通过计分。
@@ -35,6 +35,7 @@ class AttemptGateInput:
     claim_used_ids: tuple[str, ...]
     isolation_checks: Mapping[str, bool]
     require_claim_injection: bool = False
+    allow_empty_claim_bundle: bool = False
 
     @classmethod
     def from_rust_result(
@@ -50,6 +51,7 @@ class AttemptGateInput:
         frozen_claim_content_hashes: Mapping[str, str],
         isolation_checks: Mapping[str, bool],
         require_claim_injection: bool = False,
+        allow_empty_claim_bundle: bool = False,
     ) -> AttemptGateInput:
         """将 Rust 定版 result 直接映射为 gate 输入，字段不做历史别名兼容。"""
         return cls(
@@ -69,6 +71,7 @@ class AttemptGateInput:
             claim_used_ids=result.claim_used_ids,
             isolation_checks=isolation_checks,
             require_claim_injection=require_claim_injection,
+            allow_empty_claim_bundle=allow_empty_claim_bundle,
         )
 
 
@@ -89,7 +92,7 @@ class GateValidator:
             failures.append("ISOLATION_CHECK_FAILED")
         if value.router_evidence_incomplete:
             failures.append("ROUTER_EVIDENCE_INCOMPLETE")
-        self._validate_router(value, failures)
+        self._validate_router(value, failures, warnings)
         reason = ",".join(failures) if failures else "ALL_REQUIRED_EVIDENCE_PRESENT"
         if warnings:
             reason = f"{reason}_WITH_{'_AND_'.join(warnings)}"
@@ -126,7 +129,9 @@ class GateValidator:
             failures.append("RESPONSE_MODEL_MISMATCH")
 
     @staticmethod
-    def _validate_router(value: AttemptGateInput, failures: list[str]) -> None:
+    def _validate_router(
+        value: AttemptGateInput, failures: list[str], warnings: list[str]
+    ) -> None:
         if any(evidence.attempt_id != value.attempt_id for evidence in value.router_evidence):
             failures.append("ROUTER_EVIDENCE_ATTEMPT_MISMATCH")
         candidates = {
@@ -147,34 +152,39 @@ class GateValidator:
         used = set(value.claim_used_ids)
         if value.variant == "B_empty" and (candidates or selected or injected or used):
             failures.append("B_EMPTY_ROUTER_NOT_EMPTY")
-        if value.variant != "B_claim":
+        if value.variant not in {"B_claim", "B_forced_claim"}:
             return
         frozen = set(value.frozen_claim_ids)
         if not frozen:
-            failures.append("B_CLAIM_BUNDLE_EMPTY")
+            if value.allow_empty_claim_bundle:
+                warnings.append("EMPTY_CLAIM_BUNDLE")
+            else:
+                failures.append("CLAIM_BUNDLE_EMPTY")
         if value.frozen_bundle_sha256 is None or not SHA256_PATTERN.fullmatch(
             value.frozen_bundle_sha256
         ):
-            failures.append("B_CLAIM_BUNDLE_HASH_INVALID")
-        if value.require_claim_injection and not injected:
-            failures.append("B_CLAIM_NOT_INJECTED")
+            failures.append("CLAIM_BUNDLE_HASH_INVALID")
+        if value.require_claim_injection and not injected and not (
+            value.allow_empty_claim_bundle and not frozen
+        ):
+            failures.append("CLAIM_NOT_INJECTED")
         if not candidates | selected | injected | used <= frozen:
-            failures.append("B_CLAIM_OUTSIDE_FROZEN_BUNDLE")
+            failures.append("CLAIM_OUTSIDE_FROZEN_BUNDLE")
         for evidence in value.router_evidence:
             if evidence.bundle_hash != value.frozen_bundle_sha256:
-                failures.append("B_CLAIM_BUNDLE_HASH_MISMATCH")
+                failures.append("CLAIM_BUNDLE_HASH_MISMATCH")
             candidate_ids = set(evidence.candidate_claim_ids)
             selected_ids = set(evidence.selected_claim_ids)
             injected_ids = evidence.injected_claim_ids
             if not selected_ids <= candidate_ids or not set(injected_ids) <= selected_ids:
-                failures.append("B_CLAIM_ROUTER_HIERARCHY_INVALID")
+                failures.append("CLAIM_ROUTER_HIERARCHY_INVALID")
             if len(evidence.injected_content_hashes) != len(injected_ids):
-                failures.append("B_CLAIM_INJECTED_CONTENT_ARITY_INVALID")
+                failures.append("CLAIM_INJECTED_CONTENT_ARITY_INVALID")
                 continue
             for claim_id, content_hash in zip(
                 injected_ids, evidence.injected_content_hashes, strict=True
             ):
                 if value.frozen_claim_content_hashes.get(claim_id) != content_hash:
-                    failures.append("B_CLAIM_INJECTED_CONTENT_MISMATCH")
+                    failures.append("CLAIM_INJECTED_CONTENT_MISMATCH")
         if not used <= injected:
-            failures.append("B_CLAIM_USED_NOT_INJECTED")
+            failures.append("CLAIM_USED_NOT_INJECTED")

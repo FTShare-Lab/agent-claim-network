@@ -80,6 +80,7 @@ impl ToolRegistry {
             process_owner_agent_id: "unknown-agent".into(),
             attachment_limits: AttachmentLimits::default(),
             evaluation_secret_env: None,
+            evaluation_submission: None,
         })
     }
 
@@ -177,6 +178,7 @@ impl ToolRegistry {
         self.access = ToolAccessProfile::memory_review();
         self.delegation_host = None;
         self.delegation_progress = None;
+        self.evaluation_submission = None;
         self
     }
 
@@ -189,6 +191,25 @@ impl ToolRegistry {
         self.delegation_host = None;
         self.delegation_progress = None;
         self
+    }
+
+    /// 为单个非交互评测 attempt 装配显式提交控制器。
+    ///
+    /// 该方法不自行提升权限；调用方仍须先选择 evaluation profile。普通 session 从不调用它，
+    /// 因而不会看到或触发 `submit_task`。
+    pub(crate) fn with_evaluation_submission(mut self, submission: EvaluationSubmission) -> Self {
+        self.evaluation_submission = Some(submission);
+        self
+    }
+
+    pub(crate) fn evaluation_submission_enabled(&self) -> bool {
+        self.evaluation_submission.is_some()
+    }
+
+    pub(crate) fn evaluation_submission_requested(&self) -> bool {
+        self.evaluation_submission
+            .as_ref()
+            .is_some_and(EvaluationSubmission::was_submitted)
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
@@ -632,6 +653,17 @@ impl ToolRegistry {
                 }));
             }
         }
+        if self.evaluation_submission.is_some() {
+            definitions.push(ToolDefinition {
+                name: "submit_task".into(),
+                description: "End this coding-benchmark attempt after you have completed the implementation, run the relevant checks, and inspected the diff. Call this exactly once as the only tool call in an assistant response. It has no arguments, cannot run tests or edit files, and immediately ends the attempt; do not call it while work remains.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+            });
+        }
         (definitions, mcp_routes)
     }
 
@@ -775,6 +807,7 @@ impl ToolRegistry {
             }
         }
         let result = match name {
+            "submit_task" => self.submit_evaluation_task(input),
             "code_run" if self.access.local_tools => self.code_run(input, &context).await,
             "write_stdin" if self.access.local_tools => self.write_stdin(input, &context).await,
             "process_list" if self.access.local_tools => self.process_list(input, &context).await,
@@ -837,5 +870,21 @@ impl ToolRegistry {
             }
         }
         result
+    }
+
+    fn submit_evaluation_task(&self, input: Value) -> Result<ToolExecution, ToolError> {
+        let Some(submission) = &self.evaluation_submission else {
+            return Err(ToolError::UnknownTool("submit_task".into()));
+        };
+        let Some(arguments) = input.as_object() else {
+            return Err(ToolError::InvalidArgs(
+                "submit_task 参数必须是空对象".into(),
+            ));
+        };
+        if !arguments.is_empty() {
+            return Err(ToolError::InvalidArgs("submit_task 不接受任何参数".into()));
+        }
+        submission.mark_submitted();
+        Ok(ToolExecution::completed(json!({"submitted": true})))
     }
 }

@@ -166,8 +166,25 @@ class GateValidatorTests(unittest.TestCase):
         result = GateValidator().validate(empty)
 
         self.assertEqual(result.decision, "fail")
-        self.assertIn("B_CLAIM_BUNDLE_EMPTY", result.reason)
-        self.assertNotIn("B_CLAIM_NOT_INJECTED", result.reason)
+        self.assertIn("CLAIM_BUNDLE_EMPTY", result.reason)
+        self.assertNotIn("CLAIM_NOT_INJECTED", result.reason)
+
+    def test_explicit_empty_bundle_mode_allows_a_claim_arm_to_execute(self) -> None:
+        result = GateValidator().validate(
+            replace(
+                _b_claim_input(),
+                router_evidence=(),
+                frozen_claim_ids=(),
+                frozen_claim_content_hashes={},
+                allow_empty_claim_bundle=True,
+                require_claim_injection=True,
+                claim_used_ids=(),
+            )
+        )
+
+        self.assertEqual(result.decision, "pass")
+        self.assertIn("EMPTY_CLAIM_BUNDLE", result.reason)
+        self.assertNotIn("CLAIM_NOT_INJECTED", result.reason)
 
     def test_hard_gate_requires_b_claim_injection(self) -> None:
         result = GateValidator().validate(
@@ -179,7 +196,7 @@ class GateValidatorTests(unittest.TestCase):
             )
         )
 
-        self.assertIn("B_CLAIM_NOT_INJECTED", result.reason)
+        self.assertIn("CLAIM_NOT_INJECTED", result.reason)
 
     def test_isolation_check_failure_fails_the_gate(self) -> None:
         result = GateValidator().validate(
@@ -220,11 +237,11 @@ class GateValidatorTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "B_CLAIM_BUNDLE_HASH_MISMATCH",
+            "CLAIM_BUNDLE_HASH_MISMATCH",
             GateValidator().validate(replace(base, frozen_bundle_sha256="d" * 64)).reason,
         )
         self.assertIn(
-            "B_CLAIM_INJECTED_CONTENT_MISMATCH",
+            "CLAIM_INJECTED_CONTENT_MISMATCH",
             GateValidator()
             .validate(replace(base, frozen_claim_content_hashes={"claim-1": "d" * 64}))
             .reason,
@@ -238,4 +255,17 @@ class GateValidatorTests(unittest.TestCase):
         )
         result = GateValidator().validate(replace(base, router_evidence=(bad_evidence,)))
         self.assertIn("ROUTER_EVIDENCE_ATTEMPT_MISMATCH", result.reason)
-        self.assertIn("B_CLAIM_ROUTER_HIERARCHY_INVALID", result.reason)
+        self.assertIn("CLAIM_ROUTER_HIERARCHY_INVALID", result.reason)
+
+    def test_forced_claim_requires_router_injection(self) -> None:
+        result = GateValidator().validate(
+            replace(
+                _b_claim_input(),
+                variant="B_forced_claim",
+                require_claim_injection=True,
+                router_evidence=(),
+                claim_used_ids=(),
+            )
+        )
+
+        self.assertIn("CLAIM_NOT_INJECTED", result.reason)

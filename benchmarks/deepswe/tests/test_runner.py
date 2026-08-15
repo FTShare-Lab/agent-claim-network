@@ -11,6 +11,7 @@ from unittest.mock import patch
 from acn_deepswe.assets import frozen_coding_benchmark_skill
 from acn_deepswe.dataset import FrozenDatasetManifest
 from acn_deepswe.host_runner import (
+    AttemptProgressMonitor,
     CONTAINER_MODEL_KEY_ENV,
     EVALUATION_AUTO_COMPACT_CTX_RATIO,
     EVALUATION_CODE_RUN_MAX_OUTPUT_CHARS,
@@ -52,7 +53,7 @@ allow_internet = false
 
 
 class ConfigGenerationTests(unittest.TestCase):
-    def test_only_b_claim_attempt_toml_declares_a_claim_bundle(self) -> None:
+    def test_claim_variants_attempt_toml_declare_a_claim_bundle(self) -> None:
         plan = build_attempt_plan(DATASET, Path("/tmp/acn-eval-plan"), seed=2)
         for attempt in plan.attempts:
             with self.subTest(variant=attempt.variant):
@@ -62,9 +63,14 @@ class ConfigGenerationTests(unittest.TestCase):
                     rendered["task_prompt"].startswith("先读取并遵循 /coding-benchmark")
                 )
                 self.assertEqual(rendered["attempt_deadline_secs"], 5100)
+                self.assertEqual(rendered["model_egress_mode"], "pier")
                 self.assertEqual(
                     rendered.get("claim_bundle"),
-                    "/opt/acn-eval/claims.json" if attempt.variant == "B_claim" else None,
+                    (
+                        "/opt/acn-eval/claims.json"
+                        if attempt.variant in {"B_claim", "B_forced_claim"}
+                        else None
+                    ),
                 )
 
     def test_attempt_deadline_leaves_room_before_the_pier_wall_clock(self) -> None:
@@ -183,20 +189,26 @@ class ConfigGenerationTests(unittest.TestCase):
                 )
                 build_pier_job_config(attempt, files, provenance(), artifacts, UPSTREAM)
 
+            claim_attempt = next(
+                attempt for attempt in plan.attempts if attempt.variant == "B_claim"
+            )
             files = write_attempt_files(
-                plan.attempts[2], root / "B_claim", "fix test", provenance(), UPSTREAM
+                claim_attempt, root / "B_claim", "fix test", provenance(), UPSTREAM
             )
             with self.assertRaisesRegex(ValueError, "claim bundle"):
-                build_pier_job_config(plan.attempts[2], files, provenance(), artifacts, UPSTREAM)
+                build_pier_job_config(claim_attempt, files, provenance(), artifacts, UPSTREAM)
 
 
 class DryRunTests(unittest.TestCase):
-    def test_dry_run_reports_the_fixed_three_arm_order(self) -> None:
+    def test_dry_run_reports_four_arms(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             plan = build_attempt_plan(DATASET, Path(directory) / "run", seed=2)
             experiment = build_experiment_manifest("experiment-1", plan, "b" * 64, provenance())
             steps = Task1HostRunner(experiment, Path(directory) / "jobs").run_task1()
-        self.assertEqual([step.phase for step in steps], ["A", "freeze", "B_empty", "B_claim"])
+        self.assertEqual(
+            {step.phase for step in steps},
+            {"A", "freeze", "B_empty", "B_claim", "B_forced_claim"},
+        )
 
     def test_runner_preserves_crossbalanced_b_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -204,10 +216,18 @@ class DryRunTests(unittest.TestCase):
             experiment = build_experiment_manifest("experiment-1", plan, "b" * 64, provenance())
             crossbalanced = replace(
                 experiment,
-                attempts=(experiment.attempts[0], experiment.attempts[2], experiment.attempts[1]),
+                attempts=(
+                    experiment.attempts[0],
+                    experiment.attempts[3],
+                    experiment.attempts[1],
+                    experiment.attempts[2],
+                ),
             )
             steps = Task1HostRunner(crossbalanced, Path(directory) / "jobs").run_task1()
-        self.assertEqual([step.phase for step in steps], ["A", "freeze", "B_claim", "B_empty"])
+        self.assertEqual(
+            {step.phase for step in steps},
+            {"A", "freeze", "B_empty", "B_claim", "B_forced_claim"},
+        )
 
 
 class IsolationTests(unittest.TestCase):
@@ -255,7 +275,7 @@ class RealExecutionTests(unittest.TestCase):
             bundle_hash = hashlib.sha256(artifacts.claim_bundle.read_bytes()).hexdigest()
 
         self.assertEqual(variants, [item.variant for item in plan.attempts])
-        self.assertEqual([item["status"] for item in manifest["attempt_results"]], ["passed"] * 3)
+        self.assertEqual([item["status"] for item in manifest["attempt_results"]], ["passed"] * 4)
         self.assertEqual(manifest["experiment_cohort"], "success_efficiency")
         self.assertEqual(bundle["claims"][0]["id"], "claim-1")
         self.assertEqual(manifest["frozen_claim_bundle_hash"], bundle_hash)
@@ -273,6 +293,91 @@ class RealExecutionTests(unittest.TestCase):
             )
         )
         self.assertTrue(all(env["PYTHONDONTWRITEBYTECODE"] == "1" for env in pier_envs))
+        self.assertTrue(
+            all(item["progress_path"].endswith("/progress.json") for item in manifest["attempt_results"])
+        )
+
+    def test_operator_interruption_preserves_progress_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = build_attempt_plan(DATASET, root / "run", seed=2)
+            experiment = build_experiment_manifest("experiment-1", plan, "b" * 64, provenance())
+            artifacts = _artifacts(root, claim_bundle=root / "claims.json")
+            execution = _execution(root, artifacts)
+
+            def run(*_args: object, **_kwargs: object) -> FakeCompleted:
+                raise KeyboardInterrupt
+
+            with (
+                patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True),
+                self.assertRaisesRegex(TaskExecutionError, "INTERRUPTED_BY_OPERATOR"),
+            ):
+                Task1HostRunner(experiment, root / "jobs", execution, run=run).run_task1(
+                    execute=True
+                )
+            manifest = json.loads(execution.manifest_path.read_text(encoding="utf-8"))
+            progress = json.loads(
+                Path(manifest["attempt_results"][0]["progress_path"]).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(manifest["attempt_results"][0]["reason"], "INTERRUPTED_BY_OPERATOR")
+        self.assertEqual(progress["status"], "interrupted")
+        self.assertEqual(progress["terminal_reason"], "INTERRUPTED_BY_OPERATOR")
+
+
+class ProgressMonitorTests(unittest.TestCase):
+    def test_active_session_events_are_observed_without_stopping_the_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            attempt = AttemptManifest(
+                1, "task-1-a", "task-1", "A", str((root / "attempt").resolve())
+            )
+            ledger = (
+                Path(attempt.output_path)
+                / "host-config"
+                / "pier-jobs"
+                / attempt.attempt_id
+                / "trial-1"
+                / "agent"
+                / "runtime"
+                / "data"
+                / "agents"
+                / "eval"
+                / "sessions"
+                / "session-1"
+                / "turn_events.jsonl"
+            )
+            ledger.parent.mkdir(parents=True)
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "seq": 3,
+                        "turn_id": "turn-1",
+                        "created_at": "2026-08-12T14:07:21Z",
+                        "kind": "tool_call_completed",
+                        "name": "file_read",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            monitor = AttemptProgressMonitor(
+                attempt,
+                Path(attempt.output_path),
+                poll_secs=1,
+                stall_after_secs=60,
+            )
+            monitor.start()
+            active = json.loads(monitor.progress_path.read_text(encoding="utf-8"))
+            monitor.finish("pier_completed", pier_return_code=0)
+            completed = json.loads(monitor.progress_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(active["status"], "active")
+        self.assertEqual(active["event_count"], 1)
+        self.assertEqual(active["last_event"]["kind"], "tool_call_completed")
+        self.assertFalse(active["possibly_stalled"])
+        self.assertEqual(completed["status"], "pier_completed")
+        self.assertEqual(completed["pier_return_code"], 0)
 
     def test_staged_package_drift_stops_before_the_next_attempt_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -365,7 +470,7 @@ class ProvenanceTests(unittest.TestCase):
 
         # agent 自身失败按未通过计分，不中断实验。
         self.assertEqual(
-            [item["status"] for item in manifest["attempt_results"]], ["agent_failed"] * 3
+            [item["status"] for item in manifest["attempt_results"]], ["agent_failed"] * 4
         )
 
     def test_a_verifier_gate_failure_stops_before_b_empty(self) -> None:
@@ -400,6 +505,32 @@ class ProvenanceTests(unittest.TestCase):
         self.assertEqual(manifest["attempt_results"][0]["status"], "gate_failed")
         self.assertIn("VERIFIER_DID_NOT_RUN", manifest["attempt_results"][0]["reason"])
 
+    def test_direct_model_egress_is_explicit_but_cannot_pass_the_formal_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = build_attempt_plan(DATASET, root / "run", seed=2)
+            experiment = build_experiment_manifest("experiment-1", plan, "b" * 64, provenance())
+            artifacts = _artifacts(root, claim_bundle=root / "claims.json")
+            execution = replace(_execution(root, artifacts), model_egress_mode="direct")
+
+            def run(command: list[str], **_kwargs: object) -> FakeCompleted:
+                job = json.loads(Path(command[-1]).read_text())
+                attempt = next(item for item in plan.attempts if item.attempt_id == job["job_name"])
+                _write_fake_trial(Path(job["jobs_dir"]), attempt, bundle_path=artifacts.claim_bundle)
+                return FakeCompleted(0)
+
+            with (
+                patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True),
+                self.assertRaisesRegex(TaskExecutionError, "ISOLATION_CHECK_FAILED"),
+            ):
+                Task1HostRunner(experiment, root / "jobs", execution, run=run).run_task1(
+                    execute=True
+                )
+            manifest = json.loads(execution.manifest_path.read_text())
+
+        self.assertEqual(manifest["execution"]["model_egress_mode"], "direct")
+        self.assertIn("ISOLATION_CHECK_FAILED", manifest["attempt_results"][0]["reason"])
+
     def test_a_without_claims_runs_b_empty_and_marks_b_claim_not_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -431,11 +562,61 @@ class ProvenanceTests(unittest.TestCase):
         self.assertEqual(variants, ["A", "B_empty"])
         self.assertIsNone(manifest["failure"])
         self.assertEqual(
-            [item["variant"] for item in manifest["attempt_results"]], ["A", "B_empty", "B_claim"]
+            [item["variant"] for item in manifest["attempt_results"]],
+            ["A", "B_empty", "B_claim", "B_forced_claim"],
         )
-        self.assertEqual(manifest["attempt_results"][-1]["status"], "not_run")
-        self.assertEqual(manifest["attempt_results"][-1]["reason"], "NO_ELIGIBLE_CLAIM")
+        self.assertEqual(
+            [item["status"] for item in manifest["attempt_results"][-2:]], ["not_run", "not_run"]
+        )
+        self.assertEqual(
+            [item["reason"] for item in manifest["attempt_results"][-2:]],
+            ["NO_ELIGIBLE_CLAIM", "NO_ELIGIBLE_CLAIM"],
+        )
         self.assertEqual(manifest["experiment_cohort"], "unpaired_no_claim")
+
+    def test_a_without_claims_can_execute_all_four_arms_with_an_empty_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = build_attempt_plan(DATASET, root / "run", seed=2)
+            experiment = build_experiment_manifest("experiment-1", plan, "b" * 64, provenance())
+            artifacts = _artifacts(root, claim_bundle=root / "claims.json")
+            execution = replace(
+                _execution(root, artifacts), run_all_variants_without_claims=True
+            )
+            variants: list[str] = []
+
+            def run(command: list[str], **_kwargs: object) -> FakeCompleted:
+                job = json.loads(Path(command[-1]).read_text())
+                attempt = next(item for item in plan.attempts if item.attempt_id == job["job_name"])
+                variants.append(attempt.variant)
+                _write_fake_trial(
+                    Path(job["jobs_dir"]),
+                    attempt,
+                    bundle_path=artifacts.claim_bundle,
+                    emit_claim=False,
+                )
+                return FakeCompleted(0)
+
+            with patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True):
+                Task1HostRunner(experiment, root / "jobs", execution, run=run).run_task1(
+                    execute=True
+                )
+            manifest = json.loads(execution.manifest_path.read_text())
+
+        self.assertEqual(variants, [item.variant for item in plan.attempts])
+        self.assertEqual(
+            [item["status"] for item in manifest["attempt_results"]], ["passed"] * 4
+        )
+        claim_records = [
+            item for item in manifest["attempt_results"] if item["variant"] in {"B_claim", "B_forced_claim"}
+        ]
+        self.assertTrue(
+            all(item["claim_observation"]["bundle_available"] is False for item in claim_records)
+        )
+        self.assertTrue(
+            all("EMPTY_CLAIM_BUNDLE" in item["reason"] for item in claim_records)
+        )
+        self.assertTrue(manifest["execution"]["run_all_variants_without_claims"])
 
     def test_a_verifier_failure_with_claims_runs_failure_recovery_pair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -464,7 +645,7 @@ class ProvenanceTests(unittest.TestCase):
                 )
             manifest = json.loads(execution.manifest_path.read_text())
 
-        self.assertEqual(variants, ["A", "B_empty", "B_claim"])
+        self.assertEqual(set(variants), {"A", "B_empty", "B_claim", "B_forced_claim"})
         self.assertEqual(manifest["experiment_cohort"], "failure_recovery")
 
     def test_hard_gate_rejects_ineligible_a_before_b_arms(self) -> None:
@@ -520,6 +701,41 @@ class ProvenanceTests(unittest.TestCase):
             manifest = json.loads(execution.manifest_path.read_text())
 
         self.assertEqual(manifest["attempt_results"][0]["reason"], "PIER_INFRASTRUCTURE_FAILURE")
+
+    def test_upstream_concurrency_exhaustion_is_infrastructure_failure_without_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = build_attempt_plan(DATASET, root / "run", seed=2)
+            experiment = build_experiment_manifest("experiment-1", plan, "b" * 64, provenance())
+            artifacts = _artifacts(root, claim_bundle=root / "claims.json")
+            execution = _execution(root, artifacts)
+
+            def run(command: list[str], **_kwargs: object) -> FakeCompleted:
+                job = json.loads(Path(command[-1]).read_text())
+                attempt = next(item for item in plan.attempts if item.attempt_id == job["job_name"])
+                _write_fake_trial(
+                    Path(job["jobs_dir"]), attempt, bundle_path=artifacts.claim_bundle
+                )
+                result = next(Path(job["jobs_dir"]).glob("*/*/agent/evaluation/result.json"))
+                raw = json.loads(result.read_text(encoding="utf-8"))
+                raw["exit_type"] = "failed"
+                raw["failure_kind"] = "upstream_concurrency_exhausted"
+                result.write_text(json.dumps(raw), encoding="utf-8")
+                return FakeCompleted(0)
+
+            with (
+                patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True),
+                self.assertRaisesRegex(TaskExecutionError, "UPSTREAM_CONCURRENCY_EXHAUSTED"),
+            ):
+                Task1HostRunner(experiment, root / "jobs", execution, run=run).run_task1(
+                    execute=True
+                )
+            manifest = json.loads(execution.manifest_path.read_text(encoding="utf-8"))
+
+        record = manifest["attempt_results"][0]
+        self.assertEqual(record["status"], "infrastructure_failed")
+        self.assertEqual(record["reason"], "UPSTREAM_CONCURRENCY_EXHAUSTED")
+        self.assertIsNone(record["gate_path"])
 
 
 class SentinelTests(unittest.TestCase):
@@ -598,29 +814,31 @@ def _write_fake_trial(
 
     evidence: list[dict[str, object]] = []
     used: list[str] = []
-    if variant == "B_claim":
+    if variant in {"B_claim", "B_forced_claim"}:
         body = bundle_path.read_bytes()
-        claim = json.loads(body)["claims"][0]
-        content_hash = hashlib.sha256(
-            json.dumps(claim, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
-                "utf-8"
-            )
-        ).hexdigest()
-        evidence = [
-            {
-                "schema_version": 1,
-                "evidence_id": "router-1",
-                "attempt_id": attempt_id,
-                "bundle_hash": hashlib.sha256(body).hexdigest(),
-                "query_hash": "b" * 64,
-                "candidate_claim_ids": ["claim-1"],
-                "selected_claim_ids": ["claim-1"],
-                "injected_claim_ids": ["claim-1"],
-                "injected_content_hashes": [content_hash],
-                "timestamp_utc": "2026-07-26T00:00:00Z",
-            }
-        ]
-        used = ["claim-1"]
+        claims = json.loads(body)["claims"]
+        if claims:
+            claim = claims[0]
+            content_hash = hashlib.sha256(
+                json.dumps(claim, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            evidence = [
+                {
+                    "schema_version": 1,
+                    "evidence_id": "router-1",
+                    "attempt_id": attempt_id,
+                    "bundle_hash": hashlib.sha256(body).hexdigest(),
+                    "query_hash": "b" * 64,
+                    "candidate_claim_ids": ["claim-1"],
+                    "selected_claim_ids": ["claim-1"],
+                    "injected_claim_ids": ["claim-1"],
+                    "injected_content_hashes": [content_hash],
+                    "timestamp_utc": "2026-07-26T00:00:00Z",
+                }
+            ]
+            used = ["claim-1"]
 
     (evaluation / "result.json").write_text(
         json.dumps(

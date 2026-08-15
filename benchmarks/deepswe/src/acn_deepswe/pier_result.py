@@ -1,4 +1,4 @@
-"""按 pinned Pier 0.3 `TrialResult` 产物读取 verifier 与 trial 路径。"""
+"""按冻结 Pier checkout 的 `TrialResult` 产物读取 verifier 与 trial 路径。"""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from .schemas import VerifierResult
 
 
 class PierResultError(ValueError):
-    """Pier 的单次 trial 产物不完整或不符合 0.3 定版 schema。"""
+    """Pier 的单次 trial 产物不完整或不符合冻结 schema。"""
 
 
 @dataclass(frozen=True)
@@ -64,7 +64,7 @@ def read_single_trial_evidence(job_directory: Path) -> tuple[Path, PierTrialEvid
         )
     result_path = trial_results[0]
     raw = _read_object(result_path)
-    # 以下字段来自 pinned Pier 的 TrialResult 必填字段，避免根据目录名猜测产物。
+    # 以下字段来自冻结 Pier 的 TrialResult 必填字段，避免根据目录名猜测产物。
     task_name = _string(raw, "task_name")
     trial_name = _string(raw, "trial_name")
     trial_uri = _string(raw, "trial_uri")

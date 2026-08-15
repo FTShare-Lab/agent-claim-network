@@ -12,8 +12,12 @@ from acn_deepswe.plan import build_attempt_plan
 from acn_deepswe.presmoke import (
     PresmokeExecutionError,
     PresmokeHostRunner,
+    PresmokeTaskResult,
     PresmokeTaskSpec,
+    load_completed_task_results,
     load_presmoke_task_ids,
+    load_terminal_task_results,
+    reserve_interrupted_retries,
 )
 from acn_deepswe.provenance import EvaluationProvenance
 from acn_deepswe.runner import build_experiment_manifest
@@ -175,6 +179,136 @@ class PresmokeRunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "顺序"):
                 PresmokeHostRunner(tuple(reversed(specs)), Path(directory) / "aggregate.json")
 
+    def test_resume_skips_only_task_with_four_valid_gated_arms(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            specs = build_specs(root)
+            write_completed_task_artifacts(specs[0])
+            completion = root / "task-completions.json"
+            completed = load_completed_task_results(specs, completion)
+            started: list[str] = []
+
+            def factory(spec: PresmokeTaskSpec) -> FakeTaskRunner:
+                return FakeTaskRunner(spec.task_id, started)
+
+            results = PresmokeHostRunner(
+                specs[1:],
+                root / "aggregate.json",
+                frozen_task_ids=TASK_IDS,
+                task_runner_factory=factory,
+                completed_task_results=completed,
+                completion_manifest_path=completion,
+            ).run(execute=True)
+            checkpoint = json.loads(completion.read_text(encoding="utf-8"))
+
+        self.assertEqual(tuple(result.task_id for result in completed), (TASK_IDS[0],))
+        self.assertEqual(started, list(TASK_IDS[1:]))
+        self.assertEqual(tuple(result.task_id for result in results), TASK_IDS)
+        self.assertEqual(checkpoint["status"], "completed")
+        self.assertEqual(
+            [item["task_id"] for item in checkpoint["completed_tasks"]], list(TASK_IDS)
+        )
+
+    def test_failure_is_checkpointed_as_a_terminal_state_and_not_reclassified_as_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            specs = build_specs(root)
+            completion = root / "task-completions.json"
+
+            def factory(spec: PresmokeTaskSpec) -> FakeTaskRunner:
+                return FakeTaskRunner(spec.task_id, [], fail=spec.task_id == TASK_IDS[0])
+
+            with self.assertRaises(PresmokeExecutionError):
+                PresmokeHostRunner(
+                    specs,
+                    root / "aggregate.json",
+                    task_runner_factory=factory,
+                    completion_manifest_path=completion,
+                ).run(execute=True)
+            terminal = load_terminal_task_results(specs, completion)
+            checkpoint = json.loads(completion.read_text(encoding="utf-8"))
+
+        self.assertEqual(checkpoint["schema_version"], 2)
+        self.assertEqual(checkpoint["task_results"][0]["status"], "failed")
+        self.assertEqual(terminal[0].status, "failed")
+
+    def test_failure_manifest_is_terminal_before_parent_checkpoint_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = build_specs(root)[0]
+            spec.manifest_path.parent.mkdir(parents=True)
+            spec.manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "attempt_results": [],
+                        "failure": "GATE: RESPONSE_MODEL_MISMATCH",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            terminal = load_terminal_task_results((spec,), root / "task-completions.json")
+
+        self.assertEqual(
+            terminal,
+            (
+                PresmokeTaskResult(
+                    TASK_IDS[0],
+                    "failed",
+                    str(spec.manifest_path),
+                    "GATE: RESPONSE_MODEL_MISMATCH",
+                ),
+            ),
+        )
+
+    def test_no_eligible_claim_checkpoint_is_a_reusable_terminal_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            specs = build_specs(root)
+            write_no_eligible_claim_task_artifacts(specs[0])
+            completion = root / "task-completions.json"
+            completion.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "task_results": [
+                            PresmokeTaskResult(
+                                specs[0].task_id,
+                                "no_eligible_claim",
+                                str(specs[0].manifest_path),
+                                None,
+                            ).to_dict()
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            terminal = load_terminal_task_results(specs, completion)
+            started: list[str] = []
+
+            def factory(spec: PresmokeTaskSpec) -> FakeTaskRunner:
+                return FakeTaskRunner(spec.task_id, started)
+
+            results = PresmokeHostRunner(
+                specs[1:],
+                root / "aggregate.json",
+                frozen_task_ids=TASK_IDS,
+                task_runner_factory=factory,
+                completed_task_results=terminal,
+                completion_manifest_path=completion,
+            ).run(execute=True)
+
+        self.assertEqual(terminal[0].status, "no_eligible_claim")
+        self.assertEqual(started, list(TASK_IDS[1:]))
+        self.assertEqual(results[0].status, "no_eligible_claim")
+
+    def test_interrupted_retry_can_be_reserved_only_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            completion = (Path(directory) / "task-completions.json").resolve()
+            reserve_interrupted_retries(completion, (TASK_IDS[0],))
+            with self.assertRaisesRegex(ValueError, "唯一续跑机会"):
+                reserve_interrupted_retries(completion, (TASK_IDS[0],))
+
 
 class FakeTaskRunner:
     def __init__(
@@ -260,4 +394,76 @@ def build_specs(root: Path) -> tuple[PresmokeTaskSpec, ...]:
             manifest_path=root / "manifests" / f"{task_id}.json",
         )
         for index, task_id in enumerate(TASK_IDS)
+    )
+
+
+def write_completed_task_artifacts(spec: PresmokeTaskSpec) -> None:
+    records = []
+    for attempt in spec.experiment.attempts:
+        output = Path(attempt.output_path)
+        output.mkdir(parents=True)
+        result_path = output / "attempt-result.json"
+        gate_path = output / "gate.json"
+        result_path.write_text(
+            json.dumps({"attempt_id": attempt.attempt_id, "variant": attempt.variant}),
+            encoding="utf-8",
+        )
+        gate_path.write_text(
+            json.dumps({"attempt_id": attempt.attempt_id, "decision": "pass"}),
+            encoding="utf-8",
+        )
+        records.append(
+            {
+                "attempt_id": attempt.attempt_id,
+                "variant": attempt.variant,
+                "status": "passed",
+                "result_path": str(result_path),
+                "gate_path": str(gate_path),
+            }
+        )
+    spec.manifest_path.parent.mkdir(parents=True)
+    spec.manifest_path.write_text(
+        json.dumps({"failure": None, "attempt_results": records}), encoding="utf-8"
+    )
+
+
+def write_no_eligible_claim_task_artifacts(spec: PresmokeTaskSpec) -> None:
+    records = []
+    for attempt in spec.experiment.attempts:
+        if attempt.variant in {"B_claim", "B_forced_claim"}:
+            records.append(
+                {
+                    "attempt_id": attempt.attempt_id,
+                    "variant": attempt.variant,
+                    "status": "not_run",
+                    "reason": "NO_ELIGIBLE_CLAIM",
+                    "result_path": None,
+                    "gate_path": None,
+                }
+            )
+            continue
+        output = Path(attempt.output_path)
+        output.mkdir(parents=True)
+        result_path = output / "attempt-result.json"
+        gate_path = output / "gate.json"
+        result_path.write_text(
+            json.dumps({"attempt_id": attempt.attempt_id, "variant": attempt.variant}),
+            encoding="utf-8",
+        )
+        gate_path.write_text(
+            json.dumps({"attempt_id": attempt.attempt_id, "decision": "pass"}),
+            encoding="utf-8",
+        )
+        records.append(
+            {
+                "attempt_id": attempt.attempt_id,
+                "variant": attempt.variant,
+                "status": "passed",
+                "result_path": str(result_path),
+                "gate_path": str(gate_path),
+            }
+        )
+    spec.manifest_path.parent.mkdir(parents=True)
+    spec.manifest_path.write_text(
+        json.dumps({"failure": None, "attempt_results": records}), encoding="utf-8"
     )

@@ -1,4 +1,4 @@
-"""单个 task 的三臂宿主编排：A → freeze barrier → B_empty / B_claim。
+"""单个 task 的四臂宿主编排：A → freeze barrier → B_empty / B_claim / B_forced_claim。
 
 每个 attempt 生成一份 Pier job 配置并调用 pinned `pier run`，随后收集 Pier 判卷结果
 与 ACN 自己的 result.json / events.jsonl，交给 Gate 做机器可判定检查。
@@ -11,9 +11,12 @@ import json
 import os
 import secrets
 import subprocess
+import threading
+import time
 import tomllib
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .claim_freeze import append_freeze_barrier, freeze_claim_bundle
@@ -23,13 +26,17 @@ from .pier_result import PierResultError, PierTrialEvidence, read_single_trial_e
 from .provenance import EvaluationProvenance, sha256_directory_tree
 from .runner import ExperimentManifest
 from .rust_contract import read_rust_event_ledger, read_rust_result
-from .schemas import AttemptManifest
+from .schemas import AttemptManifest, RouterEvidence
 
 HOST_MODEL_KEY_ENV = "ACN_EVAL_UPSTREAM_KEY"
 CONTAINER_MODEL_KEY_ENV = "ACN_EVAL_MODEL_KEY"
-EVALUATION_AUTO_COMPACT_CTX_RATIO = 0.25
+# 与 ACN 的项目默认值保持一致；评测 provenance 会冻结该有效值。
+EVALUATION_AUTO_COMPACT_CTX_RATIO = 0.80
 EVALUATION_FILE_READ_MAX_CHARS = 20_000
 EVALUATION_CODE_RUN_MAX_OUTPUT_CHARS = 20_000
+CLAIM_BUNDLE_VARIANTS = frozenset(("B_claim", "B_forced_claim"))
+DEFAULT_PROGRESS_POLL_SECS = 30
+DEFAULT_PROGRESS_STALL_AFTER_SECS = 600
 
 
 @dataclass(frozen=True)
@@ -69,7 +76,11 @@ class Task1ExecutionConfig:
     expected_response_model: str
     frozen_acn_source_root: Path
     frozen_pier_source_root: Path
+    model_egress_mode: str = "pier"
     require_eligible_claim: bool = False
+    run_all_variants_without_claims: bool = False
+    progress_poll_secs: int = DEFAULT_PROGRESS_POLL_SECS
+    progress_stall_after_secs: int = DEFAULT_PROGRESS_STALL_AFTER_SECS
 
 
 @dataclass(frozen=True)
@@ -81,6 +92,8 @@ class AttemptExecutionRecord:
     result_path: str | None
     gate_path: str | None
     verifier_passed: bool | None = None
+    claim_observation: dict[str, object] | None = None
+    progress_path: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -91,6 +104,8 @@ class AttemptExecutionRecord:
             "result_path": self.result_path,
             "gate_path": self.gate_path,
             "verifier_passed": self.verifier_passed,
+            "claim_observation": self.claim_observation,
+            "progress_path": self.progress_path,
         }
 
 
@@ -99,10 +114,132 @@ class TaskExecutionResult:
     status: str
 
 
+class AttemptProgressMonitor:
+    """观测 Pier 运行中 session 事件；仅写状态，不干预 agent 生命周期。"""
+
+    def __init__(
+        self,
+        attempt: AttemptManifest,
+        attempt_dir: Path,
+        *,
+        poll_secs: int,
+        stall_after_secs: int,
+    ) -> None:
+        self.attempt = attempt
+        self.attempt_dir = attempt_dir
+        self.poll_secs = poll_secs
+        self.stall_after_secs = stall_after_secs
+        self.progress_path = attempt_dir / "progress.json"
+        self._started_wall = datetime.now(UTC)
+        self._started_monotonic = time.monotonic()
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._write_snapshot()
+        self._thread = threading.Thread(
+            target=self._observe,
+            name=f"acn-eval-progress-{self.attempt.attempt_id[:12]}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def finish(
+        self,
+        status: str,
+        *,
+        reason: str | None = None,
+        pier_return_code: int | None = None,
+    ) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.poll_secs + 1)
+        self._write_snapshot(
+            terminal_status=status,
+            terminal_reason=reason,
+            pier_return_code=pier_return_code,
+        )
+
+    def _observe(self) -> None:
+        while not self._stop.wait(self.poll_secs):
+            self._write_snapshot()
+
+    def _write_snapshot(
+        self,
+        *,
+        terminal_status: str | None = None,
+        terminal_reason: str | None = None,
+        pier_return_code: int | None = None,
+    ) -> None:
+        with self._lock:
+            now = datetime.now(UTC)
+            ledgers = self._turn_event_ledgers()
+            latest = ledgers[-1] if ledgers else None
+            latest_stat = None
+            if latest is not None:
+                try:
+                    latest_stat = latest.stat()
+                except OSError:
+                    latest = None
+            last_event = _last_turn_event(latest) if latest is not None else None
+            seconds_since_activity: int | None = None
+            if latest_stat is not None:
+                seconds_since_activity = max(0, int(now.timestamp() - latest_stat.st_mtime))
+            elapsed = max(0, int(time.monotonic() - self._started_monotonic))
+            if terminal_status is not None:
+                status = terminal_status
+                possible_stall = False
+            elif latest is None:
+                possible_stall = elapsed >= self.stall_after_secs
+                status = "possibly_stalled" if possible_stall else "awaiting_session_event"
+            else:
+                possible_stall = seconds_since_activity >= self.stall_after_secs
+                status = "possibly_stalled" if possible_stall else "active"
+            payload: dict[str, object] = {
+                "schema_version": 1,
+                "attempt_id": self.attempt.attempt_id,
+                "variant": self.attempt.variant,
+                "status": status,
+                "started_at_utc": _utc_text(self._started_wall),
+                "observed_at_utc": _utc_text(now),
+                "elapsed_secs": elapsed,
+                "progress_poll_secs": self.poll_secs,
+                "progress_stall_after_secs": self.stall_after_secs,
+                "session_event_ledgers": [str(path.resolve()) for path in ledgers],
+                "event_count": sum(_turn_event_count(path) for path in ledgers),
+                "last_activity_at_utc": (
+                    _utc_text(datetime.fromtimestamp(latest_stat.st_mtime, UTC))
+                    if latest_stat is not None
+                    else None
+                ),
+                "seconds_since_activity": seconds_since_activity,
+                "possibly_stalled": possible_stall,
+                "last_event": last_event,
+                "terminal_reason": terminal_reason,
+                "pier_return_code": pier_return_code,
+            }
+            _write_json(self.progress_path, payload)
+
+    def _turn_event_ledgers(self) -> tuple[Path, ...]:
+        job_dir = Task1HostRunner._pier_job_directory(self.attempt)
+        paths = tuple(
+            path
+            for path in job_dir.glob("*/agent/runtime/data/agents/*/sessions/*/turn_events.jsonl")
+            if path.is_file()
+        )
+        return tuple(sorted(paths, key=lambda path: (_file_mtime_ns(path), str(path))))
+
+
 def build_attempt_toml(
-    attempt: AttemptManifest, task_prompt: str, attempt_deadline_secs: int
+    attempt: AttemptManifest,
+    task_prompt: str,
+    attempt_deadline_secs: int,
+    model_egress_mode: str = "pier",
 ) -> str:
-    """容器内 attempt 配置；只有 B_claim 带 claim_bundle。"""
+    """容器内 attempt 配置；模型出口模式必须随输入一起冻结。"""
+    if model_egress_mode not in {"pier", "direct"}:
+        raise ValueError("model_egress_mode 仅支持 pier 或 direct")
     prompt = "先读取并遵循 /coding-benchmark skill。\n\n" + task_prompt
     lines = [
         "schema_version = 1",
@@ -115,8 +252,9 @@ def build_attempt_toml(
         'upstream = "eval"',
         f"variant = {json.dumps(attempt.variant)}",
         f"attempt_deadline_secs = {attempt_deadline_secs}",
+        f"model_egress_mode = {json.dumps(model_egress_mode)}",
     ]
-    if attempt.variant == "B_claim":
+    if attempt.variant in CLAIM_BUNDLE_VARIANTS:
         lines.append('claim_bundle = "/opt/acn-eval/claims.json"')
     return "\n".join(lines) + "\n"
 
@@ -223,6 +361,7 @@ def write_attempt_files(
     task_prompt: str,
     provenance: EvaluationProvenance,
     upstream_base_url: str,
+    model_egress_mode: str = "pier",
 ) -> AttemptFiles:
     """写入不含 credential 的容器 attempt TOML 与 ACN 配置。"""
     directory.mkdir(parents=True, exist_ok=True)
@@ -230,7 +369,12 @@ def write_attempt_files(
     acn_path = directory / f"{attempt.attempt_id}.acn.toml"
     _atomic_write_text(
         attempt_path,
-        build_attempt_toml(attempt, task_prompt, attempt_deadline_secs(provenance)),
+        build_attempt_toml(
+            attempt,
+            task_prompt,
+            attempt_deadline_secs(provenance),
+            model_egress_mode,
+        ),
     )
     _atomic_write_text(acn_path, build_acn_config(provenance, upstream_base_url))
     return AttemptFiles(attempt_path, acn_path)
@@ -245,12 +389,12 @@ def build_pier_job_config(
 ) -> dict[str, object]:
     """每个 attempt 固定单次、单并发、零 solve retry 的 Pier job。"""
     required_artifacts = (artifacts.acn_eval, artifacts.frozen_skill)
-    if attempt.variant == "B_claim":
+    if attempt.variant in CLAIM_BUNDLE_VARIANTS:
         required_artifacts += (artifacts.claim_bundle,)
     for path in required_artifacts:
         if not path.is_absolute() or not path.exists():
             if path == artifacts.claim_bundle:
-                raise ValueError("B_claim 的 claim bundle 必须存在且为绝对路径")
+                raise ValueError(f"{attempt.variant} 的 claim bundle 必须存在且为绝对路径")
             raise ValueError(f"Pier job artifact 必须存在且为绝对路径: {path}")
     task_dir = artifacts.normalized_task_dir
     if (
@@ -308,7 +452,7 @@ def build_pier_job_config(
 
 
 class Task1HostRunner:
-    """编排 A → Gate → freeze → B_empty / B_claim；默认只生成计划。"""
+    """编排 A → Gate → freeze → B_empty / B_claim / B_forced_claim；默认只生成计划。"""
 
     def __init__(
         self,
@@ -330,30 +474,40 @@ class Task1HostRunner:
 
     def run_task1(self, *, execute: bool = False) -> tuple[HostRunStep, ...] | TaskExecutionResult:
         attempts = self._ordered_attempts()
-        steps = (
-            HostRunStep("A", attempts[0].attempt_id, execute),
-            HostRunStep("freeze", None, execute),
-            HostRunStep(attempts[1].variant, attempts[1].attempt_id, execute),
-            HostRunStep(attempts[2].variant, attempts[2].attempt_id, execute),
+        steps = tuple(
+            [
+                HostRunStep("A", attempts[0].attempt_id, execute),
+                HostRunStep("freeze", None, execute),
+            ]
+            + [HostRunStep(attempt.variant, attempt.attempt_id, execute) for attempt in attempts[1:]]
         )
         if execute:
             return self._execute_attempts(attempts)
         return steps
 
-    def _ordered_attempts(self) -> tuple[AttemptManifest, AttemptManifest, AttemptManifest]:
+    def _ordered_attempts(self) -> tuple[AttemptManifest, ...]:
         attempts = self.experiment.attempts
+        b_variants = {item.variant for item in attempts[1:]}
+        valid_variants = (
+            (len(attempts) == 3 and b_variants == {"B_empty", "B_claim"})
+            or (
+                len(attempts) == 4
+                and b_variants == {"B_empty", "B_claim", "B_forced_claim"}
+            )
+        )
         if (
-            len(attempts) != 3
+            not attempts
             or attempts[0].variant != "A"
-            or {item.variant for item in attempts[1:]} != {"B_empty", "B_claim"}
+            or not valid_variants
         ):
             raise ValueError(
-                "task1 host runner 只接受 A 后接 B_empty/B_claim 任意交叉顺序的单任务三臂"
+                "task1 host runner 只接受 A 后接 B_empty/B_claim 的旧三臂，或包含 "
+                "B_forced_claim 的四臂"
             )
-        return attempts[0], attempts[1], attempts[2]
+        return attempts
 
     def _execute_attempts(
-        self, attempts: tuple[AttemptManifest, AttemptManifest, AttemptManifest]
+        self, attempts: tuple[AttemptManifest, ...]
     ) -> TaskExecutionResult:
         execution = self.execution
         if execution is None:
@@ -378,11 +532,11 @@ class Task1HostRunner:
                 if a_record.verifier_passed is True
                 else "failure_recovery"
             ) if has_frozen_claims else "unpaired_no_claim"
-            if not has_frozen_claims:
+            if not has_frozen_claims and not execution.run_all_variants_without_claims:
                 if execution.require_eligible_claim:
                     raise TaskExecutionError("NO_ELIGIBLE_CLAIM")
                 for attempt in attempts[1:]:
-                    if attempt.variant == "B_claim":
+                    if attempt.variant in CLAIM_BUNDLE_VARIANTS:
                         records.append(
                             AttemptExecutionRecord(
                                 attempt.attempt_id,
@@ -423,7 +577,15 @@ class Task1HostRunner:
             execution.task_prompt,
             self.experiment.provenance,
             execution.upstream_base_url,
+            execution.model_egress_mode,
         )
+        progress = AttemptProgressMonitor(
+            attempt,
+            attempt_dir,
+            poll_secs=execution.progress_poll_secs,
+            stall_after_secs=execution.progress_stall_after_secs,
+        )
+        progress.start()
         try:
             job = build_pier_job_config(
                 attempt,
@@ -453,23 +615,38 @@ class Task1HostRunner:
                 },
             )
             if completed.returncode != 0:
-                return self._write_failed_attempt(
-                    attempt, attempt_dir, "PIER_INFRASTRUCTURE_FAILURE"
+                reason = "PIER_INFRASTRUCTURE_FAILURE"
+                progress.finish(
+                    "pier_failed", reason=reason, pier_return_code=completed.returncode
                 )
-        except (OSError, ValueError) as error:
-            return self._write_failed_attempt(attempt, attempt_dir, f"PIER_JOB_FAILURE:{error}")
+                return self._write_failed_attempt(
+                    attempt, attempt_dir, reason, progress.progress_path
+                )
+        except (OSError, ValueError, KeyboardInterrupt) as error:
+            reason = _attempt_start_failure_reason(error)
+            progress.finish("interrupted", reason=reason)
+            return self._write_failed_attempt(attempt, attempt_dir, reason, progress.progress_path)
         try:
-            return self._collect_and_gate(attempt, execution, attempt_dir)
-        except (OSError, ValueError, PierResultError) as error:
-            return self._write_failed_attempt(
-                attempt, attempt_dir, f"EVIDENCE_PARSE_FAILURE:{error}"
+            record = self._collect_and_gate(
+                attempt, execution, attempt_dir, progress.progress_path
             )
+        except KeyboardInterrupt:
+            reason = "INTERRUPTED_BY_OPERATOR"
+            progress.finish("interrupted", reason=reason)
+            return self._write_failed_attempt(attempt, attempt_dir, reason, progress.progress_path)
+        except (OSError, ValueError, PierResultError) as error:
+            reason = f"EVIDENCE_PARSE_FAILURE:{error}"
+            progress.finish("evidence_parse_failed", reason=reason)
+            return self._write_failed_attempt(attempt, attempt_dir, reason, progress.progress_path)
+        progress.finish("pier_completed", pier_return_code=completed.returncode)
+        return replace(record, progress_path=str(progress.progress_path.resolve()))
 
     def _collect_and_gate(
         self,
         attempt: AttemptManifest,
         execution: Task1ExecutionConfig,
         attempt_dir: Path,
+        progress_path: Path,
     ) -> AttemptExecutionRecord:
         trial_dir, pier = read_single_trial_evidence(self._pier_job_directory(attempt))
         evaluation_dir = trial_dir / "agent" / "evaluation"
@@ -482,9 +659,33 @@ class Task1HostRunner:
             raise ValueError("Rust result/events attempt_id 与当前 attempt 不一致")
         if rust_result.exit_type not in {"completed", "failed"}:
             raise ValueError(f"Rust exit_type 无效: {rust_result.exit_type}")
+        if rust_result.failure_kind == "upstream_concurrency_exhausted":
+            reason = "UPSTREAM_CONCURRENCY_EXHAUSTED"
+            _write_json(
+                attempt_dir / "attempt-result.json",
+                {
+                    "schema_version": 1,
+                    "attempt_id": attempt.attempt_id,
+                    "variant": attempt.variant,
+                    "failure": reason,
+                    "rust_result": str((evaluation_dir / "result.json").resolve()),
+                    "rust_events": str(events_path.resolve()),
+                    "progress_path": str(progress_path.resolve()),
+                    "failure_kind": rust_result.failure_kind,
+                },
+            )
+            return AttemptExecutionRecord(
+                attempt.attempt_id,
+                attempt.variant,
+                "infrastructure_failed",
+                reason,
+                str(attempt_dir / "attempt-result.json"),
+                None,
+                progress_path=str(progress_path.resolve()),
+            )
         patch = trial_dir / "artifacts" / "model.patch"
         artifact_hash = _sha256_file(patch)
-        if attempt.variant == "B_claim":
+        if attempt.variant in CLAIM_BUNDLE_VARIANTS:
             frozen_bundle_sha256, frozen_claim_content_hashes = _frozen_bundle_evidence(
                 execution.artifacts.claim_bundle
             )
@@ -504,7 +705,16 @@ class Task1HostRunner:
                 frozen_claim_content_hashes=frozen_claim_content_hashes,
                 isolation_checks=isolation_checks,
                 require_claim_injection=(
-                    execution.require_eligible_claim and attempt.variant == "B_claim"
+                    bool(self._frozen_claim_ids)
+                    and (
+                        attempt.variant == "B_forced_claim"
+                        or (execution.require_eligible_claim and attempt.variant == "B_claim")
+                    )
+                ),
+                allow_empty_claim_bundle=(
+                    execution.run_all_variants_without_claims
+                    and attempt.variant in CLAIM_BUNDLE_VARIANTS
+                    and not self._frozen_claim_ids
                 ),
             )
         )
@@ -529,13 +739,21 @@ class Task1HostRunner:
                     attempt_dir / "host-config" / f"{attempt.attempt_id}.acn.toml"
                 ),
                 "frozen_claim_bundle_hash": (
-                    frozen_bundle_sha256 if attempt.variant == "B_claim" else None
+                    frozen_bundle_sha256 if attempt.variant in CLAIM_BUNDLE_VARIANTS else None
+                ),
+                "claim_observation": _claim_observation(
+                    attempt.variant,
+                    rust_result.router_evidence,
+                    rust_result.claim_used_ids,
+                    frozen_claim_content_hashes,
                 ),
                 "rust_exit_type": rust_result.exit_type,
+                "failure_kind": rust_result.failure_kind,
                 "agent_steps": rust_result.agent_steps,
                 "usage": rust_result.usage.to_dict(),
                 "model": self.experiment.provenance.model,
                 "expected_response_model": execution.expected_response_model,
+                "progress_path": str(progress_path.resolve()),
                 "verifier_passed": verifier.passed,
                 "isolation_checks": isolation_checks,
                 "gate": gate.to_dict(),
@@ -558,6 +776,13 @@ class Task1HostRunner:
             str(result_path),
             str(gate_path),
             verifier.passed,
+            _claim_observation(
+                attempt.variant,
+                rust_result.router_evidence,
+                rust_result.claim_used_ids,
+                frozen_claim_content_hashes,
+            ),
+            str(progress_path.resolve()),
         )
 
     def _freeze_after_a(self, attempt: AttemptManifest, execution: Task1ExecutionConfig) -> None:
@@ -614,6 +839,13 @@ class Task1HostRunner:
             ),
             "task_agent_no_network": agent_offline,
             "task_verifier_no_network": verifier_offline,
+            # 只有经过 Pier allowlist 的模型出口可作为正式结果；direct 仅供诊断，
+            # 即使 task.toml 仍声明离线，也不能让 Gate 误把它记成正式隔离。
+            "model_egress_is_formal": execution.model_egress_mode == "pier"
+            and _attempt_model_egress_matches(
+                Path(attempt.output_path) / "host-config" / f"{attempt.attempt_id}.toml",
+                "pier",
+            ),
             "claim_visibility_matches_variant": _claim_visibility_matches_variant(
                 Path(attempt.output_path) / "host-config" / f"{attempt.attempt_id}.toml",
                 attempt.variant,
@@ -627,7 +859,7 @@ class Task1HostRunner:
         )
 
     def _write_failed_attempt(
-        self, attempt: AttemptManifest, attempt_dir: Path, reason: str
+        self, attempt: AttemptManifest, attempt_dir: Path, reason: str, progress_path: Path
     ) -> AttemptExecutionRecord:
         path = attempt_dir / "attempt-result.json"
         _write_json(
@@ -637,10 +869,17 @@ class Task1HostRunner:
                 "attempt_id": attempt.attempt_id,
                 "variant": attempt.variant,
                 "failure": reason,
+                "progress_path": str(progress_path.resolve()),
             },
         )
         return AttemptExecutionRecord(
-            attempt.attempt_id, attempt.variant, "infrastructure_failed", reason, str(path), None
+            attempt.attempt_id,
+            attempt.variant,
+            "infrastructure_failed",
+            reason,
+            str(path),
+            None,
+            progress_path=str(progress_path.resolve()),
         )
 
     def _write_execution_manifest(
@@ -666,10 +905,12 @@ class Task1HostRunner:
                     "upstream_base_url": execution.upstream_base_url,
                     "host_model_key_env": HOST_MODEL_KEY_ENV,
                     "container_model_key_env": CONTAINER_MODEL_KEY_ENV,
+                    "model_egress_mode": execution.model_egress_mode,
                     "pier_executable": str(execution.pier_executable),
                     "task_prompt_hash": hashlib.sha256(
                         execution.task_prompt.encode("utf-8")
                     ).hexdigest(),
+                    "run_all_variants_without_claims": execution.run_all_variants_without_claims,
                 },
                 "attempt_results": [record.to_dict() for record in records],
                 "failure": failure,
@@ -681,6 +922,16 @@ class Task1HostRunner:
             raise TaskExecutionError("upstream_base_url 与 expected_response_model 不得为空")
         if not os.environ.get(HOST_MODEL_KEY_ENV):
             raise TaskExecutionError(f"宿主环境缺少模型 key: {HOST_MODEL_KEY_ENV}")
+        if execution.progress_poll_secs <= 0 or execution.progress_stall_after_secs <= 0:
+            raise TaskExecutionError("progress_poll_secs 与 progress_stall_after_secs 必须为正整数")
+        if execution.progress_stall_after_secs < execution.progress_poll_secs:
+            raise TaskExecutionError("progress_stall_after_secs 不得小于 progress_poll_secs")
+        if execution.require_eligible_claim and execution.run_all_variants_without_claims:
+            raise TaskExecutionError(
+                "require_eligible_claim 与 run_all_variants_without_claims 不能同时启用"
+            )
+        if execution.model_egress_mode not in {"pier", "direct"}:
+            raise TaskExecutionError("model_egress_mode 仅支持 pier 或 direct")
         for path in (
             execution.artifacts.acn_eval,
             execution.artifacts.frozen_skill,
@@ -757,6 +1008,52 @@ def _positive_int(values: dict[str, int], key: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"provenance.{key} 必须为正整数")
     return value
+
+
+def _attempt_start_failure_reason(error: BaseException) -> str:
+    if isinstance(error, KeyboardInterrupt):
+        return "INTERRUPTED_BY_OPERATOR"
+    return f"PIER_JOB_FAILURE:{error}"
+
+
+def _utc_text(value: datetime) -> str:
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _file_mtime_ns(path: Path) -> int:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return -1
+
+
+def _turn_event_count(path: Path) -> int:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return sum(1 for line in handle if line.strip())
+    except OSError:
+        return 0
+
+
+def _last_turn_event(path: Path) -> dict[str, object] | None:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        event: dict[str, object] = {}
+        for key in ("seq", "turn_id", "created_at", "kind", "name", "summary"):
+            value = raw.get(key)
+            if isinstance(value, (str, int)) and not isinstance(value, bool):
+                event[key] = value
+        return event
+    return None
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -851,6 +1148,41 @@ def _claim_visibility_matches_variant(attempt_toml: Path, variant: str) -> bool:
     except (OSError, tomllib.TOMLDecodeError):
         return False
     claim_bundle = raw.get("claim_bundle")
-    if variant == "B_claim":
+    if variant in CLAIM_BUNDLE_VARIANTS:
         return claim_bundle == "/opt/acn-eval/claims.json"
     return claim_bundle is None
+
+
+def _attempt_model_egress_matches(attempt_toml: Path, expected_mode: str) -> bool:
+    """Gate 复读冻结 attempt TOML，拒绝环境变量隐式改变模型出口。"""
+    try:
+        raw = tomllib.loads(attempt_toml.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    return raw.get("model_egress_mode") == expected_mode
+
+
+def _claim_observation(
+    variant: str,
+    router_evidence: tuple[RouterEvidence, ...],
+    claim_used_ids: tuple[str, ...],
+    frozen_claim_content_hashes: dict[str, str],
+) -> dict[str, object] | None:
+    """输出按 attempt 可审计的 claim 消费漏斗，供 aggregate 汇总而非推断。"""
+    if variant not in CLAIM_BUNDLE_VARIANTS:
+        return None
+    injected_ids = {
+        claim_id
+        for evidence in router_evidence
+        for claim_id in evidence.injected_claim_ids
+    }
+    used_ids = set(claim_used_ids)
+    return {
+        "delivery": "forced" if variant == "B_forced_claim" else "on_demand",
+        "bundle_available": bool(frozen_claim_content_hashes),
+        "retrieved": bool(router_evidence),
+        "injected": bool(injected_ids),
+        "used": bool(used_ids),
+        "injected_claim_count": len(injected_ids),
+        "used_claim_count": len(used_ids),
+    }

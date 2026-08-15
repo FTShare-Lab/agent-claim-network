@@ -192,9 +192,11 @@ impl SessionEngine {
             available_skills: self.agent.available_skills_for_prompt(),
             subagent_max_concurrent: self.subagent_max_concurrent,
         };
-        self.prompt_registry
+        let system_prompt = self
+            .prompt_registry
             .render(PROMPT_AGENT_SYSTEM, context)
-            .context("渲染 evaluation session system prompt 失败")
+            .context("渲染 evaluation session system prompt 失败")?;
+        Ok(append_acn_md(system_prompt, self.read_acn_md().await?))
     }
 
     pub(super) async fn read_acn_md(&self) -> anyhow::Result<Option<String>> {

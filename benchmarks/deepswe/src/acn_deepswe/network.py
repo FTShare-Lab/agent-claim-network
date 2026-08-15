@@ -1,9 +1,10 @@
-"""把 DeepSWE 的 `network_mode` 转成 pinned Pier 认识的 `allow_internet`。
+"""把 DeepSWE 的 `network_mode` 转成当前 Pier 认识的 `allow_internet`。
 
-pinned Pier 0.3 不读 DeepSWE `task.toml` 里的 `agent.network_mode` /
-`verifier.network_mode`。转换必须 fail-closed：只有两者都是 `"no-network"` 才生成
-Pier 兼容副本，并对 agent 与 verifier 两个环境显式写入 `allow_internet = false`；
-源文件与转换结果的 SHA-256 一并返回，供实验 manifest 冻结。
+DeepSWE 的 task TOML 以 `network_mode` 表示离线口径，而 Pier 仍以 environment 的
+`allow_internet` 执行隔离。转换必须 fail-closed：只有两者都是 `"no-network"` 才生成
+Pier 兼容副本，并对 agent 与 verifier 两个环境显式写入 `allow_internet = false`。序列化
+必须保留当前 DeepSWE 的 `[[verifier.collect]]` 数组表，保证 verifier 的 patch 收集钩子不会
+在归一化时丢失。
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from pathlib import Path
 
 OFFLINE_NETWORK_MODE = "no-network"
 NETWORK_TRANSLATION_WARNING = (
-    "pinned Pier 不识别 network_mode；已按 no-network 转换为 allow_internet = false"
+    "DeepSWE network_mode 已按 no-network 转换为 Pier allow_internet = false"
 )
 
 
@@ -119,11 +120,36 @@ def _dump_table(table: Mapping[str, object], path: tuple[str, ...], lines: list[
             lines.append("")
         lines.append("[" + ".".join(path) + "]")
     for key, value in table.items():
-        if not isinstance(value, dict):
+        if not isinstance(value, dict) and not _is_array_of_tables(value):
             lines.append(f"{key} = {_dump_value(value)}")
     for key, value in table.items():
         if isinstance(value, dict):
             _dump_table(value, path + (key,), lines)
+        elif _is_array_of_tables(value):
+            for item in value:
+                _dump_array_table(item, path + (key,), lines)
+
+
+def _is_array_of_tables(value: object) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(item, Mapping) for item in value)
+    )
+
+
+def _dump_array_table(
+    table: Mapping[str, object], path: tuple[str, ...], lines: list[str]
+) -> None:
+    if lines:
+        lines.append("")
+    lines.append("[[" + ".".join(path) + "]]")
+    for key, value in table.items():
+        if isinstance(value, dict) or _is_array_of_tables(value):
+            raise NetworkNormalizationError(
+                "task.toml 的数组表不支持嵌套表或嵌套数组表"
+            )
+        lines.append(f"{key} = {_dump_value(value)}")
 
 
 def _dump_value(value: object) -> str:
@@ -136,6 +162,8 @@ def _dump_value(value: object) -> str:
     if isinstance(value, float):
         return repr(value)
     if isinstance(value, list):
+        if any(isinstance(item, Mapping) for item in value):
+            raise NetworkNormalizationError("task.toml 的数组表必须由表序列化")
         return "[" + ", ".join(_dump_value(item) for item in value) + "]"
     raise NetworkNormalizationError(f"task.toml 含无法序列化的值类型: {type(value).__name__}")
 

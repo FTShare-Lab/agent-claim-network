@@ -21,7 +21,7 @@ mod web;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
@@ -113,6 +113,30 @@ pub enum ToolError {
     ProcessContinuesInBackground { process_id: String },
     #[error("mcp: {0}")]
     Mcp(String),
+}
+
+/// 仅用于非交互评测的显式完成信号。
+///
+/// 控制器由评测入口创建并以 clone 交给该 attempt 的 tool registry；因此提交状态不会
+/// 泄漏到普通 session、subagent 或另一个 attempt。它不是通用工具能力，只有 evaluation
+/// profile 显式装配时才会向模型公开 `submit_task`。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct EvaluationSubmission {
+    submitted: Arc<AtomicBool>,
+}
+
+impl EvaluationSubmission {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn mark_submitted(&self) {
+        self.submitted.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn was_submitted(&self) -> bool {
+        self.submitted.load(Ordering::Acquire)
+    }
 }
 
 /// ToolRegistry dispatch 的类型化返回值。
@@ -413,6 +437,7 @@ pub struct ToolRegistry {
     limits: ToolLimits,
     attachment_limits: AttachmentLimits,
     evaluation_secret_env: Option<String>,
+    evaluation_submission: Option<EvaluationSubmission>,
 }
 
 fn current_year_web_guidance() -> String {

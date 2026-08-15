@@ -57,3 +57,18 @@ class RustContractTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RustContractError, "schema_version"):
                 read_rust_result(result)
+
+    def test_result_accepts_known_infrastructure_failure_kind_only(self) -> None:
+        fixture = Path(__file__).parent / "fixtures" / "rust-acn-eval-result.json"
+        with tempfile.TemporaryDirectory() as directory:
+            result = Path(directory) / "result.json"
+            raw = json.loads(fixture.read_text(encoding="utf-8"))
+            raw["failure_kind"] = "upstream_concurrency_exhausted"
+            result.write_text(json.dumps(raw), encoding="utf-8")
+            self.assertEqual(
+                read_rust_result(result).failure_kind, "upstream_concurrency_exhausted"
+            )
+            raw["failure_kind"] = "unknown"
+            result.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(RustContractError, "failure_kind"):
+                read_rust_result(result)
