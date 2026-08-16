@@ -1614,8 +1614,42 @@ impl SessionHandle {
         {
             return Ok(());
         }
-        let max_historical_seq = self
-            .read_turn_journal()
+        // v0.2.3 的 Finalizing session 可能已有尚待恢复的 finalize checkpoint。
+        // 此时 recap cursor 必须保持缺失，直到 checkpoint 先完成应用；否则迁移到
+        // journal 尾端会改变 checkpoint 当时的 recap 输入。
+        let preserve_legacy_recap_cursor = self
+            .metadata
+            .recap_background_completion_until_seq
+            .is_none()
+            && self.metadata.status == SessionStatus::Finalizing
+            && self.read_finalize_checkpoint().await?.is_some();
+        let max_historical_seq = self.latest_background_completion_seq().await;
+        let mut changed = false;
+        if self
+            .metadata
+            .provider_background_completion_until_seq
+            .is_none()
+        {
+            self.metadata.provider_background_completion_until_seq = Some(max_historical_seq);
+            changed = true;
+        }
+        if self
+            .metadata
+            .recap_background_completion_until_seq
+            .is_none()
+            && !preserve_legacy_recap_cursor
+        {
+            self.metadata.recap_background_completion_until_seq = Some(max_historical_seq);
+            changed = true;
+        }
+        if changed {
+            write_yaml_atomic(&self.paths.session_yaml, &self.metadata).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn latest_background_completion_seq(&self) -> u64 {
+        self.read_turn_journal()
             .await
             .events
             .into_iter()
@@ -1627,15 +1661,7 @@ impl SessionHandle {
             })
             .map(|event| event.seq)
             .max()
-            .unwrap_or(0);
-        self.metadata
-            .provider_background_completion_until_seq
-            .get_or_insert(max_historical_seq);
-        self.metadata
-            .recap_background_completion_until_seq
-            .get_or_insert(max_historical_seq);
-        write_yaml_atomic(&self.paths.session_yaml, &self.metadata).await?;
-        Ok(())
+            .unwrap_or(0)
     }
 
     async fn read_provider_history_file(&self) -> ProviderHistoryFile {
@@ -1979,6 +2005,32 @@ impl SessionHandle {
         Ok(())
     }
 
+    pub(crate) async fn discard_legacy_finalize_checkpoint_and_advance_recap_background_cursor(
+        &mut self,
+        seq: u64,
+    ) -> Result<(), SessionStoreError> {
+        let _guard = self.lock_session().await?;
+        match fs::remove_file(&self.paths.finalize_checkpoint_yaml).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(SessionStoreError::io(
+                    &self.paths.finalize_checkpoint_yaml,
+                    error,
+                ));
+            }
+        }
+        self.metadata = self.read_metadata_light().await?;
+        let current = self
+            .metadata
+            .recap_background_completion_until_seq
+            .unwrap_or(0);
+        self.metadata.recap_background_completion_until_seq = Some(current.max(seq));
+        self.metadata.updated_at = Utc::now();
+        write_yaml_atomic(&self.paths.session_yaml, &self.metadata).await?;
+        Ok(())
+    }
+
     pub async fn update_compaction(
         &mut self,
         compaction: SessionCompactionState,
@@ -2130,6 +2182,16 @@ impl SessionHandle {
         }
         if self.metadata.finalized_at.is_some() && self.metadata.status != SessionStatus::Closed {
             return Err(SessionStoreError::Closed(self.metadata.id.to_string()));
+        }
+        match fs::remove_file(&self.paths.finalize_checkpoint_yaml).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(SessionStoreError::io(
+                    &self.paths.finalize_checkpoint_yaml,
+                    error,
+                ));
+            }
         }
         self.metadata.status = SessionStatus::Open;
         self.metadata.closed_at = None;
@@ -2366,6 +2428,69 @@ frontier:
             loaded.metadata.recap_background_completion_until_seq,
             Some(historical_tail)
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_finalizing_session_with_checkpoint_defers_recap_cursor_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().join("agents"));
+        let agent = agent_id("agent-a");
+        let mut session = store
+            .create_with_id_factory(&agent, "system", || session_id("session_5555eeee"), 1)
+            .await
+            .unwrap();
+        let mut writer = session.open_turn_journal_writer().await.unwrap();
+        writer
+            .append(
+                "turn_1",
+                Utc::now(),
+                TurnJournalEventKind::BackgroundProcessCompleted {
+                    tool_use_id: "toolu_legacy".into(),
+                    process_id: "legacyproc1".into(),
+                    instance_id: 1,
+                    status: "finished".into(),
+                    exit_code: Some(0),
+                    signal: None,
+                    success: true,
+                },
+                TurnJournalFlush::Immediate,
+            )
+            .await
+            .unwrap();
+        drop(writer);
+        let historical_tail = session.latest_background_completion_seq().await;
+        session.metadata.status = SessionStatus::Finalizing;
+        session.metadata.provider_background_completion_until_seq = None;
+        session.metadata.recap_background_completion_until_seq = None;
+        write_yaml_atomic(&session.paths.session_yaml, &session.metadata)
+            .await
+            .unwrap();
+        session
+            .write_finalize_checkpoint(&FinalizeCheckpoint {
+                recap_start_index: 0,
+                recap_end_index: 0,
+                recap_segment_hash: "legacy-hash".into(),
+                prepared_claims: Vec::new(),
+                prepared_disputes: Vec::new(),
+                used_claim_ids: Vec::new(),
+                trace_text: "legacy frozen trace".into(),
+                trace_created_at: Utc::now(),
+                trace_id: None,
+                status: FinalizeCheckpointStatus::Prepared,
+            })
+            .await
+            .unwrap();
+
+        let loaded = store
+            .load_existing_session(&agent, &session.metadata.id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            loaded.metadata.provider_background_completion_until_seq,
+            Some(historical_tail)
+        );
+        assert_eq!(loaded.metadata.recap_background_completion_until_seq, None);
     }
 
     #[tokio::test]
@@ -3589,7 +3714,7 @@ frontier:
     }
 
     #[tokio::test]
-    async fn reopen_existing_session_allows_finalized_session_and_preserves_recap_pointer() {
+    async fn reopen_existing_session_clears_previous_finalize_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path().to_path_buf());
         let agent = agent_id("agent-a");
@@ -3643,10 +3768,7 @@ frontier:
                 .committed_message_until(),
             1
         );
-        assert_eq!(
-            reopened.read_finalize_checkpoint().await.unwrap(),
-            Some(checkpoint)
-        );
+        assert_eq!(reopened.read_finalize_checkpoint().await.unwrap(), None);
     }
 
     #[tokio::test]
