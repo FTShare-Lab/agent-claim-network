@@ -44,6 +44,8 @@ claim/dispute 的生成应基于 transcript、`background_process_completions` �
 
 上述内容只是候选检查清单。应先把候选提炼成可独立理解的判断，再按下方 claim 标准筛选；不要把检查过程、任务流水或 transcript 摘要写入 claim。不要为了覆盖清单而为每一类凑 claim，也不要为了记录“做过什么”而生成 claim；没有足够高价值的新增或更新时，相应数组应为空。
 
+避免为通用环境噪音生成claim，例如:围绕 Git identity/commit author、离线、网络或沙箱测试环境的内容。
+
 # claim
 {% include "what_is_claim.j2" %}
 
