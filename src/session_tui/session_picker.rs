@@ -40,7 +40,7 @@ impl SessionPickerState {
             KeyCode::Enter => {
                 if let Some(session) = self.sessions.get(self.selected) {
                     self.event_tx
-                        .send(AppEvent::PickerSessionSelected(session.metadata.id.clone()));
+                        .send(AppEvent::PickerSessionSelected(session.id.clone()));
                 }
             }
             KeyCode::Esc => self.event_tx.send(AppEvent::PickerCancelled),
@@ -60,13 +60,12 @@ impl SessionPickerState {
             "id                 closed_at            status  last_message",
         ));
         for (index, session) in self.sessions.iter().enumerate() {
-            let id = session.metadata.id.as_str();
+            let id = session.id.as_str();
             let closed_at = session
-                .metadata
                 .closed_at
                 .map(|time| time.format("%Y-%m-%dT%H:%M:%SZ").to_string())
                 .unwrap_or_else(|| "-".into());
-            let status = format!("{:?}", session.metadata.status).to_lowercase();
+            let status = format!("{:?}", session.status).to_lowercase();
             let last_user = truncate_to_width(
                 session.last_user_text.as_deref().unwrap_or(""),
                 table_width.saturating_sub(48),
@@ -118,8 +117,8 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claim::{AgentId, SessionId};
-    use crate::session::{SessionMetadata, SessionStatus};
+    use crate::claim::SessionId;
+    use crate::session::SessionStatus;
     use chrono::Utc;
     use crossterm::event::{KeyEvent, KeyEventKind, KeyModifiers};
     use std::str::FromStr;
@@ -127,21 +126,10 @@ mod tests {
     fn summary(id: &str) -> ResumedSessionSummary {
         let now = Utc::now();
         ResumedSessionSummary {
-            metadata: SessionMetadata {
-                id: SessionId::from_str(id).unwrap(),
-                agent_id: AgentId::new("agent-a").unwrap(),
-                status: SessionStatus::Closed,
-                created_at: now,
-                updated_at: now,
-                closed_at: Some(now),
-                source: "tui".into(),
-                model: "test-model".into(),
-                system_prompt_path: "system_prompt.md".into(),
-                message_count: 0,
-                finalized_at: None,
-                recapped_until: 0,
-                compaction: None,
-            },
+            id: SessionId::from_str(id).unwrap(),
+            status: SessionStatus::Closed,
+            updated_at: now,
+            closed_at: Some(now),
             last_user_text: Some("hello".into()),
         }
     }

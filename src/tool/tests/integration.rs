@@ -30,7 +30,7 @@ async fn file_read_rejects_memory_files_when_memory_store_is_configured() {
         )
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("memory 工具"));
+    assert!(err.to_string().contains("agent 私有受保护文件"));
 }
 
 #[tokio::test]
@@ -85,6 +85,55 @@ async fn memory_tools_are_exposed_only_when_store_is_configured() {
         1
     );
     assert!(names.iter().any(|name| name == "code_run"));
+}
+
+#[tokio::test]
+async fn disabled_memory_hides_tool_and_subagent_snapshot_but_keeps_files_protected() {
+    let dir = tempfile::tempdir().unwrap();
+    tokio::fs::create_dir_all(dir.path().join("memories"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        dir.path().join("memories/MEMORY.md"),
+        "private project memory",
+    )
+    .await
+    .unwrap();
+    let store = Arc::new(LocalFsMemoryStore::new(
+        dir.path().to_path_buf(),
+        100,
+        100,
+        true,
+    ));
+    let registry = ToolRegistry::new(&test_tool_config(dir.path()))
+        .unwrap()
+        .with_memory_store(store)
+        .with_memory_enabled(false);
+
+    let definitions = registry.definitions();
+    assert!(!definitions.iter().any(|tool| tool.name == "memory"));
+    assert!(!definitions
+        .iter()
+        .any(|tool| tool.description.to_ascii_lowercase().contains("memory")));
+    let err = registry
+        .dispatch("memory", serde_json::json!({"action": "add"}))
+        .await
+        .expect_err("disabled memory tool must be unknown");
+    assert!(matches!(err, ToolError::UnknownTool(_)));
+
+    let context = registry.delegation_runtime_context().await;
+    assert!(!context.to_ascii_lowercase().contains("memory"));
+    assert!(!context.contains("private project memory"));
+
+    let err = registry
+        .dispatch(
+            "file_read",
+            serde_json::json!({"path": "memories/MEMORY.md"}),
+        )
+        .await
+        .expect_err("protected file must remain inaccessible");
+    assert!(err.to_string().contains("agent 私有受保护文件"));
+    assert!(!err.to_string().contains("memory 工具"));
 }
 
 #[tokio::test]

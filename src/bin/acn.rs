@@ -102,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
         &upstream,
         Some(Arc::clone(&mcp_manager)),
     ) {
-        Ok(engine) => engine.with_fork_memory_review(cli.fork_review),
+        Ok(engine) => engine,
         Err(error) => {
             mcp_manager.shutdown().await;
             return Err(error);
@@ -396,7 +396,6 @@ fn session_usage() -> &'static str {
 struct Cli {
     config: Option<PathBuf>,
     upstream: Option<String>,
-    fork_review: bool,
     resume: StartupResume,
     cd: Option<PathBuf>,
 }
@@ -1772,7 +1771,6 @@ where
 {
     let mut config = None;
     let mut upstream = None;
-    let mut fork_review = true;
     let mut resume = StartupResume::None;
     let mut cd = None;
     let mut args = args.into_iter().map(Into::into).skip(1).peekable();
@@ -1780,10 +1778,6 @@ where
         match arg.as_str() {
             "--config" => config = Some(PathBuf::from(args.next().context("--config 后缺少路径")?)),
             "--upstream" => upstream = Some(args.next().context("--upstream 后缺少名称")?),
-            "--fork-review" => {
-                let raw = args.next().context("--fork-review 后缺少 true/false")?;
-                fork_review = parse_bool_arg("--fork-review", &raw)?;
-            }
             "--resume" => {
                 resume = match args.peek() {
                     Some(next) if !next.starts_with('-') => {
@@ -1807,7 +1801,6 @@ where
     Ok(Cli {
         config,
         upstream,
-        fork_review,
         resume,
         cd,
     })
@@ -1826,7 +1819,6 @@ fn acn_usage() -> &'static str {
 选项:
   --config <path>             指定 config.toml；不传则按 ACN_CONFIG 和默认配置查找
   --upstream <name>           选择 [upstreams.<name>]；不传则使用配置里的默认 upstream
-  --fork-review <true|false>  控制后台 memory review；默认 true
   --resume [session_id]       不带 session_id 时打开恢复列表；带 session_id 时直接恢复指定会话
   --cd <dir>, -C <dir>        指定 agent 工具读写文件和执行命令的工作目录
   --version, -V               显示版本号、构建提交和提交时间
@@ -2256,14 +2248,6 @@ fn clean_table_field(value: &str) -> String {
         .collect()
 }
 
-fn parse_bool_arg(name: &str, raw: &str) -> anyhow::Result<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => anyhow::bail!("{name} 只接受 true 或 false，实际: {raw}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use agent_claim_network::build_info;
@@ -2304,6 +2288,8 @@ mod tests {
             message_count: 0,
             finalized_at: None,
             recapped_until: 0,
+            provider_background_completion_until_seq: Some(0),
+            recap_background_completion_until_seq: Some(0),
             compaction: None,
         }
     }
@@ -2432,7 +2418,6 @@ api_key_env = "UNUSED_TEST_LLM_KEY"
             Some(std::path::Path::new("config.toml"))
         );
         assert_eq!(cli.upstream.as_deref(), Some("agent_hub"));
-        assert!(cli.fork_review);
         assert_eq!(cli.resume, super::StartupResume::None);
         assert_eq!(cli.cd.as_deref(), Some(std::path::Path::new(".")));
     }
@@ -2446,7 +2431,6 @@ api_key_env = "UNUSED_TEST_LLM_KEY"
             Some(std::path::Path::new("config.toml"))
         );
         assert_eq!(cli.upstream, None);
-        assert!(cli.fork_review);
         assert_eq!(cli.resume, super::StartupResume::None);
     }
 
@@ -2646,52 +2630,15 @@ api_key_env = "UNUSED_TEST_LLM_KEY"
     }
 
     #[test]
-    fn parse_cli_accepts_fork_review_false() {
-        let cli =
-            super::parse_cli_from(["acn", "--config", "config.toml", "--fork-review", "false"])
-                .unwrap();
+    fn parse_cli_rejects_removed_fork_review_flag() {
+        for value in ["true", "false"] {
+            let err =
+                super::parse_cli_from(["acn", "--config", "config.toml", "--fork-review", value])
+                    .unwrap_err()
+                    .to_string();
 
-        assert!(!cli.fork_review);
-        assert_eq!(cli.resume, super::StartupResume::None);
-    }
-
-    #[test]
-    fn parse_cli_accepts_fork_review_true() {
-        let cli =
-            super::parse_cli_from(["acn", "--config", "config.toml", "--fork-review", "true"])
-                .unwrap();
-
-        assert!(cli.fork_review);
-        assert_eq!(cli.resume, super::StartupResume::None);
-    }
-
-    #[test]
-    fn parse_cli_rejects_fork_review_underscore_flag() {
-        let err =
-            super::parse_cli_from(["acn", "--config", "config.toml", "--fork_review", "false"])
-                .unwrap_err()
-                .to_string();
-
-        assert!(err.contains("未知参数: --fork_review"));
-    }
-
-    #[test]
-    fn parse_cli_rejects_fork_review_without_value() {
-        let err = super::parse_cli_from(["acn", "--config", "config.toml", "--fork-review"])
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("--fork-review 后缺少 true/false"));
-    }
-
-    #[test]
-    fn parse_cli_rejects_invalid_fork_review_bool() {
-        let err =
-            super::parse_cli_from(["acn", "--config", "config.toml", "--fork-review", "maybe"])
-                .unwrap_err()
-                .to_string();
-
-        assert!(err.contains("--fork-review 只接受 true 或 false"));
+            assert!(err.contains("未知参数: --fork-review"));
+        }
     }
 
     #[test]

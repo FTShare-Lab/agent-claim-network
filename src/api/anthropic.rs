@@ -33,6 +33,7 @@ use super::provider::{
 };
 use super::redact_media_error_body;
 use super::types::{SessionTurnContentBlock, SessionTurnEvent, SessionTurnMessage};
+use super::{ProviderRecoveryInterrupt, SessionTurnInterrupted};
 use crate::config::{AnthropicThinking, ReasoningEffort};
 use crate::prompt::PromptError;
 
@@ -63,6 +64,8 @@ pub enum AnthropicError {
     TerminalFailure { reason: String },
     #[error("准备 Anthropic continuation request 失败: {reason}")]
     RequestPreparation { reason: String },
+    #[error("Anthropic recovery interrupted")]
+    RecoveryInterrupted,
     #[error("prompt 渲染失败: {0}")]
     Prompt(#[from] PromptError),
     #[error(
@@ -93,6 +96,8 @@ pub struct AnthropicMessagesClient {
     reasoning_effort: ReasoningEffort,
     thinking: AnthropicThinking,
     thinking_budget_tokens: Option<u32>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
 }
 
 pub struct AnthropicProviderAdapter {
@@ -117,6 +122,23 @@ impl AnthropicContinuationRequestObserver<'_> {
             })
     }
 
+    async fn abandon_before_send(&mut self) -> Result<(), AnthropicError> {
+        self.observer
+            .provider_request_abandoned_before_send(&self.messages)
+            .await
+            .map_err(|error| AnthropicError::RequestPreparation {
+                reason: format!("{error:#}"),
+            })
+    }
+
+    fn request_started(&mut self) -> Result<(), AnthropicError> {
+        self.observer
+            .provider_request_started(&self.messages)
+            .map_err(|error| AnthropicError::RequestPreparation {
+                reason: format!("{error:#}"),
+            })
+    }
+
     fn push_round(&mut self, replay_messages: Vec<Value>, text: String) {
         let content = if text.trim().is_empty() {
             Vec::new()
@@ -131,6 +153,16 @@ impl AnthropicContinuationRequestObserver<'_> {
                 messages: replay_messages,
             }),
         });
+    }
+
+    fn discard_pending_round(&mut self) -> Result<(), AnthropicError> {
+        self.messages
+            .pop()
+            .ok_or_else(|| AnthropicError::OutputShape {
+                reason: "safe steer 收束时缺少未发送的 Anthropic neutral replay".into(),
+                raw: String::new(),
+            })?;
+        Ok(())
     }
 }
 
@@ -170,6 +202,8 @@ impl AnthropicMessagesClient {
             reasoning_effort: ReasoningEffort::None,
             thinking: AnthropicThinking::Auto,
             thinking_budget_tokens: None,
+            temperature: None,
+            top_p: None,
         })
     }
 
@@ -208,6 +242,8 @@ impl AnthropicMessagesClient {
             },
             tools,
             stream,
+            temperature: self.temperature,
+            top_p: self.top_p,
         }
     }
 
@@ -215,14 +251,17 @@ impl AnthropicMessagesClient {
         AnthropicError::Http(LlmHttpError::new(error, phase, Some(self.timeout)))
     }
 
-    async fn send_with_retry_count(
+    async fn send_with_retry_count_and_start_hook(
         &self,
         body: &CreateMessageRequest,
         retry_count: u32,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+        request_started: &mut (dyn FnMut() -> Result<(), AnthropicError> + Send),
     ) -> Result<Value, AnthropicError> {
         let mut last_retryable: Option<AnthropicError> = None;
         for attempt in 0..=retry_count {
-            match self.send_once(body).await {
+            ensure_anthropic_recovery_active(recovery_interrupt)?;
+            match self.send_once(body, request_started).await {
                 Ok(v) => return Ok(v),
                 Err(e) if is_retryable(&e) && attempt < retry_count => {
                     let backoff =
@@ -236,7 +275,7 @@ impl AnthropicMessagesClient {
                         e
                     );
                     last_retryable = Some(e);
-                    tokio::time::sleep(backoff).await;
+                    wait_for_anthropic_backoff(backoff, recovery_interrupt).await?;
                 }
                 Err(e) => return Err(e),
             }
@@ -249,14 +288,20 @@ impl AnthropicMessagesClient {
         )
     }
 
-    async fn send_once(&self, body: &CreateMessageRequest) -> Result<Value, AnthropicError> {
-        let resp = self
+    async fn send_once(
+        &self,
+        body: &CreateMessageRequest,
+        request_started: &mut (dyn FnMut() -> Result<(), AnthropicError> + Send),
+    ) -> Result<Value, AnthropicError> {
+        let pending = self
             .http
             .post(self.endpoint.as_str())
             .header("x-api-key", self.api_key.as_str())
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(body)
+            .json(body);
+        request_started()?;
+        let resp = pending
             .send()
             .await
             .map_err(|error| self.http_error(error, LlmHttpPhase::SendRequest))?;
@@ -296,10 +341,15 @@ impl AnthropicMessagesClient {
             retry_count,
             false,
             None,
+            None,
         )
         .await
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "continuation 的 retry、中断与 request observer 需显式穿过同一边界"
+    )]
     async fn send_text_with_continuation_for_provider_with_retry_count_observed(
         &self,
         system: &str,
@@ -307,6 +357,7 @@ impl AnthropicMessagesClient {
         tools: Option<Vec<ApiToolDefinition>>,
         max_tokens: u32,
         retry_count: u32,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         observer: &mut AnthropicContinuationRequestObserver<'_>,
     ) -> Result<ContinuedAssistantTurn, AnthropicError> {
         self.send_text_with_continuation_with_policy(
@@ -317,6 +368,7 @@ impl AnthropicMessagesClient {
             retry_count,
             false,
             Some(observer),
+            recovery_interrupt,
         )
         .await
     }
@@ -334,6 +386,7 @@ impl AnthropicMessagesClient {
         retry_count: u32,
         error_on_unresolved_max_tokens: bool,
         mut request_observer: Option<&mut AnthropicContinuationRequestObserver<'_>>,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
     ) -> Result<ContinuedAssistantTurn, AnthropicError> {
         let mut merged_text = String::new();
         let mut last_response: Option<Value> = None;
@@ -342,11 +395,93 @@ impl AnthropicMessagesClient {
         let mut replay_messages = Vec::new();
 
         for round in 0..=MAX_CONTINUATION_TURNS {
+            if recovery_interrupt.is_some_and(ProviderRecoveryInterrupt::is_cancelled) {
+                if last_stop_reason == "max_tokens"
+                    && last_response.is_some()
+                    && !has_tool_use_block(&last_blocks)
+                {
+                    discard_pending_anthropic_continuation(
+                        messages,
+                        &mut replay_messages,
+                        request_observer.as_deref_mut(),
+                    )?;
+                    recovery_interrupt
+                        .expect("cancelled recovery interrupt must be present")
+                        .preserve_successful_response();
+                    last_stop_reason = "end_turn".into();
+                    break;
+                }
+                return Err(AnthropicError::RecoveryInterrupted);
+            }
             if let Some(observer) = request_observer.as_deref_mut() {
                 observer.before_request().await?;
             }
+            if recovery_interrupt.is_some_and(ProviderRecoveryInterrupt::is_cancelled) {
+                if last_stop_reason == "max_tokens"
+                    && last_response.is_some()
+                    && !has_tool_use_block(&last_blocks)
+                {
+                    if let Some(observer) = request_observer.as_deref_mut() {
+                        observer.abandon_before_send().await?;
+                    }
+                    discard_pending_anthropic_continuation(
+                        messages,
+                        &mut replay_messages,
+                        request_observer.as_deref_mut(),
+                    )?;
+                    recovery_interrupt
+                        .expect("cancelled recovery interrupt must be present")
+                        .preserve_successful_response();
+                    last_stop_reason = "end_turn".into();
+                    break;
+                }
+                return Err(AnthropicError::RecoveryInterrupted);
+            }
             let body = self.request_for(system, messages.clone(), tools.clone(), max_tokens, None);
-            let response = self.send_with_retry_count(&body, retry_count).await?;
+            let mut request_start_recorded = false;
+            let response_result = {
+                let mut request_started = || {
+                    if request_start_recorded {
+                        return Ok(());
+                    }
+                    if let Some(observer) = request_observer.as_deref_mut() {
+                        observer.request_started()?;
+                    }
+                    request_start_recorded = true;
+                    Ok(())
+                };
+                self.send_with_retry_count_and_start_hook(
+                    &body,
+                    retry_count,
+                    recovery_interrupt,
+                    &mut request_started,
+                )
+                .await
+            };
+            let response = match response_result {
+                Ok(response) => response,
+                Err(AnthropicError::RecoveryInterrupted)
+                    if !request_start_recorded
+                        && last_stop_reason == "max_tokens"
+                        && last_response.is_some()
+                        && !has_tool_use_block(&last_blocks) =>
+                {
+                    if let Some(observer) = request_observer.as_deref_mut() {
+                        observer.abandon_before_send().await?;
+                    }
+                    discard_pending_anthropic_continuation(
+                        messages,
+                        &mut replay_messages,
+                        request_observer.as_deref_mut(),
+                    )?;
+                    recovery_interrupt
+                        .expect("RecoveryInterrupted requires a recovery interrupt")
+                        .preserve_successful_response();
+                    last_stop_reason = "end_turn".into();
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
             let assistant_blocks =
                 content_blocks(&response).ok_or_else(|| AnthropicError::OutputShape {
                     reason: "缺少 content blocks".into(),
@@ -371,6 +506,12 @@ impl AnthropicMessagesClient {
             if has_tool_use_block(&last_blocks) {
                 // Anthropic 协议要求 tool_use 后必须立刻跟 tool_result，不能先插 user continuation。
                 // 遇到 "max_tokens + tool_use" 时提前返回给 provider turn loop，由外层先执行工具回环。
+                break;
+            }
+            if let Some(interrupt) = recovery_interrupt.filter(|interrupt| interrupt.is_cancelled())
+            {
+                interrupt.preserve_successful_response();
+                last_stop_reason = "end_turn".into();
                 break;
             }
             if round == MAX_CONTINUATION_TURNS && error_on_unresolved_max_tokens {
@@ -405,6 +546,27 @@ impl AnthropicMessagesClient {
             replay_messages,
         })
     }
+}
+
+fn discard_pending_anthropic_continuation(
+    messages: &mut Vec<ApiMessage>,
+    replay_messages: &mut Vec<Value>,
+    observer: Option<&mut AnthropicContinuationRequestObserver<'_>>,
+) -> Result<(), AnthropicError> {
+    messages.pop().ok_or_else(|| AnthropicError::OutputShape {
+        reason: "safe steer 收束时缺少未发送的 Anthropic continuation".into(),
+        raw: String::new(),
+    })?;
+    replay_messages
+        .pop()
+        .ok_or_else(|| AnthropicError::OutputShape {
+            reason: "safe steer 收束时缺少未发送的 Anthropic replay message".into(),
+            raw: String::new(),
+        })?;
+    if let Some(observer) = observer {
+        observer.discard_pending_round()?;
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -464,6 +626,7 @@ impl AnthropicProviderAdapter {
             .unwrap_or(self.client.retry_count);
         let retry_after_partial =
             request.stream_output_mode == crate::api::ProviderStreamOutputMode::Buffered;
+        let recovery_interrupt = request.recovery_interrupt.clone();
         let base_messages = request.messages;
         let request_has_media = base_messages.iter().any(|message| {
             message.content.iter().any(|block| {
@@ -516,6 +679,7 @@ impl AnthropicProviderAdapter {
                     retry_after_partial,
                     &mut provider_emit,
                     &mut request_observer,
+                    recovery_interrupt.as_ref(),
                 )
                 .await
         } else {
@@ -526,6 +690,7 @@ impl AnthropicProviderAdapter {
                     api_tools,
                     request.max_tokens,
                     retry_count,
+                    recovery_interrupt.as_ref(),
                     &mut request_observer,
                 )
                 .await
@@ -536,6 +701,9 @@ impl AnthropicProviderAdapter {
                 return Err(ProviderRequestPreparationFailure::new(reason).into());
             }
             Err(error) => {
+                if matches!(&error, AnthropicError::RecoveryInterrupted) {
+                    return Err(SessionTurnInterrupted.into());
+                }
                 if request.stream && anthropic_adapter_stream_failure(&error) {
                     return Err(ProviderStreamFailure::new(error.to_string()).into());
                 }
@@ -620,6 +788,17 @@ impl AnthropicProviderAdapter {
     ) -> Self {
         self.client.thinking = thinking;
         self.client.thinking_budget_tokens = budget_tokens;
+        self
+    }
+
+    /// 设置 Agent 请求的可选采样参数；`None` 会在序列化时省略。
+    pub(crate) fn with_sampling_parameters(
+        mut self,
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+    ) -> Self {
+        self.client.temperature = temperature;
+        self.client.top_p = top_p;
         self
     }
 }
@@ -1059,6 +1238,7 @@ fn is_retryable(e: &AnthropicError) -> bool {
         | AnthropicError::Prompt(_)
         | AnthropicError::TerminalFailure { .. }
         | AnthropicError::RequestPreparation { .. }
+        | AnthropicError::RecoveryInterrupted
         | AnthropicError::NoConsumableOutput { .. } => false,
         // 多模态拒收是确定性 4xx，重试无意义
         AnthropicError::MediaRejected { .. } => false,
@@ -1077,8 +1257,39 @@ fn is_stream_retryable(error: &AnthropicError) -> bool {
         | AnthropicError::NoConsumableOutput { .. }
         | AnthropicError::TerminalFailure { .. }
         | AnthropicError::RequestPreparation { .. }
+        | AnthropicError::RecoveryInterrupted
         | AnthropicError::Prompt(_)
         | AnthropicError::MediaRejected { .. } => false,
+    }
+}
+
+fn ensure_anthropic_recovery_active(
+    recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+) -> Result<(), AnthropicError> {
+    if recovery_interrupt.is_some_and(ProviderRecoveryInterrupt::is_cancelled) {
+        return Err(AnthropicError::RecoveryInterrupted);
+    }
+    Ok(())
+}
+
+async fn wait_for_anthropic_backoff(
+    delay: Duration,
+    recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+) -> Result<(), AnthropicError> {
+    if delay.is_zero() {
+        return ensure_anthropic_recovery_active(recovery_interrupt);
+    }
+    match recovery_interrupt {
+        Some(interrupt) => {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => Ok(()),
+                _ = interrupt.cancelled() => Err(AnthropicError::RecoveryInterrupted),
+            }
+        }
+        None => {
+            tokio::time::sleep(delay).await;
+            Ok(())
+        }
     }
 }
 
@@ -1109,9 +1320,55 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn recovery_interrupt_stops_anthropic_retry_backoff() {
+        let interrupt = ProviderRecoveryInterrupt::new();
+        let cancel = interrupt.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel.cancel();
+        });
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_anthropic_backoff(Duration::from_secs(60), Some(&interrupt)),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+
+        assert!(matches!(error, AnthropicError::RecoveryInterrupted));
+    }
+
+    #[test]
+    fn cancelled_anthropic_recovery_is_not_retryable() {
+        let interrupt = ProviderRecoveryInterrupt::new();
+        interrupt.cancel();
+
+        assert!(matches!(
+            ensure_anthropic_recovery_active(Some(&interrupt)),
+            Err(AnthropicError::RecoveryInterrupted)
+        ));
+        assert!(!is_retryable(&AnthropicError::RecoveryInterrupted));
+        assert!(!is_stream_retryable(&AnthropicError::RecoveryInterrupted));
+    }
+
     #[derive(Default)]
     struct RecordingRequestObserver {
         requests: Vec<Vec<SessionTurnMessage>>,
+    }
+
+    struct CancellingStartedObserver {
+        interrupt: ProviderRecoveryInterrupt,
+        requests: Vec<Vec<SessionTurnMessage>>,
+        started: usize,
+    }
+
+    struct CancellingContinuationPreflightObserver {
+        interrupt: ProviderRecoveryInterrupt,
+        requests: Vec<Vec<SessionTurnMessage>>,
+        started: usize,
+        abandoned: usize,
     }
 
     #[async_trait]
@@ -1121,6 +1378,57 @@ mod tests {
             messages: &[SessionTurnMessage],
         ) -> anyhow::Result<()> {
             self.requests.push(messages.to_vec());
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ProviderRequestObserver for CancellingStartedObserver {
+        async fn before_provider_request(
+            &mut self,
+            messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            self.requests.push(messages.to_vec());
+            Ok(())
+        }
+
+        fn provider_request_started(
+            &mut self,
+            _messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            self.started += 1;
+            self.interrupt.cancel();
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ProviderRequestObserver for CancellingContinuationPreflightObserver {
+        async fn before_provider_request(
+            &mut self,
+            messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            self.requests.push(messages.to_vec());
+            if self.requests.len() == 2 {
+                self.interrupt.cancel();
+            }
+            Ok(())
+        }
+
+        fn provider_request_started(
+            &mut self,
+            _messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            self.started += 1;
+            Ok(())
+        }
+
+        async fn provider_request_abandoned_before_send(
+            &mut self,
+            messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            assert_eq!(Some(messages), self.requests.last().map(Vec::as_slice));
+            self.abandoned += 1;
             Ok(())
         }
     }
@@ -1241,6 +1549,8 @@ mod tests {
 
         assert!(body.get("output_config").is_none());
         assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
     }
 
     #[test]
@@ -1252,6 +1562,20 @@ mod tests {
             let body = serde_json::to_value(request).unwrap();
             assert_eq!(body.get("output_config"), Some(&json!({"effort": "xhigh"})));
             assert!(body.get("reasoning_effort").is_none());
+        }
+    }
+
+    #[test]
+    fn configured_sampling_parameters_are_sent_for_streaming_and_non_streaming_requests() {
+        let mut client = client_with_reasoning_effort(ReasoningEffort::None);
+        client.temperature = Some(0.55);
+        client.top_p = Some(0.8);
+
+        for stream in [None, Some(true)] {
+            let request = client.request_for("system", Vec::new(), None, 128, stream);
+            let body = serde_json::to_value(request).unwrap();
+            assert_eq!(body.get("temperature"), Some(&json!(0.55)));
+            assert_eq!(body.get("top_p"), Some(&json!(0.8)));
         }
     }
 
@@ -1678,6 +2002,121 @@ mod tests {
         let replayed_messages = serde_json::to_value(&messages[1..]).unwrap();
         assert!(replayed_messages.to_string().contains("private-one"));
         assert!(replayed_messages.to_string().contains(CONTINUATION_TRIGGER));
+    }
+
+    #[tokio::test]
+    async fn safe_steer_after_send_keeps_successful_max_tokens_response_without_continuation() {
+        let (endpoint, requests) = spawn_json_server(vec![json!({
+            "content":[{"type":"text", "text":"partial-answer"}],
+            "stop_reason":"max_tokens",
+            "usage":{"input_tokens":1,"output_tokens":2}
+        })])
+        .await;
+        let adapter = AnthropicProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            32,
+            Duration::from_secs(5),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let interrupt = ProviderRecoveryInterrupt::new();
+        let mut observer = CancellingStartedObserver {
+            interrupt: interrupt.clone(),
+            requests: Vec::new(),
+            started: 0,
+        };
+
+        let response = adapter
+            .send_with_request_observer(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 32,
+                    stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: Some(interrupt),
+                    retry_count_override: None,
+                },
+                &mut |_| {},
+                &mut observer,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.stop, ProviderStop::Done);
+        assert!(matches!(
+            response.assistant_message.content.as_slice(),
+            [SessionTurnContentBlock::Text { text }] if text == "partial-answer"
+        ));
+        assert_eq!(observer.started, 1);
+        assert_eq!(observer.requests.len(), 1);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn safe_steer_during_continuation_wal_keeps_anthropic_partial() {
+        let (endpoint, requests) = spawn_json_server(vec![json!({
+            "content":[{"type":"text", "text":"partial-answer"}],
+            "stop_reason":"max_tokens",
+            "usage":{"input_tokens":1,"output_tokens":2}
+        })])
+        .await;
+        let adapter = AnthropicProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            32,
+            Duration::from_secs(5),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let interrupt = ProviderRecoveryInterrupt::new();
+        let mut observer = CancellingContinuationPreflightObserver {
+            interrupt: interrupt.clone(),
+            requests: Vec::new(),
+            started: 0,
+            abandoned: 0,
+        };
+
+        let response = adapter
+            .send_with_request_observer(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 32,
+                    stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: Some(interrupt.clone()),
+                    retry_count_override: None,
+                },
+                &mut |_| {},
+                &mut observer,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.stop, ProviderStop::Done);
+        assert!(matches!(
+            response.assistant_message.content.as_slice(),
+            [SessionTurnContentBlock::Text { text }] if text == "partial-answer"
+        ));
+        assert!(interrupt.should_preserve_successful_response());
+        assert_eq!(observer.requests.len(), 2);
+        assert_eq!(observer.started, 1);
+        assert_eq!(observer.abandoned, 1);
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

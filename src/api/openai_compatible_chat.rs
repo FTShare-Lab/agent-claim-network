@@ -21,12 +21,14 @@ use super::continuation::{
 };
 use super::provider::{
     NoopProviderRequestObserver, ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy,
-    ProviderNoConsumableOutput, ProviderReplayIdentity, ProviderReplayProtocol, ProviderRequest,
-    ProviderRequestObserver, ProviderRequestPreparationFailure, ProviderResponse, ProviderStop,
-    ProviderStreamFailure, ProviderTerminalFailure, ProviderTransport, ToolSpec,
+    ProviderNoConsumableOutput, ProviderRecoveryInterrupt, ProviderReplayIdentity,
+    ProviderReplayProtocol, ProviderRequest, ProviderRequestObserver,
+    ProviderRequestPreparationFailure, ProviderResponse, ProviderStop, ProviderStreamFailure,
+    ProviderTerminalFailure, ProviderTransport, ToolSpec,
 };
 use super::redact_media_error_body;
 use super::types::{ProviderReplayState, SessionTurnContentBlock, SessionTurnMessage};
+use crate::api::SessionTurnInterrupted;
 use crate::config::ReasoningEffort;
 
 #[derive(Debug, thiserror::Error)]
@@ -54,7 +56,8 @@ pub struct OpenAiCompatibleChatProviderAdapter {
     client: ChatCompletionsClient,
     model: String,
     reasoning_effort: ReasoningEffort,
-    temperature: Option<f32>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
 }
 
 impl OpenAiCompatibleChatProviderAdapter {
@@ -79,6 +82,7 @@ impl OpenAiCompatibleChatProviderAdapter {
             model,
             reasoning_effort: ReasoningEffort::None,
             temperature: None,
+            top_p: None,
         })
     }
 
@@ -89,8 +93,19 @@ impl OpenAiCompatibleChatProviderAdapter {
     }
 
     /// 为内部确定性任务设置采样温度；普通 Agent 请求保持 provider 默认值。
-    pub(crate) fn with_temperature(mut self, temperature: f32) -> Self {
+    pub(crate) fn with_temperature(mut self, temperature: f64) -> Self {
         self.temperature = Some(temperature);
+        self
+    }
+
+    /// 设置 Agent 请求的可选采样参数；`None` 会在序列化时省略。
+    pub(crate) fn with_sampling_parameters(
+        mut self,
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+    ) -> Self {
+        self.temperature = temperature;
+        self.top_p = top_p;
         self
     }
 
@@ -119,6 +134,7 @@ impl OpenAiCompatibleChatProviderAdapter {
                 include_usage: true,
             }),
             temperature: self.temperature,
+            top_p: self.top_p,
         }
     }
 
@@ -136,6 +152,7 @@ impl OpenAiCompatibleChatProviderAdapter {
         stream: bool,
         retry_count: u32,
         retry_after_partial: bool,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         emit: &mut (dyn FnMut(ProviderEvent) + Send),
         observer: &mut (dyn ProviderRequestObserver + Send),
     ) -> Result<ContinuedChatTurn, OpenAiCompatibleChatError> {
@@ -143,16 +160,42 @@ impl OpenAiCompatibleChatProviderAdapter {
         let mut merged_text = String::new();
         let mut last_message = None;
         let mut last_finish_reason = Some(ChatFinishReason::Stop);
-        let mut continued = false;
+        let mut continuation_requests_started = 0usize;
         let mut provider_messages = base_messages.to_vec();
 
         for round in 0..=MAX_CONTINUATION_TURNS {
+            if let Some(interrupt) = recovery_interrupt.filter(|interrupt| interrupt.is_cancelled())
+            {
+                if last_finish_reason == Some(ChatFinishReason::Length) && last_message.is_some() {
+                    discard_pending_chat_continuation(messages, &mut provider_messages)?;
+                    interrupt.preserve_successful_response();
+                    last_finish_reason = Some(ChatFinishReason::Stop);
+                    break;
+                }
+                return Err(ChatCompletionsError::RecoveryInterrupted.into());
+            }
             observer
                 .before_provider_request(&provider_messages)
                 .await
                 .map_err(|error| OpenAiCompatibleChatError::RequestPreparation {
                     reason: format!("{error:#}"),
                 })?;
+            if let Some(interrupt) = recovery_interrupt.filter(|interrupt| interrupt.is_cancelled())
+            {
+                if last_finish_reason == Some(ChatFinishReason::Length) && last_message.is_some() {
+                    observer
+                        .provider_request_abandoned_before_send(&provider_messages)
+                        .await
+                        .map_err(|error| OpenAiCompatibleChatError::RequestPreparation {
+                            reason: format!("{error:#}"),
+                        })?;
+                    discard_pending_chat_continuation(messages, &mut provider_messages)?;
+                    interrupt.preserve_successful_response();
+                    last_finish_reason = Some(ChatFinishReason::Stop);
+                    break;
+                }
+                return Err(ChatCompletionsError::RecoveryInterrupted.into());
+            }
             let request = self.request_for(
                 system_prompt,
                 messages.clone(),
@@ -160,25 +203,75 @@ impl OpenAiCompatibleChatProviderAdapter {
                 max_tokens,
                 stream,
             );
-            let response = if stream {
-                let mut chat_emit = |event| match event {
-                    ChatStreamEvent::ContentDelta { text } => {
-                        emit(ProviderEvent::AssistantTextDelta { text });
+            let mut request_start_recorded = false;
+            let response_result = {
+                let mut request_started = || {
+                    if request_start_recorded {
+                        return Ok(());
                     }
+                    observer
+                        .provider_request_started(&provider_messages)
+                        .map_err(|error| ChatCompletionsError::RequestPreparation {
+                            reason: format!("{error:#}"),
+                        })?;
+                    request_start_recorded = true;
+                    if round > 0 {
+                        continuation_requests_started =
+                            continuation_requests_started.saturating_add(1);
+                    }
+                    Ok(())
                 };
-                self.client
-                    .send_with_retry_count_and_mode(
-                        &request,
-                        retry_count,
-                        retry_after_partial,
-                        &mut chat_emit,
-                    )
-                    .await?
-            } else {
-                let mut noop = |_event: ChatStreamEvent| {};
-                self.client
-                    .send_with_retry_count(&request, retry_count, &mut noop)
-                    .await?
+                if stream {
+                    let mut chat_emit = |event| match event {
+                        ChatStreamEvent::ContentDelta { text } => {
+                            emit(ProviderEvent::AssistantTextDelta { text });
+                        }
+                    };
+                    self.client
+                        .send_with_retry_count_and_mode_and_interrupt_and_start_hook(
+                            &request,
+                            retry_count,
+                            retry_after_partial,
+                            recovery_interrupt,
+                            &mut chat_emit,
+                            &mut request_started,
+                        )
+                        .await
+                } else {
+                    let mut noop = |_event: ChatStreamEvent| {};
+                    self.client
+                        .send_with_retry_count_and_mode_and_interrupt_and_start_hook(
+                            &request,
+                            retry_count,
+                            false,
+                            recovery_interrupt,
+                            &mut noop,
+                            &mut request_started,
+                        )
+                        .await
+                }
+            };
+            let response = match response_result {
+                Ok(response) => response,
+                Err(ChatCompletionsError::RecoveryInterrupted)
+                    if !request_start_recorded
+                        && last_finish_reason == Some(ChatFinishReason::Length)
+                        && last_message.is_some() =>
+                {
+                    observer
+                        .provider_request_abandoned_before_send(&provider_messages)
+                        .await
+                        .map_err(|error| OpenAiCompatibleChatError::RequestPreparation {
+                            reason: format!("{error:#}"),
+                        })?;
+                    discard_pending_chat_continuation(messages, &mut provider_messages)?;
+                    recovery_interrupt
+                        .expect("RecoveryInterrupted requires a recovery interrupt")
+                        .preserve_successful_response();
+                    last_finish_reason = Some(ChatFinishReason::Stop);
+                    break;
+                }
+                Err(error) => return Err(error.into()),
             };
             if let Some(usage) = response
                 .usage
@@ -204,12 +297,20 @@ impl OpenAiCompatibleChatProviderAdapter {
             if finish_reason != ChatFinishReason::Length {
                 break;
             }
-            if has_tool_calls || round == MAX_CONTINUATION_TURNS {
+            if has_tool_calls {
+                break;
+            }
+            if let Some(interrupt) = recovery_interrupt.filter(|interrupt| interrupt.is_cancelled())
+            {
+                interrupt.preserve_successful_response();
+                last_finish_reason = Some(ChatFinishReason::Stop);
+                break;
+            }
+            if round == MAX_CONTINUATION_TURNS {
                 break;
             }
             let continuation = ChatMessage::user(CONTINUATION_TRIGGER.to_string());
             messages.push(continuation.clone());
-            continued = true;
             let replay_messages = [assistant_replay, continuation]
                 .into_iter()
                 .map(serde_json::to_value)
@@ -241,7 +342,7 @@ impl OpenAiCompatibleChatProviderAdapter {
             message,
             finish_reason: last_finish_reason,
             merged_text,
-            replay_messages: if continued {
+            replay_messages: if continuation_requests_started > 0 {
                 Some(
                     messages[replay_start..]
                         .iter()
@@ -257,6 +358,25 @@ impl OpenAiCompatibleChatProviderAdapter {
             },
         })
     }
+}
+
+fn discard_pending_chat_continuation(
+    messages: &mut Vec<ChatMessage>,
+    provider_messages: &mut Vec<SessionTurnMessage>,
+) -> Result<(), OpenAiCompatibleChatError> {
+    messages
+        .pop()
+        .ok_or_else(|| OpenAiCompatibleChatError::OutputShape {
+            reason: "safe steer 收束时缺少未发送的 Chat continuation".into(),
+            raw: String::new(),
+        })?;
+    provider_messages
+        .pop()
+        .ok_or_else(|| OpenAiCompatibleChatError::OutputShape {
+            reason: "safe steer 收束时缺少未发送的 Chat neutral replay".into(),
+            raw: String::new(),
+        })?;
+    Ok(())
 }
 
 #[async_trait]
@@ -316,6 +436,7 @@ impl OpenAiCompatibleChatProviderAdapter {
             .unwrap_or(self.client.retry_count());
         let retry_after_partial =
             request.stream_output_mode == crate::api::ProviderStreamOutputMode::Buffered;
+        let recovery_interrupt = request.recovery_interrupt.clone();
         let base_messages = request.messages;
         let mut messages = session_turn_messages_to_chat(base_messages.clone(), &self.model)?;
         let request_has_media = messages_contain_media(&messages);
@@ -330,6 +451,7 @@ impl OpenAiCompatibleChatProviderAdapter {
                 request.stream,
                 retry_count,
                 retry_after_partial,
+                recovery_interrupt.as_ref(),
                 emit,
                 observer,
             )
@@ -340,6 +462,12 @@ impl OpenAiCompatibleChatProviderAdapter {
                 return Err(ProviderRequestPreparationFailure::new(reason).into());
             }
             Err(error) => {
+                if matches!(
+                    &error,
+                    OpenAiCompatibleChatError::Client(ChatCompletionsError::RecoveryInterrupted)
+                ) {
+                    return Err(SessionTurnInterrupted.into());
+                }
                 if request.stream && chat_adapter_stream_failure(&error) {
                     return Err(ProviderStreamFailure::new(error.to_string()).into());
                 }
@@ -744,6 +872,19 @@ mod tests {
         requests: Vec<Vec<SessionTurnMessage>>,
     }
 
+    struct CancellingStartedObserver {
+        interrupt: ProviderRecoveryInterrupt,
+        requests: Vec<Vec<SessionTurnMessage>>,
+        started: usize,
+    }
+
+    struct CancellingContinuationPreflightObserver {
+        interrupt: ProviderRecoveryInterrupt,
+        requests: Vec<Vec<SessionTurnMessage>>,
+        started: usize,
+        abandoned: usize,
+    }
+
     #[async_trait]
     impl ProviderRequestObserver for RecordingRequestObserver {
         async fn before_provider_request(
@@ -751,6 +892,57 @@ mod tests {
             messages: &[SessionTurnMessage],
         ) -> anyhow::Result<()> {
             self.requests.push(messages.to_vec());
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ProviderRequestObserver for CancellingStartedObserver {
+        async fn before_provider_request(
+            &mut self,
+            messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            self.requests.push(messages.to_vec());
+            Ok(())
+        }
+
+        fn provider_request_started(
+            &mut self,
+            _messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            self.started += 1;
+            self.interrupt.cancel();
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ProviderRequestObserver for CancellingContinuationPreflightObserver {
+        async fn before_provider_request(
+            &mut self,
+            messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            self.requests.push(messages.to_vec());
+            if self.requests.len() == 2 {
+                self.interrupt.cancel();
+            }
+            Ok(())
+        }
+
+        fn provider_request_started(
+            &mut self,
+            _messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            self.started += 1;
+            Ok(())
+        }
+
+        async fn provider_request_abandoned_before_send(
+            &mut self,
+            messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            assert_eq!(Some(messages), self.requests.last().map(Vec::as_slice));
+            self.abandoned += 1;
             Ok(())
         }
     }
@@ -775,6 +967,7 @@ mod tests {
             model: "test-model".into(),
             reasoning_effort,
             temperature: None,
+            top_p: None,
         }
     }
 
@@ -1090,6 +1283,121 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn safe_steer_after_send_keeps_successful_length_response_without_continuation() {
+        let (endpoint, captured) = spawn_chat_json_sequence(vec![json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "partial-answer"},
+                "finish_reason": "length"
+            }]
+        })])
+        .await;
+        let adapter = OpenAiCompatibleChatProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            Duration::from_secs(5),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let interrupt = ProviderRecoveryInterrupt::new();
+        let mut observer = CancellingStartedObserver {
+            interrupt: interrupt.clone(),
+            requests: Vec::new(),
+            started: 0,
+        };
+
+        let response = adapter
+            .send_with_request_observer(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 32,
+                    stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: Some(interrupt),
+                    retry_count_override: None,
+                },
+                &mut |_| {},
+                &mut observer,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.stop, ProviderStop::Done);
+        assert!(matches!(
+            response.assistant_message.content.as_slice(),
+            [SessionTurnContentBlock::Text { text }] if text == "partial-answer"
+        ));
+        assert_eq!(observer.started, 1);
+        assert_eq!(observer.requests.len(), 1);
+        assert_eq!(captured.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn safe_steer_during_continuation_wal_keeps_chat_partial() {
+        let (endpoint, captured) = spawn_chat_json_sequence(vec![json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "partial-answer"},
+                "finish_reason": "length"
+            }]
+        })])
+        .await;
+        let adapter = OpenAiCompatibleChatProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            Duration::from_secs(5),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let interrupt = ProviderRecoveryInterrupt::new();
+        let mut observer = CancellingContinuationPreflightObserver {
+            interrupt: interrupt.clone(),
+            requests: Vec::new(),
+            started: 0,
+            abandoned: 0,
+        };
+
+        let response = adapter
+            .send_with_request_observer(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 32,
+                    stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: Some(interrupt.clone()),
+                    retry_count_override: None,
+                },
+                &mut |_| {},
+                &mut observer,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.stop, ProviderStop::Done);
+        assert!(matches!(
+            response.assistant_message.content.as_slice(),
+            [SessionTurnContentBlock::Text { text }] if text == "partial-answer"
+        ));
+        assert!(interrupt.should_preserve_successful_response());
+        assert_eq!(observer.requests.len(), 2);
+        assert_eq!(observer.started, 1);
+        assert_eq!(observer.abandoned, 1);
+        assert_eq!(captured.await.unwrap().len(), 1);
+    }
+
     #[test]
     fn chat_tool_call_maps_to_canonical_tool_use() {
         let turn = ContinuedChatTurn {
@@ -1140,16 +1448,21 @@ mod tests {
         let body = serde_json::to_value(req).unwrap();
 
         assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
     }
 
     #[test]
-    fn configured_temperature_is_sent_without_enabling_reasoning() {
-        let adapter = adapter().with_temperature(0.0);
-        let req = adapter.request_for("system", Vec::new(), Vec::new(), 128, true);
-        let body = serde_json::to_value(req).unwrap();
+    fn configured_sampling_parameters_are_sent_for_streaming_and_non_streaming_requests() {
+        let adapter = adapter().with_sampling_parameters(Some(0.75), Some(0.9));
+        for stream in [false, true] {
+            let req = adapter.request_for("system", Vec::new(), Vec::new(), 128, stream);
+            let body = serde_json::to_value(req).unwrap();
 
-        assert_eq!(body.get("temperature"), Some(&json!(0.0)));
-        assert!(body.get("reasoning_effort").is_none());
+            assert_eq!(body.get("temperature"), Some(&json!(0.75)));
+            assert_eq!(body.get("top_p"), Some(&json!(0.9)));
+            assert!(body.get("reasoning_effort").is_none());
+        }
     }
 
     #[test]

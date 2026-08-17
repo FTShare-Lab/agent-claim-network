@@ -101,6 +101,7 @@ impl ResponsesWebSocketTransport {
         clippy::too_many_arguments,
         reason = "WebSocket retry 需显式携带 fallback scope 与缓冲语义"
     )]
+    #[cfg(test)]
     pub(super) async fn send_with_retry_count_for_scope(
         &self,
         request: &ResponsesRequest,
@@ -112,6 +113,39 @@ impl ResponsesWebSocketTransport {
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         retry_after_partial: bool,
         emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
+    ) -> Result<WebSocketSendOutcome, ResponsesError> {
+        let mut noop = || Ok(());
+        self.send_with_retry_count_for_scope_and_start_hook(
+            request,
+            chain_id,
+            fallback_scope,
+            retry_count,
+            retry_base_delay,
+            retry_max_delay,
+            recovery_interrupt,
+            retry_after_partial,
+            emit,
+            &mut noop,
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "WebSocket retry 需显式携带 fallback、恢复中断与 WAL start hook"
+    )]
+    pub(super) async fn send_with_retry_count_for_scope_and_start_hook(
+        &self,
+        request: &ResponsesRequest,
+        chain_id: ProviderRuntimeChainId,
+        fallback_scope: Option<&ProviderRuntimeFallbackScope>,
+        retry_count: u32,
+        retry_base_delay: Duration,
+        retry_max_delay: Duration,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+        retry_after_partial: bool,
+        emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
+        request_started: &mut (dyn FnMut() -> Result<(), ResponsesError> + Send),
     ) -> Result<WebSocketSendOutcome, ResponsesError> {
         ensure_recovery_active(recovery_interrupt)?;
         if self.websocket_sticky(chain_id, fallback_scope).await {
@@ -220,7 +254,9 @@ impl ResponsesWebSocketTransport {
                     emitted_visible_text = true;
                     emit(event);
                 };
-                connection.run_response(payload, &mut tracking_emit).await
+                connection
+                    .run_response(payload, &mut tracking_emit, request_started)
+                    .await
             })
             .await
             .unwrap_or_else(|_| {
@@ -835,16 +871,29 @@ impl WebSocketConnection {
         &mut self,
         payload: String,
         emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
+        request_started: &mut (dyn FnMut() -> Result<(), ResponsesError> + Send),
     ) -> Result<ReducedResponses, WebSocketRequestFailure> {
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (ready_tx, ready_rx) = oneshot::channel();
         let (ack_tx, ack_rx) = oneshot::channel();
         self.commands
             .send(ConnectionCommand::Start {
                 payload,
                 events: events_tx,
+                ready: ready_tx,
                 ack: ack_tx,
             })
             .map_err(|_| stream_failure("WebSocket connection actor 已停止"))?;
+        let send_permission = ready_rx
+            .await
+            .map_err(|_| stream_failure("WebSocket request 发送就绪确认丢失"))?;
+        if let Err(error) = request_started() {
+            let _ = send_permission.send(false);
+            return Err(error.into());
+        }
+        send_permission
+            .send(true)
+            .map_err(|_| stream_failure("WebSocket request 发送许可丢失"))?;
         ack_rx
             .await
             .map_err(|_| stream_failure("WebSocket request 启动确认丢失"))?
@@ -896,6 +945,7 @@ enum ConnectionCommand {
     Start {
         payload: String,
         events: mpsc::UnboundedSender<IncomingMessage>,
+        ready: oneshot::Sender<oneshot::Sender<bool>>,
         ack: oneshot::Sender<Result<(), String>>,
     },
     Invalidate,
@@ -964,7 +1014,30 @@ async fn run_connection_actor(
                 }
             },
             command = commands.recv() => match command {
-                Some(ConnectionCommand::Start { payload, events, ack }) if active.is_none() => {
+                Some(ConnectionCommand::Start {
+                    payload,
+                    events,
+                    ready,
+                    ack,
+                }) if active.is_none() => {
+                    let (send_permission, permission) = oneshot::channel();
+                    if ready.send(send_permission).is_err() {
+                        invalid.store(true, Ordering::Release);
+                        break;
+                    }
+                    match permission.await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let _ = ack.send(Err(
+                                "WebSocket request 在发送前被调用方放弃".into(),
+                            ));
+                            continue;
+                        }
+                        Err(_) => {
+                            invalid.store(true, Ordering::Release);
+                            break;
+                        }
+                    }
                     match websocket.send(Message::Text(payload)).await {
                         Ok(()) => {
                             active = Some(events);
@@ -1680,6 +1753,8 @@ mod tests {
             store: false,
             include: None,
             reasoning: None,
+            temperature: None,
+            top_p: None,
         }
     }
 
@@ -1864,6 +1939,37 @@ mod tests {
 
         assert_eq!(response.output_text, "ok");
         assert_eq!(transport, crate::api::ProviderTransport::ResponsesWebSocket);
+    }
+
+    #[tokio::test]
+    async fn websocket_start_hook_failure_abandons_request_before_frame_send() {
+        let (server, state) = start_websocket_server(FakeBehavior::Success).await;
+        let transport = transport(&server.endpoint, 1);
+        let mut started_calls = 0usize;
+        let error = transport
+            .send_with_retry_count_for_scope_and_start_hook(
+                &request(vec![json!({"type":"message","n":1})]),
+                ProviderRuntimeChainId::new(),
+                None,
+                0,
+                Duration::ZERO,
+                Duration::ZERO,
+                None,
+                false,
+                &mut |_| {},
+                &mut || {
+                    started_calls = started_calls.saturating_add(1);
+                    Err(ResponsesError::RequestPreparation {
+                        reason: "test WAL start failure".into(),
+                    })
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ResponsesError::RequestPreparation { .. }));
+        assert_eq!(started_calls, 1);
+        assert!(state.requests.lock().await.is_empty());
     }
 
     #[tokio::test]

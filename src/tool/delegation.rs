@@ -308,28 +308,30 @@ impl ToolRegistry {
     pub async fn delegation_runtime_context(&self) -> String {
         let mut lines = Vec::new();
         lines.push(format!("workspace_root: {}", self.workspace_root.display()));
-        lines.push("memory_snapshot_mode: read_only_context_no_memory_tool".to_string());
         lines.push("mcp_tools_inherited: same visible MCP tools as parent session".to_string());
-        if let Some(memory_store) = &self.memory_store {
-            match memory_store.read_snapshot().await {
-                Ok(snapshot) => {
-                    if !snapshot.user_entries.is_empty() {
-                        let joined = snapshot.user_entries.join("; ");
-                        lines.push(format!(
-                            "user_memory_snapshot: {}",
-                            truncate_chars(&joined, 1200).0
-                        ));
+        if self.memory_enabled {
+            lines.push("memory_snapshot_mode: read_only_context_no_memory_tool".to_string());
+            if let Some(memory_store) = &self.memory_store {
+                match memory_store.read_snapshot().await {
+                    Ok(snapshot) => {
+                        if !snapshot.user_entries.is_empty() {
+                            let joined = snapshot.user_entries.join("; ");
+                            lines.push(format!(
+                                "user_memory_snapshot: {}",
+                                truncate_chars(&joined, 1200).0
+                            ));
+                        }
+                        if !snapshot.memory_entries.is_empty() {
+                            let joined = snapshot.memory_entries.join("; ");
+                            lines.push(format!(
+                                "project_memory_snapshot: {}",
+                                truncate_chars(&joined, 1200).0
+                            ));
+                        }
                     }
-                    if !snapshot.memory_entries.is_empty() {
-                        let joined = snapshot.memory_entries.join("; ");
-                        lines.push(format!(
-                            "project_memory_snapshot: {}",
-                            truncate_chars(&joined, 1200).0
-                        ));
+                    Err(err) => {
+                        lines.push(format!("memory_snapshot_error: {err:#}"));
                     }
-                }
-                Err(err) => {
-                    lines.push(format!("memory_snapshot_error: {err:#}"));
                 }
             }
         }

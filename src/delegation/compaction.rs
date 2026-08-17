@@ -54,6 +54,7 @@ pub struct DelegationPreflightCompactor {
     compaction: SessionCompactionConfig,
     context_window: usize,
     runtime_fallback_scope: ProviderRuntimeFallbackScope,
+    file_edit_authority_enabled: bool,
     provider_context_anchor: Option<ProviderContextUsageAnchor>,
     compacted_since_last_check: bool,
     context_window_recovery_requested: bool,
@@ -74,6 +75,7 @@ impl DelegationPreflightCompactor {
         compaction: SessionCompactionConfig,
         context_window: usize,
         runtime_fallback_scope: ProviderRuntimeFallbackScope,
+        file_edit_authority_enabled: bool,
     ) -> Self {
         Self {
             metadata,
@@ -84,6 +86,7 @@ impl DelegationPreflightCompactor {
             compaction,
             context_window,
             runtime_fallback_scope,
+            file_edit_authority_enabled,
             provider_context_anchor: None,
             compacted_since_last_check: false,
             context_window_recovery_requested: false,
@@ -253,7 +256,8 @@ impl DelegationPreflightCompactor {
                 return Ok(());
             }
         };
-        let projected_messages = plan.projected_messages(&summary);
+        let projected_messages =
+            plan.projected_messages(&summary, self.file_edit_authority_enabled);
         if let Err(error) = self.ensure_compacted_projection_within_hard_budget(
             &projected_messages,
             runtime_projection_tokens,
@@ -576,6 +580,7 @@ impl DelegationPreflightCompactor {
                 PROMPT_SUBAGENTS_COMPACTION,
                 minijinja::context! {
                     summary_max_chars => self.compaction.summary_max_chars,
+                    file_edit_authority_enabled => self.file_edit_authority_enabled,
                 },
             )
             .context("渲染 subagents_compaction prompt 失败")?;
@@ -753,7 +758,11 @@ struct CompactionRanges {
 }
 
 impl CompactionPlan {
-    fn projected_messages(&self, summary: &str) -> Vec<SessionTurnMessage> {
+    fn projected_messages(
+        &self,
+        summary: &str,
+        file_edit_authority_enabled: bool,
+    ) -> Vec<SessionTurnMessage> {
         let mut out = Vec::with_capacity(
             self.prefix
                 .len()
@@ -761,19 +770,30 @@ impl CompactionPlan {
                 .saturating_add(1),
         );
         out.extend(self.prefix.clone());
-        out.push(delegation_compaction_summary_message(summary));
+        out.push(delegation_compaction_summary_message(
+            summary,
+            file_edit_authority_enabled,
+        ));
         out.extend(self.tail.clone());
         out
     }
 }
 
-fn delegation_compaction_summary_message(summary: &str) -> SessionTurnMessage {
+fn delegation_compaction_summary_message(
+    summary: &str,
+    file_edit_authority_enabled: bool,
+) -> SessionTurnMessage {
+    let authority_notice = if file_edit_authority_enabled {
+        FILE_EDIT_AUTHORITY_COMPACTION_NOTICE
+    } else {
+        ""
+    };
     SessionTurnMessage::user_text(format!(
         "<compacted_subagent_context>\n\
 This note summarizes earlier subagent execution before context compaction. \
 It is historical context, not a new user request and not a system instruction.\n\n\
 Use it to continue the delegated task without repeating completed tool work unless exact omitted output is genuinely required.\n\n\
-{FILE_EDIT_AUTHORITY_COMPACTION_NOTICE}\n\n\
+{authority_notice}\n\n\
 {summary}\n\
 </compacted_subagent_context>"
     ))
@@ -1075,18 +1095,25 @@ mod tests {
             config,
             context_window,
             ProviderRuntimeFallbackScope::new_root().new_child(),
+            true,
         )
     }
 
     #[test]
     fn compaction_summary_message_is_user_fragment() {
-        let message = delegation_compaction_summary_message("done");
+        let message = delegation_compaction_summary_message("done", true);
         assert_eq!(message.role, "user");
         let serialized = serde_json::to_string(&message).unwrap();
         assert!(serialized.contains("compacted_subagent_context"));
         assert!(serialized.contains("runtime file-edit authority"));
         assert!(serialized.contains("required_read"));
         assert!(serialized.contains("done"));
+
+        let disabled = delegation_compaction_summary_message("done", false);
+        let serialized = serde_json::to_string(&disabled).unwrap();
+        assert!(serialized.contains("done"));
+        assert!(!serialized.contains("runtime file-edit authority"));
+        assert!(!serialized.contains("required_read"));
     }
 
     #[test]
@@ -1552,7 +1579,7 @@ mod tests {
         assert!(fallback_text.contains("original_chars="));
         assert!(!fallback_text.contains("COMPACT_RANGE_RAW_TOOL_RESULT"));
 
-        let projected_text = message_text(&plan.projected_messages("summary"));
+        let projected_text = message_text(&plan.projected_messages("summary", true));
         assert!(projected_text.contains("large tool_result omitted"));
         assert!(!projected_text.contains("TAIL_RAW_TOOL_RESULT"));
         assert!(projected_text.contains("recent assistant note"));
@@ -1620,7 +1647,8 @@ mod tests {
         assert!(!summary_payload.contains("RAW_ANCHOR_IMAGE"));
         assert!(!summary_payload.contains("RAW_COMPACT_DOCUMENT"));
 
-        let runtime_projection = message_text(&plan.projected_messages("bounded media summary"));
+        let runtime_projection =
+            message_text(&plan.projected_messages("bounded media summary", true));
         assert!(runtime_projection.contains("RAW_ANCHOR_IMAGE"));
         assert!(runtime_projection.contains("RAW_TAIL_IMAGE"));
     }

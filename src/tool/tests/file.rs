@@ -1339,7 +1339,7 @@ async fn file_patch_replace_all_updates_every_match_and_diff() {
 }
 
 #[tokio::test]
-async fn file_patch_rejects_missing_stale_and_noop_targets() {
+async fn file_patch_rejects_missing_unread_zero_match_and_stale_targets() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("note.txt");
     tokio::fs::write(&path, "old\n").await.unwrap();
@@ -1358,13 +1358,6 @@ async fn file_patch_rejects_missing_stale_and_noop_targets() {
         &session,
         "file_patch",
         json!({"path": "note.txt", "old_content": "old", "new_content": "new"}),
-    )
-    .await;
-    let noop = dispatch_file_tool(
-        &registry,
-        &session,
-        "file_patch",
-        json!({"path": "note.txt", "old_content": "old", "new_content": "old"}),
     )
     .await;
     let _ = full_file_read(&registry, &session, "note.txt").await;
@@ -1386,7 +1379,6 @@ async fn file_patch_rejects_missing_stale_and_noop_targets() {
 
     assert_eq!(missing["status"], "error");
     assert_eq!(unread["status"], "error");
-    assert_eq!(noop["status"], "error");
     assert_eq!(zero_match["status"], "error");
     assert!(zero_match["msg"]
         .as_str()
@@ -1397,6 +1389,104 @@ async fn file_patch_rejects_missing_stale_and_noop_targets() {
         tokio::fs::read_to_string(path).await.unwrap(),
         "old\nexternal\n"
     );
+}
+
+#[tokio::test]
+async fn disabled_file_edit_authority_allows_existing_file_edits_without_read_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("note.txt");
+    tokio::fs::write(&path, "old\nold\n").await.unwrap();
+    let mut config = test_tool_config(dir.path());
+    config.file_edit_authority_enabled = false;
+    let registry = ToolRegistry::new(&config).unwrap();
+    let session = SessionId::from_str("session_aaaaaaaa").unwrap();
+    let context = ToolDispatchContext {
+        current_session_id: Some(session.clone()),
+        current_turn_id: Some("turn_1".into()),
+        ..ToolDispatchContext::default()
+    };
+
+    assert!(registry.file_read_state_scope(&context).is_none());
+    registry
+        .begin_file_read_state_checkpoint(&session, "turn_1")
+        .await
+        .unwrap();
+    registry
+        .commit_file_read_state_checkpoint(&session, "turn_1")
+        .await
+        .unwrap();
+
+    let patched = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_patch",
+        json!({
+            "path": "note.txt",
+            "old_content": "old",
+            "new_content": "patched",
+            "replace_all": true,
+        }),
+    )
+    .await;
+    assert_eq!(patched["status"], "success");
+    assert_eq!(patched["replacements"], 2);
+
+    let overwritten = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_write",
+        json!({"path": "note.txt", "content": "overwritten\n"}),
+    )
+    .await;
+    assert_eq!(overwritten["status"], "success");
+    assert_eq!(
+        tokio::fs::read_to_string(path).await.unwrap(),
+        "overwritten\n"
+    );
+}
+
+#[tokio::test]
+async fn file_patch_noop_writes_normally_and_preserves_read_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("note.txt");
+    tokio::fs::write(&path, "old\n").await.unwrap();
+    let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
+    let session = SessionId::from_str("session_aaaaaaaa").unwrap();
+    let _ = full_file_read(&registry, &session, "note.txt").await;
+    #[cfg(unix)]
+    let inode_before = {
+        use std::os::unix::fs::MetadataExt;
+        tokio::fs::metadata(&path).await.unwrap().ino()
+    };
+
+    let mut noop = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_patch",
+        json!({"path": "note.txt", "old_content": "old", "new_content": "old"}),
+    )
+    .await;
+
+    assert_eq!(noop["status"], "success");
+    assert_eq!(noop["replacements"], 1);
+    assert!(crate::tool::diff::take_file_change(&mut noop).is_none());
+    assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "old\n");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let inode_after = tokio::fs::metadata(&path).await.unwrap().ino();
+        assert_ne!(inode_after, inode_before, "no-op patch 仍应完成原子替换");
+    }
+
+    let follow_up = dispatch_file_tool(
+        &registry,
+        &session,
+        "file_patch",
+        json!({"path": "note.txt", "old_content": "old", "new_content": "new"}),
+    )
+    .await;
+    assert_eq!(follow_up["status"], "success");
+    assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "new\n");
 }
 
 #[tokio::test]
@@ -1843,7 +1933,7 @@ async fn file_write_rejects_new_memory_file_through_symlinked_parent() {
         .await
         .unwrap_err();
 
-    assert!(error.to_string().contains("memory 工具"));
+    assert!(error.to_string().contains("agent 私有受保护文件"));
     assert!(!memories.join("MEMORY.md").exists());
 }
 
@@ -1872,7 +1962,7 @@ async fn file_write_rejects_new_memory_files_through_symlink_and_parent_segments
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains("memory 工具"));
+        assert!(error.to_string().contains("agent 私有受保护文件"));
         assert!(!memories.join(file_name).exists());
     }
     assert!(!memories.join("newdir").exists());
@@ -1901,7 +1991,7 @@ async fn direct_file_tools_reject_memory_files() {
         )
         .await
         .unwrap_err();
-    assert!(write_err.to_string().contains("memory 工具"));
+    assert!(write_err.to_string().contains("agent 私有受保护文件"));
 
     let patch_err = registry
         .dispatch(
@@ -1914,7 +2004,7 @@ async fn direct_file_tools_reject_memory_files() {
         )
         .await
         .unwrap_err();
-    assert!(patch_err.to_string().contains("memory 工具"));
+    assert!(patch_err.to_string().contains("agent 私有受保护文件"));
 }
 
 #[tokio::test]

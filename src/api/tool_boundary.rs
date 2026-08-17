@@ -84,6 +84,17 @@ impl ToolBoundaryControl {
         self.inner.recovery_cancellation.clone()
     }
 
+    /// safe steer 发生在一次成功的 max-token response 之后时，adapter 会放弃尚未
+    /// 发送的 continuation，并把该 response 标为可提交。显式取消始终优先。
+    pub(crate) fn should_commit_successful_response(&self) -> bool {
+        self.is_cancelled()
+            && !self.is_explicit_cancel()
+            && self
+                .inner
+                .recovery_cancellation
+                .should_preserve_successful_response()
+    }
+
     fn set_cancel_reason(&self, reason: ToolCallSkipReason, replace_existing: bool) {
         let changed = {
             let mut dispatch = lock_dispatch_state(&self.inner.dispatch);

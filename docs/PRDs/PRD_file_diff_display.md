@@ -41,7 +41,7 @@
   - 文件不存在：允许按空文件创建。
   - 文件存在：必须有完整 read state；stale 时拒绝写入。
 - stale 判定优先用 mtime / metadata；如时间戳变化但完整 read state 内容与当前内容一致，可视为未 stale，减少 formatter / 平台时间戳误报。
-- `old_content == new_content` 时 `file_patch` 直接失败，不做 no-op 写入。
+- `old_content == new_content` 时仍按普通 `file_patch` 完成文件、匹配、唯一性与修改许可校验，并执行同内容原子写入；调用成功但不生成 diff。
 
 ### file_patch 精确性
 

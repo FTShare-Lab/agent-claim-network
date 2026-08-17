@@ -3,7 +3,7 @@
 //! 本模块承接单轮用户输入后的模型调用、工具执行和 tool_result 回灌。
 //! 它只理解 canonical session message，不关心 Anthropic/OpenAI 等后端协议细节。
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use chrono::{DateTime, Local, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tokio::time;
 use tokio::time::Instant;
 
@@ -78,6 +78,8 @@ struct ProviderRequestProgress<'a> {
     preflight: Option<&'a mut dyn SessionTurnPreflight>,
     canonical_tail_count: usize,
     preparing_write_ahead: Arc<AtomicBool>,
+    latest_request_started: bool,
+    previous_messages_before_pending: Option<Vec<SessionTurnMessage>>,
 }
 
 impl<'a> ProviderRequestProgress<'a> {
@@ -91,6 +93,8 @@ impl<'a> ProviderRequestProgress<'a> {
             preflight,
             canonical_tail_count,
             preparing_write_ahead: Arc::new(AtomicBool::new(false)),
+            latest_request_started: false,
+            previous_messages_before_pending: None,
         }
     }
 
@@ -102,8 +106,22 @@ impl<'a> ProviderRequestProgress<'a> {
         self.preflight.take()
     }
 
-    fn begin_provider_attempt(&self) {
+    fn begin_provider_attempt(&mut self) {
         self.preparing_write_ahead.store(false, Ordering::Release);
+        self.latest_request_started = false;
+    }
+
+    async fn rollback_unsent_request(&mut self) -> anyhow::Result<()> {
+        if self.latest_request_started {
+            return Ok(());
+        }
+        if let Some(preflight) = self.preflight.as_deref_mut() {
+            preflight.provider_request_abandoned_before_send().await?;
+        }
+        if let Some(previous) = self.previous_messages_before_pending.take() {
+            self.latest_messages = previous;
+        }
+        Ok(())
     }
 
     fn write_ahead_phase(&self) -> Arc<AtomicBool> {
@@ -120,6 +138,13 @@ impl ProviderRequestObserver for ProviderRequestProgress<'_> {
         if messages == self.latest_messages {
             return Ok(());
         }
+        if self.previous_messages_before_pending.is_some() {
+            return Err(ProviderRequestPreparationFailure::new(
+                "adapter 在上一份 Provider request 发送或回滚前准备了下一份请求",
+            )
+            .into());
+        }
+        self.latest_request_started = false;
         self.preparing_write_ahead.store(true, Ordering::Release);
         if !messages.starts_with(&self.latest_messages) {
             return Err(ProviderRequestPreparationFailure::new(format!(
@@ -147,9 +172,46 @@ impl ProviderRequestObserver for ProviderRequestProgress<'_> {
                 }
             }
         }
-        self.latest_messages = messages.to_vec();
+        self.previous_messages_before_pending = Some(std::mem::replace(
+            &mut self.latest_messages,
+            messages.to_vec(),
+        ));
         self.preparing_write_ahead.store(false, Ordering::Release);
         Ok(())
+    }
+
+    fn provider_request_started(&mut self, messages: &[SessionTurnMessage]) -> anyhow::Result<()> {
+        if messages != self.latest_messages {
+            return Err(ProviderRequestPreparationFailure::new(
+                "adapter 标记发送的 Provider 请求与最新 WAL 不一致",
+            )
+            .into());
+        }
+        if let Some(preflight) = self.preflight.as_deref_mut() {
+            preflight.provider_request_started(messages)?;
+        }
+        self.latest_request_started = true;
+        self.previous_messages_before_pending = None;
+        Ok(())
+    }
+
+    async fn provider_request_abandoned_before_send(
+        &mut self,
+        messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<()> {
+        if messages != self.latest_messages {
+            return Err(ProviderRequestPreparationFailure::new(
+                "adapter 放弃的 Provider 请求与最新 WAL 不一致",
+            )
+            .into());
+        }
+        if self.latest_request_started {
+            return Err(ProviderRequestPreparationFailure::new(
+                "adapter 不能把已经开始发送的 Provider 请求回滚为未发送",
+            )
+            .into());
+        }
+        self.rollback_unsent_request().await
     }
 }
 
@@ -349,6 +411,19 @@ pub trait SessionTurnPreflight: Send {
         _provider_messages: &[SessionTurnMessage],
         _canonical_tail_count: usize,
     ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// 最新 request WAL 对应的网络发送已经开始；从此不再把它判定为“确定未发送”。
+    fn provider_request_started(
+        &mut self,
+        _provider_messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// 请求在任何网络发送开始前被取消或安全中断，回滚刚准备的 request WAL。
+    async fn provider_request_abandoned_before_send(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -675,7 +750,6 @@ impl AgentTurnLoop {
             .map(|_| None)
             .collect::<Vec<Option<ExecutedToolUse>>>();
         let max_parallel = self.tools.max_parallel_tool_calls();
-        let failed_file_write_paths = Arc::new(Mutex::new(BTreeSet::new()));
         let mut batch_start = 0usize;
 
         while batch_start < tool_uses.len() {
@@ -714,7 +788,6 @@ impl AgentTurnLoop {
                     emit,
                     durable_recorder,
                     &mut executions,
-                    Arc::clone(&failed_file_write_paths),
                 )
                 .await?;
             if matches!(outcome, ToolBatchOutcome::Interrupted) {
@@ -756,7 +829,6 @@ impl AgentTurnLoop {
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
         durable_recorder: &mut Option<&mut dyn SessionTurnEventRecorder>,
         executions: &mut [Option<ExecutedToolUse>],
-        failed_file_write_paths: Arc<Mutex<BTreeSet<std::path::PathBuf>>>,
     ) -> anyhow::Result<ToolBatchOutcome> {
         let batch = &all_tool_uses[batch_start..batch_end];
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
@@ -879,7 +951,6 @@ impl AgentTurnLoop {
                         progress_tx: Some(progress_tx.clone()),
                         cancellation: cancellation.clone(),
                         provider_mcp_routes: Some(Arc::clone(provider_mcp_routes)),
-                        failed_file_write_paths: Some(Arc::clone(&failed_file_write_paths)),
                     };
                     let tools = Arc::clone(&self.tools);
                     let execution_name = tool_use.name.clone();
@@ -1394,6 +1465,7 @@ impl AgentTurnLoop {
             user_attachments,
             skill_instructions,
             &self.attachment_limits,
+            self.tools.file_edit_authority_enabled(),
         )
         .await?;
         for message in attachment_warnings {
@@ -1562,19 +1634,27 @@ impl AgentTurnLoop {
                 .await;
             let request_messages = frozen_provider_prefix.project(&provider_messages)?;
             if let Some(preflight) = preflight.as_mut() {
-                match time::timeout(
+                let request_ready: anyhow::Result<()> = match time::timeout(
                     PROVIDER_WAL_PREPARATION_TIMEOUT,
                     preflight.provider_request_ready(&request_messages, committed.len()),
                 )
                 .await
                 {
-                    Ok(result) => result?,
-                    Err(_) => {
-                        return Err(ProviderRequestPreparationFailure::new(
-                            "Provider 请求状态保存超时（10 秒）",
-                        )
-                        .into());
+                    Ok(result) => result,
+                    Err(_) => Err(ProviderRequestPreparationFailure::new(
+                        "Provider 请求状态保存超时（10 秒）",
+                    )
+                    .into()),
+                };
+                if let Err(error) = request_ready {
+                    if let Err(rollback_error) =
+                        preflight.provider_request_abandoned_before_send().await
+                    {
+                        return Err(error.context(format!(
+                            "回滚确定未发送的 Provider request WAL 失败: {rollback_error:#}"
+                        )));
                     }
+                    return Err(error);
                 }
             }
             let mut latest_provider_context_usage = None;
@@ -1709,7 +1789,11 @@ impl AgentTurnLoop {
                 .await?;
             }
 
-            if tool_boundary_is_cancelled(tool_boundary_control.as_ref()) {
+            if tool_boundary_is_cancelled(tool_boundary_control.as_ref())
+                && !tool_boundary_control
+                    .as_ref()
+                    .is_some_and(ToolBoundaryControl::should_commit_successful_response)
+            {
                 if !tool_uses.is_empty() {
                     let deadline = tool_boundary_control
                         .as_ref()
@@ -2160,45 +2244,51 @@ impl AgentTurnLoop {
         let request_timeout = self.provider.request_timeout();
         request_progress.begin_provider_attempt();
         let write_ahead_phase = request_progress.write_ahead_phase();
-        let provider_send =
-            self.provider
-                .send_with_request_observer(request, emit, request_progress);
-        let provider_call = async {
-            match request_timeout {
-                Some(timeout) => match time::timeout(timeout, provider_send).await {
-                    Ok(result) => result,
-                    Err(_) if write_ahead_phase.load(Ordering::Acquire) => {
-                        Err(ProviderRequestPreparationFailure::new(format!(
-                            "Provider continuation WAL timeout after {}ms",
+        let result = {
+            let provider_send =
+                self.provider
+                    .send_with_request_observer(request, emit, request_progress);
+            let provider_call = async {
+                match request_timeout {
+                    Some(timeout) => match time::timeout(timeout, provider_send).await {
+                        Ok(result) => result,
+                        Err(_) if write_ahead_phase.load(Ordering::Acquire) => {
+                            Err(ProviderRequestPreparationFailure::new(format!(
+                                "Provider continuation WAL timeout after {}ms",
+                                timeout.as_millis()
+                            ))
+                            .into())
+                        }
+                        Err(_) if request_is_streaming => Err(ProviderStreamFailure::new(format!(
+                            "LLM provider streaming call timeout after {}ms",
                             timeout.as_millis()
                         ))
-                        .into())
+                        .into()),
+                        Err(_) => Err(anyhow::anyhow!(
+                            "LLM provider call timeout after {}ms",
+                            timeout.as_millis()
+                        )),
+                    },
+                    None => provider_send.await,
+                }
+            };
+            tokio::pin!(provider_call);
+            match provider_interrupt {
+                Some(interrupt) if interrupt.is_cancelled() => Err(SessionTurnInterrupted.into()),
+                Some(interrupt) => {
+                    tokio::select! {
+                        biased;
+                        response = &mut provider_call => response,
+                        _ = interrupt.cancelled() => Err(SessionTurnInterrupted.into()),
                     }
-                    Err(_) if request_is_streaming => Err(ProviderStreamFailure::new(format!(
-                        "LLM provider streaming call timeout after {}ms",
-                        timeout.as_millis()
-                    ))
-                    .into()),
-                    Err(_) => Err(anyhow::anyhow!(
-                        "LLM provider call timeout after {}ms",
-                        timeout.as_millis()
-                    )),
-                },
-                None => provider_send.await,
+                }
+                None => provider_call.await,
             }
         };
-        tokio::pin!(provider_call);
-        match provider_interrupt {
-            Some(interrupt) if interrupt.is_cancelled() => Err(SessionTurnInterrupted.into()),
-            Some(interrupt) => {
-                tokio::select! {
-                    biased;
-                    response = &mut provider_call => response,
-                    _ = interrupt.cancelled() => Err(SessionTurnInterrupted.into()),
-                }
-            }
-            None => provider_call.await,
+        if result.is_err() && !request_progress.latest_request_started {
+            request_progress.rollback_unsent_request().await?;
         }
+        result
     }
 
     async fn wait_for_non_streaming_fallback(
@@ -2623,6 +2713,7 @@ async fn session_user_message(
     attachments: Vec<SessionAttachment>,
     skill_instructions: Vec<SkillInstructions>,
     limits: &AttachmentLimits,
+    file_edit_authority_enabled: bool,
 ) -> anyhow::Result<(SessionTurnMessage, Vec<TextAttachmentRead>, Vec<String>)> {
     if !limits.enabled && !attachments.is_empty() {
         anyhow::bail!("附件功能已禁用");
@@ -2649,7 +2740,8 @@ async fn session_user_message(
     let mut text_reads = Vec::<TextAttachmentRead>::new();
     let mut warnings = Vec::<String>::new();
     for attachment in attachments {
-        let (block, text_read, warning) = session_attachment_block(attachment, limits).await?;
+        let (block, text_read, warning) =
+            session_attachment_block(attachment, limits, file_edit_authority_enabled).await?;
         blocks.push(block);
         if let Some(text_read) = text_read {
             text_reads.push(text_read);
@@ -2668,6 +2760,7 @@ async fn session_user_message(
 async fn session_attachment_block(
     attachment: SessionAttachment,
     limits: &AttachmentLimits,
+    file_edit_authority_enabled: bool,
 ) -> anyhow::Result<(
     SessionTurnContentBlock,
     Option<TextAttachmentRead>,
@@ -2709,7 +2802,9 @@ async fn session_attachment_block(
                 None,
             ))
         }
-        SessionAttachment::TextFile { path } => read_text_file_block(&path, limits).await,
+        SessionAttachment::TextFile { path } => {
+            read_text_file_block(&path, limits, file_edit_authority_enabled).await
+        }
         SessionAttachment::DocumentFile { path, media_type } => {
             if media_type != "application/pdf" {
                 anyhow::bail!(
@@ -2737,6 +2832,7 @@ async fn session_attachment_block(
 async fn read_text_file_block(
     path: &Path,
     limits: &AttachmentLimits,
+    file_edit_authority_enabled: bool,
 ) -> anyhow::Result<(
     SessionTurnContentBlock,
     Option<TextAttachmentRead>,
@@ -2748,7 +2844,7 @@ async fn read_text_file_block(
         .await
         .context("解析文本附件真实路径失败")?;
     if crate::attachment::is_protected_memory_path(&canonical_path) {
-        anyhow::bail!("MEMORY.md / USER.md 必须通过 memory 工具访问");
+        anyhow::bail!("目标是 agent 私有受保护文件，不能作为附件读取");
     }
     let content = crate::attachment::read_text_attachment(&canonical_path, limits)
         .await
@@ -2759,20 +2855,40 @@ async fn read_text_file_block(
         .unwrap_or("attachment");
     let actual_chars = content.chars().count();
     if actual_chars > limits.max_text_chars {
-        let provider_text = format!(
-            "Attached text file body omitted: {name}\nPath: {}\nCharacters: \
-             {actual_chars}\nThe file exceeds the per-file text attachment limit of {} \
-             characters. Use file_read with this path to inspect it before editing.",
-            path.display(),
-            limits.max_text_chars,
-        );
-        let warning = format!(
-            "文本附件 `{}` 共 {} 个字符，超过单文件上限 {}；已仅向模型提供路径，\
-             未注入正文，也未授予读取许可。",
-            path.display(),
-            actual_chars,
-            limits.max_text_chars,
-        );
+        let provider_text = if file_edit_authority_enabled {
+            format!(
+                "Attached text file body omitted: {name}\nPath: {}\nCharacters: \
+                 {actual_chars}\nThe file exceeds the per-file text attachment limit of {} \
+                 characters. Use file_read with this path to inspect it before editing.",
+                path.display(),
+                limits.max_text_chars,
+            )
+        } else {
+            format!(
+                "Attached text file body omitted: {name}\nPath: {}\nCharacters: \
+                 {actual_chars}\nThe file exceeds the per-file text attachment limit of {} \
+                 characters. Use file_read with this path when its contents are needed.",
+                path.display(),
+                limits.max_text_chars,
+            )
+        };
+        let warning = if file_edit_authority_enabled {
+            format!(
+                "文本附件 `{}` 共 {} 个字符，超过单文件上限 {}；已仅向模型提供路径，\
+                 未注入正文，也未授予读取许可。",
+                path.display(),
+                actual_chars,
+                limits.max_text_chars,
+            )
+        } else {
+            format!(
+                "文本附件 `{}` 共 {} 个字符，超过单文件上限 {}；已仅向模型提供路径，\
+                 未注入正文。",
+                path.display(),
+                actual_chars,
+                limits.max_text_chars,
+            )
+        };
         return Ok((
             SessionTurnContentBlock::text(provider_text),
             None,
@@ -3028,7 +3144,6 @@ async fn emit_forced_abort_interrupts(
                     progress_tx: None,
                     cancellation: None,
                     provider_mcp_routes: None,
-                    failed_file_write_paths: None,
                 })
                 .await
         } else {
@@ -3451,9 +3566,9 @@ mod tests {
     use tokio::time::{sleep, timeout, Duration};
 
     use super::{
-        assistant_message_text, provider_assistant_suffix_for_latest_request,
-        ProviderNoConsumableOutput, ProviderRequestPreparationFailure, ProviderStreamFailure,
-        ProviderTerminalFailure, CONTINUATION_TRIGGER,
+        assistant_message_text, provider_assistant_suffix_for_latest_request, read_text_file_block,
+        ProviderNoConsumableOutput, ProviderRequestPreparationFailure, ProviderRequestProgress,
+        ProviderStreamFailure, ProviderTerminalFailure, CONTINUATION_TRIGGER,
     };
     use crate::agent::fs::LocalFsMemoryStore;
     use crate::api::{
@@ -3478,6 +3593,7 @@ mod tests {
         events: Vec<ProviderEvent>,
         emit_preflight_context_estimate: bool,
         cancel_after_response: Option<ToolBoundaryControl>,
+        preserve_safe_steer_after_response: Option<ToolBoundaryControl>,
     }
 
     struct ScriptedProviderAttempt {
@@ -3519,7 +3635,17 @@ mod tests {
         provider_request_ready_calls: Arc<AtomicUsize>,
     }
 
-    struct BlockingInitialWalPreflight;
+    struct BlockingInitialWalPreflight {
+        abandoned_requests: Arc<AtomicUsize>,
+    }
+
+    struct FailingInitialWalPreflight {
+        abandoned_requests: Arc<AtomicUsize>,
+    }
+
+    struct CountingAbandonPreflight {
+        abandoned_requests: Arc<AtomicUsize>,
+    }
 
     struct BlockingResponseWalPreflight;
 
@@ -3861,6 +3987,53 @@ mod tests {
             pending::<()>().await;
             Ok(())
         }
+
+        async fn provider_request_abandoned_before_send(&mut self) -> anyhow::Result<()> {
+            self.abandoned_requests.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SessionTurnPreflight for FailingInitialWalPreflight {
+        async fn before_provider_request(
+            &mut self,
+            _system_prompt: &mut String,
+            _provider_messages: &mut Vec<SessionTurnMessage>,
+            _emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn provider_request_ready(
+            &mut self,
+            _provider_messages: &[SessionTurnMessage],
+            _canonical_tail_count: usize,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("metadata commit failed after provider WAL replacement")
+        }
+
+        async fn provider_request_abandoned_before_send(&mut self) -> anyhow::Result<()> {
+            self.abandoned_requests.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SessionTurnPreflight for CountingAbandonPreflight {
+        async fn before_provider_request(
+            &mut self,
+            _system_prompt: &mut String,
+            _provider_messages: &mut Vec<SessionTurnMessage>,
+            _emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn provider_request_abandoned_before_send(&mut self) -> anyhow::Result<()> {
+            self.abandoned_requests.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -3892,6 +4065,7 @@ mod tests {
                 events: Vec::new(),
                 emit_preflight_context_estimate: true,
                 cancel_after_response: None,
+                preserve_safe_steer_after_response: None,
             }
         }
 
@@ -3909,6 +4083,14 @@ mod tests {
             self.cancel_after_response = Some(control);
             self
         }
+
+        fn with_preserved_safe_steer_after_response(
+            mut self,
+            control: ToolBoundaryControl,
+        ) -> Self {
+            self.preserve_safe_steer_after_response = Some(control);
+            self
+        }
     }
 
     #[async_trait]
@@ -3922,6 +4104,7 @@ mod tests {
             request: ProviderRequest,
             emit: &mut (dyn FnMut(ProviderEvent) + Send),
         ) -> anyhow::Result<ProviderResponse> {
+            let recovery_interrupt = request.recovery_interrupt.clone();
             self.requests.lock().await.push(request);
             for event in &self.events {
                 emit(event.clone());
@@ -3934,6 +4117,13 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("fake provider response exhausted"))?;
             if let Some(control) = &self.cancel_after_response {
                 control.cancel(ToolCallSkipReason::TurnInterruptedBeforeDispatch);
+            }
+            if let Some(control) = &self.preserve_safe_steer_after_response {
+                control.cancel_if_open(ToolCallSkipReason::TurnInterruptedBeforeDispatch);
+                recovery_interrupt
+                    .as_ref()
+                    .expect("controlled turn must pass a recovery interrupt")
+                    .preserve_successful_response();
             }
             Ok(response)
         }
@@ -4950,7 +5140,10 @@ mod tests {
             ProviderStop::Done,
         )]));
         let turn_loop = tool_loop(provider.clone());
-        let mut preflight = BlockingInitialWalPreflight;
+        let abandoned_requests = Arc::new(AtomicUsize::new(0));
+        let mut preflight = BlockingInitialWalPreflight {
+            abandoned_requests: Arc::clone(&abandoned_requests),
+        };
 
         let error = turn_loop
             .run_session_turn_with_hooks(request(), &mut |_| {}, None, None, Some(&mut preflight))
@@ -4962,6 +5155,31 @@ mod tests {
             .is_some());
         assert!(error.to_string().contains("请求状态保存超时"));
         assert!(provider.requests.lock().await.is_empty());
+        assert_eq!(abandoned_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn initial_request_wal_failure_rolls_back_before_returning() {
+        let provider = Arc::new(FakeProvider::new(vec![response(
+            vec![SessionTurnContentBlock::text("must not be sent")],
+            ProviderStop::Done,
+        )]));
+        let turn_loop = tool_loop(provider.clone());
+        let abandoned_requests = Arc::new(AtomicUsize::new(0));
+        let mut preflight = FailingInitialWalPreflight {
+            abandoned_requests: Arc::clone(&abandoned_requests),
+        };
+
+        let error = turn_loop
+            .run_session_turn_with_hooks(request(), &mut |_| {}, None, None, Some(&mut preflight))
+            .await
+            .expect_err("failed initial request WAL must reject the turn");
+
+        assert!(error
+            .to_string()
+            .contains("metadata commit failed after provider WAL replacement"));
+        assert!(provider.requests.lock().await.is_empty());
+        assert_eq!(abandoned_requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -4983,6 +5201,29 @@ mod tests {
             .is_some());
         assert!(error.to_string().contains("响应状态保存超时"));
         assert_eq!(provider.requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn abandoned_continuation_restores_previous_provider_request_baseline() {
+        let initial = vec![SessionTurnMessage::user_text("initial")];
+        let mut continued = initial.clone();
+        continued.push(SessionTurnMessage::assistant_text("partial"));
+        let abandoned_requests = Arc::new(AtomicUsize::new(0));
+        let mut preflight = CountingAbandonPreflight {
+            abandoned_requests: Arc::clone(&abandoned_requests),
+        };
+        let mut progress = ProviderRequestProgress::new(initial.clone(), Some(&mut preflight), 0);
+
+        progress.before_provider_request(&continued).await.unwrap();
+        assert_eq!(progress.latest_messages(), continued);
+
+        progress
+            .provider_request_abandoned_before_send(&continued)
+            .await
+            .unwrap();
+
+        assert_eq!(progress.latest_messages(), initial);
+        assert_eq!(abandoned_requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -5855,7 +6096,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("MEMORY.md / USER.md 必须通过 memory 工具访问"));
+            .contains("agent 私有受保护文件，不能作为附件读取"));
         assert!(provider.requests.lock().await.is_empty());
     }
 
@@ -6001,6 +6242,29 @@ mod tests {
                         && message.contains("未授予读取许可")
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn oversized_text_attachment_omits_authority_guidance_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.txt");
+        tokio::fs::write(&path, "12345").await.unwrap();
+        let limits = AttachmentLimits {
+            max_text_chars: 4,
+            ..AttachmentLimits::default()
+        };
+
+        let (block, read, warning) = read_text_file_block(&path, &limits, false).await.unwrap();
+        let SessionTurnContentBlock::Text { text } = block else {
+            panic!("oversized text attachment should remain a text block");
+        };
+
+        assert!(read.is_none());
+        assert!(text.contains("when its contents are needed"));
+        assert!(!text.contains("before editing"));
+        let warning = warning.unwrap();
+        assert!(warning.contains("未注入正文"));
+        assert!(!warning.contains("许可"));
     }
 
     #[tokio::test]
@@ -6369,7 +6633,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn later_same_path_write_is_skipped_after_business_failure() {
+    async fn later_same_path_writes_continue_after_business_failure() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("note.txt");
         tokio::fs::write(&path, "original\n").await.unwrap();
@@ -6384,14 +6648,24 @@ mod tests {
             response(
                 vec![
                     tool_use(
+                        "toolu_read",
+                        "file_read",
+                        json!({"path": "note.txt", "show_linenos": false}),
+                    ),
+                    tool_use(
                         "toolu_first",
-                        "file_write",
-                        json!({"path": "note.txt", "content": "first\n"}),
+                        "file_patch",
+                        json!({"path": "note.txt", "old_content": "missing", "new_content": "first"}),
                     ),
                     tool_use(
                         "toolu_second",
-                        "file_write",
-                        json!({"path": "note.txt", "content": "second\n"}),
+                        "file_patch",
+                        json!({"path": "note.txt", "old_content": "original", "new_content": "second"}),
+                    ),
+                    tool_use(
+                        "toolu_third",
+                        "file_patch",
+                        json!({"path": "note.txt", "old_content": "second", "new_content": "third"}),
                     ),
                 ],
                 ProviderStop::ToolUse,
@@ -6411,9 +6685,11 @@ mod tests {
             .unwrap();
         let first = tool_result_content(non_context_messages(&turn)[2], "toolu_first");
         let second = tool_result_content(non_context_messages(&turn)[2], "toolu_second");
+        let third = tool_result_content(non_context_messages(&turn)[2], "toolu_third");
         assert_eq!(first["outcome"]["kind"], "business_failure");
-        assert_eq!(second["output"]["status"], "skipped");
-        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "original\n");
+        assert_eq!(second["outcome"]["kind"], "completed");
+        assert_eq!(third["outcome"]["kind"], "completed");
+        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "third\n");
     }
 
     #[tokio::test]
@@ -7724,6 +8000,35 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| matches!(event, SessionTurnEvent::ToolCallCompleted { id, .. } if id == "toolu_2")));
+    }
+
+    #[tokio::test]
+    async fn safe_steer_commits_successful_max_token_partial_without_continuation() {
+        let control = ToolBoundaryControl::new();
+        let provider = Arc::new(
+            FakeProvider::new(vec![response(
+                vec![SessionTurnContentBlock::text("successful partial")],
+                ProviderStop::Done,
+            )])
+            .with_preserved_safe_steer_after_response(control.clone()),
+        );
+        let turn_loop = tool_loop(provider.clone());
+
+        let turn = turn_loop
+            .run_session_turn_with_tool_boundary_control(
+                request(),
+                &mut |_| {},
+                Some(control.clone()),
+            )
+            .await
+            .unwrap();
+
+        assert!(control.should_commit_successful_response());
+        assert_eq!(provider.requests.lock().await.len(), 1);
+        assert_eq!(
+            turn.messages.last().map(|message| &message.message),
+            Some(&SessionTurnMessage::assistant_text("successful partial"))
+        );
     }
 
     #[tokio::test]

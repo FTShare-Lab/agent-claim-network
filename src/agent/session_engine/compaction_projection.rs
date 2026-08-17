@@ -16,7 +16,8 @@ use crate::api::{
     estimated_projected_segment_tokens, large_tool_result_omission_text,
     omit_turn_messages_tool_results, project_compaction_input_media,
     project_compaction_input_tool_results, project_turn_message_tool_results,
-    provider_anchor_end_index, provider_safe_segments, ProviderHistoryMediaPolicy,
+    provider_anchor_end_index, provider_safe_segments,
+    strip_file_edit_authority_compaction_notices, ProviderHistoryMediaPolicy,
     ProviderReplayIdentity, SessionTurnContentBlock, SessionTurnMessage, TurnMessage,
     FILE_EDIT_AUTHORITY_COMPACTION_NOTICE,
 };
@@ -61,15 +62,25 @@ pub(super) struct CompactionTranscriptProjection {
     pub(super) tool_results_omitted: Vec<TurnMessage>,
 }
 
+#[cfg(test)]
 pub(super) fn compaction_transcript_projection(
     messages: Vec<SessionTurnMessage>,
     tool_result_raw_max_chars: usize,
+) -> CompactionTranscriptProjection {
+    compaction_transcript_projection_with_memory_mode(messages, tool_result_raw_max_chars, true)
+}
+
+pub(super) fn compaction_transcript_projection_with_memory_mode(
+    messages: Vec<SessionTurnMessage>,
+    tool_result_raw_max_chars: usize,
+    memory_enabled: bool,
 ) -> CompactionTranscriptProjection {
     let messages = redact_memory_tool_messages(
         messages
             .into_iter()
             .map(project_compaction_input_media)
             .collect(),
+        memory_enabled,
     );
     let large_tool_results_omitted =
         project_compaction_input_tool_results(messages.clone(), tool_result_raw_max_chars);
@@ -83,7 +94,10 @@ pub(super) fn compaction_transcript_projection(
     }
 }
 
-fn redact_memory_tool_messages(mut messages: Vec<SessionTurnMessage>) -> Vec<SessionTurnMessage> {
+fn redact_memory_tool_messages(
+    mut messages: Vec<SessionTurnMessage>,
+    memory_enabled: bool,
+) -> Vec<SessionTurnMessage> {
     let memory_tool_use_ids = messages
         .iter()
         .flat_map(|message| message.content.iter())
@@ -98,12 +112,20 @@ fn redact_memory_tool_messages(mut messages: Vec<SessionTurnMessage>) -> Vec<Ses
         for block in &mut message.content {
             let replacement = match block {
                 SessionTurnContentBlock::ToolUse { name, .. } if name == "memory" => {
-                    Some("[tool_use memory input omitted from recap transcript]")
+                    Some(if memory_enabled {
+                        "[tool_use memory input omitted from recap transcript]"
+                    } else {
+                        "[private tool input omitted from compaction transcript]"
+                    })
                 }
                 SessionTurnContentBlock::ToolResult { tool_use_id, .. }
                     if memory_tool_use_ids.contains(tool_use_id) =>
                 {
-                    Some("[tool_result memory output omitted from recap transcript]")
+                    Some(if memory_enabled {
+                        "[tool_result memory output omitted from recap transcript]"
+                    } else {
+                        "[private tool output omitted from compaction transcript]"
+                    })
                 }
                 _ => None,
             };
@@ -115,17 +137,31 @@ fn redact_memory_tool_messages(mut messages: Vec<SessionTurnMessage>) -> Vec<Ses
     messages
 }
 
+#[cfg(test)]
 pub(super) fn session_compaction_transcript_projection(
     messages: &[SessionMessage],
     tool_result_raw_max_chars: usize,
 ) -> CompactionTranscriptProjection {
-    compaction_transcript_projection(
+    session_compaction_transcript_projection_with_memory_mode(
+        messages,
+        tool_result_raw_max_chars,
+        true,
+    )
+}
+
+pub(super) fn session_compaction_transcript_projection_with_memory_mode(
+    messages: &[SessionMessage],
+    tool_result_raw_max_chars: usize,
+    memory_enabled: bool,
+) -> CompactionTranscriptProjection {
+    compaction_transcript_projection_with_memory_mode(
         messages
             .iter()
             .cloned()
             .map(session_message_to_turn_message)
             .collect(),
         tool_result_raw_max_chars,
+        memory_enabled,
     )
 }
 
@@ -143,6 +179,7 @@ pub(super) fn compacted_context_for_turn(
     tool_result_raw_max_chars: usize,
     media_policy: ProviderHistoryMediaPolicy,
     replay_identity: Option<ProviderReplayIdentity>,
+    file_edit_authority_enabled: bool,
 ) -> anyhow::Result<(String, Vec<SessionTurnMessage>)> {
     let Some(compaction) = metadata.compaction.as_ref() else {
         return Ok((
@@ -154,6 +191,9 @@ pub(super) fn compacted_context_for_turn(
         replayable_compacted_provider_history(metadata, messages.len(), replay_identity.as_ref())
     {
         let mut history = provider_history.messages.clone();
+        if !file_edit_authority_enabled {
+            strip_file_edit_authority_compaction_notices(&mut history);
+        }
         history.extend(session_messages_to_provider_turn_messages(
             messages
                 .iter()
@@ -172,8 +212,10 @@ pub(super) fn compacted_context_for_turn(
             session_messages_to_provider_turn_messages(messages, media_policy, replay_identity),
         ));
     }
-    let committed_summary_message =
-        compacted_committed_summary_message(compaction.committed_summary());
+    let committed_summary_message = compacted_committed_summary_message(
+        compaction.committed_summary(),
+        file_edit_authority_enabled,
+    );
     let committed_suffix = session_messages_to_provider_turn_messages(
         messages
             .iter()
@@ -232,11 +274,17 @@ pub(super) fn replayable_compacted_provider_history<'a>(
 
 pub(super) fn compacted_committed_summary_message(
     committed_summary: &str,
+    file_edit_authority_enabled: bool,
 ) -> Option<SessionTurnMessage> {
     let committed_summary = committed_summary.trim();
     if committed_summary.is_empty() {
         return None;
     }
+    let authority_notice = if file_edit_authority_enabled {
+        FILE_EDIT_AUTHORITY_COMPACTION_NOTICE
+    } else {
+        ""
+    };
     Some(SessionTurnMessage::user_text(format!(
         "<compacted_session_context>\n\
 This note summarizes earlier committed conversation before context compaction. \
@@ -245,7 +293,7 @@ Use it to understand prior constraints, completed work, important tool results, 
 unresolved issues, and pending next steps. Do not restart or repeat steps that \
 this context says are already completed. Only re-call a tool when exact omitted \
 output is genuinely required.\n\n\
-{FILE_EDIT_AUTHORITY_COMPACTION_NOTICE}\n\n\
+{authority_notice}\n\n\
 ### Earlier Conversation\n\n\
 {committed_summary}\n\
 </compacted_session_context>"
@@ -254,8 +302,9 @@ output is genuinely required.\n\n\
 
 pub(super) fn estimate_compacted_committed_summary_message_tokens(
     committed_summary: &str,
+    file_edit_authority_enabled: bool,
 ) -> usize {
-    compacted_committed_summary_message(committed_summary)
+    compacted_committed_summary_message(committed_summary, file_edit_authority_enabled)
         .as_ref()
         .map(|message| estimate_session_turn_messages_tokens(std::slice::from_ref(message)))
         .unwrap_or(0)
@@ -394,6 +443,7 @@ pub(super) fn project_provider_context(
     media_policy: ProviderHistoryMediaPolicy,
     replay_identity: Option<ProviderReplayIdentity>,
     protected_active_tail_segments: usize,
+    file_edit_authority_enabled: bool,
 ) -> ProviderProjection {
     let committed_message_until = compaction.committed_message_until();
     let active_cursor = current_active_turn_cursor(compaction, active_context)
@@ -414,6 +464,7 @@ pub(super) fn project_provider_context(
         budget.tool_result_raw_max_chars,
         active_turn_summary,
         protected_active_tail_segments,
+        file_edit_authority_enabled,
     );
     let mut messages = if let Some(provider_history) =
         compaction.provider_history.as_ref().filter(|history| {
@@ -422,6 +473,9 @@ pub(super) fn project_provider_context(
                     || history.pending_turn.is_some())
         }) {
         let mut messages = provider_history.messages.clone();
+        if !file_edit_authority_enabled {
+            strip_file_edit_authority_compaction_notices(&mut messages);
+        }
         messages.extend(session_messages_to_provider_turn_messages(
             session_messages
                 .iter()
@@ -433,8 +487,10 @@ pub(super) fn project_provider_context(
         ));
         messages
     } else {
-        let committed_summary_message =
-            compacted_committed_summary_message(compaction.committed_summary());
+        let committed_summary_message = compacted_committed_summary_message(
+            compaction.committed_summary(),
+            file_edit_authority_enabled,
+        );
         let committed_suffix = session_messages_to_provider_turn_messages(
             session_messages
                 .iter()
@@ -495,6 +551,7 @@ pub(super) fn project_active_suffix(
     tool_result_raw_max_chars: usize,
     active_turn_summary: Option<&str>,
     protected_tail_segments: usize,
+    file_edit_authority_enabled: bool,
 ) -> ActiveSuffixProjection {
     if active_suffix.is_empty() {
         return ActiveSuffixProjection {
@@ -521,7 +578,10 @@ pub(super) fn project_active_suffix(
             .is_some_and(|summary| !summary.is_empty());
     if compacted_until_segment > 0 {
         if let Some(summary) = active_turn_summary.map(str::trim).filter(|s| !s.is_empty()) {
-            projected.push(active_turn_progress_message(summary));
+            projected.push(active_turn_progress_message(
+                summary,
+                file_edit_authority_enabled,
+            ));
         }
     }
     projected.extend(
@@ -551,12 +611,20 @@ pub(super) fn project_active_suffix(
     }
 }
 
-pub(super) fn active_turn_progress_message(summary: &str) -> SessionTurnMessage {
+pub(super) fn active_turn_progress_message(
+    summary: &str,
+    file_edit_authority_enabled: bool,
+) -> SessionTurnMessage {
+    let authority_notice = if file_edit_authority_enabled {
+        FILE_EDIT_AUTHORITY_COMPACTION_NOTICE
+    } else {
+        ""
+    };
     SessionTurnMessage::user_text(format!(
         "<compacted_current_turn_progress>\n\
 This note summarizes work already completed earlier in the current user turn before context compaction. \
 It is not a new user request.\n\n\
-{FILE_EDIT_AUTHORITY_COMPACTION_NOTICE}\n\n\
+{authority_notice}\n\n\
 {summary}\n\n\
 Continue the latest user request from this progress state. Do not repeat completed steps unless exact omitted output is required.\n\
 </compacted_current_turn_progress>"

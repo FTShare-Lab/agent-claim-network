@@ -12,7 +12,7 @@ use super::{SessionEngine, PROMPT_MEMORY_REVIEW};
 
 impl SessionEngine {
     pub(super) fn fork_memory_review_cadence_reached(&self) -> bool {
-        if !self.fork_memory_review {
+        if !self.turn_loop.tool_registry().memory_enabled() || !self.fork_memory_review {
             return false;
         }
         let mut turns = match self.turns_since_fork_memory_review.lock() {
@@ -46,6 +46,9 @@ impl SessionEngine {
     }
 
     pub(super) async fn spawn_memory_review(&self, session: &SessionHandle) {
+        if !self.turn_loop.tool_registry().memory_enabled() || !self.fork_memory_review {
+            return;
+        }
         let system_prompt = match self.render_memory_review_system_prompt().await {
             Ok(system_prompt) => system_prompt,
             Err(e) => {

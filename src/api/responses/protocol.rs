@@ -18,6 +18,10 @@ pub struct ResponsesRequest {
     pub include: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ResponsesReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -405,6 +409,8 @@ mod tests {
             store: false,
             include: None,
             reasoning: None,
+            temperature: None,
+            top_p: None,
         };
 
         let value = serde_json::to_value(request).unwrap();

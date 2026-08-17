@@ -22,6 +22,10 @@ pub(super) struct CreateMessageRequest {
     pub(super) tools: Option<Vec<ApiToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) top_p: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]

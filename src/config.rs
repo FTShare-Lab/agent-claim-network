@@ -62,6 +62,7 @@ fn default_service_name() -> String {
 
 pub const DEFAULT_FILE_READ_MAX_CHARS: usize = 100_000;
 pub const DEFAULT_FILE_DIFF_MAX_CHANGED_LINES: usize = 20;
+pub const DEFAULT_FILE_EDIT_AUTHORITY_ENABLED: bool = true;
 pub const DEFAULT_MAX_PARALLEL_TOOL_CALLS: usize = 5;
 pub const DEFAULT_CODE_RUN_INITIAL_YIELD_MS: u64 = 10_000;
 pub const DEFAULT_CODE_RUN_MIN_YIELD_MS: u64 = 250;
@@ -133,6 +134,7 @@ pub const MCP_RECONNECT_RETRY_MAX_DELAY_MS: u64 = 2_000;
 /// MCP 生命周期切换时等待底层 transport/child 收束的上限；不暴露到 TOML。
 pub const MCP_CONNECTION_SHUTDOWN_TIMEOUT_SECS: u64 = 3;
 pub const DEFAULT_LLM_MAX_TOKENS: u32 = 65_536;
+pub const DEFAULT_MEMORY_ENABLED: bool = true;
 pub const DEFAULT_MEMORY_CHAR_LIMIT: usize = 1600;
 pub const DEFAULT_USER_CHAR_LIMIT: usize = 1000;
 pub const DEFAULT_MEMORY_SAFETY_SCAN: bool = true;
@@ -160,6 +162,7 @@ pub const DEFAULT_SESSION_DELEGATION_WAIT_DEFAULT_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_SESSION_DELEGATION_WAIT_MIN_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_SESSION_DELEGATION_WAIT_MAX_TIMEOUT_SECS: u64 = 60 * 60;
 pub const DEFAULT_FORK_MEMORY_REVIEW_INTERVAL_TURNS: usize = 10;
+pub const DEFAULT_MEMORY_REVIEW_ENABLED: bool = true;
 pub const DEFAULT_SESSION_NOTIFY_ON_FINALIZE_COMPLETION: bool = true;
 pub const DEFAULT_TURN_JOURNAL_DELTA_SNAPSHOT_INTERVAL_MS: u64 = 500;
 pub const DEFAULT_TURN_JOURNAL_DELTA_SNAPSHOT_CHARS: usize = 1024;
@@ -201,6 +204,10 @@ fn default_workspace_root() -> PathBuf {
 
 fn default_fork_memory_review_interval_turns() -> usize {
     DEFAULT_FORK_MEMORY_REVIEW_INTERVAL_TURNS
+}
+
+fn default_memory_review_enabled() -> bool {
+    DEFAULT_MEMORY_REVIEW_ENABLED
 }
 
 fn default_session_notify_on_finalize_completion() -> bool {
@@ -375,6 +382,10 @@ fn default_memory_char_limit() -> usize {
     DEFAULT_MEMORY_CHAR_LIMIT
 }
 
+fn default_memory_enabled() -> bool {
+    DEFAULT_MEMORY_ENABLED
+}
+
 fn default_user_char_limit() -> usize {
     DEFAULT_USER_CHAR_LIMIT
 }
@@ -389,6 +400,10 @@ fn default_file_read_max_chars() -> usize {
 
 fn default_file_diff_max_changed_lines() -> usize {
     DEFAULT_FILE_DIFF_MAX_CHANGED_LINES
+}
+
+fn default_file_edit_authority_enabled() -> bool {
+    DEFAULT_FILE_EDIT_AUTHORITY_ENABLED
 }
 
 fn default_max_parallel_tool_calls() -> usize {
@@ -762,6 +777,12 @@ pub struct LlmChatConfig {
     pub supports_websockets: bool,
     #[serde(default)]
     pub reasoning_effort: ReasoningEffort,
+    /// 可选采样温度；未配置时沿用上游默认值。
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    /// 可选 nucleus sampling 参数；未配置时沿用上游默认值。
+    #[serde(default)]
+    pub top_p: Option<f64>,
     /// Anthropic Messages 的显式 thinking 模式；其他 provider 忽略。
     #[serde(default)]
     pub anthropic_thinking: AnthropicThinking,
@@ -799,6 +820,8 @@ impl Default for LlmChatConfig {
             model: "claude-sonnet-4-20250514".to_string(),
             supports_websockets: false,
             reasoning_effort: ReasoningEffort::None,
+            temperature: None,
+            top_p: None,
             anthropic_thinking: AnthropicThinking::Auto,
             anthropic_thinking_budget_tokens: None,
             api_key_env: "ANTHROPIC_API_KEY".to_string(),
@@ -956,6 +979,8 @@ pub struct ToolConfig {
     pub file_read_max_chars: usize,
     #[serde(default = "default_file_diff_max_changed_lines")]
     pub file_diff_max_changed_lines: usize,
+    #[serde(default = "default_file_edit_authority_enabled")]
+    pub file_edit_authority_enabled: bool,
     #[serde(default = "default_max_parallel_tool_calls")]
     pub max_parallel_tool_calls: usize,
     /// background-shell 的固定初始观察窗口；不开放 TOML 覆盖。
@@ -1043,6 +1068,8 @@ struct ToolConfigFile {
     file_read_max_chars: usize,
     #[serde(default = "default_file_diff_max_changed_lines")]
     file_diff_max_changed_lines: usize,
+    #[serde(default = "default_file_edit_authority_enabled")]
+    file_edit_authority_enabled: bool,
     #[serde(default = "default_max_parallel_tool_calls")]
     max_parallel_tool_calls: usize,
     #[serde(default = "default_code_run_max_output_chars")]
@@ -1064,6 +1091,7 @@ impl Default for ToolConfigFile {
         Self {
             file_read_max_chars: default_file_read_max_chars(),
             file_diff_max_changed_lines: default_file_diff_max_changed_lines(),
+            file_edit_authority_enabled: default_file_edit_authority_enabled(),
             max_parallel_tool_calls: default_max_parallel_tool_calls(),
             code_run_max_output_chars: default_code_run_max_output_chars(),
             write_stdin_max_poll_timeout_ms: default_write_stdin_max_poll_timeout_ms(),
@@ -1081,6 +1109,7 @@ impl From<ToolConfigFile> for ToolConfig {
             workspace_root: default_workspace_root(),
             file_read_max_chars: value.file_read_max_chars,
             file_diff_max_changed_lines: value.file_diff_max_changed_lines,
+            file_edit_authority_enabled: value.file_edit_authority_enabled,
             max_parallel_tool_calls: value.max_parallel_tool_calls,
             code_run_initial_yield_ms: default_code_run_initial_yield_ms(),
             code_run_min_yield_ms: default_code_run_min_yield_ms(),
@@ -1213,6 +1242,8 @@ impl Default for RouterClientConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryConfig {
+    #[serde(default = "default_memory_enabled")]
+    pub enabled: bool,
     #[serde(default = "default_memory_char_limit")]
     pub memory_char_limit: usize,
     #[serde(default = "default_user_char_limit")]
@@ -1224,6 +1255,7 @@ pub struct MemoryConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
+            enabled: default_memory_enabled(),
             memory_char_limit: default_memory_char_limit(),
             user_char_limit: default_user_char_limit(),
             memory_safety_scan: default_memory_safety_scan(),
@@ -1264,6 +1296,8 @@ impl Default for SessionCompactionConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentMemoryReviewConfig {
+    #[serde(default = "default_memory_review_enabled")]
+    pub enabled: bool,
     #[serde(default = "default_fork_memory_review_interval_turns")]
     pub interval_turns: usize,
 }
@@ -1271,6 +1305,7 @@ pub struct AgentMemoryReviewConfig {
 impl Default for AgentMemoryReviewConfig {
     fn default() -> Self {
         Self {
+            enabled: default_memory_review_enabled(),
             interval_turns: default_fork_memory_review_interval_turns(),
         }
     }
@@ -2386,6 +2421,16 @@ fn validate_config(
             "agent.llm.context_window must be > 0".into(),
         ));
     }
+    for (name, value) in [
+        ("agent.llm.temperature", cfg.agent.llm.temperature),
+        ("agent.llm.top_p", cfg.agent.llm.top_p),
+    ] {
+        if value.is_some_and(|value| !value.is_finite()) {
+            return Err(ConfigError::Validation(format!(
+                "{name} must be a finite number"
+            )));
+        }
+    }
     if cfg.agent.llm.timeout_secs == 0 {
         return Err(ConfigError::Validation(
             "agent.llm.timeout_secs must be > 0".into(),
@@ -2447,7 +2492,15 @@ fn validate_config(
             )));
         }
     }
-    if cfg.agent.session.memory_review.interval_turns == 0 {
+    if !cfg.agent.memory.enabled && cfg.agent.session.memory_review.enabled {
+        return Err(ConfigError::Validation(
+            "agent.session.memory_review.enabled must be false when agent.memory.enabled is false"
+                .into(),
+        ));
+    }
+    if cfg.agent.session.memory_review.enabled
+        && cfg.agent.session.memory_review.interval_turns == 0
+    {
         return Err(ConfigError::Validation(
             "agent.session.memory_review.interval_turns must be > 0".into(),
         ));
@@ -2854,12 +2907,12 @@ fn validate_config(
             "agent.tool.session_search_sqlite_busy_timeout_ms must be > 0".into(),
         ));
     }
-    if cfg.agent.memory.memory_char_limit == 0 {
+    if cfg.agent.memory.enabled && cfg.agent.memory.memory_char_limit == 0 {
         return Err(ConfigError::Validation(
             "agent.memory.memory_char_limit must be > 0".into(),
         ));
     }
-    if cfg.agent.memory.user_char_limit == 0 {
+    if cfg.agent.memory.enabled && cfg.agent.memory.user_char_limit == 0 {
         return Err(ConfigError::Validation(
             "agent.memory.user_char_limit must be > 0".into(),
         ));
@@ -3147,6 +3200,39 @@ router_endpoint = "http://127.0.0.1:8061"
     }
 
     #[test]
+    fn sampling_parameters_are_optional_and_accept_any_finite_values() {
+        let defaults = parse_and_validate(minimal_config_without_optional_defaults()).unwrap();
+        assert_eq!(defaults.agent.llm.temperature, None);
+        assert_eq!(defaults.agent.llm.top_p, None);
+
+        let configured = minimal_config_without_optional_defaults().replace(
+            r#"model = "example-anthropic-model""#,
+            "model = \"example-anthropic-model\"\ntemperature = -1.25\ntop_p = 5.5",
+        );
+        let configured = parse_and_validate(&configured).unwrap();
+        assert_eq!(configured.agent.llm.temperature, Some(-1.25));
+        assert_eq!(configured.agent.llm.top_p, Some(5.5));
+    }
+
+    #[test]
+    fn sampling_parameters_reject_non_finite_values() {
+        for (field, raw) in [
+            ("temperature", "nan"),
+            ("temperature", "inf"),
+            ("top_p", "-inf"),
+        ] {
+            let config = minimal_config_without_optional_defaults().replace(
+                r#"model = "example-anthropic-model""#,
+                &format!("model = \"example-anthropic-model\"\n{field} = {raw}"),
+            );
+            expect_parse_err_contains(
+                config,
+                &format!("agent.llm.{field} must be a finite number"),
+            );
+        }
+    }
+
+    #[test]
     fn websocket_support_defaults_off_and_is_limited_to_responses() {
         let base = minimal_config_without_optional_defaults();
         let cfg = parse_and_validate(base).unwrap();
@@ -3361,6 +3447,20 @@ reasoning_effort = "extreme""#,
         ))
         .unwrap();
         assert_eq!(configured.agent.tool.max_parallel_tool_calls, 3);
+    }
+
+    #[test]
+    fn file_edit_authority_defaults_enabled_and_accepts_override() {
+        let defaults = parse_and_validate(minimal_config_without_optional_defaults()).unwrap();
+        assert!(defaults.agent.tool.file_edit_authority_enabled);
+
+        let configured = parse_and_validate(&format!(
+            "{}\n[agent.tool]\nfile_edit_authority_enabled = false\n",
+            minimal_config_without_optional_defaults()
+        ))
+        .unwrap();
+        assert!(!configured.agent.tool.file_edit_authority_enabled);
+        assert!(!include_str!("../config.template.toml").contains("file_edit_authority_enabled"));
     }
 
     #[test]
@@ -4904,6 +5004,8 @@ workspace_root = ".""#,
     #[test]
     fn fork_memory_review_interval_defaults_and_validates() {
         let cfg = parse_and_validate(minimal_config_without_optional_defaults()).unwrap();
+        assert!(cfg.agent.memory.enabled);
+        assert!(cfg.agent.session.memory_review.enabled);
         assert_eq!(
             cfg.agent.session.memory_review.interval_turns,
             DEFAULT_FORK_MEMORY_REVIEW_INTERVAL_TURNS
@@ -4973,6 +5075,61 @@ interval_turns = 0
         assert!(err
             .to_string()
             .contains("agent.session.memory_review.interval_turns must be > 0"));
+    }
+
+    #[test]
+    fn memory_and_review_enabled_matrix_validates_only_active_limits() {
+        let raw = |memory_enabled: bool,
+                   review_enabled: bool,
+                   memory_char_limit: usize,
+                   user_char_limit: usize,
+                   interval_turns: usize| {
+            format!(
+                "{}\n\
+                 [agent.memory]\n\
+                 enabled = {memory_enabled}\n\
+                 memory_char_limit = {memory_char_limit}\n\
+                 user_char_limit = {user_char_limit}\n\n\
+                 [agent.session.memory_review]\n\
+                 enabled = {review_enabled}\n\
+                 interval_turns = {interval_turns}\n",
+                minimal_config_without_optional_defaults()
+            )
+        };
+
+        let disabled = parse_and_validate(&raw(false, false, 0, 0, 0)).unwrap();
+        assert!(!disabled.agent.memory.enabled);
+        assert!(!disabled.agent.session.memory_review.enabled);
+
+        let memory_only = parse_and_validate(&raw(true, false, 1, 1, 0)).unwrap();
+        assert!(memory_only.agent.memory.enabled);
+        assert!(!memory_only.agent.session.memory_review.enabled);
+
+        let incompatible = parse_and_validate(&raw(false, true, 0, 0, 1))
+            .unwrap_err()
+            .to_string();
+        assert!(incompatible.contains(
+            "agent.session.memory_review.enabled must be false when agent.memory.enabled is false"
+        ));
+
+        let invalid_review = parse_and_validate(&raw(true, true, 1, 1, 0))
+            .unwrap_err()
+            .to_string();
+        assert!(invalid_review.contains("agent.session.memory_review.interval_turns must be > 0"));
+
+        let template: toml::Value =
+            toml::from_str(include_str!("../config.template.toml")).unwrap();
+        assert!(template
+            .get("agent")
+            .and_then(|agent| agent.get("memory"))
+            .and_then(|memory| memory.get("enabled"))
+            .is_none());
+        assert!(template
+            .get("agent")
+            .and_then(|agent| agent.get("session"))
+            .and_then(|session| session.get("memory_review"))
+            .and_then(|review| review.get("enabled"))
+            .is_none());
     }
 
     #[test]
@@ -5436,6 +5593,7 @@ listen = "127.0.0.1:8062"
     #[test]
     fn memory_config_defaults_enable_safety_scan() {
         let cfg = MemoryConfig::default();
+        assert!(cfg.enabled);
         assert_eq!(cfg.memory_char_limit, DEFAULT_MEMORY_CHAR_LIMIT);
         assert_eq!(cfg.user_char_limit, DEFAULT_USER_CHAR_LIMIT);
         assert!(cfg.memory_safety_scan);

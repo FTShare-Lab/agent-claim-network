@@ -61,6 +61,7 @@ impl ToolRegistry {
             web_search_api_key_env: cfg.web.api_key_env.clone(),
             web_search_api_key,
             memory_store: None,
+            memory_enabled: true,
             router_client: None,
             session_search: None,
             mcp_manager: None,
@@ -86,6 +87,11 @@ impl ToolRegistry {
 
     pub fn with_memory_store(mut self, memory_store: Arc<dyn MemoryStore>) -> Self {
         self.memory_store = Some(memory_store);
+        self
+    }
+
+    pub fn with_memory_enabled(mut self, enabled: bool) -> Self {
+        self.memory_enabled = enabled;
         self
     }
 
@@ -216,6 +222,14 @@ impl ToolRegistry {
         self.definitions_with_mcp_routes().0
     }
 
+    pub(crate) fn file_edit_authority_enabled(&self) -> bool {
+        self.limits.file_edit_authority_enabled
+    }
+
+    pub(crate) fn memory_enabled(&self) -> bool {
+        self.memory_enabled
+    }
+
     /// 为一次逻辑 Provider sampling 同时冻结工具定义与 MCP 路由 generation。
     /// adapter 内部 retry、fallback 与 continuation 必须复用这一份结果。
     pub(crate) fn definitions_with_mcp_routes(
@@ -228,6 +242,8 @@ impl ToolRegistry {
         let code_run_process_scope = self.code_run_process_scope_description();
         let write_stdin_description = self.write_stdin_description();
         let process_list_description = self.process_list_description();
+        let (file_read_description, file_patch_description, file_write_description) =
+            file_tool_descriptions(self.file_edit_authority_enabled());
         let mut definitions = vec![
             ToolDefinition {
                 name: "code_run".into(),
@@ -343,7 +359,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "file_read".into(),
-                description: "Read a file by relative or absolute path. UTF-8 text results include page metadata with the exact returned line range, total lines, EOF state, next_start, and stop reason. stop_reason=eof means the file ended; count/max_chars may continue at page.next_start when more content is needed; keyword_not_found/start_after_eof should not repeat the same request. If the effective read or keyword window contains a line that cannot be returned completely, file_read fails without granting read or write authority; use code_run to inspect that line instead. Pages of the same file version accumulate: a unique file_patch needs only its covered target/boundary lines, append needs EOF coverage, while overwrite/prepend/replace_all need complete coverage. Follow page.next_start only when the task needs more content; do not read the whole file merely because truncated=true. Images and PDFs are returned as attached media content.".into(),
+                description: file_read_description.into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -376,7 +392,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "file_patch".into(),
-                description: "Replace exact text in an existing UTF-8 file. By default old_content must match exactly once and only the target plus any affected line boundary must have been returned by file_read for the current file version. If multiple matches exist, expand old_content with nearby context until it is unique. replace_all=true intentionally replaces every match and requires complete file coverage. On a read-permission error, follow required_read.".into(),
+                description: file_patch_description.into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -403,7 +419,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "file_write".into(),
-                description: "Create or overwrite/append/prepend a UTF-8 text file. New files need no prior read. Existing-file append needs a current file_read page that reaches the real EOF; overwrite and prepend require complete accumulated coverage. A complete text @file attachment is equivalent to complete coverage. On a read-permission error, follow required_read.".into(),
+                description: file_write_description.into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -518,7 +534,12 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "working_note".into(),
-                description: "Maintain session-local notes. This does not write long-term memory or claims.".into(),
+                description: if self.memory_enabled {
+                    "Maintain session-local notes. This does not write long-term memory or claims."
+                } else {
+                    "Maintain session-local notes. This does not write claims."
+                }
+                .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -558,7 +579,7 @@ impl ToolRegistry {
             "ask_user" => self.access.ask_user,
             _ => true,
         });
-        if self.access.memory && self.memory_store.is_some() {
+        if self.memory_enabled && self.access.memory && self.memory_store.is_some() {
             definitions.extend(memory::definitions());
         }
         if self.access.router && self.router_client.is_some() {
@@ -795,18 +816,7 @@ impl ToolRegistry {
         context: ToolDispatchContext,
         require_mcp_read_only: bool,
     ) -> Result<ToolExecution, ToolError> {
-        let write_key = self.file_write_group_key(name, &input).await;
-        let failed_file_write_paths = context.failed_file_write_paths.clone();
-        if let (Some(failed), Some(key)) = (&failed_file_write_paths, &write_key) {
-            if failed.lock().await.contains(key) {
-                return Ok(ToolExecution::business_failure(json!({
-                    "path": input.get("path").and_then(Value::as_str),
-                    "status": "skipped",
-                    "msg": "同一 assistant 响应中此前对该文件的写入已失败；为避免基于未知中间状态继续修改，本次调用未执行。",
-                })));
-            }
-        }
-        let result = match name {
+        match name {
             "submit_task" => self.submit_evaluation_task(input),
             "code_run" if self.access.local_tools => self.code_run(input, &context).await,
             "write_stdin" if self.access.local_tools => self.write_stdin(input, &context).await,
@@ -823,7 +833,7 @@ impl ToolRegistry {
             "ask_user" if self.access.ask_user => {
                 self.ask_user(input).await.map(ToolExecution::completed)
             }
-            "memory" if self.access.memory => {
+            "memory" if self.memory_enabled && self.access.memory => {
                 memory::dispatch(self.memory_store.as_ref(), name, input).await
             }
             "consult_router" if self.access.router => self.consult_router(input).await,
@@ -859,17 +869,7 @@ impl ToolRegistry {
                     .await
             }
             other => Err(ToolError::UnknownTool(other.to_owned())),
-        };
-        if let (Some(failed), Some(key)) = (&failed_file_write_paths, write_key) {
-            let failed_write = match &result {
-                Ok(execution) => execution.outcome == ToolExecutionOutcome::BusinessFailure,
-                Err(_) => true,
-            };
-            if failed_write {
-                failed.lock().await.insert(key);
-            }
         }
-        result
     }
 
     fn submit_evaluation_task(&self, input: Value) -> Result<ToolExecution, ToolError> {

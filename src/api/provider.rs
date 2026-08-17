@@ -80,6 +80,9 @@ pub trait ProviderAdapter: Send + Sync {
             .before_provider_request(&request.messages)
             .await
             .map_err(ProviderRequestPreparationFailure::from_error)?;
+        observer
+            .provider_request_started(&request.messages)
+            .map_err(ProviderRequestPreparationFailure::from_error)?;
         self.send(request, emit).await
     }
 
@@ -97,6 +100,22 @@ pub trait ProviderRequestObserver: Send {
         &mut self,
         messages: &[SessionTurnMessage],
     ) -> anyhow::Result<()>;
+
+    /// adapter 已完成本地恢复检查，即将第一次发起该逻辑请求的网络 I/O。
+    /// 该边界用于区分“WAL 已准备但请求确定未发送”和“发送结果存在歧义”。
+    fn provider_request_started(&mut self, messages: &[SessionTurnMessage]) -> anyhow::Result<()> {
+        let _ = messages;
+        Ok(())
+    }
+
+    /// adapter 已准备内部 continuation，但在任何 transport send-started 之前决定
+    /// 放弃；owner 必须回滚该 continuation 的 request WAL。
+    async fn provider_request_abandoned_before_send(
+        &mut self,
+        _messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) struct NoopProviderRequestObserver;
@@ -104,6 +123,17 @@ pub(crate) struct NoopProviderRequestObserver;
 #[async_trait]
 impl ProviderRequestObserver for NoopProviderRequestObserver {
     async fn before_provider_request(
+        &mut self,
+        _messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn provider_request_started(&mut self, _messages: &[SessionTurnMessage]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn provider_request_abandoned_before_send(
         &mut self,
         _messages: &[SessionTurnMessage],
     ) -> anyhow::Result<()> {
@@ -218,12 +248,13 @@ pub enum ProviderStreamOutputMode {
 
 /// steer/cancel 之后阻止尚未开始的 provider 恢复动作，但不打断当前 request。
 ///
-/// 独立 ID 仅用于保持 `ProviderRequest` 的可比较性；实际通知由 clone 共享的
-/// `CancellationToken` 完成。
+/// 独立 ID 仅用于保持 `ProviderRequest` 的可比较性；实际中断与成功 partial
+/// 收束状态由 clone 共享。
 #[derive(Debug, Clone)]
 pub struct ProviderRecoveryInterrupt {
     id: u64,
     token: CancellationToken,
+    preserve_successful_response: Arc<AtomicBool>,
 }
 
 impl ProviderRecoveryInterrupt {
@@ -232,6 +263,7 @@ impl ProviderRecoveryInterrupt {
         Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             token: CancellationToken::new(),
+            preserve_successful_response: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -245,6 +277,17 @@ impl ProviderRecoveryInterrupt {
 
     pub(crate) async fn cancelled(&self) {
         self.token.cancelled().await;
+    }
+
+    /// 当前请求已经成功返回可提交的 max-token partial；safe steer 只阻止尚未发送的
+    /// continuation，不能让公共 turn 边界再把这份成功响应整体丢弃。
+    pub(crate) fn preserve_successful_response(&self) {
+        self.preserve_successful_response
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn should_preserve_successful_response(&self) -> bool {
+        self.preserve_successful_response.load(Ordering::Acquire)
     }
 }
 
