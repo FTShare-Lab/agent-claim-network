@@ -67,7 +67,7 @@ pub(super) enum AttachmentError {
     },
     #[error("单轮附件数量超限: {actual} 个，最多 {limit} 个")]
     TooManyFiles { actual: usize, limit: usize },
-    #[error("受保护的 memory 文件不能作为附件: {0}")]
+    #[error("agent 私有受保护文件不能作为附件: {0}")]
     ProtectedMemoryPath(String),
     #[cfg(target_os = "macos")]
     #[error("系统剪贴板暂不可用: {0}")]

@@ -7,21 +7,19 @@ use crate::tool::file_text::{
 };
 
 impl ToolRegistry {
-    pub(crate) async fn file_write_group_key(&self, name: &str, input: &Value) -> Option<PathBuf> {
-        if !matches!(name, "file_patch" | "file_write") {
-            return None;
-        }
-        let raw = input.get("path")?.as_str()?;
-        Some(tool_path_lock_key(&resolve_tool_path(&self.workspace_root, raw)).await)
-    }
-
     /// resume 同一 session 时撤销其旧进程内文件修改许可。
     pub async fn clear_file_read_state(&self, session_id: &SessionId) {
+        if !self.file_edit_authority_enabled() {
+            return;
+        }
         self.read_state.clear_session(session_id).await;
     }
 
     /// 主会话 compact 只撤销 parent scope，不影响仍在运行的 delegation child。
     pub(crate) async fn clear_parent_file_read_state(&self, session_id: &SessionId) {
+        if !self.file_edit_authority_enabled() {
+            return;
+        }
         self.read_state
             .clear_scope(&ReadStateScope::new(Some(session_id.clone()), None))
             .await;
@@ -32,6 +30,9 @@ impl ToolRegistry {
         session_id: &SessionId,
         turn_id: &str,
     ) -> Result<(), String> {
+        if !self.file_edit_authority_enabled() {
+            return Ok(());
+        }
         let scope = self.file_read_state_scope_for_turn(session_id, turn_id);
         self.read_state.begin_checkpoint(&scope, turn_id).await
     }
@@ -41,6 +42,9 @@ impl ToolRegistry {
         session_id: &SessionId,
         turn_id: &str,
     ) -> Result<(), String> {
+        if !self.file_edit_authority_enabled() {
+            return Ok(());
+        }
         let scope = self.file_read_state_scope_for_turn(session_id, turn_id);
         self.read_state.commit_checkpoint(&scope, turn_id).await
     }
@@ -50,6 +54,9 @@ impl ToolRegistry {
         session_id: &SessionId,
         turn_id: &str,
     ) -> Result<(), String> {
+        if !self.file_edit_authority_enabled() {
+            return Ok(());
+        }
         let scope = self.file_read_state_scope_for_turn(session_id, turn_id);
         self.read_state.rollback_checkpoint(&scope, turn_id).await
     }
@@ -60,6 +67,9 @@ impl ToolRegistry {
         session_id: &SessionId,
         caller_id: &str,
     ) {
+        if !self.file_edit_authority_enabled() {
+            return;
+        }
         self.read_state
             .clear_scope(&ReadStateScope::new(
                 Some(session_id.clone()),
@@ -81,6 +91,9 @@ impl ToolRegistry {
         &self,
         context: &ToolDispatchContext,
     ) -> Option<ReadStateScope> {
+        if !self.file_edit_authority_enabled() {
+            return None;
+        }
         let session_id = context.current_session_id.clone()?;
         let caller_id = if self.access.delegation_child {
             Some(context.current_turn_id.clone()?)
@@ -217,9 +230,15 @@ impl ToolRegistry {
                 "path": args.path,
                 "status": "error",
                 "line": line,
-                "msg": format!(
-                    "第 {line} 行无法在本次 file_read 单行上限内完整返回，因而无法安全生成读取证据或修改许可；请改用 code_run 定向读取该行。"
-                ),
+                "msg": if self.file_edit_authority_enabled() {
+                    format!(
+                        "第 {line} 行无法在本次 file_read 单行上限内完整返回，因而无法安全生成读取证据或修改许可；请改用 code_run 定向读取该行。"
+                    )
+                } else {
+                    format!(
+                        "第 {line} 行无法在本次 file_read 单行上限内完整返回；请改用 code_run 定向读取该行。"
+                    )
+                },
             }))),
         }
     }
@@ -233,13 +252,6 @@ impl ToolRegistry {
             serde_json::from_value(input).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
         if args.old_content.is_empty() {
             return Err(ToolError::InvalidArgs("old_content 不能为空".into()));
-        }
-        if args.old_content == args.new_content {
-            return Ok(ToolExecution::business_failure(json!({
-                "path": args.path,
-                "status": "error",
-                "msg": "old_content 与 new_content 相同，拒绝 no-op patch。",
-            })));
         }
         let path = resolve_tool_path(&self.workspace_root, &args.path);
         ensure_not_memory_path(&path)?;
@@ -286,33 +298,39 @@ impl ToolRegistry {
         }
 
         let match_end = match_start.saturating_add(args.old_content.len());
-        let suggested = suggested_read_range(&before, match_start, match_end);
-        let authority = match self.evaluate_file_read_state(context, &key, &before).await {
-            ReadStateVerdict::Fresh(authority) => authority,
-            ReadStateVerdict::Missing => {
-                return Ok(ToolExecution::business_failure(patch_permission_error(
-                    &args.path,
-                    if args.replace_all {
-                        None
-                    } else {
-                        Some(suggested)
-                    },
-                    false,
-                )));
-            }
-            ReadStateVerdict::Stale => {
-                return Ok(ToolExecution::business_failure(patch_permission_error(
-                    &args.path,
-                    if args.replace_all {
-                        None
-                    } else {
-                        Some(suggested)
-                    },
-                    true,
-                )));
-            }
+        let authority = if self.file_edit_authority_enabled() {
+            let suggested = suggested_read_range(&before, match_start, match_end);
+            Some(
+                match self.evaluate_file_read_state(context, &key, &before).await {
+                    ReadStateVerdict::Fresh(authority) => authority,
+                    ReadStateVerdict::Missing => {
+                        return Ok(ToolExecution::business_failure(patch_permission_error(
+                            &args.path,
+                            if args.replace_all {
+                                None
+                            } else {
+                                Some(suggested)
+                            },
+                            false,
+                        )));
+                    }
+                    ReadStateVerdict::Stale => {
+                        return Ok(ToolExecution::business_failure(patch_permission_error(
+                            &args.path,
+                            if args.replace_all {
+                                None
+                            } else {
+                                Some(suggested)
+                            },
+                            true,
+                        )));
+                    }
+                },
+            )
+        } else {
+            None
         };
-        if args.replace_all && !authority.complete {
+        if args.replace_all && authority.as_ref().is_some_and(|value| !value.complete) {
             return Ok(ToolExecution::business_failure(patch_permission_error(
                 &args.path, None, false,
             )));
@@ -328,23 +346,30 @@ impl ToolRegistry {
         } else {
             before.replacen(&args.old_content, &args.new_content, 1)
         });
-        let migration = if args.replace_all {
-            CoverageMigration {
+        let migration = if !self.file_edit_authority_enabled() {
+            None
+        } else if args.replace_all {
+            Some(CoverageMigration {
                 ranges: LineRange::new(1, read_state::logical_line_count(&after))
                     .into_iter()
                     .collect(),
                 complete: true,
-            }
+            })
         } else {
+            let Some(authority) = authority.as_ref() else {
+                return Err(ToolError::InvalidArgs(
+                    "file edit authority state missing while enforcement is enabled".into(),
+                ));
+            };
             match migrate_edit_coverage(
                 &before,
                 &after,
-                &authority,
+                authority,
                 match_start,
                 match_end,
                 args.new_content.len(),
             ) {
-                Ok(migration) => migration,
+                Ok(migration) => Some(migration),
                 Err(required) => {
                     return Ok(ToolExecution::business_failure(patch_permission_error(
                         &args.path,
@@ -354,8 +379,9 @@ impl ToolRegistry {
                 }
             }
         };
-        let evidence =
-            ReadEvidence::known_ranges(key.clone(), &after, migration.ranges, migration.complete);
+        let evidence = migration.map(|migration| {
+            ReadEvidence::known_ranges(key.clone(), &after, migration.ranges, migration.complete)
+        });
         ensure_file_commit_not_cancelled(context)?;
         let change = compute_file_change_async(
             args.path.clone(),
@@ -379,7 +405,9 @@ impl ToolRegistry {
                 &args.path,
             )));
         }
-        self.activate_file_read_evidence(context, evidence).await;
+        if let Some(evidence) = evidence {
+            self.activate_file_read_evidence(context, evidence).await;
+        }
         let mut output = json!({
             "path": args.path,
             "status": "success",
@@ -427,7 +455,7 @@ impl ToolRegistry {
             String::new()
         };
 
-        let authority = if existed {
+        let authority = if existed && self.file_edit_authority_enabled() {
             match self.evaluate_file_read_state(context, &key, &before).await {
                 ReadStateVerdict::Fresh(authority) => Some(authority),
                 ReadStateVerdict::Missing => {
@@ -480,14 +508,16 @@ impl ToolRegistry {
                 "bytes_written": before.len(),
             })));
         }
-        let migration = if let Some(authority) = &authority {
+        let migration = if !self.file_edit_authority_enabled() {
+            None
+        } else if let Some(authority) = &authority {
             if authority.complete || mode != "append" {
-                CoverageMigration {
+                Some(CoverageMigration {
                     ranges: LineRange::new(1, read_state::logical_line_count(&after))
                         .into_iter()
                         .collect(),
                     complete: true,
-                }
+                })
             } else {
                 match migrate_edit_coverage(
                     &before,
@@ -497,7 +527,7 @@ impl ToolRegistry {
                     before.len(),
                     after.len().saturating_sub(before.len()),
                 ) {
-                    Ok(migration) => migration,
+                    Ok(migration) => Some(migration),
                     Err(_) => {
                         self.clear_file_path_state(context, &key).await;
                         return Ok(ToolExecution::business_failure(write_permission_error(
@@ -510,15 +540,16 @@ impl ToolRegistry {
                 }
             }
         } else {
-            CoverageMigration {
+            Some(CoverageMigration {
                 ranges: LineRange::new(1, read_state::logical_line_count(&after))
                     .into_iter()
                     .collect(),
                 complete: true,
-            }
+            })
         };
-        let evidence =
-            ReadEvidence::known_ranges(key.clone(), &after, migration.ranges, migration.complete);
+        let evidence = migration.map(|migration| {
+            ReadEvidence::known_ranges(key.clone(), &after, migration.ranges, migration.complete)
+        });
         ensure_file_commit_not_cancelled(context)?;
         let change = compute_file_change_async(
             args.path.clone(),
@@ -546,7 +577,9 @@ impl ToolRegistry {
                 &args.path,
             )));
         }
-        self.activate_file_read_evidence(context, evidence).await;
+        if let Some(evidence) = evidence {
+            self.activate_file_read_evidence(context, evidence).await;
+        }
         let mut output = json!({
             "path": args.path,
             "status": "success",
@@ -794,7 +827,7 @@ fn stale_write_error(display_path: &str) -> Value {
 pub(super) fn ensure_not_memory_path(path: &Path) -> Result<(), ToolError> {
     if crate::attachment::is_protected_memory_path(path) {
         return Err(ToolError::InvalidArgs(
-            "MEMORY.md / USER.md 必须通过 memory 工具访问".into(),
+            "目标是 agent 私有受保护文件，普通文件工具不可访问".into(),
         ));
     }
     Ok(())

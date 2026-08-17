@@ -3,7 +3,7 @@
 //! 本模块承接单轮用户输入后的模型调用、工具执行和 tool_result 回灌。
 //! 它只理解 canonical session message，不关心 Anthropic/OpenAI 等后端协议细节。
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use chrono::{DateTime, Local, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tokio::time;
 use tokio::time::Instant;
 
@@ -750,7 +750,6 @@ impl AgentTurnLoop {
             .map(|_| None)
             .collect::<Vec<Option<ExecutedToolUse>>>();
         let max_parallel = self.tools.max_parallel_tool_calls();
-        let failed_file_write_paths = Arc::new(Mutex::new(BTreeSet::new()));
         let mut batch_start = 0usize;
 
         while batch_start < tool_uses.len() {
@@ -789,7 +788,6 @@ impl AgentTurnLoop {
                     emit,
                     durable_recorder,
                     &mut executions,
-                    Arc::clone(&failed_file_write_paths),
                 )
                 .await?;
             if matches!(outcome, ToolBatchOutcome::Interrupted) {
@@ -831,7 +829,6 @@ impl AgentTurnLoop {
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
         durable_recorder: &mut Option<&mut dyn SessionTurnEventRecorder>,
         executions: &mut [Option<ExecutedToolUse>],
-        failed_file_write_paths: Arc<Mutex<BTreeSet<std::path::PathBuf>>>,
     ) -> anyhow::Result<ToolBatchOutcome> {
         let batch = &all_tool_uses[batch_start..batch_end];
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
@@ -954,7 +951,6 @@ impl AgentTurnLoop {
                         progress_tx: Some(progress_tx.clone()),
                         cancellation: cancellation.clone(),
                         provider_mcp_routes: Some(Arc::clone(provider_mcp_routes)),
-                        failed_file_write_paths: Some(Arc::clone(&failed_file_write_paths)),
                     };
                     let tools = Arc::clone(&self.tools);
                     let execution_name = tool_use.name.clone();
@@ -1469,6 +1465,7 @@ impl AgentTurnLoop {
             user_attachments,
             skill_instructions,
             &self.attachment_limits,
+            self.tools.file_edit_authority_enabled(),
         )
         .await?;
         for message in attachment_warnings {
@@ -2699,6 +2696,7 @@ async fn session_user_message(
     attachments: Vec<SessionAttachment>,
     skill_instructions: Vec<SkillInstructions>,
     limits: &AttachmentLimits,
+    file_edit_authority_enabled: bool,
 ) -> anyhow::Result<(SessionTurnMessage, Vec<TextAttachmentRead>, Vec<String>)> {
     if !limits.enabled && !attachments.is_empty() {
         anyhow::bail!("附件功能已禁用");
@@ -2725,7 +2723,8 @@ async fn session_user_message(
     let mut text_reads = Vec::<TextAttachmentRead>::new();
     let mut warnings = Vec::<String>::new();
     for attachment in attachments {
-        let (block, text_read, warning) = session_attachment_block(attachment, limits).await?;
+        let (block, text_read, warning) =
+            session_attachment_block(attachment, limits, file_edit_authority_enabled).await?;
         blocks.push(block);
         if let Some(text_read) = text_read {
             text_reads.push(text_read);
@@ -2744,6 +2743,7 @@ async fn session_user_message(
 async fn session_attachment_block(
     attachment: SessionAttachment,
     limits: &AttachmentLimits,
+    file_edit_authority_enabled: bool,
 ) -> anyhow::Result<(
     SessionTurnContentBlock,
     Option<TextAttachmentRead>,
@@ -2785,7 +2785,9 @@ async fn session_attachment_block(
                 None,
             ))
         }
-        SessionAttachment::TextFile { path } => read_text_file_block(&path, limits).await,
+        SessionAttachment::TextFile { path } => {
+            read_text_file_block(&path, limits, file_edit_authority_enabled).await
+        }
         SessionAttachment::DocumentFile { path, media_type } => {
             if media_type != "application/pdf" {
                 anyhow::bail!(
@@ -2813,6 +2815,7 @@ async fn session_attachment_block(
 async fn read_text_file_block(
     path: &Path,
     limits: &AttachmentLimits,
+    file_edit_authority_enabled: bool,
 ) -> anyhow::Result<(
     SessionTurnContentBlock,
     Option<TextAttachmentRead>,
@@ -2824,7 +2827,7 @@ async fn read_text_file_block(
         .await
         .context("解析文本附件真实路径失败")?;
     if crate::attachment::is_protected_memory_path(&canonical_path) {
-        anyhow::bail!("MEMORY.md / USER.md 必须通过 memory 工具访问");
+        anyhow::bail!("目标是 agent 私有受保护文件，不能作为附件读取");
     }
     let content = crate::attachment::read_text_attachment(&canonical_path, limits)
         .await
@@ -2835,20 +2838,40 @@ async fn read_text_file_block(
         .unwrap_or("attachment");
     let actual_chars = content.chars().count();
     if actual_chars > limits.max_text_chars {
-        let provider_text = format!(
-            "Attached text file body omitted: {name}\nPath: {}\nCharacters: \
-             {actual_chars}\nThe file exceeds the per-file text attachment limit of {} \
-             characters. Use file_read with this path to inspect it before editing.",
-            path.display(),
-            limits.max_text_chars,
-        );
-        let warning = format!(
-            "文本附件 `{}` 共 {} 个字符，超过单文件上限 {}；已仅向模型提供路径，\
-             未注入正文，也未授予读取许可。",
-            path.display(),
-            actual_chars,
-            limits.max_text_chars,
-        );
+        let provider_text = if file_edit_authority_enabled {
+            format!(
+                "Attached text file body omitted: {name}\nPath: {}\nCharacters: \
+                 {actual_chars}\nThe file exceeds the per-file text attachment limit of {} \
+                 characters. Use file_read with this path to inspect it before editing.",
+                path.display(),
+                limits.max_text_chars,
+            )
+        } else {
+            format!(
+                "Attached text file body omitted: {name}\nPath: {}\nCharacters: \
+                 {actual_chars}\nThe file exceeds the per-file text attachment limit of {} \
+                 characters. Use file_read with this path when its contents are needed.",
+                path.display(),
+                limits.max_text_chars,
+            )
+        };
+        let warning = if file_edit_authority_enabled {
+            format!(
+                "文本附件 `{}` 共 {} 个字符，超过单文件上限 {}；已仅向模型提供路径，\
+                 未注入正文，也未授予读取许可。",
+                path.display(),
+                actual_chars,
+                limits.max_text_chars,
+            )
+        } else {
+            format!(
+                "文本附件 `{}` 共 {} 个字符，超过单文件上限 {}；已仅向模型提供路径，\
+                 未注入正文。",
+                path.display(),
+                actual_chars,
+                limits.max_text_chars,
+            )
+        };
         return Ok((
             SessionTurnContentBlock::text(provider_text),
             None,
@@ -3104,7 +3127,6 @@ async fn emit_forced_abort_interrupts(
                     progress_tx: None,
                     cancellation: None,
                     provider_mcp_routes: None,
-                    failed_file_write_paths: None,
                 })
                 .await
         } else {
@@ -3527,7 +3549,7 @@ mod tests {
     use tokio::time::{sleep, timeout, Duration};
 
     use super::{
-        assistant_message_text, provider_assistant_suffix_for_latest_request,
+        assistant_message_text, provider_assistant_suffix_for_latest_request, read_text_file_block,
         ProviderNoConsumableOutput, ProviderRequestPreparationFailure, ProviderRequestProgress,
         ProviderStreamFailure, ProviderTerminalFailure, CONTINUATION_TRIGGER,
     };
@@ -6055,7 +6077,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("MEMORY.md / USER.md 必须通过 memory 工具访问"));
+            .contains("agent 私有受保护文件，不能作为附件读取"));
         assert!(provider.requests.lock().await.is_empty());
     }
 
@@ -6201,6 +6223,29 @@ mod tests {
                         && message.contains("未授予读取许可")
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn oversized_text_attachment_omits_authority_guidance_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.txt");
+        tokio::fs::write(&path, "12345").await.unwrap();
+        let limits = AttachmentLimits {
+            max_text_chars: 4,
+            ..AttachmentLimits::default()
+        };
+
+        let (block, read, warning) = read_text_file_block(&path, &limits, false).await.unwrap();
+        let SessionTurnContentBlock::Text { text } = block else {
+            panic!("oversized text attachment should remain a text block");
+        };
+
+        assert!(read.is_none());
+        assert!(text.contains("when its contents are needed"));
+        assert!(!text.contains("before editing"));
+        let warning = warning.unwrap();
+        assert!(warning.contains("未注入正文"));
+        assert!(!warning.contains("许可"));
     }
 
     #[tokio::test]
@@ -6569,7 +6614,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn later_same_path_write_is_skipped_after_business_failure() {
+    async fn later_same_path_writes_continue_after_business_failure() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("note.txt");
         tokio::fs::write(&path, "original\n").await.unwrap();
@@ -6584,14 +6629,24 @@ mod tests {
             response(
                 vec![
                     tool_use(
+                        "toolu_read",
+                        "file_read",
+                        json!({"path": "note.txt", "show_linenos": false}),
+                    ),
+                    tool_use(
                         "toolu_first",
-                        "file_write",
-                        json!({"path": "note.txt", "content": "first\n"}),
+                        "file_patch",
+                        json!({"path": "note.txt", "old_content": "missing", "new_content": "first"}),
                     ),
                     tool_use(
                         "toolu_second",
-                        "file_write",
-                        json!({"path": "note.txt", "content": "second\n"}),
+                        "file_patch",
+                        json!({"path": "note.txt", "old_content": "original", "new_content": "second"}),
+                    ),
+                    tool_use(
+                        "toolu_third",
+                        "file_patch",
+                        json!({"path": "note.txt", "old_content": "second", "new_content": "third"}),
                     ),
                 ],
                 ProviderStop::ToolUse,
@@ -6611,9 +6666,11 @@ mod tests {
             .unwrap();
         let first = tool_result_content(non_context_messages(&turn)[2], "toolu_first");
         let second = tool_result_content(non_context_messages(&turn)[2], "toolu_second");
+        let third = tool_result_content(non_context_messages(&turn)[2], "toolu_third");
         assert_eq!(first["outcome"]["kind"], "business_failure");
-        assert_eq!(second["output"]["status"], "skipped");
-        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "original\n");
+        assert_eq!(second["outcome"]["kind"], "completed");
+        assert_eq!(third["outcome"]["kind"], "completed");
+        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "third\n");
     }
 
     #[tokio::test]

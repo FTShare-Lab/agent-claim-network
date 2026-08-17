@@ -16,6 +16,20 @@ const COMPACTION_MEDIA_METADATA_MAX_CHARS: usize = 128;
 
 pub(crate) const FILE_EDIT_AUTHORITY_COMPACTION_NOTICE: &str = "File permission boundary: this compaction cleared runtime file-edit authority derived from earlier file_read or @file content, even if a read remains mentioned in this summary or a preserved raw tail. Treat those reads as historical context, not current authorization. Before file_patch or file_write on an existing file, establish fresh authority with file_read and follow required_read.";
 
+pub(crate) fn strip_file_edit_authority_compaction_notices(messages: &mut [SessionTurnMessage]) {
+    for message in messages {
+        for block in &mut message.content {
+            if let SessionTurnContentBlock::Text { text } = block {
+                let is_compaction_wrapper = text.contains("<compacted_session_context>")
+                    || text.contains("<compacted_current_turn_progress>");
+                if is_compaction_wrapper {
+                    *text = text.replace(FILE_EDIT_AUTHORITY_COMPACTION_NOTICE, "");
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderProjectionBudget {
     pub tail_token_limit: usize,
@@ -496,6 +510,26 @@ mod tests {
             }],
             provider_replay: None,
         }
+    }
+
+    #[test]
+    fn authority_notice_filter_only_changes_compaction_wrappers() {
+        let mut messages = vec![
+            SessionTurnMessage::user_text(format!(
+                "user quoted: {FILE_EDIT_AUTHORITY_COMPACTION_NOTICE}"
+            )),
+            SessionTurnMessage::user_text(format!(
+                "<compacted_session_context>\n{FILE_EDIT_AUTHORITY_COMPACTION_NOTICE}\nsummary\n</compacted_session_context>"
+            )),
+        ];
+
+        strip_file_edit_authority_compaction_notices(&mut messages);
+
+        let user_message = serde_json::to_string(&messages[0]).unwrap();
+        let compacted_message = serde_json::to_string(&messages[1]).unwrap();
+        assert!(user_message.contains("runtime file-edit authority"));
+        assert!(!compacted_message.contains("runtime file-edit authority"));
+        assert!(compacted_message.contains("summary"));
     }
 
     #[test]

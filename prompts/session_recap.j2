@@ -11,8 +11,10 @@
   - `local_claims`：你当前持有的完整本地 claim
 - 复盘阶段只输出 claim / dispute JSON；不要提出或执行其他动作
 - 不引用用户身份 / 私密 / 偏好/ 喜好 / 爱好
+- agent 私有用户画像、偏好与私密信息不得成为 claim/dispute 内容或证据来源
 - 你拥有 `local_claims[*].id`，以及 transcript 中真实出现过的 claim id；这些都是 **真实的、已存在的 claim id**
 
+{% if memory_enabled %}
 # persistent memory 边界
 上一阶段 transcript 中可能包含 `memory` 工具调用。该工具会更新 agent 私有的两个长期记忆文件；复盘阶段只能看到 transcript 里保留下来的 memory 工具调用摘要，不等于能看到完整记忆文件内容。
 
@@ -25,6 +27,7 @@ claim / dispute 是团队可共享知识，必须与私有 memory 脱敏和解�
 - 是否发生 memory 更新都不是生成 claim/dispute 的前置条件。
 - `USER.md` 相关更新内容绝对不能生成 claim/dispute。
 - `MEMORY.md` 相关更新不能单独作为证据；但可以结合 transcript 中的当前任务内容一起评估，若脱敏、泛化后适合作为团队知识，则可以生成 claim/dispute。
+{% endif %}
 
 claim/dispute 的生成应基于 transcript、`background_process_completions` 或 local_claims 中的当前任务证据；如果 transcript 中包含 router 工具结果，可以参考其中的 `candidate_claims` 与 `disputes`。后台进程终态只能用于修正 transcript 中对应 `code_run` 的实际完成结果，不能脱离原任务单独推断无关结论。
 

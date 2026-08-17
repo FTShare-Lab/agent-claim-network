@@ -56,6 +56,13 @@
 - revision、canonical path 和 read state 不进入公开工具结果。
 - 写入被许可拒绝时，可增加结构化 `required_read`，让 Agent 能直接进行下一次读取。
 
+### 3.3 可选关闭修改许可
+
+- `agent.tool.file_edit_authority_enabled` 默认是 `true`，维持本文定义的完整修改许可语义；该参数不出现在默认配置模板中。
+- 设为 `false` 时，不登记读取证据、不维护 checkpoint、不检查修改许可或覆盖范围，`file_patch` / `file_write` 直接进入其余文件安全校验与写入流程。精确匹配与唯一性、受保护路径、文件锁、并发变化检测、原子写入和 diff 均不受影响。
+- 关闭时，运行期提供给 Agent 的 file tool description、附件提示、compact prompt 和新生成的 compact 边界消息均不包含修改许可引导；已有 compact 历史只在后续请求的内存投影中去除 ACN 固定边界提示，不回写历史记录。
+- 参数按进程启动时的配置生效。resume 不重写或重新渲染 session 已冻结的 system prompt；新值只控制 resume 后的工具定义、工具执行和 compact 行为。重新开启后从空许可状态开始，已有文件需要重新 `file_read`。
+
 ## 4. ReadStateStore
 
 ### 4.1 文件身份和版本
@@ -382,7 +389,7 @@ revision 只基于正文 bytes，不包含 `Attached file:`、`Path:` 等包装�
 
 - 同一 canonical path 的文本 `file_read` 和修改调用由路径锁按 tool-call 顺序串行执行。
 - 不同 canonical path 的文本 `file_read` 可以按现有调度并发执行。
-- 同路径前序写入业务失败、异常或中断后，后续写入标记 skipped；`no_change` 可以继续。
+- 同路径多个写入保持 tool-call 顺序，每次调用只依据执行时的真实文件状态独立校验和执行；前序业务失败不阻止后续调用。
 - 不同路径的安全工具仍可按现有调度并行。
 - `code_run` 修改不主动更新 read state；下一次 file tool 写入会因 revision 不同拒绝旧许可。
 - 不设置单轮 `file_read` 总字符或 token 预算；单次结果仍由 `file_read_max_chars` 限制。
@@ -409,6 +416,7 @@ revision 只基于正文 bytes，不包含 `Attached file:`、`Path:` 等包装�
 - patch 插入/删除行和 EOF append 后范围迁移正确。
 - 两处及大量重复匹配都以固定长度错误拒绝；扩大 `old_content` 后只修改目标位置。
 - `replace_all=true` 正确替换全部非重叠匹配，且不保存匹配位置列表。
+- `old_content == new_content` 仍完成正常校验与同内容原子写入，返回成功、保留修改许可且不生成 diff。
 - 外部并发修改在摘要或 compare-and-swap 阶段被拒绝。
 - 许可失败返回正确 `required_read`。
 
@@ -429,7 +437,7 @@ revision 只基于正文 bytes，不包含 `Attached file:`、`Path:` 等包装�
 ### 10.4 调度和 TUI
 
 - 不同 canonical path 的多个 file read 可并发执行，同一路径的调用由路径锁串行执行。
-- 同路径多个写入按 tool-call 顺序执行；前序失败后后序 skipped。
+- 同路径多个写入按 tool-call 顺序独立执行；前序失败后，后序仍基于届时的真实文件状态正常推进。
 - 真实 ACN TUI 可以完成分页读取、局部 patch、EOF append、完整改写、`@file` 修改和 stale 拒绝。
 
 ## 11. 已知取舍

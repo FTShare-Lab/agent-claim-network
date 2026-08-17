@@ -31,8 +31,10 @@ use super::{
     hash_session_segment, is_canonical_messages_committed_error, latest_model_context_matches,
     parse_compaction_summary_outcome, persist_main_background_process_completions,
     project_provider_context, select_compaction_summary_end_index,
-    session_compaction_transcript_projection, session_messages_to_provider_turn_messages,
-    session_messages_to_turn_messages, session_messages_to_turn_transcript,
+    session_compaction_transcript_projection,
+    session_compaction_transcript_projection_with_memory_mode,
+    session_messages_to_provider_turn_messages, session_messages_to_turn_messages,
+    session_messages_to_turn_transcript, session_messages_to_turn_transcript_with_memory_mode,
     should_emit_compaction_retry_warning, spawn_turn_control_journal_forwarder,
     ActiveProjectionContext, CompactionAuditScope, CompactionAuditSummaryContext,
     CompactionAuditTrigger, CompactionRanges, CompactionSummaryInputs,
@@ -2180,6 +2182,129 @@ async fn session_system_prompt_renders_configured_subagent_concurrency_limit() {
     assert!(prompt.contains("当前不支持将这类进程转交给你"));
     assert!(prompt.contains("必须从一开始就由你直接调用 `code_run` 创建和管理"));
     assert!(prompt.contains("保持 running、做有界轮询"));
+}
+
+#[tokio::test]
+async fn resume_keeps_frozen_system_prompt_when_file_edit_authority_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        "continued",
+        Vec::new(),
+    )]));
+    let mut tool_config = ToolConfig {
+        workspace_root: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    tool_config.file_edit_authority_enabled = false;
+    let tools = Arc::new(ToolRegistry::new(&tool_config).unwrap());
+    let (engine, store) = build_test_engine_with_tools(&dir, provider.clone(), tools);
+    let inbox_report = crate::agent::InboxProcessReport::default();
+    let current_prompt = engine
+        .render_session_system_prompt_for_inbox(&inbox_report)
+        .await
+        .unwrap();
+    assert!(!current_prompt.contains("required_read"));
+
+    let agent = AgentId::new("agent-a").unwrap();
+    let session_id: SessionId = "session_a11ce001".parse().unwrap();
+    let frozen_prompt = "frozen system prompt: follow required_read from the original runtime";
+    let mut session = store
+        .create_with_id_factory(&agent, frozen_prompt, || session_id.clone(), 1)
+        .await
+        .unwrap();
+    session.mark_closed(Utc::now()).await.unwrap();
+    drop(session);
+
+    let mut resumed = engine.reopen_existing_session(&session_id).await.unwrap();
+    engine
+        .run_turn(&mut resumed, "continue", |_| {})
+        .await
+        .unwrap();
+
+    assert_eq!(
+        tokio::fs::read_to_string(&resumed.paths.system_prompt)
+            .await
+            .unwrap(),
+        frozen_prompt
+    );
+    assert_eq!(provider.requests().await[0].system_prompt, frozen_prompt);
+}
+
+#[tokio::test]
+async fn disabled_memory_omits_new_prompt_and_tools_but_resume_keeps_frozen_system_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        "continued",
+        Vec::new(),
+    )]));
+    let tool_config = ToolConfig {
+        workspace_root: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let tools = Arc::new(
+        ToolRegistry::new(&tool_config)
+            .unwrap()
+            .with_memory_enabled(false),
+    );
+    let (engine, store) = build_test_engine_with_tools(&dir, provider.clone(), tools);
+    let memory_dir = dir.path().join("agents/agent-a/memories");
+    tokio::fs::create_dir_all(&memory_dir).await.unwrap();
+    tokio::fs::write(memory_dir.join("MEMORY.md"), "PRIVATE_MEMORY_MARKER")
+        .await
+        .unwrap();
+    let current_prompt = engine
+        .render_session_system_prompt_for_inbox(&crate::agent::InboxProcessReport::default())
+        .await
+        .unwrap();
+    assert!(!current_prompt.to_ascii_lowercase().contains("memory"));
+    assert!(!current_prompt.contains("PRIVATE_MEMORY_MARKER"));
+
+    let agent = AgentId::new("agent-a").unwrap();
+    let session_id: SessionId = "session_a11ce002".parse().unwrap();
+    let frozen_prompt = "frozen system prompt with old memory instructions";
+    let mut session = store
+        .create_with_id_factory(&agent, frozen_prompt, || session_id.clone(), 1)
+        .await
+        .unwrap();
+    session.mark_closed(Utc::now()).await.unwrap();
+    drop(session);
+
+    let mut resumed = engine.reopen_existing_session(&session_id).await.unwrap();
+    engine
+        .run_turn(&mut resumed, "continue", |_| {})
+        .await
+        .unwrap();
+
+    assert_eq!(
+        tokio::fs::read_to_string(&resumed.paths.system_prompt)
+            .await
+            .unwrap(),
+        frozen_prompt
+    );
+    let requests = provider.requests().await;
+    assert_eq!(requests[0].system_prompt, frozen_prompt);
+    assert!(!requests[0].tools.iter().any(|tool| tool.name == "memory"));
+}
+
+#[test]
+fn disabled_memory_is_a_hard_stop_for_background_review_cadence() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let tool_config = ToolConfig {
+        workspace_root: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let tools = Arc::new(
+        ToolRegistry::new(&tool_config)
+            .unwrap()
+            .with_memory_enabled(false),
+    );
+    let (engine, _) = build_test_engine_with_tools(&dir, provider, tools);
+    let engine = engine
+        .with_fork_memory_review(true)
+        .with_fork_memory_review_interval_turns(1);
+
+    assert!(!engine.fork_memory_review_cadence_reached());
 }
 
 #[tokio::test]
@@ -8610,6 +8735,20 @@ fn compaction_summary_projections_redact_memory_tool_input_and_output() {
         assert!(!serialized.contains("PRIVATE_MEMORY_INPUT"));
         assert!(!serialized.contains("PRIVATE_MEMORY_OUTPUT"));
     }
+
+    let projection =
+        session_compaction_transcript_projection_with_memory_mode(&messages, 4_096, false);
+    let recap = session_messages_to_turn_transcript_with_memory_mode(&messages, false);
+    for serialized in [
+        serde_json::to_string(&projection.full).unwrap(),
+        serde_json::to_string(&recap).unwrap(),
+    ] {
+        assert!(!serialized.to_ascii_lowercase().contains("memory"));
+        assert!(serialized.contains("private tool input omitted"));
+        assert!(serialized.contains("private tool output omitted"));
+        assert!(!serialized.contains("PRIVATE_MEMORY_INPUT"));
+        assert!(!serialized.contains("PRIVATE_MEMORY_OUTPUT"));
+    }
 }
 
 #[test]
@@ -9189,6 +9328,7 @@ fn provider_projection_preserves_current_anchor_and_omits_large_tool_result_raw(
         ProviderHistoryMediaPolicy::Placeholder,
         None,
         0,
+        true,
     );
     let rendered = serde_json::to_string(&projection.messages).unwrap();
 
@@ -9260,6 +9400,7 @@ fn provider_projection_injects_active_progress_note_after_compaction() {
         ProviderHistoryMediaPolicy::Placeholder,
         None,
         0,
+        true,
     );
 
     assert_eq!(projection.messages.len(), 2);
@@ -9331,6 +9472,7 @@ fn provider_projection_skips_active_segments_covered_by_cursor() {
         ProviderHistoryMediaPolicy::Placeholder,
         None,
         0,
+        true,
     );
     let rendered = serde_json::to_string(&projection.messages).unwrap();
 
@@ -9382,6 +9524,7 @@ fn provider_projection_ignores_active_summary_when_cursor_hash_mismatches() {
         ProviderHistoryMediaPolicy::Placeholder,
         None,
         0,
+        true,
     );
     let rendered = serde_json::to_string(&projection.messages).unwrap();
 
@@ -9440,6 +9583,7 @@ async fn committed_compacted_context_projects_large_tool_results() {
         128,
         ProviderHistoryMediaPolicy::Placeholder,
         None,
+        true,
     )
     .unwrap();
     let rendered = serde_json::to_string(&history).unwrap();
@@ -9500,6 +9644,7 @@ async fn persisted_provider_window_replays_new_canonical_tail_without_reprojecti
         8,
         ProviderHistoryMediaPolicy::Placeholder,
         None,
+        true,
     )
     .unwrap();
     let rendered = serde_json::to_string(&history).unwrap();
@@ -9511,6 +9656,56 @@ async fn persisted_provider_window_replays_new_canonical_tail_without_reprojecti
     );
     assert!(rendered.contains(&large_result));
     assert!(!rendered.contains("large tool_result omitted"));
+}
+
+#[tokio::test]
+async fn disabled_authority_filters_historical_compaction_notice_without_rewriting_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (_engine, store) = build_test_engine(&dir, provider);
+    let mut session = create_test_session(&store, "session_c0ffee28").await;
+    let historical = compacted_committed_summary_message("historical summary", true).unwrap();
+    let mut compaction =
+        SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
+    compaction.provider_history = Some(Box::new(CompactedProviderHistory {
+        replay_identity: None,
+        pending_turn: None,
+        canonical_message_until: 0,
+        messages: vec![historical],
+    }));
+    session.update_compaction(compaction).await.unwrap();
+    let metadata = session.read_metadata().await.unwrap();
+
+    let (_, projected) = compacted_context_for_turn(
+        "system",
+        &metadata,
+        Vec::new(),
+        usize::MAX,
+        usize::MAX,
+        0,
+        128,
+        ProviderHistoryMediaPolicy::Placeholder,
+        None,
+        false,
+    )
+    .unwrap();
+
+    let projected = serde_json::to_string(&projected).unwrap();
+    assert!(projected.contains("historical summary"));
+    assert!(!projected.contains("runtime file-edit authority"));
+    assert!(!projected.contains("required_read"));
+    let persisted = session.read_metadata().await.unwrap();
+    let persisted = serde_json::to_string(
+        &persisted
+            .compaction
+            .as_ref()
+            .and_then(|state| state.provider_history.as_ref())
+            .unwrap()
+            .messages,
+    )
+    .unwrap();
+    assert!(persisted.contains("runtime file-edit authority"));
+    assert!(persisted.contains("required_read"));
 }
 
 #[tokio::test]
@@ -9632,6 +9827,7 @@ async fn pending_provider_window_reconciles_canonical_tail_after_post_commit_fai
         8,
         ProviderHistoryMediaPolicy::Placeholder,
         None,
+        true,
     )
     .unwrap();
 
@@ -9712,6 +9908,7 @@ async fn uncommitted_pending_provider_window_discards_unaccepted_response_suffix
         128,
         ProviderHistoryMediaPolicy::Placeholder,
         None,
+        true,
     )
     .unwrap();
     assert_eq!(projected, vec![exact_request]);
@@ -9797,6 +9994,7 @@ async fn committed_pending_provider_window_preserves_later_shell_tail() {
         128,
         ProviderHistoryMediaPolicy::Placeholder,
         None,
+        true,
     )
     .unwrap();
     let projected = serde_json::to_string(&projected).unwrap();
@@ -9854,6 +10052,7 @@ async fn committed_compacted_context_preserves_recent_user_and_turn_end_answer()
         128,
         ProviderHistoryMediaPolicy::Placeholder,
         None,
+        true,
     )
     .unwrap();
     let rendered = serde_json::to_string(&history).unwrap();
@@ -9888,7 +10087,7 @@ fn provider_projection_prunes_committed_preserves_to_respect_global_hard_budget(
         SessionTurnMessage::assistant_text("latest progress stays raw"),
     ];
     let summary = "summary covers previous turn";
-    let summary_tokens = compacted_committed_summary_message(summary)
+    let summary_tokens = compacted_committed_summary_message(summary, true)
         .as_ref()
         .map(|message| estimate_session_turn_messages_tokens(std::slice::from_ref(message)))
         .unwrap_or(0);
@@ -9914,6 +10113,7 @@ fn provider_projection_prunes_committed_preserves_to_respect_global_hard_budget(
         ProviderHistoryMediaPolicy::Placeholder,
         None,
         0,
+        true,
     );
     let rendered = serde_json::to_string(&projection.messages).unwrap();
 
@@ -10094,7 +10294,7 @@ async fn preflight_committed_tail_selection_reserves_budget_for_committed_summar
     let messages = session.read_messages().await.unwrap();
     let active = vec![SessionTurnMessage::user_text("current anchor")];
     let active_tokens = estimate_session_turn_messages_tokens(&active);
-    let summary_tokens = estimate_compacted_committed_summary_message_tokens(&prior_summary);
+    let summary_tokens = estimate_compacted_committed_summary_message_tokens(&prior_summary, true);
     let recent_tail_tokens = SessionEngine::estimated_projected_message_tokens(
         messages[2..].iter(),
         engine.compaction.tool_result_raw_max_chars,
@@ -10830,6 +11030,7 @@ fn provider_projection_keeps_protected_context_tool_result_raw() {
         ProviderHistoryMediaPolicy::Placeholder,
         None,
         1,
+        true,
     );
     let rendered = serde_json::to_string(&projection.messages).unwrap();
 
@@ -11711,6 +11912,7 @@ fn compacted_prefix_drops_media_and_replay_while_suffix_preserves_them() {
         ProviderHistoryMediaPolicy::Preserve,
         Some(responses_replay_identity()),
         0,
+        true,
     );
     let rendered = serde_json::to_string(&projection.messages).unwrap();
 
@@ -11738,6 +11940,7 @@ fn compacted_prefix_drops_media_and_replay_while_suffix_preserves_them() {
         ProviderHistoryMediaPolicy::Placeholder,
         None,
         0,
+        true,
     );
     let canonical_rendered = serde_json::to_string(&canonical_projection.messages).unwrap();
     assert!(!canonical_rendered.contains("new-replay"));

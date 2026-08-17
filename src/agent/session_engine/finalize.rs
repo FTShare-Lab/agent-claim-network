@@ -21,7 +21,7 @@ use crate::storage::FileLockGuard;
 
 use super::compaction_projection::validate_session_compaction_state;
 use super::events::emit_warnings;
-use super::transcript::{session_messages_to_turn_transcript, session_trace_text};
+use super::transcript::{session_messages_to_turn_transcript_with_memory_mode, session_trace_text};
 use super::{
     checkpoint_trace_id, hash_session_segment, merge_finalize_reports,
     report_from_finalize_checkpoint, stable_hash_json, validate_finalize_checkpoint_segment,
@@ -496,7 +496,9 @@ impl SessionEngine {
         background_process_completions: &SessionRecapBackgroundProcessProjection,
         fallback_scope: crate::api::ProviderRuntimeFallbackScope,
     ) -> anyhow::Result<(Vec<ClaimId>, Vec<Claim>, Vec<Dispute>)> {
-        let transcript = session_messages_to_turn_transcript(session_messages);
+        let memory_enabled = self.turn_loop.tool_registry().memory_enabled();
+        let transcript =
+            session_messages_to_turn_transcript_with_memory_mode(session_messages, memory_enabled);
         if transcript.is_empty() && background_process_completions.items.is_empty() {
             log::debug!(
                 target: "agent",
@@ -520,7 +522,12 @@ impl SessionEngine {
         };
         let system_prompt = self
             .prompt_registry
-            .render(PROMPT_SESSION_RECAP, ())
+            .render(
+                PROMPT_SESSION_RECAP,
+                serde_json::json!({
+                    "memory_enabled": memory_enabled,
+                }),
+            )
             .context("渲染 session_recap prompt 失败")?;
         let user_text = serde_json::to_string_pretty(&payload)?;
         let agent_id = self.agent.agent_id.clone();

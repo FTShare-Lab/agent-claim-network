@@ -22,12 +22,14 @@ const SOLO_TEAM_SERVICES_OVERVIEW: &str = "【当前团队服务状态】用户�
 #[derive(Debug, Serialize)]
 struct SessionSystemPromptContext<'a> {
     agent_id: &'a crate::claim::AgentId,
+    memory_enabled: bool,
     memory_md: &'a str,
     user_md: &'a str,
     local_claims_snapshot: &'a str,
     router_scopes_overview: &'a str,
     available_skills: Vec<AvailableSkill>,
     subagent_max_concurrent: usize,
+    file_edit_authority_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -140,26 +142,38 @@ impl SessionEngine {
         &self,
         router_scopes_overview: &str,
     ) -> anyhow::Result<String> {
-        let memory_snapshot = self.agent.memory_store.read_snapshot().await?;
-        let memory_text = render_prompt_block(
-            MemoryTarget::Memory,
-            &memory_snapshot.memory_entries,
-            memory_snapshot.memory_usage.cap_chars,
-        );
-        let user_text = render_prompt_block(
-            MemoryTarget::User,
-            &memory_snapshot.user_entries,
-            memory_snapshot.user_usage.cap_chars,
-        );
+        let memory_enabled = self.turn_loop.tool_registry().memory_enabled();
+        let (memory_text, user_text) = if memory_enabled {
+            let memory_snapshot = self.agent.memory_store.read_snapshot().await?;
+            (
+                render_prompt_block(
+                    MemoryTarget::Memory,
+                    &memory_snapshot.memory_entries,
+                    memory_snapshot.memory_usage.cap_chars,
+                ),
+                render_prompt_block(
+                    MemoryTarget::User,
+                    &memory_snapshot.user_entries,
+                    memory_snapshot.user_usage.cap_chars,
+                ),
+            )
+        } else {
+            (String::new(), String::new())
+        };
         let local_claims_snapshot = self.render_local_claims_snapshot().await;
         let context = SessionSystemPromptContext {
             agent_id: &self.agent.agent_id,
+            memory_enabled,
             memory_md: &memory_text,
             user_md: &user_text,
             local_claims_snapshot: &local_claims_snapshot,
             router_scopes_overview,
             available_skills: self.agent.available_skills_for_prompt(),
             subagent_max_concurrent: self.subagent_max_concurrent,
+            file_edit_authority_enabled: self
+                .turn_loop
+                .tool_registry()
+                .file_edit_authority_enabled(),
         };
         let system_prompt = self
             .prompt_registry
@@ -200,6 +214,10 @@ impl SessionEngine {
     }
 
     pub(super) async fn render_memory_review_system_prompt(&self) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            self.turn_loop.tool_registry().memory_enabled(),
+            "persistent memory is disabled"
+        );
         let memory_snapshot = self.agent.memory_store.read_snapshot().await?;
         let memory_text = render_prompt_block(
             MemoryTarget::Memory,

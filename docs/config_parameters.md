@@ -1,6 +1,6 @@
 # 配置参数说明
 
-本文说明 `config.template.toml` / `config.toml` 的配置方法。实际运行配置文件只保留常用字段和值；完整字段含义、默认值和注意事项统一放在这里维护。
+本文说明 `config.toml` 的配置方法。实际运行配置文件只保留常用字段和值；完整字段含义、默认值和注意事项统一放在这里维护。
 
 阅读建议：
 
@@ -118,6 +118,7 @@ ACN 会用有效配置、选中的 upstream 和 finalize 所需凭据摘要生�
 
 ### `[agent.session.memory_review]`
 
+- `enabled`：是否启动后台 fork memory review，默认 `true`；设为 `false` 时不启动 review。
 - `interval_turns`：后台 fork memory review 的触发间隔；触发时也只 review 最近同样数量的 user turn。必须大于 0。
 
 ### `[agent.session.subagents]`
@@ -231,6 +232,7 @@ MCP server 按连接方式分两类：
 
 ### `[agent.memory]`
 
+- `enabled`：是否启用 Memory，默认 `true`。
 - `memory_char_limit`：agent 私有 `MEMORY.md` 容量上限。超限时 memory 工具拒绝写入。
 - `user_char_limit`：agent 私有 `USER.md` 容量上限。超限时 memory 工具拒绝写入。
 - `memory_safety_scan`：写入 MEMORY / USER 前是否拦截明显 prompt injection、密钥外传和后门持久化内容。
@@ -239,6 +241,7 @@ MCP server 按连接方式分两类：
 
 - `file_read_max_chars`：`file_read` 单页及单个 `@` 文本文件可返回的最大字符数，默认 `100000`。`file_read` 超限时可按 `page.next_start` 继续分页；`@` 文本超限时只提供路径和字符数，并引导模型改用 `file_read`。
 - `file_diff_max_changed_lines`：`file_write` / `file_patch` 修改成功后采集并在 TUI 历史区展示的 diff 最大**改动行数**（仅统计 +/- 行，上下文行不占额度），超出部分截断并提示剩余改动行数。
+- `file_edit_authority_enabled`：是否要求模型先通过 `file_read` 或完整文本附件取得已有文件当前版本的修改许可，默认 `true`。设为 `false` 时，`file_patch` / `file_write` 不执行读取许可与覆盖范围校验，也不维护许可 evidence/checkpoint；精确匹配、路径保护、文件锁、并发变化检测、原子写入和 diff 等其余行为不变。
 - `max_parallel_tool_calls`：一个 agent 当前 turn 内、连续可并发工具批次的最大活跃调用数，默认 `5`，必须大于 `0`。它不跨 turn、session 或 agent 共享，也不限制 provider 的 fallback 尝试次数。
 - `code_run_max_output_chars`：单次 `code_run` / `write_stdin` 工具中每个 stdout/stderr stream 回传允许的最大输出字符数，默认 `1048576`，最多 `2097152`；pipe 模式两个 stream 各自适用该上限，PTY 只有 stdout。
 - `write_stdin_max_poll_timeout_ms`：`write_stdin` 空轮询的最大观察窗口，默认且最大 `300000`ms。它必须不小于内部 `code_run` 最大观察窗口 `30000`ms；非空写入仍受内部 `30000`ms 上限约束。

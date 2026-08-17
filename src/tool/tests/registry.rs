@@ -5,6 +5,26 @@
 use super::*;
 
 #[test]
+fn file_tool_descriptions_omit_authority_guidance_when_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_tool_config(dir.path());
+    config.file_edit_authority_enabled = false;
+    let definitions = ToolRegistry::new(&config).unwrap().definitions();
+
+    for name in ["file_read", "file_patch", "file_write"] {
+        let description = &definitions
+            .iter()
+            .find(|definition| definition.name == name)
+            .unwrap()
+            .description;
+        assert!(!description.contains("authority"));
+        assert!(!description.contains("coverage"));
+        assert!(!description.contains("required_read"));
+        assert!(!description.contains("read-permission"));
+    }
+}
+
+#[test]
 fn concurrency_classifier_matches_native_tool_matrix() {
     let dir = tempfile::tempdir().unwrap();
     let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();

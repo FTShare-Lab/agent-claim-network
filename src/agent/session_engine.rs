@@ -1843,6 +1843,7 @@ impl SessionEngine {
             self.turn_loop.history_media_policy(),
             self.turn_loop.history_replay_identity(),
             protected_active_tail_segments,
+            self.turn_loop.tool_registry().file_edit_authority_enabled(),
         )
     }
 
@@ -3281,6 +3282,7 @@ impl SessionEngine {
             self.compaction.tool_result_raw_max_chars,
             self.turn_loop.history_media_policy(),
             provider_replay_identity.clone(),
+            self.turn_loop.tool_registry().file_edit_authority_enabled(),
         )?;
         let active_start_index = history.len();
         let runtime_chain_id = session.runtime_chain_id();
@@ -3553,6 +3555,7 @@ impl SessionEngine {
             self.compaction.tool_result_raw_max_chars,
             self.turn_loop.history_media_policy(),
             self.turn_loop.history_replay_identity(),
+            self.turn_loop.tool_registry().file_edit_authority_enabled(),
         )?;
         let delegation = SessionTurnMessage::model_context(
             ModelContextSource::Delegation,
@@ -3793,6 +3796,7 @@ impl SessionEngine {
                 self.turn_loop.history_media_policy(),
                 self.turn_loop.history_replay_identity(),
                 protected_active_tail_segments,
+                self.turn_loop.tool_registry().file_edit_authority_enabled(),
             )
         });
         log::info!(
@@ -3858,6 +3862,7 @@ impl SessionEngine {
                 .as_ref()
                 .map(|prior| prior.summary.as_str()),
             protected_active_tail_segments,
+            self.turn_loop.tool_registry().file_edit_authority_enabled(),
         )
         .messages;
         let summary_start = metadata
@@ -3870,7 +3875,12 @@ impl SessionEngine {
             .as_ref()
             .map(SessionCompactionState::committed_summary)
             .filter(|summary| !summary.trim().is_empty())
-            .map(estimate_compacted_committed_summary_message_tokens)
+            .map(|summary| {
+                estimate_compacted_committed_summary_message_tokens(
+                    summary,
+                    self.turn_loop.tool_registry().file_edit_authority_enabled(),
+                )
+            })
             .unwrap_or(0);
         let committed_tail_limit = raw_preserve_budget_after_mandatory(
             projection_budget.tail_token_limit,
@@ -3885,7 +3895,7 @@ impl SessionEngine {
             committed_tail_limit,
         );
         let committed_transcripts = if summary_end > summary_start {
-            let projection = session_compaction_transcript_projection(
+            let projection = session_compaction_transcript_projection_with_memory_mode(
                 session_messages
                     .get(summary_start..summary_end)
                     .with_context(|| {
@@ -3894,6 +3904,7 @@ impl SessionEngine {
                         )
                     })?,
                 self.compaction.tool_result_raw_max_chars,
+                self.turn_loop.tool_registry().memory_enabled(),
             );
             (!projection.full.is_empty()).then_some(projection)
         } else {
@@ -3987,9 +3998,10 @@ impl SessionEngine {
             active_suffix,
             &segments[summary_start_segment..summary_end_segment],
         );
-        let transcript_projection = compaction_transcript_projection(
+        let transcript_projection = compaction_transcript_projection_with_memory_mode(
             summary_messages.into_iter().cloned().collect(),
             self.compaction.tool_result_raw_max_chars,
+            self.turn_loop.tool_registry().memory_enabled(),
         );
         if transcript_projection.full.is_empty() {
             log::debug!(
@@ -4541,9 +4553,10 @@ impl SessionEngine {
                                 ranges.summary_start_index, ranges.summary_end_index
                             )
                         })?;
-                    session_compaction_transcript_projection(
+                    session_compaction_transcript_projection_with_memory_mode(
                         segment,
                         self.compaction.tool_result_raw_max_chars,
+                        self.turn_loop.tool_registry().memory_enabled(),
                     )
                     .full
                     .is_empty()
@@ -4763,10 +4776,12 @@ impl SessionEngine {
                 let (used_claim_ids, prepared_claims, prepared_disputes, summary, audit_ids) =
                     match (has_recap_work, has_summary_work) {
                         (true, true) => {
-                            let summary_transcript = session_compaction_transcript_projection(
-                                summary_segment,
-                                self.compaction.tool_result_raw_max_chars,
-                            );
+                            let summary_transcript =
+                                session_compaction_transcript_projection_with_memory_mode(
+                                    summary_segment,
+                                    self.compaction.tool_result_raw_max_chars,
+                                    self.turn_loop.tool_registry().memory_enabled(),
+                                );
                             let summary_inputs = CompactionSummaryInputs {
                                 audit: CompactionAuditSummaryContext {
                                     trigger: CompactionAuditTrigger::ManualCheckpoint,
@@ -4849,10 +4864,12 @@ impl SessionEngine {
                             )
                         }
                         (false, true) => {
-                            let summary_transcript = session_compaction_transcript_projection(
-                                summary_segment,
-                                self.compaction.tool_result_raw_max_chars,
-                            );
+                            let summary_transcript =
+                                session_compaction_transcript_projection_with_memory_mode(
+                                    summary_segment,
+                                    self.compaction.tool_result_raw_max_chars,
+                                    self.turn_loop.tool_registry().memory_enabled(),
+                                );
                             let summary_inputs = CompactionSummaryInputs {
                                 audit: CompactionAuditSummaryContext {
                                     trigger: CompactionAuditTrigger::ManualCheckpoint,
@@ -5220,6 +5237,10 @@ impl SessionEngine {
                 PROMPT_SESSION_COMPACTION,
                 serde_json::json!({
                     "summary_max_chars": inputs.summary_max_chars,
+                    "file_edit_authority_enabled": self
+                        .turn_loop
+                        .tool_registry()
+                        .file_edit_authority_enabled(),
                 }),
             )
             .context("渲染 session_compaction prompt 失败")?;

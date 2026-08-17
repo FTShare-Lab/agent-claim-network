@@ -345,7 +345,15 @@ fn session_block_to_turn_with_policy(
     }
 }
 
+#[cfg(test)]
 pub(super) fn session_messages_to_turn_transcript(messages: &[SessionMessage]) -> Vec<TurnMessage> {
+    session_messages_to_turn_transcript_with_memory_mode(messages, true)
+}
+
+pub(super) fn session_messages_to_turn_transcript_with_memory_mode(
+    messages: &[SessionMessage],
+    memory_enabled: bool,
+) -> Vec<TurnMessage> {
     let mut tool_names_by_id = FxHashMap::default();
     for message in messages {
         for block in &message.content {
@@ -360,7 +368,11 @@ pub(super) fn session_messages_to_turn_transcript(messages: &[SessionMessage]) -
         .filter(|message| !is_model_context_message(message))
         .map(|message| TurnMessage {
             role: message.role.to_string(),
-            content: flatten_session_content(&message.content, &tool_names_by_id),
+            content: flatten_session_content_with_memory_mode(
+                &message.content,
+                &tool_names_by_id,
+                memory_enabled,
+            ),
         })
         .collect()
 }
@@ -368,6 +380,14 @@ pub(super) fn session_messages_to_turn_transcript(messages: &[SessionMessage]) -
 pub(super) fn flatten_session_content(
     blocks: &[SessionContentBlock],
     tool_names_by_id: &FxHashMap<&str, &str>,
+) -> String {
+    flatten_session_content_with_memory_mode(blocks, tool_names_by_id, true)
+}
+
+fn flatten_session_content_with_memory_mode(
+    blocks: &[SessionContentBlock],
+    tool_names_by_id: &FxHashMap<&str, &str>,
+    memory_enabled: bool,
 ) -> String {
     let mut parts = Vec::new();
     for block in blocks {
@@ -399,9 +419,11 @@ pub(super) fn flatten_session_content(
             },
             SessionContentBlock::ToolUse { name, input, .. } => {
                 if name == "memory" {
-                    parts.push(format!(
-                        "[tool_use {name} input omitted from recap transcript]"
-                    ));
+                    parts.push(if memory_enabled {
+                        format!("[tool_use {name} input omitted from recap transcript]")
+                    } else {
+                        "[private tool input omitted from recap transcript]".into()
+                    });
                 } else {
                     parts.push(format!("[tool_use {name} {input}]"));
                 }
@@ -414,7 +436,11 @@ pub(super) fn flatten_session_content(
                     .get(tool_use_id.as_str())
                     .is_some_and(|name| *name == "memory")
                 {
-                    parts.push("[tool_result memory output omitted from recap transcript]".into());
+                    parts.push(if memory_enabled {
+                        "[tool_result memory output omitted from recap transcript]".into()
+                    } else {
+                        "[private tool output omitted from recap transcript]".into()
+                    });
                 } else {
                     parts.push(content.clone());
                 }

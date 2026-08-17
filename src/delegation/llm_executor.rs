@@ -243,6 +243,8 @@ impl DelegationExecutor for LlmDelegationExecutor {
             &self.prompt_registry,
             &metadata,
             &runtime_context,
+            self.tool_registry_template.memory_enabled(),
+            self.tool_registry_template.file_edit_authority_enabled(),
         )
         .map_err(|err| {
             DelegationExecutionError::new(format!("渲染 subagents system prompt 失败: {err}"))
@@ -281,6 +283,7 @@ impl DelegationExecutor for LlmDelegationExecutor {
             self.compaction.clone(),
             self.context_window,
             runtime_fallback_scope.clone(),
+            self.tool_registry_template.file_edit_authority_enabled(),
         );
         let turn_result = {
             let mut tool_names = BTreeMap::<String, String>::new();
@@ -407,6 +410,8 @@ fn delegation_system_prompt(
     prompt_registry: &PromptRegistry,
     metadata: &DelegationMetadata,
     runtime_context: &str,
+    memory_enabled: bool,
+    file_edit_authority_enabled: bool,
 ) -> Result<String, PromptError> {
     prompt_registry.render(
         PROMPT_SUBAGENTS_SYSTEM,
@@ -418,6 +423,8 @@ fn delegation_system_prompt(
             title => metadata.title.as_str(),
             role => metadata.role.as_str(),
             runtime_context => runtime_context,
+            memory_enabled => memory_enabled,
+            file_edit_authority_enabled => file_edit_authority_enabled,
         },
     )
 }
