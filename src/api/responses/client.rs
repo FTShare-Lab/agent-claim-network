@@ -757,6 +757,8 @@ mod tests {
             store: false,
             include: None,
             reasoning: None,
+            temperature: None,
+            top_p: None,
         }
     }
 

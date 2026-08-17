@@ -744,6 +744,7 @@ mod tests {
             stream,
             stream_options: None,
             temperature: None,
+            top_p: None,
         }
     }
 

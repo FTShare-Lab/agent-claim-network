@@ -281,6 +281,7 @@ pub(crate) fn build_provider_adapter(cfg: &Config) -> anyhow::Result<Arc<dyn Pro
                     Duration::from_millis(chat.retry_max_delay_ms),
                 )?
                 .with_reasoning_effort(chat.reasoning_effort)
+                .with_sampling_parameters(chat.temperature, chat.top_p)
                 .with_thinking(
                     chat.anthropic_thinking,
                     chat.anthropic_thinking_budget_tokens,
@@ -302,7 +303,8 @@ pub(crate) fn build_provider_adapter(cfg: &Config) -> anyhow::Result<Arc<dyn Pro
                     Duration::from_millis(chat.retry_base_delay_ms),
                     Duration::from_millis(chat.retry_max_delay_ms),
                 )?
-                .with_reasoning_effort(chat.reasoning_effort),
+                .with_reasoning_effort(chat.reasoning_effort)
+                .with_sampling_parameters(chat.temperature, chat.top_p),
             ))
         }
         LlmProvider::OpenAiResponses => {
@@ -320,6 +322,7 @@ pub(crate) fn build_provider_adapter(cfg: &Config) -> anyhow::Result<Arc<dyn Pro
                 Duration::from_millis(chat.retry_max_delay_ms),
             )?
             .with_reasoning_effort(chat.reasoning_effort)
+            .with_sampling_parameters(chat.temperature, chat.top_p)
             .with_websockets(
                 chat.supports_websockets,
                 cfg.agent.session.subagents.max_concurrent.saturating_add(3),
@@ -660,6 +663,8 @@ mod tests {
                     anthropic_thinking: crate::config::AnthropicThinking::Auto,
                     anthropic_thinking_budget_tokens: None,
                     supports_websockets: false,
+                    temperature: None,
+                    top_p: None,
                     api_key_env: "ANTHROPIC_API_KEY".into(),
                     max_tokens: 1024,
                     context_window: crate::config::DEFAULT_LLM_CONTEXT_WINDOW,

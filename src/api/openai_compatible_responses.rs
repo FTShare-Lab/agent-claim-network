@@ -56,6 +56,8 @@ pub struct OpenAiCompatibleResponsesProviderAdapter {
     model: String,
     reasoning_effort: ReasoningEffort,
     include_reasoning_replay: bool,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
 }
 
 impl OpenAiCompatibleResponsesProviderAdapter {
@@ -84,6 +86,8 @@ impl OpenAiCompatibleResponsesProviderAdapter {
             model,
             reasoning_effort: ReasoningEffort::None,
             include_reasoning_replay: true,
+            temperature: None,
+            top_p: None,
         })
     }
 
@@ -95,6 +99,17 @@ impl OpenAiCompatibleResponsesProviderAdapter {
 
     pub(crate) fn with_reasoning_replay(mut self, enabled: bool) -> Self {
         self.include_reasoning_replay = enabled;
+        self
+    }
+
+    /// 设置 Agent 请求的可选采样参数；`None` 会在序列化时省略。
+    pub(crate) fn with_sampling_parameters(
+        mut self,
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+    ) -> Self {
+        self.temperature = temperature;
+        self.top_p = top_p;
         self
     }
 
@@ -133,6 +148,8 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                     effort: effort.to_string(),
                 }
             }),
+            temperature: self.temperature,
+            top_p: self.top_p,
         }
     }
 
@@ -866,6 +883,8 @@ mod tests {
             model: "test-model".into(),
             reasoning_effort,
             include_reasoning_replay: true,
+            temperature: None,
+            top_p: None,
         }
     }
 
@@ -1261,6 +1280,8 @@ mod tests {
         assert_eq!(value["stream"], true);
         assert_eq!(value["max_output_tokens"], 123);
         assert_eq!(value["reasoning"]["effort"], "high");
+        assert!(value.get("temperature").is_none());
+        assert!(value.get("top_p").is_none());
         assert!(value["reasoning"].get("summary").is_none());
         assert_eq!(value["tools"][0]["strict"], false);
         assert_eq!(value["tools"][0]["type"], "function");
@@ -1276,6 +1297,19 @@ mod tests {
             .unwrap()
             .get("reasoning")
             .is_none());
+    }
+
+    #[test]
+    fn configured_sampling_parameters_are_sent_for_streaming_and_non_streaming_requests() {
+        let adapter = adapter_with_reasoning_effort(ReasoningEffort::None)
+            .with_sampling_parameters(Some(0.6), Some(0.85));
+
+        for stream in [false, true] {
+            let request = adapter.request_for("system", Vec::new(), Vec::new(), 128, stream);
+            let value = serde_json::to_value(request).unwrap();
+            assert_eq!(value.get("temperature"), Some(&json!(0.6)));
+            assert_eq!(value.get("top_p"), Some(&json!(0.85)));
+        }
     }
 
     #[test]

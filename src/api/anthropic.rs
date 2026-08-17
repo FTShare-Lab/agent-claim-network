@@ -96,6 +96,8 @@ pub struct AnthropicMessagesClient {
     reasoning_effort: ReasoningEffort,
     thinking: AnthropicThinking,
     thinking_budget_tokens: Option<u32>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
 }
 
 pub struct AnthropicProviderAdapter {
@@ -200,6 +202,8 @@ impl AnthropicMessagesClient {
             reasoning_effort: ReasoningEffort::None,
             thinking: AnthropicThinking::Auto,
             thinking_budget_tokens: None,
+            temperature: None,
+            top_p: None,
         })
     }
 
@@ -238,6 +242,8 @@ impl AnthropicMessagesClient {
             },
             tools,
             stream,
+            temperature: self.temperature,
+            top_p: self.top_p,
         }
     }
 
@@ -782,6 +788,17 @@ impl AnthropicProviderAdapter {
     ) -> Self {
         self.client.thinking = thinking;
         self.client.thinking_budget_tokens = budget_tokens;
+        self
+    }
+
+    /// 设置 Agent 请求的可选采样参数；`None` 会在序列化时省略。
+    pub(crate) fn with_sampling_parameters(
+        mut self,
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+    ) -> Self {
+        self.client.temperature = temperature;
+        self.client.top_p = top_p;
         self
     }
 }
@@ -1532,6 +1549,8 @@ mod tests {
 
         assert!(body.get("output_config").is_none());
         assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
     }
 
     #[test]
@@ -1543,6 +1562,20 @@ mod tests {
             let body = serde_json::to_value(request).unwrap();
             assert_eq!(body.get("output_config"), Some(&json!({"effort": "xhigh"})));
             assert!(body.get("reasoning_effort").is_none());
+        }
+    }
+
+    #[test]
+    fn configured_sampling_parameters_are_sent_for_streaming_and_non_streaming_requests() {
+        let mut client = client_with_reasoning_effort(ReasoningEffort::None);
+        client.temperature = Some(0.55);
+        client.top_p = Some(0.8);
+
+        for stream in [None, Some(true)] {
+            let request = client.request_for("system", Vec::new(), None, 128, stream);
+            let body = serde_json::to_value(request).unwrap();
+            assert_eq!(body.get("temperature"), Some(&json!(0.55)));
+            assert_eq!(body.get("top_p"), Some(&json!(0.8)));
         }
     }
 

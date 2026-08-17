@@ -56,7 +56,8 @@ pub struct OpenAiCompatibleChatProviderAdapter {
     client: ChatCompletionsClient,
     model: String,
     reasoning_effort: ReasoningEffort,
-    temperature: Option<f32>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
 }
 
 impl OpenAiCompatibleChatProviderAdapter {
@@ -81,6 +82,7 @@ impl OpenAiCompatibleChatProviderAdapter {
             model,
             reasoning_effort: ReasoningEffort::None,
             temperature: None,
+            top_p: None,
         })
     }
 
@@ -91,8 +93,19 @@ impl OpenAiCompatibleChatProviderAdapter {
     }
 
     /// 为内部确定性任务设置采样温度；普通 Agent 请求保持 provider 默认值。
-    pub(crate) fn with_temperature(mut self, temperature: f32) -> Self {
+    pub(crate) fn with_temperature(mut self, temperature: f64) -> Self {
         self.temperature = Some(temperature);
+        self
+    }
+
+    /// 设置 Agent 请求的可选采样参数；`None` 会在序列化时省略。
+    pub(crate) fn with_sampling_parameters(
+        mut self,
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+    ) -> Self {
+        self.temperature = temperature;
+        self.top_p = top_p;
         self
     }
 
@@ -121,6 +134,7 @@ impl OpenAiCompatibleChatProviderAdapter {
                 include_usage: true,
             }),
             temperature: self.temperature,
+            top_p: self.top_p,
         }
     }
 
@@ -953,6 +967,7 @@ mod tests {
             model: "test-model".into(),
             reasoning_effort,
             temperature: None,
+            top_p: None,
         }
     }
 
@@ -1433,16 +1448,21 @@ mod tests {
         let body = serde_json::to_value(req).unwrap();
 
         assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
     }
 
     #[test]
-    fn configured_temperature_is_sent_without_enabling_reasoning() {
-        let adapter = adapter().with_temperature(0.0);
-        let req = adapter.request_for("system", Vec::new(), Vec::new(), 128, true);
-        let body = serde_json::to_value(req).unwrap();
+    fn configured_sampling_parameters_are_sent_for_streaming_and_non_streaming_requests() {
+        let adapter = adapter().with_sampling_parameters(Some(0.75), Some(0.9));
+        for stream in [false, true] {
+            let req = adapter.request_for("system", Vec::new(), Vec::new(), 128, stream);
+            let body = serde_json::to_value(req).unwrap();
 
-        assert_eq!(body.get("temperature"), Some(&json!(0.0)));
-        assert!(body.get("reasoning_effort").is_none());
+            assert_eq!(body.get("temperature"), Some(&json!(0.75)));
+            assert_eq!(body.get("top_p"), Some(&json!(0.9)));
+            assert!(body.get("reasoning_effort").is_none());
+        }
     }
 
     #[test]

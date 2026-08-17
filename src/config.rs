@@ -777,6 +777,12 @@ pub struct LlmChatConfig {
     pub supports_websockets: bool,
     #[serde(default)]
     pub reasoning_effort: ReasoningEffort,
+    /// 可选采样温度；未配置时沿用上游默认值。
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    /// 可选 nucleus sampling 参数；未配置时沿用上游默认值。
+    #[serde(default)]
+    pub top_p: Option<f64>,
     /// Anthropic Messages 的显式 thinking 模式；其他 provider 忽略。
     #[serde(default)]
     pub anthropic_thinking: AnthropicThinking,
@@ -814,6 +820,8 @@ impl Default for LlmChatConfig {
             model: "claude-sonnet-4-20250514".to_string(),
             supports_websockets: false,
             reasoning_effort: ReasoningEffort::None,
+            temperature: None,
+            top_p: None,
             anthropic_thinking: AnthropicThinking::Auto,
             anthropic_thinking_budget_tokens: None,
             api_key_env: "ANTHROPIC_API_KEY".to_string(),
@@ -2379,6 +2387,16 @@ fn validate_config(
             "agent.llm.context_window must be > 0".into(),
         ));
     }
+    for (name, value) in [
+        ("agent.llm.temperature", cfg.agent.llm.temperature),
+        ("agent.llm.top_p", cfg.agent.llm.top_p),
+    ] {
+        if value.is_some_and(|value| !value.is_finite()) {
+            return Err(ConfigError::Validation(format!(
+                "{name} must be a finite number"
+            )));
+        }
+    }
     if cfg.agent.llm.timeout_secs == 0 {
         return Err(ConfigError::Validation(
             "agent.llm.timeout_secs must be > 0".into(),
@@ -3145,6 +3163,39 @@ router_endpoint = "http://127.0.0.1:8061"
         let cfg = parse_and_validate(minimal_config_without_optional_defaults()).unwrap();
 
         assert_eq!(cfg.agent.llm.reasoning_effort, ReasoningEffort::None);
+    }
+
+    #[test]
+    fn sampling_parameters_are_optional_and_accept_any_finite_values() {
+        let defaults = parse_and_validate(minimal_config_without_optional_defaults()).unwrap();
+        assert_eq!(defaults.agent.llm.temperature, None);
+        assert_eq!(defaults.agent.llm.top_p, None);
+
+        let configured = minimal_config_without_optional_defaults().replace(
+            r#"model = "example-anthropic-model""#,
+            "model = \"example-anthropic-model\"\ntemperature = -1.25\ntop_p = 5.5",
+        );
+        let configured = parse_and_validate(&configured).unwrap();
+        assert_eq!(configured.agent.llm.temperature, Some(-1.25));
+        assert_eq!(configured.agent.llm.top_p, Some(5.5));
+    }
+
+    #[test]
+    fn sampling_parameters_reject_non_finite_values() {
+        for (field, raw) in [
+            ("temperature", "nan"),
+            ("temperature", "inf"),
+            ("top_p", "-inf"),
+        ] {
+            let config = minimal_config_without_optional_defaults().replace(
+                r#"model = "example-anthropic-model""#,
+                &format!("model = \"example-anthropic-model\"\n{field} = {raw}"),
+            );
+            expect_parse_err_contains(
+                config,
+                &format!("agent.llm.{field} must be a finite number"),
+            );
+        }
     }
 
     #[test]
