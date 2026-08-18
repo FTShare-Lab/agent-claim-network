@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ApiError } from '../../lib/apiClient'
 import {
   adoptAnalysis,
-  createManualAnalysis,
+  createAnalysis,
   getAnalysis,
   getDispute,
   listAnalyses,
@@ -57,13 +57,9 @@ function applyResolutionToCache(
 }
 
 function allAnalyses(data?: {
-  automatic_analysis?: ArbitrationAnalysisSummary | null
-  manual_analysis?: ArbitrationAnalysisSummary | null
+  current_analysis?: ArbitrationAnalysisSummary | null
 }) {
-  if (!data) return []
-  return [data.automatic_analysis, data.manual_analysis].filter(
-    (analysis): analysis is ArbitrationAnalysisSummary => Boolean(analysis),
-  )
+  return data?.current_analysis ? [data.current_analysis] : []
 }
 
 export function useDisputesQuery() {
@@ -202,10 +198,10 @@ export function useResolveDisputeMutation() {
   })
 }
 
-export function useCreateManualAnalysisMutation() {
+export function useCreateAnalysisMutation() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: createManualAnalysis,
+    mutationFn: createAnalysis,
     onSettled: async (_data, _error, id) => invalidateDisputeQueries(queryClient, id),
   })
 }

@@ -14,9 +14,9 @@ use crate::config::ArbitrationMode;
 use crate::storage::{paths, read_yaml, write_yaml_atomic, FileLockGuard, StorageError};
 
 use super::types::{
-    AnalysisJob, AnalysisSource, AnalysisState, ArbitrationAnalysis, ArbitrationResolutionRecord,
-    MaintainerDisputeRecord, PendingResolutionDelivery, ResolutionEventTarget,
-    ResolutionObservation, ARBITRATION_SCHEMA_VERSION,
+    AnalysisJob, AnalysisState, ArbitrationAnalysis, ArbitrationResolutionRecord,
+    LegacyAnalysisSource, MaintainerDisputeRecord, PendingResolutionDelivery,
+    ResolutionEventTarget, ResolutionObservation, ARBITRATION_SCHEMA_VERSION,
 };
 
 #[derive(Debug, Clone)]
@@ -92,67 +92,50 @@ impl ArbitrationStore {
             .with_context(|| format!("写 Maintainer dispute 失败: {path:?}"))
     }
 
-    pub async fn read_automatic_analysis(
+    pub async fn read_current_analysis(
         &self,
         dispute_id: &DisputeId,
     ) -> anyhow::Result<Option<ArbitrationAnalysis>> {
-        read_optional_yaml(&paths::team_store_arbitration_automatic_analysis_path(
-            &self.team_root,
-            dispute_id,
-        ))
-        .await
+        let current_path =
+            paths::team_store_arbitration_current_analysis_path(&self.team_root, dispute_id);
+        if let Some(current) = read_optional_yaml(&current_path).await? {
+            return Ok(Some(normalize_legacy_adoption_mode(current, None)));
+        }
+        let automatic = read_optional_yaml(
+            &paths::team_store_arbitration_legacy_automatic_analysis_path(
+                &self.team_root,
+                dispute_id,
+            ),
+        )
+        .await?;
+        let manual = read_optional_yaml(
+            &paths::team_store_arbitration_legacy_manual_analysis_path(&self.team_root, dispute_id),
+        )
+        .await?;
+        Ok(select_legacy_current_analysis(automatic, manual))
     }
 
-    pub async fn create_automatic_analysis(
+    pub async fn create_report_analysis(
         &self,
         analysis: &ArbitrationAnalysis,
     ) -> anyhow::Result<()> {
-        if analysis.source != AnalysisSource::Automatic {
-            anyhow::bail!("automatic analysis 的 source 必须为 automatic");
-        }
         create_once_yaml(
-            &paths::team_store_arbitration_automatic_analysis_path(
+            &paths::team_store_arbitration_current_analysis_path(
                 &self.team_root,
                 &analysis.dispute_id,
             ),
             analysis,
-            "automatic analysis",
+            "current analysis",
         )
         .await
     }
 
-    pub async fn read_manual_analysis(
-        &self,
-        dispute_id: &DisputeId,
-    ) -> anyhow::Result<Option<ArbitrationAnalysis>> {
-        read_optional_yaml(&paths::team_store_arbitration_manual_analysis_path(
-            &self.team_root,
-            dispute_id,
-        ))
-        .await
-    }
-
-    #[cfg(test)]
-    pub async fn list_manual_analysis(
-        &self,
-        dispute_id: &DisputeId,
-    ) -> anyhow::Result<Vec<ArbitrationAnalysis>> {
-        Ok(self
-            .read_manual_analysis(dispute_id)
-            .await?
-            .into_iter()
-            .collect())
-    }
-
-    pub async fn create_manual_analysis(
+    pub async fn replace_current_analysis(
         &self,
         analysis: &ArbitrationAnalysis,
     ) -> anyhow::Result<()> {
-        if analysis.source != AnalysisSource::Manual {
-            anyhow::bail!("manual analysis 的 source 必须为 manual");
-        }
         write_yaml_atomic(
-            &paths::team_store_arbitration_manual_analysis_path(
+            &paths::team_store_arbitration_current_analysis_path(
                 &self.team_root,
                 &analysis.dispute_id,
             ),
@@ -163,44 +146,27 @@ impl ArbitrationStore {
     }
 
     pub async fn read_analysis(&self, job: &AnalysisJob) -> anyhow::Result<ArbitrationAnalysis> {
-        let analysis = match job.source {
-            AnalysisSource::Automatic => self
-                .read_automatic_analysis(&job.dispute_id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("未找到 automatic analysis"))?,
-            AnalysisSource::Manual => self
-                .read_manual_analysis(&job.dispute_id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("未找到 manual analysis"))?,
-        };
-        if analysis.analysis_id != job.analysis_id || analysis.source != job.source {
-            anyhow::bail!("analysis job 与持久化记录不一致");
+        let analysis = self
+            .read_current_analysis(&job.dispute_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("未找到 current analysis"))?;
+        if analysis.analysis_id != job.analysis_id {
+            anyhow::bail!("analysis job 已被新的 current analysis 替换");
         }
         Ok(analysis)
     }
 
     pub async fn is_current_analysis_job(&self, job: &AnalysisJob) -> anyhow::Result<bool> {
-        let current = match job.source {
-            AnalysisSource::Automatic => self.read_automatic_analysis(&job.dispute_id).await?,
-            AnalysisSource::Manual => self.read_manual_analysis(&job.dispute_id).await?,
-        };
-        Ok(current.is_some_and(|analysis| {
-            analysis.analysis_id == job.analysis_id && analysis.source == job.source
-        }))
+        let current = self.read_current_analysis(&job.dispute_id).await?;
+        Ok(current.is_some_and(|analysis| analysis.analysis_id == job.analysis_id))
     }
 
     pub async fn write_analysis(&self, analysis: &ArbitrationAnalysis) -> anyhow::Result<()> {
         validate_analysis(analysis)?;
-        let path = match analysis.source {
-            AnalysisSource::Automatic => paths::team_store_arbitration_automatic_analysis_path(
-                &self.team_root,
-                &analysis.dispute_id,
-            ),
-            AnalysisSource::Manual => paths::team_store_arbitration_manual_analysis_path(
-                &self.team_root,
-                &analysis.dispute_id,
-            ),
-        };
+        let path = paths::team_store_arbitration_current_analysis_path(
+            &self.team_root,
+            &analysis.dispute_id,
+        );
         write_yaml_atomic(&path, analysis)
             .await
             .with_context(|| format!("写 arbitration analysis 失败: {path:?}"))
@@ -261,36 +227,53 @@ impl ArbitrationStore {
             }
 
             let dispute_id = dispute.dispute.id;
-            let automatic_path =
-                paths::team_store_arbitration_automatic_analysis_path(&self.team_root, &dispute_id);
-            match read_optional_yaml::<ArbitrationAnalysis>(&automatic_path).await {
-                Ok(Some(analysis)) => push_recoverable_analysis(
-                    &mut jobs,
-                    analysis,
-                    &automatic_path,
-                    &dispute_id,
-                    AnalysisSource::Automatic,
-                    include_auto_approved && dispute.dispute.status == DisputeStatus::Open,
-                ),
-                Ok(None) => {}
-                Err(error) => {
-                    log_recovery_scan_error(&automatic_path, "automatic analysis YAML", &error)
+            let current_path =
+                paths::team_store_arbitration_current_analysis_path(&self.team_root, &dispute_id);
+            let current = match read_optional_yaml::<ArbitrationAnalysis>(&current_path).await {
+                Ok(Some(analysis)) => Some(normalize_legacy_adoption_mode(analysis, None)),
+                Ok(None) => {
+                    let automatic_path =
+                        paths::team_store_arbitration_legacy_automatic_analysis_path(
+                            &self.team_root,
+                            &dispute_id,
+                        );
+                    let manual_path = paths::team_store_arbitration_legacy_manual_analysis_path(
+                        &self.team_root,
+                        &dispute_id,
+                    );
+                    let automatic = match read_optional_yaml(&automatic_path).await {
+                        Ok(analysis) => analysis,
+                        Err(error) => {
+                            log_recovery_scan_error(
+                                &automatic_path,
+                                "legacy analysis YAML",
+                                &error,
+                            );
+                            None
+                        }
+                    };
+                    let manual = match read_optional_yaml(&manual_path).await {
+                        Ok(analysis) => analysis,
+                        Err(error) => {
+                            log_recovery_scan_error(&manual_path, "legacy analysis YAML", &error);
+                            None
+                        }
+                    };
+                    select_legacy_current_analysis(automatic, manual)
                 }
-            }
-
-            let manual_path =
-                paths::team_store_arbitration_manual_analysis_path(&self.team_root, &dispute_id);
-            match read_optional_yaml::<ArbitrationAnalysis>(&manual_path).await {
-                Ok(Some(analysis)) => push_recoverable_analysis(
+                Err(error) => {
+                    log_recovery_scan_error(&current_path, "current analysis YAML", &error);
+                    None
+                }
+            };
+            if let Some(analysis) = current {
+                push_recoverable_analysis(
                     &mut jobs,
                     analysis,
-                    &manual_path,
+                    &current_path,
                     &dispute_id,
-                    AnalysisSource::Manual,
-                    false,
-                ),
-                Ok(None) => {}
-                Err(error) => log_recovery_scan_error(&manual_path, "manual analysis YAML", &error),
+                    include_auto_approved && dispute.dispute.status == DisputeStatus::Open,
+                );
             }
         }
         jobs.sort();
@@ -588,24 +571,22 @@ fn push_recoverable_analysis(
     analysis: ArbitrationAnalysis,
     path: &Path,
     dispute_id: &DisputeId,
-    expected_source: AnalysisSource,
     include_auto_approved: bool,
 ) {
     if let Err(error) = validate_analysis(&analysis) {
         log_recovery_scan_error(path, "analysis 记录", &error);
         return;
     }
-    if analysis.dispute_id != *dispute_id || analysis.source != expected_source {
+    if analysis.dispute_id != *dispute_id {
         log_recovery_scan_error(
             path,
             "analysis 记录",
-            &anyhow::anyhow!("analysis 与所在 Dispute/source 不一致"),
+            &anyhow::anyhow!("analysis 与所在 Dispute 不一致"),
         );
         return;
     }
     let recoverable = analysis.state.is_recoverable()
         || (include_auto_approved
-            && expected_source == AnalysisSource::Automatic
             && analysis.state == AnalysisState::Approved
             && analysis.mode == ArbitrationMode::Auto
             && analysis.adoption_blocked_reason.is_none());
@@ -613,9 +594,63 @@ fn push_recoverable_analysis(
         jobs.push(AnalysisJob {
             dispute_id: dispute_id.clone(),
             analysis_id: analysis.analysis_id,
-            source: expected_source,
         });
     }
+}
+
+fn select_legacy_current_analysis(
+    automatic: Option<ArbitrationAnalysis>,
+    manual: Option<ArbitrationAnalysis>,
+) -> Option<ArbitrationAnalysis> {
+    let automatic = automatic.map(|analysis| {
+        normalize_legacy_adoption_mode(analysis, Some(LegacyAnalysisSource::Automatic))
+    });
+    let manual = manual.map(|analysis| {
+        normalize_legacy_adoption_mode(analysis, Some(LegacyAnalysisSource::Manual))
+    });
+    match (automatic, manual) {
+        (None, None) => None,
+        (Some(analysis), None) | (None, Some(analysis)) => Some(analysis),
+        (Some(automatic), Some(manual)) => {
+            match (
+                automatic.state == AnalysisState::Adopting,
+                manual.state == AnalysisState::Adopting,
+            ) {
+                (true, false) => Some(automatic),
+                (false, true) => Some(manual),
+                _ => Some(
+                    if (&manual.created_at, &manual.updated_at, &manual.analysis_id)
+                        > (
+                            &automatic.created_at,
+                            &automatic.updated_at,
+                            &automatic.analysis_id,
+                        )
+                    {
+                        manual
+                    } else {
+                        automatic
+                    },
+                ),
+            }
+        }
+    }
+}
+
+fn normalize_legacy_adoption_mode(
+    mut analysis: ArbitrationAnalysis,
+    source_hint: Option<LegacyAnalysisSource>,
+) -> ArbitrationAnalysis {
+    // 历史 manual 记录可能在 auto 配置下创建。把“必须显式采用”折叠进仍会持久化的
+    // mode，避免 source 兼容字段在下一次写入时省略后改变采用语义。
+    let is_manual = analysis.legacy_source == LegacyAnalysisSource::Manual
+        || source_hint == Some(LegacyAnalysisSource::Manual);
+    if is_manual {
+        analysis.legacy_source = LegacyAnalysisSource::Manual;
+        analysis.mode = ArbitrationMode::Manual;
+    } else if let Some(source) = source_hint {
+        analysis.legacy_source = source;
+    }
+    analysis
 }
 
 fn is_yaml_data_path(path: &Path) -> bool {
@@ -663,8 +698,8 @@ fn validate_analysis(analysis: &ArbitrationAnalysis) -> anyhow::Result<()> {
         anyhow::bail!("analysis_round 必须在 1..=3");
     }
     if let Some(snapshot) = analysis.report_snapshot.as_ref() {
-        if analysis.source != AnalysisSource::Automatic || snapshot.id != analysis.dispute_id {
-            anyhow::bail!("analysis report snapshot 与 automatic dispute 不一致");
+        if snapshot.id != analysis.dispute_id {
+            anyhow::bail!("analysis report snapshot 与 dispute 不一致");
         }
     }
     Ok(())
@@ -743,6 +778,7 @@ async fn list_yaml<T: DeserializeOwned>(dir: &Path) -> anyhow::Result<Vec<T>> {
 mod tests {
     use super::*;
     use crate::claim::{AgentId, Dispute, DisputeStatus};
+    use crate::maintainer::arbitration::types::LegacyAnalysisSource;
     use crate::maintainer::arbitration::ArbitrationAnalysisId;
 
     fn dispute() -> MaintainerDisputeRecord {
@@ -760,7 +796,7 @@ mod tests {
 
     fn analysis(
         dispute_id: &DisputeId,
-        source: AnalysisSource,
+        source: LegacyAnalysisSource,
         state: AnalysisState,
         mode: ArbitrationMode,
     ) -> ArbitrationAnalysis {
@@ -769,7 +805,7 @@ mod tests {
             schema_version: ARBITRATION_SCHEMA_VERSION,
             analysis_id: ArbitrationAnalysisId::random(),
             dispute_id: dispute_id.clone(),
-            source,
+            legacy_source: source,
             report_snapshot: None,
             created_at: now,
             updated_at: now,
@@ -811,6 +847,95 @@ mod tests {
         );
     }
 
+    #[test]
+    fn current_analysis_omits_legacy_source_but_reads_old_yaml() {
+        let record = dispute();
+        let current = analysis(
+            &record.dispute.id,
+            LegacyAnalysisSource::Automatic,
+            AnalysisState::Pending,
+            ArbitrationMode::Shadow,
+        );
+        let yaml = serde_yaml_ng::to_string(&current).unwrap();
+        assert!(!yaml.lines().any(|line| line.starts_with("source:")));
+
+        let legacy_yaml = format!("source: manual\n{yaml}");
+        let decoded: ArbitrationAnalysis = serde_yaml_ng::from_str(&legacy_yaml).unwrap();
+        assert_eq!(decoded.legacy_source, LegacyAnalysisSource::Manual);
+        assert!(!serde_yaml_ng::to_string(&decoded)
+            .unwrap()
+            .lines()
+            .any(|line| line.starts_with("source:")));
+    }
+
+    #[tokio::test]
+    async fn legacy_manual_approved_analysis_keeps_explicit_adoption_after_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ArbitrationStore::new(root.path().to_path_buf());
+        let record = dispute();
+        store.write_dispute(&record).await.unwrap();
+        let manual = analysis(
+            &record.dispute.id,
+            LegacyAnalysisSource::Manual,
+            AnalysisState::Approved,
+            ArbitrationMode::Auto,
+        );
+        let path = paths::team_store_arbitration_legacy_manual_analysis_path(
+            store.team_root(),
+            &record.dispute.id,
+        );
+        write_yaml_atomic(&path, &manual).await.unwrap();
+
+        let normalized = store
+            .read_current_analysis(&record.dispute.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(normalized.mode, ArbitrationMode::Manual);
+        assert!(store.recoverable_jobs(true).await.unwrap().is_empty());
+
+        store.write_analysis(&normalized).await.unwrap();
+        let restarted = ArbitrationStore::new(root.path().to_path_buf())
+            .read_current_analysis(&record.dispute.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restarted.mode, ArbitrationMode::Manual);
+    }
+
+    #[tokio::test]
+    async fn legacy_manual_pending_analysis_recovers_only_as_read_only() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ArbitrationStore::new(root.path().to_path_buf());
+        let record = dispute();
+        store.write_dispute(&record).await.unwrap();
+        let manual = analysis(
+            &record.dispute.id,
+            LegacyAnalysisSource::Manual,
+            AnalysisState::Pending,
+            ArbitrationMode::Auto,
+        );
+        let path = paths::team_store_arbitration_legacy_manual_analysis_path(
+            store.team_root(),
+            &record.dispute.id,
+        );
+        write_yaml_atomic(&path, &manual).await.unwrap();
+
+        let normalized = store
+            .read_current_analysis(&record.dispute.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(normalized.mode, ArbitrationMode::Manual);
+        assert_eq!(
+            store.recoverable_jobs(true).await.unwrap(),
+            vec![AnalysisJob {
+                dispute_id: record.dispute.id,
+                analysis_id: manual.analysis_id,
+            }]
+        );
+    }
+
     #[tokio::test]
     async fn semantic_input_revision_starts_at_zero_and_increments_under_lock() {
         let root = tempfile::tempdir().unwrap();
@@ -835,14 +960,11 @@ mod tests {
         store.write_dispute(&valid).await.unwrap();
         let valid_analysis = analysis(
             &valid.dispute.id,
-            AnalysisSource::Automatic,
+            LegacyAnalysisSource::Automatic,
             AnalysisState::Pending,
             ArbitrationMode::Shadow,
         );
-        store
-            .create_automatic_analysis(&valid_analysis)
-            .await
-            .unwrap();
+        store.create_report_analysis(&valid_analysis).await.unwrap();
 
         let empty_open = dispute();
         store.write_dispute(&empty_open).await.unwrap();
@@ -853,29 +975,28 @@ mod tests {
             .unwrap();
         let orphan = analysis(
             &corrupt.dispute.id,
-            AnalysisSource::Automatic,
+            LegacyAnalysisSource::Automatic,
             AnalysisState::Pending,
             ArbitrationMode::Auto,
         );
-        store.create_automatic_analysis(&orphan).await.unwrap();
+        store.create_report_analysis(&orphan).await.unwrap();
 
         assert_eq!(
             store.recoverable_jobs(true).await.unwrap(),
             vec![AnalysisJob {
                 dispute_id: valid.dispute.id,
                 analysis_id: valid_analysis.analysis_id,
-                source: AnalysisSource::Automatic,
             }]
         );
         assert!(store
-            .read_automatic_analysis(&empty_open.dispute.id)
+            .read_current_analysis(&empty_open.dispute.id)
             .await
             .unwrap()
             .is_none());
     }
 
     #[tokio::test]
-    async fn recovery_scan_isolates_corrupt_manual_and_filters_auto_approved_by_mode() {
+    async fn recovery_scan_selects_one_legacy_current_analysis_and_isolates_corruption() {
         let root = tempfile::tempdir().unwrap();
         let store = ArbitrationStore::new(root.path().to_path_buf());
         let record = dispute();
@@ -883,21 +1004,33 @@ mod tests {
 
         let automatic = analysis(
             &record.dispute.id,
-            AnalysisSource::Automatic,
+            LegacyAnalysisSource::Automatic,
             AnalysisState::Approved,
             ArbitrationMode::Auto,
         );
-        store.create_automatic_analysis(&automatic).await.unwrap();
-        let manual = analysis(
+        let automatic_path = paths::team_store_arbitration_legacy_automatic_analysis_path(
+            store.team_root(),
             &record.dispute.id,
-            AnalysisSource::Manual,
+        );
+        write_yaml_atomic(&automatic_path, &automatic)
+            .await
+            .unwrap();
+        let mut manual = analysis(
+            &record.dispute.id,
+            LegacyAnalysisSource::Manual,
             AnalysisState::WaitingContext,
             ArbitrationMode::Shadow,
         );
-        store.create_manual_analysis(&manual).await.unwrap();
+        manual.created_at = "2026-08-01T00:00:01Z".parse().unwrap();
+        manual.updated_at = manual.created_at;
+        let manual_path = paths::team_store_arbitration_legacy_manual_analysis_path(
+            store.team_root(),
+            &record.dispute.id,
+        );
+        write_yaml_atomic(&manual_path, &manual).await.unwrap();
         let corrupt_record = dispute();
         store.write_dispute(&corrupt_record).await.unwrap();
-        let corrupt_manual_path = paths::team_store_arbitration_manual_analysis_path(
+        let corrupt_manual_path = paths::team_store_arbitration_legacy_manual_analysis_path(
             store.team_root(),
             &corrupt_record.dispute.id,
         );
@@ -913,23 +1046,15 @@ mod tests {
             vec![AnalysisJob {
                 dispute_id: record.dispute.id.clone(),
                 analysis_id: manual.analysis_id.clone(),
-                source: AnalysisSource::Manual,
             }]
         );
 
-        let mut expected = vec![
-            AnalysisJob {
-                dispute_id: record.dispute.id.clone(),
-                analysis_id: automatic.analysis_id,
-                source: AnalysisSource::Automatic,
-            },
-            AnalysisJob {
+        assert_eq!(
+            store.recoverable_jobs(true).await.unwrap(),
+            vec![AnalysisJob {
                 dispute_id: record.dispute.id,
                 analysis_id: manual.analysis_id,
-                source: AnalysisSource::Manual,
-            },
-        ];
-        expected.sort();
-        assert_eq!(store.recoverable_jobs(true).await.unwrap(), expected);
+            }]
+        );
     }
 }

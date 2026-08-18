@@ -194,8 +194,7 @@ const ENDPOINT_GROUPS: EndpointGroup[] = [
         summary: '查询单个 dispute',
         response: `DisputeDetail {
   ...MaintainerDisputeRecord,
-  automatic_analysis?: ArbitrationAnalysisSummary,
-  manual_analysis?: ArbitrationAnalysisSummary,
+  current_analysis?: ArbitrationAnalysisSummary,
   holder_adoption?: HolderAdoptionView
 }`,
         caller: 'workbench Disputes Drawer',
@@ -203,14 +202,14 @@ const ENDPOINT_GROUPS: EndpointGroup[] = [
       {
         method: 'GET',
         path: '/api/disputes/{id}/analyses',
-        summary: '查询唯一 Automatic Analysis 与当前 Manual Analysis',
-        response: '{ automatic_analysis?, manual_analysis? }',
+        summary: '查询当前 Analysis',
+        response: '{ current_analysis? }',
         caller: 'workbench Disputes Drawer',
       },
       {
         method: 'POST',
         path: '/api/disputes/{id}/analyses',
-        summary: '显式运行只分析、不行动的 Manual Analysis，并覆盖旧结果',
+        summary: '显式运行 Analysis，并覆盖当前结果',
         response: '202 Accepted + ArbitrationAnalysisSummary',
         caller: 'workbench Disputes Analyze',
       },
@@ -231,7 +230,7 @@ const ENDPOINT_GROUPS: EndpointGroup[] = [
       {
         method: 'POST',
         path: '/disputes/report',
-        summary: 'agent 上报 dispute；shadow/auto 建立 Automatic Analysis，manual 只保存 dispute',
+        summary: 'agent 上报 dispute；shadow/auto 建立 Current Analysis，manual 只保存 dispute',
         body: `{
   auth: { agent_id: string, acn_key: string },
   data: Dispute {

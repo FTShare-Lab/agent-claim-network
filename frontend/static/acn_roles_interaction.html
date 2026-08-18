@@ -3410,7 +3410,7 @@ Ctrl+O      光标位于附件时预览当前输入框和队列里的附件</cod
               </button>
               <button id="tab-workbench-disputes" type="button" role="tab" aria-selected="false" aria-controls="workbench-detail" tabindex="-1" data-workbench="disputes">
                 <strong>Disputes</strong>
-                <span>查看 open/resolved 冲突与 direct Claims，审阅 Automatic / Manual Analysis，显式 Adopt 或人工 Resolve。</span>
+                <span>查看 open/resolved 冲突与 direct Claims，审阅 Current Analysis，显式 Adopt 或人工 Resolve。</span>
               </button>
               <button id="tab-workbench-team-auth" type="button" role="tab" aria-selected="false" aria-controls="workbench-detail" tabindex="-1" data-workbench="team_auth">
                 <strong>Team Auth</strong>
@@ -3918,10 +3918,10 @@ evidence_summary: Synthesized from practical experience with DSL tools…</pre>
       },
       disputes: {
         title: "Disputes 页面：处理冲突而不是抹平冲突",
-        body: "管理员可以在 Disputes 页面查看 open/resolved dispute 与 direct Claims，审阅可选的 Automatic Analysis 和显式创建的 Manual Analysis。manual 模式下上报只保存 Dispute；管理员可 Analyze 后 Adopt approved 结果，也可直接 Human Resolve。两条路径都保留原始 summary，只增量写入 resolution，并通过结构化通知让 holder Agent 自主内化。",
+        body: "管理员可以在 Disputes 页面查看 open/resolved dispute、direct Claims 与可选的 Current Analysis。manual 模式下上报只保存 Dispute；管理员可 Analyze 后 Adopt approved 结果，也可直接 Human Resolve。每次 Analyze 都会替换 Current Analysis。两条路径都保留原始 summary，只增量写入 resolution，并通过结构化通知让 holder Agent 自主内化。",
         boxes: [
-          ["可见内容", "dispute、direct Claims、当前 resolution、Automatic / Manual Analysis 与 holder adoption。"],
-          ["典型动作", "运行 Manual Analysis、采用 approved Analysis、人工 Resolve，或驳回并替换 automatic Resolution。"],
+          ["可见内容", "dispute、direct Claims、Current Analysis、当前 resolution 与 holder adoption。"],
+          ["典型动作", "运行 Analysis、采用 approved Analysis、人工 Resolve，或驳回并替换 automatic Resolution。"],
           ["边界", "Analysis 只是分析结果；Adopt / Resolve 才形成 Resolution。Maintainer 不直接改写 holder Claim 或私有 Memory。"],
           ["相关页面", '<a href="../app/">Maintainer 管理台</a>']
         ]
@@ -4006,7 +4006,7 @@ created_at: 2026-04-28T05:34:22Z`
         bullets: [
           "Dispute.claims 至少列出两条不同 direct Claim，不能自我引用。",
           "open dispute 提醒候选 claim 存在争议，但不阻塞工作。",
-          "Automatic / Manual Analysis 只保存模型分析；Adopt 或 Human Resolve 才写入 Resolution 并关闭 Dispute。",
+          "Current Analysis 只保存模型分析；Adopt 或 Human Resolve 才写入 Resolution 并关闭 Dispute。",
           "新 resolution 保留原始 summary，并可通过结构化 ClaimAttributeUpdate 让 holder Agent 自主内化。",
           "单人模式不报告 Dispute，也不维护以后补传的队列。"
         ],

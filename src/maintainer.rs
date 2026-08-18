@@ -439,7 +439,11 @@ impl Maintainer {
         match store.read_dispute(&dispute.id).await {
             Ok(existing) => {
                 if !same_report_payload(&existing.dispute, dispute) {
-                    anyhow::bail!("dispute id={} 已存在但原始字段不同", dispute.id);
+                    return Err(arbitration::AnalysisConflict(format!(
+                        "dispute id={} 已存在但原始字段不同",
+                        dispute.id
+                    ))
+                    .into());
                 }
                 return Ok(());
             }

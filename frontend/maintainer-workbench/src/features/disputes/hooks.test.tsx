@@ -22,7 +22,7 @@ import type {
 
 vi.mock('./api', () => ({
   adoptAnalysis: vi.fn(),
-  createManualAnalysis: vi.fn(),
+  createAnalysis: vi.fn(),
   getAnalysis: vi.fn(),
   getDispute: vi.fn(),
   listAnalyses: vi.fn(),
@@ -38,7 +38,6 @@ const createdAt = '2026-08-10T08:00:00Z'
 function analysis(state: AnalysisState): ArbitrationAnalysisSummary {
   return {
     analysis_id: analysisId,
-    source: 'automatic',
     state,
     created_at: createdAt,
     updated_at: createdAt,
@@ -116,17 +115,17 @@ describe('dispute analysis queries', () => {
     })
   })
 
-  it('polls the unique automatic analysis and refreshes dependent views after progress', async () => {
+  it('polls the current analysis and refreshes dependent views after progress', async () => {
     vi.mocked(disputeApi.listAnalyses)
-      .mockResolvedValueOnce({ automatic_analysis: analysis('proposing') })
-      .mockResolvedValue({ automatic_analysis: analysis('approved') })
+      .mockResolvedValueOnce({ current_analysis: analysis('proposing') })
+      .mockResolvedValue({ current_analysis: analysis('approved') })
     const queryClient = createQueryClient()
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
     const { result } = renderHook(() => useAnalysesQuery(disputeId), { wrapper: wrapper(queryClient) })
 
-    await waitFor(() => expect(result.current.data?.automatic_analysis?.state).toBe('proposing'))
+    await waitFor(() => expect(result.current.data?.current_analysis?.state).toBe('proposing'))
     await act(async () => { await result.current.refetch() })
-    await waitFor(() => expect(result.current.data?.automatic_analysis?.state).toBe('approved'))
+    await waitFor(() => expect(result.current.data?.current_analysis?.state).toBe('approved'))
 
     for (const queryKey of [
       ['disputes'],

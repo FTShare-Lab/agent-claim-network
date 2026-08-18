@@ -334,11 +334,11 @@ background-shell 其余时序、容量和 PTY 参数是 `config.rs` 内部默认
 ### `[maintainer.arbitration]`
 
 - `enabled`：是否启用分析服务。默认 `false`；关闭时 Analyze/Adopt 返回不可用，人工 Resolve、Resolution 投递恢复，以及关闭前已经固定的采用意图恢复仍可用，恢复过程不调用 LLM。
-- `mode`：`manual` 在上报时只保存 Dispute，由管理者显式 Analyze 后决定 Adopt 或直接 Human Resolve；`shadow` 为新 Dispute 创建唯一 Automatic Analysis但不自动采用；`auto` 创建并在通过验证后自动采用。默认 `shadow`。三种启用模式下，管理者都可对 approved Analysis 显式 Adopt。
+- `mode`：`manual` 在上报时只保存 Dispute，由管理者显式 Analyze 后决定 Adopt 或直接 Human Resolve；`shadow` 为新 Dispute 创建 Current Analysis但不自动采用；`auto` 创建并在通过验证后自动采用。默认 `shadow`。每个 Dispute 只保存一个 Current Analysis；显式 Analyze 会替换它，新记录遵循当前模式的采用行为。
 - `confidence_threshold`：proposal 和 verification 都必须达到的置信度，范围 `[0, 1]`，默认 `0.90`。
 - `max_source_claims`：直接 Claim 的 source graph 广度优先加载上限，默认 `20`。该上限不作用于 Router 返回的补充候选或治理 Policy。
 
-Analysis 由有界、单 consumer 的持久事件队列驱动。`auto` 的 Automatic Analysis 在采用前检测到输入变化时，依次写入 5 分钟和 15 分钟的持久延迟并在同一记录内重分析，最多三轮。daemon 恢复已持久化的执行态、延迟重分析和 adopting 状态；`manual` 上报的 Dispute 不补建 Automatic Analysis，`shadow` 结果也不会因配置切换而自动采用。
+Analysis 由有界、单 consumer 的持久事件队列驱动。创建于 `auto` 且当前配置仍为 `auto` 的 Current Analysis 在采用前检测到输入变化时，依次写入 5 分钟和 15 分钟的持久延迟并在同一记录内重分析，最多三轮。切换到其他模式会暂停尚未固定 intent 的自动采用；已持久化的等待轮次仍按原时间恢复，重新启用 `auto` 后可继续采用。daemon 恢复已持久化的执行态、延迟重分析和 adopting 状态；`manual` 上报的 Dispute 不补建 Analysis，`shadow` 结果也不会因配置切换而自动采用。
 
 Resolution 由独立有界事件队列完成提交与可选 holder 投递。固定 Resolution intent 会先写入 pending commit/delivery；失败时退避，启动时只恢复这些持久任务。即使无需通知 holder，也沿用同一提交恢复边界。ACK、相关 Claim 上传与 Resolution 切换定向触发 holder observation。
 

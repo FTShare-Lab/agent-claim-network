@@ -1,4 +1,4 @@
-//! automatic、人工采用、人工 Resolve 与 reject-and-replace 的统一提交边界。
+//! Analysis 采用、人工 Resolve 与 reject-and-replace 的统一提交边界。
 
 use std::collections::BTreeSet;
 use std::io::ErrorKind;
@@ -663,41 +663,20 @@ impl ResolutionService {
         &self,
         dispute_id: &DisputeId,
     ) -> anyhow::Result<Option<AnalysisJob>> {
-        let mut analyses = Vec::new();
-        if let Some(automatic) = self.store.read_automatic_analysis(dispute_id).await? {
-            analyses.push(automatic);
+        let Some(analysis) = self.store.read_current_analysis(dispute_id).await? else {
+            return Ok(None);
+        };
+        if analysis.state != AnalysisState::Adopting {
+            return Ok(None);
         }
-        if let Some(manual) = self.store.read_manual_analysis(dispute_id).await? {
-            analyses.push(manual);
-        }
-
-        let mut owner: Option<AnalysisJob> = None;
-        for analysis in analyses
-            .into_iter()
-            .filter(|analysis| analysis.state == AnalysisState::Adopting)
-        {
-            let candidate = AnalysisJob {
-                dispute_id: dispute_id.clone(),
-                analysis_id: analysis.analysis_id.clone(),
-                source: analysis.source,
-            };
-            let record = self
-                .fixed_analysis_resolution(&candidate, &analysis)
-                .await?;
-            if record.resolution.resolved_by != ResolvedBy::Human {
-                continue;
-            }
-            if let Some(existing) = owner.as_ref() {
-                anyhow::bail!(
-                    "dispute={} 存在多个 human adoption owner: {}, {}",
-                    dispute_id,
-                    existing.analysis_id,
-                    candidate.analysis_id
-                );
-            }
-            owner = Some(candidate);
-        }
-        Ok(owner)
+        let candidate = AnalysisJob {
+            dispute_id: dispute_id.clone(),
+            analysis_id: analysis.analysis_id.clone(),
+        };
+        let record = self
+            .fixed_analysis_resolution(&candidate, &analysis)
+            .await?;
+        Ok((record.resolution.resolved_by == ResolvedBy::Human).then_some(candidate))
     }
 
     async fn fixed_analysis_resolution(
@@ -993,17 +972,12 @@ impl ResolutionService {
         let Some(source_id) = record.analysis_source_id.as_ref() else {
             return Ok(());
         };
-        let mut analysis = match self
-            .store
-            .read_automatic_analysis(&target.dispute_id)
-            .await?
-        {
-            Some(analysis) if analysis.analysis_id == *source_id => analysis,
-            _ => match self.store.read_manual_analysis(&target.dispute_id).await? {
-                Some(analysis) if analysis.analysis_id == *source_id => analysis,
-                _ => return Ok(()),
-            },
+        let Some(mut analysis) = self.store.read_current_analysis(&target.dispute_id).await? else {
+            return Ok(());
         };
+        if analysis.analysis_id != *source_id {
+            return Ok(());
+        }
         if analysis.state != AnalysisState::Adopting {
             return Ok(());
         }

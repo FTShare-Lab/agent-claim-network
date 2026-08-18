@@ -552,12 +552,48 @@ mod tests {
         }
         assert!(prompt.contains("不读取 Memory、USER、session transcript 或工具上下文"));
         assert!(prompt.contains("全部非 deprecated 本地 Claims"));
+        assert!(prompt.contains("当前 Agent 持有的任意 status 的 direct Claims"));
         assert!(prompt.contains("全部 direct Claim 冻结快照"));
         assert!(prompt.contains("只能更新 `local_claims`"));
+        assert!(prompt.contains("仍可见、可修改并可恢复"));
         assert!(prompt.contains("非直接 deprecated Claim 不可见"));
         assert!(prompt.contains("仅仅选择不采纳 Resolution"));
         assert!(prompt.contains("新的实质证据"));
         assert!(prompt.contains("语义输入完全相同，不要重复创建"));
+    }
+
+    #[test]
+    fn repository_arbitration_prompts_prefer_minimal_knowledge_changes() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let reg = PromptRegistry::new(&root).unwrap();
+        let prompt_context = minijinja::context! { confidence_threshold => 0.90 };
+        let proposal = reg
+            .render("maintainer_arbitration_proposal", &prompt_context)
+            .unwrap();
+        let verification = reg
+            .render("maintainer_arbitration_verification", &prompt_context)
+            .unwrap();
+        let inbox = reg
+            .render("inbox_claim_attribute_update_internalize", ())
+            .unwrap();
+
+        for prompt in [&proposal, &verification] {
+            assert!(prompt.contains("最小知识变更"));
+            assert!(prompt.contains("`coexist`"));
+            assert!(prompt.contains("`lifecycle_update`"));
+            assert!(prompt.contains("`conflict_resolved`"));
+            assert!(prompt.contains("`unresolved`"));
+            assert!(prompt.contains("原地更新"));
+            assert!(prompt.contains("创建重复 Claim"));
+        }
+        assert!(proposal.contains("不指示创建新 Claim"));
+        assert!(verification.contains("不能假设 Maintainer 看到了 holder 的完整本地知识"));
+        assert!(inbox.contains("以下最小知识变更顺序"));
+        assert!(inbox.contains("已有另一条等价、正确且非 deprecated 的本地 Claim"));
+        assert!(inbox.contains("不要创建重复 Claim"));
+        assert!(inbox.contains("优先原地更新这个 direct Claim"));
+        assert!(inbox.contains("独立、可复用知识单元时，才创建新 Claim"));
+        assert!(inbox.contains("可以不产生任何 Claim 变更"));
     }
 
     #[test]

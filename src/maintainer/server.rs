@@ -246,7 +246,7 @@ pub(crate) fn build_app() -> AxumRouter<AppState> {
         .route("/api/disputes/{id}", get(api::get_dispute))
         .route(
             "/api/disputes/{id}/analyses",
-            get(api::list_dispute_analyses).post(api::create_manual_analysis),
+            get(api::list_dispute_analyses).post(api::create_analysis),
         )
         .route(
             "/api/disputes/{id}/analyses/{analysis_id}",
@@ -521,7 +521,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_analysis_route_is_admin_guarded_and_reports_disabled() {
+    async fn analysis_route_is_admin_guarded_and_reports_disabled() {
         let team = tempfile::tempdir().unwrap();
         let (state, _maintainer) = admin_auth_state(&team);
         let app = build_app()

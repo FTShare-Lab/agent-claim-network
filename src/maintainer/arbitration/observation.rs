@@ -96,11 +96,29 @@ impl ObservationService {
             }
         }
         holders.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
-        if let Some(previous) = previous
-            .as_ref()
-            .filter(|previous| previous.observed_at > observed_at)
-        {
-            return Ok(previous.clone());
+        if let Some(previous) = previous.as_ref() {
+            if previous.observed_at > observed_at {
+                return Ok(previous.clone());
+            }
+            for holder in &mut holders {
+                if let Some(existing) = previous.holders.iter().find(|existing| {
+                    existing.agent_id == holder.agent_id
+                        && existing.state == holder.state
+                        && existing.reasons == holder.reasons
+                        && existing.delivery_observed == holder.delivery_observed
+                        && existing.delivered_at == holder.delivered_at
+                        && existing.assessment_count == holder.assessment_count
+                        && existing.matched_count == holder.matched_count
+                        && existing.claims == holder.claims
+                }) {
+                    holder.last_observed_at = existing.last_observed_at;
+                }
+            }
+            let mut previous_holders = previous.holders.clone();
+            previous_holders.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+            if previous_holders == holders {
+                return Ok(previous.clone());
+            }
         }
         let observation = ResolutionObservation {
             resolution_id: record.resolution_id.clone(),
@@ -471,7 +489,7 @@ holders:
     }
 
     #[tokio::test]
-    async fn refresh_audits_only_observation_state_changes() {
+    async fn unchanged_refresh_preserves_observation_time_and_audits_only_state_changes() {
         let root = tempfile::tempdir().unwrap();
         let holder = AgentId::new("agent-a").unwrap();
         let policy_id = PolicyId::random();
@@ -588,10 +606,18 @@ holders:
             .refresh(&record, "2026-08-03T00:00:00Z".parse().unwrap())
             .await
             .unwrap();
-        service
+        let unchanged = service
             .refresh(&record, "2026-08-03T01:00:00Z".parse().unwrap())
             .await
             .unwrap();
+        assert_eq!(unchanged, first);
+        assert_eq!(
+            store
+                .read_observation(&record.dispute_id, &record.resolution_id)
+                .await
+                .unwrap(),
+            Some(first.clone())
+        );
         assert_eq!(first.holders[0].state, ObservationState::ObservedConverged);
         assert_eq!(
             history

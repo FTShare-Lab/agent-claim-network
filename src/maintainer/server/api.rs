@@ -18,7 +18,7 @@ use crate::claim::{
 };
 use crate::maintainer::arbitration::{
     is_analysis_conflict, is_analysis_retry, AnalysisError, AnalysisJob, AnalysisPhase,
-    AnalysisSource, AnalysisState, ArbitrationAnalysis, ArbitrationAnalysisId, ArbitrationProposal,
+    AnalysisState, ArbitrationAnalysis, ArbitrationAnalysisId, ArbitrationProposal,
     ArbitrationResolutionRecord, ArbitrationStore, ArbitrationVerification, ClaimObservation,
     FrozenArbitrationContext, HumanResolutionInput, MaintainerDisputeRecord, ObservationService,
     ObservationState, RejectResolutionInput, ResolutionObservation, ResolutionService,
@@ -102,7 +102,6 @@ pub struct RejectResolutionRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct ArbitrationAnalysisSummary {
     pub analysis_id: ArbitrationAnalysisId,
-    pub source: AnalysisSource,
     pub state: AnalysisState,
     pub phase: Option<AnalysisPhase>,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -156,7 +155,6 @@ impl ArbitrationAnalysisSummary {
         };
         Self {
             analysis_id: analysis.analysis_id.clone(),
-            source: analysis.source,
             state: analysis.state,
             phase: analysis.lease.as_ref().map(|lease| lease.phase),
             created_at: analysis.created_at,
@@ -185,8 +183,7 @@ pub struct DisputeListItem {
 pub struct DisputeDetail {
     #[serde(flatten)]
     pub record: MaintainerDisputeRecord,
-    pub automatic_analysis: Option<ArbitrationAnalysisSummary>,
-    pub manual_analysis: Option<ArbitrationAnalysisSummary>,
+    pub current_analysis: Option<ArbitrationAnalysisSummary>,
     pub holder_adoption: Option<HolderAdoptionView>,
 }
 
@@ -198,13 +195,12 @@ pub struct ArbitrationAnalysisDetail {
     pub verification: Option<ArbitrationVerification>,
     pub warnings: Vec<crate::maintainer::arbitration::ContextWarning>,
     pub validation_result: String,
-    pub rounds: Vec<crate::maintainer::arbitration::AutomaticAnalysisRound>,
+    pub rounds: Vec<crate::maintainer::arbitration::AnalysisRound>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ArbitrationAnalysesResponse {
-    pub automatic_analysis: Option<ArbitrationAnalysisSummary>,
-    pub manual_analysis: Option<ArbitrationAnalysisSummary>,
+    pub current_analysis: Option<ArbitrationAnalysisSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -461,12 +457,8 @@ pub async fn get_dispute(
         .read_dispute(&dispute_id)
         .await
         .map_err(|error| arbitration_read_error(error, &format!("未找到 dispute: {id}")))?;
-    let automatic_analysis = store
-        .read_automatic_analysis(&dispute_id)
-        .await
-        .map_err(internal_error)?;
-    let manual_analysis = store
-        .read_manual_analysis(&dispute_id)
+    let current_analysis = store
+        .read_current_analysis(&dispute_id)
         .await
         .map_err(internal_error)?;
     let current_resolution = match record.resolution.as_ref() {
@@ -491,14 +483,7 @@ pub async fn get_dispute(
         None
     };
     Ok(Json(DisputeDetail {
-        automatic_analysis: automatic_analysis.as_ref().map(|analysis| {
-            ArbitrationAnalysisSummary::from_analysis(
-                analysis,
-                &record,
-                state.arbitration.is_some(),
-            )
-        }),
-        manual_analysis: manual_analysis.as_ref().map(|analysis| {
+        current_analysis: current_analysis.as_ref().map(|analysis| {
             ArbitrationAnalysisSummary::from_analysis(
                 analysis,
                 &record,
@@ -520,8 +505,8 @@ pub async fn list_dispute_analyses(
         .read_dispute(&dispute_id)
         .await
         .map_err(|error| arbitration_read_error(error, "未找到 dispute"))?;
-    let automatic_analysis = store
-        .read_automatic_analysis(&dispute_id)
+    let current_analysis = store
+        .read_current_analysis(&dispute_id)
         .await
         .map_err(internal_error)?
         .as_ref()
@@ -532,22 +517,7 @@ pub async fn list_dispute_analyses(
                 state.arbitration.is_some(),
             )
         });
-    let manual_analysis = store
-        .read_manual_analysis(&dispute_id)
-        .await
-        .map_err(internal_error)?
-        .as_ref()
-        .map(|analysis| {
-            ArbitrationAnalysisSummary::from_analysis(
-                analysis,
-                &dispute,
-                state.arbitration.is_some(),
-            )
-        });
-    Ok(Json(ArbitrationAnalysesResponse {
-        automatic_analysis,
-        manual_analysis,
-    }))
+    Ok(Json(ArbitrationAnalysesResponse { current_analysis }))
 }
 
 pub async fn get_dispute_analysis(
@@ -591,20 +561,11 @@ async fn read_analysis_by_id(
     dispute_id: &DisputeId,
     analysis_id: &ArbitrationAnalysisId,
 ) -> Result<ArbitrationAnalysis, (StatusCode, String)> {
-    if let Some(automatic) = store
-        .read_automatic_analysis(dispute_id)
-        .await
-        .map_err(internal_error)?
-    {
-        if automatic.analysis_id == *analysis_id {
-            return Ok(automatic);
-        }
-    }
-    let manual = store
-        .read_manual_analysis(dispute_id)
+    let current = store
+        .read_current_analysis(dispute_id)
         .await
         .map_err(internal_error)?;
-    manual
+    current
         .filter(|analysis| analysis.analysis_id == *analysis_id)
         .ok_or_else(|| {
             (
@@ -722,7 +683,7 @@ fn holder_claim_adoption_view(
     }
 }
 
-pub async fn create_manual_analysis(
+pub async fn create_analysis(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<ArbitrationAnalysisSummary>), (StatusCode, String)> {
@@ -739,26 +700,25 @@ pub async fn create_manual_analysis(
             "maintainer arbitration scheduler is unavailable".to_string(),
         )
     })?;
-    // Manual Analysis 先落盘、后入有界队列。请求若恰在两步之间被取消，Drop
+    // Current Analysis 先落盘、后入有界队列。请求若恰在两步之间被取消，Drop
     // 只能同步唤醒持久恢复扫描，不能 await enqueue。
     let mut recovery_wake = AnalysisRecoveryWakeGuard::new(Some(scheduler));
     let analysis = service
-        .create_manual_analysis(&dispute_id)
+        .create_analysis(&dispute_id)
         .await
         .map_err(arbitration_mutation_error)?;
     if let Err(error) = scheduler
         .enqueue(AnalysisJob {
             dispute_id: dispute_id.clone(),
             analysis_id: analysis.analysis_id.clone(),
-            source: AnalysisSource::Manual,
         })
         .await
     {
-        // Manual Analysis 已经持久化，是这次显式请求的稳定结果。调度器故障不能把
+        // Current Analysis 已经持久化，是这次显式请求的稳定结果。调度器故障不能把
         // 客户端诱导到重试并额外 mint 一条 Analysis；启动恢复会重新提交 pending job。
         log::warn!(
             target: "maintainer_arbitration",
-            "manual analysis={} 唤醒失败，等待启动恢复: {error:#}",
+            "current analysis={} 唤醒失败，等待启动恢复: {error:#}",
             analysis.analysis_id
         );
     }
@@ -788,11 +748,10 @@ pub async fn adopt_analysis(
             "maintainer arbitration is disabled".to_string(),
         )
     })?;
-    let analysis = read_analysis_by_id(service.store(), &dispute_id, &analysis_id).await?;
+    read_analysis_by_id(service.store(), &dispute_id, &analysis_id).await?;
     let job = AnalysisJob {
         dispute_id: dispute_id.clone(),
         analysis_id,
-        source: analysis.source,
     };
     // Adopt 会先固定 Resolution 与投递意图，再提交 Dispute/outbox。若客户端在这个
     // 窗口断开，两条持久恢复队列都必须在当前进程被唤醒。
@@ -1341,7 +1300,7 @@ pub async fn report_dispute(
         .validate_agent_report()
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
     if let Some(service) = state.arbitration.as_ref() {
-        // Automatic Analysis 与 Dispute 的 create-once 状态先于 enqueue 持久化。
+        // Current Analysis 与 Dispute 的 create-once 状态先于 enqueue 持久化。
         // 客户端取消不能让 pending 记录在当前进程中失去唤醒来源。
         let mut recovery_wake =
             AnalysisRecoveryWakeGuard::new(state.arbitration_scheduler.as_ref());
@@ -1352,13 +1311,12 @@ pub async fn report_dispute(
         if result.should_enqueue {
             if let (Some(scheduler), Some(analysis)) = (
                 state.arbitration_scheduler.as_ref(),
-                result.automatic_analysis.as_ref(),
+                result.current_analysis.as_ref(),
             ) {
                 if let Err(error) = scheduler
                     .enqueue(AnalysisJob {
                         dispute_id: dispute.id.clone(),
                         analysis_id: analysis.analysis_id.clone(),
-                        source: AnalysisSource::Automatic,
                     })
                     .await
                 {
@@ -1366,7 +1324,7 @@ pub async fn report_dispute(
                     // report 失败。启动恢复会重新提交这条 job。
                     log::warn!(
                         target: "maintainer_arbitration",
-                        "dispute={} 自动分析唤醒失败，等待启动恢复: {error:#}",
+                        "dispute={} Analysis 唤醒失败，等待启动恢复: {error:#}",
                         dispute.id
                     );
                 }
@@ -1378,7 +1336,7 @@ pub async fn report_dispute(
             .maintainer
             .report_dispute(&dispute)
             .await
-            .map_err(internal_error)?;
+            .map_err(arbitration_mutation_error)?;
     }
     log_history_error(
         state
@@ -1974,7 +1932,7 @@ mod tests {
         dispute_id: &DisputeId,
         state: AnalysisState,
     ) -> ArbitrationAnalysis {
-        let mut analysis = service.create_manual_analysis(dispute_id).await.unwrap();
+        let mut analysis = service.create_analysis(dispute_id).await.unwrap();
         analysis.state = state;
         service.store().write_analysis(&analysis).await.unwrap();
         analysis
@@ -2264,7 +2222,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_mode_report_exposes_no_automatic_analysis() {
+    async fn manual_mode_report_exposes_no_current_analysis() {
         let (mut state, ..) = build_state();
         enable_test_arbitration_mode(&mut state, ArbitrationMode::Manual);
         let reporter = AgentId::new("agent-a").unwrap();
@@ -2293,13 +2251,11 @@ mod tests {
             list_dispute_analyses(State(state.clone()), Path(dispute.id.to_string()))
                 .await
                 .unwrap();
-        assert!(analyses.automatic_analysis.is_none());
-        assert!(analyses.manual_analysis.is_none());
+        assert!(analyses.current_analysis.is_none());
         let Json(detail) = get_dispute(State(state), Path(dispute.id.to_string()))
             .await
             .unwrap();
-        assert!(detail.automatic_analysis.is_none());
-        assert!(detail.manual_analysis.is_none());
+        assert!(detail.current_analysis.is_none());
         assert_eq!(
             detail.record.dispute.status,
             crate::claim::DisputeStatus::Open
@@ -2338,6 +2294,45 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn report_dispute_replay_with_changed_payload_returns_conflict_when_arbitration_disabled()
+    {
+        let (state, ..) = build_state();
+        let reporter = AgentId::new("agent-a").unwrap();
+        let dispute = Dispute {
+            id: DisputeId::random(),
+            name: "reported".into(),
+            reporter_agent_id: reporter.clone(),
+            claims: vec![ClaimId::random(), ClaimId::random()],
+            summary: "original report".into(),
+            status: crate::claim::DisputeStatus::Open,
+            created_at: now_seconds(),
+            resolved_at: None,
+        };
+        assert_eq!(
+            report_dispute(
+                State(state.clone()),
+                Json(envelope(&reporter, "", dispute.clone())),
+            )
+            .await
+            .unwrap(),
+            StatusCode::OK
+        );
+
+        let mut changed = dispute.clone();
+        changed.summary = "changed report with the same id".into();
+        let error = report_dispute(State(state.clone()), Json(envelope(&reporter, "", changed)))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        let stored = ArbitrationStore::new(state.maintainer.team_root().to_path_buf())
+            .read_dispute(&dispute.id)
+            .await
+            .unwrap();
+        assert_eq!(stored.dispute.summary, "original report");
     }
 
     #[tokio::test]
@@ -3237,10 +3232,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_analysis_returns_conflict_when_arbitration_is_disabled() {
+    async fn analysis_returns_conflict_when_arbitration_is_disabled() {
         let (state, ..) = build_state();
 
-        let error = create_manual_analysis(State(state), Path(DisputeId::random().to_string()))
+        let error = create_analysis(State(state), Path(DisputeId::random().to_string()))
             .await
             .unwrap_err();
 
@@ -3288,7 +3283,6 @@ mod tests {
             &AnalysisJob {
                 dispute_id: barrier_dispute.id,
                 analysis_id: barrier.analysis_id,
-                source: AnalysisSource::Manual,
             },
         )
         .await;
@@ -3300,7 +3294,7 @@ mod tests {
         seed_claim(state.maintainer.team_root(), &claim_b).await;
         let dispute = Dispute {
             id: DisputeId::random(),
-            name: "cancelled manual analysis".into(),
+            name: "cancelled current analysis".into(),
             reporter_agent_id: holder,
             claims: vec![claim_a.id, claim_b.id],
             summary: "the request is cancelled immediately after its durable write".into(),
@@ -3312,11 +3306,10 @@ mod tests {
             .write_dispute(&MaintainerDisputeRecord::from(dispute.clone()))
             .await
             .unwrap();
-        let analysis = service.create_manual_analysis(&dispute.id).await.unwrap();
+        let analysis = service.create_analysis(&dispute.id).await.unwrap();
         let job = AnalysisJob {
             dispute_id: dispute.id,
             analysis_id: analysis.analysis_id,
-            source: AnalysisSource::Manual,
         };
 
         drop(AnalysisRecoveryWakeGuard::new(Some(&scheduler)));
@@ -3363,7 +3356,6 @@ mod tests {
         let sentinel_job = AnalysisJob {
             dispute_id: sentinel_dispute.id,
             analysis_id: sentinel.analysis_id,
-            source: AnalysisSource::Manual,
         };
         let (scheduler, _worker) = crate::maintainer::arbitration::spawn_arbitration_scheduler(
             service.clone(),
@@ -3393,10 +3385,7 @@ mod tests {
             .write_dispute(&MaintainerDisputeRecord::from(original_dispute.clone()))
             .await
             .unwrap();
-        let mut analysis = service
-            .create_manual_analysis(&original_dispute.id)
-            .await
-            .unwrap();
+        let mut analysis = service.create_analysis(&original_dispute.id).await.unwrap();
         let resolution_id = ArbitrationResolutionId::random();
         let resolved_at = "2026-08-03T00:00:00Z".parse().unwrap();
         let assessments = vec![
@@ -3503,7 +3492,6 @@ mod tests {
         let job = AnalysisJob {
             dispute_id: analysis.dispute_id.clone(),
             analysis_id: analysis.analysis_id.clone(),
-            source: AnalysisSource::Manual,
         };
 
         // 模拟 HTTP Adopt 在 fixed intent 落盘后被取消：future drop 只能执行同步
@@ -3574,7 +3562,7 @@ mod tests {
         assert_eq!(reject_error.0, StatusCode::NOT_FOUND);
 
         enable_test_arbitration(&mut state);
-        let analyze_error = create_manual_analysis(State(state), Path(dispute_id.to_string()))
+        let analyze_error = create_analysis(State(state), Path(dispute_id.to_string()))
             .await
             .unwrap_err();
         assert_eq!(analyze_error.0, StatusCode::NOT_FOUND);

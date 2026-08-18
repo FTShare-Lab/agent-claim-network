@@ -24,7 +24,6 @@ export type DisputeResolution = {
   rejection_reason?: string
 }
 
-export type AnalysisSource = 'automatic' | 'manual'
 export type AnalysisState =
   | 'pending'
   | 'waiting_context'
@@ -64,7 +63,6 @@ export type AnalysisVerification = {
 
 export type ArbitrationAnalysisSummary = {
   analysis_id: string
-  source: AnalysisSource
   state: AnalysisState
   phase?: 'proposal' | 'verification' | null
   created_at: string
@@ -81,7 +79,7 @@ export type ArbitrationAnalysisSummary = {
   context_change_reason?: string | null
 }
 
-export type AutomaticAnalysisRound = {
+export type AnalysisRound = {
   round: number
   started_at: string
   completed_at?: string | null
@@ -110,12 +108,11 @@ export type ArbitrationAnalysisDetail = ArbitrationAnalysisSummary & {
   verification?: AnalysisVerification | null
   warnings: Array<{ code: string; detail: string }>
   validation_result: string
-  rounds?: AutomaticAnalysisRound[]
+  rounds?: AnalysisRound[]
 }
 
 export type AnalysisListResponse = {
-  automatic_analysis?: ArbitrationAnalysisSummary | null
-  manual_analysis?: ArbitrationAnalysisSummary | null
+  current_analysis?: ArbitrationAnalysisSummary | null
 }
 
 export type ClaimAdoptionComparison = {
@@ -180,8 +177,7 @@ export type Dispute = {
 }
 
 export type DisputeDetail = Dispute & {
-  automatic_analysis?: ArbitrationAnalysisSummary | null
-  manual_analysis?: ArbitrationAnalysisSummary | null
+  current_analysis?: ArbitrationAnalysisSummary | null
   holder_adoption?: HolderAdoptionView | null
 }
 

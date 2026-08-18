@@ -1,4 +1,4 @@
-//! 单 automatic analysis、显式 manual analysis 与采用状态机。
+//! Current Analysis 的执行、重分析与采用状态机。
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -16,9 +16,9 @@ use super::evaluator::ArbitrationEvaluator;
 use super::resolution::{validate_assessments, AdoptionGuards, ResolutionService};
 use super::store::ArbitrationStore;
 use super::types::{
-    AnalysisError, AnalysisJob, AnalysisLease, AnalysisPhase, AnalysisSource, AnalysisState,
+    AnalysisError, AnalysisJob, AnalysisLease, AnalysisPhase, AnalysisRound, AnalysisState,
     ArbitrationAnalysis, ArbitrationAnalysisId, ArbitrationResolutionRecord,
-    AutomaticAnalysisRound, FrozenArbitrationContext, MaintainerDisputeRecord, VerificationVerdict,
+    FrozenArbitrationContext, MaintainerDisputeRecord, VerificationVerdict,
     ARBITRATION_PROMPT_VERSION, ARBITRATION_SCHEMA_VERSION, CURRENT_SEMANTIC_PROJECTION_VERSION,
 };
 
@@ -70,7 +70,7 @@ fn retry(message: impl Into<String>) -> anyhow::Error {
 #[derive(Debug, Clone)]
 pub struct ReportDisputeResult {
     pub created: bool,
-    pub automatic_analysis: Option<ArbitrationAnalysis>,
+    pub current_analysis: Option<ArbitrationAnalysis>,
     pub should_enqueue: bool,
 }
 
@@ -156,7 +156,7 @@ impl ArbitrationService {
         ))
     }
 
-    /// enabled 路径的 Dispute 上报入口：shadow/auto 把 pending 与原始
+    /// enabled 路径的 Dispute 上报入口：shadow/auto 把 Current Analysis 与原始
     /// Dispute 在同一 per-dispute 临界区内落盘；manual 只保存 Dispute。
     pub async fn report_dispute(&self, dispute: &Dispute) -> anyhow::Result<ReportDisputeResult> {
         dispute.validate_agent_report()?;
@@ -173,17 +173,17 @@ impl ArbitrationService {
                 if self.config.mode == ArbitrationMode::Manual {
                     return Ok(ReportDisputeResult {
                         created: false,
-                        automatic_analysis: None,
+                        current_analysis: self.store.read_current_analysis(&dispute.id).await?,
                         should_enqueue: false,
                     });
                 }
-                let automatic_analysis = self.store.read_automatic_analysis(&dispute.id).await?;
-                let should_enqueue = automatic_analysis
+                let current_analysis = self.store.read_current_analysis(&dispute.id).await?;
+                let should_enqueue = current_analysis
                     .as_ref()
                     .is_some_and(|analysis| analysis.state.is_recoverable());
                 return Ok(ReportDisputeResult {
                     created: false,
-                    automatic_analysis,
+                    current_analysis,
                     should_enqueue,
                 });
             }
@@ -191,13 +191,14 @@ impl ArbitrationService {
             Err(error) => return Err(error),
         }
         if self.config.mode == ArbitrationMode::Manual {
-            if let Some(existing) = self.store.read_automatic_analysis(&dispute.id).await? {
+            let orphan = self.store.read_current_analysis(&dispute.id).await?;
+            if let Some(existing) = orphan.as_ref() {
                 let same_report = existing.report_snapshot.as_ref().is_some_and(|snapshot| {
                     crate::maintainer::same_report_payload(snapshot, dispute)
                 });
                 if !same_report {
                     return Err(conflict(format!(
-                        "dispute id={} 的 orphan automatic analysis 与本次原始字段不一致",
+                        "dispute id={} 的 orphan current analysis 与本次原始字段不一致",
                         dispute.id
                     )));
                 }
@@ -208,30 +209,33 @@ impl ArbitrationService {
             self.store
                 .write_dispute(&MaintainerDisputeRecord::from(dispute.clone()))
                 .await?;
+            let should_enqueue = orphan
+                .as_ref()
+                .is_some_and(|analysis| analysis.state.is_recoverable());
             return Ok(ReportDisputeResult {
                 created: true,
-                automatic_analysis: None,
-                should_enqueue: false,
+                current_analysis: orphan,
+                should_enqueue,
             });
         }
-        // pending 先写可将进程崩溃窗口退化为不可见的孤儿记录；重放上报会复用它。
-        let automatic_analysis = match self.store.read_automatic_analysis(&dispute.id).await? {
+        // Analysis 先写可将进程崩溃窗口退化为不可见的孤儿记录；重放上报会复用它。
+        let current_analysis = match self.store.read_current_analysis(&dispute.id).await? {
             Some(existing) => {
                 let same_report = existing.report_snapshot.as_ref().is_some_and(|snapshot| {
                     crate::maintainer::same_report_payload(snapshot, dispute)
                 });
                 if !same_report {
                     return Err(conflict(format!(
-                        "dispute id={} 的 orphan automatic analysis 与本次原始字段不一致",
+                        "dispute id={} 的 orphan current analysis 与本次原始字段不一致",
                         dispute.id
                     )));
                 }
                 existing
             }
             None => {
-                let mut analysis = self.new_analysis(&dispute.id, AnalysisSource::Automatic);
+                let mut analysis = self.new_analysis(&dispute.id);
                 analysis.report_snapshot = Some(dispute.clone());
-                self.store.create_automatic_analysis(&analysis).await?;
+                self.store.create_report_analysis(&analysis).await?;
                 analysis
             }
         };
@@ -243,13 +247,13 @@ impl ArbitrationService {
             .await?;
         Ok(ReportDisputeResult {
             created: true,
-            automatic_analysis: Some(automatic_analysis),
+            current_analysis: Some(current_analysis),
             should_enqueue: true,
         })
     }
 
-    /// 每次显式 Analyze 都覆盖当前 manual analysis；此操作不产生治理副作用。
-    pub async fn create_manual_analysis(
+    /// 每次显式 Analyze 都覆盖 Current Analysis；采用前不产生治理副作用。
+    pub async fn create_analysis(
         &self,
         dispute_id: &DisputeId,
     ) -> anyhow::Result<ArbitrationAnalysis> {
@@ -260,23 +264,23 @@ impl ArbitrationService {
         }
         if self
             .store
-            .read_manual_analysis(dispute_id)
+            .read_current_analysis(dispute_id)
             .await?
             .is_some_and(|analysis| analysis.state == AnalysisState::Adopting)
         {
             return Err(conflict(format!(
-                "dispute={dispute_id} 的 manual analysis 正在提交 resolution"
+                "dispute={dispute_id} 的 current analysis 正在提交 resolution"
             )));
         }
-        let analysis = self.new_analysis(dispute_id, AnalysisSource::Manual);
-        self.store.create_manual_analysis(&analysis).await?;
+        let analysis = self.new_analysis(dispute_id);
+        self.store.replace_current_analysis(&analysis).await?;
         self.preemption_wake.notify_waiters();
         Ok(analysis)
     }
 
     pub async fn recoverable_jobs(&self) -> anyhow::Result<Vec<AnalysisJob>> {
-        // auto 模式若恰好在 Approved 落盘后崩溃，启动恢复继续采用同一分析；shadow
-        // 与 manual 的 Approved 都是有意的只读终态。
+        // auto 模式若恰好在 Approved 落盘后崩溃，启动恢复继续采用同一分析；
+        // shadow 与 manual 的 Approved 都是有意的只读终态。
         self.store
             .recoverable_jobs(self.config.mode == ArbitrationMode::Auto)
             .await
@@ -332,8 +336,7 @@ impl ArbitrationService {
                     }
                 }
                 AnalysisState::Approved
-                    if job.source == AnalysisSource::Automatic
-                        && analysis.mode == ArbitrationMode::Auto
+                    if analysis.mode == ArbitrationMode::Auto
                         && self.config.mode == ArbitrationMode::Auto
                         && analysis.adoption_blocked_reason.is_none() =>
                 {
@@ -342,7 +345,7 @@ impl ArbitrationService {
                         Err(error) if is_analysis_conflict(&error) => {
                             log::info!(
                                 target: "maintainer_arbitration",
-                                "automatic analysis={} 未采用: {error:#}",
+                                "current analysis={} 未采用: {error:#}",
                                 job.analysis_id
                             );
                             return self.store.read_analysis(job).await;
@@ -462,13 +465,11 @@ impl ArbitrationService {
                 let reason = self
                     .context_builder
                     .describe_changes(analysis.context.as_ref(), &current.frozen)?;
-                if job.source == AnalysisSource::Automatic
-                    && analysis.mode == ArbitrationMode::Auto
+                if analysis.mode == ArbitrationMode::Auto
                     && self.config.mode == ArbitrationMode::Auto
                 {
-                    self.schedule_automatic_reanalysis(&mut analysis, reason)
-                        .await?;
-                    return Err(conflict("Automatic Analysis 的分析输入已变化"));
+                    self.schedule_reanalysis(&mut analysis, reason).await?;
+                    return Err(conflict("Current Analysis 的分析输入已变化"));
                 }
                 let message = format!("Analysis 的分析输入已变化，请重新 Analyze：{reason}");
                 analysis.adoption_blocked_reason = Some(message.clone());
@@ -494,7 +495,7 @@ impl ArbitrationService {
         Err(retry("Adopt 最终复核未能取得稳定团队知识快照"))
     }
 
-    async fn schedule_automatic_reanalysis(
+    async fn schedule_reanalysis(
         &self,
         analysis: &mut ArbitrationAnalysis,
         reason: String,
@@ -815,32 +816,30 @@ impl ArbitrationService {
         };
         analysis.lease = None;
         analysis.updated_at = now;
-        if analysis.source == AnalysisSource::Automatic {
-            if let (
-                Some(fingerprint),
-                Some(snapshot_hash),
-                Some(proposal),
-                Some(verification),
-                Some(context),
-            ) = (
-                analysis.semantic_fingerprint.clone(),
-                analysis.context_snapshot_hash.clone(),
-                analysis.proposal.clone(),
-                analysis.verification.clone(),
-                analysis.context.as_ref(),
-            ) {
-                analysis.rounds.push(AutomaticAnalysisRound {
-                    round: analysis.analysis_round,
-                    started_at: context.generated_at,
-                    completed_at: Some(now),
-                    semantic_projection_version: analysis.semantic_projection_version,
-                    semantic_fingerprint: fingerprint,
-                    context_snapshot_hash: snapshot_hash,
-                    proposal,
-                    verification,
-                    context_change_reason: analysis.context_change_reason.clone(),
-                });
-            }
+        if let (
+            Some(fingerprint),
+            Some(snapshot_hash),
+            Some(proposal),
+            Some(verification),
+            Some(context),
+        ) = (
+            analysis.semantic_fingerprint.clone(),
+            analysis.context_snapshot_hash.clone(),
+            analysis.proposal.clone(),
+            analysis.verification.clone(),
+            analysis.context.as_ref(),
+        ) {
+            analysis.rounds.push(AnalysisRound {
+                round: analysis.analysis_round,
+                started_at: context.generated_at,
+                completed_at: Some(now),
+                semantic_projection_version: analysis.semantic_projection_version,
+                semantic_fingerprint: fingerprint,
+                context_snapshot_hash: snapshot_hash,
+                proposal,
+                verification,
+                context_change_reason: analysis.context_change_reason.clone(),
+            });
         }
         self.store.write_analysis(&analysis).await
     }
@@ -935,13 +934,13 @@ impl ArbitrationService {
         self.store.write_analysis(&analysis).await
     }
 
-    fn new_analysis(&self, dispute_id: &DisputeId, source: AnalysisSource) -> ArbitrationAnalysis {
+    fn new_analysis(&self, dispute_id: &DisputeId) -> ArbitrationAnalysis {
         let now = self.clock.now();
         ArbitrationAnalysis {
             schema_version: ARBITRATION_SCHEMA_VERSION,
             analysis_id: ArbitrationAnalysisId::random(),
             dispute_id: dispute_id.clone(),
-            source,
+            legacy_source: super::types::LegacyAnalysisSource::Automatic,
             report_snapshot: None,
             created_at: now,
             updated_at: now,
@@ -1656,24 +1655,22 @@ mod tests {
 
         async fn report(&self) -> AnalysisJob {
             let result = self.service.report_dispute(&self.dispute).await.unwrap();
-            let analysis = result.automatic_analysis.unwrap();
+            let analysis = result.current_analysis.unwrap();
             AnalysisJob {
                 dispute_id: self.dispute.id.clone(),
                 analysis_id: analysis.analysis_id,
-                source: AnalysisSource::Automatic,
             }
         }
 
-        async fn manual_job(&self) -> AnalysisJob {
+        async fn explicit_job(&self) -> AnalysisJob {
             let analysis = self
                 .service
-                .create_manual_analysis(&self.dispute.id)
+                .create_analysis(&self.dispute.id)
                 .await
                 .unwrap();
             AnalysisJob {
                 dispute_id: self.dispute.id.clone(),
                 analysis_id: analysis.analysis_id,
-                source: AnalysisSource::Manual,
             }
         }
     }
@@ -1719,7 +1716,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn report_creates_one_automatic_and_replay_deduplicates() {
+    async fn report_creates_one_current_analysis_and_replay_deduplicates() {
         let fixture = Fixture::new(ArbitrationMode::Shadow, ScriptedEvaluator::approved()).await;
         let first = fixture
             .service
@@ -1735,19 +1732,19 @@ mod tests {
         assert!(!replay.created);
         assert!(replay.should_enqueue);
         assert_eq!(
-            first.automatic_analysis.unwrap().analysis_id,
-            replay.automatic_analysis.unwrap().analysis_id
+            first.current_analysis.unwrap().analysis_id,
+            replay.current_analysis.unwrap().analysis_id
         );
         assert!(fixture
             .store
-            .list_manual_analysis(&fixture.dispute.id)
+            .read_current_analysis(&fixture.dispute.id)
             .await
             .unwrap()
-            .is_empty());
+            .is_some());
     }
 
     #[tokio::test]
-    async fn manual_mode_report_is_idempotent_without_automatic_analysis() {
+    async fn manual_mode_report_is_idempotent_without_current_analysis() {
         let fixture = Fixture::new(ArbitrationMode::Manual, ScriptedEvaluator::approved()).await;
 
         let first = fixture
@@ -1756,7 +1753,7 @@ mod tests {
             .await
             .unwrap();
         assert!(first.created);
-        assert!(first.automatic_analysis.is_none());
+        assert!(first.current_analysis.is_none());
         assert!(!first.should_enqueue);
 
         let replay = fixture
@@ -1765,11 +1762,11 @@ mod tests {
             .await
             .unwrap();
         assert!(!replay.created);
-        assert!(replay.automatic_analysis.is_none());
+        assert!(replay.current_analysis.is_none());
         assert!(!replay.should_enqueue);
         assert!(fixture
             .store
-            .read_automatic_analysis(&fixture.dispute.id)
+            .read_current_analysis(&fixture.dispute.id)
             .await
             .unwrap()
             .is_none());
@@ -1787,9 +1784,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_report_does_not_wake_existing_automatic_but_startup_recovery_keeps_it() {
+    async fn manual_report_does_not_wake_existing_analysis_but_startup_recovery_keeps_it() {
         let fixture = Fixture::new(ArbitrationMode::Shadow, ScriptedEvaluator::approved()).await;
-        let automatic_job = fixture.report().await;
+        let current_job = fixture.report().await;
         let manual_service = fixture.rebuilt_service(ArbitrationMode::Manual);
 
         let replay = manual_service
@@ -1797,25 +1794,25 @@ mod tests {
             .await
             .unwrap();
         assert!(!replay.created);
-        assert!(replay.automatic_analysis.is_none());
+        assert_eq!(
+            replay
+                .current_analysis
+                .as_ref()
+                .map(|item| &item.analysis_id),
+            Some(&current_job.analysis_id)
+        );
         assert!(!replay.should_enqueue);
 
         let recoverable = manual_service.recoverable_jobs().await.unwrap();
-        assert!(recoverable.contains(&automatic_job));
+        assert!(recoverable.contains(&current_job));
     }
 
     #[tokio::test]
-    async fn manual_report_rejects_conflicting_orphan_automatic_analysis() {
+    async fn manual_report_rejects_conflicting_orphan_current_analysis() {
         let fixture = Fixture::new(ArbitrationMode::Manual, ScriptedEvaluator::approved()).await;
-        let mut orphan = fixture
-            .service
-            .new_analysis(&fixture.dispute.id, AnalysisSource::Automatic);
+        let mut orphan = fixture.service.new_analysis(&fixture.dispute.id);
         orphan.report_snapshot = Some(fixture.dispute.clone());
-        fixture
-            .store
-            .create_automatic_analysis(&orphan)
-            .await
-            .unwrap();
+        fixture.store.create_report_analysis(&orphan).await.unwrap();
 
         let mut changed = fixture.dispute.clone();
         changed.summary = "different report payload".into();
@@ -1826,17 +1823,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orphan_automatic_analysis_only_accepts_identical_report_replay() {
+    async fn manual_report_recovers_matching_orphan_current_analysis() {
         let fixture = Fixture::new(ArbitrationMode::Shadow, ScriptedEvaluator::approved()).await;
-        let mut orphan = fixture
-            .service
-            .new_analysis(&fixture.dispute.id, AnalysisSource::Automatic);
+        fixture.seed_claims().await;
+        let mut orphan = fixture.service.new_analysis(&fixture.dispute.id);
         orphan.report_snapshot = Some(fixture.dispute.clone());
-        fixture
-            .store
-            .create_automatic_analysis(&orphan)
+        fixture.store.create_report_analysis(&orphan).await.unwrap();
+
+        let manual_service = fixture.rebuilt_service(ArbitrationMode::Manual);
+        let replay = manual_service
+            .report_dispute(&fixture.dispute)
             .await
             .unwrap();
+        assert!(replay.created);
+        assert!(replay.should_enqueue);
+        assert_eq!(
+            replay
+                .current_analysis
+                .as_ref()
+                .map(|analysis| &analysis.analysis_id),
+            Some(&orphan.analysis_id)
+        );
+
+        let recovered = manual_service
+            .process_analysis(
+                &AnalysisJob {
+                    dispute_id: fixture.dispute.id.clone(),
+                    analysis_id: orphan.analysis_id,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.state, AnalysisState::Approved);
+        assert_eq!(
+            fixture
+                .store
+                .read_dispute(&fixture.dispute.id)
+                .await
+                .unwrap()
+                .dispute
+                .status,
+            DisputeStatus::Open
+        );
+        assert!(fixture
+            .store
+            .list_resolution_records(&fixture.dispute.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn orphan_current_analysis_only_accepts_identical_report_replay() {
+        let fixture = Fixture::new(ArbitrationMode::Shadow, ScriptedEvaluator::approved()).await;
+        let mut orphan = fixture.service.new_analysis(&fixture.dispute.id);
+        orphan.report_snapshot = Some(fixture.dispute.clone());
+        fixture.store.create_report_analysis(&orphan).await.unwrap();
 
         let mut changed = fixture.dispute.clone();
         changed.summary = "same id but changed report payload".into();
@@ -1851,7 +1894,7 @@ mod tests {
             .unwrap();
         assert!(recovered.created);
         assert_eq!(
-            recovered.automatic_analysis.unwrap().analysis_id,
+            recovered.current_analysis.unwrap().analysis_id,
             orphan.analysis_id
         );
         assert_eq!(fixture.store.list_disputes().await.unwrap().len(), 1);
@@ -1872,16 +1915,16 @@ mod tests {
             .unwrap();
         assert!(!replay.created);
         assert!(!replay.should_enqueue);
-        assert!(replay.automatic_analysis.is_none());
+        assert!(replay.current_analysis.is_none());
     }
 
     #[tokio::test]
-    async fn manual_analysis_overwrites_the_previous_result_without_side_effects() {
+    async fn explicit_analysis_overwrites_the_previous_result_without_side_effects() {
         let fixture = Fixture::new(ArbitrationMode::Shadow, ScriptedEvaluator::approved()).await;
         fixture.seed_claims().await;
         fixture.report().await;
-        let first = fixture.manual_job().await;
-        let second = fixture.manual_job().await;
+        let first = fixture.explicit_job().await;
+        let second = fixture.explicit_job().await;
         assert_ne!(first.analysis_id, second.analysis_id);
         assert!(!fixture.store.is_current_analysis_job(&first).await.unwrap());
         assert!(fixture
@@ -1892,11 +1935,12 @@ mod tests {
         assert_eq!(
             fixture
                 .store
-                .list_manual_analysis(&fixture.dispute.id)
+                .read_current_analysis(&fixture.dispute.id)
                 .await
                 .unwrap()
-                .len(),
-            1
+                .unwrap()
+                .analysis_id,
+            second.analysis_id
         );
         assert!(fixture
             .store
@@ -1913,7 +1957,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overwriting_manual_analysis_stops_the_old_provider_wait() {
+    async fn overwriting_current_analysis_stops_the_old_provider_wait() {
         let evaluator = ScriptedEvaluator::approved();
         evaluator.block_next_proposal();
         let fixture = Fixture::new(ArbitrationMode::Manual, evaluator.clone()).await;
@@ -1923,8 +1967,8 @@ mod tests {
             .report_dispute(&fixture.dispute)
             .await
             .unwrap();
-        assert!(report.automatic_analysis.is_none());
-        let first = fixture.manual_job().await;
+        assert!(report.current_analysis.is_none());
+        let first = fixture.explicit_job().await;
         let service = fixture.service.clone();
         let first_for_task = first.clone();
         let task = tokio::spawn(async move {
@@ -1939,7 +1983,7 @@ mod tests {
         .await
         .unwrap();
 
-        let second = fixture.manual_job().await;
+        let second = fixture.explicit_job().await;
         tokio::time::timeout(Duration::from_secs(1), task)
             .await
             .expect("被覆盖的 Analysis 不应等待完整 provider timeout")
@@ -1955,7 +1999,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overwriting_manual_analysis_stops_a_blocked_context_build() {
+    async fn overwriting_current_analysis_stops_a_blocked_context_build() {
         let fixture = Fixture::new(ArbitrationMode::Manual, ScriptedEvaluator::approved()).await;
         fixture.seed_claims().await;
         fixture
@@ -1969,14 +2013,10 @@ mod tests {
             router.clone(),
             ResolutionService::new(fixture.maintainer.clone(), fixture.store.clone()),
         );
-        let first = service
-            .create_manual_analysis(&fixture.dispute.id)
-            .await
-            .unwrap();
+        let first = service.create_analysis(&fixture.dispute.id).await.unwrap();
         let first_job = AnalysisJob {
             dispute_id: fixture.dispute.id.clone(),
             analysis_id: first.analysis_id,
-            source: AnalysisSource::Manual,
         };
         let first_task = {
             let service = service.clone();
@@ -1991,10 +2031,7 @@ mod tests {
             .await
             .expect("旧 Analysis 应进入 Router 上下文构建");
 
-        let second = service
-            .create_manual_analysis(&fixture.dispute.id)
-            .await
-            .unwrap();
+        let second = service.create_analysis(&fixture.dispute.id).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), first_task)
             .await
             .expect("被覆盖的 Analysis 不应等待 Router timeout")
@@ -2009,7 +2046,6 @@ mod tests {
         let second_job = AnalysisJob {
             dispute_id: fixture.dispute.id.clone(),
             analysis_id: second.analysis_id,
-            source: AnalysisSource::Manual,
         };
         let completed = tokio::time::timeout(
             Duration::from_secs(1),
@@ -2037,14 +2073,10 @@ mod tests {
             router.clone(),
             ResolutionService::new(fixture.maintainer.clone(), fixture.store.clone()),
         );
-        let analysis = service
-            .create_manual_analysis(&fixture.dispute.id)
-            .await
-            .unwrap();
+        let analysis = service.create_analysis(&fixture.dispute.id).await.unwrap();
         let job = AnalysisJob {
             dispute_id: fixture.dispute.id.clone(),
             analysis_id: analysis.analysis_id,
-            source: AnalysisSource::Manual,
         };
         let task = {
             let service = service.clone();
@@ -2286,7 +2318,7 @@ mod tests {
         assert_eq!(
             fixture
                 .store
-                .read_automatic_analysis(&fixture.dispute.id)
+                .read_current_analysis(&fixture.dispute.id)
                 .await
                 .unwrap()
                 .unwrap()
@@ -2334,7 +2366,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_analysis_is_read_only_until_adopted_and_adopt_never_calls_model() {
+    async fn manual_mode_analysis_is_read_only_until_adopted_and_adopt_never_calls_model() {
         let fixture = Fixture::new(ArbitrationMode::Manual, ScriptedEvaluator::approved()).await;
         fixture.seed_claims().await;
         let report = fixture
@@ -2342,9 +2374,9 @@ mod tests {
             .report_dispute(&fixture.dispute)
             .await
             .unwrap();
-        assert!(report.automatic_analysis.is_none());
+        assert!(report.current_analysis.is_none());
         assert!(!report.should_enqueue);
-        let job = fixture.manual_job().await;
+        let job = fixture.explicit_job().await;
         let analyzed = fixture
             .service
             .process_analysis(&job, &CancellationToken::new())
@@ -2382,6 +2414,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_manual_pending_analysis_finishes_without_automatic_adoption() {
+        let fixture = Fixture::new(ArbitrationMode::Auto, ScriptedEvaluator::approved()).await;
+        fixture.seed_claims().await;
+        fixture
+            .store
+            .write_dispute(&MaintainerDisputeRecord::from(fixture.dispute.clone()))
+            .await
+            .unwrap();
+        let mut legacy_manual = fixture.service.new_analysis(&fixture.dispute.id);
+        legacy_manual.legacy_source = super::super::types::LegacyAnalysisSource::Manual;
+        let path = paths::team_store_arbitration_legacy_manual_analysis_path(
+            fixture.store.team_root(),
+            &fixture.dispute.id,
+        );
+        write_yaml_atomic(&path, &legacy_manual).await.unwrap();
+
+        let restarted = fixture.rebuilt_service(ArbitrationMode::Auto);
+        let jobs = restarted.recoverable_jobs().await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        let analyzed = restarted
+            .process_analysis(&jobs[0], &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(analyzed.state, AnalysisState::Approved);
+        assert_eq!(analyzed.mode, ArbitrationMode::Manual);
+        assert_eq!(
+            fixture
+                .store
+                .read_dispute(&fixture.dispute.id)
+                .await
+                .unwrap()
+                .dispute
+                .status,
+            DisputeStatus::Open
+        );
+        assert!(fixture
+            .store
+            .list_resolution_records(&fixture.dispute.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn manual_mode_allows_human_resolution_without_analysis() {
         let fixture = Fixture::new(ArbitrationMode::Manual, ScriptedEvaluator::approved()).await;
         fixture.seed_claims().await;
@@ -2390,7 +2467,7 @@ mod tests {
             .report_dispute(&fixture.dispute)
             .await
             .unwrap();
-        assert!(report.automatic_analysis.is_none());
+        assert!(report.current_analysis.is_none());
 
         let resolution = ResolutionService::new(fixture.maintainer.clone(), fixture.store.clone())
             .resolve_human(
@@ -2415,10 +2492,10 @@ mod tests {
         );
         assert!(fixture
             .store
-            .list_manual_analysis(&fixture.dispute.id)
+            .read_current_analysis(&fixture.dispute.id)
             .await
             .unwrap()
-            .is_empty());
+            .is_none());
         assert_eq!(fixture.evaluator.calls(), (0, 0));
     }
 
@@ -2427,7 +2504,7 @@ mod tests {
         let fixture = Fixture::new(ArbitrationMode::Shadow, ScriptedEvaluator::approved()).await;
         fixture.seed_claims().await;
         fixture.report().await;
-        let job = fixture.manual_job().await;
+        let job = fixture.explicit_job().await;
         fixture
             .service
             .process_analysis(&job, &CancellationToken::new())
@@ -2457,7 +2534,7 @@ mod tests {
         let fixture = Fixture::new(ArbitrationMode::Shadow, ScriptedEvaluator::approved()).await;
         fixture.seed_claims().await;
         fixture.report().await;
-        let outdated_job = fixture.manual_job().await;
+        let outdated_job = fixture.explicit_job().await;
         fixture
             .service
             .process_analysis(&outdated_job, &CancellationToken::new())
@@ -2476,7 +2553,7 @@ mod tests {
         assert!(is_analysis_conflict(&outdated));
         write_yaml_atomic(&path, &fixture.claims[0]).await.unwrap();
 
-        let fresh_job = fixture.manual_job().await;
+        let fresh_job = fixture.explicit_job().await;
         fixture
             .service
             .process_analysis(&fresh_job, &CancellationToken::new())
@@ -2510,7 +2587,7 @@ mod tests {
         let fixture = Fixture::new(ArbitrationMode::Shadow, ScriptedEvaluator::approved()).await;
         fixture.seed_claims().await;
         fixture.report().await;
-        let job = fixture.manual_job().await;
+        let job = fixture.explicit_job().await;
         let router = LifecycleRouter::new();
         let config = MaintainerArbitrationConfig {
             enabled: true,
@@ -2562,11 +2639,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_recovery_reuses_the_same_manual_analysis() {
+    async fn startup_recovery_reuses_the_same_current_analysis() {
         let fixture = Fixture::new(ArbitrationMode::Shadow, ScriptedEvaluator::approved()).await;
         fixture.seed_claims().await;
         fixture.report().await;
-        let job = fixture.manual_job().await;
+        let job = fixture.explicit_job().await;
         let recoverable = fixture.service.recoverable_jobs().await.unwrap();
         assert!(recoverable.contains(&job));
         let recovered = fixture
@@ -2578,11 +2655,12 @@ mod tests {
         assert_eq!(
             fixture
                 .store
-                .list_manual_analysis(&fixture.dispute.id)
+                .read_current_analysis(&fixture.dispute.id)
                 .await
                 .unwrap()
-                .len(),
-            1
+                .unwrap()
+                .analysis_id,
+            job.analysis_id
         );
     }
 
@@ -2982,11 +3060,10 @@ mod tests {
             Arc::new(SystemArbitrationClock),
         ));
         let report = crashing.report_dispute(&fixture.dispute).await.unwrap();
-        let analysis = report.automatic_analysis.unwrap();
+        let analysis = report.current_analysis.unwrap();
         let job = AnalysisJob {
             dispute_id: fixture.dispute.id.clone(),
             analysis_id: analysis.analysis_id,
-            source: AnalysisSource::Automatic,
         };
         assert!(crashing
             .process_analysis(&job, &CancellationToken::new())
@@ -3020,17 +3097,11 @@ mod tests {
     async fn explicit_adopt_error_retry_recovers_fixed_resolution_idempotently() {
         let fixture = Fixture::new(ArbitrationMode::Shadow, ScriptedEvaluator::approved()).await;
         fixture.seed_claims().await;
-        let job = fixture.report().await;
-        let competing_job = fixture.manual_job().await;
-        let approved = fixture
-            .service
-            .process_analysis(&job, &CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(approved.state, AnalysisState::Approved);
+        let _initial_job = fixture.report().await;
+        let job = fixture.explicit_job().await;
         fixture
             .service
-            .process_analysis(&competing_job, &CancellationToken::new())
+            .process_analysis(&job, &CancellationToken::new())
             .await
             .unwrap();
         let router = Arc::new(CountingRouter::default());
@@ -3053,14 +3124,6 @@ mod tests {
             .unwrap()
             .is_empty());
         let router_calls = router.calls();
-
-        let competing = service.adopt_analysis(&competing_job).await.unwrap_err();
-        assert!(is_analysis_conflict(&competing));
-        assert!(format!("{competing:#}").contains(job.analysis_id.as_str()));
-        assert_eq!(router.calls(), router_calls);
-        let untouched = fixture.store.read_analysis(&competing_job).await.unwrap();
-        assert_eq!(untouched.state, AnalysisState::Approved);
-        assert!(untouched.resolution_id.is_none());
 
         let recovered = service.adopt_analysis(&job).await.unwrap();
         let repeated = service.adopt_analysis(&job).await.unwrap();
@@ -3087,17 +3150,11 @@ mod tests {
     async fn cancelled_explicit_adopt_retry_recovers_fixed_pending_resolution() {
         let fixture = Fixture::new(ArbitrationMode::Shadow, ScriptedEvaluator::approved()).await;
         fixture.seed_claims().await;
-        let job = fixture.report().await;
-        let competing_job = fixture.manual_job().await;
-        let approved = fixture
-            .service
-            .process_analysis(&job, &CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(approved.state, AnalysisState::Approved);
+        let _initial_job = fixture.report().await;
+        let job = fixture.explicit_job().await;
         fixture
             .service
-            .process_analysis(&competing_job, &CancellationToken::new())
+            .process_analysis(&job, &CancellationToken::new())
             .await
             .unwrap();
         let barrier = AdoptionPersistedBarrier::new();
@@ -3130,19 +3187,6 @@ mod tests {
             .unwrap()
             .is_empty());
         let router_calls = router.calls();
-        let competing = service.adopt_analysis(&competing_job).await.unwrap_err();
-        assert!(is_analysis_conflict(&competing));
-        assert!(format!("{competing:#}").contains(job.analysis_id.as_str()));
-        assert_eq!(router.calls(), router_calls);
-        assert_eq!(
-            fixture
-                .store
-                .read_analysis(&competing_job)
-                .await
-                .unwrap()
-                .state,
-            AnalysisState::Approved
-        );
         let recovered = service.adopt_analysis(&job).await.unwrap();
 
         assert_eq!(recovered.resolution_id, fixed_resolution_id);
@@ -3164,245 +3208,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_human_adoption_preempts_competing_automatic_recovery() {
+    async fn replacing_current_analysis_fences_late_automatic_recovery() {
         let fixture = Fixture::new(ArbitrationMode::Auto, ScriptedEvaluator::approved()).await;
         fixture.seed_claims().await;
-        let automatic_job = fixture.report().await;
-        let human_job = fixture.manual_job().await;
-        let human_approved = fixture
+        let old_job = fixture.report().await;
+        let current_job = fixture.explicit_job().await;
+
+        let error = fixture
             .service
-            .process_analysis(&human_job, &CancellationToken::new())
+            .process_analysis(&old_job, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("current analysis 替换"));
+
+        let adopted = fixture
+            .service
+            .process_analysis(&current_job, &CancellationToken::new())
             .await
             .unwrap();
-        assert_eq!(human_approved.state, AnalysisState::Approved);
-
-        let router = Arc::new(CountingRouter::default());
-        let automatic_barrier = AdoptionPersistedBarrier::new();
-        let automatic_service = fixture.rebuilt_service_with_router_and_resolution_service(
-            ArbitrationMode::Auto,
-            router.clone(),
-            ResolutionService::new(fixture.maintainer.clone(), fixture.store.clone())
-                .with_adoption_persisted_barrier(automatic_barrier.clone()),
-        );
-        let automatic_task = {
-            let service = automatic_service.clone();
-            let job = automatic_job.clone();
-            tokio::spawn(async move {
-                service
-                    .process_analysis(&job, &CancellationToken::new())
-                    .await
-            })
-        };
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            automatic_barrier.wait_until_entered(),
-        )
-        .await
-        .expect("automatic adoption 应在固定 intent 后暂停");
-        let automatic_pending = fixture.store.read_analysis(&automatic_job).await.unwrap();
-        assert_eq!(automatic_pending.state, AnalysisState::Adopting);
-        assert_eq!(
-            automatic_pending
-                .pending_resolution
-                .as_ref()
-                .unwrap()
-                .resolution
-                .resolved_by,
-            ResolvedBy::Automatic
-        );
-        automatic_task.abort();
-        assert!(automatic_task.await.unwrap_err().is_cancelled());
-
-        let human_barrier = AdoptionPersistedBarrier::new();
-        let human_service = fixture.rebuilt_service_with_router_and_resolution_service(
-            ArbitrationMode::Auto,
-            router.clone(),
-            ResolutionService::new(fixture.maintainer.clone(), fixture.store.clone())
-                .with_adoption_persisted_barrier(human_barrier.clone()),
-        );
-        let human_task = {
-            let service = human_service.clone();
-            let job = human_job.clone();
-            tokio::spawn(async move { service.adopt_analysis(&job).await })
-        };
-        tokio::time::timeout(Duration::from_secs(1), human_barrier.wait_until_entered())
-            .await
-            .expect("human adoption 应在固定 intent 后暂停");
-        let human_pending = fixture.store.read_analysis(&human_job).await.unwrap();
-        assert_eq!(human_pending.state, AnalysisState::Adopting);
-        let human_resolution_id = human_pending.resolution_id.clone().unwrap();
-        assert_eq!(
-            human_pending
-                .pending_resolution
-                .as_ref()
-                .unwrap()
-                .resolution
-                .resolved_by,
-            ResolvedBy::Human
-        );
-        human_task.abort();
-        assert!(human_task.await.unwrap_err().is_cancelled());
-        assert!(fixture
-            .store
-            .list_resolution_records(&fixture.dispute.id)
-            .await
-            .unwrap()
-            .is_empty());
-
-        let evaluator_calls = fixture.evaluator.calls();
-        let router_calls = router.calls();
-        let recovery = fixture.rebuilt_service_with_router_and_resolution_service(
-            ArbitrationMode::Auto,
-            router.clone(),
-            ResolutionService::new(fixture.maintainer.clone(), fixture.store.clone()),
-        );
-        let automatic_stopped = recovery
-            .process_analysis(&automatic_job, &CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(automatic_stopped.state, AnalysisState::Approved);
-        assert!(automatic_stopped
-            .adoption_blocked_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains(human_job.analysis_id.as_str())));
-        assert!(fixture
-            .store
-            .list_resolution_records(&fixture.dispute.id)
-            .await
-            .unwrap()
-            .is_empty());
+        assert_eq!(adopted.state, AnalysisState::Adopted);
         assert_eq!(
             fixture
                 .store
-                .read_dispute(&fixture.dispute.id)
+                .read_current_analysis(&fixture.dispute.id)
                 .await
                 .unwrap()
-                .dispute
-                .status,
-            DisputeStatus::Open
+                .unwrap()
+                .analysis_id,
+            current_job.analysis_id
         );
-        let recoverable = recovery.recoverable_jobs().await.unwrap();
-        assert!(!recoverable.contains(&automatic_job));
-        assert!(recoverable.contains(&human_job));
-        assert_eq!(fixture.evaluator.calls(), evaluator_calls);
-        assert_eq!(router.calls(), router_calls);
-
-        let adopted = recovery.adopt_analysis(&human_job).await.unwrap();
-        assert_eq!(adopted.resolution_id, human_resolution_id);
-        assert_eq!(adopted.resolution.resolved_by, ResolvedBy::Human);
-        assert_eq!(fixture.evaluator.calls(), evaluator_calls);
-        assert_eq!(router.calls(), router_calls);
-        let resolutions = fixture
-            .store
-            .list_resolution_records(&fixture.dispute.id)
-            .await
-            .unwrap();
-        assert_eq!(resolutions.len(), 1);
-        assert_eq!(resolutions[0].resolution_id, human_resolution_id);
-        assert_eq!(resolutions[0].resolution.resolved_by, ResolvedBy::Human);
-        let resolved = fixture
-            .store
-            .read_dispute(&fixture.dispute.id)
-            .await
-            .unwrap();
-        assert_eq!(resolved.dispute.status, DisputeStatus::Resolved);
-        assert_eq!(
-            resolved.resolution.unwrap().resolution_id,
-            human_resolution_id
-        );
-    }
-
-    #[tokio::test]
-    async fn resolved_human_adoption_terminally_blocks_late_automatic_recovery() {
-        let fixture = Fixture::new(ArbitrationMode::Auto, ScriptedEvaluator::approved()).await;
-        fixture.seed_claims().await;
-        let automatic_job = fixture.report().await;
-        let human_job = fixture.manual_job().await;
-        fixture
-            .service
-            .process_analysis(&human_job, &CancellationToken::new())
-            .await
-            .unwrap();
-
-        let router = Arc::new(CountingRouter::default());
-        let automatic_barrier = AdoptionPersistedBarrier::new();
-        let automatic_service = fixture.rebuilt_service_with_router_and_resolution_service(
-            ArbitrationMode::Auto,
-            router.clone(),
-            ResolutionService::new(fixture.maintainer.clone(), fixture.store.clone())
-                .with_adoption_persisted_barrier(automatic_barrier.clone()),
-        );
-        let automatic_task = {
-            let service = automatic_service.clone();
-            let job = automatic_job.clone();
-            tokio::spawn(async move {
-                service
-                    .process_analysis(&job, &CancellationToken::new())
-                    .await
-            })
-        };
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            automatic_barrier.wait_until_entered(),
-        )
-        .await
-        .expect("automatic adoption 应在固定 intent 后暂停");
-        automatic_task.abort();
-        assert!(automatic_task.await.unwrap_err().is_cancelled());
         assert_eq!(
             fixture
                 .store
-                .read_analysis(&automatic_job)
+                .list_resolution_records(&fixture.dispute.id)
                 .await
                 .unwrap()
-                .state,
-            AnalysisState::Adopting
+                .len(),
+            1
         );
-
-        let recovery = fixture.rebuilt_service_with_router_and_resolution_service(
-            ArbitrationMode::Auto,
-            router.clone(),
-            ResolutionService::new(fixture.maintainer.clone(), fixture.store.clone()),
-        );
-        let human = recovery.adopt_analysis(&human_job).await.unwrap();
-        assert_eq!(human.resolution.resolved_by, ResolvedBy::Human);
-        let evaluator_calls = fixture.evaluator.calls();
-        let router_calls = router.calls();
-
-        let stopped = recovery
-            .process_analysis(&automatic_job, &CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(stopped.state, AnalysisState::Approved);
-        assert!(stopped
-            .adoption_blocked_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains(human.resolution_id.as_str())));
-        assert!(!recovery
-            .recoverable_jobs()
-            .await
-            .unwrap()
-            .contains(&automatic_job));
-
-        let repeated = recovery
-            .process_analysis(&automatic_job, &CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(repeated.state, AnalysisState::Approved);
-        assert_eq!(
-            repeated.adoption_blocked_reason,
-            stopped.adoption_blocked_reason
-        );
-        assert_eq!(fixture.evaluator.calls(), evaluator_calls);
-        assert_eq!(router.calls(), router_calls);
-        let resolutions = fixture
-            .store
-            .list_resolution_records(&fixture.dispute.id)
-            .await
-            .unwrap();
-        assert_eq!(resolutions.len(), 1);
-        assert_eq!(resolutions[0].resolution_id, human.resolution_id);
-        assert_eq!(resolutions[0].resolution.resolved_by, ResolvedBy::Human);
     }
 
     #[tokio::test]
@@ -3432,11 +3275,10 @@ mod tests {
             Arc::new(SystemArbitrationClock),
         ));
         let report = service.report_dispute(&fixture.dispute).await.unwrap();
-        let analysis = report.automatic_analysis.unwrap();
+        let analysis = report.current_analysis.unwrap();
         let job = AnalysisJob {
             dispute_id: fixture.dispute.id.clone(),
             analysis_id: analysis.analysis_id,
-            source: AnalysisSource::Automatic,
         };
 
         let pending = tokio::time::timeout(

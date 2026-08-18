@@ -283,7 +283,7 @@ cargo run --bin acn-maintainer -- --config /path/to/config.toml
 本机试跑用上面即可；长期给团队用再加 `--release`（编译更慢，运行更省、二进制更小）。可以分开部署，只要每个 Agent 都能访问到这两个地址。
 
 - **Router**：按 scope / 语义检索团队 Claim 与相关 dispute，只负责发现，不判对错。
-- **Maintainer**：收 Claim 镜像与 dispute，发 policy，做过期扫描，往各 Agent 的 inbox 投递建议；还可选用独立 LLM 分析冲突。`manual` 只响应管理者显式 Analyze，`shadow`/`auto` 为新 dispute 创建唯一 Automatic Analysis，且只有 `auto` 自动采用。holder Agent 通过一次专用模型调用结合完整 Resolution、非 deprecated 本地 Claim 与全部 direct Claim 快照决定本地效果，Effect Journal 负责崩溃恢复。
+- **Maintainer**：收 Claim 镜像与 dispute，发 policy，做过期扫描，往各 Agent 的 inbox 投递建议；还可选用独立 LLM 分析冲突。每个 dispute 只有一个 Current Analysis：`manual` 只响应管理者显式 Analyze，`shadow`/`auto` 在上报时创建分析，且只有创建于 `auto`、当前仍运行在 `auto` 的分析自动采用。holder Agent 通过一次专用模型调用结合完整 Resolution、非 deprecated 本地 Claim、自己持有的任意状态 direct Claim 与全部 direct Claim 快照决定本地效果，Effect Journal 负责崩溃恢复。
 
 Maintainer 还带 Web 管理台（默认 `/app`）：agents、claims、disputes、policies、sweep、Router 查询、审计、团队 key 等。构建见 [前端说明](frontend/README.md)。
 

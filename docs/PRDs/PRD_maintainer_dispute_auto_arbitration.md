@@ -31,9 +31,8 @@ Agent 会在团队 Claim 互相冲突、适用范围不清或发生生命周期�
 - `direct_claims`：由 `Dispute.claims` 显式列出并唯一解析的全部 Claim。
 - `source_claims`：从 direct Claim 的 Claim 来源开始，按 Claim ID 稳定 BFS 展开的来源图，受 `max_source_claims` 限制。
 - `router_candidate_claims`：按 direct Claim scope 查询并合并去重的 Router 候选 Claim。
-- `Automatic Analysis`：`shadow` 或 `auto` 模式为 Dispute 创建的唯一系统分析记录。
-- `Manual Analysis`：管理者点击 Analyze 后写入的单一人工分析槽；再次 Analyze 会覆盖该槽。
-- `Analysis round`：Automatic Analysis 的一次 Proposal + Verification。初始分析为第 1 轮。
+- `Current Analysis`：一个 Dispute 当前唯一的分析记录。它可以由 Dispute 上报触发，也可以由管理者点击 Analyze 创建；新的 Analyze 原子替换旧记录。
+- `Analysis round`：Current Analysis 的一次 Proposal + Verification。初始分析为第 1 轮。
 - `context_changed`：Analysis 完成后，采用前发现稳定分析输入已经发生实质变化。
 - `Resolution`：关闭 Dispute 的当前正式治理记录，包含结论、依据、逐 Claim assessment、来源 Analysis 与稳定投递意图。
 - `Adopt`：不再次调用模型，把仍适用于当前输入的 approved Analysis 转换为 Resolution。
@@ -61,6 +60,8 @@ Agent 会在团队 Claim 互相冲突、适用范围不清或发生生命周期�
 
 只有 `coexist`、`lifecycle_update`、`conflict_resolved` 才要求每条 direct Claim 必须且只能有一条 assessment，包含 Claim ID、recommended status、判断、理由和可选 scope/statement 建议。每个 Proposal 的 `evidence_refs` 必须唯一覆盖全部 direct Claim，并可继续引用支撑结论的 Policy、source Claim、Router candidate Claim、真实 Router Dispute 或历史 Resolution；Policy 是主要依据或结果为 `unresolved` 时也不能省略 direct Claim。`unresolved` 不输出 Claim assessment，也不建议 status、scope 或 statement 修改；它只说明缺失材料并等待人类管理者处理。Proposal 与 Verification 的 confidence 都表示当前冻结上下文是否足以支持正式关闭 Dispute。任一阶段低于门槛、Verification 不同意核心字段或 assessment、或任一阶段选择 unresolved，都使 Analysis 进入 `unresolved`。
 
+resolved assessment 遵循最小知识变更原则：`coexist` 默认保持当前有效 Claim，仅在边界含混时澄清 scope/statement；`lifecycle_update` 区分当前基线与被替代知识，同一知识单元可准确修正时优先建议原地更新；`conflict_resolved` 保持有依据的正确 Claim，错误 Claim可在同一主题内纠正时优先建议原地更新。只有 Claim 已无当前价值且正确知识已有明确承载对象时才建议 deprecated。Maintainer 不假设 holder 的完整本地知识，也不在 assessment 中要求创建新 Claim；是否已有本地替代、是否需要新增独立知识单元，由 holder Agent 内化时判断。Verification 独立检查这些建议是否与 type、证据和知识边界一致，但不把推荐策略变成固定 type/status 规则。
+
 ## 模式与 Analysis 生命周期
 
 ### `enabled=false`
@@ -71,21 +72,21 @@ Agent 会在团队 Claim 互相冲突、适用范围不清或发生生命周期�
 
 Dispute 上报只持久化 open Dispute。管理者可以：
 
-- 点击 Analyze 写入 Manual Analysis；
-- Adopt approved Manual Analysis；
+- 点击 Analyze 写入或替换 Current Analysis；
+- Adopt approved Current Analysis；
 - 忽略 Analysis，直接 Human Resolve。
 
 ### `shadow`
 
-新 Dispute 创建唯一 Automatic Analysis并执行双阶段分析。approved 结果只供审阅，可由管理者显式 Adopt。`unresolved` 与 `failed` 保持 open。
+新 Dispute 创建 Current Analysis并执行双阶段分析。approved 结果只供审阅，可由管理者显式 Adopt。`unresolved` 与 `failed` 保持 open。
 
 ### `auto`
 
-新 Dispute 创建唯一 Automatic Analysis。双阶段通过且采用前输入稳定时形成 automatic Resolution。`unresolved`、`failed`、低置信或 Verification 不通过时保持 open。
+新 Dispute 创建 Current Analysis。双阶段通过、采用前输入稳定且 Maintainer 仍运行在 `auto` 时形成 automatic Resolution。管理者点击 Analyze 会替换 Current Analysis，新记录仍遵循 `auto` 的自动采用规则。`unresolved`、`failed`、低置信或 Verification 不通过时保持 open。
 
 Analysis 由有界、单 consumer 的持久事件调度器处理。Analysis 先落盘，再进入队列；请求在两步之间取消时会唤醒持久恢复扫描。队列容量只限制内存工作集，持久状态是恢复依据。每个执行阶段使用 lease token fencing，完成的 Proposal 与 Verification 在恢复时复用。
 
-Manual Analysis 被新的 Analyze 覆盖，或其 Dispute 被 Resolution 关闭时，执行中的 provider 调用会在短周期状态检查后被丢弃，不继续占用唯一 consumer；保存 Proposal、进入 Verification 和最终采用前都会再次确认当前 Analysis 槽与 open 状态。
+Current Analysis 被新的 Analyze 覆盖，或其 Dispute 被 Resolution 关闭时，执行中的 provider 调用会在短周期状态检查后被丢弃，不继续占用唯一 consumer；保存 Proposal、进入 Verification 和最终采用前都会再次确认 Analysis ID 与 open 状态。
 
 ## 冻结上下文与稳定输入判定
 
@@ -116,15 +117,17 @@ Router candidate 以 Claim 的稳定内容参与上下文与 fingerprint；其�
 
 direct mirror 暂未到齐时，Analysis 进入 `waiting_context` 并按有限预算重试上下文准备；该阶段不调用 LLM。Router 补充来源失败形成稳定 warning；完整治理 Policy 超过 context window 时 Analysis 进入 `failed`。
 
-## Automatic Analysis 的输入变化重分析
+## `auto` 模式的输入变化重分析
 
-该机制只作用于创建时模式为 `auto` 的 Automatic Analysis。
+只有创建时模式为 `auto` 且 Maintainer 当前仍运行在 `auto` 的 Current Analysis，才会在采用检查中新增输入变化重分析计划。已经持久化为 `waiting_reanalysis` 的轮次按原 `next_retry_at` 恢复，但在非 `auto` 模式下完成后不会自动采用。切换到 `shadow` 或 `manual` 会暂停尚未固定 Resolution intent 的自动采用；切回 `auto` 后可从同一持久记录恢复。创建于其他模式的 approved Analysis 不会因后来切到 `auto` 而被自动采用。
+
+从持久记录恢复时，原本要求管理者显式 Adopt 的 Analysis 继续保持该采用边界；当前运行模式不会把它改为自动采用。之后由管理者新建的 Current Analysis 按创建时模式运行。
 
 1. 第 1 轮 Analysis approved 后，采用前第一次发现 `context_changed`：保留第 1 轮，进入 `waiting_reanalysis`，在 5 分钟后开始第 2 轮。
 2. 第 2 轮 approved 后再次发现 `context_changed`：保留前两轮，在 15 分钟后开始第 3 轮。
 3. 第 3 轮 approved 后仍发现 `context_changed`：停止自动处理，Dispute 保持 open，状态说明为“分析输入连续变化，已停止自动处理，等待人工”。
 
-等待时间写入 `next_retry_at`，由持久调度器延迟队列管理；其他 Analysis 可以继续执行。Maintainer 重启后按同一个时间点恢复等待。一个 Automatic Analysis 最多运行三轮，不创建额外 Automatic/Manual Analysis，也不重复创建 Resolution、Policy 或 inbox。
+等待时间写入 `next_retry_at`，由持久调度器延迟队列管理；其他 Dispute 的 Analysis 可以继续执行。Maintainer 重启后按同一个时间点恢复等待。一个 Current Analysis 最多运行三轮，不创建额外 Analysis，也不重复创建 Resolution、Policy 或 inbox。
 
 每轮审计保存：
 
@@ -136,9 +139,9 @@ direct mirror 暂未到齐时，Analysis 进入 `waiting_context` 并按有限�
 
 `manual`、`shadow`、`enabled=false` 不使用自动输入变化重分析。`unresolved`、`failed`、低置信和 Verification 不通过也不会进入该流程。
 
-## Manual Analyze 与 Adopt
+## Analyze 与 Adopt
 
-`POST /api/disputes/{id}/analyses` 为 open Dispute 创建 Manual Analysis并覆盖该 Dispute 的现有 Manual Analysis 槽。它只运行 Proposal/Verification，不修改 Dispute、Policy、outbox 或当前 Resolution。
+`POST /api/disputes/{id}/analyses` 为 open Dispute 创建 Current Analysis，并原子覆盖原记录。覆盖前尚未提交的旧任务会被 Analysis ID fencing，不能回写。Analyze 本身不修改 Dispute、Policy、outbox 或当前 Resolution；新记录是否自动采用由创建时模式决定。
 
 管理 API：
 
@@ -147,7 +150,7 @@ direct mirror 暂未到齐时，Analysis 进入 `waiting_context` 并按有限�
 - `GET /api/disputes/{id}/analyses/{analysis_id}`
 - `POST /api/disputes/{id}/analyses/{analysis_id}/adopt`
 
-`GET /analyses` 返回可选的 Automatic Analysis 与可选的当前 Manual Analysis。被覆盖的 Manual Analysis 不形成产品历史或 chain。
+`GET /analyses` 只返回可选的 `current_analysis`。被覆盖的记录不形成产品历史或 chain，也不能继续 Adopt。
 
 Adopt 只接受双阶段通过、resolution type 非 unresolved、状态为 approved 的当前 Analysis：
 
@@ -167,7 +170,7 @@ Resolution 在提交前固定以下内容：
 
 - Dispute 与 direct Claim 快照；
 - resolution type、basis、conclusion 与 assessments；
-- 可选 Analysis source 与 semantic/context hash；
+- 可选来源 Analysis ID 与 semantic/context hash；
 - Policy、Maintainer action ID；
 - 每个 holder 的 inbox ID、target 与完整消息快照。
 
@@ -177,7 +180,7 @@ Resolution 在提交前固定以下内容：
 per-dispute lock → semantic-input 文件锁 → outbox 进程锁 → outbox 文件锁
 ```
 
-Resolution、Policy 和 outbox entry 都使用 create-or-verify 语义。相同 ID 和 immutable payload 幂等成功，不同 payload 报冲突。已经固定的人类 Resolution 优先于尚未提交的 Automatic Analysis。
+Resolution、Policy 和 outbox entry 都使用 create-or-verify 语义。相同 ID 和 immutable payload 幂等成功，不同 payload 报冲突。已经固定的人类 Resolution 优先于尚未提交的 Analysis。
 
 ## Agent 仲裁 Inbox 内化
 
@@ -191,10 +194,10 @@ direct_claims
 ```
 
 - `arbitration_message` 包含完整 Policy、Resolution、原始 Dispute 与 direct Claim 快照。
-- `local_claims` 是当前 Agent 全部非 deprecated 本地 Claim。
+- `local_claims` 是当前 Agent 全部非 deprecated 本地 Claim，并补入由当前 Agent 持有的任意 status direct Claim；这些 Claim 均可由当前 holder 修改。
 - `direct_claims` 是原 Dispute 的全部 direct Claim 快照，保留任意 status 与 holder。
 
-该调用不读取 Memory、USER、session transcript 或工具上下文。模型可以保持不变、更新本地输入中的 Claim、创建 Claim，或在发现新的实质冲突时报告新 Dispute。后端校验输出 JSON、占位符、ID 格式、当前 holder、更新目标确实存在于本地输入，以及 Claim/Dispute 基本领域约束；Claim/Policy source ID 不从 Memory 或隐藏上下文派生。
+该调用不读取 Memory、USER、session transcript 或工具上下文。模型先判断当前 Claim 是否已经符合 Resolution；已有等价、正确的非 deprecated 本地 Claim 时，不创建重复知识，错误 direct Claim可按 assessment 变为 deprecated；没有等价本地替代且属于同一知识单元时，优先原地更新 direct Claim；只有无法由现有 Claim 准确表达的独立、可复用知识单元才创建新 Claim。没有必要变更时可以保持不变，不能为了记录 Resolution 或提高可观察性而制造更新。模型也可在发现新的实质冲突时报告新 Dispute。后端校验输出 JSON、占位符、ID 格式、当前 holder、更新目标确实存在于本地输入，以及 Claim/Dispute 基本领域约束；Claim/Policy source ID 不从 Memory 或隐藏上下文派生。
 
 每条消息在 `<agent_home>/inbox/effects/<inbox_id>.yaml` 保存稳定 Effect Journal：
 
@@ -229,14 +232,14 @@ Observation 只用于治理可见性，不触发 Analysis、Resolution、通知�
 ## Workbench
 
 - Dispute 列表把 open 放在 resolved 前，组内按时间倒序。
-- 详情展示原始 Dispute、可选 Automatic Analysis、单一 Manual Analysis、当前 Resolution 与 holder adoption。
+- 详情展示原始 Dispute、可选 Current Analysis、当前 Resolution 与 holder adoption。
 - open Dispute 提供 Analyze 与 Human Resolve；approved Analysis 提供 Adopt。
-- Automatic Analysis 等待重分析时展示轮次、5/15 分钟等待、下次重试时间与原因。
+- `auto` 模式的 Current Analysis 等待重分析时展示轮次、5/15 分钟等待、下次重试时间与原因。
 - 第三次输入变化后展示“分析输入连续变化，已停止自动处理，等待人工”。
-- resolved Dispute 以当前 Resolution 为主，Analysis 作为只读审计信息。
+- open Dispute 直接展示 Analysis，供管理者参考 unresolved 分析；resolved Dispute 优先展示当前 Resolution，并默认收起 Analysis 过程，按需展开审阅。
 - Direct Claim、Analysis 与 Resolution 使用明确的视觉分区；Resolution assessment 标为治理建议，不与 Claim 当前状态混淆。
 - Delivery & Holder Adoption 默认折叠；展开后按 holder 展示 Resolution 时的 Claim 快照与当前 mirror，重点呈现 Agent 的实际内化结果，不以是否逐字段遵循建议作为界面评价。
-- 页面展示唯一 Automatic Analysis、当前 Manual Analysis 与当前 Resolution。
+- 页面只展示一个 Current Analysis 与当前 Resolution。
 
 ## 配置
 
@@ -258,11 +261,11 @@ Proposal 与 Verification 使用同一份 Maintainer LLM 配置，但执行两�
 
 - 三种启用模式与 `enabled=false` 的上报、Analyze、Adopt、Human Resolve 行为符合上述定义。
 - 稳定输入判定对真实知识变化敏感，对 Router candidate lifecycle 派生元数据和运行噪声保持稳定。
-- Automatic Analysis 最多三轮；5/15 分钟等待持久、可恢复且不阻塞其他 job。
+- `auto` 模式的 Current Analysis 最多三轮；5/15 分钟等待持久、可恢复且不阻塞其他 job。
 - 三轮 fingerprint、Proposal、Verification、时间与变化原因完整保留。
-- Manual Analyze 覆盖单一槽，不产生 history/chain；Adopt 不重新调用模型。
+- Analyze 覆盖 Current Analysis，不产生 history/chain；Adopt 不重新调用模型。
 - Resolution 与投递 ID 在并发、请求取消、进程重启和部分 outbox 写入后保持幂等。
 - pending delivery 退避恢复；ACK、Claim upload 与 Resolution switch 只刷新相关当前 Resolution；旧 observation cache 保持冻结。
-- Agent 仲裁调用只收到完整消息、非 deprecated 本地 Claim 与全部 direct Claim，不读取 Memory；Effect Journal 崩溃恢复不重复调用模型。
+- Agent 仲裁调用只收到完整消息、非 deprecated 本地 Claim、当前 holder 持有的任意状态 direct Claim 与全部 direct Claim，不读取 Memory；当前 holder 可修改自己实际持有的 direct Claim，Effect Journal 崩溃恢复不重复调用模型。
 - Workbench 在 Resolution 提交后立即刷新当前 Dispute、Analysis 与 Resolution 视图。
 - Rust 与 Workbench 的格式、静态检查、测试、构建及独立 code review 通过。

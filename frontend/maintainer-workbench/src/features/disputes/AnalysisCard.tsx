@@ -55,7 +55,6 @@ export function AnalysisCard({ analysis, label, onAdopt, adopting = false, compa
           <div className="mt-1 break-all font-mono text-[11px] text-slate-700">{analysis.analysis_id}</div>
         </div>
         <div className="flex flex-wrap gap-1.5">
-          <StatusBadge tone={analysis.source === 'automatic' ? 'info' : 'neutral'}>{analysis.source}</StatusBadge>
           <StatusBadge>{formatValue(analysis.state)}</StatusBadge>
         </div>
       </div>
@@ -220,7 +219,7 @@ export function AnalysisCard({ analysis, label, onAdopt, adopting = false, compa
 
       {!compact && detail?.rounds?.length ? (
         <details className="mt-3 rounded-md border border-slate-200 bg-slate-50 p-2.5 text-xs">
-          <summary className="cursor-pointer font-medium text-slate-700">Automatic analysis rounds ({detail.rounds.length})</summary>
+          <summary className="cursor-pointer font-medium text-slate-700">Analysis rounds ({detail.rounds.length})</summary>
           <div className="mt-2 space-y-2">
             {detail.rounds.map((round) => (
               <div key={`${round.round}:${round.semantic_fingerprint}`} className="rounded bg-white p-2">

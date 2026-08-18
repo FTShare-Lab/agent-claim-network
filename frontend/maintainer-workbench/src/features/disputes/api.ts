@@ -30,7 +30,7 @@ export function getAnalysis(id: string, analysisId: string) {
   return apiClient.get<ArbitrationAnalysisDetail>(`/api/disputes/${id}/analyses/${analysisId}`)
 }
 
-export function createManualAnalysis(id: string) {
+export function createAnalysis(id: string) {
   return apiClient.post<ArbitrationAnalysisSummary>(`/api/disputes/${id}/analyses`, {})
 }
 

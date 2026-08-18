@@ -257,14 +257,14 @@ describe('public demo data contract', () => {
     const analyses = await requestStaticDemoData<AnalysisListResponse>(
       `/api/disputes/${resolved!.id}/analyses`,
     )
-    const analysisId = analyses.automatic_analysis!.analysis_id
+    const analysisId = analyses.current_analysis!.analysis_id
     expect(analysisId).toMatch(ID_PATTERNS.analysis)
     const analysis = await requestStaticDemoData<ArbitrationAnalysisDetail>(
       `/api/disputes/${resolved!.id}/analyses/${analysisId}`,
     )
 
     expect(detail.resolution).toEqual(resolved!.resolution)
-    expect(detail.automatic_analysis).toEqual(analyses.automatic_analysis)
+    expect(detail.current_analysis).toEqual(analyses.current_analysis)
     expect(detail.holder_adoption?.summary.converged).toBe(1)
     expect(analysis.analysis_id).toBe(analysisId)
     expect(analysis.resolution_id).toBe(resolved!.resolution!.resolution_id)

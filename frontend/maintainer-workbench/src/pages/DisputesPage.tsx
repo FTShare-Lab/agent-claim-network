@@ -16,7 +16,7 @@ import {
   useAdoptAnalysisMutation,
   useAnalysesQuery,
   useAnalysisDetailQuery,
-  useCreateManualAnalysisMutation,
+  useCreateAnalysisMutation,
   useDisputeDetailQuery,
   useDisputesQuery,
   useRejectResolutionMutation,
@@ -85,21 +85,21 @@ function analyzeResultMessage(analysis: ArbitrationAnalysisSummary) {
   if (analysis.state === 'failed') {
     const failure = analysis.error
       ? `${analysis.error.code}: ${analysis.error.message}`
-      : 'Open the manual analysis to inspect the failure.'
-    return { isError: true, text: `Manual analysis failed · ${label}. ${failure}` }
+      : 'Open the analysis to inspect the failure.'
+    return { isError: true, text: `Analysis failed · ${label}. ${failure}` }
   }
   if (analysis.state === 'approved') {
     return {
       isError: false,
       text: analysis.adoptable
-        ? `Manual analysis completed and can be adopted · ${label}.`
-        : `Manual analysis completed · ${label}.`,
+        ? `Analysis completed and can be adopted · ${label}.`
+        : `Analysis completed · ${label}.`,
     }
   }
   if (analysis.state === 'unresolved') {
-    return { isError: false, text: `Manual analysis completed as unresolved · ${label}.` }
+    return { isError: false, text: `Analysis completed as unresolved · ${label}.` }
   }
-  return { isError: false, text: `Manual analysis started · ${label}.` }
+  return { isError: false, text: `Analysis started · ${label}.` }
 }
 
 function arbitrationMutationError(error: unknown, conflictMessage: string) {
@@ -268,7 +268,7 @@ export function DisputesPage() {
   const { data: disputes = [], isLoading, error } = useDisputesQuery()
   const { data: claims = [], isLoading: claimsLoading } = useClaimsQuery()
   const resolveMutation = useResolveDisputeMutation()
-  const analyzeMutation = useCreateManualAnalysisMutation()
+  const analyzeMutation = useCreateAnalysisMutation()
   const adoptMutation = useAdoptAnalysisMutation()
   const rejectMutation = useRejectResolutionMutation()
   const claimNameMap = useMemo(() => new Map(claims.map((claim) => [claim.claim.id, claim.claim.name])), [claims])
@@ -320,27 +320,19 @@ export function DisputesPage() {
   const disputeDetail = useDisputeDetailQuery(selectedDisputeId)
   const analyses = useAnalysesQuery(selectedDisputeId)
   const selectedDispute = disputeDetail.data ?? selectedDisputeFromList
-  const automaticAnalysisSummary = analyses.data
-    ? analyses.data.automatic_analysis ?? undefined
-    : disputeDetail.data?.automatic_analysis ?? undefined
-  const manualAnalysisSummary = analyses.data
-    ? analyses.data.manual_analysis ?? undefined
-    : disputeDetail.data?.manual_analysis ?? undefined
-  const automaticAnalysisDetail = useAnalysisDetailQuery(
+  const currentAnalysisSummary = analyses.data
+    ? analyses.data.current_analysis ?? undefined
+    : disputeDetail.data?.current_analysis ?? undefined
+  const currentAnalysisDetail = useAnalysisDetailQuery(
     selectedDisputeId,
-    automaticAnalysisSummary?.analysis_id,
+    currentAnalysisSummary?.analysis_id,
   )
-  const manualAnalysisDetail = useAnalysisDetailQuery(
-    selectedDisputeId,
-    manualAnalysisSummary?.analysis_id,
-  )
-  const automaticAnalysis = automaticAnalysisDetail.data ?? automaticAnalysisSummary
-  const manualAnalysis = manualAnalysisDetail.data ?? manualAnalysisSummary
+  const currentAnalysis = currentAnalysisDetail.data ?? currentAnalysisSummary
   const selectedClaim = drawerState?.current.type === 'claim' ? claims.find((item) => item.claim.id === drawerState.current.id) ?? null : null
   const selectedAnalyzeNotice = (() => {
     if (!analyzeNotice || analyzeNotice.disputeId !== selectedDispute?.id) return null
-    const current = manualAnalysisSummary?.analysis_id === analyzeNotice.result.analysis_id
-      ? manualAnalysisSummary
+    const current = currentAnalysisSummary?.analysis_id === analyzeNotice.result.analysis_id
+      ? currentAnalysisSummary
       : analyzeNotice.result
     return analyzeResultMessage(current)
   })()
@@ -444,7 +436,7 @@ export function DisputesPage() {
         setAnalyzeNotice(null)
         setArbitrationError(arbitrationMutationError(
           err,
-          'Manual analysis could not be started because the dispute state changed.',
+          'Analysis could not be started because the dispute state changed.',
         ))
       },
     })
@@ -494,6 +486,25 @@ export function DisputesPage() {
       )),
     })
   }
+
+  const currentAnalysisContent = (
+    <>
+      {analyses.isLoading && !currentAnalysis ? <div className="text-xs text-slate-500">Loading current analysis…</div> : null}
+      {analyses.error ? <div className="text-xs text-rose-700">{String(analyses.error)}</div> : null}
+      {currentAnalysisDetail.error ? <div className="text-xs text-rose-700">{String(currentAnalysisDetail.error)}</div> : null}
+      {currentAnalysis ? (
+        <AnalysisCard
+          analysis={currentAnalysis}
+          label="Current analysis"
+          onAdopt={selectedDispute?.status === 'open' ? adoptSelectedAnalysis : undefined}
+          adopting={adoptMutation.isPending && adoptingAnalysisId === currentAnalysis.analysis_id}
+          resolutionClosed={selectedDispute?.status === 'resolved'}
+        />
+      ) : (
+        <div className="text-xs text-slate-500">No analysis is recorded for this dispute.</div>
+      )}
+    </>
+  )
 
   if (isLoading) return <div className="rounded-lg border border-slate-200 bg-white p-6 text-sm text-slate-500">Loading disputes…</div>
   if (error) return <div className="rounded-lg border border-rose-200 bg-rose-50 p-6 text-sm text-rose-700">{String(error)}</div>
@@ -680,47 +691,23 @@ export function DisputesPage() {
             <DrawerSection title="Summary">
               <div className="whitespace-pre-wrap text-sm leading-6 text-slate-800">{selectedDispute.summary}</div>
             </DrawerSection>
-            <DrawerSection title="Automatic Analysis" tone="analysis">
-              {analyses.isLoading && !automaticAnalysis ? <div className="text-xs text-slate-500">Loading automatic analysis…</div> : null}
-              {analyses.error ? <div className="text-xs text-rose-700">{String(analyses.error)}</div> : null}
-              {automaticAnalysisDetail.error ? <div className="text-xs text-rose-700">{String(automaticAnalysisDetail.error)}</div> : null}
-              <div>
-                {automaticAnalysis ? (
-                  <AnalysisCard
-                    analysis={automaticAnalysis}
-                    label="Automatic analysis"
-                    onAdopt={selectedDispute.status === 'open' ? adoptSelectedAnalysis : undefined}
-                    adopting={adoptMutation.isPending && adoptingAnalysisId === automaticAnalysis.analysis_id}
-                    resolutionClosed={selectedDispute.status === 'resolved'}
-                  />
-                ) : (
-                  <div className="text-xs text-slate-500">No automatic analysis is recorded for this dispute.</div>
-                )}
-              </div>
-            </DrawerSection>
-            <DrawerSection title="Manual Analysis" tone="analysis">
-              {manualAnalysisDetail.error ? <div className="text-xs text-rose-700">{String(manualAnalysisDetail.error)}</div> : null}
-              <div>
-                {manualAnalysis ? (
-                  <AnalysisCard
-                    analysis={manualAnalysis}
-                    label="Manual analysis"
-                    onAdopt={selectedDispute.status === 'open' ? adoptSelectedAnalysis : undefined}
-                    adopting={adoptMutation.isPending && adoptingAnalysisId === manualAnalysis.analysis_id}
-                    resolutionClosed={selectedDispute.status === 'resolved'}
-                  />
-                ) : (
-                  <div className="text-xs text-slate-500">No human-triggered analysis has been recorded.</div>
-                )}
-              </div>
-            </DrawerSection>
-            <DrawerSection title="Current Resolution" tone="resolution">
-              {selectedDispute.resolution ? (
+            {selectedDispute.resolution ? (
+              <DrawerSection title="Current Resolution" tone="resolution">
                 <ResolutionDetail resolution={selectedDispute.resolution} />
-              ) : (
-                <div className="text-xs text-slate-500">No resolution has closed this dispute.</div>
-              )}
-            </DrawerSection>
+              </DrawerSection>
+            ) : null}
+            {selectedDispute.status === 'open' || currentAnalysis ? (
+              <DrawerSection title="Current Analysis" tone="analysis">
+                {selectedDispute.status === 'resolved' ? (
+                  <details className="rounded-lg border border-violet-200 bg-white p-3">
+                    <summary className="cursor-pointer text-xs font-semibold text-violet-800">
+                      View analysis process · {formatResolutionValue(currentAnalysis?.state)}
+                    </summary>
+                    <div className="mt-3">{currentAnalysisContent}</div>
+                  </details>
+                ) : currentAnalysisContent}
+              </DrawerSection>
+            ) : null}
             <HolderAdoptionPanel adoption={disputeDetail.data?.holder_adoption} />
             {selectedDispute.resolution?.resolved_by === 'automatic' ? (
               <div className="rounded-lg border border-amber-200 bg-amber-50 p-3">

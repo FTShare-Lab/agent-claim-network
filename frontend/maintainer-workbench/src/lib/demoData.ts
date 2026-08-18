@@ -195,7 +195,6 @@ const demoRouterResolution: DisputeResolution = {
 }
 const demoRouterAnalysis: ArbitrationAnalysisSummary = {
   analysis_id: IDS.analyses.routerAuthority,
-  source: 'automatic',
   state: 'adopted',
   created_at: ago({ days: 1, hours: 4 }),
   updated_at: demoRouterResolvedAt,
@@ -471,7 +470,7 @@ const demoOutbox: OutboxEntry[] = [
 const demoAnalysisLists: Record<string, AnalysisListResponse> = {
   [IDS.disputes.retryBoundary]: {},
   [IDS.disputes.routerAuthority]: {
-    automatic_analysis: demoRouterAnalysis,
+    current_analysis: demoRouterAnalysis,
   },
 }
 const demoRouterAnalysisDetail: ArbitrationAnalysisDetail = {
@@ -514,7 +513,7 @@ const demoDisputeDetails: Record<string, DisputeDetail> = {
   [IDS.disputes.retryBoundary]: demoDisputes[0],
   [IDS.disputes.routerAuthority]: {
     ...demoDisputes[1],
-    automatic_analysis: demoRouterAnalysis,
+    current_analysis: demoRouterAnalysis,
     holder_adoption: {
       observed_at: ago({ hours: 12 }),
       summary: {

@@ -71,9 +71,8 @@ const proposal = {
   reasoning: 'The scopes and environments are directly comparable.',
 }
 
-const automaticAnalysis: ArbitrationAnalysisSummary = {
-  analysis_id: 'analysis_automatic',
-  source: 'automatic',
+const unresolvedAnalysis: ArbitrationAnalysisSummary = {
+  analysis_id: 'analysis_unresolved',
   state: 'unresolved',
   created_at: createdAt,
   updated_at: '2026-05-15T10:05:00Z',
@@ -83,9 +82,8 @@ const automaticAnalysis: ArbitrationAnalysisSummary = {
   adoption_blocker: 'The verification result is unresolved.',
 }
 
-const manualAnalysis: ArbitrationAnalysisSummary = {
-  analysis_id: 'analysis_manual_latest',
-  source: 'manual',
+const approvedAnalysis: ArbitrationAnalysisSummary = {
+  analysis_id: 'analysis_approved',
   state: 'approved',
   created_at: '2026-05-15T11:00:00Z',
   updated_at: '2026-05-15T11:04:00Z',
@@ -173,10 +171,9 @@ const longCurrentStatement = '当前镜像中的知识陈述保留了旧版本�
 
 const resolvedDetail: DisputeDetail = {
   ...resolvedDispute,
-  automatic_analysis: {
-    ...manualAnalysis,
-    analysis_id: 'analysis_resolved_automatic',
-    source: 'automatic',
+  current_analysis: {
+    ...approvedAnalysis,
+    analysis_id: 'analysis_resolved',
     // 模拟 Adopt 后仍残留在客户端缓存里的旧 approved 摘要。已 resolved 时
     // 页面必须以 Resolution 为准，不能继续展示旧采用阻挡信息。
     state: 'approved',
@@ -276,7 +273,7 @@ function buildFetch(overrides?: {
   createAnalysis?: Response
   adopt?: Response
   resolvedDetail?: DisputeDetail
-  manualMode?: boolean
+  currentAnalysis?: ArbitrationAnalysisSummary | null
 }) {
   return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = typeof input === 'string' ? input : input.toString()
@@ -287,8 +284,9 @@ function buildFetch(overrides?: {
     if (path === '/api/disputes/dispute_open' && method === 'GET') {
       return new Response(JSON.stringify({
         ...openDispute,
-        automatic_analysis: overrides?.manualMode ? null : automaticAnalysis,
-        manual_analysis: manualAnalysis,
+        current_analysis: overrides && 'currentAnalysis' in overrides
+          ? overrides.currentAnalysis
+          : approvedAnalysis,
       }))
     }
     if (path === '/api/disputes/dispute_resolved' && method === 'GET') {
@@ -296,8 +294,8 @@ function buildFetch(overrides?: {
     }
     if (path === '/api/disputes/dispute_open/analyses' && method === 'POST') {
       return overrides?.createAnalysis ?? new Response(JSON.stringify({
-        ...manualAnalysis,
-        analysis_id: 'analysis_manual_started',
+        ...approvedAnalysis,
+        analysis_id: 'analysis_started',
         state: 'pending',
         proposal: undefined,
         adoptable: false,
@@ -306,28 +304,28 @@ function buildFetch(overrides?: {
     }
     if (path === '/api/disputes/dispute_open/analyses' && method === 'GET') {
       return new Response(JSON.stringify({
-        automatic_analysis: overrides?.manualMode ? null : automaticAnalysis,
-        manual_analysis: manualAnalysis,
+        current_analysis: overrides && 'currentAnalysis' in overrides
+          ? overrides.currentAnalysis
+          : approvedAnalysis,
       }))
     }
     if (path === '/api/disputes/dispute_resolved/analyses' && method === 'GET') {
       return new Response(JSON.stringify({
-        automatic_analysis: resolvedDetail.automatic_analysis,
-        manual_analysis: null,
+        current_analysis: resolvedDetail.current_analysis,
       }))
     }
     const analysisMatch = path.match(/^\/api\/disputes\/dispute_(open|resolved)\/analyses\/([^/]+)$/)
     if (analysisMatch && method === 'GET') {
       const analysisId = analysisMatch[2]
       const analysis = [
-        automaticAnalysis,
-        manualAnalysis,
-        resolvedDetail.automatic_analysis!,
+        unresolvedAnalysis,
+        approvedAnalysis,
+        resolvedDetail.current_analysis!,
       ].find((item) => item.analysis_id === analysisId)
       if (!analysis) return new Response('analysis not found', { status: 404 })
       return new Response(JSON.stringify(analysisDetail(analysis)))
     }
-    if (path === '/api/disputes/dispute_open/analyses/analysis_manual_latest/adopt' && method === 'POST') {
+    if (path === '/api/disputes/dispute_open/analyses/analysis_approved/adopt' && method === 'POST') {
       return overrides?.adopt ?? new Response(JSON.stringify({
         resolution_id: 'resolution_adopted',
         dispute_id: 'dispute_open',
@@ -335,7 +333,7 @@ function buildFetch(overrides?: {
         resolution: { ...resolution, resolution_id: 'resolution_adopted', resolved_by: 'human' },
         dispute_snapshot: openDispute,
         direct_claim_snapshots: claimsResponse.map((item) => item.claim),
-        analysis_source_id: manualAnalysis.analysis_id,
+        analysis_source_id: approvedAnalysis.analysis_id,
       }), { status: 201 })
     }
     if (path === '/disputes/dispute_open/resolve' && method === 'POST') {
@@ -391,36 +389,37 @@ describe('DisputesPage', () => {
     expect(details).not.toHaveTextContent('"statement":')
   })
 
-  it('shows one automatic analysis and the single current manual analysis', async () => {
+  it('shows exactly one current unresolved analysis without source categories', async () => {
+    vi.stubGlobal('fetch', buildFetch({ currentAnalysis: unresolvedAnalysis }))
     render(renderWorkbenchRoute('/disputes'))
     fireEvent.click(await screen.findByText('Scope mismatch'))
     const drawer = await screen.findByRole('dialog', { name: 'Scope mismatch' })
 
-    const automatic = await within(drawer).findByRole('article', { name: 'Automatic analysis analysis_automatic' })
-    expect(automatic).toHaveTextContent('unresolved')
-    expect(automatic).toHaveTextContent('不建议修改 Claim')
-    expect(within(automatic).queryByText(/Direct Claim assessments/)).not.toBeInTheDocument()
-    expect(within(automatic).queryByRole('button', { name: '采用此分析' })).not.toBeInTheDocument()
-    fireEvent.click(await within(automatic).findByText('Analysis context summary'))
-    expect(automatic).toHaveTextContent('Related Claims in context2')
-    expect(automatic).not.toHaveTextContent('Router candidates')
-    expect(await within(drawer).findByRole('article', { name: 'Manual analysis analysis_manual_latest' })).toHaveTextContent('approved')
-    expect(within(drawer).queryByRole('button', { name: /manual analysis history/i })).not.toBeInTheDocument()
+    const current = await within(drawer).findByRole('article', { name: 'Current analysis analysis_unresolved' })
+    expect(current).toHaveTextContent('unresolved')
+    expect(current).toHaveTextContent('不建议修改 Claim')
+    expect(within(current).queryByText(/Direct Claim assessments/)).not.toBeInTheDocument()
+    expect(within(current).queryByRole('button', { name: '采用此分析' })).not.toBeInTheDocument()
+    fireEvent.click(await within(current).findByText('Analysis context summary'))
+    expect(current).toHaveTextContent('Related Claims in context2')
+    expect(current).not.toHaveTextContent('Router candidates')
+    expect(drawer).not.toHaveTextContent('Automatic Analysis')
+    expect(drawer).not.toHaveTextContent('Manual Analysis')
     expect(within(drawer).queryByText('Attempt Timeline')).not.toBeInTheDocument()
   })
 
-  it('keeps Analyze and Human Resolve available when manual mode has no automatic analysis', async () => {
-    vi.stubGlobal('fetch', buildFetch({ manualMode: true }))
+  it('keeps Analyze and Human Resolve available when no current analysis exists', async () => {
+    vi.stubGlobal('fetch', buildFetch({ currentAnalysis: null }))
     render(renderWorkbenchRoute('/disputes'))
     fireEvent.click(await screen.findByText('Scope mismatch'))
     const drawer = await screen.findByRole('dialog', { name: 'Scope mismatch' })
 
-    expect(await within(drawer).findByText('No automatic analysis is recorded for this dispute.')).toBeInTheDocument()
+    expect(await within(drawer).findByText('No analysis is recorded for this dispute.')).toBeInTheDocument()
     expect(within(drawer).getByRole('button', { name: 'Analyze' })).toBeEnabled()
     expect(within(drawer).getByRole('button', { name: 'Resolve Dispute' })).toBeEnabled()
   })
 
-  it('creates an explicit manual analysis and reports that it started', async () => {
+  it('creates a replacement current analysis and reports that it started', async () => {
     render(renderWorkbenchRoute('/disputes'))
     fireEvent.click(await screen.findByText('Scope mismatch'))
     fireEvent.click(await screen.findByRole('button', { name: 'Analyze' }))
@@ -429,15 +428,15 @@ describe('DisputesPage', () => {
       '/api/disputes/dispute_open/analyses',
       expect.objectContaining({ method: 'POST', body: '{}' }),
     ))
-    expect(await screen.findByRole('status')).toHaveTextContent('Manual analysis started')
-    expect(screen.getByRole('status')).toHaveTextContent('analysis_manual_started')
+    expect(await screen.findByRole('status')).toHaveTextContent('Analysis started')
+    expect(screen.getByRole('status')).toHaveTextContent('analysis_started')
   })
 
   it('updates Analyze feedback when polling reaches a terminal state', async () => {
     const fallbackFetch = buildFetch()
     const startedAnalysis: ArbitrationAnalysisSummary = {
-      ...manualAnalysis,
-      analysis_id: 'analysis_manual_started',
+      ...approvedAnalysis,
+      analysis_id: 'analysis_started',
       state: 'pending',
       created_at: '2026-05-15T12:00:00Z',
       updated_at: '2026-05-15T12:00:00Z',
@@ -462,13 +461,12 @@ describe('DisputesPage', () => {
       }
       if (analysisStarted && path === '/api/disputes/dispute_open/analyses' && method === 'GET') {
         return new Response(JSON.stringify({
-          automatic_analysis: automaticAnalysis,
-          manual_analysis: failedAnalysis,
+          current_analysis: failedAnalysis,
         }))
       }
       if (
         analysisStarted
-        && path === '/api/disputes/dispute_open/analyses/analysis_manual_started'
+        && path === '/api/disputes/dispute_open/analyses/analysis_started'
         && method === 'GET'
       ) {
         return new Response(JSON.stringify(analysisDetail(failedAnalysis)))
@@ -481,12 +479,12 @@ describe('DisputesPage', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Analyze' }))
 
     const feedback = await screen.findByRole('alert')
-    expect(feedback).toHaveTextContent('Manual analysis failed')
+    expect(feedback).toHaveTextContent('Analysis failed')
     expect(feedback).toHaveTextContent('provider_timeout')
-    expect(feedback).toHaveTextContent('analysis_manual_started')
+    expect(feedback).toHaveTextContent('analysis_started')
   })
 
-  it('shows a manual Analyze conflict inline', async () => {
+  it('shows an Analyze conflict inline', async () => {
     vi.stubGlobal('fetch', buildFetch({ createAnalysis: new Response('analysis scheduler is unavailable', { status: 409 }) }))
     render(renderWorkbenchRoute('/disputes'))
     fireEvent.click(await screen.findByText('Scope mismatch'))
@@ -501,7 +499,7 @@ describe('DisputesPage', () => {
     fireEvent.click(await screen.findByRole('button', { name: '采用此分析' }))
 
     await waitFor(() => expect(fetch).toHaveBeenCalledWith(
-      '/api/disputes/dispute_open/analyses/analysis_manual_latest/adopt',
+      '/api/disputes/dispute_open/analyses/analysis_approved/adopt',
       expect.objectContaining({ method: 'POST', body: '{}' }),
     ))
     expect(await screen.findByRole('status')).toHaveTextContent('Analysis adopted as resolution resolution_adopted')
@@ -532,7 +530,7 @@ describe('DisputesPage', () => {
     })
   })
 
-  it('shows the current resolution without a chain or cached adoption blocker', async () => {
+  it('prioritizes the current resolution and collapses resolved analysis details', async () => {
     render(renderWorkbenchRoute('/disputes'))
     fireEvent.click(await screen.findByText('Already resolved'))
     const drawer = await screen.findByRole('dialog', { name: 'Already resolved' })
@@ -547,6 +545,14 @@ describe('DisputesPage', () => {
     expect(within(drawer).queryByText('Dispute 已经被其他 Decision 解决')).not.toBeInTheDocument()
     expect(within(drawer).queryByRole('button', { name: 'Analyze' })).not.toBeInTheDocument()
     expect(within(drawer).queryByRole('button', { name: 'Resolve Dispute' })).not.toBeInTheDocument()
+
+    const analysisToggle = within(drawer).getByText(/View analysis process/)
+    const collapsedAnalysis = analysisToggle.closest('details')
+    expect(collapsedAnalysis).not.toHaveAttribute('open')
+
+    fireEvent.click(analysisToggle)
+    expect(collapsedAnalysis).toHaveAttribute('open')
+    expect(within(drawer).getByRole('article', { name: 'Current analysis analysis_resolved' })).toBeInTheDocument()
   })
 
   it('summarizes observed updates without scoring recommendation compliance', async () => {
@@ -555,6 +561,7 @@ describe('DisputesPage', () => {
     const panel = await screen.findByRole('region', { name: 'Delivery and holder adoption' })
 
     await waitFor(() => expect(panel).toHaveTextContent('Notified5'))
+    expect(panel).toHaveClass('border-amber-700', 'bg-amber-50/40')
     expect(panel).toHaveTextContent('Delivered4')
     expect(panel).toHaveTextContent('Observed updates2')
     expect(panel).toHaveTextContent('Awaiting update1')
@@ -564,10 +571,10 @@ describe('DisputesPage', () => {
     expect(within(panel).queryByText('agent-diverged')).not.toBeInTheDocument()
 
     fireEvent.click(within(panel).getByRole('button', { name: 'Show holder adoption' }))
-    expect(within(panel).getByText('尚未送达')).toBeInTheDocument()
-    expect(within(panel).getByText('已送达，等待 Agent 更新')).toBeInTheDocument()
-    expect(within(panel).getAllByText('已观察到 Agent 更新')).toHaveLength(2)
-    expect(within(panel).getByText('当前 Claim mirror 不可用')).toBeInTheDocument()
+    expect(within(panel).getByText('Awaiting delivery')).toBeInTheDocument()
+    expect(within(panel).getByText('Delivered, awaiting Agent update')).toBeInTheDocument()
+    expect(within(panel).getAllByText('Agent update observed')).toHaveLength(2)
+    expect(within(panel).getByText('Claim mirror unavailable')).toBeInTheDocument()
   })
 
   it('renders Claim snapshots before and after Agent internalization', async () => {
@@ -593,7 +600,7 @@ describe('DisputesPage', () => {
     fireEvent.click(within(comparison).getByRole('button', { name: '收起全文' }))
     expect(comparison).not.toHaveTextContent(longSnapshotStatement)
 
-    fireEvent.click(within(holder).getByText('技术详情'))
+    fireEvent.click(within(holder).getByText('Technical details'))
     expect(holder).toHaveTextContent('Policy ID:')
     expect(holder).toHaveTextContent('policy_resolution')
     expect(holder).not.toHaveTextContent('"policy_id"')

@@ -21,11 +21,10 @@ pub use service::{
 };
 pub use store::ArbitrationStore;
 pub use types::{
-    AnalysisError, AnalysisJob, AnalysisLease, AnalysisPhase, AnalysisSource, AnalysisState,
+    AnalysisError, AnalysisJob, AnalysisLease, AnalysisPhase, AnalysisRound, AnalysisState,
     ArbitrationAnalysis, ArbitrationAnalysisId, ArbitrationProposal, ArbitrationResolutionRecord,
-    ArbitrationVerification, AutomaticAnalysisRound, ClaimAssessmentVerification, ClaimObservation,
-    ContextWarning, DeliveryIntent, FrozenArbitrationContext, HolderObservation,
-    MaintainerDisputeRecord, ObservationState, PendingResolutionDelivery, ResolutionEventTarget,
-    ResolutionObservation,
+    ArbitrationVerification, ClaimAssessmentVerification, ClaimObservation, ContextWarning,
+    DeliveryIntent, FrozenArbitrationContext, HolderObservation, MaintainerDisputeRecord,
+    ObservationState, PendingResolutionDelivery, ResolutionEventTarget, ResolutionObservation,
 };
 pub use worker::{spawn_arbitration_scheduler, ArbitrationScheduler};

@@ -300,8 +300,8 @@ acn session cleanup --apply
 
 团队模式下，Maintainer endpoint 同时提供知识管理页面。它用于查看 claim、dispute、policy、agent、outbox/send log、stale sweep、Router 查询和 HTTP audit。管理员鉴权与团队 key 配置见 [配置参数](config_parameters.md)。
 
-`manual` 下新 Dispute 只保存为 open，等待管理者 Analyze 或 Human Resolve；`shadow`/`auto` 会创建唯一 Automatic Analysis。详情页同时显示可选 Automatic Analysis、单一 Manual Analysis 和当前 Resolution。再次 Analyze 会覆盖 Manual Analysis 槽，不形成历史列表。approved Analysis 可以 Adopt；Adopt 会复核当前输入，不重新调用模型。
+`manual` 下新 Dispute 只保存为 open，等待管理者 Analyze 或 Human Resolve；`shadow`/`auto` 会创建 Current Analysis。每个 Dispute 始终只展示一个 Current Analysis；再次 Analyze 会原子替换它，不形成历史列表。approved Analysis 可以 Adopt；Adopt 会复核当前输入，不重新调用模型。`auto` 下显式 Analyze 创建的新记录仍遵循自动采用规则；切换到其他模式会暂停尚未固定 Resolution intent 的自动采用。
 
-`auto` 采用前若发现分析输入变化，页面显示第几轮、5 分钟或 15 分钟等待、下次重试时间和原因；第三轮仍变化时停止自动处理并等待人工。resolved Dispute 以当前 Resolution 为主，Analysis 作为只读审计信息。详情页以不同视觉分区区分 Direct Claim、Analysis 与 Resolution；Resolution assessment 明确标为治理建议，不冒充 Claim 当前状态。Analysis context summary 中的 `Related Claims in context` 是冻结上下文中实际提供给模型的相关 Claim 数量。`Delivery & Holder Adoption` 默认折叠，可展开对照 Resolution 时的 Claim 快照与当前 holder mirror，查看 Agent 实际如何内化。Automatic Resolution 可通过 Reject & Replace 更新为人工 Resolution。
+`auto` 采用前若发现分析输入变化，页面显示第几轮、5 分钟或 15 分钟等待、下次重试时间和原因；第三轮仍变化时停止自动处理并等待人工。open Dispute 会直接展示 Analysis，便于人类参考 unresolved 结果继续判断；resolved Dispute 优先展示当前 Resolution，并默认收起重复的 Analysis 过程，管理者需要时可以展开审阅。详情页以不同视觉分区区分 Direct Claim、Analysis 与 Resolution；Resolution assessment 明确标为治理建议，不冒充 Claim 当前状态。Analysis context summary 中的 `Related Claims in context` 是冻结上下文中实际提供给模型的相关 Claim 数量。`Delivery & Holder Adoption` 默认折叠，可展开对照 Resolution 时的 Claim 快照与当前 holder mirror，查看 Agent 实际如何内化。Automatic Resolution 可通过 Reject & Replace 更新为人工 Resolution。
 
-holder 收到结构化 Resolution 后仍由 Agent 自己决定是否更新本地 Claim。仲裁专用模型调用只读取完整仲裁消息、全部非 deprecated 本地 Claim 与全部 direct Claim 快照，不读取 Memory 或 USER。Effect Journal 保存已校验效果，崩溃恢复不再次调用模型。
+holder 收到结构化 Resolution 后仍由 Agent 自己决定是否更新本地 Claim。Agent 先复用已有的正确非 deprecated 本地知识：若已有等价正确 Claim，可以只将错误 direct Claim deprecated；若没有本地替代且仍是同一知识单元，优先原地修正 direct Claim；只有独立、可复用的新知识无法由现有 Claim 表达时才创建新 Claim。当前 holder 可以修改自己实际持有的 direct Claim，不受其当前 status 限制；其他 holder 的 direct Claim 只读。已经符合 Resolution 或无需修改时可以保持不变。仲裁专用模型调用只读取完整仲裁消息、全部非 deprecated 本地 Claim、当前 holder 持有的任意状态 direct Claim 与全部 direct Claim 快照，不读取 Memory 或 USER。Effect Journal 保存已校验效果，崩溃恢复不再次调用模型。

@@ -486,8 +486,8 @@ mod tests {
 
     use super::super::resolution::CommitFailpoint;
     use super::super::types::{
-        AnalysisSource, ArbitrationAnalysis, ArbitrationAnalysisId, ArbitrationResolutionRecord,
-        DeliveryIntent, DeliveryTargetIntent, MaintainerDisputeRecord, PendingResolutionDelivery,
+        ArbitrationAnalysis, ArbitrationAnalysisId, ArbitrationResolutionRecord, DeliveryIntent,
+        DeliveryTargetIntent, MaintainerDisputeRecord, PendingResolutionDelivery,
         ARBITRATION_PROMPT_VERSION, ARBITRATION_SCHEMA_VERSION,
         CURRENT_SEMANTIC_PROJECTION_VERSION,
     };
@@ -904,13 +904,12 @@ mod tests {
         let job = AnalysisJob {
             dispute_id: fixture.record.dispute_id.clone(),
             analysis_id: ArbitrationAnalysisId::random(),
-            source: AnalysisSource::Manual,
         };
         let analysis = ArbitrationAnalysis {
             schema_version: ARBITRATION_SCHEMA_VERSION,
             analysis_id: job.analysis_id.clone(),
             dispute_id: job.dispute_id.clone(),
-            source: job.source,
+            legacy_source: crate::maintainer::arbitration::types::LegacyAnalysisSource::Manual,
             report_snapshot: None,
             created_at: fixture.record.created_at,
             updated_at: fixture.record.created_at,

@@ -139,15 +139,24 @@ pub fn team_store_arbitration_dispute_dir(
     team_store_arbitrations_dir(team_root).join(dispute_id.as_str())
 }
 
-/// 固定的 create-once 自动分析。
-pub fn team_store_arbitration_automatic_analysis_path(
+/// 每个 Dispute 唯一的当前 Analysis。再次 Analyze 会原子覆盖该文件。
+pub fn team_store_arbitration_current_analysis_path(
+    team_root: &Path,
+    dispute_id: &crate::claim::DisputeId,
+) -> PathBuf {
+    team_store_arbitration_dispute_dir(team_root, dispute_id).join("analysis.yaml")
+}
+
+/// 旧版本自动分析路径，只用于读取兼容。
+pub fn team_store_arbitration_legacy_automatic_analysis_path(
     team_root: &Path,
     dispute_id: &crate::claim::DisputeId,
 ) -> PathBuf {
     team_store_arbitration_dispute_dir(team_root, dispute_id).join("automatic_analysis.yaml")
 }
 
-pub fn team_store_arbitration_manual_analysis_path(
+/// 旧版本人工分析路径，只用于读取兼容。
+pub fn team_store_arbitration_legacy_manual_analysis_path(
     team_root: &Path,
     dispute_id: &crate::claim::DisputeId,
 ) -> PathBuf {

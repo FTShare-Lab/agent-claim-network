@@ -68,7 +68,7 @@ impl<'de> Deserialize<'de> for ArbitrationAnalysisId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AnalysisSource {
+pub(crate) enum LegacyAnalysisSource {
     Automatic,
     Manual,
 }
@@ -77,7 +77,6 @@ pub enum AnalysisSource {
 pub struct AnalysisJob {
     pub dispute_id: DisputeId,
     pub analysis_id: ArbitrationAnalysisId,
-    pub source: AnalysisSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,7 +252,7 @@ pub struct AnalysisError {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AutomaticAnalysisRound {
+pub struct AnalysisRound {
     pub round: u32,
     #[serde(with = "serde_utc")]
     pub started_at: DateTime<Utc>,
@@ -277,9 +276,16 @@ pub struct ArbitrationAnalysis {
     pub schema_version: u32,
     pub analysis_id: ArbitrationAnalysisId,
     pub dispute_id: DisputeId,
-    pub source: AnalysisSource,
-    /// Automatic Analysis 与原始上报之间的 create-once 绑定，用于双文件写入崩溃后的安全重放。
-    /// Manual Analysis 不需要该字段；旧记录缺失时保持可读。
+    /// 仅用于读取旧 automatic/manual Analysis YAML。旧 manual 记录在 store 边界
+    /// 归一为 manual mode；新记录不再序列化来源，执行行为只由创建时 mode 决定。
+    #[serde(
+        default = "legacy_analysis_source",
+        rename = "source",
+        skip_serializing
+    )]
+    pub(crate) legacy_source: LegacyAnalysisSource,
+    /// 系统随 Dispute 上报创建 Analysis 时保存原始快照，用于双文件写入崩溃后的
+    /// 安全重放。管理员显式 Analyze 创建的记录不需要该字段。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report_snapshot: Option<Dispute>,
     #[serde(with = "serde_utc")]
@@ -301,7 +307,7 @@ pub struct ArbitrationAnalysis {
     #[serde(default = "initial_analysis_round")]
     pub analysis_round: u32,
     #[serde(default)]
-    pub rounds: Vec<AutomaticAnalysisRound>,
+    pub rounds: Vec<AnalysisRound>,
     #[serde(default)]
     pub context_change_count: u32,
     #[serde(default, with = "serde_utc_opt")]
@@ -326,6 +332,10 @@ pub struct ArbitrationAnalysis {
     pub adoption_blocked_reason: Option<String>,
     #[serde(default)]
     pub context_prepare_attempts: u32,
+}
+
+const fn legacy_analysis_source() -> LegacyAnalysisSource {
+    LegacyAnalysisSource::Automatic
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -10,12 +10,16 @@ import type {
 import { ExpandableText } from './ExpandableText'
 
 const observationLabels: Record<HolderAdoption['observation_state'], string> = {
-  not_delivered: '尚未送达',
-  delivered_unobserved: '已送达，等待 Agent 更新',
-  observed_converged: '已观察到 Agent 更新',
-  observed_diverged: '已观察到 Agent 更新',
-  unknown: '当前 Claim mirror 不可用',
+  not_delivered: 'Awaiting delivery',
+  delivered_unobserved: 'Delivered, awaiting Agent update',
+  observed_converged: 'Agent update observed',
+  observed_diverged: 'Agent update observed',
+  unknown: 'Claim mirror unavailable',
 }
+
+const summaryCellClass = 'rounded border border-amber-900/15 bg-white/80 p-2'
+const summaryLabelClass = 'text-amber-800'
+const summaryValueClass = 'mt-0.5 text-base font-semibold text-amber-950'
 
 function observationTone(state: HolderAdoption['observation_state']) {
   if (state === 'observed_converged' || state === 'observed_diverged') return 'success' as const
@@ -35,7 +39,7 @@ function ClaimComparison({ claim }: { claim: ClaimAdoptionComparison }) {
   const changes = changedFields(claim)
   const hasSnapshot = Boolean(claim.snapshot_status || claim.snapshot_scope || claim.snapshot_statement)
   return (
-    <article aria-label={`Claim adoption ${claim.claim_id}`} className="rounded-lg border border-cyan-100 bg-white p-3">
+    <article aria-label={`Claim adoption ${claim.claim_id}`} className="rounded-lg border border-amber-200 bg-white p-3">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="min-w-0">
           <div className="break-words text-xs font-semibold text-slate-900">{claim.claim_name ?? 'Claim'}</div>
@@ -63,12 +67,12 @@ function ClaimComparison({ claim }: { claim: ClaimAdoptionComparison }) {
             {claim.snapshot_statement}
           </ExpandableText>
         </div>
-        <div className="rounded-lg border border-cyan-200 bg-cyan-50/70 p-2.5">
-          <div className="text-[11px] font-bold uppercase tracking-wide text-cyan-800">After · Current Agent Claim</div>
+        <div className="rounded-lg border border-amber-200 bg-amber-50/70 p-2.5">
+          <div className="text-[11px] font-bold uppercase tracking-wide text-amber-800">After · Current Agent Claim</div>
           <div className="mt-2">{claim.current_status ? <StatusBadge>{claim.current_status}</StatusBadge> : <span className="text-slate-500">Mirror unavailable</span>}</div>
-          <div className="mt-2 text-[11px] font-medium text-cyan-700">Scope</div>
+          <div className="mt-2 text-[11px] font-medium text-amber-700">Scope</div>
           <div className="mt-0.5 break-words leading-5 text-slate-900">{claim.current_scope ?? 'Mirror unavailable'}</div>
-          <div className="mt-2 text-[11px] font-medium text-cyan-700">Statement</div>
+          <div className="mt-2 text-[11px] font-medium text-amber-700">Statement</div>
           <ExpandableText className="mt-0.5 block leading-5 text-slate-900" limit={130} emptyLabel="Mirror unavailable">
             {claim.current_statement}
           </ExpandableText>
@@ -80,7 +84,7 @@ function ClaimComparison({ claim }: { claim: ClaimAdoptionComparison }) {
 
 function HolderCard({ holder, observedAt }: { holder: HolderAdoption; observedAt?: string }) {
   return (
-    <article aria-label={`Holder adoption ${holder.agent_id}`} className="rounded-md border border-slate-200 bg-slate-50 p-3">
+    <article aria-label={`Holder adoption ${holder.agent_id}`} className="rounded-md border border-amber-200 bg-amber-50/40 p-3">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div>
           <div className="text-xs font-semibold text-slate-900">{holder.agent_id}</div>
@@ -112,7 +116,7 @@ function HolderCard({ holder, observedAt }: { holder: HolderAdoption; observedAt
       ) : null}
 
       <details className="mt-3 rounded-md border border-slate-200 bg-white p-2.5">
-        <summary className="cursor-pointer text-xs font-medium text-blue-700">
+        <summary className="cursor-pointer text-xs font-medium text-amber-800">
           Before / after ({holder.claims.length})
         </summary>
         <div className="mt-2 space-y-2">
@@ -124,7 +128,7 @@ function HolderCard({ holder, observedAt }: { holder: HolderAdoption; observedAt
 
       {holder.technical && Object.values(holder.technical).some(Boolean) ? (
         <details className="mt-2 rounded-md border border-slate-200 bg-white p-2.5 text-[11px]">
-          <summary className="cursor-pointer font-medium text-slate-600">技术详情</summary>
+          <summary className="cursor-pointer font-medium text-slate-600">Technical details</summary>
           <dl className="mt-2 space-y-1.5">
             {holder.technical.policy_id ? <div><dt className="inline text-slate-500">Policy ID: </dt><dd className="inline break-all font-mono">{holder.technical.policy_id}</dd></div> : null}
             {holder.technical.inbox_id ? <div><dt className="inline text-slate-500">Inbox ID: </dt><dd className="inline break-all font-mono">{holder.technical.inbox_id}</dd></div> : null}
@@ -149,15 +153,15 @@ export function HolderAdoptionPanel({ adoption }: { adoption?: HolderAdoptionVie
   const observedUpdates = summary.converged + summary.diverged
 
   return (
-    <section aria-label="Delivery and holder adoption" className="rounded-xl border border-cyan-200 bg-cyan-50/30 p-3.5 shadow-sm">
-      <div className="flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-[0.08em] text-cyan-950">
-          <span aria-hidden="true" className="h-4 w-1 rounded-full bg-cyan-600" />
+    <section aria-label="Delivery and holder adoption" className="rounded-xl border border-amber-700 bg-amber-50/40 p-3.5 shadow-sm">
+      <div className="flex items-center justify-between gap-3 border-b border-amber-900/20 pb-2.5">
+        <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-[0.08em] text-amber-950">
+          <span aria-hidden="true" className="h-4 w-1 rounded-full bg-amber-600" />
           Delivery &amp; Holder Adoption
         </div>
         <button
           type="button"
-          className="rounded-md border border-cyan-200 bg-white px-2 py-1 text-xs font-semibold text-cyan-800 hover:bg-cyan-50"
+          className="rounded-md border border-amber-700/40 bg-white px-2 py-1 text-xs font-semibold text-amber-950 hover:bg-amber-100/60"
           aria-expanded={expanded}
           onClick={() => setExpanded((current) => !current)}
         >
@@ -166,12 +170,12 @@ export function HolderAdoptionPanel({ adoption }: { adoption?: HolderAdoptionVie
       </div>
 
       <dl className="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-3">
-        <div className="rounded bg-white p-2"><dt className="text-slate-600">Notified</dt><dd className="mt-0.5 text-base font-semibold text-slate-950">{summary.notified_holders}</dd></div>
-        <div className="rounded bg-white p-2"><dt className="text-slate-600">Delivered</dt><dd className="mt-0.5 text-base font-semibold text-slate-950">{summary.delivered}</dd></div>
-        <div className="rounded bg-emerald-50 p-2"><dt className="text-emerald-700">Observed updates</dt><dd className="mt-0.5 text-base font-semibold text-emerald-800">{observedUpdates}</dd></div>
-        <div className="rounded bg-amber-50 p-2"><dt className="text-amber-700">Awaiting update</dt><dd className="mt-0.5 text-base font-semibold text-amber-800">{summary.unobserved}</dd></div>
-        <div className="rounded bg-slate-100 p-2"><dt className="text-slate-600">Mirror unavailable</dt><dd className="mt-0.5 text-base font-semibold text-slate-800">{summary.unknown}</dd></div>
-        <div className="rounded bg-white p-2"><dt className="text-slate-600">Last observed</dt><dd className="mt-1 font-mono text-[11px] text-slate-800">{formatDateTime(adoption?.observed_at)}</dd></div>
+        <div className={summaryCellClass}><dt className={summaryLabelClass}>Notified</dt><dd className={summaryValueClass}>{summary.notified_holders}</dd></div>
+        <div className={summaryCellClass}><dt className={summaryLabelClass}>Delivered</dt><dd className={summaryValueClass}>{summary.delivered}</dd></div>
+        <div className={summaryCellClass}><dt className={summaryLabelClass}>Observed updates</dt><dd className={summaryValueClass}>{observedUpdates}</dd></div>
+        <div className={summaryCellClass}><dt className={summaryLabelClass}>Awaiting update</dt><dd className={summaryValueClass}>{summary.unobserved}</dd></div>
+        <div className={summaryCellClass}><dt className={summaryLabelClass}>Mirror unavailable</dt><dd className={summaryValueClass}>{summary.unknown}</dd></div>
+        <div className={summaryCellClass}><dt className={summaryLabelClass}>Last observed</dt><dd className="mt-1 font-mono text-[11px] text-amber-950">{formatDateTime(adoption?.observed_at)}</dd></div>
       </dl>
 
       {expanded ? (
@@ -180,10 +184,10 @@ export function HolderAdoptionPanel({ adoption }: { adoption?: HolderAdoptionVie
             ? adoption.holders.map((holder) => (
               <HolderCard key={holder.agent_id} holder={holder} observedAt={adoption.observed_at} />
             ))
-            : <div className="rounded bg-slate-50 p-3 text-xs text-slate-500">No holder delivery or adoption data is available.</div>}
+            : <div className="rounded border border-amber-200 bg-white p-3 text-xs text-slate-500">No holder delivery or adoption data is available.</div>}
         </div>
       ) : (
-        <div className="mt-2 text-xs text-slate-500">
+        <div className="mt-2 text-xs text-slate-600">
           {summary.notified_holders
             ? `${summary.notified_holders} holder${summary.notified_holders === 1 ? '' : 's'} tracked; expand to inspect how each Agent changed its Claims.`
             : 'No holder notification is associated with the current resolution.'}

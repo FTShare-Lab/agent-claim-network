@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::ArbitrationMode;
 
-use super::{AnalysisJob, AnalysisSource, AnalysisState, ArbitrationService};
+use super::{AnalysisJob, AnalysisState, ArbitrationService};
 
 const RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
@@ -200,7 +200,6 @@ impl AnalysisJobProcessor for ArbitrationService {
         let analysis = self.store().read_analysis(job).await?;
         Ok(analysis.state.is_recoverable()
             || (analysis.state == AnalysisState::Approved
-                && job.source == AnalysisSource::Automatic
                 && analysis.mode == ArbitrationMode::Auto
                 && analysis.adoption_blocked_reason.is_none()))
     }
@@ -536,13 +535,12 @@ mod tests {
 
     use super::*;
     use crate::claim::DisputeId;
-    use crate::maintainer::arbitration::{AnalysisSource, ArbitrationAnalysisId};
+    use crate::maintainer::arbitration::ArbitrationAnalysisId;
 
     fn job() -> AnalysisJob {
         AnalysisJob {
             dispute_id: DisputeId::random(),
             analysis_id: ArbitrationAnalysisId::random(),
-            source: AnalysisSource::Manual,
         }
     }
 
