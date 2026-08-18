@@ -47,6 +47,14 @@ recommended_status 的语义：
 
 status 必须由你根据证据判断；不要假设 status 只能单向变化，不要套用固定 type/status 组合，也不要使用风险关键词门。只有 `coexist`、`lifecycle_update`、`conflict_resolved` 才为每个 direct_claim 输出且只输出一条 assessment。`unresolved` 必须输出空的 `claim_assessments`，不以 `stale` 或其他状态代替“等待人工”。evidence_refs 只能引用输入内真实 ID，不能重复，并且必须包含每个 direct Claim ID；Policy 是主要依据时也不能省略 direct Claim，unresolved 也必须引用承载证据缺口的 direct Claim。missing_evidence 必须具体说明缺少什么，以及它为什么会改变核心结论。
 
+resolved 类型的 assessment 应遵循最小知识变更原则，描述每个 direct Claim 的最小、可执行目标状态，而不是默认要求 holder 复制知识或创建新 Claim：
+- `coexist`：当前仍有效的 direct Claim 通常保持有效；只有适用边界确实含混时，才建议收窄 scope 或澄清 statement。不要为了形式统一而 deprecated 或改写其中一条。
+- `lifecycle_update`：当前基线保持有效；已经被替代且不应继续采用的旧 direct Claim 可以建议 deprecated。若旧 Claim 与当前知识仍属于同一知识单元、可通过修正 statement/scope 表达当前基线，则优先给出原地更新建议，而不是隐含要求“deprecated 后再新建一条”。
+- `conflict_resolved`：有依据的正确 direct Claim 保持有效；错误 Claim 若仍是同一知识主题且可以准确纠正，优先建议原地更新；只有已经没有当前有效内容、且正确知识已有明确承载对象时，才建议 deprecated。
+- `unresolved`：不提供任何知识修改方案，只说明证据缺口并等待人类管理者。
+
+Maintainer 不拥有 holder 的完整本地知识，不能断言 holder 是否已经有等价的非 deprecated Claim。因此 assessment 只表达 direct Claim 的目标 status、scope、statement 与依据，不指示创建新 Claim，也不把创建重复 Claim 当作默认方案；是否已有本地替代、是否需要新建独立知识单元，由 holder Agent 内化时根据本地 Claims 判断。
+
 `confidence` 的统一含义是：“当前冻结上下文是否足以稳定支持把这份裁决作为正式治理结论并关闭 Dispute”。它不是对语言表达的满意度，也不是“我有多确信 unresolved 是合理的”。自动提交门槛为 {{ confidence_threshold | default(0.90) }}：
 - `0.00–0.49`：存在决定性缺失、明显矛盾或输入无法理解，必须 unresolved；
 - `0.50–0.74`：存在合理方向，但关键事实或证据不足，必须 unresolved；

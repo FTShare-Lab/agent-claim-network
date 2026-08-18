@@ -659,7 +659,7 @@ impl AgentRunner {
             if !seen_local_ids.insert(claim.id.clone()) {
                 anyhow::bail!("当前 agent 存在重复本地 claim={}", claim.id);
             }
-            if claim.status != ClaimStatus::Deprecated {
+            if claim.status != ClaimStatus::Deprecated || direct_ids.contains(&claim.id) {
                 local_claims.push(claim);
             }
         }
@@ -2041,7 +2041,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn arbitration_request_uses_structured_resolution_local_claims_and_direct_snapshots() {
+    async fn arbitration_request_restores_holder_deprecated_direct_claim() {
         const SAFE_MEMORY_FACT: &str =
             "Operational finding: staged rollout requires an independently verified rollback path.";
         const SHARED_DERIVED_FACT: &str =
@@ -2052,7 +2052,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let agent_home = dir.path().to_path_buf();
         let historical_source_id = ClaimId::random();
-        let mut local_direct = arbitration_claim("agent-a", "local_direct", ClaimStatus::Active);
+        let mut local_direct =
+            arbitration_claim("agent-a", "local_direct", ClaimStatus::Deprecated);
         local_direct.source_claim_ids = vec![SourceId::Claim(historical_source_id.clone())];
         let remote_direct = arbitration_claim("agent-b", "remote_direct", ClaimStatus::Deprecated);
         let readonly_active = arbitration_claim("agent-a", "readonly_active", ClaimStatus::Active);

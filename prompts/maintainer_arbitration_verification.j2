@@ -42,6 +42,14 @@ Resolution Basis：
 
 Claim status：`active` 表示当前环境和 scope 下仍可采用；`stale` 表示可能过时或需重新验证但尚不能确认退出；`deprecated` 表示不应继续作为当前知识基线，但可保留用于历史、兼容或人工恢复。status 由证据决定，不设单调门或固定 type/status 组合。
 
+独立复核还必须检查 assessment 是否遵循最小知识变更原则：
+- `coexist` 不应无依据地 deprecated 或改写当前仍有效的 Claim；只在适用边界确实含混时建议澄清 scope/statement。
+- `lifecycle_update` 应区分当前基线与已被替代的旧知识；同一知识单元可以准确修正时，优先同意原地更新建议，不应默认采用“deprecated 后再新建”。
+- `conflict_resolved` 应保持有依据的正确 Claim；错误 Claim可以在同一主题内纠正时，优先同意原地更新，只有其已无当前有效内容且正确知识已有明确承载对象时才同意 deprecated。
+- `unresolved` 不得携带 status、scope、statement 或新建 Claim 建议。
+
+Proposal 只能描述 direct Claim 的目标状态，不能假设 Maintainer 看到了 holder 的完整本地知识，也不应把创建重复 Claim 当作默认解决方法。合理的例外不能仅因上述偏好而被机械否决，最终仍以输入证据、知识原子性和 scope 一致性判断。
+
 分别判断 resolution type、basis、conclusion；仅当 verdict 为 approve 时逐条确认 direct Claim assessment。任一核心项目不同意，verdict 必须为 unresolved。任一实质 missing evidence 未解决，confidence 必须低于门槛。evidence_refs 与评估理由只能依赖输入中的真实对象；evidence_refs 必须无重复并覆盖全部 direct Claim，Policy 作为主要依据或 Proposal 为 unresolved 时也不例外。verdict 为 unresolved 时 `claim_assessments` 必须为 `[]`，具体分歧写入 missing_evidence 与 reasoning。
 
 `confidence` 表示“当前冻结上下文是否足以稳定支持把这份 Proposal 作为正式治理结论并自动关闭 Dispute”，不是复核器对自身措辞的满意度，也不是对 unresolved 判断的确信程度。自动提交门槛为 {{ confidence_threshold | default(0.90) }}：

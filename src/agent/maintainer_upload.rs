@@ -159,6 +159,7 @@ impl AgentRunner {
         let mut retryable_failures = 0usize;
         let mut rejected_failures = 0usize;
         let mut rejected_sample: Option<String> = None;
+        let mut conflicting_dispute_ids = Vec::new();
 
         let mut claim_results =
             futures::stream::iter(attempted.claims.clone().into_iter().map(|claim| {
@@ -193,7 +194,9 @@ impl AgentRunner {
                         }
                     }
                     // 其他 client/未知错误继续保留本地待传并记 warning，绝不中断会话。
-                    UploadErrorKind::Client | UploadErrorKind::Unknown => {
+                    UploadErrorKind::Conflict
+                    | UploadErrorKind::Client
+                    | UploadErrorKind::Unknown => {
                         rejected_failures += 1;
                         rejected_sample.get_or_insert_with(|| err.to_string());
                         let durable = attempted.durable_claim_ids.contains(&claim.id);
@@ -229,6 +232,9 @@ impl AgentRunner {
                         forbidden_failures += 1;
                         forbidden_sample.get_or_insert_with(|| err.to_string());
                         failed.disputes.push(dispute);
+                    }
+                    UploadErrorKind::Conflict => {
+                        conflicting_dispute_ids.push(dispute.id.to_string());
                     }
                     // 其他 client/未知错误继续保留本地待传并记 warning，绝不中断会话。
                     UploadErrorKind::Client | UploadErrorKind::Unknown => {
@@ -267,6 +273,19 @@ impl AgentRunner {
             let detail = forbidden_sample.as_deref().unwrap_or("forbidden");
             warnings.push(format!(
                 "Maintainer rejected {forbidden_failures} items as forbidden ({detail}). Team sync was skipped; fix object ownership before retrying from local source."
+            ));
+        }
+        if !conflicting_dispute_ids.is_empty() {
+            conflicting_dispute_ids.sort();
+            conflicting_dispute_ids.dedup();
+            // 用户侧提示保持无需行动的措辞；具体 ID 只进日志，便于排查内容分歧。
+            log::debug!(
+                "dispute 上报与团队既有记录 ID 冲突，已保留团队版本: {}",
+                conflicting_dispute_ids.join(", ")
+            );
+            warnings.push(format!(
+                "{} dispute report(s) already exist in the team with the same ID. The team version was kept, so no action is needed.",
+                conflicting_dispute_ids.len()
             ));
         }
         if rejected_failures > 0 {
@@ -310,6 +329,7 @@ enum UploadErrorKind {
     Auth,
     Forbidden,
     Retryable,
+    Conflict,
     Client,
     Unknown,
 }
@@ -319,6 +339,7 @@ fn classify_upload_error(err: &anyhow::Error) -> UploadErrorKind {
         Some(err) if err.is_auth() => UploadErrorKind::Auth,
         Some(err) if err.is_retryable() => UploadErrorKind::Retryable,
         Some(MaintainerClientError::Client { status: 403, .. }) => UploadErrorKind::Forbidden,
+        Some(MaintainerClientError::Client { status: 409, .. }) => UploadErrorKind::Conflict,
         Some(MaintainerClientError::Client { .. }) => UploadErrorKind::Client,
         Some(_) | None => UploadErrorKind::Unknown,
     }
@@ -478,6 +499,7 @@ mod tests {
         forbidden_claims: Mutex<BTreeSet<String>>,
         auth_error_disputes: Mutex<BTreeSet<String>>,
         forbidden_disputes: Mutex<BTreeSet<String>>,
+        conflicting_disputes: Mutex<BTreeSet<String>>,
         client_error_claims: Mutex<BTreeSet<String>>,
         unknown_error_claims: Mutex<BTreeSet<String>>,
         uploaded_claims: Mutex<Vec<String>>,
@@ -591,6 +613,14 @@ mod tests {
                     operation: "disputes/report".into(),
                     status: 403,
                     body: "forbidden".into(),
+                }
+                .into());
+            }
+            if self.conflicting_disputes.lock().unwrap().contains(&id) {
+                return Err(MaintainerClientError::Client {
+                    operation: "disputes/report".into(),
+                    status: 409,
+                    body: "dispute payload conflict".into(),
                 }
                 .into());
             }
@@ -890,6 +920,218 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_batch_reports_dispute_after_claim_attempt_even_when_claim_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let maintainer = Arc::new(TestMaintainerClient::default());
+        let runner = build_runner(&dir, maintainer.clone());
+        let pending_claim = claim(
+            "claim_11111111",
+            ClaimStatus::Active,
+            "2026-06-22T00:00:00Z",
+        );
+        let ready_claim = claim(
+            "claim_22222222",
+            ClaimStatus::Active,
+            "2026-06-22T00:00:00Z",
+        );
+        let pending_dispute = dispute("dispute_11111111", "2026-06-22T00:00:00Z");
+        maintainer
+            .retryable_claims
+            .lock()
+            .unwrap()
+            .insert(pending_claim.id.to_string());
+
+        let report = runner
+            .upload_maintainer_batch(
+                vec![pending_claim.clone(), ready_claim.clone()],
+                vec![pending_dispute.clone()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.pending_claims, 1);
+        assert_eq!(report.pending_disputes, 0);
+        assert_eq!(
+            maintainer.uploaded_claims.lock().unwrap().as_slice(),
+            &[ready_claim.id.to_string()]
+        );
+        assert_eq!(
+            maintainer.uploaded_disputes.lock().unwrap().as_slice(),
+            &[pending_dispute.id.to_string()]
+        );
+        let path = paths::agent_home_pending_maintainer_uploads_path(dir.path());
+        let pending: PendingMaintainerUploads = read_yaml(&path).await.unwrap();
+        assert_eq!(pending.claims, vec![pending_claim.clone()]);
+        assert!(pending.disputes.is_empty());
+
+        maintainer.retryable_claims.lock().unwrap().clear();
+        let recovered = runner
+            .upload_maintainer_batch(Vec::new(), Vec::new())
+            .await
+            .unwrap();
+
+        assert_eq!(recovered.pending_claims, 0);
+        assert_eq!(recovered.pending_disputes, 0);
+        assert_eq!(
+            maintainer.uploaded_disputes.lock().unwrap().as_slice(),
+            &[pending_dispute.id.to_string()]
+        );
+        assert!(!fs::try_exists(path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn upload_batch_does_not_retain_ordinary_auth_failed_claim_for_dispute() {
+        let dir = tempfile::tempdir().unwrap();
+        let maintainer = Arc::new(TestMaintainerClient::default());
+        let runner = build_runner(&dir, maintainer.clone());
+        let pending_claim = claim(
+            "claim_11111111",
+            ClaimStatus::Active,
+            "2026-06-22T00:00:00Z",
+        );
+        let pending_dispute = dispute("dispute_11111111", "2026-06-22T00:00:00Z");
+        maintainer
+            .auth_error_claims
+            .lock()
+            .unwrap()
+            .insert(pending_claim.id.to_string());
+
+        let report = runner
+            .upload_maintainer_batch(vec![pending_claim.clone()], vec![pending_dispute.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(report.pending_claims, 0);
+        assert_eq!(report.pending_disputes, 0);
+        assert_eq!(
+            maintainer.uploaded_disputes.lock().unwrap().as_slice(),
+            &[pending_dispute.id.to_string()]
+        );
+        let path = paths::agent_home_pending_maintainer_uploads_path(dir.path());
+        assert!(!fs::try_exists(path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn upload_batch_does_not_block_dispute_unrelated_to_failed_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let maintainer = Arc::new(TestMaintainerClient::default());
+        let runner = build_runner(&dir, maintainer.clone());
+        let unrelated_claim = claim(
+            "claim_33333333",
+            ClaimStatus::Active,
+            "2026-06-22T00:00:00Z",
+        );
+        let ready_dispute = dispute("dispute_11111111", "2026-06-22T00:00:00Z");
+        maintainer
+            .retryable_claims
+            .lock()
+            .unwrap()
+            .insert(unrelated_claim.id.to_string());
+
+        let report = runner
+            .upload_maintainer_batch(vec![unrelated_claim], vec![ready_dispute.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(report.pending_claims, 1);
+        assert_eq!(report.pending_disputes, 0);
+        assert_eq!(
+            maintainer.uploaded_disputes.lock().unwrap().as_slice(),
+            &[ready_dispute.id.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_batch_does_not_add_referenced_claims_from_the_local_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let maintainer = Arc::new(TestMaintainerClient::default());
+        let runner = build_runner(&dir, maintainer.clone());
+        let pending_claim = claim(
+            "claim_11111111",
+            ClaimStatus::Active,
+            "2026-06-20T00:00:00Z",
+        );
+        let ready_claim = claim(
+            "claim_22222222",
+            ClaimStatus::Active,
+            "2026-06-20T00:00:00Z",
+        );
+        let unrelated_claim = claim(
+            "claim_33333333",
+            ClaimStatus::Active,
+            "2026-06-20T00:00:00Z",
+        );
+        for local_claim in [&pending_claim, &ready_claim, &unrelated_claim] {
+            runner.claim_store.write_claim(local_claim).await.unwrap();
+        }
+        let pending_dispute = dispute("dispute_11111111", "2026-06-22T00:00:00Z");
+        let report = runner
+            .upload_maintainer_batch(Vec::new(), vec![pending_dispute.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(report.pending_claims, 0);
+        assert_eq!(report.pending_disputes, 0);
+        assert!(maintainer.uploaded_claims.lock().unwrap().is_empty());
+        assert_eq!(
+            maintainer.uploaded_disputes.lock().unwrap().as_slice(),
+            &[pending_dispute.id.to_string()]
+        );
+        let path = paths::agent_home_pending_maintainer_uploads_path(dir.path());
+        assert!(!fs::try_exists(path).await.unwrap());
+        assert!(!maintainer
+            .uploaded_claims
+            .lock()
+            .unwrap()
+            .contains(&pending_claim.id.to_string()));
+        assert!(!maintainer
+            .uploaded_claims
+            .lock()
+            .unwrap()
+            .contains(&ready_claim.id.to_string()));
+        assert!(!maintainer
+            .uploaded_claims
+            .lock()
+            .unwrap()
+            .contains(&unrelated_claim.id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn upload_batch_does_not_scan_local_storage_for_dispute_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let maintainer = Arc::new(TestMaintainerClient::default());
+        let runner = build_runner(&dir, maintainer.clone());
+        let mut remote_claim = claim(
+            "claim_11111111",
+            ClaimStatus::Active,
+            "2026-06-20T00:00:00Z",
+        );
+        remote_claim.holder = AgentId::new("agent-b").unwrap();
+        let local_claim = claim(
+            "claim_22222222",
+            ClaimStatus::Active,
+            "2026-06-20T00:00:00Z",
+        );
+        runner.claim_store.write_claim(&remote_claim).await.unwrap();
+        runner.claim_store.write_claim(&local_claim).await.unwrap();
+
+        let report = runner
+            .upload_maintainer_batch(
+                Vec::new(),
+                vec![dispute("dispute_11111111", "2026-06-22T00:00:00Z")],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.pending_claims, 0);
+        assert!(maintainer.uploaded_claims.lock().unwrap().is_empty());
+        assert_eq!(
+            maintainer.uploaded_disputes.lock().unwrap().as_slice(),
+            &["dispute_11111111"]
+        );
+    }
+
+    #[tokio::test]
     async fn upload_batch_writes_pending_before_network_attempt() {
         let dir = tempfile::tempdir().unwrap();
         let maintainer = Arc::new(TestMaintainerClient::default());
@@ -1100,6 +1342,40 @@ mod tests {
             uploaded,
             BTreeSet::from([unauthorized.id.to_string(), forbidden.id.to_string()])
         );
+    }
+
+    #[tokio::test]
+    async fn upload_batch_drops_conflicting_dispute_after_one_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let maintainer = Arc::new(TestMaintainerClient::default());
+        let runner = build_runner(&dir, maintainer.clone());
+        let conflicting = dispute("dispute_55555555", "2026-06-22T00:00:00Z");
+        maintainer
+            .conflicting_disputes
+            .lock()
+            .unwrap()
+            .insert(conflicting.id.to_string());
+
+        let report = runner
+            .upload_maintainer_batch(Vec::new(), vec![conflicting.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(report.pending_disputes, 0);
+        let warning = report.warning.unwrap();
+        // 面向非编程用户的提示不暴露内部 ID，只说明团队版本已保留且无需处理。
+        assert!(!warning.contains(conflicting.id.as_str()));
+        assert!(warning.contains("already exist in the team"));
+        assert!(warning.contains("no action is needed"));
+        let path = paths::agent_home_pending_maintainer_uploads_path(dir.path());
+        assert!(!fs::try_exists(&path).await.unwrap());
+
+        let repeated = runner
+            .upload_maintainer_batch(Vec::new(), Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(repeated, MaintainerUploadReport::default());
+        assert!(!fs::try_exists(path).await.unwrap());
     }
 
     #[tokio::test]
