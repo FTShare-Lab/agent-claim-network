@@ -72,6 +72,7 @@ api_key_env = "LLM_API_KEY"
 ### 4.2 本地状态管理（2A）
 
 - 每次 Responses 请求固定发送 `store = false`。
+- 每次 Responses 请求固定发送 `truncation = "disabled"`，禁止上游静默裁剪历史。
 - Agent 每次请求固定发送 `include = ["reasoning.encrypted_content"]`，取得可在无状态下一轮原样回传的加密 reasoning item；Router rerank 继续省略 `include`。
 - ACN 不使用 `previous_response_id` 作为 session 的权威状态。
 - 当前请求由有效 canonical input history、匹配当前 wire protocol 与精确 model、且位于当前连续世代的 provider replay items 和当前用户输入共同构造。
@@ -223,6 +224,7 @@ enum ProviderReplayState {
 - `max_output_tokens`；
 - `stream`；
 - `store = false`；
+- `truncation = "disabled"`；
 - 非 `none` 时的 `reasoning.effort`。
 
 系统提示映射为 `instructions`，每次请求都按 ACN 当前 system prompt/compaction 结果重新发送，不依赖服务端 response state。

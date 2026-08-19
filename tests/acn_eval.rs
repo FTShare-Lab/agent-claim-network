@@ -47,6 +47,7 @@ async fn evaluation_rejects_model_key_env_other_than_isolated_env() {
         upstream: "eval".into(),
         variant: "A".into(),
         attempt_deadline_secs: 1,
+        model_egress_mode: "pier".into(),
         claim_bundle: None,
     };
     tokio::fs::create_dir_all(&config.workspace_root)
@@ -81,6 +82,7 @@ async fn invalid_claim_bundle_still_writes_failed_attempt_artifacts() {
         upstream: "eval".into(),
         variant: "B_claim".into(),
         attempt_deadline_secs: 1,
+        model_egress_mode: "pier".into(),
         claim_bundle: Some(bundle.clone()),
     };
     tokio::fs::create_dir_all(&config.workspace_root)
@@ -131,6 +133,7 @@ fn evaluation_paths_are_absolute_and_versioned() {
         upstream: "benchmark".into(),
         variant: "A".into(),
         attempt_deadline_secs: 5100,
+        model_egress_mode: "pier".into(),
         claim_bundle: None,
     };
 

@@ -1,14 +1,14 @@
 # ACN 解题对齐全量运行
 
-该轮用于观察轻量解题 harness 的两项可控改动：关闭文件修改许可证与 Memory 相关运行时路径，并在所有 ACN arms 使用相同的解题流程、非结束轮工具调用纪律和采样参数。它仍是 ACN 四臂实验，不能与单 agent 的外部得分直接并列。
+该轮用于观察轻量解题 harness 的两项可控改动：关闭文件修改许可证与 Memory 相关运行时路径，并在所有 ACN arms 使用相同的解题流程、非结束轮工具调用纪律和与 MiniSWE Responses 对照对齐的采样参数。它仍是 ACN 四臂实验，不能与单 agent 的外部得分直接并列。
 
 运行时生成的 ACN TOML 固定为：
 
 - `agent.tool.file_edit_authority_enabled=false`；
 - `agent.memory.enabled=false`；
 - `agent.session.memory_review.enabled=false`；
-- `agent.llm.temperature=0.95`；
-- `agent.llm.top_p=1.0`。
+- `agent.llm.temperature=1.0`；
+- `agent.llm.top_p=0.95`。
 
 请求模型保持 `deepseek-v4-flash-local-exp`，预期响应 checkpoint 保持 `deepseek-v4-flash`，provider 保持 `openai_responses`，`reasoning_effort=max`，上下文能力声明为 1,000,000，输出上限为 65,536。模型凭据和 base URL 仅从受保护的运行环境读取，不能放入本文件、JSON 配置或命令行。
 
