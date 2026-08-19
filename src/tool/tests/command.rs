@@ -95,6 +95,7 @@ async fn code_run_executes_python_in_workspace() {
             "code_run",
             serde_json::json!({
                 "script": "print('hello')",
+                "description": "Print a greeting from Python",
                 "type": "python",
             }),
         )
@@ -174,6 +175,7 @@ async fn code_run_tty_uses_fixed_size_and_accepts_interactive_input() {
             json!({
                 "process_id": process_id,
                 "chars": "hello\n",
+                "description": "Send the requested reply to the interactive command",
                 "yield_time_ms": 500
             }),
         )

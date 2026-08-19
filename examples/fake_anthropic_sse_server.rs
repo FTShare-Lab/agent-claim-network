@@ -305,7 +305,7 @@ fn background_process_tool_messages() -> Sse<impl Stream<Item = SseItem>> {
             "index": 0,
             "delta": {
                 "type": "input_json_delta",
-                "partial_json": "{\"script\":\"sleep 30\",\"yield_time_ms\":1000}"
+                "partial_json": "{\"description\":\"Start the background-process fixture.\",\"script\":\"sleep 30\",\"yield_time_ms\":1000}"
             }
         }),
         json!({"type": "content_block_stop", "index": 0}),
@@ -631,7 +631,17 @@ fn tool_messages_many(tools: Vec<(&str, &str, Value)>) -> Sse<impl Stream<Item =
         "type": "message_start",
         "message": {"usage": {"input_tokens": 1}}
     })];
-    for (index, (tool_use_id, tool_name, input)) in tools.into_iter().enumerate() {
+    for (index, (tool_use_id, tool_name, mut input)) in tools.into_iter().enumerate() {
+        if let Some(object) = input.as_object_mut() {
+            let description = match tool_name {
+                "code_run" => Some("Run the deterministic process-control fixture command."),
+                "write_stdin" => Some("Poll or control the deterministic fixture process."),
+                _ => None,
+            };
+            if let Some(description) = description {
+                object.insert("description".into(), Value::String(description.into()));
+            }
+        }
         events.extend([
             json!({
                 "type": "content_block_start",

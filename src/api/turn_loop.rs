@@ -3,6 +3,7 @@
 //! 本模块承接单轮用户输入后的模型调用、工具执行和 tool_result 回灌。
 //! 它只理解 canonical session message，不关心 Anthropic/OpenAI 等后端协议细节。
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -3448,11 +3449,26 @@ fn consult_router_output_preview(value: &Value) -> Option<String> {
 }
 
 fn tool_started_summary(name: &str, input: &Value) -> String {
+    let input = tool_input_runtime_projection(name, input);
     format!("tool {name} {}", one_line_preview(&input.to_string(), 160))
 }
 
-fn tool_input_preview(_name: &str, input: &Value, max_chars: usize) -> (String, bool) {
+fn tool_input_preview(name: &str, input: &Value, max_chars: usize) -> (String, bool) {
+    let input = tool_input_runtime_projection(name, input);
     truncate_chars(&input.to_string(), max_chars)
+}
+
+/// `description` 预留给后续用户可见展示；当前执行摘要与 recovery journal 只保留
+/// 实际命令/进程参数，避免说明文本抢占有界 preview。
+fn tool_input_runtime_projection<'a>(name: &str, input: &'a Value) -> Cow<'a, Value> {
+    if !matches!(name, "code_run" | "write_stdin") || input.get("description").is_none() {
+        return Cow::Borrowed(input);
+    }
+    let mut projected = input.clone();
+    if let Some(object) = projected.as_object_mut() {
+        object.remove("description");
+    }
+    Cow::Owned(projected)
 }
 
 fn tool_completed_summary(
@@ -4871,6 +4887,37 @@ mod tests {
         assert!(preview.contains("private objective"));
         assert!(summary.contains("scan"));
         assert!(summary.contains("private objective"));
+    }
+
+    #[test]
+    fn command_descriptions_do_not_hide_runtime_inputs_in_summaries_or_journal() {
+        let description = "user-facing purpose ".repeat(30);
+        let code_run = json!({
+            "description": description,
+            "script": "printf command-visible",
+            "type": "bash",
+        });
+        let code_summary = super::tool_started_summary("code_run", &code_run);
+        let (code_preview, code_truncated) = super::tool_input_preview("code_run", &code_run, 160);
+        assert!(code_summary.contains("printf command-visible"));
+        assert!(!code_summary.contains("description"));
+        assert!(code_preview.contains("printf command-visible"));
+        assert!(!code_preview.contains("description"));
+        assert!(!code_truncated);
+
+        let write_stdin = json!({
+            "description": "poll the managed command ".repeat(30),
+            "process_id": "deadbeef",
+            "yield_time_ms": 500,
+        });
+        let stdin_summary = super::tool_started_summary("write_stdin", &write_stdin);
+        let (stdin_preview, stdin_truncated) =
+            super::tool_input_preview("write_stdin", &write_stdin, 160);
+        assert!(stdin_summary.contains("deadbeef"));
+        assert!(!stdin_summary.contains("description"));
+        assert!(stdin_preview.contains("deadbeef"));
+        assert!(!stdin_preview.contains("description"));
+        assert!(!stdin_truncated);
     }
 
     #[test]

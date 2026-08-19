@@ -224,6 +224,11 @@ impl ToolRegistry {
                             "type": "string",
                             "description": "Code to execute"
                         },
+                        "description": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "A concise, user-facing sentence explaining what this command does and why it contributes to the goal. Use the user's language. Describe the purpose without repeating commands, passwords, tokens, or other sensitive input."
+                        },
                         "type": {
                             "type": "string",
                             "enum": ["bash", "python", "powershell"],
@@ -256,7 +261,7 @@ impl ToolRegistry {
                             "description": "Maximum returned output characters per stdout/stderr stream for this call (PTY uses stdout only). Usually omit this field; truncated output advances only after provider delivery and the next poll continues from the returned cursor."
                         }
                     },
-                    "required": ["script"],
+                    "required": ["script", "description"],
                     "additionalProperties": false
                 }),
             },
@@ -267,6 +272,11 @@ impl ToolRegistry {
                     "type": "object",
                     "properties": {
                         "process_id": { "type": "string", "pattern": "^[0-9a-f]{8}$" },
+                        "description": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "A concise, user-facing sentence explaining the purpose of this process interaction, including polling, sending input, interrupting, or terminating. Use the user's language. Describe the purpose without repeating commands, passwords, tokens, or other sensitive input."
+                        },
                         "chars": {
                             "type": "string",
                             "description": format!(
@@ -311,7 +321,7 @@ impl ToolRegistry {
                             "description": "Must be supplied together with stdout_cursor."
                         }
                     },
-                    "required": ["process_id"],
+                    "required": ["process_id", "description"],
                     "additionalProperties": false
                 }),
             },

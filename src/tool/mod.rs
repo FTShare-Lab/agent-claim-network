@@ -451,6 +451,8 @@ struct FileWriteArgs {
 #[serde(deny_unknown_fields)]
 struct CodeRunArgs {
     script: String,
+    #[serde(default, rename = "description")]
+    _description: String,
     r#type: Option<String>,
     cwd: Option<String>,
     #[serde(default)]
@@ -463,6 +465,8 @@ struct CodeRunArgs {
 #[serde(deny_unknown_fields)]
 struct WriteStdinArgs {
     process_id: String,
+    #[serde(default, rename = "description")]
+    _description: String,
     chars: Option<String>,
     #[serde(default)]
     terminate: bool,
