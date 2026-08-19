@@ -10,6 +10,39 @@ TUI_HEIGHT="${TUI_HEIGHT:-32}"
 TUI_OUT_DIR="${TUI_OUT_DIR:-target/tui-scenarios/welcome-resize}"
 
 source "$REPO_ROOT/.agents/skills/tui-smoke-test-with-tmux/scripts/tui_tmux_lib.sh"
+tui_build_if_needed
+ACN_BINARY="$(tui_resolve_binary TUI_ACN_BINARY acn bin)"
+TUI_SKIP_BUILD=1
+mkdir -p "$TUI_OUT_DIR"
+TUI_OUT_DIR_ABS="$(cd "$TUI_OUT_DIR" && pwd)"
+WELCOME_RUNTIME_ROOT="$(mktemp -d "$TUI_OUT_DIR_ABS/runtime.XXXXXX")"
+WELCOME_CONFIG="$WELCOME_RUNTIME_ROOT/config.toml"
+WELCOME_ACN_HOME="$WELCOME_RUNTIME_ROOT/acn_home"
+mkdir -p "$WELCOME_ACN_HOME"
+python3 - "$REPO_ROOT/config.toml" "$WELCOME_CONFIG" "$WELCOME_ACN_HOME" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+source, target, acn_home = map(Path, sys.argv[1:])
+text, count = re.subn(
+    r"(?m)^acn_home\s*=\s*.*$",
+    "acn_home = " + json.dumps(str(acn_home.resolve())),
+    source.read_text(),
+    count=1,
+)
+if count != 1:
+    raise SystemExit("expected exactly one storage.acn_home in config.toml")
+target.write_text(text)
+PY
+tui_config_acn_home "$WELCOME_CONFIG" >/dev/null
+TUI_COMMAND="'$ACN_BINARY' --config '$WELCOME_CONFIG'"
+
+cleanup_welcome_resize() {
+  tui_cleanup
+  tui_terminate_owned_supervisors "$WELCOME_CONFIG" "$ACN_BINARY"
+}
 
 assert_single_welcome_card() {
   local capture="$1"
@@ -34,10 +67,22 @@ assert_single_blank_before_entry() {
   fi
 }
 
+trap cleanup_welcome_resize EXIT
 tui_start
 
-sleep 3
-tui_capture "initial_131"
+WELCOME_SEEN=0
+for _ in $(seq 1 30); do
+  sleep 1
+  tui_capture "initial_131"
+  if rg -q 'Agent Claim Network' "$TUI_OUT_DIR_ABS/initial_131.txt"; then
+    WELCOME_SEEN=1
+    break
+  fi
+done
+if [[ "$WELCOME_SEEN" != "1" ]]; then
+  echo "welcome card did not render within 30 seconds" >&2
+  exit 1
+fi
 tui_assert_contains "initial_131" "Agent Claim Network" "initial capture missing welcome card"
 tui_assert_contains "initial_131" "Runtime Metadata.*ACN 工作流" "initial capture missing paired section headings"
 tui_assert_contains "initial_131" "Maintainer (✅|❓|❌)  Router (✅|❓|❌)" "initial capture missing combined team status"

@@ -218,9 +218,12 @@ run_focused_tui_smoke() (
   export TUI_OUT_DIR="$SMOKE_DIR/tui-mcp-panel"
   export TUI_COMMAND="env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost $ACN_BIN --config $CONFIG_PATH --upstream review_tui"
   export TUI_SKIP_BUILD="1"
+  export TUI_SUPERVISOR_CONFIG="$CONFIG_PATH"
+  export TUI_SUPERVISOR_BINARY="$ACN_BIN"
   # shellcheck source=/dev/null
   source "$REPO_ROOT/.agents/skills/tui-smoke-test-with-tmux/scripts/tui_tmux_lib.sh"
 
+  trap tui_cleanup_runtime EXIT
   tui_start
   local initial_seen=0
   for _ in $(seq 1 30); do
@@ -491,6 +494,8 @@ echo "[mcp-smoke] canonical and focused TUI"
 "$REPO_ROOT/.agents/skills/tui-smoke-test-with-tmux/scripts/tui_tmux_smoke.sh" \
   --session "acn_tui_mcp_canonical_$$" \
   --command "env NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost $ACN_BIN --config $CONFIG_PATH --upstream review_tui" \
+  --supervisor-config "$CONFIG_PATH" \
+  --supervisor-binary "$ACN_BIN" \
   --skip-build \
   --out-dir "$SMOKE_DIR/tui-canonical"
 run_focused_tui_smoke

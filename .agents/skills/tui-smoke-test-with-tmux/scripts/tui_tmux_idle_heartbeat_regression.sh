@@ -12,8 +12,9 @@ TUI_OUT_DIR="${TUI_OUT_DIR:-target/tui-scenarios/idle-heartbeat-refresh}"
 TUI_BUILD_COMMAND="${TUI_BUILD_COMMAND:-cargo build --quiet --bin acn --example fake_anthropic_sse_server}"
 
 source "$REPO_ROOT/.agents/skills/tui-smoke-test-with-tmux/scripts/tui_tmux_lib.sh"
-
 tui_build_if_needed
+ACN_BINARY="$(tui_resolve_binary TUI_ACN_BINARY acn bin)"
+FAKE_SERVER_BINARY="$(tui_resolve_binary TUI_FAKE_SERVER_BINARY fake_anthropic_sse_server example)"
 TUI_SKIP_BUILD=1
 mkdir -p "$TUI_OUT_DIR"
 TUI_OUT_DIR_ABS="$(cd "$TUI_OUT_DIR" && pwd)"
@@ -24,8 +25,8 @@ FAKE_SERVER_PID=""
 
 cleanup() {
   tui_cleanup
-  if [[ -x "$REPO_ROOT/target/debug/acn" && -f "$FAKE_CONFIG" ]]; then
-    "$REPO_ROOT/target/debug/acn" supervisor stop --config "$FAKE_CONFIG" >/dev/null 2>&1 || true
+  if [[ -f "$FAKE_CONFIG" ]]; then
+    tui_terminate_owned_supervisors "$FAKE_CONFIG" "$ACN_BINARY" || true
   fi
   if [[ "$FAKE_SERVER_PID" =~ ^[0-9]+$ ]]; then
     kill -TERM "$FAKE_SERVER_PID" >/dev/null 2>&1 || true
@@ -40,7 +41,7 @@ cleanup() {
 trap cleanup EXIT
 
 rm -f "$FAKE_READY_FILE"
-"$REPO_ROOT/target/debug/examples/fake_anthropic_sse_server" \
+"$FAKE_SERVER_BINARY" \
   --ready-file "$FAKE_READY_FILE" \
   --response-mode background-process &
 FAKE_SERVER_PID="$!"
@@ -84,10 +85,8 @@ notify_on_finalize_completion = false
 interval_turns = 100
 EOF
 
-TUI_COMMAND="ACN_FAKE_LLM_API_KEY=test-key target/debug/acn --config '$FAKE_CONFIG'"
+TUI_COMMAND="ACN_FAKE_LLM_API_KEY=test-key '$ACN_BINARY' --config '$FAKE_CONFIG'"
 tui_start
-# tui_start 会覆盖 trap；恢复包含 fake server、supervisor 与临时 home 的完整清理。
-trap cleanup EXIT
 
 wait_capture() {
   local name="$1" pattern="$2" description="$3"

@@ -17,6 +17,9 @@ unset NO_COLOR
   echo "ACN_LLM_API_KEY is required; source export_env.sh first" >&2
   exit 1
 }
+tui_build_if_needed
+ACN_BINARY="$(tui_resolve_binary TUI_ACN_BINARY acn bin)"
+TUI_SKIP_BUILD=1
 
 BASE_OUT="${BACKGROUND_SHELL_REAL_LLM_OUT_DIR:-target/tui-scenarios/background-shell-real-llm}"
 if [[ "$BASE_OUT" == /* ]]; then
@@ -30,7 +33,10 @@ CONFIG_SOURCE="${BACKGROUND_SHELL_REAL_LLM_CONFIG:-$REPO_ROOT/config.toml}"
 if [[ ! -f "$CONFIG_SOURCE" ]]; then
   CONFIG_SOURCE="$REPO_ROOT/config.toml"
 fi
+IFS=$'\t' read -r SELECTED_UPSTREAM SELECTED_AGENT_ID < <(tui_config_agent_identity "$CONFIG_SOURCE")
 ACN_HOME="$RUN_ROOT/acn_home"
+AGENT_RUNTIME_ROOT="$ACN_HOME/$SELECTED_UPSTREAM"
+SESSION_ROOT="$AGENT_RUNTIME_ROOT/data/agents/$SELECTED_AGENT_ID/sessions"
 PROCESS_PID_PATH="$RUN_ROOT/managed-root.pid"
 PROCESS_PGID_PATH="$RUN_ROOT/managed-root.pgid"
 PROCESS_PGIDS_PATH="$RUN_ROOT/managed.pgids"
@@ -39,7 +45,7 @@ VIEWPORT_STARTED_PATH="$RUN_ROOT/viewport-started.log"
 VIEWPORT_PGID_PREFIX="$RUN_ROOT/managed-viewport"
 SUBAGENT_STARTED_PATH="$RUN_ROOT/subagent-started.log"
 SUBAGENT_PGID_PREFIX="$RUN_ROOT/managed-subagent"
-MCP_CONFIG_PATH="$ACN_HOME/dev/.mcp.json"
+MCP_CONFIG_PATH="$AGENT_RUNTIME_ROOT/.mcp.json"
 MCP_FIXTURE_PATH="$REPO_ROOT/.agents/skills/tui-smoke-test-with-tmux/scripts/shared_mcp_real_llm_fixture.sh"
 MCP_FIXTURE_LOG="$RUN_ROOT/mcp-fixture.jsonl"
 MCP_FIXTURE_INIT_COUNT="$RUN_ROOT/mcp-initialize-count.txt"
@@ -48,7 +54,7 @@ MCP_FIXTURE_TIMEOUT_ONCE_STATE="$RUN_ROOT/mcp-timeout-once-used"
 SUBAGENT_TERMINATE_CAPTURE=""
 TUI_SESSION="acn_background_shell_real_llm_$$"
 TUI_OUT_DIR="$RUN_ROOT"
-TUI_COMMAND="cargo run --quiet --bin acn -- --config $CONFIG_PATH"
+TUI_COMMAND="'$ACN_BINARY' --config '$CONFIG_PATH'"
 TUI_WIDTH=132
 TUI_HEIGHT=40
 WAIT_SECS="${BACKGROUND_SHELL_REAL_LLM_WAIT_SECS:-180}"
@@ -136,17 +142,13 @@ terminate_fixture_pid_if_still_owned() {
 }
 
 cleanup() {
+  local cleanup_status=0
   tui_cleanup
   # `/exit` 可以把最终收束交给测试专用 supervisor；它和 TUI 不在同一个 tmux
-  # session，必须按这次生成的 config 再做一次精确清理，不能遗留到开发环境。
-  while IFS= read -r supervisor_pid_path; do
-    supervisor_pid="$(tr -d '[:space:]' < "$supervisor_pid_path")"
-    [[ "$supervisor_pid" =~ ^[0-9]+$ ]] || continue
-    supervisor_command="$(ps -p "$supervisor_pid" -o command= 2>/dev/null || true)"
-    if [[ "$supervisor_command" == *"acn supervisor run --config $CONFIG_PATH"* ]]; then
-      kill -TERM "$supervisor_pid" 2>/dev/null || true
-    fi
-  done < <(find "$ACN_HOME" -path '*/runtime/supervisor/supervisor.pid' -type f -print)
+  # session，必须按这次生成的 config 精确收束，并容忍两者退出时的启动竞态。
+  if ! tui_terminate_owned_supervisors "$CONFIG_PATH" "$ACN_BINARY"; then
+    cleanup_status=1
+  fi
   if [[ -f "$PROCESS_PGIDS_PATH" ]]; then
     while IFS= read -r pgid; do
       pgid="${pgid//[[:space:]]/}"
@@ -182,6 +184,7 @@ cleanup() {
       }
     ' "$MCP_FIXTURE_LOG" | sort -u)
   fi
+  return "$cleanup_status"
 }
 
 assert_process_group_live_path() {
@@ -343,7 +346,7 @@ wait_for_line_count() {
 wait_for_pty_process_id() {
   local deadline=$((SECONDS + WAIT_SECS)) event_path process_id
   while (( SECONDS < deadline )); do
-    event_path="$(find "$ACN_HOME/dev/data/agents/agent-a/sessions" -name turn_events.jsonl -type f -print | sort | tail -n 1)"
+    event_path="$(find "$SESSION_ROOT" -name turn_events.jsonl -type f -print | sort | tail -n 1)"
     if [[ -n "$event_path" ]]; then
       process_id="$(perl -MJSON::PP -e '
         while (<>) {
@@ -373,7 +376,7 @@ wait_for_pty_process_id() {
 wait_for_short_code_run_result() {
   local deadline=$((SECONDS + WAIT_SECS)) event_path
   while (( SECONDS < deadline )); do
-    event_path="$(find "$ACN_HOME/dev/data/agents/agent-a/sessions" -name turn_events.jsonl -type f -print | sort | tail -n 1)"
+    event_path="$(find "$SESSION_ROOT" -name turn_events.jsonl -type f -print | sort | tail -n 1)"
     if [[ -n "$event_path" ]] && perl -MJSON::PP -e '
       my (%names, %inputs);
       while (<>) {
@@ -407,7 +410,7 @@ wait_for_short_code_run_result() {
 wait_for_pty_first_write_result() {
   local deadline=$((SECONDS + WAIT_SECS)) event_path
   while (( SECONDS < deadline )); do
-    event_path="$(find "$ACN_HOME/dev/data/agents/agent-a/sessions" -name turn_events.jsonl -type f -print | sort | tail -n 1)"
+    event_path="$(find "$SESSION_ROOT" -name turn_events.jsonl -type f -print | sort | tail -n 1)"
     if [[ -n "$event_path" ]] && perl -MJSON::PP -e '
       my (%names, %inputs, $saw_list, $saw_first) = ((), (), 0, 0);
       while (<>) {
@@ -442,7 +445,7 @@ wait_for_pty_first_write_result() {
 wait_for_pty_terminal_result() {
   local deadline=$((SECONDS + WAIT_SECS)) event_path
   while (( SECONDS < deadline )); do
-    event_path="$(find "$ACN_HOME/dev/data/agents/agent-a/sessions" -name turn_events.jsonl -type f -print | sort | tail -n 1)"
+    event_path="$(find "$SESSION_ROOT" -name turn_events.jsonl -type f -print | sort | tail -n 1)"
     if [[ -n "$event_path" ]] && perl -MJSON::PP -e '
       my (%names, %inputs);
       while (<>) {
@@ -611,9 +614,9 @@ send_prompt() {
   tui_send_keys C-m
 }
 
-tui_start
 trap cleanup EXIT
-wait_capture "initial" "ACN|initializing|open|agent-a" "TUI startup"
+tui_start
+wait_capture "initial" "ACN|initializing|open|$SELECTED_AGENT_ID" "TUI startup"
 
 send_prompt "Use process tools only. Call code_run with type bash, tty false and yield_time_ms 10000. Its script must start with the exact first line '# ACN_ROOT', then execute: echo \$\$ > '$PROCESS_PID_PATH'; pgid=\$(ps -o pgid= -p \$\$ | tr -d '[:space:]'); printf '%s\\n' \"\$pgid\" > '$PROCESS_PGID_PATH'; printf '%s\\n' \"\$pgid\" >> '$PROCESS_PGIDS_PATH'; echo started > '$PROCESS_STARTED_PATH'; sleep 300; printf natural-finish. Do not use '&', kill, write_stdin, or answer while code_run is still in its initial observation window."
 wait_for_file "$PROCESS_STARTED_PATH" "registered code_run to enter its initial yield"
@@ -679,7 +682,8 @@ tmux resize-window -t "$TUI_SESSION" -x 48 -y 8
 sleep 0.5
 tui_capture "ps_narrow_initial"
 tui_assert_contains "ps_narrow_initial" "PROCESS ID" "narrow /ps lost its required identity column"
-tui_assert_contains "ps_narrow_initial" "owner=.*cmd=" "narrow /ps did not retain owner and command fields"
+tui_assert_contains "ps_narrow_initial" "owner:" "narrow /ps did not retain owner field"
+tui_assert_contains "ps_narrow_initial" "command:" "narrow /ps did not retain command field"
 # 选中项在时间竞争下可能是首行（新快照已先应用）也可能是末行（旧 process_id
 # 选中被保留）。先试 Down；如果刚好在末行再回退到 Up，避免把边界 no-op 误判为
 # viewport 不会跟随。
@@ -757,7 +761,7 @@ tui_assert_contains "mcp_panel_after_active_reconnect" "ready" "replacement MCP 
 assert_fixture_pid_exited "$old_mcp_fixture_pid"
 assert_managed_process_group_live
 tui_send_keys Escape
-wait_capture "mcp_reconnect_dispatch_failure" "Error: dispatch failed" "old MCP tool dispatch failure"
+wait_capture "mcp_reconnect_dispatch_failure" "Error: Dispatch failed" "old MCP tool dispatch failure"
 wait_capture "mcp_reconnect_turn_idle" "┌ Idle" "turn continuation after MCP reconnect"
 
 send_prompt "Call MCP tool mcp__shared__ping exactly once with an empty object. Do not call code_run, create subagents, write_stdin, process_list, or any other tool. After it returns, answer only MCP_REPLACEMENT_PING_DONE."
