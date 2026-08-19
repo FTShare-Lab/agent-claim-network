@@ -29,8 +29,10 @@ use crate::tool::EvaluationSubmission;
 pub const EVALUATION_SCHEMA_VERSION: u32 = 1;
 pub const EVALUATION_MODEL_KEY_ENV: &str = "ACN_EVAL_MODEL_KEY";
 
-/// 评测 runtime 的 ACN.md 只保留 Claim 的使用边界，避免不同 arm 携带额外项目指令。
-const EVALUATION_ACN_MD_GUIDANCE: &str = r#"若当前任务可能与团队已有 claim 有关，先查看冻结 router 的 scope overview；存在相关 scope 时，用 `consult_router` 查询候选 claim。
+/// 评测 runtime 的 ACN.md 对所有 arm 固定注入相同的解题纪律与 Claim 使用边界。
+const EVALUATION_ACN_MD_GUIDANCE: &str = r#"对于需要修改代码的任务，按“定位相关代码、构造最小复现、实施最小修复、复跑验证、检查边界或回归、检查 diff、提交”逐步推进。任何尚未准备结束的 assistant 回复，都必须通过至少一个工具调用取得新的可证伪证据或推进实际修改；不得只给出计划，也不得用无信息量命令凑调用次数。只有已核验任务验收条件并检查 diff 后，才可在仅包含无参数 `submit_task` 的回复中结束。
+
+若当前任务可能与团队已有 claim 有关，先查看冻结 router 的 scope overview；存在相关 scope 时，用 `consult_router` 查询候选 claim。
 
 候选 claim 只是此前探索的经验和线索，不代表其中的方案已经成功，也不保证在当前任务或当前代码状态下仍成立。始终以当前任务契约、工作区事实以及可复现的工具和测试结果独立判断；证据不足、条件不符或与当前证据冲突时，不要沿用其中的解法。
 
@@ -1024,7 +1026,7 @@ model_egress_mode = "pier"
     }
 
     #[tokio::test]
-    async fn evaluation_acn_md_contains_only_claim_guidance() {
+    async fn evaluation_acn_md_contains_fixed_solving_and_claim_guidance() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ACN.md");
 
@@ -1034,6 +1036,8 @@ model_egress_mode = "pier"
             tokio::fs::read_to_string(path).await.unwrap(),
             EVALUATION_ACN_MD_GUIDANCE
         );
+        assert!(EVALUATION_ACN_MD_GUIDANCE.contains("至少一个工具调用"));
+        assert!(EVALUATION_ACN_MD_GUIDANCE.contains("submit_task"));
     }
 
     #[test]

@@ -314,8 +314,9 @@ def freeze_fixture(
     seed: int,
     *,
     sample_size: int,
+    reuse_local_agent_image_fingerprint: str | None = None,
 ) -> FrozenDatasetManifest:
-    del tasks_root, deepswe_checkout, pier_checkout
+    del tasks_root, deepswe_checkout, pier_checkout, reuse_local_agent_image_fingerprint
     assert sample_size == len(TASK_IDS)
     normalized_root.mkdir(parents=True)
     manifest = {

@@ -149,7 +149,9 @@ skill、task 与两份 Python source tree hash。`acn_revision` 必须等于当�
 得分；一般 429 若没有这个精确标记，仍按原始 agent 结果处理，避免把普通限流误归因。
 
 Pier 固定 `force_build=false`，使用冻结 `task.toml` 指向的官方预构建镜像，避免本机联网重建
-和架构漂移；同时固定 `n_attempts=1`、`n_concurrent_trials=1`、`max_retries=0`。
+和架构漂移；同时固定 `delete=false`，使每个 trial 结束时拆掉 Compose 容器，但保留已在本地的
+官方题面镜像。Pier 的 `delete=true` 会执行 `down --rmi all`，把这些镜像删掉后再次拉取，
+既浪费磁盘也不再能复用预构建环境。同时固定 `n_attempts=1`、`n_concurrent_trials=1`、`max_retries=0`。
 
 `EvaluationProvenance.model` 是发送给模型服务的请求模型名，`expected_response_model` 是
 上游实际返回的 checkpoint 名，二者都写入 execution manifest。当前示例使用

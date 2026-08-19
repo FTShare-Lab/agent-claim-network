@@ -34,6 +34,8 @@ CONTAINER_MODEL_KEY_ENV = "ACN_EVAL_MODEL_KEY"
 EVALUATION_AUTO_COMPACT_CTX_RATIO = 0.80
 EVALUATION_FILE_READ_MAX_CHARS = 20_000
 EVALUATION_CODE_RUN_MAX_OUTPUT_CHARS = 20_000
+EVALUATION_TEMPERATURE = 0.95
+EVALUATION_TOP_P = 1.0
 CLAIM_BUNDLE_VARIANTS = frozenset(("B_claim", "B_forced_claim"))
 DEFAULT_PROGRESS_POLL_SECS = 30
 DEFAULT_PROGRESS_STALL_AFTER_SECS = 600
@@ -309,6 +311,8 @@ def build_acn_config(provenance: EvaluationProvenance, upstream_base_url: str) -
             "endpoint": f"{upstream_base_url.rstrip('/')}/v1",
             "model": provenance.model,
             "reasoning_effort": provenance.reasoning_effort,
+            "temperature": EVALUATION_TEMPERATURE,
+            "top_p": EVALUATION_TOP_P,
             "api_key_env": CONTAINER_MODEL_KEY_ENV,
             "max_tokens": _positive_int(resources, "max_tokens"),
             "context_window": _positive_int(resources, "context_window"),
@@ -326,9 +330,12 @@ def build_acn_config(provenance: EvaluationProvenance, upstream_base_url: str) -
         "agent.session.compaction": {
             "auto_compact_ctx_ratio": EVALUATION_AUTO_COMPACT_CTX_RATIO,
         },
+        "agent.session.memory_review": {"enabled": False},
+        "agent.memory": {"enabled": False},
         "agent.tool": {
             "file_read_max_chars": EVALUATION_FILE_READ_MAX_CHARS,
             "file_diff_max_changed_lines": 20,
+            "file_edit_authority_enabled": False,
             "max_parallel_tool_calls": 1,
             "code_run_max_output_chars": EVALUATION_CODE_RUN_MAX_OUTPUT_CHARS,
         },
@@ -415,8 +422,8 @@ def build_pier_job_config(
         "retry": {"max_retries": 0},
         "environment": {
             "force_build": False,
-            # 结束 trial 时清理容器/卷，但保留预拉取的官方任务镜像。否则 Pier 的
-            # `down --rmi all` 会让下一次冻结 preflight 缺少 content digest，并重复下载。
+            # 结束 trial 时只拆 Compose 容器，不 --rmi。Pier 的 delete=True 会
+            # `down --rmi all`，把已预构建的官方题面镜像一并删掉，随后重复拉取，撑爆磁盘。
             "delete": False,
             "override_cpus": resources.get("cpus"),
             "override_memory_mb": resources.get("memory_mb"),

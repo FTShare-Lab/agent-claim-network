@@ -28,6 +28,8 @@ provider = "openai_responses"
 endpoint = "https://upstream.invalid/v1"
 model = "fixture-model"
 reasoning_effort = "max"
+temperature = 0.95
+top_p = 1.0
 api_key_env = "ACN_EVAL_MODEL_KEY"
 max_tokens = 1024
 context_window = 8192
@@ -40,9 +42,14 @@ id_mint_max_retries = 3
 notify_on_finalize_completion = false
 [agent.session.compaction]
 auto_compact_ctx_ratio = 0.8
+[agent.session.memory_review]
+enabled = false
+[agent.memory]
+enabled = false
 [agent.tool]
 file_read_max_chars = 20000
 file_diff_max_changed_lines = 20
+file_edit_authority_enabled = false
 max_parallel_tool_calls = 1
 code_run_max_output_chars = 20000
 [agent.attachment]
