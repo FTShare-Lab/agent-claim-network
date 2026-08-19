@@ -87,6 +87,7 @@ fn contains_responses_payload_key(text: &str) -> bool {
 
 pub(crate) use client::is_stream_recovery_failure;
 pub use client::{ResponsesClient, ResponsesError, ResponsesStreamEvent};
+pub(crate) use protocol::RESPONSES_TRUNCATION_DISABLED;
 pub use protocol::{
     reduce_response_value, ReducedResponses, ResponsesFunctionCall, ResponsesReasoning,
     ResponsesRequest, ResponsesTerminal, ResponsesTool,

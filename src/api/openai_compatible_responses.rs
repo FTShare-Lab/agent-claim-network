@@ -140,6 +140,7 @@ impl OpenAiCompatibleResponsesProviderAdapter {
             max_output_tokens: max_tokens,
             stream,
             store: false,
+            truncation: crate::api::responses::RESPONSES_TRUNCATION_DISABLED.to_string(),
             include: self
                 .include_reasoning_replay
                 .then(|| vec!["reasoning.encrypted_content".into()]),
@@ -1276,6 +1277,7 @@ mod tests {
         let value = serde_json::to_value(request).unwrap();
 
         assert_eq!(value["store"], false);
+        assert_eq!(value["truncation"], "disabled");
         assert_eq!(value["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(value["stream"], true);
         assert_eq!(value["max_output_tokens"], 123);

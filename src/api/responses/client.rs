@@ -813,6 +813,7 @@ mod tests {
             max_output_tokens: 128,
             stream,
             store: false,
+            truncation: crate::api::responses::protocol::RESPONSES_TRUNCATION_DISABLED.to_string(),
             include: None,
             reasoning: None,
             temperature: None,

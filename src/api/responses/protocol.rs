@@ -14,6 +14,8 @@ pub struct ResponsesRequest {
     pub max_output_tokens: u32,
     pub stream: bool,
     pub store: bool,
+    /// 禁止上游静默裁剪历史；与 MiniSWE Responses 对照请求一致。
+    pub truncation: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -23,6 +25,8 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
 }
+
+pub(crate) const RESPONSES_TRUNCATION_DISABLED: &str = "disabled";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ResponsesReasoning {
@@ -407,6 +411,7 @@ mod tests {
             max_output_tokens: 1024,
             stream: true,
             store: false,
+            truncation: RESPONSES_TRUNCATION_DISABLED.to_string(),
             include: None,
             reasoning: None,
             temperature: None,
@@ -416,6 +421,7 @@ mod tests {
         let value = serde_json::to_value(request).unwrap();
 
         assert_eq!(value["store"], false);
+        assert_eq!(value["truncation"], RESPONSES_TRUNCATION_DISABLED);
         assert!(value.get("reasoning").is_none());
         assert_eq!(value["tools"][0]["strict"], false);
         assert_eq!(value["tools"][0]["name"], "file_read");

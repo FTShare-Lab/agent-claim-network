@@ -90,8 +90,8 @@ class ConfigGenerationTests(unittest.TestCase):
         self.assertEqual(llm["api_key_env"], CONTAINER_MODEL_KEY_ENV)
         self.assertEqual(llm["provider"], "openai_responses")
         self.assertEqual(llm["reasoning_effort"], "max")
-        self.assertEqual(llm["temperature"], 0.95)
-        self.assertEqual(llm["top_p"], 1.0)
+        self.assertEqual(llm["temperature"], 1.0)
+        self.assertEqual(llm["top_p"], 0.95)
         self.assertEqual(llm["max_tokens"], provenance().resources["max_tokens"])
         rerank = parsed["router"]["rerank"]
         self.assertEqual(rerank["provider"], "openai_responses")
