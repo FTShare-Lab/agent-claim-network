@@ -1,0 +1,45 @@
+# MiniSWE 2.4.5 Responses 协议对照：显式请求 reasoning=max 与 65,536 输出上限。
+# 凭据和 endpoint 仅通过运行时环境变量传入，禁止写入本文件。
+job_name: miniswe-official-full-v2.4.5-responses-v6-max-reasoning-c40
+jobs_dir: ${MINISWE_JOBS_DIR}
+n_attempts: 2
+n_concurrent_trials: 40
+timeout_multiplier: 1.0
+quiet: false
+
+retry:
+  max_retries: 0
+
+environment:
+  type: docker
+  delete: true
+
+agents:
+  - name: mini-swe-agent
+    model_name: openai/deepseek-v4-flash-local
+    env:
+      OPENAI_API_KEY: ${MINISWE_API_KEY}
+      OPENAI_BASE_URL: ${MINISWE_OPENAI_BASE_URL}
+      NO_PROXY: ${MINISWE_NO_PROXY}
+      no_proxy: ${MINISWE_NO_PROXY}
+    kwargs:
+      version: "2.4.5"
+      model_class: litellm_response
+      normalize_response_reasoning_text: true
+      restrict_egress_to_configured_base: true
+      cost_limit: 0
+      model_kwargs:
+        model_info:
+          max_input_tokens: 1000000
+          max_output_tokens: 65536
+          litellm_provider: openai
+          mode: responses
+        max_output_tokens: 65536
+        reasoning:
+          effort: max
+        truncation: disabled
+        temperature: 1.0
+        top_p: 0.95
+
+datasets:
+  - path: ${DEEPSWE_TASKS_DIR}

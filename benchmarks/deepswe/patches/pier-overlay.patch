@@ -1,0 +1,564 @@
+diff --git a/src/pier/agents/installed/mini_swe_agent.py b/src/pier/agents/installed/mini_swe_agent.py
+index 75d25b6..80bc7ff 100644
+--- a/src/pier/agents/installed/mini_swe_agent.py
++++ b/src/pier/agents/installed/mini_swe_agent.py
+@@ -580,6 +580,9 @@ class MiniSweAgent(BaseInstalledAgent):
+         model_kwargs: dict[str, Any] | None = None,
+         extra_python_packages: list[str] | None = None,
+         set_cache_control: str | None = None,
++        normalize_response_reasoning_text: bool = False,
++        ensure_chat_reasoning_content: bool = False,
++        restrict_egress_to_configured_base: bool = False,
+         config_yaml: str | None = None,
+         config_file: str | None = None,
+         *args,
+@@ -592,6 +595,11 @@ class MiniSweAgent(BaseInstalledAgent):
+         self._model_kwargs = model_kwargs or {}
+         self._extra_python_packages = extra_python_packages or []
+         self._set_cache_control = set_cache_control
++        self._normalize_response_reasoning_text = normalize_response_reasoning_text
++        self._ensure_chat_reasoning_content = ensure_chat_reasoning_content
++        self._restrict_egress_to_configured_base = (
++            restrict_egress_to_configured_base
++        )
+         self._config_yaml = config_yaml
+         if config_file:
+             self._config_yaml = Path(config_file).read_text()
+@@ -709,7 +717,12 @@ mini-swe-agent --help
+             "GEMINI_API_BASE",
+             "OPENROUTER_API_BASE",
+         ):
+-            if value := self._get_env(key):
++            value = (
++                self._extra_env.get(key)
++                if self._restrict_egress_to_configured_base
++                else self._get_env(key)
++            )
++            if value:
+                 urls.append(value)
+ 
+         if self._config_yaml:
+@@ -723,10 +736,11 @@ mini-swe-agent --help
+         if self.model_name and "/" in self.model_name:
+             provider = self.model_name.split("/", 1)[0]
+ 
+-        return allowlist_from_urls(
+-            urls,
+-            default_domains=self._DEFAULT_PROVIDER_DOMAINS.get(provider or "", []),
+-        )
++        default_domains = self._DEFAULT_PROVIDER_DOMAINS.get(provider or "", [])
++        if self._restrict_egress_to_configured_base and urls:
++            default_domains = []
++
++        return allowlist_from_urls(urls, default_domains=default_domains)
+ 
+     @property
+     def _mini_swe_agent_trajectory_path(self) -> PurePosixPath:
+@@ -764,6 +778,124 @@ mini-swe-agent --help
+             for key, value in self._model_kwargs.items()
+         )
+ 
++    def _response_reasoning_normalization_command(self) -> str:
++        """Return an opt-in runtime compatibility patch for Responses replay.
++
++        The patch is deliberately applied after the agent image is built.  This
++        keeps the normal mini-swe-agent installation layer cacheable and makes
++        the workaround local to the trial that requested it.
++        """
++        if not self._normalize_response_reasoning_text:
++            return ""
++
++        return r'''
++python_bin="$(head -n 1 "$(command -v mini-swe-agent)" | sed 's/^#!//')"
++"$python_bin" <<'PY'
++from importlib.util import find_spec
++from pathlib import Path
++
++marker = "# pier-response-reasoning-text-normalization"
++patch = """
++# pier-response-reasoning-text-normalization
++_pier_original_prepare_messages_for_api = LitellmResponseModel._prepare_messages_for_api
++
++
++def _pier_prepare_messages_with_reasoning_text(self, messages):
++    # Normalize non-compliant Responses reasoning content for stateless replay.
++    normalized_messages = []
++    for message in messages:
++        if message.get("object") != "response":
++            normalized_messages.append(message)
++            continue
++
++        normalized_message = dict(message)
++        normalized_output = []
++        for item in message.get("output", []):
++            if not isinstance(item, dict) or item.get("type") != "reasoning":
++                normalized_output.append(item)
++                continue
++
++            normalized_item = dict(item)
++            content = normalized_item.get("content")
++            if isinstance(content, list):
++                normalized_item["content"] = [
++                    {**part, "type": "reasoning_text"}
++                    if isinstance(part, dict)
++                    and part.get("type") == "text"
++                    and isinstance(part.get("text"), str)
++                    else part
++                    for part in content
++                ]
++            normalized_output.append(normalized_item)
++
++        normalized_message["output"] = normalized_output
++        normalized_messages.append(normalized_message)
++
++    return _pier_original_prepare_messages_for_api(self, normalized_messages)
++
++
++LitellmResponseModel._prepare_messages_for_api = _pier_prepare_messages_with_reasoning_text
++"""
++
++spec = find_spec("minisweagent.models.litellm_response_model")
++if spec is None or spec.origin is None:
++    raise RuntimeError("mini-swe-agent Responses model module was not installed")
++path = Path(spec.origin)
++source = path.read_text(encoding="utf-8")
++if marker not in source:
++    path.write_text(source + patch, encoding="utf-8")
++PY
++'''
++
++    def _chat_reasoning_content_padding_command(self) -> str:
++        """Return an opt-in DeepSeek Chat thinking compatibility patch.
++
++        In thinking mode, DeepSeek expects every historical assistant tool-call
++        message to carry ``reasoning_content``. Some OpenAI-compatible
++        gateways omit it when a tool call has no visible reasoning text; an
++        explicit empty string preserves the required message shape.
++        """
++        if not self._ensure_chat_reasoning_content:
++            return ""
++
++        return r'''
++python_bin="$(head -n 1 "$(command -v mini-swe-agent)" | sed 's/^#!//')"
++"$python_bin" <<'PY'
++from importlib.util import find_spec
++from pathlib import Path
++
++marker = "# pier-chat-reasoning-content-padding"
++patch = """
++# pier-chat-reasoning-content-padding
++_pier_original_chat_prepare_messages_for_api = LitellmModel._prepare_messages_for_api
++
++
++def _pier_prepare_chat_messages_with_reasoning_content(self, messages):
++    padded_messages = []
++    for message in messages:
++        if (
++            message.get("role") == "assistant"
++            and message.get("tool_calls")
++            and not isinstance(message.get("reasoning_content"), str)
++        ):
++            message = {**message, "reasoning_content": ""}
++        padded_messages.append(message)
++    return _pier_original_chat_prepare_messages_for_api(self, padded_messages)
++
++
++LitellmModel._prepare_messages_for_api = _pier_prepare_chat_messages_with_reasoning_content
++"""
++
++spec = find_spec("minisweagent.models.litellm_model")
++if spec is None or spec.origin is None:
++    raise RuntimeError("mini-swe-agent Chat model module was not installed")
++path = Path(spec.origin)
++source = path.read_text(encoding="utf-8")
++if marker not in source:
++    path.write_text(source + patch, encoding="utf-8")
++PY
++'''
++
+     def _build_config_flags(self, *, custom_config_path: str | None = None) -> str:
+         config_flags = "-c mini.yaml "
+ 
+@@ -777,10 +909,26 @@ mini-swe-agent --help
+             config_flags += f"-c model.model_class={shlex.quote(model_class)} "
+ 
+         if self._reasoning_effort:
+-            config_flags += (
+-                f"-c model.model_kwargs.reasoning_effort="
+-                f"{shlex.quote(self._reasoning_effort)} "
+-            )
++            # The OpenAI Responses API expects the effort nested under
++            # ``reasoning``.  Passing the LiteLLM convenience argument
++            # ``reasoning_effort`` works for some native OpenAI models, but is
++            # not reliably translated for custom OpenAI-compatible endpoints.
++            # Keep the existing generic argument for non-Responses adapters,
++            # such as Gemini via LiteLLM.
++            if self._model_class_override in {
++                "litellm_response",
++                "litellm_response_toolcall",
++            }:
++                reasoning = json.dumps({"effort": self._reasoning_effort})
++                config_flags += (
++                    "-c model.model_kwargs.reasoning="
++                    f"{shlex.quote(reasoning)} "
++                )
++            else:
++                config_flags += (
++                    f"-c model.model_kwargs.reasoning_effort="
++                    f"{shlex.quote(self._reasoning_effort)} "
++                )
+ 
+         if self._set_cache_control:
+             config_flags += (
+@@ -888,11 +1036,16 @@ mini-swe-agent --help
+             await self.exec_as_agent(environment, command=write_config_cmd, env=env)
+ 
+         config_flags = self._build_config_flags(custom_config_path=custom_config_path)
++        compatibility_command = (
++            self._response_reasoning_normalization_command()
++            + self._chat_reasoning_content_padding_command()
++        )
+ 
+         await self.exec_as_agent(
+             environment,
+             command=(
+                 '. "$HOME/.local/bin/env"; '
++                f"{compatibility_command}"
+                 f"mini-swe-agent --yolo --model={run_model_name} --task={escaped_instruction} "
+                 f"--output={self._mini_swe_agent_trajectory_path} {extra_flags}"
+                 f"{config_flags}"
+diff --git a/src/pier/environments/docker/docker.py b/src/pier/environments/docker/docker.py
+index 2ed4e92..4c9ac8b 100644
+--- a/src/pier/environments/docker/docker.py
++++ b/src/pier/environments/docker/docker.py
+@@ -200,6 +200,7 @@ class DockerEnvironment(BaseEnvironment):
+         self._resources_compose_temp_dir: tempfile.TemporaryDirectory | None = None
+         self._resources_compose_path: Path | None = None
+         self._agent_build_context_dir: Path | None = None
++        self._egress_proxy_temp_dir: tempfile.TemporaryDirectory | None = None
+         self._egress_proxy_compose_path: Path | None = None
+         self._egress_proxy_env: dict[str, str] = {}
+ 
+@@ -397,22 +398,41 @@ class DockerEnvironment(BaseEnvironment):
+                 "or prebuilt-image tasks, not docker-compose tasks."
+             )
+         token = new_proxy_token()
++        self._cleanup_egress_proxy_compose_file()
++        self._egress_proxy_temp_dir = tempfile.TemporaryDirectory()
++        proxy_temp_dir = Path(self._egress_proxy_temp_dir.name)
+         self._egress_proxy_env = proxy_environment(
+             token, EGRESS_PROXY_SERVICE, EGRESS_PROXY_PORT
+         )
+         self._egress_proxy_compose_path = write_docker_proxy_compose(
+-            path=self.trial_paths.trial_dir / "docker-compose-egress-proxy.json",
+-            proxy_dir=self.trial_paths.trial_dir / "egress-proxy",
++            path=proxy_temp_dir / "docker-compose-egress-proxy.json",
++            proxy_dir=proxy_temp_dir / "egress-proxy",
+             allowlist=allowlist,
+             token=token,
+         )
+ 
++    def _cleanup_egress_proxy_compose_file(self) -> None:
++        """Remove temporary proxy credentials after the environment stops."""
++        self._egress_proxy_env = {}
++        self._egress_proxy_compose_path = None
++        if self._egress_proxy_temp_dir is None:
++            return
++        try:
++            self._egress_proxy_temp_dir.cleanup()
++        except OSError as error:
++            self.logger.debug(f"Failed to remove egress proxy files: {error}")
++        finally:
++            self._egress_proxy_temp_dir = None
++
+     def agent_process_env(self, env: dict[str, str] | None) -> dict[str, str] | None:
+         if not self._egress_proxy_env:
+             return env
+-        merged = dict(self._egress_proxy_env)
+-        if env:
+-            merged.update(env)
++        # The filtered-egress proxy is a security boundary for agent commands.
++        # Agent-level env can add provider credentials and base URLs, but must
++        # not disable or redirect the proxy by overriding HTTP(S)_PROXY or
++        # NO_PROXY.
++        merged = dict(env or {})
++        merged.update(self._egress_proxy_env)
+         return merged or None
+ 
+     def _write_mounts_compose_file(self) -> Path:
+@@ -706,6 +726,8 @@ class DockerEnvironment(BaseEnvironment):
+             except Exception as e:
+                 self.logger.warning(f"Docker compose down failed: {e}")
+         self._cleanup_resources_compose_file()
++        if not self._keep_containers:
++            self._cleanup_egress_proxy_compose_file()
+ 
+     async def upload_file(self, source_path: Path | str, target_path: str):
+         await self._platform.upload_file(source_path, target_path)
+diff --git a/src/pier/environments/modal.py b/src/pier/environments/modal.py
+index 994799a..13e2355 100644
+--- a/src/pier/environments/modal.py
++++ b/src/pier/environments/modal.py
+@@ -950,9 +950,11 @@ class ModalEnvironment(BaseEnvironment):
+     def agent_process_env(self, env: dict[str, str] | None) -> dict[str, str] | None:
+         if not self._egress_proxy_env:
+             return env
+-        merged = dict(self._egress_proxy_env)
+-        if env:
+-            merged.update(env)
++        # Keep the filtered-egress proxy authoritative for agent commands.
++        # User-provided env may configure the model, but may not bypass the
++        # task's network policy with proxy variables.
++        merged = dict(env or {})
++        merged.update(self._egress_proxy_env)
+         return merged or None
+ 
+     def _volumes_config(self) -> dict[str, Volume]:
+diff --git a/src/pier/models/task/config.py b/src/pier/models/task/config.py
+index a141656..ac860d2 100644
+--- a/src/pier/models/task/config.py
++++ b/src/pier/models/task/config.py
+@@ -190,6 +190,14 @@ class SolutionConfig(BaseModel):
+ 
+ class AgentConfig(BaseModel):
+     timeout_sec: float | None = None
++    network_mode: str | None = Field(
++        default=None,
++        description=(
++            "Task-level network policy. DeepSWE/Harbor tasks use "
++            "'no-network' to prohibit task internet access; Pier translates "
++            "that policy into filtered model egress for the agent environment."
++        ),
++    )
+     user: str | int | None = Field(
+         default=None,
+         description="Username or UID to run the agent as. None uses the environment's default USER (e.g., root).",
+@@ -446,8 +454,24 @@ class TaskConfig(BaseModel):
+     @model_validator(mode="before")
+     @classmethod
+     def handle_version_rename(cls, data: Any) -> Any:
+-        if isinstance(data, dict) and "version" in data:
++        if not isinstance(data, dict):
++            return data
++
++        if "version" in data:
+             data.setdefault("schema_version", data.pop("version"))
++
++        # DeepSWE task.toml uses [agent].network_mode = "no-network".  Pier's
++        # execution isolation is expressed by [environment].allow_internet,
++        # with a model-domain allowlist restoring only inference egress.  Without
++        # this translation, Pydantic silently ignored the task policy and local
++        # Docker trials had unrestricted task internet access.
++        agent = data.get("agent")
++        if isinstance(agent, dict) and agent.get("network_mode") == "no-network":
++            environment = data.get("environment")
++            if not isinstance(environment, dict):
++                environment = {}
++                data["environment"] = environment
++            environment["allow_internet"] = False
+         return data
+ 
+     @classmethod
+diff --git a/tests/test_egress_proxy_cleanup.py b/tests/test_egress_proxy_cleanup.py
+new file mode 100644
+index 0000000..1c037d4
+--- /dev/null
++++ b/tests/test_egress_proxy_cleanup.py
+@@ -0,0 +1,21 @@
++from pathlib import Path
++from tempfile import TemporaryDirectory
++from unittest.mock import Mock
++
++from pier.environments.docker.docker import DockerEnvironment
++
++
++def test_egress_proxy_credentials_are_kept_outside_trial_archive():
++    environment = object.__new__(DockerEnvironment)
++    environment.logger = Mock()
++    environment._egress_proxy_env = {"HTTPS_PROXY": "http://agent:token@example:8080"}
++    environment._egress_proxy_temp_dir = TemporaryDirectory()
++    temporary_dir = Path(environment._egress_proxy_temp_dir.name)
++    environment._egress_proxy_compose_path = temporary_dir / "docker-compose.json"
++    environment._egress_proxy_compose_path.write_text("credential")
++
++    environment._cleanup_egress_proxy_compose_file()
++
++    assert not temporary_dir.exists()
++    assert environment._egress_proxy_compose_path is None
++    assert environment._egress_proxy_env == {}
+diff --git a/tests/test_filtered_egress_env.py b/tests/test_filtered_egress_env.py
+index 1fa6f1a..d96c93b 100644
+--- a/tests/test_filtered_egress_env.py
++++ b/tests/test_filtered_egress_env.py
+@@ -41,6 +41,27 @@ def test_docker_agent_process_env_adds_proxy_only_for_agent_commands():
+     assert process_env["HTTP_PROXY"].startswith("http://agent:secret@")
+ 
+ 
++def test_docker_agent_process_env_does_not_allow_proxy_bypass():
++    env = DockerEnvironment.__new__(DockerEnvironment)
++    env._egress_proxy_env = proxy_environment(
++        "secret", EGRESS_PROXY_SERVICE, EGRESS_PROXY_PORT
++    )
++
++    process_env = env.agent_process_env(
++        {
++            "OPENAI_API_KEY": "test",
++            "HTTP_PROXY": "",
++            "HTTPS_PROXY": "",
++            "NO_PROXY": "*",
++        }
++    )
++
++    assert process_env["OPENAI_API_KEY"] == "test"
++    assert process_env["HTTP_PROXY"].startswith("http://agent:secret@")
++    assert process_env["HTTPS_PROXY"].startswith("http://agent:secret@")
++    assert process_env["NO_PROXY"] == "localhost,127.0.0.1"
++
++
+ def test_modal_agent_process_env_adds_proxy_only_for_agent_commands():
+     env = ModalEnvironment.__new__(ModalEnvironment)
+     env._egress_proxy_env = proxy_environment("secret", "r123.modal.host", 12345)
+@@ -51,6 +72,16 @@ def test_modal_agent_process_env_adds_proxy_only_for_agent_commands():
+     assert process_env["HTTP_PROXY"] == "http://agent:secret@r123.modal.host:12345"
+ 
+ 
++def test_modal_agent_process_env_does_not_allow_proxy_bypass():
++    env = ModalEnvironment.__new__(ModalEnvironment)
++    env._egress_proxy_env = proxy_environment("secret", "r123.modal.host", 12345)
++
++    process_env = env.agent_process_env({"HTTP_PROXY": "", "NO_PROXY": "*"})
++
++    assert process_env["HTTP_PROXY"] == "http://agent:secret@r123.modal.host:12345"
++    assert process_env["NO_PROXY"] == "localhost,127.0.0.1"
++
++
+ def test_modal_direct_exec_uses_non_login_shell():
+     class DummyModalEnv:
+         def __init__(self):
+diff --git a/tests/test_harbor_ports.py b/tests/test_harbor_ports.py
+index db3283c..7fdcff8 100644
+--- a/tests/test_harbor_ports.py
++++ b/tests/test_harbor_ports.py
+@@ -29,6 +29,30 @@ def test_task_toml_dump_uses_blank_lines_between_sections():
+     assert "\n\n[environment]\n" in dumped
+ 
+ 
++def test_deepswe_no_network_agent_policy_enables_filtered_egress():
++    config = TaskConfig.model_validate_toml(
++        """
++schema_version = "1.3"
++
++[agent]
++network_mode = "no-network"
++
++[verifier]
++network_mode = "no-network"
++
++[environment]
++docker_image = "example/image:latest"
++"""
++    )
++
++    assert config.agent.network_mode == "no-network"
++    assert config.environment.allow_internet is False
++
++    round_tripped = TaskConfig.model_validate_toml(config.model_dump_toml())
++    assert round_tripped.agent.network_mode == "no-network"
++    assert round_tripped.environment.allow_internet is False
++
++
+ def test_legacy_memory_conflict_is_rejected():
+     with pytest.raises(ValidationError, match="Conflicting 'memory' and 'memory_mb'"):
+         TaskEnvironmentConfig.model_validate({"memory": "1G", "memory_mb": 2048})
+diff --git a/tests/test_mini_swe_agent_conversion.py b/tests/test_mini_swe_agent_conversion.py
+index e8eba69..a1a8bc9 100644
+--- a/tests/test_mini_swe_agent_conversion.py
++++ b/tests/test_mini_swe_agent_conversion.py
+@@ -16,6 +16,41 @@ def test_mini_swe_install_refreshes_litellm_cost_map_backup(tmp_path: Path):
+     assert "model_prices_and_context_window_backup.json" in spec.steps[-1].run
+ 
+ 
++def test_mini_swe_can_normalize_noncompliant_responses_reasoning_content(
++    tmp_path: Path,
++):
++    agent = MiniSweAgent(
++        logs_dir=tmp_path,
++        model_name="openai/deepseek-v4-flash",
++        normalize_response_reasoning_text=True,
++    )
++
++    runtime_patch = agent._response_reasoning_normalization_command()
++
++    assert "pier-response-reasoning-text-normalization" in runtime_patch
++    assert 'part.get("type") == "text"' in runtime_patch
++    assert '"type": "reasoning_text"' in runtime_patch
++    assert "_pier_original_prepare_messages_for_api" in runtime_patch
++    assert "pier-response-reasoning-text-normalization" not in agent.install_spec().steps[-1].run
++
++
++def test_mini_swe_can_pad_missing_chat_tool_reasoning_content(tmp_path: Path):
++    agent = MiniSweAgent(
++        logs_dir=tmp_path,
++        model_name="openai/deepseek-v4-flash",
++        model_class="litellm",
++        ensure_chat_reasoning_content=True,
++    )
++
++    runtime_patch = agent._chat_reasoning_content_padding_command()
++
++    assert "pier-chat-reasoning-content-padding" in runtime_patch
++    assert 'message.get("tool_calls")' in runtime_patch
++    assert '"reasoning_content": ""' in runtime_patch
++    assert "_pier_original_chat_prepare_messages_for_api" in runtime_patch
++    assert "pier-chat-reasoning-content-padding" not in agent.install_spec().steps[-1].run
++
++
+ def test_mini_swe_cost_limit_zero_is_config_override(tmp_path: Path):
+     agent = MiniSweAgent(logs_dir=tmp_path, model_name="openai/gpt-5.5")
+ 
+@@ -36,7 +71,22 @@ def test_mini_swe_openai_uses_responses_model_class(tmp_path: Path):
+     config_flags = agent._build_config_flags()
+ 
+     assert "-c model.model_class=litellm_response" in config_flags
+-    assert "-c model.model_kwargs.reasoning_effort=xhigh" in config_flags
++    assert "-c model.model_kwargs.reasoning='{\"effort\": \"xhigh\"}'" in config_flags
++
++
++def test_mini_swe_non_responses_model_keeps_generic_reasoning_effort(
++    tmp_path: Path,
++):
++    agent = MiniSweAgent(
++        logs_dir=tmp_path,
++        model_name="gemini/gemini-3-flash-preview",
++        reasoning_effort="high",
++    )
++
++    config_flags = agent._build_config_flags()
++
++    assert "-c model.model_kwargs.reasoning_effort=high" in config_flags
++    assert "model.model_kwargs.reasoning=" not in config_flags
+ 
+ 
+ def test_mini_swe_model_class_can_be_overridden(tmp_path: Path):
+diff --git a/tests/test_network_allowlists.py b/tests/test_network_allowlists.py
+index 542a99c..60d1767 100644
+--- a/tests/test_network_allowlists.py
++++ b/tests/test_network_allowlists.py
+@@ -104,3 +104,17 @@ model:
+     )
+ 
+     assert {"api.openai.com", "gateway.example.com"} <= domains(agent)
++
++
++def test_mini_swe_can_restrict_egress_to_configured_base_url(
++    tmp_path: Path, monkeypatch
++):
++    monkeypatch.setenv("OPENAI_BASE_URL", "https://unrelated.example.com/v1")
++    agent = MiniSweAgent(
++        logs_dir=tmp_path,
++        model_name="openai/custom-model",
++        extra_env={"OPENAI_BASE_URL": "https://gateway.example.com/v1"},
++        restrict_egress_to_configured_base=True,
++    )
++
++    assert domains(agent) == {"gateway.example.com"}
