@@ -6,13 +6,15 @@ import hashlib
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import tempfile
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from .network import normalize_task_network
+from .network import _dump_toml, normalize_task_network
 from .provenance import TASK_DIRECTORY_HASH_ALGORITHM, sha256_directory_tree
 
 FREEZE_ALGORITHM = "random.sample_without_replacement_v1"
@@ -27,6 +29,45 @@ SUPPORTED_FREEZE_ALGORITHMS = frozenset(
 
 class DatasetFreezeError(ValueError):
     """候选任务不完整或冻结输出不可审计时抛出。"""
+
+
+_LOCAL_AGENT_FINGERPRINT = re.compile(r"^[0-9a-f]{16}$")
+
+
+def sanitize_docker_image_name(name: str) -> str:
+    """与 Pier 本地镜像 tag 规则一致，只用于复用已构建的 hb__ 镜像。"""
+    sanitized = name.lower()
+    if not re.match(r"^[a-z0-9]", sanitized):
+        sanitized = "0" + sanitized
+    return re.sub(r"[^a-z0-9._-]", "-", sanitized)
+
+
+def local_agent_image_name(task_name: str, fingerprint: str) -> str:
+    """返回 MiniSWE 预构建 agent 镜像名：hb__<task>__agent-<fingerprint>。"""
+    if not task_name.strip():
+        raise DatasetFreezeError("task.name 不能为空")
+    if not _LOCAL_AGENT_FINGERPRINT.fullmatch(fingerprint):
+        raise DatasetFreezeError("reuse_local_agent_image_fingerprint 必须是 16 位小写十六进制")
+    return sanitize_docker_image_name(f"hb__{task_name}__agent-{fingerprint}")
+
+
+def retarget_normalized_task_to_local_agent_image(task_dir: Path, fingerprint: str) -> str:
+    """把冻结副本的 docker_image 改写为本地 hb__ agent 镜像，避免再 build 一层。"""
+    path = task_dir / "task.toml"
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise DatasetFreezeError(f"无法读取冻结 task.toml: {task_dir}") from error
+    task = data.get("task")
+    environment = data.get("environment")
+    if not isinstance(task, dict) or not isinstance(task.get("name"), str):
+        raise DatasetFreezeError(f"冻结 task.toml 缺少 task.name: {task_dir}")
+    if not isinstance(environment, dict) or not isinstance(environment.get("docker_image"), str):
+        raise DatasetFreezeError(f"冻结 task.toml 缺少 environment.docker_image: {task_dir}")
+    image = local_agent_image_name(task["name"], fingerprint)
+    environment["docker_image"] = image
+    path.write_text(_dump_toml(data), encoding="utf-8")
+    return image
 
 
 @dataclass(frozen=True)
@@ -97,6 +138,7 @@ def freeze_execution_dataset(
     pier_checkout: Path,
     seed: int,
     sample_size: int = 5,
+    reuse_local_agent_image_fingerprint: str | None = None,
 ) -> FrozenDatasetManifest:
     """冻结可直接执行的任务集，并生成关闭普通公网的完整任务副本。"""
     if not manifest_path.is_absolute():
@@ -129,9 +171,14 @@ def freeze_execution_dataset(
             source_task = resolved_tasks_root / task_id
             normalized = normalize_task_network(source_task, temporary_root)
             normalized_task = temporary_root / task_id
+            if reuse_local_agent_image_fingerprint is not None:
+                retarget_normalized_task_to_local_agent_image(
+                    normalized_task, reuse_local_agent_image_fingerprint
+                )
+            normalized_toml = (normalized_task / "task.toml").read_bytes()
             task_toml_hashes[task_id] = {
                 "source": normalized.source_hash,
-                "normalized": normalized.normalized_hash,
+                "normalized": hashlib.sha256(normalized_toml).hexdigest(),
             }
             task_directory_hashes[task_id] = {
                 "source": sha256_directory_tree(source_task),

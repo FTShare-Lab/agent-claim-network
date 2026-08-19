@@ -1,0 +1,41 @@
+{
+  "run_root": "/absolute/path/to/deepswe-runs/acn-solver-aligned-full",
+  "deepswe_checkout": "/absolute/path/to/DeepSWE",
+  "source_tasks_root": "/absolute/path/to/DeepSWE/tasks",
+  "pier_checkout": "/absolute/path/to/pier",
+  "pier_executable": "/absolute/path/to/pier/.venv/bin/pier",
+  "acn_eval": "/absolute/path/to/acn_eval",
+  "frozen_skill": "/absolute/path/to/agent_claim_network/benchmarks/deepswe/assets/coding-benchmark",
+  "model": "deepseek-v4-flash-local-exp",
+  "response_model": "deepseek-v4-flash",
+  "reasoning_effort": "max",
+  "model_egress_mode": "pier",
+  "task_workers": 30,
+  "run_all_variants_without_claims": true,
+  "reuse_local_agent_image_fingerprint": "49d8576f4ad30ffd",
+  "smoke_size": 0,
+  "full_size": 113,
+  "dataset_seed": 20260817,
+  "smoke_plan_seed": 20260818,
+  "full_plan_seed": 20260819,
+  "progress": {
+    "poll_secs": 30,
+    "stall_after_secs": 600
+  },
+  "resources": {
+    "cpus": 2,
+    "memory_mb": 8192,
+    "storage_mb": 20480,
+    "max_tokens": 65536,
+    "context_window": 1000000
+  },
+  "timeouts": {
+    "agent_seconds": 5400,
+    "deadline_reserve_seconds": 120
+  },
+  "llm_retry": {
+    "retry_count": 2,
+    "retry_base_delay_ms": 1000,
+    "retry_max_delay_ms": 30000
+  }
+}

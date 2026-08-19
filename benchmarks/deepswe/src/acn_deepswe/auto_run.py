@@ -7,6 +7,7 @@ import getpass
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -51,6 +52,7 @@ class AutomatedRunConfig:
     llm_retry: dict[str, int]
     progress: dict[str, int]
     run_all_variants_without_claims: bool = False
+    reuse_local_agent_image_fingerprint: str | None = None
 
 
 _REQUIRED_PATHS = (
@@ -172,6 +174,9 @@ def load_config(path: Path) -> AutomatedRunConfig:
             raw.get("run_all_variants_without_claims", False),
             "run_all_variants_without_claims",
         ),
+        reuse_local_agent_image_fingerprint=_optional_fingerprint(
+            raw.get("reuse_local_agent_image_fingerprint")
+        ),
     )
 
 
@@ -193,6 +198,7 @@ def prepare_run(config: AutomatedRunConfig) -> dict[str, object]:
             config.pier_checkout,
             config.dataset_seed,
             sample_size=config.full_size,
+            reuse_local_agent_image_fingerprint=config.reuse_local_agent_image_fingerprint,
         )
         all_manifest = _read_json_object(all_manifest_path, "全量冻结 manifest")
         all_dataset = FrozenDatasetManifest.from_dict(all_manifest)
@@ -630,6 +636,16 @@ def _nonempty_string(raw: Mapping[str, object], field: str) -> str:
     value = raw.get(field)
     if not isinstance(value, str) or not value:
         raise AutomatedRunError(f"配置缺少非空字符串: {field}")
+    return value
+
+
+def _optional_fingerprint(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{16}", value):
+        raise AutomatedRunError(
+            "reuse_local_agent_image_fingerprint 必须是 16 位小写十六进制"
+        )
     return value
 
 

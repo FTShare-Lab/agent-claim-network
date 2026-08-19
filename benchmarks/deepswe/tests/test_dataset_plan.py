@@ -9,6 +9,7 @@ from acn_deepswe.dataset import (
     FrozenDatasetManifest,
     freeze_dataset,
     freeze_execution_dataset,
+    local_agent_image_name,
 )
 from acn_deepswe.plan import build_attempt_plan
 from acn_deepswe.provenance import TASK_DIRECTORY_HASH_ALGORITHM, sha256_directory_tree
@@ -134,6 +135,57 @@ class DatasetAndPlanTests(unittest.TestCase):
                     seed=17,
                     sample_size=6,
                 )
+
+    def test_local_agent_image_name_matches_pier_hb_tag(self) -> None:
+        self.assertEqual(
+            local_agent_image_name("datacurve/abs-module-cache-flags", "49d8576f4ad30ffd"),
+            "hb__datacurve-abs-module-cache-flags__agent-49d8576f4ad30ffd",
+        )
+
+    def test_execution_freeze_retargets_docker_image_to_local_agent_layer(self) -> None:
+        task_toml = """
+[task]
+name = "datacurve/abs-module-cache-flags"
+[agent]
+network_mode = "no-network"
+[verifier]
+network_mode = "no-network"
+[environment]
+docker_image = "public.ecr.aws/example/task:v1"
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            deepswe = root / "deep-swe"
+            task = deepswe / "tasks" / "abs-module-cache-flags"
+            task.mkdir(parents=True)
+            (task / "task.toml").write_text(task_toml)
+            (task / "instruction.md").write_text("task")
+            (task / "environment").mkdir()
+            (task / "tests").mkdir()
+            pier = root / "pier"
+            pier.mkdir()
+            (pier / "README.md").write_text("fixture")
+            _commit_checkout(deepswe)
+            _commit_checkout(pier)
+
+            normalized = root / "normalized"
+            freeze_execution_dataset(
+                deepswe / "tasks",
+                root / "frozen.json",
+                normalized,
+                deepswe,
+                pier,
+                seed=17,
+                sample_size=1,
+                reuse_local_agent_image_fingerprint="49d8576f4ad30ffd",
+            )
+            rendered = (normalized / "abs-module-cache-flags" / "task.toml").read_text()
+            self.assertIn(
+                'docker_image = "hb__datacurve-abs-module-cache-flags__agent-49d8576f4ad30ffd"',
+                rendered,
+            )
+            self.assertIn("allow_internet = false", rendered)
+            self.assertNotIn("public.ecr.aws/example/task:v1", rendered)
 
     def test_checked_in_manifests_parse_and_build_attempt_plans(self) -> None:
         manifests = (

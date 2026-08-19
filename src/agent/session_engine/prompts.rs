@@ -199,12 +199,17 @@ impl SessionEngine {
         let router_scopes_overview = format_router_scopes_overview(&overview);
         let context = SessionSystemPromptContext {
             agent_id: &self.agent.agent_id,
+            memory_enabled: self.turn_loop.tool_registry().memory_enabled(),
             memory_md: "",
             user_md: "",
             local_claims_snapshot: &local_claims_snapshot,
             router_scopes_overview: &router_scopes_overview,
             available_skills: self.agent.available_skills_for_prompt(),
             subagent_max_concurrent: self.subagent_max_concurrent,
+            file_edit_authority_enabled: self
+                .turn_loop
+                .tool_registry()
+                .file_edit_authority_enabled(),
         };
         let system_prompt = self
             .prompt_registry

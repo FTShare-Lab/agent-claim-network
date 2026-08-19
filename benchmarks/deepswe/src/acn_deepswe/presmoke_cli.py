@@ -589,6 +589,8 @@ def _ensure_frozen_task_images_available(config: PresmokeConfig) -> None:
             continue
         except PresmokeCliError:
             pass
+        if image.startswith("hb__"):
+            raise PresmokeCliError(f"本地评测镜像不存在，拒绝拉取: {image}")
         pulled = subprocess.run(
             ["docker", "pull", image], check=False, capture_output=True, text=True
         )
