@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 验证 turn idle 后 `/ps` ELAPSED 与底栏 focus 仍由 1 秒 heartbeat 持续刷新。
+# 验证 turn idle 后 heartbeat 持续刷新 `/ps` / focus，并把后台终态改写回历史 ToolCell。
 set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
@@ -12,8 +12,9 @@ TUI_OUT_DIR="${TUI_OUT_DIR:-target/tui-scenarios/idle-heartbeat-refresh}"
 TUI_BUILD_COMMAND="${TUI_BUILD_COMMAND:-cargo build --quiet --bin acn --example fake_anthropic_sse_server}"
 
 source "$REPO_ROOT/.agents/skills/tui-smoke-test-with-tmux/scripts/tui_tmux_lib.sh"
-
 tui_build_if_needed
+ACN_BINARY="$(tui_resolve_binary TUI_ACN_BINARY acn bin)"
+FAKE_SERVER_BINARY="$(tui_resolve_binary TUI_FAKE_SERVER_BINARY fake_anthropic_sse_server example)"
 TUI_SKIP_BUILD=1
 mkdir -p "$TUI_OUT_DIR"
 TUI_OUT_DIR_ABS="$(cd "$TUI_OUT_DIR" && pwd)"
@@ -24,8 +25,8 @@ FAKE_SERVER_PID=""
 
 cleanup() {
   tui_cleanup
-  if [[ -x "$REPO_ROOT/target/debug/acn" && -f "$FAKE_CONFIG" ]]; then
-    "$REPO_ROOT/target/debug/acn" supervisor stop --config "$FAKE_CONFIG" >/dev/null 2>&1 || true
+  if [[ -f "$FAKE_CONFIG" ]]; then
+    tui_terminate_owned_supervisors "$FAKE_CONFIG" "$ACN_BINARY" || true
   fi
   if [[ "$FAKE_SERVER_PID" =~ ^[0-9]+$ ]]; then
     kill -TERM "$FAKE_SERVER_PID" >/dev/null 2>&1 || true
@@ -40,7 +41,7 @@ cleanup() {
 trap cleanup EXIT
 
 rm -f "$FAKE_READY_FILE"
-"$REPO_ROOT/target/debug/examples/fake_anthropic_sse_server" \
+"$FAKE_SERVER_BINARY" \
   --ready-file "$FAKE_READY_FILE" \
   --response-mode background-process &
 FAKE_SERVER_PID="$!"
@@ -84,10 +85,8 @@ notify_on_finalize_completion = false
 interval_turns = 100
 EOF
 
-TUI_COMMAND="ACN_FAKE_LLM_API_KEY=test-key target/debug/acn --config '$FAKE_CONFIG'"
+TUI_COMMAND="ACN_FAKE_LLM_API_KEY=test-key '$ACN_BINARY' --config '$FAKE_CONFIG'"
 tui_start
-# tui_start 会覆盖 trap；恢复包含 fake server、supervisor 与临时 home 的完整清理。
-trap cleanup EXIT
 
 wait_capture() {
   local name="$1" pattern="$2" description="$3"
@@ -175,6 +174,33 @@ wait_capture "mcp_first" "MCP.*Servers|No MCP servers configured" "/mcp panel"
 sleep 2
 tui_capture "mcp_second"
 tui_assert_contains "mcp_second" "MCP.*Servers|No MCP servers configured" "/mcp panel disappeared during idle heartbeat"
+
+tui_send_keys Escape
+tui_send_keys "/ps"
+sleep 0.1
+tui_send_keys Enter
+wait_capture "ps_before_terminate" "main.*running" "background process before user termination"
+tui_send_keys t
+wait_capture "terminate_confirm" "\[y\] Yes.*\[n/Esc\] No" "/ps terminate confirmation"
+tui_send_keys y
+# 立即回到聊天页；后续必须由 completion heartbeat 自己重写已经落入原生 scrollback 的
+# code_run cell，不能借关闭 panel 的 hard-clear 偶然得到正确结果。
+tui_send_keys Escape
+wait_capture "background_terminal" "Process terminated: signal 9" "rewritten background code_run terminal result"
+tui_assert_not_contains \
+  "background_terminal" \
+  "Process running in background" \
+  "completed background code_run still showed its stale running result"
+tui_assert_not_contains \
+  "background_terminal" \
+  "Background process ID=" \
+  "background completion appended a duplicate transcript notification"
+if ! rg -n '"kind":"background_process_completed".*"tool_use_id":"toolu_fake_background_process"' \
+  "$FAKE_ACN_HOME" > "$TUI_OUT_DIR_ABS/background-completion-journal.txt"; then
+  echo "background completion was not persisted to the turn journal" >&2
+  exit 1
+fi
+
 tui_assert_stderr_empty
 
-echo "idle heartbeat scenario passed: elapsed ${FIRST_ELAPSED}s -> ${SECOND_ELAPSED}s, focus ${FIRST_FOCUS}s -> ${SECOND_FOCUS}s"
+echo "idle heartbeat scenario passed: elapsed ${FIRST_ELAPSED}s -> ${SECOND_ELAPSED}s, focus ${FIRST_FOCUS}s -> ${SECOND_FOCUS}s, history completion rewritten and journaled"

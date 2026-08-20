@@ -52,6 +52,8 @@ pub(super) struct AssistantCell {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ToolCell {
+    /// tool_use_id 只在单 turn 唯一；后台终态回写必须同时匹配此字段。
+    pub(super) turn_id: Option<String>,
     pub(super) id: String,
     pub(super) name: String,
     pub(super) summary: String,
@@ -1314,6 +1316,7 @@ mod tests {
     #[test]
     fn non_file_tool_cannot_render_injected_file_change() {
         let lines = HistoryEntry::Tool(ToolCell {
+            turn_id: None,
             id: "toolu_1".into(),
             name: "web_search".into(),
             summary: "tool web_search ok".into(),
@@ -1505,6 +1508,7 @@ mod tests {
     #[test]
     fn successful_tool_call_does_not_use_green_transcript_accent() {
         let lines = HistoryEntry::Tool(ToolCell {
+            turn_id: None,
             id: "toolu_1".into(),
             name: "web_search".into(),
             summary: "tool web_search ok".into(),
@@ -1526,6 +1530,7 @@ mod tests {
     #[test]
     fn completed_tool_call_keeps_started_input_detail() {
         let lines = HistoryEntry::Tool(ToolCell {
+            turn_id: None,
             id: "toolu_1".into(),
             name: "web_search".into(),
             summary: "tool web_search ok".into(),
@@ -1554,6 +1559,7 @@ mod tests {
     #[test]
     fn mcp_tool_call_uses_compact_display_name() {
         let lines = HistoryEntry::Tool(ToolCell {
+            turn_id: None,
             id: "toolu_1".into(),
             name: "mcp__pal__ask".into(),
             summary: "tool mcp__pal__ask ok".into(),
@@ -1582,6 +1588,7 @@ mod tests {
     #[test]
     fn running_mcp_tool_call_renders_latest_progress() {
         let lines = ToolCell {
+            turn_id: None,
             id: "toolu_1".into(),
             name: "mcp__pal__ask".into(),
             summary: r#"tool mcp__pal__ask {"q":"hi"}"#.into(),
@@ -1610,6 +1617,7 @@ mod tests {
     #[test]
     fn failed_tool_call_keeps_input_before_error_detail() {
         let lines = HistoryEntry::Tool(ToolCell {
+            turn_id: None,
             id: "toolu_1".into(),
             name: "file_read".into(),
             summary: "tool file_read failed permission denied".into(),
@@ -1637,6 +1645,7 @@ mod tests {
     #[test]
     fn typed_outcome_controls_tool_state_instead_of_summary_text() {
         let lines = HistoryEntry::Tool(ToolCell {
+            turn_id: None,
             id: "toolu_1".into(),
             name: "file_read".into(),
             summary: "tool file_read failed misleading legacy text".into(),
@@ -1659,6 +1668,7 @@ mod tests {
     #[test]
     fn non_success_http_outcome_is_visible_and_failed() {
         let lines = HistoryEntry::Tool(ToolCell {
+            turn_id: None,
             id: "toolu_1".into(),
             name: "web_fetch".into(),
             summary: "tool web_fetch http_status=404".into(),
@@ -1688,6 +1698,7 @@ mod tests {
     #[test]
     fn successful_hard_termination_renders_signal_without_error_state() {
         let lines = HistoryEntry::Tool(ToolCell {
+            turn_id: None,
             id: "toolu_1".into(),
             name: "write_stdin".into(),
             summary: "tool write_stdin terminated_signal=9".into(),

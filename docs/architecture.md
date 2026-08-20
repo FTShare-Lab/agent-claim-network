@@ -88,6 +88,7 @@ TUI 退出非空 session 时，可将 finalize job 交给独立 supervisor。Sup
 
 - Anthropic Messages
 - OpenAI-compatible Chat Completions
+- OpenAI-compatible Responses（HTTP SSE/JSON，`store = false`）
 
 普通 turn、compact、finalize recap、inbox 内化和 memory review 共享 provider-neutral DTO，但使用各自的 prompt 和工具权限。
 
@@ -137,8 +138,9 @@ Agent 进程使用 `<acn_home>/<upstream>/data/agents/<agent_id>/`。Router 和 
 1. 启动或恢复时处理 inbox；团队模式还会拉取 Maintainer 消息并查询 Router scope overview。
 2. 读取当时的 Memory、用户资料、本地 claim、Skill 摘要和 `ACN.md`，渲染并持久化 system prompt。
 3. 每个用户 turn 经 provider tool loop 执行；canonical message 与增量 turn journal 分别承担稳定历史和中断恢复。
+   最近一次真实 Provider 窗口另存为 session 内独立原子 WAL，不内嵌进 `session.yaml`；WAL 缺失或损坏时从 canonical history 重建。
 4. 上下文接近预算时在 provider request 前压缩已覆盖历史；手动 `/compact` 复用同一边界。
-5. 退出后 finalize 生成 recap，形成或更新 claim 与 trace；团队模式下再持久上传 claim mirror，并报告符合条件的 dispute。
+5. 退出后 finalize 生成 recap，形成或更新 claim 与 trace；canonical message 或后台终态任一仍未 recap 时都交给 supervisor，团队模式下再持久上传 claim mirror，并报告符合条件的 dispute。
 6. 已 finalize 的 session 关闭；空 session 可以直接清理。
 
 已创建 session 的 system prompt 是冻结快照。修改 `ACN.md`、Memory、Skill 或本地 claim 只影响后续新 session。
@@ -177,7 +179,7 @@ Policy 消息自包含完整 payload；Agent 不需要也不允许直接读取 M
 
 ## 鉴权与故障边界
 
-- LLM、Web、MCP bearer 与 Team Auth secret 从环境变量读取。
+- LLM、Web、MCP bearer 与 Team Auth secret 从环境变量读取；通过 `acn mcp login` 获得的 MCP OAuth token 按 server 配置保存在系统 keyring，或 selected upstream runtime 下权限受限的 `.mcp-oauth/` 目录。
 - Team Auth 请求使用带 `agent_id` 与 key 的信封；服务端可按配置启用校验。
 - Maintainer 管理页面与管理 API 可以启用独立 Basic Auth。
 - Router/Maintainer 网络错误按可重试性分类并进入 warning；本地持久化失败仍是当前操作的硬错误。

@@ -172,6 +172,20 @@ impl PromptRegistry {
     pub fn validate_renderable(&self, names: &[&str]) -> Result<(), PromptError> {
         for name in names {
             match *name {
+                "agent_system" => self.render(
+                    name,
+                    minijinja::context! {
+                        agent_id => "agent-a",
+                        memory_enabled => true,
+                        memory_md => "agent memory",
+                        user_md => "user profile",
+                        local_claims_snapshot => "local claims",
+                        router_scopes_overview => "router overview",
+                        available_skills => Vec::<serde_json::Value>::new(),
+                        subagent_max_concurrent => 6usize,
+                        file_edit_authority_enabled => true,
+                    },
+                )?,
                 "session_compaction" => self.render(
                     name,
                     minijinja::context! {
@@ -190,6 +204,12 @@ impl PromptRegistry {
                         user_md => "user profile",
                     },
                 )?,
+                "session_recap" => self.render(
+                    name,
+                    minijinja::context! {
+                        memory_enabled => true,
+                    },
+                )?,
                 "subagents_system" => self.render(
                     name,
                     minijinja::context! {
@@ -200,6 +220,8 @@ impl PromptRegistry {
                         title => "test delegation",
                         role => "test verifier",
                         runtime_context => "runtime context",
+                        memory_enabled => true,
+                        file_edit_authority_enabled => true,
                     },
                 )?,
                 "subagents_compaction" => self.render(
@@ -223,11 +245,13 @@ mod tests {
     #[derive(Serialize)]
     struct AgentSystemTestContext<'a> {
         agent_id: &'a str,
+        memory_enabled: bool,
         memory_md: &'a str,
         user_md: &'a str,
         local_claims_snapshot: &'a str,
         available_skills: Vec<AgentSystemSkillContext<'a>>,
         subagent_max_concurrent: usize,
+        file_edit_authority_enabled: bool,
     }
 
     #[derive(Serialize)]
@@ -237,9 +261,19 @@ mod tests {
         spec_path: &'a str,
     }
 
-    fn agent_system_test_context() -> AgentSystemTestContext<'static> {
+    fn agent_system_test_context(
+        file_edit_authority_enabled: bool,
+    ) -> AgentSystemTestContext<'static> {
+        agent_system_test_context_with_memory(true, file_edit_authority_enabled)
+    }
+
+    fn agent_system_test_context_with_memory(
+        memory_enabled: bool,
+        file_edit_authority_enabled: bool,
+    ) -> AgentSystemTestContext<'static> {
         AgentSystemTestContext {
             agent_id: "agent-a",
+            memory_enabled,
             memory_md: "agent memory",
             user_md: "user profile",
             local_claims_snapshot: "以下是当前 agent 已内化且仍有效的 self claims 快照，不是团队真理；当任务涉及团队共享知识、复用或冲突时，仍应 consult_router。\n\n```jsonl\n{\"id\":\"claim_1234abcd\",\"name\":\"claim name\",\"scope\":\"scope/a\",\"statement\":\"statement\",\"status\":\"active\",\"confidence\":\"high\",\"created_at\":\"2026-05-20T00:00:00Z\"}\n```",
@@ -249,6 +283,7 @@ mod tests {
                 spec_path: "<acn_home>/skills/consult_router/SKILL.md",
             }],
             subagent_max_concurrent: 7,
+            file_edit_authority_enabled,
         }
     }
 
@@ -338,7 +373,7 @@ mod tests {
             );
 
             let out = if name == "agent_system" {
-                reg.render(name, agent_system_test_context()).unwrap()
+                reg.render(name, agent_system_test_context(true)).unwrap()
             } else {
                 reg.render(name, ()).unwrap()
             };
@@ -355,11 +390,31 @@ mod tests {
     }
 
     #[test]
+    fn repository_claim_guidance_prioritizes_reusable_decisions() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let reg = PromptRegistry::new(&root).unwrap();
+        let out = reg.render("what_is_claim", ()).unwrap();
+
+        assert!(out.contains(
+            "优先保留会显著影响未来决策、任务成败，或减少高成本重复探索的非显而易见结论"
+        ));
+        assert!(out.contains("关键约束、不变量和决策边界的完整判断"));
+        assert!(out.contains("适用条件、限定或因果依据"));
+        assert!(out.contains("才适合单独成为 claim"));
+        assert!(out.contains("不要把多个彼此无关的判断强行合并"));
+        assert!(out.contains("架构关系背后的因果判断"));
+        assert!(out.contains("重要成功或失败路径"));
+        assert!(out.contains("适用条件、因果解释和行动含义"));
+        assert!(out.contains("搜索顺序、命令流水、一次性错误或未验证猜测"));
+        assert!(out.contains("不能单独证明一条 claim 应为 `high`"));
+    }
+
+    #[test]
     fn repository_agent_system_mentions_skills_as_protocol() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
         let reg = PromptRegistry::new(&root).unwrap();
         let out = reg
-            .render("agent_system", agent_system_test_context())
+            .render("agent_system", agent_system_test_context(true))
             .unwrap();
         assert!(out.contains("agent-a"));
         assert!(out.contains("agent memory"));
@@ -416,6 +471,22 @@ mod tests {
     }
 
     #[test]
+    fn repository_agent_system_uses_runtime_context_for_relative_dates() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let reg = PromptRegistry::new(&root).unwrap();
+        let out = reg
+            .render("agent_system", agent_system_test_context(true))
+            .unwrap();
+
+        assert!(out.contains("以最新 runtime context 为基准"));
+        assert!(out.contains("不要仅为确认其中已有的日期、星期或时区而调用 `code_run`"));
+        assert!(out.contains("runtime context 不提供小时、分钟或秒"));
+        assert!(out.contains("应直接查证相关事实来源，而不是先机械查询系统时间"));
+        assert!(!out.contains("本 prompt 不提供可靠的当前日期"));
+        assert!(!out.contains("务必先单独使用 `code_run` 获取当前时间与时区"));
+    }
+
+    #[test]
     fn repository_memory_review_system_uses_own_prompt_and_memory_snapshot() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
         let reg = PromptRegistry::new(&root).unwrap();
@@ -442,6 +513,55 @@ mod tests {
     }
 
     #[test]
+    fn disabled_memory_is_omitted_from_agent_and_recap_prompts() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let reg = PromptRegistry::new(&root).unwrap();
+        let agent = reg
+            .render(
+                "agent_system",
+                agent_system_test_context_with_memory(false, true),
+            )
+            .unwrap();
+        let recap = reg
+            .render(
+                "session_recap",
+                minijinja::context! { memory_enabled => false },
+            )
+            .unwrap();
+        let subagent = reg
+            .render(
+                "subagents_system",
+                minijinja::context! {
+                    subagent_id => "subagent_1234abcd",
+                    parent_session_id => "session_parent",
+                    parent_turn_id => "turn_parent",
+                    owner_agent_id => "agent-a",
+                    title => "worker",
+                    role => "implementer",
+                    runtime_context => "workspace=/tmp/acn",
+                    memory_enabled => false,
+                    file_edit_authority_enabled => true,
+                },
+            )
+            .unwrap();
+        let enabled_recap = reg
+            .render(
+                "session_recap",
+                minijinja::context! { memory_enabled => true },
+            )
+            .unwrap();
+
+        assert!(!agent.to_ascii_lowercase().contains("memory"));
+        assert!(!agent.contains("agent memory"));
+        assert!(!agent.contains("user profile"));
+        assert!(!recap.to_ascii_lowercase().contains("memory"));
+        assert!(!subagent.to_ascii_lowercase().contains("memory"));
+        assert!(recap.contains("agent 私有用户画像、偏好与私密信息不得成为 claim/dispute"));
+        assert!(enabled_recap.contains("# persistent memory 边界"));
+        assert!(enabled_recap.contains("USER.md"));
+    }
+
+    #[test]
     fn repository_subagents_system_renders_subagent_identity_and_boundaries() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
         let reg = PromptRegistry::new(&root).unwrap();
@@ -456,6 +576,8 @@ mod tests {
                     title => "manual-happy-1",
                     role => "tui verifier",
                     runtime_context => "workspace=/tmp/acn",
+                    memory_enabled => true,
+                    file_edit_authority_enabled => true,
                 },
             )
             .unwrap();
@@ -492,6 +614,7 @@ mod tests {
                 "subagents_compaction",
                 minijinja::context! {
                     summary_max_chars => 1234usize,
+                    file_edit_authority_enabled => true,
                 },
             )
             .unwrap();
@@ -508,7 +631,12 @@ mod tests {
     fn repository_session_recap_reads_router_results_from_transcript() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
         let reg = PromptRegistry::new(&root).unwrap();
-        let out = reg.render("session_recap", ()).unwrap();
+        let out = reg
+            .render(
+                "session_recap",
+                minijinja::context! { memory_enabled => true },
+            )
+            .unwrap();
 
         assert!(out.contains("transcript 中可能包含 router 工具调用结果"));
         assert!(out.contains("candidate_claims"));
@@ -518,6 +646,11 @@ mod tests {
         assert!(out.contains("必须输出完整属性和 `status`"));
         assert!(out.contains("仍相关的来源 id 需要一并返回"));
         assert!(out.contains("后端也会忽略并把新 claim 初始化为 `active`"));
+        assert!(out.contains("# claim 提炼步骤"));
+        assert!(out.contains("关键决策节点"));
+        assert!(out.contains("不要把这些要素单独摘成缺少判断含义的碎片"));
+        assert!(out.contains("已显著消耗探索成本"));
+        assert!(out.contains("不要为了覆盖清单而为每一类凑 claim"));
         assert!(!out.contains("`router_context`："));
         assert!(!out.contains("router_context.candidate_claims"));
         assert!(!out.contains("transcript、router_context 或 local_claims"));
@@ -753,6 +886,7 @@ mod tests {
                     "end_index": 2,
                     "prior_summary": null,
                     "summary_max_chars": 1234,
+                    "file_edit_authority_enabled": true,
                 }),
             )
             .unwrap();
@@ -762,5 +896,53 @@ mod tests {
         assert!(out.contains("运行期修改许可"));
         assert!(out.contains("required_read"));
         assert!(!out.contains("summary_max_chars"));
+    }
+
+    #[test]
+    fn file_edit_authority_guidance_is_omitted_when_disabled() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let reg = PromptRegistry::new(&root).unwrap();
+        let agent = reg
+            .render("agent_system", agent_system_test_context(false))
+            .unwrap();
+        let subagent = reg
+            .render(
+                "subagents_system",
+                minijinja::context! {
+                    subagent_id => "subagent_1234abcd",
+                    parent_session_id => "session_parent",
+                    parent_turn_id => "turn_parent",
+                    owner_agent_id => "agent-a",
+                    title => "worker",
+                    role => "implementer",
+                    runtime_context => "workspace=/tmp/acn",
+                    memory_enabled => true,
+                    file_edit_authority_enabled => false,
+                },
+            )
+            .unwrap();
+        let session_compaction = reg
+            .render(
+                "session_compaction",
+                minijinja::context! {
+                    summary_max_chars => 1234usize,
+                    file_edit_authority_enabled => false,
+                },
+            )
+            .unwrap();
+        let subagent_compaction = reg
+            .render(
+                "subagents_compaction",
+                minijinja::context! {
+                    summary_max_chars => 1234usize,
+                    file_edit_authority_enabled => false,
+                },
+            )
+            .unwrap();
+
+        for prompt in [agent, subagent, session_compaction, subagent_compaction] {
+            assert!(!prompt.contains("required_read"));
+            assert!(!prompt.contains("运行期修改许可"));
+        }
     }
 }

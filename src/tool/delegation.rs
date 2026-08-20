@@ -5,6 +5,28 @@
 use super::*;
 
 impl ToolRegistry {
+    pub(crate) async fn bind_delegation_fallback_root_for_session(
+        &self,
+        session_id: &SessionId,
+        root: crate::api::ProviderRuntimeFallbackScope,
+    ) -> Result<(), ToolError> {
+        let Some(host) = &self.delegation_host else {
+            return Ok(());
+        };
+        host.runner_for(session_id)?.bind_fallback_root(root).await;
+        Ok(())
+    }
+
+    pub(crate) fn subscribe_delegation_activity_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<tokio::sync::watch::Receiver<u64>>, ToolError> {
+        let Some(host) = &self.delegation_host else {
+            return Ok(None);
+        };
+        Ok(Some(host.runner_for(session_id)?.subscribe_activity()))
+    }
+
     pub async fn abandon_delegations_for_session(
         &self,
         session_id: &SessionId,
@@ -161,6 +183,10 @@ impl ToolRegistry {
                 active
             }
         };
+        #[cfg(test)]
+        if let Some(notify) = &host.wait_subagents_snapshot_resolved {
+            notify.notify_one();
+        }
         let cancellation = context.cancellation.unwrap_or_default();
         let deadline = time::Instant::now() + timeout;
 
@@ -175,6 +201,13 @@ impl ToolRegistry {
                 ));
             }
 
+            let activity_changed = async {
+                #[cfg(test)]
+                if let Some(notify) = &host.wait_subagents_blocking {
+                    notify.notify_one();
+                }
+                activity_rx.changed().await
+            };
             tokio::select! {
                 _ = time::sleep_until(deadline) => {
                     let state = load_wait_subagents_state(runner.store(), &waited_ids).await?;
@@ -185,7 +218,7 @@ impl ToolRegistry {
                     };
                     return Ok(wait_subagents_response(outcome, until, waited_ids, state));
                 }
-                changed = activity_rx.changed() => {
+                changed = activity_changed => {
                     if changed.is_err() {
                         return Err(ToolError::Delegation(
                             "wait_subagents activity channel closed unexpectedly".into(),
@@ -275,28 +308,30 @@ impl ToolRegistry {
     pub async fn delegation_runtime_context(&self) -> String {
         let mut lines = Vec::new();
         lines.push(format!("workspace_root: {}", self.workspace_root.display()));
-        lines.push("memory_snapshot_mode: read_only_context_no_memory_tool".to_string());
         lines.push("mcp_tools_inherited: same visible MCP tools as parent session".to_string());
-        if let Some(memory_store) = &self.memory_store {
-            match memory_store.read_snapshot().await {
-                Ok(snapshot) => {
-                    if !snapshot.user_entries.is_empty() {
-                        let joined = snapshot.user_entries.join("; ");
-                        lines.push(format!(
-                            "user_memory_snapshot: {}",
-                            truncate_chars(&joined, 1200).0
-                        ));
+        if self.memory_enabled {
+            lines.push("memory_snapshot_mode: read_only_context_no_memory_tool".to_string());
+            if let Some(memory_store) = &self.memory_store {
+                match memory_store.read_snapshot().await {
+                    Ok(snapshot) => {
+                        if !snapshot.user_entries.is_empty() {
+                            let joined = snapshot.user_entries.join("; ");
+                            lines.push(format!(
+                                "user_memory_snapshot: {}",
+                                truncate_chars(&joined, 1200).0
+                            ));
+                        }
+                        if !snapshot.memory_entries.is_empty() {
+                            let joined = snapshot.memory_entries.join("; ");
+                            lines.push(format!(
+                                "project_memory_snapshot: {}",
+                                truncate_chars(&joined, 1200).0
+                            ));
+                        }
                     }
-                    if !snapshot.memory_entries.is_empty() {
-                        let joined = snapshot.memory_entries.join("; ");
-                        lines.push(format!(
-                            "project_memory_snapshot: {}",
-                            truncate_chars(&joined, 1200).0
-                        ));
+                    Err(err) => {
+                        lines.push(format!("memory_snapshot_error: {err:#}"));
                     }
-                }
-                Err(err) => {
-                    lines.push(format!("memory_snapshot_error: {err:#}"));
                 }
             }
         }

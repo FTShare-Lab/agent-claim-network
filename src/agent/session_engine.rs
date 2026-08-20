@@ -5,9 +5,11 @@
 //! maintainer 与 inbox 能力，但交互式 session 的 LLM 调用只走 provider-neutral 组件。
 
 use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -24,13 +26,16 @@ use super::user_shell::{
     format_user_shell_command_record, run_user_shell_command as execute_user_shell_command,
 };
 use crate::api::{
-    ensure_compaction_request_within_context_window, estimate_session_turn_messages_tokens,
-    project_compaction_input_media, AgentTurnLoop, ClaimAttributeUpdateInternalizeRequest,
-    ContextUsageSnapshot, ContextUsageSource, InboxInternalizeKind, InternalizeRequest,
-    MemoryReviewLoop, SessionAttachment, SessionCompactionOutcome, SessionTurn, SessionTurnEvent,
-    SessionTurnEventRecorder, SessionTurnInterrupted, SessionTurnMessage, SessionTurnPreflight,
-    SessionTurnRequest, StructuredJsonAttemptRequest, StructuredJsonCaller, ToolBoundaryControl,
-    TurnMessage,
+    context_recovery_protected_tail_from_marker, ensure_compaction_request_within_context_window,
+    estimate_session_turn_messages_tokens, project_compaction_input_media,
+    project_turn_message_for_safe_transcript, trailing_model_context_segments, AgentTurnLoop,
+    ClaimAttributeUpdateInternalizeRequest, CompletedSessionTurnMessage, ContextUsageSnapshot,
+    ContextUsageSource, InboxInternalizeKind, InternalizeRequest, MemoryReviewLoop,
+    ModelContextSource, ProviderReplayIdentity, SessionAttachment, SessionCompactionOutcome,
+    SessionTurn, SessionTurnContentBlock, SessionTurnContextAppender, SessionTurnEvent,
+    SessionTurnEventRecorder, SessionTurnHooks, SessionTurnInterrupted, SessionTurnMessage,
+    SessionTurnPreflight, SessionTurnRequest, StructuredJsonAttemptRequest, StructuredJsonCaller,
+    ToolBoundaryControl, TurnMessage,
 };
 use crate::claim::{AgentId, Claim, ClaimId, DisputeId, SessionId, SourceId, TraceId};
 use crate::config::{
@@ -39,19 +44,21 @@ use crate::config::{
     COMPACTION_RETRY_SUMMARY_DIVISOR, DEFAULT_FORK_MEMORY_REVIEW_INTERVAL_TURNS,
     DEFAULT_SESSION_SEARCH_SQLITE_BUSY_TIMEOUT_MS,
 };
-use crate::delegation::{DelegationStore, DelegationSummary};
+use crate::delegation::{DelegationId, DelegationStatus, DelegationStore, DelegationSummary};
 use crate::mcp::connection_manager::McpConnectionManager;
 use crate::prompt::PromptRegistry;
 use crate::session::{
-    canonical_user_content_hash, replay_turn_journal, turn_journal_recovery_context_for_chain,
-    ActiveTurnCompactionCursor, CompactionAppliedReport, CompactionCheckpoint,
-    CompactionCheckpointStatus, FinalizeCheckpoint, NewSessionMessage, RecoveryContextLimits,
-    SessionCompactionState, SessionContentBlock, SessionHandle, SessionMessage, SessionMessageRole,
-    SessionStatus, SessionStore, SessionStoreError, TurnJournalEventKind, TurnJournalFlush,
-    TurnJournalStatus, TurnJournalTurn,
+    canonical_user_content_hash, read_session_turn_journal, replay_turn_journal,
+    turn_journal_recovery_context_for_chain, ActiveTurnCompactionCursor, CompactedProviderHistory,
+    CompactionAppliedReport, CompactionCheckpoint, CompactionCheckpointStatus, FinalizeCheckpoint,
+    NewSessionMessage, PendingProviderHistoryTurn, RecoveryContextLimits, SessionCompactionState,
+    SessionContentBlock, SessionHandle, SessionMessage, SessionMessageRole, SessionStatus,
+    SessionStore, SessionStoreError, TurnJournalEventKind, TurnJournalFlush, TurnJournalStatus,
+    TurnJournalTurn,
 };
 use crate::skill::{resolve_explicit_skill_instructions, SkillInjectionLimits, SkillInstructions};
-use crate::tool::BackgroundProcessEvent;
+use crate::storage::FileLockGuard;
+use crate::tool::{BackgroundProcessEvent, ProcessCompletion, ToolRegistry};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -134,6 +141,7 @@ pub struct SessionEngine {
     fork_memory_review_interval_turns: usize,
     turns_since_fork_memory_review: Arc<Mutex<usize>>,
     active_context_usage_anchor: Arc<Mutex<Option<ActiveContextUsageAnchor>>>,
+    delegation_projection_baselines: Arc<Mutex<HashMap<SessionId, DelegationProjectionBaseline>>>,
     attachment: AttachmentConfig,
     mcp_manager: Option<Arc<McpConnectionManager>>,
     subagent_max_concurrent: usize,
@@ -261,6 +269,8 @@ struct PreparedSessionTurn {
     previous_message_count: usize,
     turn: SessionTurn,
     provider_context_used_tokens: Option<usize>,
+    compacted_provider_history: Option<Vec<SessionTurnMessage>>,
+    provider_replay_identity: Option<ProviderReplayIdentity>,
 }
 
 struct CommittedSessionTurn {
@@ -270,6 +280,7 @@ struct CommittedSessionTurn {
 
 struct RunTurnInnerRequest {
     turn_id: String,
+    recovered_model_context: Vec<CompletedSessionTurnMessage>,
     user_text: String,
     user_attachments: Vec<SessionAttachment>,
     skill_instructions: Vec<SkillInstructions>,
@@ -302,6 +313,7 @@ struct PreflightCompactionRequest<'a> {
     base_message_count: usize,
     active_projection_compacted: bool,
     runtime_projection_tokens: usize,
+    protected_active_tail_segments: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -333,6 +345,7 @@ struct PreflightCompactionPlan {
     turn_id: String,
     base_message_count: usize,
     runtime_budget: PreflightRuntimeProjectionBudget,
+    protected_active_tail_segments: usize,
 }
 
 struct PreflightCompactor<'a> {
@@ -343,38 +356,292 @@ struct PreflightCompactor<'a> {
     base_message_count: usize,
     active_projection_compacted: bool,
     provider_context_anchor: Option<ProviderContextUsageAnchor>,
-    delegation_projection_loaded: bool,
-    delegation_projection: Option<String>,
-    delegation_projection_inserted: bool,
-    background_projection: Option<String>,
-    background_projection_insert_index: Option<usize>,
+    context_window_recovery_requested: bool,
+    context_window_recovery_tail_marker: Option<SessionTurnMessage>,
+    history_replaced_since_last_check: bool,
+    frozen_provider_history_prefix_len: usize,
+    capture_provider_history: bool,
+    last_compacted_provider_history: Option<Vec<SessionTurnMessage>>,
+    provider_compaction_before_pending_request: Option<Option<SessionCompactionState>>,
+    background_completion_delivery_seq: Arc<AtomicU64>,
+    provider_replay_identity: Option<ProviderReplayIdentity>,
+}
+
+struct MainModelContextAppender {
+    tools: Arc<ToolRegistry>,
+    session_id: SessionId,
+    session_dir: PathBuf,
+    delegation_activity: Option<tokio::sync::watch::Receiver<u64>>,
+    delegation_projection_baselines: Arc<Mutex<HashMap<SessionId, DelegationProjectionBaseline>>>,
+    observed_delegation_baseline: Option<DelegationProjectionBaseline>,
     background_completion_delivery_ids: Vec<crate::tool::ProcessCompletionDeliveryReceipt>,
+    background_completion_until_seq: u64,
+    background_completion_delivery_seq: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+struct DelegationProjectionBaseline {
+    activity_revision: Option<u64>,
+    message: SessionTurnMessage,
+}
+
+#[async_trait]
+impl SessionTurnContextAppender for MainModelContextAppender {
+    async fn observe_context(
+        &mut self,
+        provider_messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<Vec<SessionTurnMessage>> {
+        let mut pending = Vec::new();
+
+        self.tools
+            .rollback_process_deliveries_for_owner(&self.session_id, None)
+            .await;
+        let (delivery_ids, frozen_completions) = self
+            .tools
+            .begin_background_completion_delivery_for_owner(&self.session_id, None)
+            .await;
+        self.background_completion_delivery_ids = delivery_ids;
+        persist_main_background_process_completions(
+            self.tools.as_ref(),
+            &self.session_id,
+            &self.session_dir,
+            &frozen_completions,
+        )
+        .await?;
+        let journal = read_session_turn_journal(&self.session_dir.join("turn_events.jsonl")).await;
+        for warning in &journal.warnings {
+            log::warn!(
+                target: "agent",
+                "background completion journal 读取降级 session={} line={:?}: {}",
+                self.session_id,
+                warning.line,
+                warning.message
+            );
+        }
+        let owner = self.tools.process_owner_for_session(&self.session_id, None);
+        let mut persisted_completions = Vec::new();
+        let mut journaled_terminal_instances = BTreeSet::new();
+        let mut delivered_through = self.background_completion_until_seq;
+        for event in journal.events {
+            let TurnJournalEventKind::BackgroundProcessCompleted {
+                tool_use_id,
+                process_id,
+                instance_id,
+                status,
+                exit_code,
+                signal,
+                success,
+            } = event.kind
+            else {
+                continue;
+            };
+            journaled_terminal_instances.insert((process_id.clone(), instance_id));
+            if event.seq <= self.background_completion_until_seq {
+                continue;
+            }
+            delivered_through = delivered_through.max(event.seq);
+            persisted_completions.push(ProcessCompletion {
+                root_session_id: self.session_id.to_string(),
+                owner: owner.clone(),
+                process_id,
+                originating_turn_id: Some(event.turn_id),
+                originating_tool_use_id: Some(tool_use_id),
+                instance_id,
+                status,
+                exit_code,
+                signal,
+                success,
+                finished_at: SystemTime::now(),
+                elapsed_minutes: 0,
+            });
+        }
+        let background = self
+            .tools
+            .background_process_projection_for_owner_with_journaled_terminals(
+                &self.session_id,
+                None,
+                persisted_completions,
+                &journaled_terminal_instances,
+            )
+            .await;
+        if delivered_through > self.background_completion_until_seq {
+            self.background_completion_delivery_seq
+                .store(delivered_through, Ordering::Release);
+        }
+        match background {
+            Some(text) => pending.push(SessionTurnMessage::model_context(
+                ModelContextSource::BackgroundProcess,
+                text,
+            )),
+            None => pending.push(SessionTurnMessage::model_context(
+                ModelContextSource::BackgroundProcess,
+                ToolRegistry::empty_background_process_projection(),
+            )),
+        }
+
+        let activity_revision = self
+            .delegation_activity
+            .as_ref()
+            .map(|receiver| *receiver.borrow());
+        let cached_baseline = match self.observed_delegation_baseline.as_ref() {
+            Some(baseline) => Some(baseline.clone()),
+            None => self
+                .delegation_projection_baselines
+                .lock()
+                .map_err(|_| anyhow::anyhow!("delegation projection baseline lock poisoned"))?
+                .get(&self.session_id)
+                .cloned(),
+        };
+        if let Some(baseline) =
+            cached_baseline.filter(|baseline| baseline.activity_revision == activity_revision)
+        {
+            // Compaction 可能保留了一份更早的 delegation snapshot、却压掉最新一份。
+            // revision 未变时直接复用已获 provider 确认的精确快照；不能只检查 source
+            // 是否存在，否则新 compact window 会退回陈旧状态。
+            pending.push(baseline.message.clone());
+            if !latest_model_context_matches(provider_messages, &baseline.message) {
+                self.observed_delegation_baseline = Some(baseline);
+            }
+        } else {
+            let text = delegation_summary_projection(&self.session_dir)
+                .await?
+                .unwrap_or(empty_delegation_summary_projection()?);
+            let message = SessionTurnMessage::model_context(ModelContextSource::Delegation, text);
+            self.observed_delegation_baseline = Some(DelegationProjectionBaseline {
+                activity_revision,
+                message: message.clone(),
+            });
+            pending.push(message);
+        }
+
+        Ok(pending)
+    }
+
+    async fn after_provider_response_success(&mut self) -> anyhow::Result<()> {
+        if let Some(baseline) = self.observed_delegation_baseline.take() {
+            self.delegation_projection_baselines
+                .lock()
+                .map_err(|_| anyhow::anyhow!("delegation projection baseline lock poisoned"))?
+                .insert(self.session_id.clone(), baseline);
+        }
+        if !self.background_completion_delivery_ids.is_empty() {
+            self.tools
+                .commit_completion_notification_delivery_for_owner(
+                    &self.session_id,
+                    None,
+                    &self.background_completion_delivery_ids,
+                )
+                .await;
+            self.background_completion_delivery_ids.clear();
+        }
+        let delivered_through = self
+            .background_completion_delivery_seq
+            .swap(0, Ordering::AcqRel);
+        self.background_completion_until_seq =
+            self.background_completion_until_seq.max(delivered_through);
+        Ok(())
+    }
+}
+
+/// completion 只有在 journal 获得稳定 seq 后才允许进入 main provider projection。
+/// 独立锁把 TUI heartbeat 与 provider preflight 的“查重 + append + ack”线性化。
+async fn persist_main_background_process_completions(
+    tools: &ToolRegistry,
+    session_id: &SessionId,
+    session_dir: &Path,
+    completions: &[ProcessCompletion],
+) -> anyhow::Result<()> {
+    if completions.is_empty() {
+        return Ok(());
+    }
+    let _guard = FileLockGuard::lock_exclusive(session_dir.join("background_completion.lock"))
+        .await
+        .context("获取 background completion journal 锁失败")?;
+    let journal_path = session_dir.join("turn_events.jsonl");
+    let journal = read_session_turn_journal(&journal_path).await;
+    let mut journaled_instances = journal
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TurnJournalEventKind::BackgroundProcessCompleted {
+                process_id,
+                instance_id,
+                ..
+            } => Some((process_id.clone(), *instance_id)),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut writer = crate::session::TurnJournalWriter::open(journal_path).await?;
+    for completion in completions {
+        let allocation = (completion.process_id.clone(), completion.instance_id);
+        if !journaled_instances.contains(&allocation) {
+            let turn_id = completion
+                .originating_turn_id
+                .as_ref()
+                .context("main background completion 缺少 originating turn")?;
+            let tool_use_id = completion
+                .originating_tool_use_id
+                .as_ref()
+                .context("main background completion 缺少 originating tool use")?;
+            writer
+                .append(
+                    turn_id.clone(),
+                    Utc::now(),
+                    TurnJournalEventKind::BackgroundProcessCompleted {
+                        tool_use_id: tool_use_id.clone(),
+                        process_id: completion.process_id.clone(),
+                        instance_id: completion.instance_id,
+                        status: completion.status.clone(),
+                        exit_code: completion.exit_code,
+                        signal: completion.signal,
+                        success: completion.success,
+                    },
+                    TurnJournalFlush::Immediate,
+                )
+                .await?;
+            journaled_instances.insert(allocation);
+        }
+        tools
+            .acknowledge_process_completion_for_root_session(session_id, completion.instance_id)
+            .await;
+    }
+    Ok(())
+}
+
+fn latest_model_context_matches(
+    messages: &[SessionTurnMessage],
+    expected: &SessionTurnMessage,
+) -> bool {
+    let Some((expected_source, expected_fingerprint, expected_text)) =
+        expected.model_context_snapshot()
+    else {
+        return false;
+    };
+    messages
+        .iter()
+        .rev()
+        .find_map(|message| {
+            let snapshot = message.model_context_snapshot()?;
+            (*snapshot.0 == *expected_source).then_some(snapshot)
+        })
+        .is_some_and(|(_, fingerprint, text)| {
+            fingerprint == expected_fingerprint && text == expected_text
+        })
 }
 
 #[async_trait]
 impl SessionTurnPreflight for PreflightCompactor<'_> {
+    fn frozen_provider_history_prefix_len(&self) -> usize {
+        self.frozen_provider_history_prefix_len
+    }
+
     async fn before_provider_request(
         &mut self,
         system_prompt: &mut String,
         provider_messages: &mut Vec<SessionTurnMessage>,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
     ) -> anyhow::Result<()> {
-        self.remove_background_projection(provider_messages);
-        self.engine
-            .turn_loop
-            .tool_registry()
-            .rollback_process_deliveries_for_owner(&self.session.metadata.id, None)
-            .await;
-        let (projection, delivery_ids) = self
-            .engine
-            .turn_loop
-            .tool_registry()
-            .begin_background_process_projection_delivery_for_owner(&self.session.metadata.id, None)
-            .await;
-        self.background_projection = projection;
-        self.background_completion_delivery_ids = delivery_ids;
-        self.load_delegation_projection().await?;
-        self.insert_delegation_projection(provider_messages);
+        let forced_context_recovery = std::mem::take(&mut self.context_window_recovery_requested);
         let Some(active_suffix_raw) = provider_messages
             .get(self.active_start_index..)
             .map(|messages| messages.to_vec())
@@ -387,17 +654,32 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
             self.engine.compaction.auto_compact_ctx_ratio,
         );
         if trigger_threshold == 0 {
-            self.insert_background_projection(provider_messages).await;
+            if forced_context_recovery {
+                anyhow::bail!("模型上下文已满，但自动压缩已关闭。请启用自动压缩或新建会话。");
+            }
             return Ok(());
         }
-        let trigger_tokens = self
-            .trigger_context_tokens(system_prompt, provider_messages)
-            .saturating_add(self.background_projection_tokens());
-        if !auto_compact_should_trigger(trigger_tokens, trigger_threshold) {
-            self.insert_background_projection(provider_messages).await;
+        let trigger_tokens = self.trigger_context_tokens(system_prompt, provider_messages);
+        if !forced_context_recovery
+            && !auto_compact_should_trigger(trigger_tokens, trigger_threshold)
+        {
             return Ok(());
         }
         let projected_base_system_prompt = system_prompt.clone();
+        let segments = active_provider_safe_segments(&active_suffix);
+        let recovery_protected_tail_segments =
+            match self.context_window_recovery_tail_marker.as_ref() {
+                Some(marker) => {
+                    context_recovery_protected_tail_from_marker(&active_suffix, &segments, marker)
+                        .context("上下文续写状态异常，无法自动恢复")?
+                }
+                None => 0,
+            };
+        if forced_context_recovery && recovery_protected_tail_segments == 0 {
+            anyhow::bail!("上下文续写状态异常，无法自动恢复");
+        }
+        let protected_active_tail_segments = recovery_protected_tail_segments
+            .max(trailing_model_context_segments(&active_suffix, &segments));
         let projection = match self
             .engine
             .compact_provider_preflight(
@@ -408,7 +690,9 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
                     turn_id: &self.turn_id,
                     base_message_count: self.base_message_count,
                     active_projection_compacted: self.active_projection_compacted,
-                    runtime_projection_tokens: self.runtime_projection_tokens(),
+                    // 持久化 context 已经在 provider_messages 中计入，不再另做 runtime reserve。
+                    runtime_projection_tokens: 0,
+                    protected_active_tail_segments,
                 },
                 emit,
             )
@@ -416,10 +700,15 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
         {
             Ok(Some(projection)) => projection,
             Ok(None) => {
-                self.insert_background_projection(provider_messages).await;
+                if forced_context_recovery {
+                    anyhow::bail!("模型上下文已满，但没有可安全压缩的历史。请简化任务后重试。");
+                }
                 return Ok(());
             }
             Err(error) => {
+                if forced_context_recovery {
+                    return Err(error.context("模型上下文已满，自动压缩失败。请重试或新建会话。"));
+                }
                 let Some(recoverable) =
                     error.downcast_ref::<RecoverableCompactionPreparationError>()
                 else {
@@ -431,7 +720,6 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
                         .append_session_event_log(self.session, "WARN", &warning)
                         .await;
                     emit(SessionTurnEvent::CompactionSkipped { warning });
-                    self.insert_background_projection(provider_messages).await;
                     return Ok(());
                 }
                 let message = recoverable.blocking_message();
@@ -446,14 +734,38 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
             .clear_parent_file_read_state(&self.session.metadata.id)
             .await;
         self.active_start_index = projection.active_start_index;
-        self.delegation_projection_inserted = false;
-        self.background_projection_insert_index = None;
-        self.insert_delegation_projection(provider_messages);
-        self.insert_background_projection(provider_messages).await;
         self.active_projection_compacted = true;
+        self.history_replaced_since_last_check = true;
+        self.capture_provider_history = true;
         self.provider_context_anchor = None;
         self.engine
             .clear_active_context_usage_anchor(&self.session.metadata.id);
+        if forced_context_recovery {
+            let projected_tokens = self
+                .engine
+                .turn_loop
+                .estimate_context_tokens(system_prompt, provider_messages);
+            if projected_tokens >= trigger_tokens {
+                log::warn!(
+                    target: "agent",
+                    "context recovery compaction 未缩小请求：压缩前估算 {trigger_tokens} tokens，压缩后估算 {projected_tokens} tokens"
+                );
+                anyhow::bail!("自动压缩未能释放上下文空间。请简化任务或新建会话。");
+            }
+        }
+        Ok(())
+    }
+
+    fn request_context_window_recovery(
+        &mut self,
+        assistant_marker: &SessionTurnMessage,
+    ) -> anyhow::Result<()> {
+        if self.engine.compaction.auto_compact_ctx_ratio == 0.0 {
+            anyhow::bail!("模型上下文已满，但自动压缩已关闭。请启用自动压缩或新建会话。");
+        }
+        self.context_window_recovery_tail_marker
+            .get_or_insert_with(|| assistant_marker.clone());
+        self.context_window_recovery_requested = true;
         Ok(())
     }
 
@@ -474,95 +786,160 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
         self.provider_context_anchor = None;
     }
 
+    fn history_replacement_expected(
+        &self,
+        system_prompt: &str,
+        provider_messages: &[SessionTurnMessage],
+    ) -> bool {
+        let trigger_threshold = auto_compact_trigger_threshold_tokens(
+            self.engine.context_window,
+            self.engine.compaction.auto_compact_ctx_ratio,
+        );
+        trigger_threshold != 0
+            && (self.context_window_recovery_requested
+                || auto_compact_should_trigger(
+                    self.trigger_context_tokens(system_prompt, provider_messages),
+                    trigger_threshold,
+                ))
+    }
+
+    fn take_history_replaced_since_last_check(&mut self) -> bool {
+        std::mem::take(&mut self.history_replaced_since_last_check)
+    }
+
+    async fn provider_request_ready(
+        &mut self,
+        provider_messages: &[SessionTurnMessage],
+        canonical_tail_count: usize,
+    ) -> anyhow::Result<()> {
+        self.persist_provider_history(
+            provider_messages,
+            canonical_tail_count,
+            provider_messages.len(),
+        )
+        .await
+    }
+
+    async fn provider_response_ready(
+        &mut self,
+        provider_messages: &[SessionTurnMessage],
+        canonical_tail_count: usize,
+    ) -> anyhow::Result<()> {
+        let metadata = self.session.read_metadata().await?;
+        let provider_history = metadata
+            .compaction
+            .as_ref()
+            .and_then(|compaction| compaction.provider_history.as_ref())
+            .context("Provider response 固化前缺少 request WAL")?;
+        let pending = provider_history
+            .pending_turn
+            .as_ref()
+            .filter(|pending| pending.turn_id == self.turn_id)
+            .context("Provider response 固化前 request WAL 不属于当前 turn")?;
+        let provider_request_message_count = pending
+            .provider_request_message_count
+            .unwrap_or(provider_history.messages.len());
+        if provider_request_message_count > provider_messages.len() {
+            anyhow::bail!(
+                "Provider response history 短于最后一次请求: request={}, response={}",
+                provider_request_message_count,
+                provider_messages.len()
+            );
+        }
+        self.persist_provider_history(
+            provider_messages,
+            canonical_tail_count,
+            provider_request_message_count,
+        )
+        .await
+    }
+
+    fn provider_request_started(
+        &mut self,
+        _provider_messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<()> {
+        // 网络发送一旦开始，结果在 crash/cancel 下就可能已被上游接受；保守保留 WAL。
+        self.provider_compaction_before_pending_request = None;
+        Ok(())
+    }
+
+    async fn provider_request_abandoned_before_send(&mut self) -> anyhow::Result<()> {
+        let Some(previous) = self.provider_compaction_before_pending_request.take() else {
+            return Ok(());
+        };
+        match previous {
+            Some(compaction) => self.session.update_compaction(compaction).await?,
+            None => self.session.clear_compaction().await?,
+        }
+        self.last_compacted_provider_history = self
+            .session
+            .read_metadata()
+            .await?
+            .compaction
+            .and_then(|state| state.provider_history)
+            .map(|history| history.messages);
+        Ok(())
+    }
+
     async fn after_provider_response_success(&mut self) -> anyhow::Result<()> {
-        if !self.background_completion_delivery_ids.is_empty() {
-            self.engine
-                .turn_loop
-                .tool_registry()
-                .commit_completion_notification_delivery_for_owner(
-                    &self.session.metadata.id,
-                    None,
-                    &self.background_completion_delivery_ids,
-                )
-                .await;
-            self.background_completion_delivery_ids.clear();
+        let delivered_through = self
+            .background_completion_delivery_seq
+            .load(Ordering::Acquire);
+        if delivered_through > 0 {
+            self.session
+                .advance_provider_background_completion_until(delivered_through)
+                .await?;
         }
         Ok(())
     }
 }
 
 impl PreflightCompactor<'_> {
-    async fn load_delegation_projection(&mut self) -> anyhow::Result<()> {
-        if self.delegation_projection_loaded {
+    async fn persist_provider_history(
+        &mut self,
+        provider_messages: &[SessionTurnMessage],
+        canonical_tail_count: usize,
+        provider_request_message_count: usize,
+    ) -> anyhow::Result<()> {
+        if !self.capture_provider_history {
             return Ok(());
         }
-        self.delegation_projection = delegation_summary_projection(&self.session.paths.dir).await?;
-        self.delegation_projection_loaded = true;
+        let canonical_message_until = self
+            .base_message_count
+            .checked_add(canonical_tail_count)
+            .context("compacted provider history canonical cursor 溢出")?;
+        if provider_request_message_count > provider_messages.len() {
+            anyhow::bail!(
+                "Provider request boundary 越界: request={}, history={}",
+                provider_request_message_count,
+                provider_messages.len()
+            );
+        }
+        let metadata = self.session.read_metadata().await?;
+        // 稳定 Provider 窗口同时是所有 main request 的 WAL，不能把
+        // “是否曾发生过语义 compaction”当成恢复正确性的开关。
+        // 尚无 compaction state 时复用空 summary 的同一有界窗口，
+        // 不建立另一个持久化事实源。
+        self.provider_compaction_before_pending_request = Some(metadata.compaction.clone());
+        let mut compaction = metadata.compaction.unwrap_or_else(|| {
+            SessionCompactionState::from_committed_summary(0, String::new(), Utc::now())
+        });
+        let messages = provider_messages.to_vec();
+        compaction.provider_history = Some(Box::new(CompactedProviderHistory {
+            replay_identity: self.provider_replay_identity.clone(),
+            pending_turn: Some(PendingProviderHistoryTurn {
+                turn_id: self.turn_id.clone(),
+                base_message_count: self.base_message_count,
+                provider_request_message_count: Some(provider_request_message_count),
+            }),
+            canonical_message_until,
+            messages: messages.clone(),
+        }));
+        self.session.update_compaction(compaction).await?;
+        self.last_compacted_provider_history = Some(messages);
         Ok(())
     }
 
-    fn insert_delegation_projection(&mut self, provider_messages: &mut Vec<SessionTurnMessage>) {
-        if self.delegation_projection_inserted {
-            return;
-        }
-        let Some(projection) = self.delegation_projection.clone() else {
-            return;
-        };
-        let insert_index = self.active_start_index.min(provider_messages.len());
-        provider_messages.insert(insert_index, SessionTurnMessage::user_text(projection));
-        self.active_start_index = insert_index.saturating_add(1);
-        self.delegation_projection_inserted = true;
-    }
-
-    fn remove_background_projection(&mut self, provider_messages: &mut Vec<SessionTurnMessage>) {
-        let Some(index) = self.background_projection_insert_index.take() else {
-            return;
-        };
-        if index < provider_messages.len() {
-            provider_messages.remove(index);
-            if index < self.active_start_index {
-                self.active_start_index = self.active_start_index.saturating_sub(1);
-            }
-            // provider usage 是包含该 runtime-only message 的实测值。删除它后不能只把
-            // message_count 原样沿用，否则下一轮把新 tool result 当成 anchor 之前的内容，
-            // 从而低估 context；重算虽稍保守，但不会越过 compaction safety budget。
-            self.provider_context_anchor = None;
-        }
-    }
-
-    async fn insert_background_projection(
-        &mut self,
-        provider_messages: &mut Vec<SessionTurnMessage>,
-    ) {
-        let Some(projection) = self.background_projection.clone() else {
-            return;
-        };
-        let index = self.active_start_index.min(provider_messages.len());
-        provider_messages.insert(index, SessionTurnMessage::user_text(projection));
-        self.active_start_index = index.saturating_add(1);
-        self.background_projection_insert_index = Some(index);
-    }
-
-    fn background_projection_tokens(&self) -> usize {
-        self.background_projection.as_ref().map_or(0, |projection| {
-            estimate_session_turn_messages_tokens(&[SessionTurnMessage::user_text(projection)])
-        })
-    }
-
-    fn delegation_projection_tokens(&self) -> usize {
-        self.delegation_projection.as_ref().map_or(0, |projection| {
-            estimate_session_turn_messages_tokens(&[SessionTurnMessage::user_text(projection)])
-        })
-    }
-
-    /// compact 期间暂时从 raw projection 拿掉、校验后再插回的全部 runtime-only 内容。
-    fn runtime_projection_tokens(&self) -> usize {
-        self.background_projection_tokens()
-            .saturating_add(self.delegation_projection_tokens())
-    }
-}
-
-impl PreflightCompactor<'_> {
     fn raw_request_with_output_fits_context(&self, input_tokens: usize) -> bool {
         let output_tokens =
             usize::try_from(self.engine.turn_loop.max_tokens()).unwrap_or(usize::MAX);
@@ -624,7 +1001,28 @@ struct CompactionRanges {
 struct SessionRecapPayload<'a> {
     instruction: &'a str,
     transcript: &'a [TurnMessage],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    background_process_completions: Option<&'a SessionRecapBackgroundProcessProjection>,
     local_claims: &'a [Claim],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SessionRecapBackgroundProcessProjection {
+    #[serde(skip)]
+    consumed_through_seq: u64,
+    omitted_older_count: usize,
+    items: Vec<SessionRecapBackgroundProcessCompletion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SessionRecapBackgroundProcessCompletion {
+    turn_id: String,
+    tool_use_id: String,
+    process_id: String,
+    status: String,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    success: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -690,6 +1088,17 @@ struct CompactionAuditSummaryContext<'a> {
 struct GeneratedCompactionSummary {
     outcome: SessionCompactionOutcome,
     audit_id: String,
+}
+
+/// 已完成本地预算预检、但尚未发给 provider 的压缩摘要请求。
+///
+/// 将预检与模型调用分开后，已确认可发起的摘要和 recap 可以并行；预检失败时
+/// 则不会启动任何 recap 请求。
+#[derive(Debug)]
+struct PreparedCompactionSummaryRequest {
+    system_prompt: String,
+    provider_messages: Vec<SessionTurnMessage>,
+    payload_preview: CompactionAuditTextPreview,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -853,6 +1262,7 @@ struct CompactionAuditTextPreview {
 struct SessionInboxJsonGenerator<'a> {
     prompt_registry: &'a PromptRegistry,
     json_caller: &'a StructuredJsonCaller,
+    fallback_scope: crate::api::ProviderRuntimeFallbackScope,
 }
 
 #[async_trait]
@@ -861,6 +1271,7 @@ impl InboxJsonGenerator for SessionInboxJsonGenerator<'_> {
         &self,
         kind: InboxInternalizeKind,
         request: InternalizeRequest,
+        preferred_transport: Option<crate::api::ProviderTransport>,
     ) -> anyhow::Result<serde_json::Value> {
         let prompt_name = match kind {
             InboxInternalizeKind::PolicyUpdate => PROMPT_INBOX_POLICY_UPDATE_INTERNALIZE,
@@ -874,9 +1285,11 @@ impl InboxJsonGenerator for SessionInboxJsonGenerator<'_> {
             .with_context(|| format!("渲染 {prompt_name} prompt 失败"))?;
         let user_text = serde_json::to_string_pretty(&request)?;
         self.json_caller
-            .generate_json(
+            .generate_json_streaming_once(
                 system_prompt,
                 vec![SessionTurnMessage::user_text(user_text)],
+                crate::api::BufferedProviderRuntime::new(self.fallback_scope.clone()),
+                preferred_transport,
             )
             .await
     }
@@ -1051,6 +1464,7 @@ impl SessionEngine {
             fork_memory_review_interval_turns: DEFAULT_FORK_MEMORY_REVIEW_INTERVAL_TURNS,
             turns_since_fork_memory_review: Arc::new(Mutex::new(0)),
             active_context_usage_anchor: Arc::new(Mutex::new(None)),
+            delegation_projection_baselines: Arc::new(Mutex::new(HashMap::new())),
             attachment: AttachmentConfig::default(),
             mcp_manager: None,
             subagent_max_concurrent: options.subagent_max_concurrent,
@@ -1100,7 +1514,7 @@ impl SessionEngine {
         let completions = self
             .turn_loop
             .tool_registry()
-            .take_process_completions_for_root_session(&session.metadata.id)
+            .pending_process_completions_for_root_session(&session.metadata.id)
             .await;
         let mut events = Vec::with_capacity(lifecycle_events.len() + completions.len());
         for lifecycle_event in lifecycle_events {
@@ -1163,6 +1577,23 @@ impl SessionEngine {
                 }
             }
         }
+        if let Err(error) = persist_main_background_process_completions(
+            self.turn_loop.tool_registry().as_ref(),
+            &session.metadata.id,
+            &session.paths.dir,
+            &completions,
+        )
+        .await
+        {
+            log::warn!(
+                target: "agent",
+                "background completion journal 写入失败 session={}: {error:#}",
+                session.metadata.id,
+            );
+            // durable obligation 原样保留；下个 heartbeat、provider preflight 或 finalize
+            // 会在同一把 completion lock 下重试。
+            return events;
+        }
         for completion in completions {
             let owner_subagent = completion.owner.subagent_id.as_deref().unwrap_or("main");
             let termination = completion
@@ -1174,8 +1605,10 @@ impl SessionEngine {
                 session,
                 "INFO",
                 format!(
-                    "Background process completed: process_id={} owner_agent={} owner_root_session={} owner_subagent={} status={} {}",
+                    "Background process completed: process_id={} turn_id={} tool_use_id={} owner_agent={} owner_root_session={} owner_subagent={} status={} {}",
                     completion.process_id,
+                    completion.originating_turn_id.as_deref().unwrap_or("unknown"),
+                    completion.originating_tool_use_id.as_deref().unwrap_or("unknown"),
                     completion.owner.owner_agent_id,
                     completion.owner.root_session_id,
                     owner_subagent,
@@ -1186,12 +1619,15 @@ impl SessionEngine {
             .await;
             events.push(SessionEvent::BackgroundProcessCompleted {
                 process_id: completion.process_id,
+                originating_turn_id: completion.originating_turn_id,
+                originating_tool_use_id: completion.originating_tool_use_id,
                 owner_agent_id: completion.owner.owner_agent_id,
                 owner_root_session_id: completion.owner.root_session_id,
                 owner_subagent_id: completion.owner.subagent_id,
                 status: completion.status,
                 exit_code: completion.exit_code,
                 signal: completion.signal,
+                success: completion.success,
             });
         }
         events
@@ -1217,7 +1653,43 @@ impl SessionEngine {
             .await;
     }
 
-    /// TUI/CLI runtime 退出时收束当前 engine 共享 registry 的全部受管 terminal。
+    async fn settle_processes_for_session_finalization<F>(
+        &self,
+        session: &SessionHandle,
+        emit: &mut F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(SessionEvent),
+    {
+        // 先持久化 watcher 已经登记但 heartbeat 尚未消费的终态，再终止 live entry。
+        for event in self.drain_background_process_completions(session).await {
+            emit(event);
+        }
+        self.turn_loop
+            .tool_registry()
+            .settle_processes_for_session(&session.metadata.id, Duration::from_secs(5))
+            .await;
+        for event in self.drain_background_process_completions(session).await {
+            emit(event);
+        }
+
+        let pending = self
+            .turn_loop
+            .tool_registry()
+            .pending_process_completions_for_root_session(&session.metadata.id)
+            .await;
+        if !pending.is_empty() {
+            anyhow::bail!(
+                "{} background process completion(s) are still awaiting durable journal persistence",
+                pending.len()
+            );
+        }
+        self.cleanup_processes_for_session(&session.metadata.id)
+            .await;
+        Ok(())
+    }
+
+    /// TUI/CLI runtime 退出时关闭全部受管 terminal，避免子进程泄漏到宿主退出之后。
     pub(crate) async fn shutdown_background_processes(&self) {
         self.turn_loop
             .tool_registry()
@@ -1244,7 +1716,14 @@ impl SessionEngine {
     fn estimated_message_tokens<'a>(
         messages: impl IntoIterator<Item = &'a SessionMessage>,
     ) -> usize {
-        estimated_session_message_tokens_projected(messages, None)
+        estimated_session_message_tokens_projected(
+            messages,
+            None,
+            Some(crate::api::ProviderReplayIdentity {
+                protocol: crate::api::ProviderReplayProtocol::OpenAiResponses,
+                model: "test-model".into(),
+            }),
+        )
     }
 
     #[cfg(test)]
@@ -1252,7 +1731,14 @@ impl SessionEngine {
         messages: impl IntoIterator<Item = &'a SessionMessage>,
         tool_result_raw_max_chars: usize,
     ) -> usize {
-        estimated_session_message_tokens_projected(messages, Some(tool_result_raw_max_chars))
+        estimated_session_message_tokens_projected(
+            messages,
+            Some(tool_result_raw_max_chars),
+            Some(crate::api::ProviderReplayIdentity {
+                protocol: crate::api::ProviderReplayProtocol::OpenAiResponses,
+                model: "test-model".into(),
+            }),
+        )
     }
 
     fn compaction_summary_end_index(
@@ -1283,6 +1769,7 @@ impl SessionEngine {
             tail_token_limit,
             self.compaction.tail_previous_real_user_turns,
             self.compaction.tool_result_raw_max_chars,
+            self.turn_loop.history_replay_identity(),
         )
     }
 
@@ -1383,6 +1870,10 @@ impl SessionEngine {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "preflight provider 投影需显式携带 session、active turn、预算与受保护恢复边界"
+    )]
     fn preflight_projection(
         &self,
         base_system_prompt: &str,
@@ -1391,6 +1882,7 @@ impl SessionEngine {
         active_suffix: &[SessionTurnMessage],
         active_context: ActiveProjectionContext<'_>,
         budget: ProviderProjectionBudget,
+        protected_active_tail_segments: usize,
     ) -> ProviderProjection {
         project_provider_context(
             base_system_prompt,
@@ -1399,6 +1891,10 @@ impl SessionEngine {
             active_suffix.to_vec(),
             active_context,
             budget,
+            self.turn_loop.history_media_policy(),
+            self.turn_loop.history_replay_identity(),
+            protected_active_tail_segments,
+            self.turn_loop.tool_registry().file_edit_authority_enabled(),
         )
     }
 
@@ -1411,8 +1907,12 @@ impl SessionEngine {
         audit_id: Option<&str>,
     ) -> anyhow::Result<ProviderProjection> {
         let raw_tail_tokens_before = estimate_session_turn_messages_tokens(&projection.messages);
-        let externalized =
-            externalize_heavy_user_blocks(projection, &session.paths.compaction_assets_dir).await;
+        let externalized = externalize_heavy_user_blocks(
+            projection,
+            &session.paths.compaction_assets_dir,
+            self.turn_loop.history_media_policy(),
+        )
+        .await;
         let raw_tail_tokens_after =
             estimate_session_turn_messages_tokens(&externalized.projection.messages);
         if let Some(audit_id) = audit_id {
@@ -1545,12 +2045,13 @@ impl SessionEngine {
 
     async fn start_turn_journal(
         &self,
-        session: &SessionHandle,
+        session: &mut SessionHandle,
         user_text: &str,
         skill_instructions: &[SkillInstructions],
     ) -> anyhow::Result<(
         String,
         Option<String>,
+        Vec<CompletedSessionTurnMessage>,
         TurnJournalEmitter,
         JoinHandle<anyhow::Result<()>>,
     )> {
@@ -1567,9 +2068,14 @@ impl SessionEngine {
         let projection = replay_turn_journal(journal_read);
         let turn_id = next_turn_journal_turn_id(&projection);
         let canonical_messages = session.read_messages().await?;
+        self.reconcile_pending_provider_history(session, &projection, &canonical_messages)
+            .await?;
         let recovery_turns = recovery_turn_chain(&projection, &canonical_messages);
-        let recovery_context =
-            turn_journal_recovery_context_for_chain(recovery_turns, self.turn_recovery_limits);
+        let recovered_model_context = recovered_model_context(&recovery_turns);
+        let recovery_context = turn_journal_recovery_context_for_chain(
+            recovery_turns.iter().copied(),
+            self.turn_recovery_limits,
+        );
         let mut initial_writer = session.open_turn_journal_writer().await?;
         initial_writer
             .append(
@@ -1613,7 +2119,76 @@ impl SessionEngine {
             self.turn_journal_delta_snapshot_interval,
             self.turn_journal_delta_snapshot_chars,
         );
-        Ok((turn_id, recovery_context, emitter, writer))
+        Ok((
+            turn_id,
+            recovery_context,
+            recovered_model_context,
+            emitter,
+            writer,
+        ))
+    }
+
+    /// 在新 turn 建立前，把上一 turn 的 provider-history WAL 游标与 journal/canonical
+    /// 事实对齐。失败或取消的 turn 没有提交其预计 canonical tail；此后追加的 shell
+    /// record 等消息必须从原 base 继续投影，不能被未来游标跳过。
+    async fn reconcile_pending_provider_history(
+        &self,
+        session: &mut SessionHandle,
+        projection: &crate::session::TurnJournalProjection,
+        canonical_messages: &[SessionMessage],
+    ) -> anyhow::Result<()> {
+        let metadata = session.read_metadata().await?;
+        let Some(mut compaction) = metadata.compaction else {
+            return Ok(());
+        };
+        let Some(provider_history) = compaction.provider_history.as_mut() else {
+            return Ok(());
+        };
+        let Some(pending) = provider_history.pending_turn.clone() else {
+            return Ok(());
+        };
+        if pending.base_message_count > canonical_messages.len() {
+            anyhow::bail!(
+                "pending provider history base cursor 越界: base={}, canonical={}",
+                pending.base_message_count,
+                canonical_messages.len()
+            );
+        }
+
+        let pending_turn_committed = projection
+            .turns
+            .iter()
+            .find(|turn| turn.turn_id == pending.turn_id)
+            .is_some_and(|turn| {
+                turn.status == Some(TurnJournalStatus::Committed)
+                    || journal_turn_is_already_canonical(turn, canonical_messages)
+            });
+        if pending_turn_committed {
+            if provider_history.canonical_message_until > canonical_messages.len() {
+                anyhow::bail!(
+                    "已提交 pending provider history cursor 越界: until={}, canonical={}",
+                    provider_history.canonical_message_until,
+                    canonical_messages.len()
+                );
+            }
+        } else {
+            if let Some(provider_request_message_count) = pending.provider_request_message_count {
+                if provider_request_message_count > provider_history.messages.len() {
+                    anyhow::bail!(
+                        "未提交 pending provider request boundary 越界: request={}, history={}",
+                        provider_request_message_count,
+                        provider_history.messages.len()
+                    );
+                }
+                provider_history
+                    .messages
+                    .truncate(provider_request_message_count);
+            }
+            provider_history.canonical_message_until = pending.base_message_count;
+        }
+        provider_history.pending_turn = None;
+        session.update_compaction(compaction).await?;
+        Ok(())
     }
 
     async fn finish_turn_journal(
@@ -1836,6 +2411,7 @@ impl SessionEngine {
         let inbox_generator = SessionInboxJsonGenerator {
             prompt_registry: &self.prompt_registry,
             json_caller: &self.json_caller,
+            fallback_scope: session.inbox_fallback_scope_for_request(),
         };
         let report = self.runner.process_inbox_with(&inbox_generator).await?;
         self.append_session_warnings_log(session, &report.warnings)
@@ -1886,9 +2462,11 @@ impl SessionEngine {
         emit(SessionEvent::StartupProgress {
             label: "processing inbox...".into(),
         });
+        let inbox_fallback_scope = crate::api::ProviderRuntimeFallbackScope::new_root();
         let inbox_generator = SessionInboxJsonGenerator {
             prompt_registry: &self.prompt_registry,
             json_caller: &self.json_caller,
+            fallback_scope: inbox_fallback_scope.clone(),
         };
         let inbox_report = self.runner.process_inbox_with(&inbox_generator).await?;
         emit(SessionEvent::TeamServicesConnectionUpdated {
@@ -1905,7 +2483,7 @@ impl SessionEngine {
         emit(SessionEvent::StartupProgress {
             label: "creating session...".into(),
         });
-        let session = self
+        let mut session = self
             .session_store
             .create_with_metadata_id_factory(
                 &self.runner.agent_id,
@@ -1916,6 +2494,7 @@ impl SessionEngine {
                 max_attempts,
             )
             .await?;
+        session.replace_runtime_fallback_root(inbox_fallback_scope);
         emit(SessionEvent::SessionStarted {
             session_id: session.metadata.id.clone(),
             agent_id: self.agent.agent_id.clone(),
@@ -2039,7 +2618,31 @@ impl SessionEngine {
             },
         )
         .await?;
-        let (turn_id, recovery_context, mut journal_emitter, journal_writer) = self
+        // recovery snapshot 必须排在独立 watcher 的 durable completion 之后。否则用户在
+        // 下一个 heartbeat 前立刻提交新 turn 时，本轮模型会冻结并看到陈旧的
+        // `ProcessRunning`，即使 completion 随后才写入上一 turn journal。
+        let background_events = self.drain_background_process_completions(session).await;
+        for event in background_events {
+            emit(event);
+        }
+        let pending_background_completions = self
+            .turn_loop
+            .tool_registry()
+            .pending_process_completions_for_root_session(&session.metadata.id)
+            .await;
+        if !pending_background_completions.is_empty() {
+            anyhow::bail!(
+                "cannot start a new turn while {} background process completion(s) await durable journal persistence",
+                pending_background_completions.len()
+            );
+        }
+        let (
+            turn_id,
+            recovery_context,
+            recovered_model_context,
+            mut journal_emitter,
+            journal_writer,
+        ) = self
             .start_turn_journal(session, &user_text, &skill_instructions)
             .await?;
         let checkpoint_result = self
@@ -2067,6 +2670,9 @@ impl SessionEngine {
         }
         let model_user_text =
             user_text_with_recovery_context(user_text.clone(), recovery_context.as_deref());
+        emit(SessionEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+        });
         emit(SessionEvent::UserMessageAccepted {
             text: visible_user_text,
         });
@@ -2077,6 +2683,7 @@ impl SessionEngine {
             sink: journal_emitter.sink(),
             assistant_delta_flusher: journal_emitter.assistant_delta_flusher(),
         };
+        let runtime_chain_id = session.runtime_chain_id();
         let result = async {
             checkpoint_result?;
             let mut turn_emit = |event| match event {
@@ -2209,6 +2816,7 @@ impl SessionEngine {
                     session,
                     RunTurnInnerRequest {
                         turn_id: turn_id.clone(),
+                        recovered_model_context,
                         user_text: model_user_text,
                         user_attachments,
                         skill_instructions,
@@ -2225,6 +2833,9 @@ impl SessionEngine {
                     if tool_boundary_control
                         .as_ref()
                         .is_some_and(ToolBoundaryControl::is_cancelled)
+                        && !tool_boundary_control
+                            .as_ref()
+                            .is_some_and(ToolBoundaryControl::should_commit_successful_response)
                     {
                         Err(SessionTurnInterrupted.into())
                     } else {
@@ -2248,6 +2859,9 @@ impl SessionEngine {
             .as_ref()
             .err()
             .is_some_and(is_canonical_messages_committed_error);
+        if result.is_err() && !canonical_messages_committed_error {
+            self.turn_loop.discard_runtime_chain(runtime_chain_id).await;
+        }
         let interrupted_status = if turn_interrupted {
             tool_boundary_interrupt_status
                 .as_ref()
@@ -2613,6 +3227,7 @@ impl SessionEngine {
         let inbox_generator = SessionInboxJsonGenerator {
             prompt_registry: &self.prompt_registry,
             json_caller: &self.json_caller,
+            fallback_scope: session.inbox_fallback_scope_for_request(),
         };
         let result = self.runner.process_inbox_with(&inbox_generator).await;
         match result {
@@ -2696,6 +3311,18 @@ impl SessionEngine {
         let all_messages = session.read_messages().await?;
         let previous_message_count = all_messages.len();
         validate_session_compaction_state(&metadata, all_messages.len())?;
+        let provider_replay_identity = self.turn_loop.history_replay_identity();
+        // 每次 main Provider 请求都必须先推进 write-ahead 窗口。
+        // 未压缩 session 也可能在 tool loop/失败/取消前送出尚未进入
+        // canonical transcript 的 suffix，因而不能依赖“已有 compaction”作为开关。
+        let capture_provider_history = true;
+        let frozen_provider_history_prefix_len = replayable_compacted_provider_history(
+            &metadata,
+            all_messages.len(),
+            provider_replay_identity.as_ref(),
+        )
+        .map(|history| history.messages.len())
+        .unwrap_or(0);
         let (system_prompt, history) = compacted_context_for_turn(
             &base_system_prompt,
             &metadata,
@@ -2704,9 +3331,36 @@ impl SessionEngine {
             self.compaction_hard_tail_token_limit(),
             self.compaction.tail_previous_real_user_turns,
             self.compaction.tool_result_raw_max_chars,
+            self.turn_loop.history_media_policy(),
+            provider_replay_identity.clone(),
+            self.turn_loop.tool_registry().file_edit_authority_enabled(),
         )?;
         let active_start_index = history.len();
+        let runtime_chain_id = session.runtime_chain_id();
+        let runtime_fallback_scope = session.runtime_fallback_scope();
         let turn_id_for_tools = request.turn_id.clone();
+        let tools = self.turn_loop.tool_registry();
+        tools
+            .bind_delegation_fallback_root_for_session(&metadata.id, session.inbox_fallback_scope())
+            .await
+            .context("绑定 subagent fallback scope 失败")?;
+        let delegation_activity = tools
+            .subscribe_delegation_activity_for_session(&metadata.id)
+            .context("订阅 subagent activity 失败")?;
+        let background_completion_delivery_seq = Arc::new(AtomicU64::new(0));
+        let mut context_appender = MainModelContextAppender {
+            tools,
+            session_id: metadata.id.clone(),
+            session_dir: session.paths.dir.clone(),
+            delegation_activity,
+            delegation_projection_baselines: Arc::clone(&self.delegation_projection_baselines),
+            observed_delegation_baseline: None,
+            background_completion_delivery_ids: Vec::new(),
+            background_completion_until_seq: metadata
+                .provider_background_completion_until_seq
+                .unwrap_or(0),
+            background_completion_delivery_seq: Arc::clone(&background_completion_delivery_seq),
+        };
         let mut preflight = PreflightCompactor {
             engine: self,
             session,
@@ -2715,16 +3369,19 @@ impl SessionEngine {
             base_message_count: previous_message_count,
             active_projection_compacted: false,
             provider_context_anchor: None,
-            delegation_projection_loaded: false,
-            delegation_projection: None,
-            delegation_projection_inserted: false,
-            background_projection: None,
-            background_projection_insert_index: None,
-            background_completion_delivery_ids: Vec::new(),
+            context_window_recovery_requested: false,
+            context_window_recovery_tail_marker: None,
+            history_replaced_since_last_check: false,
+            frozen_provider_history_prefix_len,
+            capture_provider_history,
+            last_compacted_provider_history: None,
+            provider_compaction_before_pending_request: None,
+            background_completion_delivery_seq,
+            provider_replay_identity: provider_replay_identity.clone(),
         };
         let turn = self
             .turn_loop
-            .run_session_turn_with_hooks(
+            .run_session_turn_with_context_and_runtime_chain_hooks(
                 SessionTurnRequest {
                     current_session_id: Some(metadata.id.clone()),
                     current_turn_id: Some(turn_id_for_tools),
@@ -2734,10 +3391,16 @@ impl SessionEngine {
                     user_attachments: request.user_attachments,
                     skill_instructions: request.skill_instructions,
                 },
+                request.recovered_model_context,
+                runtime_chain_id,
+                runtime_fallback_scope,
                 emit,
                 request.tool_boundary_control,
-                durable_recorder,
-                Some(&mut preflight),
+                SessionTurnHooks::new(
+                    durable_recorder,
+                    Some(&mut context_appender),
+                    Some(&mut preflight),
+                ),
             )
             .await?;
         Ok(PreparedSessionTurn {
@@ -2746,6 +3409,8 @@ impl SessionEngine {
             provider_context_used_tokens: preflight
                 .provider_context_anchor
                 .map(|anchor| anchor.used_tokens),
+            compacted_provider_history: preflight.last_compacted_provider_history,
+            provider_replay_identity,
         })
     }
 
@@ -2755,6 +3420,17 @@ impl SessionEngine {
         prepared: PreparedSessionTurn,
     ) -> anyhow::Result<CommittedSessionTurn> {
         let metadata = session.read_metadata().await?;
+        let compacted_provider_history = prepared.compacted_provider_history.clone();
+        let provider_replay_identity = prepared.provider_replay_identity.clone();
+        if compacted_provider_history.is_some()
+            && prepared
+                .turn
+                .messages
+                .last()
+                .is_none_or(|message| message.role != "assistant")
+        {
+            anyhow::bail!("compacted turn 必须以最终 assistant message 结束");
+        }
         let expected_message_count = prepared
             .previous_message_count
             .saturating_add(prepared.turn.messages.len());
@@ -2815,9 +3491,14 @@ impl SessionEngine {
         } else {
             self.clear_active_context_usage_anchor(&metadata.id);
         }
-        self.clear_active_compaction(session)
-            .await
-            .map_err(|source| SessionTurnCommittedPostCommitError { source })?;
+        self.finalize_compaction_after_committed_turn(
+            session,
+            compacted_provider_history,
+            provider_replay_identity,
+            message_count,
+        )
+        .await
+        .map_err(|source| SessionTurnCommittedPostCommitError { source })?;
         Ok(CommittedSessionTurn {
             message_count,
             provider_context_usage_observed,
@@ -2830,8 +3511,15 @@ impl SessionEngine {
         journal_emitter: &TurnJournalEmitter,
         messages: &[crate::api::CompletedSessionTurnMessage],
     ) -> anyhow::Result<()> {
-        let Some(user_message) = messages.first().filter(|message| message.role == "user") else {
-            anyhow::bail!("prepared session turn 缺少首条 user message");
+        let Some(user_message) = messages.iter().find(|message| {
+            message.role == "user"
+                && message.model_context_snapshot().is_none()
+                && !message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, SessionTurnContentBlock::ToolResult { .. }))
+        }) else {
+            anyhow::bail!("prepared session turn 缺少真实 user message");
         };
         let content = user_message
             .content
@@ -2863,6 +3551,36 @@ impl SessionEngine {
         Ok(())
     }
 
+    async fn finalize_compaction_after_committed_turn(
+        &self,
+        session: &mut SessionHandle,
+        provider_history: Option<Vec<SessionTurnMessage>>,
+        replay_identity: Option<ProviderReplayIdentity>,
+        message_count: usize,
+    ) -> anyhow::Result<()> {
+        let metadata = session.read_metadata().await?;
+        let Some(mut compaction) = metadata.compaction else {
+            if provider_history.is_some() {
+                anyhow::bail!(
+                    "turn 捕获了 compacted provider history，但 session 缺少 compaction state"
+                );
+            }
+            return Ok(());
+        };
+        if let Some(messages) = provider_history {
+            compaction.provider_history = Some(Box::new(CompactedProviderHistory {
+                replay_identity,
+                pending_turn: None,
+                canonical_message_until: message_count,
+                messages,
+            }));
+        }
+        compaction.active_turn_summary = None;
+        compaction.frontier.active_turn = None;
+        session.update_compaction(compaction).await?;
+        Ok(())
+    }
+
     pub async fn estimate_session_context_tokens(
         &self,
         session: &SessionHandle,
@@ -2886,9 +3604,18 @@ impl SessionEngine {
             self.compaction_hard_tail_token_limit(),
             self.compaction.tail_previous_real_user_turns,
             self.compaction.tool_result_raw_max_chars,
+            self.turn_loop.history_media_policy(),
+            self.turn_loop.history_replay_identity(),
+            self.turn_loop.tool_registry().file_edit_authority_enabled(),
         )?;
-        if let Some(projection) = delegation_summary_projection(&session.paths.dir).await? {
-            history.push(SessionTurnMessage::user_text(projection));
+        let delegation = SessionTurnMessage::model_context(
+            ModelContextSource::Delegation,
+            delegation_summary_projection(&session.paths.dir)
+                .await?
+                .unwrap_or(empty_delegation_summary_projection()?),
+        );
+        if !latest_model_context_matches(&history, &delegation) {
+            history.push(delegation);
         }
         Ok(self
             .turn_loop
@@ -2965,6 +3692,7 @@ impl SessionEngine {
             base_message_count,
             active_projection_compacted,
             runtime_projection_tokens,
+            protected_active_tail_segments,
         } = request;
         let runtime_budget = self.preflight_runtime_projection_budget(runtime_projection_tokens);
         let projection_budget = runtime_budget.provider_projection;
@@ -3008,6 +3736,7 @@ impl SessionEngine {
             active_context,
             active_projection_compacted,
             runtime_budget,
+            protected_active_tail_segments,
         )?;
         if plan.committed_transcript.is_none() && plan.active_turn.is_none() {
             if let Some(state) = recovered_state {
@@ -3018,6 +3747,7 @@ impl SessionEngine {
                     &active_suffix,
                     active_context,
                     projection_budget,
+                    protected_active_tail_segments,
                 );
                 let projection = if self
                     .ensure_provider_projection_within_hard_budget(
@@ -3114,6 +3844,10 @@ impl SessionEngine {
                 active_suffix,
                 active_context,
                 projection_budget,
+                self.turn_loop.history_media_policy(),
+                self.turn_loop.history_replay_identity(),
+                protected_active_tail_segments,
+                self.turn_loop.tool_registry().file_edit_authority_enabled(),
             )
         });
         log::info!(
@@ -3130,6 +3864,10 @@ impl SessionEngine {
         Ok(Some(projection))
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "preflight 规划需显式携带 session、active turn、runtime budget 与受保护尾段边界"
+    )]
     fn build_preflight_compaction_plan(
         &self,
         metadata: &crate::session::SessionMetadata,
@@ -3138,6 +3876,7 @@ impl SessionEngine {
         active_context: ActiveProjectionContext<'_>,
         active_projection_compacted: bool,
         runtime_budget: PreflightRuntimeProjectionBudget,
+        protected_active_tail_segments: usize,
     ) -> anyhow::Result<PreflightCompactionPlan> {
         let projection_budget = runtime_budget.provider_projection;
 
@@ -3147,6 +3886,7 @@ impl SessionEngine {
             active_context.turn_id,
             active_context.base_message_count,
             projection_budget.tail_token_limit,
+            protected_active_tail_segments,
         )?;
         let prior_active_turn = matching_active_turn_compaction(
             metadata,
@@ -3172,7 +3912,10 @@ impl SessionEngine {
             prior_active_turn
                 .as_ref()
                 .map(|prior| prior.summary.as_str()),
-        );
+            protected_active_tail_segments,
+            self.turn_loop.tool_registry().file_edit_authority_enabled(),
+        )
+        .messages;
         let summary_start = metadata
             .compaction
             .as_ref()
@@ -3183,7 +3926,12 @@ impl SessionEngine {
             .as_ref()
             .map(SessionCompactionState::committed_summary)
             .filter(|summary| !summary.trim().is_empty())
-            .map(estimate_compacted_committed_summary_message_tokens)
+            .map(|summary| {
+                estimate_compacted_committed_summary_message_tokens(
+                    summary,
+                    self.turn_loop.tool_registry().file_edit_authority_enabled(),
+                )
+            })
             .unwrap_or(0);
         let committed_tail_limit = raw_preserve_budget_after_mandatory(
             projection_budget.tail_token_limit,
@@ -3198,7 +3946,7 @@ impl SessionEngine {
             committed_tail_limit,
         );
         let committed_transcripts = if summary_end > summary_start {
-            Some(session_compaction_transcript_projection(
+            let projection = session_compaction_transcript_projection_with_memory_mode(
                 session_messages
                     .get(summary_start..summary_end)
                     .with_context(|| {
@@ -3207,7 +3955,9 @@ impl SessionEngine {
                         )
                     })?,
                 self.compaction.tool_result_raw_max_chars,
-            ))
+                self.turn_loop.tool_registry().memory_enabled(),
+            );
+            (!projection.full.is_empty()).then_some(projection)
         } else {
             None
         };
@@ -3241,6 +3991,7 @@ impl SessionEngine {
             turn_id: active_context.turn_id.to_string(),
             base_message_count: active_context.base_message_count,
             runtime_budget,
+            protected_active_tail_segments,
         })
     }
 
@@ -3251,11 +4002,13 @@ impl SessionEngine {
         turn_id: &str,
         base_message_count: usize,
         tail_token_limit: usize,
+        protected_tail_segments: usize,
     ) -> anyhow::Result<Option<ActiveTurnPlan>> {
         let segments = active_provider_safe_segments(active_suffix);
         if segments.is_empty() {
             return Ok(None);
         }
+        let compactable_segments = segments.len().saturating_sub(protected_tail_segments);
         let current_coverage = metadata
             .compaction
             .as_ref()
@@ -3272,15 +4025,22 @@ impl SessionEngine {
             })
             .map(|cursor| cursor.compacted_until_segment)
             .unwrap_or(0);
-        if current_coverage >= segments.len() {
+        if current_coverage >= compactable_segments {
             return Ok(None);
         }
+        let protected_tail_tokens = if protected_tail_segments > 0 {
+            let protected_start = segments[compactable_segments].start;
+            estimate_session_turn_messages_tokens(&active_suffix[protected_start..])
+        } else {
+            0
+        };
         let summary_start_segment = current_coverage;
         let summary_end_segment = self.active_summary_end_segment(
             active_suffix,
-            &segments,
+            &segments[..compactable_segments],
             current_coverage,
             tail_token_limit,
+            protected_tail_tokens,
         );
         if summary_end_segment <= summary_start_segment {
             return Ok(None);
@@ -3289,10 +4049,18 @@ impl SessionEngine {
             active_suffix,
             &segments[summary_start_segment..summary_end_segment],
         );
-        let transcript_projection = compaction_transcript_projection(
+        let transcript_projection = compaction_transcript_projection_with_memory_mode(
             summary_messages.into_iter().cloned().collect(),
             self.compaction.tool_result_raw_max_chars,
+            self.turn_loop.tool_registry().memory_enabled(),
         );
+        if transcript_projection.full.is_empty() {
+            log::debug!(
+                target: "agent",
+                "active-turn compaction 跳过空有效投影: turn_id={turn_id} segments=[{summary_start_segment}, {summary_end_segment})"
+            );
+            return Ok(None);
+        }
         let source_hash = active_segments_hash(active_suffix, &segments[..summary_end_segment])?;
         Ok(Some(ActiveTurnPlan {
             summary_start_segment,
@@ -3317,12 +4085,13 @@ impl SessionEngine {
         segments: &[MessageRange],
         current_coverage: usize,
         tail_token_limit: usize,
+        protected_tail_tokens: usize,
     ) -> usize {
-        let anchor_tokens = active_suffix
-            .first()
-            .map(|message| estimate_session_turn_messages_tokens(std::slice::from_ref(message)))
-            .unwrap_or(0);
-        let mut remaining_raw_tail_budget = tail_token_limit.saturating_sub(anchor_tokens);
+        let anchor_end = crate::api::provider_anchor_end_index(active_suffix);
+        let anchor_tokens = estimate_session_turn_messages_tokens(&active_suffix[..anchor_end]);
+        let mut remaining_raw_tail_budget = tail_token_limit
+            .saturating_sub(anchor_tokens)
+            .saturating_sub(protected_tail_tokens);
         let mut preserve_start = segments.len();
         for segment_index in (current_coverage..segments.len()).rev() {
             let segment = &segments[segment_index];
@@ -3387,6 +4156,9 @@ impl SessionEngine {
             let mut state = metadata.compaction.clone().unwrap_or_else(|| {
                 SessionCompactionState::from_committed_summary(0, String::new(), Utc::now())
             });
+            // active-only compaction 本身就是允许替换历史的缓存断点。旧的精确 Provider
+            // 窗口已经包含当前 active suffix，不能再作为新投影前缀参与拼接。
+            state.provider_history = None;
             state.active_turn_summary = active_turn_summary;
             state.frontier.active_turn = active_turn_cursor;
             state.summary_updated_at = Utc::now();
@@ -3435,6 +4207,18 @@ impl SessionEngine {
             plan.committed_transcript.is_some(),
             plan.active_turn.is_some(),
         );
+        let active_turn_user_anchor = plan
+            .active_turn
+            .as_ref()
+            .and_then(|_| {
+                let anchor_end = crate::api::provider_anchor_end_index(active_suffix);
+                active_suffix[..anchor_end]
+                    .iter()
+                    .rev()
+                    .find(|message| message.model_context_snapshot().is_none())
+            })
+            .cloned()
+            .map(project_turn_message_for_safe_transcript);
         let summary_inputs = CompactionSummaryInputs {
             audit: CompactionAuditSummaryContext {
                 trigger: CompactionAuditTrigger::AutoPreflight,
@@ -3460,10 +4244,7 @@ impl SessionEngine {
                 .committed_transcript_with_tool_results_omitted
                 .as_deref(),
             prior_active_turn_summary: prior_active_summary.as_deref(),
-            active_turn_user_anchor: plan
-                .active_turn
-                .as_ref()
-                .and_then(|_| active_suffix.first()),
+            active_turn_user_anchor: active_turn_user_anchor.as_ref(),
             active_turn_start_segment: plan
                 .active_turn
                 .as_ref()
@@ -3497,11 +4278,18 @@ impl SessionEngine {
                         plan.ranges.recap_start_index, plan.ranges.recap_end_index
                     )
                 })?;
-            // Summary 先完成本地预算检查；超限时不能并发启动无效的 recap provider 请求。
-            let generated_compaction = self
-                .generate_compaction_summary(session, &summary_inputs, emit)
-                .await?;
-            let prepared_recap = match self.prepare_finalize_segment(recap_segment).await {
+            let prepared_summary = self.prepare_compaction_summary_request(&summary_inputs)?;
+            let (summary_result, recap_result) = tokio::join!(
+                self.generate_prepared_compaction_summary(
+                    session,
+                    &summary_inputs,
+                    prepared_summary,
+                    emit,
+                ),
+                self.prepare_finalize_segment(recap_segment, session.runtime_fallback_scope()),
+            );
+            let generated_compaction = summary_result?;
+            let prepared_recap = match recap_result {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     let audit_ids = vec![generated_compaction.audit_id.clone()];
@@ -3544,6 +4332,7 @@ impl SessionEngine {
             active_suffix,
             active_context,
             projection_budget,
+            plan.protected_active_tail_segments,
         );
         let preflight_projection = if self
             .ensure_provider_projection_within_hard_budget(
@@ -3613,6 +4402,7 @@ impl SessionEngine {
                         active_suffix,
                         active_context,
                         projection_budget,
+                        plan.protected_active_tail_segments,
                     );
                     let final_projection = self
                         .externalize_and_validate_preflight_projection(
@@ -3672,7 +4462,10 @@ impl SessionEngine {
         let recap_segment_hash = audit_try!(hash_session_segment(recap_segment));
         let (used_claim_ids, prepared_claims, prepared_disputes) = match prepared_recap {
             Some(prepared) => prepared,
-            None => audit_try!(self.prepare_finalize_segment(recap_segment).await),
+            None => audit_try!(
+                self.prepare_finalize_segment(recap_segment, session.runtime_fallback_scope())
+                    .await
+            ),
         };
         let trace_text = session_trace_text(recap_segment);
         let trace_created_at = Utc::now();
@@ -3800,10 +4593,39 @@ impl SessionEngine {
             }
             _ => false,
         };
-        if ranges.summary_end_index <= ranges.summary_start_index && !has_recoverable_checkpoint {
-            return Ok(ManualCompactionOutcome::Noop(compaction_noop_reason(
-                &metadata, &ranges,
-            )));
+        if !has_recoverable_checkpoint {
+            let summary_transcript_is_empty =
+                if ranges.summary_end_index > ranges.summary_start_index {
+                    let segment = session_messages
+                        .get(ranges.summary_start_index..ranges.summary_end_index)
+                        .with_context(|| {
+                            format!(
+                                "session compact summary 范围越界: [{}, {})",
+                                ranges.summary_start_index, ranges.summary_end_index
+                            )
+                        })?;
+                    session_compaction_transcript_projection_with_memory_mode(
+                        segment,
+                        self.compaction.tool_result_raw_max_chars,
+                        self.turn_loop.tool_registry().memory_enabled(),
+                    )
+                    .full
+                    .is_empty()
+                } else {
+                    true
+                };
+            if summary_transcript_is_empty {
+                log::debug!(
+                    target: "agent",
+                    "session {} manual compaction 跳过空有效投影: compact=[{}, {})",
+                    metadata.id,
+                    ranges.summary_start_index,
+                    ranges.summary_end_index
+                );
+                return Ok(ManualCompactionOutcome::Noop(compaction_noop_reason(
+                    &metadata, &ranges,
+                )));
+            }
         }
         emit(SessionEvent::StatusChanged {
             status: SessionRuntimeStatus::Compacting,
@@ -4005,10 +4827,12 @@ impl SessionEngine {
                 let (used_claim_ids, prepared_claims, prepared_disputes, summary, audit_ids) =
                     match (has_recap_work, has_summary_work) {
                         (true, true) => {
-                            let summary_transcript = session_compaction_transcript_projection(
-                                summary_segment,
-                                self.compaction.tool_result_raw_max_chars,
-                            );
+                            let summary_transcript =
+                                session_compaction_transcript_projection_with_memory_mode(
+                                    summary_segment,
+                                    self.compaction.tool_result_raw_max_chars,
+                                    self.turn_loop.tool_registry().memory_enabled(),
+                                );
                             let summary_inputs = CompactionSummaryInputs {
                                 audit: CompactionAuditSummaryContext {
                                     trigger: CompactionAuditTrigger::ManualCheckpoint,
@@ -4036,14 +4860,25 @@ impl SessionEngine {
                                 active_turn_transcript_with_tool_results_omitted: None,
                                 summary_max_chars: self.compaction.summary_max_chars,
                             };
-                            // Summary 先完成本地预算检查；超限时不能并发启动无效的 recap provider 请求。
-                            let generated_compaction = self
-                                .generate_compaction_summary(session, &summary_inputs, emit)
-                                .await?;
+                            let prepared_summary =
+                                self.prepare_compaction_summary_request(&summary_inputs)?;
+                            let (summary_result, recap_result) = tokio::join!(
+                                self.generate_prepared_compaction_summary(
+                                    session,
+                                    &summary_inputs,
+                                    prepared_summary,
+                                    emit,
+                                ),
+                                self.prepare_finalize_segment(
+                                    recap_segment,
+                                    session.runtime_fallback_scope(),
+                                ),
+                            );
+                            let generated_compaction = summary_result?;
                             generated_audit_ids.push(generated_compaction.audit_id.clone());
                             let compaction = generated_compaction.outcome;
                             let (used_claim_ids, prepared_claims, prepared_disputes) =
-                                audit_try!(self.prepare_finalize_segment(recap_segment).await);
+                                audit_try!(recap_result);
                             let summary = audit_try!(validate_compaction_summary_text(
                                 audit_try!(compaction.committed_summary.with_context(|| {
                                     "compaction summary missing committed_summary"
@@ -4060,8 +4895,12 @@ impl SessionEngine {
                             )
                         }
                         (true, false) => {
-                            let (used_claim_ids, prepared_claims, prepared_disputes) =
-                                self.prepare_finalize_segment(recap_segment).await?;
+                            let (used_claim_ids, prepared_claims, prepared_disputes) = self
+                                .prepare_finalize_segment(
+                                    recap_segment,
+                                    session.runtime_fallback_scope(),
+                                )
+                                .await?;
                             let summary = metadata
                                 .compaction
                                 .as_ref()
@@ -4076,10 +4915,12 @@ impl SessionEngine {
                             )
                         }
                         (false, true) => {
-                            let summary_transcript = session_compaction_transcript_projection(
-                                summary_segment,
-                                self.compaction.tool_result_raw_max_chars,
-                            );
+                            let summary_transcript =
+                                session_compaction_transcript_projection_with_memory_mode(
+                                    summary_segment,
+                                    self.compaction.tool_result_raw_max_chars,
+                                    self.turn_loop.tool_registry().memory_enabled(),
+                                );
                             let summary_inputs = CompactionSummaryInputs {
                                 audit: CompactionAuditSummaryContext {
                                     trigger: CompactionAuditTrigger::ManualCheckpoint,
@@ -4203,7 +5044,7 @@ impl SessionEngine {
             })?;
         let report = self
             .apply_prepared_finalize_batch(
-                recap_segment,
+                finalize::FinalizeTraceInput::Messages(recap_segment),
                 checkpoint.used_claim_ids.clone(),
                 checkpoint.prepared_claims.clone(),
                 checkpoint.prepared_disputes.clone(),
@@ -4413,12 +5254,44 @@ impl SessionEngine {
     where
         F: FnMut(SessionEvent),
     {
+        let prepared = self.prepare_compaction_summary_request(inputs)?;
+        self.generate_prepared_compaction_summary(session, inputs, prepared, emit)
+            .await
+    }
+
+    /// 构造并验证压缩摘要请求，但不进行 provider 调用。
+    ///
+    /// 该阶段必须在 recap 前完成，避免 compact 已确定无法执行时仍消耗一次
+    /// recap 模型调用。通过后调用方可安全地并发执行摘要与 recap。
+    fn prepare_compaction_summary_request(
+        &self,
+        inputs: &CompactionSummaryInputs<'_>,
+    ) -> anyhow::Result<PreparedCompactionSummaryRequest> {
+        if inputs
+            .committed_transcript
+            .is_some_and(<[TurnMessage]>::is_empty)
+        {
+            anyhow::bail!("compaction committed transcript must not be an empty collection");
+        }
+        if inputs
+            .active_turn_transcript
+            .is_some_and(<[TurnMessage]>::is_empty)
+        {
+            anyhow::bail!("compaction active-turn transcript must not be an empty collection");
+        }
+        if inputs.committed_transcript.is_none() && inputs.active_turn_transcript.is_none() {
+            anyhow::bail!("compaction summary request requires at least one non-empty transcript");
+        }
         let system_prompt = self
             .prompt_registry
             .render(
                 PROMPT_SESSION_COMPACTION,
                 serde_json::json!({
                     "summary_max_chars": inputs.summary_max_chars,
+                    "file_edit_authority_enabled": self
+                        .turn_loop
+                        .tool_registry()
+                        .file_edit_authority_enabled(),
                 }),
             )
             .context("渲染 session_compaction prompt 失败")?;
@@ -4482,7 +5355,28 @@ impl SessionEngine {
                 }
             }
         }
-        let payload_preview = audit_text_preview(&user_text, COMPACTION_AUDIT_PREVIEW_CHARS);
+        Ok(PreparedCompactionSummaryRequest {
+            system_prompt,
+            provider_messages,
+            payload_preview: audit_text_preview(&user_text, COMPACTION_AUDIT_PREVIEW_CHARS),
+        })
+    }
+
+    async fn generate_prepared_compaction_summary<F>(
+        &self,
+        session: &SessionHandle,
+        inputs: &CompactionSummaryInputs<'_>,
+        prepared: PreparedCompactionSummaryRequest,
+        emit: &mut F,
+    ) -> anyhow::Result<GeneratedCompactionSummary>
+    where
+        F: FnMut(SessionEvent),
+    {
+        let PreparedCompactionSummaryRequest {
+            system_prompt,
+            provider_messages,
+            payload_preview,
+        } = prepared;
         let audit_id = compaction_audit_id(session, &inputs.audit, &payload_preview.hash);
         self.append_compaction_audit_event(
             session,
@@ -4504,15 +5398,24 @@ impl SessionEngine {
         let result = self
             .json_caller
             .generate_json_validated_with_guarded_attempts(
-                StructuredJsonAttemptRequest::compaction(system_prompt, provider_messages),
+                StructuredJsonAttemptRequest::compaction_streaming(
+                    system_prompt,
+                    provider_messages,
+                    crate::api::BufferedProviderRuntime::new(session.runtime_fallback_scope()),
+                ),
                 |value| parse_compaction_summary_outcome(value, inputs),
                 |retry_index, retry_total, e| {
                     let message = format!(
-                        "compaction summary JSON invalid, retrying ({retry_index}/{retry_total}): {e:#}"
+                        "compaction summary output invalid, retrying ({retry_index}/{retry_total}): {e:#}"
                     );
-                    emit(SessionEvent::Warning {
-                        message: message.clone(),
-                    });
+                    // reasoning-only / no-consumable 属于可自动恢复的 provider
+                    // 业务重试：保留日志与 compaction audit，只在最终失败时
+                    // 向 TUI 报错，避免成功恢复后仍留下误导性 Warning。
+                    if should_emit_compaction_retry_warning(e) {
+                        emit(SessionEvent::Warning {
+                            message: message.clone(),
+                        });
+                    }
                     retry_warnings.push(message);
                 },
                 |attempt| {
@@ -4562,6 +5465,10 @@ impl SessionEngine {
             }
         }
     }
+}
+
+fn should_emit_compaction_retry_warning(error: &anyhow::Error) -> bool {
+    crate::api::structured_json_no_consumable_transport(error).is_none()
 }
 
 fn compaction_noop_reason(
@@ -4644,9 +5551,45 @@ fn agent_home_from_session_dir(session_dir: &std::path::Path) -> Option<std::pat
 
 #[derive(Serialize)]
 struct DelegationProjectionPayload {
-    subagents: Vec<DelegationSummary>,
+    subagents: Vec<DelegationContextSummary>,
     omitted: usize,
     note: &'static str,
+}
+
+#[derive(Serialize)]
+struct DelegationContextSummary {
+    id: DelegationId,
+    title: String,
+    role: String,
+    status: DelegationStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_ref: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    changed_files: Vec<String>,
+}
+
+impl From<DelegationSummary> for DelegationContextSummary {
+    fn from(summary: DelegationSummary) -> Self {
+        let terminal_summary = summary
+            .status
+            .is_terminal()
+            .then_some(summary.progress_summary)
+            .flatten();
+        Self {
+            id: summary.id,
+            title: summary.title,
+            role: summary.role,
+            status: summary.status,
+            terminal_summary,
+            error_summary: summary.error_summary,
+            result_ref: summary.result_ref,
+            changed_files: summary.changed_files,
+        }
+    }
 }
 
 async fn delegation_summary_projection(session_dir: &Path) -> anyhow::Result<Option<String>> {
@@ -4654,7 +5597,11 @@ async fn delegation_summary_projection(session_dir: &Path) -> anyhow::Result<Opt
         .list_page(DELEGATION_PROJECTION_MAX_ITEMS)
         .await
         .context("读取 subagent summary projection 失败")?;
-    let summaries = page.summaries;
+    let summaries = page
+        .summaries
+        .into_iter()
+        .map(DelegationContextSummary::from)
+        .collect::<Vec<_>>();
     if summaries.is_empty() {
         return Ok(None);
     }
@@ -4668,7 +5615,7 @@ async fn delegation_summary_projection(session_dir: &Path) -> anyhow::Result<Opt
     let mut payload = DelegationProjectionPayload {
         subagents: summaries,
         omitted,
-        note: "Runtime-only bounded projection. Use list_subagents/read_subagent for explicit details. Full subagent transcript and event logs are intentionally omitted.",
+        note: "Authoritative bounded collaboration state. Use list_subagents/read_subagent for explicit progress. Full subagent transcript, ordinary progress, and event logs are intentionally omitted.",
     };
     let mut json = serde_json::to_string_pretty(&payload)?;
     while json.chars().count() > json_budget && payload.subagents.len() > 1 {
@@ -4681,10 +5628,22 @@ async fn delegation_summary_projection(session_dir: &Path) -> anyhow::Result<Opt
         let dropped = payload.subagents.len();
         payload.subagents.clear();
         payload.omitted = payload.omitted.saturating_add(dropped);
-        payload.note = "Runtime-only bounded projection exceeded the hard budget; subagent details omitted. Use list_subagents/read_subagent for explicit details.";
+        payload.note = "Authoritative collaboration snapshot exceeded the hard budget; subagent details omitted. Use list_subagents/read_subagent for explicit details.";
         json = serde_json::to_string_pretty(&payload)?;
     }
     Ok(Some(format!("{start_tag}{json}{end_tag}")))
+}
+
+fn empty_delegation_summary_projection() -> anyhow::Result<String> {
+    let payload = DelegationProjectionPayload {
+        subagents: Vec::new(),
+        omitted: 0,
+        note: "Authoritative bounded collaboration state. No subagents are currently registered. Use list_subagents/read_subagent for explicit details.",
+    };
+    Ok(format!(
+        "<subagent_summary_projection>\n{}\n</subagent_summary_projection>",
+        serde_json::to_string_pretty(&payload)?
+    ))
 }
 
 fn next_turn_journal_turn_id(projection: &crate::session::TurnJournalProjection) -> String {
@@ -4709,6 +5668,49 @@ fn recovery_turn_chain<'a>(
         })
         .map(|(_, turn)| turn)
         .collect()
+}
+
+fn recovered_model_context(turns: &[&TurnJournalTurn]) -> Vec<CompletedSessionTurnMessage> {
+    let mut snapshots = Vec::new();
+    for turn in turns {
+        let common_prefix = snapshots
+            .iter()
+            .zip(&turn.model_context)
+            .take_while(|(left, right)| same_model_context_snapshot(left, right))
+            .count();
+        if common_prefix == snapshots.len().min(turn.model_context.len()) {
+            snapshots.extend(turn.model_context.iter().skip(common_prefix).cloned());
+        } else {
+            // 新 turn 正常会先重放此前完整 context 链，再记录本轮增量。若 journal
+            // 损坏或来自旧实现而不满足此前缀关系，宁可保留其完整顺序，也不能猜测
+            // 某个同 fingerprint 的非相邻状态是重复项。
+            snapshots.extend(turn.model_context.iter().cloned());
+        }
+    }
+    snapshots
+        .into_iter()
+        .map(|snapshot| {
+            CompletedSessionTurnMessage::new(
+                SessionTurnMessage {
+                    role: "user".into(),
+                    content: vec![SessionTurnContentBlock::ModelContext {
+                        source: snapshot.source,
+                        fingerprint: snapshot.fingerprint.clone(),
+                        text: snapshot.text.clone(),
+                    }],
+                    provider_replay: None,
+                },
+                snapshot.appended_at,
+            )
+        })
+        .collect()
+}
+
+fn same_model_context_snapshot(
+    left: &crate::session::TurnJournalModelContext,
+    right: &crate::session::TurnJournalModelContext,
+) -> bool {
+    left.source == right.source && left.fingerprint == right.fingerprint && left.text == right.text
 }
 
 fn user_text_with_recovery_context(user_text: String, recovery_context: Option<&str>) -> String {
@@ -4785,6 +5787,10 @@ fn last_real_user_message(messages: &[SessionMessage]) -> Option<(usize, &Sessio
         .rev()
         .find(|(_, message)| {
             message.role == SessionMessageRole::User
+                && !message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, SessionContentBlock::ModelContext { .. }))
                 && message.content.iter().any(|block| {
                     matches!(block, SessionContentBlock::Text { text } if !text.starts_with("<user_shell_command>"))
                 })
@@ -4801,6 +5807,7 @@ fn assistant_text_after(messages: &[SessionMessage], user_index: usize) -> Strin
         .skip(user_index.saturating_add(1))
         .take_while(|message| {
             message.role == SessionMessageRole::Assistant
+                || is_independent_model_context_message(message)
                 || message
                     .content
                     .iter()
@@ -4813,6 +5820,15 @@ fn assistant_text_after(messages: &[SessionMessage], user_index: usize) -> Strin
         .join("\n")
 }
 
+fn is_independent_model_context_message(message: &SessionMessage) -> bool {
+    message.role == SessionMessageRole::User
+        && !message.content.is_empty()
+        && message
+            .content
+            .iter()
+            .all(|block| matches!(block, SessionContentBlock::ModelContext { .. }))
+}
+
 fn canonical_user_request_text(text: &str) -> Cow<'_, str> {
     extract_current_user_request(text).unwrap_or(Cow::Borrowed(text))
 }
@@ -4820,7 +5836,8 @@ fn canonical_user_request_text(text: &str) -> Cow<'_, str> {
 fn first_text_session_content(blocks: &[SessionContentBlock]) -> Option<&str> {
     blocks.iter().find_map(|block| match block {
         SessionContentBlock::Text { text } => Some(text.as_str()),
-        SessionContentBlock::SkillInstructions { .. } => None,
+        SessionContentBlock::SkillInstructions { .. }
+        | SessionContentBlock::ModelContext { .. } => None,
         SessionContentBlock::Image { .. }
         | SessionContentBlock::Document { .. }
         | SessionContentBlock::ToolUse { .. }

@@ -1,7 +1,7 @@
 [package]
 name = "agent-claim-network"
 # ACN 产品版本的唯一来源；展示、锁文件与发布 tag 由版本一致性检查约束。
-version = "0.2.1"
+version = "0.2.4"
 description = "A terminal agent and claim-based knowledge collaboration system"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
@@ -50,16 +50,23 @@ reqwest = { version = "0.12", default-features = false, features = [
     "stream",
     "system-proxy",
 ] }
+reqwest-websocket = "0.5"
+# rmcp 3 使用独立的 reqwest 0.13；显式统一 system-proxy，避免 OAuth 绕过系统代理。
+reqwest_013 = { package = "reqwest", version = "0.13", default-features = false, features = ["system-proxy"] }
 sse-stream = "0.2.3"
 axum = "0.8"
-rmcp = { version = "0.15.0", default-features = false, features = [
+rmcp = { version = "=3.1.2", default-features = false, features = [
+    "auth",
     "client",
     "macros",
+    "reqwest",
     "schemars",
     "server",
     "transport-child-process",
     "transport-streamable-http-client-reqwest",
 ] }
+keyring = "4"
+oauth2 = { version = "5", default-features = false }
 
 chrono = { version = "0.4", features = ["serde"] }
 iana-time-zone = "0.1"
@@ -98,5 +105,6 @@ mac-notification-sys = "0.6.15"
 rusttype = "0.9"
 
 [dev-dependencies]
+axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tower = "0.5"

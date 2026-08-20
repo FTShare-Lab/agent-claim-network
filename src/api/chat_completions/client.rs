@@ -6,6 +6,7 @@ use rand::Rng;
 
 use crate::api::endpoint::{resolve_llm_endpoint, LlmEndpointKind};
 use crate::api::llm_http::{read_llm_error_body, LlmHttpError, LlmHttpPhase};
+use crate::api::ProviderRecoveryInterrupt;
 
 use super::protocol::{ChatCompletionRequest, ChatCompletionResponse};
 use super::streaming::{drain_sse_frames, sse_frame_data, ChatStreamAccumulator};
@@ -29,6 +30,12 @@ pub enum ChatCompletionsError {
     InvalidEndpoint(String),
     #[error("Chat Completions 输出不符合预期: {reason}; raw={raw}")]
     OutputShape { reason: String, raw: String },
+    #[error("Chat Completions streaming 响应损坏或未完整结束: {reason}")]
+    StreamFailure { reason: String, raw: String },
+    #[error("Chat Completions recovery interrupted")]
+    RecoveryInterrupted,
+    #[error("Chat Completions request preparation failed: {reason}")]
+    RequestPreparation { reason: String },
 }
 
 pub struct ChatCompletionsClient {
@@ -50,7 +57,9 @@ impl ChatCompletionsClient {
         retry_base_delay: Duration,
         retry_max_delay: Duration,
     ) -> Result<Self, ChatCompletionsError> {
-        let http = reqwest::Client::builder()
+        let endpoint = resolve_llm_endpoint(&endpoint, LlmEndpointKind::OpenAiChatCompletions)
+            .map_err(|error| ChatCompletionsError::InvalidEndpoint(error.to_string()))?;
+        let http = crate::http_client_builder_for_endpoint(&endpoint)
             .timeout(timeout)
             .build()
             .map_err(|error| {
@@ -62,10 +71,7 @@ impl ChatCompletionsClient {
             })?;
         Ok(Self {
             http,
-            endpoint: Arc::new(
-                resolve_llm_endpoint(&endpoint, LlmEndpointKind::OpenAiChatCompletions)
-                    .map_err(|error| ChatCompletionsError::InvalidEndpoint(error.to_string()))?,
-            ),
+            endpoint: Arc::new(endpoint),
             api_key: Arc::new(api_key),
             retry_count,
             retry_base_delay,
@@ -101,11 +107,73 @@ impl ChatCompletionsClient {
         retry_count: u32,
         emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
     ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
+        self.send_with_retry_count_and_mode(request, retry_count, false, emit)
+            .await
+    }
+
+    pub(crate) async fn send_with_retry_count_and_mode(
+        &self,
+        request: &ChatCompletionRequest,
+        retry_count: u32,
+        retry_after_partial: bool,
+        emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
+    ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
+        self.send_with_retry_count_and_mode_and_interrupt(
+            request,
+            retry_count,
+            retry_after_partial,
+            None,
+            emit,
+        )
+        .await
+    }
+
+    pub(crate) async fn send_with_retry_count_and_mode_and_interrupt(
+        &self,
+        request: &ChatCompletionRequest,
+        retry_count: u32,
+        retry_after_partial: bool,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+        emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
+    ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
+        let mut noop = || Ok(());
+        self.send_with_retry_count_and_mode_and_interrupt_and_start_hook(
+            request,
+            retry_count,
+            retry_after_partial,
+            recovery_interrupt,
+            emit,
+            &mut noop,
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "请求发送边界需同时携带 retry、恢复中断与 WAL start hook"
+    )]
+    pub(crate) async fn send_with_retry_count_and_mode_and_interrupt_and_start_hook(
+        &self,
+        request: &ChatCompletionRequest,
+        retry_count: u32,
+        retry_after_partial: bool,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+        emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
+        request_started: &mut (dyn FnMut() -> Result<(), ChatCompletionsError> + Send),
+    ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
         if request.stream {
-            self.send_streaming_with_retry(request, retry_count, emit)
-                .await
+            self.send_streaming_with_retry(
+                request,
+                retry_count,
+                retry_after_partial,
+                recovery_interrupt,
+                emit,
+                request_started,
+            )
+            .await
         } else {
-            self.send_json_with_retry(request, retry_count).await
+            self.send_json_with_retry(request, retry_count, recovery_interrupt, request_started)
+                .await
         }
     }
 
@@ -113,10 +181,13 @@ impl ChatCompletionsClient {
         &self,
         request: &ChatCompletionRequest,
         retry_count: u32,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+        request_started: &mut (dyn FnMut() -> Result<(), ChatCompletionsError> + Send),
     ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
         let mut last_retryable = None;
         for attempt in 0..=retry_count {
-            match self.send_json_once(request).await {
+            ensure_recovery_active(recovery_interrupt)?;
+            match self.send_json_once(request, request_started).await {
                 Ok(value) => return Ok(value),
                 Err(e) if is_retryable(&e) && attempt < retry_count => {
                     let backoff =
@@ -130,7 +201,7 @@ impl ChatCompletionsClient {
                         e
                     );
                     last_retryable = Some(e);
-                    tokio::time::sleep(backoff).await;
+                    wait_for_backoff(backoff, recovery_interrupt).await?;
                 }
                 Err(e) => return Err(e),
             }
@@ -146,13 +217,16 @@ impl ChatCompletionsClient {
     async fn send_json_once(
         &self,
         request: &ChatCompletionRequest,
+        request_started: &mut (dyn FnMut() -> Result<(), ChatCompletionsError> + Send),
     ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
-        let resp = self
+        let pending = self
             .http
             .post(self.endpoint.as_str())
             .bearer_auth(self.api_key.as_str())
             .header("content-type", "application/json")
-            .json(request)
+            .json(request);
+        request_started()?;
+        let resp = pending
             .send()
             .await
             .map_err(|error| self.http_error(error, LlmHttpPhase::SendRequest))?;
@@ -163,21 +237,30 @@ impl ChatCompletionsClient {
         &self,
         request: &ChatCompletionRequest,
         retry_count: u32,
+        retry_after_partial: bool,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
+        request_started: &mut (dyn FnMut() -> Result<(), ChatCompletionsError> + Send),
     ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
         let mut last_retryable = None;
         for attempt in 0..=retry_count {
+            ensure_recovery_active(recovery_interrupt)?;
             let mut emitted = false;
             let result = {
                 let mut tracking_emit = |event| {
                     emitted = true;
                     emit(event);
                 };
-                self.send_streaming_once(request, &mut tracking_emit).await
+                self.send_streaming_once(request, &mut tracking_emit, request_started)
+                    .await
             };
             match result {
                 Ok(value) => return Ok(value),
-                Err(e) if !emitted && is_retryable(&e) && attempt < retry_count => {
+                Err(e)
+                    if (!emitted || retry_after_partial)
+                        && is_retryable(&e)
+                        && attempt < retry_count =>
+                {
                     let backoff =
                         compute_backoff(attempt, self.retry_base_delay, self.retry_max_delay);
                     log::warn!(
@@ -189,7 +272,7 @@ impl ChatCompletionsClient {
                         e
                     );
                     last_retryable = Some(e);
-                    tokio::time::sleep(backoff).await;
+                    wait_for_backoff(backoff, recovery_interrupt).await?;
                 }
                 Err(e) => return Err(e),
             }
@@ -206,14 +289,17 @@ impl ChatCompletionsClient {
         &self,
         request: &ChatCompletionRequest,
         emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
+        request_started: &mut (dyn FnMut() -> Result<(), ChatCompletionsError> + Send),
     ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
-        let resp = self
+        let pending = self
             .http
             .post(self.endpoint.as_str())
             .bearer_auth(self.api_key.as_str())
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
-            .json(request)
+            .json(request);
+        request_started()?;
+        let resp = pending
             .send()
             .await
             .map_err(|error| self.http_error(error, LlmHttpPhase::SendRequest))?;
@@ -234,8 +320,12 @@ impl ChatCompletionsClient {
         let mut accumulator = ChatStreamAccumulator::default();
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|error| self.http_error(error, LlmHttpPhase::ReadStreamBody))?;
+            let chunk = chunk.map_err(|error| ChatCompletionsError::StreamFailure {
+                reason: self
+                    .http_error(error, LlmHttpPhase::ReadStreamBody)
+                    .to_string(),
+                raw: String::new(),
+            })?;
             sse_buffer.extend_from_slice(&chunk);
             for frame in drain_sse_frames(&mut sse_buffer) {
                 if let Some(data) = sse_frame_data(&frame)? {
@@ -282,11 +372,50 @@ fn is_retryable(error: &ChatCompletionsError) -> bool {
     match error {
         ChatCompletionsError::Http(error) => error.is_retryable(),
         ChatCompletionsError::Status { status, .. } => *status == 429 || *status >= 500,
+        ChatCompletionsError::StreamFailure { .. } => true,
         ChatCompletionsError::Auth(_)
         | ChatCompletionsError::ResponseJson(_)
         | ChatCompletionsError::InvalidEndpoint(_)
-        | ChatCompletionsError::OutputShape { .. } => false,
+        | ChatCompletionsError::OutputShape { .. }
+        | ChatCompletionsError::RecoveryInterrupted
+        | ChatCompletionsError::RequestPreparation { .. } => false,
     }
+}
+
+fn ensure_recovery_active(
+    recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+) -> Result<(), ChatCompletionsError> {
+    if recovery_interrupt.is_some_and(ProviderRecoveryInterrupt::is_cancelled) {
+        return Err(ChatCompletionsError::RecoveryInterrupted);
+    }
+    Ok(())
+}
+
+async fn wait_for_backoff(
+    delay: Duration,
+    recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+) -> Result<(), ChatCompletionsError> {
+    if delay.is_zero() {
+        return ensure_recovery_active(recovery_interrupt);
+    }
+    match recovery_interrupt {
+        Some(interrupt) => {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => Ok(()),
+                _ = interrupt.cancelled() => Err(ChatCompletionsError::RecoveryInterrupted),
+            }
+        }
+        None => {
+            tokio::time::sleep(delay).await;
+            Ok(())
+        }
+    }
+}
+
+pub(crate) fn is_stream_failure(error: &ChatCompletionsError) -> bool {
+    matches!(error, ChatCompletionsError::StreamFailure { .. })
+        || matches!(error, ChatCompletionsError::Http(error) if error.is_retryable())
+        || matches!(error, ChatCompletionsError::Status { status, .. } if *status == 429 || *status >= 500)
 }
 
 fn compute_backoff(attempt: u32, base: Duration, max: Duration) -> Duration {
@@ -361,6 +490,47 @@ mod tests {
             Some("hello")
         );
         assert!(response.choices[0].message.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovery_interrupt_stops_chat_retry_backoff_and_future_attempts() {
+        let interrupt = ProviderRecoveryInterrupt::new();
+        let cancel = interrupt.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel.cancel();
+        });
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_backoff(Duration::from_secs(60), Some(&interrupt)),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+
+        assert!(matches!(error, ChatCompletionsError::RecoveryInterrupted));
+    }
+
+    #[tokio::test]
+    async fn cancelled_recovery_does_not_start_chat_transport() {
+        let interrupt = ProviderRecoveryInterrupt::new();
+        interrupt.cancel();
+        let client = test_client("http://127.0.0.1:9".into());
+
+        for stream in [false, true] {
+            let error = client
+                .send_with_retry_count_and_mode_and_interrupt(
+                    &request(stream),
+                    1,
+                    false,
+                    Some(&interrupt),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ChatCompletionsError::RecoveryInterrupted));
+        }
     }
 
     #[tokio::test]
@@ -491,6 +661,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_completions_retries_malformed_sse_json_before_visible_text() {
+        let success = sse_response(vec![json!({
+            "choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]
+        })]);
+        let (endpoint, requests) =
+            spawn_body_sequence(vec!["data: {broken-json}\n\n".into(), success]).await;
+        let client = ChatCompletionsClient::new(
+            endpoint,
+            "test-key".into(),
+            Duration::from_secs(5),
+            1,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        let response = client.send(&request(true), &mut |_| {}).await.unwrap();
+
+        assert_eq!(response.choices[0].message.content.as_deref(), Some("ok"));
+        assert_eq!(requests.await.unwrap(), 2);
+    }
+
+    #[tokio::test]
     async fn chat_completions_timeout_error_names_llm_timeout() {
         let endpoint = spawn_hanging_server().await;
         let client = ChatCompletionsClient::new(
@@ -551,6 +744,7 @@ mod tests {
             stream,
             stream_options: None,
             temperature: None,
+            top_p: None,
         }
     }
 
@@ -599,6 +793,49 @@ mod tests {
             socket.write_all(response.as_bytes()).await.unwrap();
         });
         format!("http://{addr}")
+    }
+
+    async fn spawn_body_sequence(bodies: Vec<String>) -> (String, tokio::task::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expected = bodies.len();
+        let handle = tokio::spawn(async move {
+            for body in bodies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end + 4]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            expected
+        });
+        (format!("http://{addr}"), handle)
     }
 
     async fn spawn_server(

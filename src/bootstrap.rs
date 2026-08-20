@@ -23,8 +23,8 @@ use crate::agent::{
 };
 use crate::api::{
     build_embedding_client, AgentTurnLoop, AnthropicProviderAdapter, MemoryReviewLoop,
-    OpenAiCompatibleChatProviderAdapter, ProviderAdapter, StructuredJsonCaller,
-    MEMORY_REVIEW_MAX_TOOL_LOOP_TURNS,
+    OpenAiCompatibleChatProviderAdapter, OpenAiCompatibleResponsesProviderAdapter, ProviderAdapter,
+    StructuredJsonCaller, MEMORY_REVIEW_MAX_TOOL_LOOP_TURNS,
 };
 use crate::attachment::AttachmentLimits;
 use crate::claim::AgentId;
@@ -52,6 +52,7 @@ use crate::tool::ToolRegistry;
 
 const ROUTER_VECTOR_WORKER_TASK_NAME: &str = "router_vector_worker";
 const ROUTER_REFRESH_WORKER_TASK_NAME: &str = "router_refresh_worker";
+const MAINTAINER_LLM_WEBSOCKET_CAPACITY: usize = 1;
 const REQUIRED_SESSION_PROMPTS: &[&str] = &[
     "agent_system",
     "inbox_policy_update_internalize",
@@ -140,6 +141,7 @@ pub fn build_agent_cli_session_engine_with_mcp(
         .with_process_id_attempts(cfg.agent.session.id_mint_max_attempts())
         .with_process_owner_agent_id(context.agent_id.clone())
         .with_memory_store(context.memory_store.clone())
+        .with_memory_enabled(cfg.agent.memory.enabled)
         .with_session_search(session_search)
         .with_attachment_limits(attachment_limits);
     if let Some(router) = context.router.clone() {
@@ -212,6 +214,9 @@ pub fn build_agent_cli_session_engine_with_mcp(
         memory_review_tool_registry,
         MEMORY_REVIEW_MAX_TOOL_LOOP_TURNS,
         chat.max_tokens,
+        chat.retry_count,
+        Duration::from_millis(chat.retry_base_delay_ms),
+        Duration::from_millis(chat.retry_max_delay_ms),
     ));
     let mut engine = SessionEngine::new(
         runner,
@@ -235,6 +240,7 @@ pub fn build_agent_cli_session_engine_with_mcp(
     .with_session_search_sqlite_busy_timeout(std::time::Duration::from_millis(
         cfg.agent.tool.session_search_sqlite_busy_timeout_ms,
     ))
+    .with_fork_memory_review(cfg.agent.session.memory_review.enabled)
     .with_fork_memory_review_interval_turns(cfg.agent.session.memory_review.interval_turns)
     .with_attachment_config(cfg.agent.attachment.clone());
     if let Some(mcp_manager) = engine_mcp_manager {
@@ -261,12 +267,17 @@ pub async fn build_refreshed_mcp_manager(cfg: &Config) -> Arc<McpConnectionManag
 }
 
 pub(crate) fn build_provider_adapter(cfg: &Config) -> anyhow::Result<Arc<dyn ProviderAdapter>> {
-    build_provider_adapter_for(&cfg.agent.llm, "agent.llm")
+    build_provider_adapter_for(
+        &cfg.agent.llm,
+        "agent.llm",
+        cfg.agent.session.subagents.max_concurrent.saturating_add(3),
+    )
 }
 
 fn build_provider_adapter_for(
     chat: &LlmChatConfig,
     config_path: &str,
+    responses_websocket_capacity: usize,
 ) -> anyhow::Result<Arc<dyn ProviderAdapter>> {
     match chat.provider {
         LlmProvider::Anthropic => {
@@ -285,10 +296,15 @@ fn build_provider_adapter_for(
                     Duration::from_millis(chat.retry_base_delay_ms),
                     Duration::from_millis(chat.retry_max_delay_ms),
                 )?
-                .with_reasoning_effort(chat.reasoning_effort),
+                .with_reasoning_effort(chat.reasoning_effort)
+                .with_sampling_parameters(chat.temperature, chat.top_p)
+                .with_thinking(
+                    chat.anthropic_thinking,
+                    chat.anthropic_thinking_budget_tokens,
+                ),
             ))
         }
-        LlmProvider::OpenAiCompatibleChat => {
+        LlmProvider::OpenAiChat => {
             let key = chat
                 .api_key
                 .clone()
@@ -303,8 +319,28 @@ fn build_provider_adapter_for(
                     Duration::from_millis(chat.retry_base_delay_ms),
                     Duration::from_millis(chat.retry_max_delay_ms),
                 )?
-                .with_reasoning_effort(chat.reasoning_effort),
+                .with_reasoning_effort(chat.reasoning_effort)
+                .with_sampling_parameters(chat.temperature, chat.top_p),
             ))
+        }
+        LlmProvider::OpenAiResponses => {
+            let key = chat
+                .api_key
+                .clone()
+                .with_context(|| missing_loaded_api_key_message(chat, config_path))?;
+            let adapter = OpenAiCompatibleResponsesProviderAdapter::new(
+                key,
+                chat.endpoint.clone(),
+                chat.model.clone(),
+                Duration::from_secs(chat.timeout_secs),
+                chat.retry_count,
+                Duration::from_millis(chat.retry_base_delay_ms),
+                Duration::from_millis(chat.retry_max_delay_ms),
+            )?
+            .with_reasoning_effort(chat.reasoning_effort)
+            .with_sampling_parameters(chat.temperature, chat.top_p)
+            .with_websockets(chat.supports_websockets, responses_websocket_capacity)?;
+            Ok(Arc::new(adapter))
         }
     }
 }
@@ -395,7 +431,8 @@ pub fn build_maintainer_arbitration_service(
         .llm
         .as_ref()
         .context("maintainer arbitration 已启用，但缺少 [maintainer.llm]")?;
-    let provider = build_provider_adapter_for(llm, "maintainer.llm")?;
+    let provider =
+        build_provider_adapter_for(llm, "maintainer.llm", MAINTAINER_LLM_WEBSOCKET_CAPACITY)?;
     let caller = Arc::new(StructuredJsonCaller::new(
         provider,
         llm.max_tokens,
@@ -692,6 +729,11 @@ mod tests {
                     endpoint: "http://127.0.0.1:1".into(),
                     model: "test-model".into(),
                     reasoning_effort: crate::config::ReasoningEffort::None,
+                    anthropic_thinking: crate::config::AnthropicThinking::Auto,
+                    anthropic_thinking_budget_tokens: None,
+                    supports_websockets: false,
+                    temperature: None,
+                    top_p: None,
                     api_key_env: "ANTHROPIC_API_KEY".into(),
                     max_tokens: 1024,
                     context_window: crate::config::DEFAULT_LLM_CONTEXT_WINDOW,
@@ -775,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_compatible_chat_provider_builds_http_cli_session_engine() {
+    fn openai_chat_provider_builds_http_cli_session_engine() {
         let team = tempfile::tempdir().unwrap();
         let hosts = tempfile::tempdir().unwrap();
         let prompts = tempfile::tempdir().unwrap();
@@ -785,11 +827,34 @@ mod tests {
             hosts.path().to_path_buf(),
             prompts.path().to_path_buf(),
         );
-        c.agent.llm.provider = LlmProvider::OpenAiCompatibleChat;
+        c.agent.llm.provider = LlmProvider::OpenAiChat;
         c.agent.llm.api_key_env = "EXAMPLE_LLM_API_KEY".into();
         c.agent.llm.api_key = Some("test-key".into());
         c.agent.llm.endpoint = "http://127.0.0.1:1".into();
         c.agent.llm.model = "test-chat-model".into();
+
+        let upstream = c.resolve_upstream(None).unwrap();
+        let engine = build_agent_cli_session_engine(&c, &upstream);
+
+        assert!(engine.is_ok());
+    }
+
+    #[test]
+    fn openai_responses_provider_builds_http_cli_session_engine() {
+        let team = tempfile::tempdir().unwrap();
+        let hosts = tempfile::tempdir().unwrap();
+        let prompts = tempfile::tempdir().unwrap();
+        write_session_prompts(prompts.path());
+        let mut c = cfg(
+            team.path().to_path_buf(),
+            hosts.path().to_path_buf(),
+            prompts.path().to_path_buf(),
+        );
+        c.agent.llm.provider = LlmProvider::OpenAiResponses;
+        c.agent.llm.api_key_env = "EXAMPLE_LLM_API_KEY".into();
+        c.agent.llm.api_key = Some("test-key".into());
+        c.agent.llm.endpoint = "http://127.0.0.1:1/v1".into();
+        c.agent.llm.model = "test-responses-model".into();
 
         let upstream = c.resolve_upstream(None).unwrap();
         let engine = build_agent_cli_session_engine(&c, &upstream);
@@ -811,10 +876,8 @@ mod tests {
 
         for (provider, expected_error) in [
             (LlmProvider::Anthropic, "Anthropic Messages endpoint"),
-            (
-                LlmProvider::OpenAiCompatibleChat,
-                "Chat Completions endpoint",
-            ),
+            (LlmProvider::OpenAiChat, "Chat Completions endpoint"),
+            (LlmProvider::OpenAiResponses, "Responses endpoint"),
         ] {
             c.agent.llm.provider = provider;
             c.agent.llm.endpoint = "llm.example.com/v1".into();

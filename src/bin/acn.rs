@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use agent_claim_network::bootstrap;
 use agent_claim_network::build_info;
@@ -11,19 +12,22 @@ use agent_claim_network::config::{
     resolve_workspace_root, Config, ResolvedUpstream, DEFAULT_SESSION_CLEANUP_RETENTION_DAYS,
 };
 use agent_claim_network::mcp::config::{
-    read_mcp_json_config, validate_server_name, write_mcp_json_config_atomic, McpJsonConfig,
-    McpServerConfig, McpTransportKind,
+    lock_mcp_json_config, read_mcp_json_config, validate_server_name, write_mcp_json_config_atomic,
+    McpJsonConfig, McpOAuthCredentialsStore, McpServerConfig, McpTransportKind,
 };
 use agent_claim_network::mcp::connection_manager::{
     McpConnectionManager, McpRuntimeState, McpServerStatus,
 };
+use agent_claim_network::mcp::oauth;
 use agent_claim_network::session::{
     cleanup_old_sessions, SessionCleanupConfig, SessionCleanupEntry, SessionCleanupOutcome,
     SessionCleanupReport, SessionMetadata, SessionStatus,
 };
 use agent_claim_network::session_tui::{self, StartupResume};
 use agent_claim_network::storage::{paths, read_yaml, FileLockGuard};
-use agent_claim_network::supervisor::{self, SupervisorLaunchConfig};
+use agent_claim_network::supervisor::{
+    self, FinalizingSessionDiagnostic, SupervisorLaunchConfig, SupervisorRetryTarget,
+};
 use agent_claim_network::update::{
     self, UpdateOptions, DEFAULT_UPDATE_BRANCH, DEFAULT_UPDATE_REPOSITORY_URL,
 };
@@ -55,17 +59,19 @@ async fn main() -> anyhow::Result<()> {
     let cli = parse_cli_from(raw_args)?;
     let (mut cfg, cfg_path) = Config::load_or_init_for_agent(cli.config.as_deref())
         .with_context(|| format!("加载 config: {:?}", cli.config))?;
-    cfg.set_tool_workspace_root(resolve_workspace_root(cli.cd.as_deref())?);
+    let workspace_root = resolve_workspace_root(cli.cd.as_deref())?;
+    cfg.set_tool_workspace_root(workspace_root.clone());
     let upstream = cfg
         .resolve_upstream(cli.upstream.as_deref())
         .context("解析 upstream 失败")?;
     activate_acn_upstream_runtime(&mut cfg, &upstream, "激活 upstream 本地目录失败")?;
+    let runtime_fingerprint = supervisor::runtime_fingerprint(&cfg, &upstream)?;
     let supervisor_launch = SupervisorLaunchConfig::new(
         cfg.agent_home(&upstream.agent_id),
         cfg_path,
         Some(upstream.name.clone()),
-        cli.cd.clone(),
         cfg.agent.session.notify_on_finalize_completion,
+        runtime_fingerprint,
     );
     let cleanup_housekeeping = session_tui::SessionCleanupHousekeepingConfig {
         agent_id: upstream.agent_id.clone(),
@@ -76,23 +82,33 @@ async fn main() -> anyhow::Result<()> {
         ),
         timing: session_tui::SessionCleanupHousekeepingTiming::default(),
     };
-    if let Some(message) =
-        direct_resume_preflight_failure(&cfg, &upstream.agent_id, &cli.resume).await
-    {
-        eprint!("{message}");
-        return Ok(());
-    }
+    // 先恢复可能中断的 finalize job，再判断目标 session 是否可 resume。否则 supervisor
+    // 崩溃留下的 queued/running job 会被预检反复报告为“请等待”，却没有进程继续执行。
     if let Err(error) = supervisor::ensure_supervisor_running(&supervisor_launch).await {
         log::warn!(
             target: "acn",
             "finalize supervisor 启动或接管失败，本次会话继续运行: {error:#}"
         );
     }
+    if let Some(message) =
+        direct_resume_preflight_failure(&cfg, &upstream.agent_id, &cli.resume).await
+    {
+        eprint!("{message}");
+        return Ok(());
+    }
     let mcp_manager = bootstrap::build_refreshed_mcp_manager(&cfg).await;
-    let engine =
-        bootstrap::build_agent_cli_session_engine_with_mcp(&cfg, &upstream, Some(mcp_manager))?
-            .with_fork_memory_review(cli.fork_review);
-    session_tui::run_session_tui_with_resume_and_cleanup(
+    let engine = match bootstrap::build_agent_cli_session_engine_with_mcp(
+        &cfg,
+        &upstream,
+        Some(Arc::clone(&mcp_manager)),
+    ) {
+        Ok(engine) => engine,
+        Err(error) => {
+            mcp_manager.shutdown().await;
+            return Err(error);
+        }
+    };
+    let tui_result = session_tui::run_session_tui_with_resume_and_cleanup(
         engine,
         cfg.agent.session.id_mint_max_attempts(),
         cli.resume,
@@ -100,7 +116,9 @@ async fn main() -> anyhow::Result<()> {
         Some(supervisor_launch),
         Some(cleanup_housekeeping),
     )
-    .await?;
+    .await;
+    mcp_manager.shutdown().await;
+    tui_result?;
     Ok(())
 }
 
@@ -378,7 +396,6 @@ fn session_usage() -> &'static str {
 struct Cli {
     config: Option<PathBuf>,
     upstream: Option<String>,
-    fork_review: bool,
     resume: StartupResume,
     cd: Option<PathBuf>,
 }
@@ -397,6 +414,16 @@ async fn direct_resume_preflight_failure(
         Ok(metadata) => metadata,
         Err(error) => return Some(format!("Resume failed: {error:#}\n")),
     };
+    if metadata.agent_id == *agent_id && metadata.status == SessionStatus::Finalizing {
+        let diagnostic =
+            supervisor::diagnose_finalizing_session(&cfg.agent_home(agent_id), session_id).await;
+        return Some(match diagnostic {
+            Ok(diagnostic) => direct_resume_finalizing_message(session_id, &diagnostic),
+            Err(error) => {
+                format!("Resume failed: session {session_id} 的 finalize 状态检查失败：{error:#}\n")
+            }
+        });
+    }
     direct_resume_metadata_failure(agent_id, session_id, &metadata)
 }
 
@@ -425,6 +452,29 @@ fn direct_resume_not_closed_message(session_id: &SessionId, status: SessionStatu
         "Resume failed: You can only resume Closed sessions.\nSession {session_id} current status: {}.\n",
         session_status_label(status)
     )
+}
+
+fn direct_resume_finalizing_message(
+    session_id: &SessionId,
+    diagnostic: &FinalizingSessionDiagnostic,
+) -> String {
+    match diagnostic {
+        FinalizingSessionDiagnostic::Queued { job_id } => format!(
+            "Resume failed: session {session_id} 正在等待 finalize（job {job_id}）。请稍后重试。\n"
+        ),
+        FinalizingSessionDiagnostic::Running { job_id } => format!(
+            "Resume failed: session {session_id} 正在 finalize（job {job_id}）。请稍后重试。\n"
+        ),
+        FinalizingSessionDiagnostic::Failed { job_id } => format!(
+            "Resume failed: session {session_id} 的 finalize 失败。\nJob: {job_id}\n\n请运行：\nacn supervisor retry {session_id}\n"
+        ),
+        FinalizingSessionDiagnostic::RunningWithoutJob => format!(
+            "Resume failed: session {session_id} 正在 finalize。请稍后重试。\n"
+        ),
+        FinalizingSessionDiagnostic::Orphaned => format!(
+            "Resume failed: session {session_id} 的 finalize 未完成。\n\n请运行：\nacn supervisor retry {session_id}\n"
+        ),
+    }
 }
 
 fn session_status_label(status: SessionStatus) -> &'static str {
@@ -477,6 +527,13 @@ enum McpCommand {
     Disable {
         name: String,
     },
+    Login {
+        name: String,
+        no_browser: bool,
+    },
+    Logout {
+        name: String,
+    },
     Status {
         name: Option<String>,
     },
@@ -499,6 +556,9 @@ enum McpAddTransport {
     StreamableHttp {
         url: String,
         bearer_token_env_var: Option<String>,
+        oauth_client_id: Option<String>,
+        oauth_callback_port: Option<u16>,
+        oauth_credentials_store: Option<McpOAuthCredentialsStore>,
     },
 }
 
@@ -531,27 +591,76 @@ async fn execute_mcp_command(path: &Path, command: McpCommand) -> anyhow::Result
                 McpAddTransport::StreamableHttp {
                     url,
                     bearer_token_env_var,
+                    oauth_client_id,
+                    oauth_callback_port,
+                    oauth_credentials_store,
                 } => {
                     if !add.env.is_empty() || !add.env_vars.is_empty() {
                         anyhow::bail!(
                             "streamable_http server 不支持 -e/--env-var；请使用 --bearer-token-env-var"
                         );
                     }
-                    McpServerConfig::streamable_http(url, bearer_token_env_var)
+                    let mut server = McpServerConfig::streamable_http(url, bearer_token_env_var);
+                    server.oauth_client_id = oauth_client_id;
+                    server.oauth_callback_port = oauth_callback_port;
+                    server.oauth_credentials_store = oauth_credentials_store;
+                    server
                 }
             };
             add_mcp_server(path, add.name, server).await
         }
         McpCommand::AddJson { name, server } => add_mcp_server(path, name, server).await,
         McpCommand::Remove { name } => {
-            let mut cfg = read_mcp_json_config(path).await?;
-            if cfg.servers.remove(&name).is_none() {
-                anyhow::bail!("MCP server 不存在: {name}");
+            let cfg = read_mcp_json_config(path).await?;
+            let server = cfg
+                .servers
+                .get(&name)
+                .with_context(|| format!("MCP server 不存在: {name}"))?
+                .clone();
+            let clear_oauth = server.transport_kind(&name)? == McpTransportKind::StreamableHttp;
+            let mut credential_lease = if clear_oauth {
+                Some(oauth::prepare_credentials_for_remove(path, &name, &server).await?)
+            } else {
+                None
+            };
+            let remove_result = async {
+                let _config_guard = lock_mcp_json_config(path).await?;
+                let mut current = read_mcp_json_config(path).await?;
+                if current.servers.get(&name) != Some(&server) {
+                    anyhow::bail!(
+                        "MCP server '{name}' 的配置在 remove 等待期间已删除或变更；请重试"
+                    );
+                }
+                current.servers.remove(&name);
+                write_mcp_json_config_atomic(path, &current).await?;
+                Ok::<(), anyhow::Error>(())
             }
-            write_mcp_json_config_atomic(path, &cfg).await?;
-            Ok(format!("removed MCP server '{name}'\n"))
+            .await;
+            if let Err(error) = remove_result {
+                if let Some(credential_lease) = credential_lease.take() {
+                    if let Err(cleanup_error) = credential_lease.cancel().await {
+                        log::warn!(
+                            "MCP server '{name}' remove 未落盘，回滚 OAuth cleanup record 失败: {cleanup_error}"
+                        );
+                    }
+                }
+                return Err(error);
+            }
+            let mut output = format!("removed MCP server '{name}'\n");
+            if let Some(credential_lease) = credential_lease {
+                if let Err(error) = credential_lease.finish().await {
+                    log::warn!(
+                        "MCP server '{name}' 配置已删除，但本地 OAuth 凭据清理失败: {error}"
+                    );
+                    output.push_str(&format!(
+                        "warning: MCP server '{name}' 配置已删除，但本地 OAuth 凭据清理失败；可在凭据存储恢复后重试 `acn mcp logout {name}`：{error}\n"
+                    ));
+                }
+            }
+            Ok(output)
         }
         McpCommand::Enable { name } => {
+            let _config_guard = lock_mcp_json_config(path).await?;
             let mut cfg = read_mcp_json_config(path).await?;
             let server = cfg
                 .servers
@@ -562,6 +671,7 @@ async fn execute_mcp_command(path: &Path, command: McpCommand) -> anyhow::Result
             Ok(format!("enabled MCP server '{name}'\n"))
         }
         McpCommand::Disable { name } => {
+            let _config_guard = lock_mcp_json_config(path).await?;
             let mut cfg = read_mcp_json_config(path).await?;
             let server = cfg
                 .servers
@@ -571,16 +681,45 @@ async fn execute_mcp_command(path: &Path, command: McpCommand) -> anyhow::Result
             write_mcp_json_config_atomic(path, &cfg).await?;
             Ok(format!("disabled MCP server '{name}'\n"))
         }
+        McpCommand::Login { name, no_browser } => {
+            let cfg = read_mcp_json_config(path).await?;
+            let server = cfg
+                .servers
+                .get(&name)
+                .with_context(|| format!("MCP server 不存在: {name}"))?;
+            if server.bearer_token_env_var.is_some() {
+                anyhow::bail!(
+                    "MCP server '{name}' 使用 bearer_token_env_var，不能执行 OAuth login；请先移除 bearer 配置"
+                );
+            }
+            oauth::login(path, &name, server, no_browser).await?;
+            Ok(format!("logged in to MCP server '{name}'\n"))
+        }
+        McpCommand::Logout { name } => {
+            let cfg = read_mcp_json_config(path).await?;
+            let retried_pending_cleanup = oauth::retry_pending_logout(path, &name).await?;
+            if let Some(server) = cfg.servers.get(&name) {
+                oauth::logout(path, &name, server).await?;
+            } else if !retried_pending_cleanup {
+                anyhow::bail!("MCP server 不存在: {name}");
+            }
+            Ok(format!("logged out of MCP server '{name}'\n"))
+        }
         McpCommand::Status { name } => {
             let workspace_root = std::env::current_dir().context("读取当前工作目录失败")?;
             let manager = McpConnectionManager::new(path.to_path_buf(), workspace_root, None);
-            if let Some(name) = &name {
-                manager.reconnect_server(name).await?;
-            } else {
-                manager.refresh_all().await?;
+            let status_result = async {
+                if let Some(name) = &name {
+                    manager.reconnect_server(name).await?;
+                } else {
+                    manager.refresh_all().await?;
+                }
+                let snapshot = manager.snapshot().await;
+                mcp_status_text(path, &snapshot, name.as_deref())
             }
-            let snapshot = manager.snapshot().await;
-            mcp_status_text(path, &snapshot, name.as_deref())
+            .await;
+            manager.shutdown().await;
+            status_result
         }
     }
 }
@@ -591,9 +730,15 @@ async fn add_mcp_server(
     server: McpServerConfig,
 ) -> anyhow::Result<String> {
     validate_server_name(&name)?;
+    let _config_guard = lock_mcp_json_config(path).await?;
     let mut cfg = read_mcp_json_config(path).await?;
     if cfg.servers.contains_key(&name) {
         anyhow::bail!("MCP server 已存在: {name}；请先 remove 后再 add");
+    }
+    if oauth::has_pending_cleanup(path, &name).await? {
+        anyhow::bail!(
+            "MCP server '{name}' 仍有待清理的本地 OAuth 凭据；请先执行 `acn mcp logout {name}`"
+        );
     }
     cfg.servers.insert(name.clone(), server);
     write_mcp_json_config_atomic(path, &cfg).await?;
@@ -641,6 +786,9 @@ where
             { parse_mcp_name_command(&args, &mut index, &mut config, &mut upstream, "disable") }
                 .map(|name| McpCommand::Disable { name })?
         }
+        "login" => parse_mcp_login(&args, &mut index, &mut config, &mut upstream)?,
+        "logout" => parse_mcp_name_command(&args, &mut index, &mut config, &mut upstream, "logout")
+            .map(|name| McpCommand::Logout { name })?,
         "status" => parse_mcp_status(&args, &mut index, &mut config, &mut upstream)?,
         other => anyhow::bail!("未知 mcp 子命令: {other}\n{}", mcp_usage()),
     };
@@ -720,6 +868,9 @@ fn parse_mcp_add(
     let mut env_vars = Vec::new();
     let mut url = None;
     let mut bearer_token_env_var = None;
+    let mut oauth_client_id = None;
+    let mut oauth_callback_port = None;
+    let mut oauth_credentials_store = None;
     let mut stdio_command = None;
     while *index < args.len() {
         match args[*index].as_str() {
@@ -766,6 +917,33 @@ fn parse_mcp_add(
                 validate_env_key("--bearer-token-env-var", &key)?;
                 bearer_token_env_var = Some(key);
             }
+            "--oauth-client-id" => {
+                *index += 1;
+                let client_id = take_mcp_value(args, index, "--oauth-client-id 后缺少 client ID")?;
+                if client_id.trim().is_empty() {
+                    anyhow::bail!("--oauth-client-id 不能为空");
+                }
+                oauth_client_id = Some(client_id);
+            }
+            "--oauth-callback-port" => {
+                *index += 1;
+                let raw = take_mcp_value(args, index, "--oauth-callback-port 后缺少端口")?;
+                let port = raw
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|port| *port > 0)
+                    .context("--oauth-callback-port 必须在 1..=65535")?;
+                oauth_callback_port = Some(port);
+            }
+            "--oauth-credentials-store" => {
+                *index += 1;
+                let value = take_mcp_value(args, index, "--oauth-credentials-store 后缺少类型")?;
+                oauth_credentials_store = Some(match value.as_str() {
+                    "keyring" => McpOAuthCredentialsStore::Keyring,
+                    "file" => McpOAuthCredentialsStore::File,
+                    _ => anyhow::bail!("--oauth-credentials-store 仅支持 keyring 或 file"),
+                });
+            }
             "-h" | "--help" => {
                 eprintln!("{}", mcp_usage());
                 std::process::exit(0);
@@ -777,16 +955,34 @@ fn parse_mcp_add(
         if stdio_command.is_some() {
             anyhow::bail!("mcp add 不能同时使用 --url 和 -- <command...>");
         }
+        if bearer_token_env_var.is_some()
+            && (oauth_client_id.is_some()
+                || oauth_callback_port.is_some()
+                || oauth_credentials_store.is_some())
+        {
+            anyhow::bail!(
+                "--bearer-token-env-var 不能与 OAuth 选项同时使用；请选择 bearer 或 OAuth"
+            );
+        }
         if url.trim().is_empty() {
             anyhow::bail!("--url 不能为空");
         }
         McpAddTransport::StreamableHttp {
             url,
             bearer_token_env_var,
+            oauth_client_id,
+            oauth_callback_port,
+            oauth_credentials_store,
         }
     } else {
-        if bearer_token_env_var.is_some() {
-            anyhow::bail!("stdio server 不支持 --bearer-token-env-var；请使用 -e 或 --env-var");
+        if bearer_token_env_var.is_some()
+            || oauth_client_id.is_some()
+            || oauth_callback_port.is_some()
+            || oauth_credentials_store.is_some()
+        {
+            anyhow::bail!(
+                "stdio server 不支持 HTTP/OAuth 选项；请使用 -e 或 --env-var 传递 stdio 凭据"
+            );
         }
         let command_parts =
             stdio_command.context("mcp add stdio server 需要在 -- 后提供 command")?;
@@ -805,6 +1001,43 @@ fn parse_mcp_add(
         env,
         env_vars,
     }))
+}
+
+fn parse_mcp_login(
+    args: &[String],
+    index: &mut usize,
+    config: &mut Option<PathBuf>,
+    upstream: &mut Option<String>,
+) -> anyhow::Result<McpCommand> {
+    let name = take_mcp_value(args, index, "mcp login 后缺少 server name")?;
+    validate_server_name(&name)?;
+    let mut no_browser = false;
+    while *index < args.len() {
+        match args[*index].as_str() {
+            "--no-browser" => {
+                no_browser = true;
+                *index += 1;
+            }
+            "--config" => {
+                *index += 1;
+                *config = Some(PathBuf::from(take_mcp_value(
+                    args,
+                    index,
+                    "--config 后缺少路径",
+                )?));
+            }
+            "--upstream" => {
+                *index += 1;
+                *upstream = Some(take_mcp_value(args, index, "--upstream 后缺少名称")?);
+            }
+            "-h" | "--help" => {
+                eprintln!("{}", mcp_usage());
+                std::process::exit(0);
+            }
+            other => anyhow::bail!("未知 mcp login 参数: {other}"),
+        }
+    }
+    Ok(McpCommand::Login { name, no_browser })
 }
 
 fn parse_mcp_name_command(
@@ -1016,6 +1249,24 @@ fn mcp_server_text(path: &Path, name: &str, server: &McpServerConfig) -> String 
                 "bearer_token_env_var: {}\n",
                 server.bearer_token_env_var.as_deref().unwrap_or("-")
             ));
+            text.push_str(&format!(
+                "oauth_client_id: {}\n",
+                server.oauth_client_id.as_deref().unwrap_or("-")
+            ));
+            text.push_str(&format!(
+                "oauth_callback_port: {}\n",
+                server
+                    .oauth_callback_port
+                    .map(|port| port.to_string())
+                    .unwrap_or_else(|| "random".to_string())
+            ));
+            text.push_str(&format!(
+                "oauth_credentials_store: {}\n",
+                match server.oauth_credentials_store.unwrap_or_default() {
+                    McpOAuthCredentialsStore::Keyring => "keyring",
+                    McpOAuthCredentialsStore::File => "file",
+                }
+            ));
         }
         Err(err) => text.push_str(&format!("error: {err}\n")),
     }
@@ -1213,14 +1464,16 @@ fn mcp_usage() -> &'static str {
   acn mcp list [--config <path>] [--upstream <name>]
   acn mcp get <name> [--json] [--config <path>] [--upstream <name>]
   acn mcp add <name> [-e KEY=VALUE] [--env-var KEY] [--config <path>] [--upstream <name>] -- <command...>
-  acn mcp add <name> --url <url> [--bearer-token-env-var ENV] [--config <path>] [--upstream <name>]
+  acn mcp add <name> --url <url> [--bearer-token-env-var ENV | [--oauth-client-id ID] [--oauth-callback-port PORT] [--oauth-credentials-store keyring|file]] [--config <path>] [--upstream <name>]
   acn mcp add-json <name> '<server-json>' [--config <path>] [--upstream <name>]
   acn mcp remove <name> [--config <path>] [--upstream <name>]
   acn mcp enable <name> [--config <path>] [--upstream <name>]
   acn mcp disable <name> [--config <path>] [--upstream <name>]
+  acn mcp login <name> [--no-browser] [--config <path>] [--upstream <name>]
+  acn mcp logout <name> [--config <path>] [--upstream <name>]
   acn mcp status [name] [--config <path>] [--upstream <name>]
 
-管理选中 upstream 的 MCP server 配置文件 <acn_home>/<upstream>/.mcp.json。add/add-json 只保存配置；status 才会真实连接 server。
+管理选中 upstream 的 MCP server 配置文件 <acn_home>/<upstream>/.mcp.json。add/add-json 只保存配置；status 才会真实连接 server。login 仅适用于支持 OAuth discovery，且支持动态注册或已配置 public client ID 的 streamable_http server。
 
 选项:
   --config <path>             指定 config.toml，用于定位 <acn_home>
@@ -1229,6 +1482,10 @@ fn mcp_usage() -> &'static str {
   --env-var KEY               stdio server 运行时从当前进程继承的环境变量名
   --url <url>                 添加 streamable_http MCP endpoint
   --bearer-token-env-var ENV  streamable_http bearer token 所在环境变量名
+  --oauth-client-id ID        预注册的 public OAuth client ID；不支持 client secret
+  --oauth-callback-port PORT  固定 loopback callback 端口；默认使用随机端口
+  --oauth-credentials-store S OAuth 凭据存储：keyring（默认）或 file
+  --no-browser                不打开浏览器，提示粘贴完整 redirect URL
   <server-json>                单个 server JSON；type=http 会保存为 streamable_http
   --json                      get 时输出原始 JSON
 "
@@ -1423,8 +1680,10 @@ fn push_session_cleanup_row<T: AsRef<str>>(text: &mut String, row: &[T; 5], widt
 
 async fn run_supervisor_cli(args: Vec<String>) -> anyhow::Result<()> {
     let cli = parse_supervisor_cli_from(args)?;
-    let (mut cfg, _cfg_path) = match cli.command {
-        SupervisorCommand::Run => Config::load_or_init_for_agent(cli.config.as_deref()),
+    let (mut cfg, cfg_path) = match cli.command {
+        SupervisorCommand::Run | SupervisorCommand::Retry => {
+            Config::load_or_init_for_agent(cli.config.as_deref())
+        }
         SupervisorCommand::Status | SupervisorCommand::Jobs { .. } | SupervisorCommand::Stop => {
             Config::load_or_init_for_supervisor_control(cli.config.as_deref())
         }
@@ -1433,7 +1692,10 @@ async fn run_supervisor_cli(args: Vec<String>) -> anyhow::Result<()> {
     let upstream = cfg
         .resolve_upstream(cli.upstream.as_deref())
         .context("解析 supervisor upstream 失败")?;
-    let agent_home = if cli.command == SupervisorCommand::Run {
+    let agent_home = if matches!(
+        cli.command,
+        SupervisorCommand::Run | SupervisorCommand::Retry
+    ) {
         activate_acn_upstream_runtime(
             &mut cfg,
             &upstream,
@@ -1445,10 +1707,41 @@ async fn run_supervisor_cli(args: Vec<String>) -> anyhow::Result<()> {
     };
     match cli.command {
         SupervisorCommand::Run => {
-            cfg.set_tool_workspace_root(resolve_workspace_root(cli.cd.as_deref())?);
+            // finalize 不调用 agent 工具；给复用的 SessionEngine 一个稳定、中性的工作目录。
+            cfg.set_tool_workspace_root(agent_home.clone());
+            let runtime_fingerprint = supervisor::runtime_fingerprint(&cfg, &upstream)?;
+            if let Some(expected) = cli.expected_runtime_fingerprint.as_deref() {
+                if expected != runtime_fingerprint.digest {
+                    anyhow::bail!(
+                        "supervisor 配置在拉起期间发生变化: expected={}, actual={}",
+                        short_fingerprint(expected),
+                        short_fingerprint(&runtime_fingerprint.digest)
+                    );
+                }
+            }
             let engine = bootstrap::build_agent_cli_session_engine(&cfg, &upstream)?
                 .with_fork_memory_review(false);
-            supervisor::run_supervisor(engine, agent_home).await
+            supervisor::run_supervisor(engine, agent_home, runtime_fingerprint).await
+        }
+        SupervisorCommand::Retry => {
+            let target = cli
+                .retry_target
+                .context("acn supervisor retry 缺少 session_id 或 job_id")?;
+            // 先完成与子进程相同的 engine 构造校验，避免无效新配置先接管并停掉旧实例。
+            cfg.set_tool_workspace_root(agent_home.clone());
+            let _engine_preflight = bootstrap::build_agent_cli_session_engine(&cfg, &upstream)?
+                .with_fork_memory_review(false);
+            let runtime_fingerprint = supervisor::runtime_fingerprint(&cfg, &upstream)?;
+            let launch = SupervisorLaunchConfig::new(
+                agent_home,
+                cfg_path,
+                Some(upstream.name.clone()),
+                cfg.agent.session.notify_on_finalize_completion,
+                runtime_fingerprint,
+            );
+            let report = supervisor::retry_finalize(&launch, target).await?;
+            print!("{}", supervisor_retry_report_text(&report));
+            Ok(())
         }
         SupervisorCommand::Status => {
             let status = supervisor::supervisor_status(&agent_home).await?;
@@ -1478,7 +1771,6 @@ where
 {
     let mut config = None;
     let mut upstream = None;
-    let mut fork_review = true;
     let mut resume = StartupResume::None;
     let mut cd = None;
     let mut args = args.into_iter().map(Into::into).skip(1).peekable();
@@ -1486,10 +1778,6 @@ where
         match arg.as_str() {
             "--config" => config = Some(PathBuf::from(args.next().context("--config 后缺少路径")?)),
             "--upstream" => upstream = Some(args.next().context("--upstream 后缺少名称")?),
-            "--fork-review" => {
-                let raw = args.next().context("--fork-review 后缺少 true/false")?;
-                fork_review = parse_bool_arg("--fork-review", &raw)?;
-            }
             "--resume" => {
                 resume = match args.peek() {
                     Some(next) if !next.starts_with('-') => {
@@ -1513,7 +1801,6 @@ where
     Ok(Cli {
         config,
         upstream,
-        fork_review,
         resume,
         cd,
     })
@@ -1524,15 +1811,14 @@ fn acn_usage() -> &'static str {
   acn [options]
   acn update [--url <git-url>] [--branch <branch>] [--config <path>]
   acn session cleanup [--apply] [options]
-  acn supervisor <status|jobs|stop> [options]
-  acn mcp <list|get|add|remove|enable|disable|status> [options]
+  acn supervisor <status|jobs|retry|stop> [options]
+  acn mcp <list|get|add|remove|enable|disable|login|logout|status> [options]
 
 启动 ACN 交互式 TUI session。普通用户通常只需要运行 `acn`；后台 finalize supervisor 会自动启动，无需手动管理。
 
 选项:
   --config <path>             指定 config.toml；不传则按 ACN_CONFIG 和默认配置查找
   --upstream <name>           选择 [upstreams.<name>]；不传则使用配置里的默认 upstream
-  --fork-review <true|false>  控制后台 memory review；默认 true
   --resume [session_id]       不带 session_id 时打开恢复列表；带 session_id 时直接恢复指定会话
   --cd <dir>, -C <dir>        指定 agent 工具读写文件和执行命令的工作目录
   --version, -V               显示版本号、构建提交和提交时间
@@ -1551,6 +1837,7 @@ Session 维护命令:
 Supervisor 排障命令:
   acn supervisor status       查看后台 supervisor 是否在运行、PID、uptime 和队列概况
   acn supervisor jobs [-l n]  查看最近 finalize job；默认 5 条，-l 0 显示全部
+  acn supervisor retry <id>   按 session_id（推荐）或 job_id 重试失败的 finalize
   acn supervisor stop         优雅停止后台 supervisor
 
 MCP 配置命令:
@@ -1558,9 +1845,11 @@ MCP 配置命令:
   acn mcp get <name>                  查看单个 MCP server 的详细配置
   acn mcp add <name> ...              新增 stdio server 或 streamable_http endpoint
   acn mcp add-json <name> <json>      从单个 server JSON 新增 MCP server
-  acn mcp remove <name>               删除 MCP server 配置
+  acn mcp remove <name>               删除 MCP server 配置及其本地 OAuth 凭据
   acn mcp enable <name>               启用 MCP server
   acn mcp disable <name>              禁用但保留 MCP server 配置
+  acn mcp login <name>                OAuth 登录；headless 环境可加 --no-browser
+  acn mcp logout <name>               退出 MCP OAuth 登录
   acn mcp status [name]               连接检查 MCP server
 "
 }
@@ -1570,7 +1859,8 @@ struct SupervisorCli {
     command: SupervisorCommand,
     config: Option<PathBuf>,
     upstream: Option<String>,
-    cd: Option<PathBuf>,
+    retry_target: Option<SupervisorRetryTarget>,
+    expected_runtime_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1578,6 +1868,7 @@ enum SupervisorCommand {
     Run,
     Status,
     Jobs { limit: usize },
+    Retry,
     Stop,
 }
 
@@ -1596,6 +1887,7 @@ where
         Some("jobs") => SupervisorCommand::Jobs {
             limit: DEFAULT_SUPERVISOR_JOBS_LIMIT,
         },
+        Some("retry") => SupervisorCommand::Retry,
         Some("stop") => SupervisorCommand::Stop,
         Some("-h" | "--help") => {
             eprintln!("{}", supervisor_usage());
@@ -1610,14 +1902,22 @@ where
     }
     let mut config = None;
     let mut upstream = None;
-    let mut cd = None;
+    let mut retry_target = None;
+    let mut expected_runtime_fingerprint = None;
     let mut jobs_limit_override = None;
     let mut args = args.into_iter().skip(3);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" => config = Some(PathBuf::from(args.next().context("--config 后缺少路径")?)),
             "--upstream" => upstream = Some(args.next().context("--upstream 后缺少名称")?),
-            "--cd" | "-C" => cd = Some(PathBuf::from(args.next().context("--cd 后缺少目录参数")?)),
+            "--runtime-fingerprint" if command == SupervisorCommand::Run => {
+                let value = args.next().context("--runtime-fingerprint 后缺少摘要")?;
+                validate_runtime_fingerprint_arg(&value)?;
+                expected_runtime_fingerprint = Some(value);
+            }
+            "--runtime-fingerprint" => {
+                anyhow::bail!("--runtime-fingerprint 仅支持 acn supervisor run")
+            }
             "-l" | "--limit" if matches!(command, SupervisorCommand::Jobs { .. }) => {
                 let raw = args.next().context("-l 后缺少数量")?;
                 jobs_limit_override = Some(
@@ -1630,6 +1930,12 @@ where
                 eprintln!("{}", supervisor_usage());
                 std::process::exit(0);
             }
+            other if command == SupervisorCommand::Retry && !other.starts_with('-') => {
+                if retry_target.is_some() {
+                    anyhow::bail!("acn supervisor retry 只接受一个 session_id 或 job_id");
+                }
+                retry_target = Some(parse_supervisor_retry_target(other)?);
+            }
             other => anyhow::bail!("未知 supervisor 参数: {other}"),
         }
     }
@@ -1637,27 +1943,66 @@ where
         (SupervisorCommand::Jobs { .. }, Some(limit)) => SupervisorCommand::Jobs { limit },
         (command, _) => command,
     };
+    if command == SupervisorCommand::Retry && retry_target.is_none() {
+        anyhow::bail!("acn supervisor retry 缺少 session_id 或 job_id");
+    }
     Ok(SupervisorCli {
         command,
         config,
         upstream,
-        cd,
+        retry_target,
+        expected_runtime_fingerprint,
     })
+}
+
+fn parse_supervisor_retry_target(value: &str) -> anyhow::Result<SupervisorRetryTarget> {
+    if value.starts_with(SessionId::PREFIX) {
+        let session_id = value
+            .parse::<SessionId>()
+            .with_context(|| format!("无效的 supervisor retry session_id: {value}"))?;
+        return Ok(SupervisorRetryTarget::Session { session_id });
+    }
+    if value.strip_prefix("job_").is_some_and(|suffix| {
+        !suffix.is_empty()
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    }) {
+        return Ok(SupervisorRetryTarget::Job {
+            job_id: value.to_string(),
+        });
+    }
+    anyhow::bail!("supervisor retry id 必须是有效的 session_id 或 job_id，实际: {value}")
+}
+
+fn validate_runtime_fingerprint_arg(value: &str) -> anyhow::Result<()> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(());
+    }
+    anyhow::bail!("--runtime-fingerprint 必须是 64 位小写十六进制摘要")
+}
+
+fn short_fingerprint(value: &str) -> &str {
+    value.get(..12).unwrap_or(value)
 }
 
 fn supervisor_usage() -> &'static str {
     "用法:
   acn supervisor status [options]
   acn supervisor jobs [options]
+  acn supervisor retry <session_id|job_id> [options]
   acn supervisor stop [options]
   acn supervisor run [options]
 
-管理 ACN finalize supervisor。普通用户无需手动启动；`run` 是 ACN 自动拉起的后台内部命令，开发和排障时主要使用 status/jobs/stop。
+管理 ACN finalize supervisor。普通用户无需手动启动；`run` 是 ACN 自动拉起的后台内部命令，开发和排障时主要使用 status/jobs/retry/stop。
 
 选项:
   --config <path>      指定 config.toml；应与启动 TUI 时使用的配置一致
   --upstream <name>    选择 [upstreams.<name>]；应与要排查的 agent upstream 一致
-  --cd <dir>, -C <dir> 仅 run 使用，指定后台 finalize 的工具工作目录
   -l <n>, --limit <n>  仅 jobs 使用，默认 5；0 表示显示全部
   -h, --help           显示帮助
 "
@@ -1696,6 +2041,14 @@ fn supervisor_status_text(
         Some(build) => text.push_str(&format!("build: {} ({})\n", build.version, build.commit)),
         None => text.push_str("build: -\n"),
     }
+    match &status.runtime_fingerprint {
+        Some(fingerprint) => text.push_str(&format!(
+            "runtime: v{}:{}\n",
+            fingerprint.schema,
+            short_fingerprint(&fingerprint.digest)
+        )),
+        None => text.push_str("runtime: -\n"),
+    }
     text.push_str(&format!("agent_id: {agent_id}\n"));
     text.push_str(&format!("agent_home: {}\n", agent_home.display()));
     text.push_str(&format!("socket: {}\n", status.socket_path.display()));
@@ -1727,7 +2080,7 @@ fn supervisor_status_text(
             supervisor::SupervisorRuntimeState::Stuck { .. } => "stuck_current",
         };
         text.push_str(&format!(
-            "{}: {} agent_id={} session_id={} attempts={} started_at={}",
+            "{}: {} agent_id={} session_id={} attempts={} manual_retries={} started_at={}",
             label,
             job.id,
             job.agent_id
@@ -1736,6 +2089,7 @@ fn supervisor_status_text(
                 .unwrap_or_else(|| "-".to_string()),
             job.session_id,
             job.attempts,
+            job.manual_retries,
             format_optional_time(job.started_at.as_ref())
         ));
         text.push('\n');
@@ -1755,6 +2109,7 @@ fn supervisor_jobs_text(jobs: &[supervisor::SupervisorJobView], limit: usize) ->
         "started_at",
         "finished_at",
         "attempts",
+        "manual_retries",
         "last_error",
     ];
     let visible_jobs = recent_supervisor_jobs(jobs, limit);
@@ -1775,6 +2130,7 @@ fn supervisor_jobs_text(jobs: &[supervisor::SupervisorJobView], limit: usize) ->
                 format_optional_time(job.started_at.as_ref()),
                 format_optional_time(job.finished_at.as_ref()),
                 job.attempts.to_string(),
+                job.manual_retries.to_string(),
                 clean_table_field(job.last_error.as_deref().unwrap_or("-")),
             ]
         })
@@ -1803,7 +2159,7 @@ fn recent_supervisor_jobs(
     jobs[start..].iter().rev().collect()
 }
 
-fn supervisor_jobs_column_widths(header: &[&str; 9], rows: &[[String; 9]]) -> [usize; 9] {
+fn supervisor_jobs_column_widths(header: &[&str; 10], rows: &[[String; 10]]) -> [usize; 10] {
     let mut widths = header.map(UnicodeWidthStr::width);
     for row in rows {
         for (index, cell) in row.iter().enumerate() {
@@ -1813,7 +2169,7 @@ fn supervisor_jobs_column_widths(header: &[&str; 9], rows: &[[String; 9]]) -> [u
     widths
 }
 
-fn push_supervisor_jobs_row<T: AsRef<str>>(text: &mut String, row: &[T; 9], widths: &[usize; 9]) {
+fn push_supervisor_jobs_row<T: AsRef<str>>(text: &mut String, row: &[T; 10], widths: &[usize; 10]) {
     for (index, cell) in row.iter().enumerate() {
         if index > 0 {
             text.push_str("  ");
@@ -1846,6 +2202,13 @@ fn supervisor_stop_report_text(report: &supervisor::SupervisorStopReport) -> Str
         text.push_str(&format!("pid: {pid}\n"));
     }
     text
+}
+
+fn supervisor_retry_report_text(report: &supervisor::SupervisorRetryReport) -> String {
+    format!(
+        "finalize retry queued\nsession_id: {}\njob_id: {}\nattempts: {} -> 0\nmanual_retries: {}\n",
+        report.session_id, report.job_id, report.previous_attempts, report.manual_retries
+    )
 }
 
 fn format_uptime(started_at: Option<&DateTime<Utc>>) -> String {
@@ -1885,14 +2248,6 @@ fn clean_table_field(value: &str) -> String {
         .collect()
 }
 
-fn parse_bool_arg(name: &str, raw: &str) -> anyhow::Result<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => anyhow::bail!("{name} 只接受 true 或 false，实际: {raw}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use agent_claim_network::build_info;
@@ -1903,8 +2258,8 @@ mod tests {
         SessionStatus,
     };
     use agent_claim_network::supervisor::{
-        SupervisorJobView, SupervisorQueueSummary, SupervisorRuntimeState,
-        SupervisorStatusSnapshot, SupervisorStopReport,
+        FinalizingSessionDiagnostic, SupervisorJobView, SupervisorQueueSummary,
+        SupervisorRuntimeState, SupervisorStatusSnapshot, SupervisorStopReport,
     };
     use chrono::{DateTime, Utc};
     use std::path::PathBuf;
@@ -1933,6 +2288,8 @@ mod tests {
             message_count: 0,
             finalized_at: None,
             recapped_until: 0,
+            provider_background_completion_until_seq: Some(0),
+            recap_background_completion_until_seq: Some(0),
             compaction: None,
         }
     }
@@ -2061,7 +2418,6 @@ api_key_env = "UNUSED_TEST_LLM_KEY"
             Some(std::path::Path::new("config.toml"))
         );
         assert_eq!(cli.upstream.as_deref(), Some("agent_hub"));
-        assert!(cli.fork_review);
         assert_eq!(cli.resume, super::StartupResume::None);
         assert_eq!(cli.cd.as_deref(), Some(std::path::Path::new(".")));
     }
@@ -2075,7 +2431,6 @@ api_key_env = "UNUSED_TEST_LLM_KEY"
             Some(std::path::Path::new("config.toml"))
         );
         assert_eq!(cli.upstream, None);
-        assert!(cli.fork_review);
         assert_eq!(cli.resume, super::StartupResume::None);
     }
 
@@ -2275,52 +2630,15 @@ api_key_env = "UNUSED_TEST_LLM_KEY"
     }
 
     #[test]
-    fn parse_cli_accepts_fork_review_false() {
-        let cli =
-            super::parse_cli_from(["acn", "--config", "config.toml", "--fork-review", "false"])
-                .unwrap();
+    fn parse_cli_rejects_removed_fork_review_flag() {
+        for value in ["true", "false"] {
+            let err =
+                super::parse_cli_from(["acn", "--config", "config.toml", "--fork-review", value])
+                    .unwrap_err()
+                    .to_string();
 
-        assert!(!cli.fork_review);
-        assert_eq!(cli.resume, super::StartupResume::None);
-    }
-
-    #[test]
-    fn parse_cli_accepts_fork_review_true() {
-        let cli =
-            super::parse_cli_from(["acn", "--config", "config.toml", "--fork-review", "true"])
-                .unwrap();
-
-        assert!(cli.fork_review);
-        assert_eq!(cli.resume, super::StartupResume::None);
-    }
-
-    #[test]
-    fn parse_cli_rejects_fork_review_underscore_flag() {
-        let err =
-            super::parse_cli_from(["acn", "--config", "config.toml", "--fork_review", "false"])
-                .unwrap_err()
-                .to_string();
-
-        assert!(err.contains("未知参数: --fork_review"));
-    }
-
-    #[test]
-    fn parse_cli_rejects_fork_review_without_value() {
-        let err = super::parse_cli_from(["acn", "--config", "config.toml", "--fork-review"])
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("--fork-review 后缺少 true/false"));
-    }
-
-    #[test]
-    fn parse_cli_rejects_invalid_fork_review_bool() {
-        let err =
-            super::parse_cli_from(["acn", "--config", "config.toml", "--fork-review", "maybe"])
-                .unwrap_err()
-                .to_string();
-
-        assert!(err.contains("--fork-review 只接受 true 或 false"));
+            assert!(err.contains("未知参数: --fork-review"));
+        }
     }
 
     #[test]
@@ -2354,6 +2672,37 @@ api_key_env = "UNUSED_TEST_LLM_KEY"
         assert_eq!(
             super::direct_resume_not_closed_message(&session_id, SessionStatus::Finalizing),
             "Resume failed: You can only resume Closed sessions.\nSession session_1234abcd current status: Finalizing.\n"
+        );
+    }
+
+    #[test]
+    fn direct_resume_finalizing_message_explains_job_state_and_retry_command() {
+        let session_id = SessionId::from_str("session_1234abcd").unwrap();
+
+        assert_eq!(
+            super::direct_resume_finalizing_message(
+                &session_id,
+                &FinalizingSessionDiagnostic::Queued {
+                    job_id: "job_queued".into(),
+                },
+            ),
+            "Resume failed: session session_1234abcd 正在等待 finalize（job job_queued）。请稍后重试。\n"
+        );
+        assert_eq!(
+            super::direct_resume_finalizing_message(
+                &session_id,
+                &FinalizingSessionDiagnostic::Failed {
+                    job_id: "job_failed".into(),
+                },
+            ),
+            "Resume failed: session session_1234abcd 的 finalize 失败。\nJob: job_failed\n\n请运行：\nacn supervisor retry session_1234abcd\n"
+        );
+        assert_eq!(
+            super::direct_resume_finalizing_message(
+                &session_id,
+                &FinalizingSessionDiagnostic::Orphaned,
+            ),
+            "Resume failed: session session_1234abcd 的 finalize 未完成。\n\n请运行：\nacn supervisor retry session_1234abcd\n"
         );
     }
 
@@ -2407,6 +2756,7 @@ api_key_env = "UNUSED_TEST_LLM_KEY"
         assert!(usage.contains("acn session cleanup --apply"));
         assert!(usage.contains("acn supervisor status"));
         assert!(usage.contains("acn supervisor jobs"));
+        assert!(usage.contains("acn supervisor retry"));
         assert!(usage.contains("acn supervisor stop"));
         assert!(usage.contains("acn mcp list"));
         assert!(usage.contains("acn mcp list [--upstream <name>]"));
@@ -2416,6 +2766,8 @@ api_key_env = "UNUSED_TEST_LLM_KEY"
         assert!(usage.contains("acn mcp remove <name>"));
         assert!(usage.contains("acn mcp enable <name>"));
         assert!(usage.contains("acn mcp disable <name>"));
+        assert!(usage.contains("acn mcp login <name>"));
+        assert!(usage.contains("acn mcp logout <name>"));
         assert!(usage.contains("acn mcp status [name]"));
         assert!(!usage.contains("接入 client 后可用"));
         assert!(!usage.contains("--upstream n"));
@@ -2671,8 +3023,8 @@ retry_max_delay_ms = 5000
     }
 
     #[test]
-    fn parse_mcp_add_http_accepts_bearer_token_env_var() {
-        let cli = super::parse_mcp_cli_from([
+    fn parse_mcp_add_http_rejects_bearer_with_oauth_options() {
+        let error = super::parse_mcp_cli_from([
             "acn",
             "mcp",
             "add",
@@ -2681,22 +3033,113 @@ retry_max_delay_ms = 5000
             "https://mcp.linear.app/mcp",
             "--bearer-token-env-var",
             "LINEAR_API_KEY",
+            "--oauth-client-id",
+            "linear-public-client",
+            "--oauth-callback-port",
+            "8765",
+            "--oauth-credentials-store",
+            "file",
+        ])
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("不能与 OAuth 选项同时使用"));
+    }
+
+    #[test]
+    fn parse_mcp_login_and_logout_accept_common_options() {
+        let login = super::parse_mcp_cli_from([
+            "acn",
+            "mcp",
+            "login",
+            "remote",
+            "--config",
+            "config.toml",
+            "--upstream",
+            "agent_hub",
+            "--no-browser",
         ])
         .unwrap();
+        let logout = super::parse_mcp_cli_from(["acn", "mcp", "logout", "remote"]).unwrap();
 
-        match cli.command {
-            super::McpCommand::Add(add) => match add.transport {
-                super::McpAddTransport::StreamableHttp {
-                    url,
-                    bearer_token_env_var,
-                } => {
-                    assert_eq!(url, "https://mcp.linear.app/mcp");
-                    assert_eq!(bearer_token_env_var.as_deref(), Some("LINEAR_API_KEY"));
-                }
-                other => panic!("unexpected transport: {other:?}"),
+        assert_eq!(login.upstream.as_deref(), Some("agent_hub"));
+        assert_eq!(
+            login.config.as_deref(),
+            Some(std::path::Path::new("config.toml"))
+        );
+        assert!(matches!(
+            login.command,
+            super::McpCommand::Login {
+                ref name,
+                no_browser: true,
+            } if name == "remote"
+        ));
+        assert!(matches!(
+            logout.command,
+            super::McpCommand::Logout { ref name } if name == "remote"
+        ));
+    }
+
+    #[tokio::test]
+    async fn mcp_login_rejects_stdio_server_before_starting_browser_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        let mut cfg = agent_claim_network::mcp::config::McpJsonConfig::default();
+        cfg.servers.insert(
+            "local".to_string(),
+            agent_claim_network::mcp::config::McpServerConfig::stdio(
+                "server".to_string(),
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+                Vec::new(),
+            ),
+        );
+        agent_claim_network::mcp::config::write_mcp_json_config_atomic(&path, &cfg)
+            .await
+            .unwrap();
+
+        let error = super::execute_mcp_command(
+            &path,
+            super::McpCommand::Login {
+                name: "local".to_string(),
+                no_browser: false,
             },
-            other => panic!("unexpected command: {other:?}"),
-        }
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("仅 streamable_http server 可登录"));
+    }
+
+    #[tokio::test]
+    async fn mcp_login_rejects_bearer_server_before_starting_browser_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        let mut cfg = agent_claim_network::mcp::config::McpJsonConfig::default();
+        cfg.servers.insert(
+            "remote".to_string(),
+            agent_claim_network::mcp::config::McpServerConfig::streamable_http(
+                "https://example.test/mcp".to_string(),
+                Some("SERVICE_API_KEY".to_string()),
+            ),
+        );
+        agent_claim_network::mcp::config::write_mcp_json_config_atomic(&path, &cfg)
+            .await
+            .unwrap();
+
+        let error = super::execute_mcp_command(
+            &path,
+            super::McpCommand::Login {
+                name: "remote".to_string(),
+                no_browser: false,
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("使用 bearer_token_env_var"));
     }
 
     #[test]
@@ -2938,6 +3381,139 @@ retry_max_delay_ms = 5000
     }
 
     #[tokio::test]
+    async fn mcp_remove_deletes_config_and_keeps_failed_oauth_cleanup_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        let mut server = agent_claim_network::mcp::config::McpServerConfig::streamable_http(
+            "https://example.test/mcp".to_string(),
+            None,
+        );
+        server.oauth_credentials_store =
+            Some(agent_claim_network::mcp::config::McpOAuthCredentialsStore::File);
+        let mut cfg = agent_claim_network::mcp::config::McpJsonConfig::default();
+        cfg.servers.insert("remote".to_string(), server);
+        agent_claim_network::mcp::config::write_mcp_json_config_atomic(&path, &cfg)
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join(".mcp-oauth"), "not a directory")
+            .await
+            .unwrap();
+
+        let output = super::execute_mcp_command(
+            &path,
+            super::McpCommand::Remove {
+                name: "remote".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(output.contains("removed MCP server 'remote'"));
+        assert!(output.contains("OAuth 凭据清理失败"));
+        let cfg = agent_claim_network::mcp::config::read_mcp_json_config(&path)
+            .await
+            .unwrap();
+        assert!(cfg.servers.is_empty());
+
+        let blocked_add = super::execute_mcp_command(
+            &path,
+            super::McpCommand::AddJson {
+                name: "remote".to_string(),
+                server: agent_claim_network::mcp::config::McpServerConfig::stdio(
+                    "server".to_string(),
+                    Vec::new(),
+                    std::collections::BTreeMap::new(),
+                    Vec::new(),
+                ),
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(blocked_add.contains("仍有待清理"));
+
+        tokio::fs::remove_file(dir.path().join(".mcp-oauth"))
+            .await
+            .unwrap();
+        let retry = super::execute_mcp_command(
+            &path,
+            super::McpCommand::Logout {
+                name: "remote".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(retry.contains("logged out of MCP server 'remote'"));
+        let retry_again = super::execute_mcp_command(
+            &path,
+            super::McpCommand::Logout {
+                name: "remote".to_string(),
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(retry_again.contains("MCP server 不存在: remote"));
+    }
+
+    #[tokio::test]
+    async fn mcp_remove_preserves_config_written_while_waiting_for_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        let mut remote = agent_claim_network::mcp::config::McpServerConfig::streamable_http(
+            "https://example.test/mcp".to_string(),
+            None,
+        );
+        remote.oauth_credentials_store =
+            Some(agent_claim_network::mcp::config::McpOAuthCredentialsStore::File);
+        let mut cfg = agent_claim_network::mcp::config::McpJsonConfig::default();
+        cfg.servers.insert("remote".to_string(), remote.clone());
+        agent_claim_network::mcp::config::write_mcp_json_config_atomic(&path, &cfg)
+            .await
+            .unwrap();
+
+        let credential_blocker = agent_claim_network::mcp::oauth::prepare_credentials_for_remove(
+            &path, "remote", &remote,
+        )
+        .await
+        .unwrap();
+        let remove_path = path.clone();
+        let remove = tokio::spawn(async move {
+            super::execute_mcp_command(
+                &remove_path,
+                super::McpCommand::Remove {
+                    name: "remote".to_string(),
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        super::execute_mcp_command(
+            &path,
+            super::McpCommand::AddJson {
+                name: "other".to_string(),
+                server: agent_claim_network::mcp::config::McpServerConfig::stdio(
+                    "server".to_string(),
+                    Vec::new(),
+                    std::collections::BTreeMap::new(),
+                    Vec::new(),
+                ),
+            },
+        )
+        .await
+        .unwrap();
+        credential_blocker.finish().await.unwrap();
+        remove.await.unwrap().unwrap();
+
+        let cfg = agent_claim_network::mcp::config::read_mcp_json_config(&path)
+            .await
+            .unwrap();
+        assert!(!cfg.servers.contains_key("remote"));
+        assert!(cfg.servers.contains_key("other"));
+    }
+
+    #[tokio::test]
     async fn execute_mcp_status_reports_disabled_without_starting_server() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".mcp.json");
@@ -3124,8 +3700,8 @@ retry_max_delay_ms = 5000
             "config.toml",
             "--upstream",
             "agent_hub",
-            "--cd",
-            ".",
+            "--runtime-fingerprint",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ])
         .unwrap();
 
@@ -3135,7 +3711,102 @@ retry_max_delay_ms = 5000
             Some(std::path::Path::new("config.toml"))
         );
         assert_eq!(cli.upstream.as_deref(), Some("agent_hub"));
-        assert_eq!(cli.cd.as_deref(), Some(std::path::Path::new(".")));
+        assert_eq!(cli.retry_target, None);
+        assert_eq!(
+            cli.expected_runtime_fingerprint.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+    }
+
+    #[test]
+    fn parse_supervisor_cli_accepts_retry_session_or_job_with_config() {
+        let session = super::parse_supervisor_cli_from([
+            "acn",
+            "supervisor",
+            "retry",
+            "--config",
+            "config.toml",
+            "session_1234abcd",
+            "--upstream",
+            "agent_hub",
+        ])
+        .unwrap();
+        let job =
+            super::parse_supervisor_cli_from(["acn", "supervisor", "retry", "job_123_abcdef01"])
+                .unwrap();
+
+        assert_eq!(session.command, super::SupervisorCommand::Retry);
+        assert_eq!(
+            session.retry_target,
+            Some(
+                agent_claim_network::supervisor::SupervisorRetryTarget::Session {
+                    session_id: "session_1234abcd".parse().unwrap(),
+                }
+            )
+        );
+        assert_eq!(
+            session.config.as_deref(),
+            Some(std::path::Path::new("config.toml"))
+        );
+        assert_eq!(session.upstream.as_deref(), Some("agent_hub"));
+        assert_eq!(
+            job.retry_target,
+            Some(
+                agent_claim_network::supervisor::SupervisorRetryTarget::Job {
+                    job_id: "job_123_abcdef01".to_string(),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn parse_supervisor_cli_rejects_missing_invalid_extra_retry_target_and_cd() {
+        let missing = super::parse_supervisor_cli_from(["acn", "supervisor", "retry"]).unwrap_err();
+        let invalid =
+            super::parse_supervisor_cli_from(["acn", "supervisor", "retry", "session_bad"])
+                .unwrap_err();
+        let extra = super::parse_supervisor_cli_from([
+            "acn",
+            "supervisor",
+            "retry",
+            "session_1234abcd",
+            "job_123",
+        ])
+        .unwrap_err();
+        let cd = super::parse_supervisor_cli_from(["acn", "supervisor", "run", "--cd", "."])
+            .unwrap_err();
+
+        assert!(missing.to_string().contains("缺少 session_id 或 job_id"));
+        assert!(invalid
+            .to_string()
+            .contains("无效的 supervisor retry session_id"));
+        assert!(extra.to_string().contains("只接受一个"));
+        assert!(cd.to_string().contains("未知 supervisor 参数: --cd"));
+    }
+
+    #[test]
+    fn parse_supervisor_cli_rejects_invalid_or_management_runtime_fingerprint() {
+        let invalid = super::parse_supervisor_cli_from([
+            "acn",
+            "supervisor",
+            "run",
+            "--runtime-fingerprint",
+            "not-a-digest",
+        ])
+        .unwrap_err()
+        .to_string();
+        let status = super::parse_supervisor_cli_from([
+            "acn",
+            "supervisor",
+            "status",
+            "--runtime-fingerprint",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])
+        .unwrap_err()
+        .to_string();
+
+        assert!(invalid.contains("64 位小写十六进制"));
+        assert!(status.contains("仅支持 acn supervisor run"));
     }
 
     #[test]
@@ -3191,6 +3862,7 @@ retry_max_delay_ms = 5000
             pid: Some(42),
             started_at: None,
             build: None,
+            runtime_fingerprint: None,
             queue: SupervisorQueueSummary {
                 total: 1,
                 queued: 0,
@@ -3207,6 +3879,7 @@ retry_max_delay_ms = 5000
                 started_at: Some(now),
                 finished_at: None,
                 attempts: 2,
+                manual_retries: 1,
                 last_error: None,
             }),
             socket_path: "/tmp/acn.sock".into(),
@@ -3232,6 +3905,7 @@ retry_max_delay_ms = 5000
             pid: Some(42),
             started_at: None,
             build: None,
+            runtime_fingerprint: None,
             queue: SupervisorQueueSummary {
                 total: 1,
                 queued: 0,
@@ -3248,6 +3922,7 @@ retry_max_delay_ms = 5000
                 started_at: Some(now),
                 finished_at: None,
                 attempts: 2,
+                manual_retries: 1,
                 last_error: None,
             }),
             socket_path: "/tmp/acn.sock".into(),
@@ -3279,6 +3954,7 @@ retry_max_delay_ms = 5000
             started_at: Some(now),
             finished_at: Some(now),
             attempts: 3,
+            manual_retries: 2,
             last_error: Some("bad\tline\nagain".to_string()),
         }];
 
@@ -3309,6 +3985,7 @@ retry_max_delay_ms = 5000
                 started_at: None,
                 finished_at: None,
                 attempts: 1,
+                manual_retries: 0,
                 last_error: None,
             })
             .collect::<Vec<_>>();
@@ -3342,6 +4019,7 @@ retry_max_delay_ms = 5000
                 started_at: None,
                 finished_at: None,
                 attempts: 1,
+                manual_retries: 0,
                 last_error: None,
             })
             .collect::<Vec<_>>();
@@ -3369,6 +4047,25 @@ retry_max_delay_ms = 5000
 
         assert!(text.contains("supervisor still shutting down"));
         assert!(!text.contains("current job"));
+    }
+
+    #[test]
+    fn supervisor_retry_output_is_identical_after_session_or_job_resolution() {
+        let report = agent_claim_network::supervisor::SupervisorRetryReport {
+            session_id: "session_1234abcd".parse().unwrap(),
+            job_id: "job_123_abcdef01".to_string(),
+            previous_attempts: 5,
+            manual_retries: 2,
+        };
+
+        let from_session = super::supervisor_retry_report_text(&report);
+        let from_job = super::supervisor_retry_report_text(&report);
+
+        assert_eq!(from_session, from_job);
+        assert!(from_session.contains("session_id: session_1234abcd"));
+        assert!(from_session.contains("job_id: job_123_abcdef01"));
+        assert!(from_session.contains("attempts: 5 -> 0"));
+        assert!(from_session.contains("manual_retries: 2"));
     }
 
     #[test]

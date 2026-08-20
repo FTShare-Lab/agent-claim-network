@@ -12,6 +12,18 @@ struct ProcessExecutionDelivery {
 }
 
 impl ToolRegistry {
+    pub(crate) fn empty_background_process_projection() -> String {
+        concat!(
+            "<background_processes>\n",
+            "Authoritative runtime state, not a user request. process_id is not an OS PID.\n",
+            "Processes:\n",
+            "- none\n",
+            "Use process_list for full live-process details and write_stdin with empty chars to read final output.\n",
+            "</background_processes>"
+        )
+        .to_string()
+    }
+
     pub(crate) async fn process_snapshots_for_root_session(
         &self,
         session_id: &SessionId,
@@ -53,14 +65,24 @@ impl ToolRegistry {
         snapshots
     }
 
-    /// 供 SessionEngine/TUI 独立消费的后台完成事件；它不属于原始 tool call 的回包。
-    pub(crate) async fn take_process_completions_for_root_session(
+    /// 供 SessionEngine/TUI durable 消费的后台完成事件；成功写 journal 后再 ack。
+    pub(crate) async fn pending_process_completions_for_root_session(
         &self,
         session_id: &SessionId,
     ) -> Vec<ProcessCompletion> {
         self.process_manager
-            .take_completions_for_root(session_id.as_str())
+            .pending_completions_for_root(session_id.as_str())
             .await
+    }
+
+    pub(crate) async fn acknowledge_process_completion_for_root_session(
+        &self,
+        session_id: &SessionId,
+        instance_id: u64,
+    ) {
+        self.process_manager
+            .acknowledge_completion_for_root(session_id.as_str(), instance_id)
+            .await;
     }
 
     /// 供 SessionEngine 消费的后台 terminal 生命周期事件。它们仅用于 runtime / TUI
@@ -81,11 +103,34 @@ impl ToolRegistry {
         session_id: &SessionId,
         subagent_id: Option<&str>,
     ) -> (Option<String>, Vec<ProcessCompletionDeliveryReceipt>) {
+        self.begin_background_process_projection_delivery_for_owner_with_persisted(
+            session_id,
+            subagent_id,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub(crate) async fn begin_background_process_projection_delivery_for_owner_with_persisted(
+        &self,
+        session_id: &SessionId,
+        subagent_id: Option<&str>,
+        persisted_completions: Vec<ProcessCompletion>,
+    ) -> (Option<String>, Vec<ProcessCompletionDeliveryReceipt>) {
         let owner = self.process_owner_for_session(session_id, subagent_id);
-        let (delivery_ids, completion_notifications) = self
+        let (delivery_ids, mut completion_notifications) = self
             .process_manager
             .begin_completion_notification_delivery_snapshot(&owner)
             .await;
+        completion_notifications.extend(persisted_completions);
+        completion_notifications.sort_by(|left, right| {
+            left.process_id
+                .cmp(&right.process_id)
+                .then_with(|| left.instance_id.cmp(&right.instance_id))
+        });
+        completion_notifications.dedup_by(|left, right| {
+            left.process_id == right.process_id && left.instance_id == right.instance_id
+        });
         let projection = self
             .background_process_projection_for_owner_with_notifications(
                 &owner,
@@ -95,153 +140,136 @@ impl ToolRegistry {
         (projection, delivery_ids)
     }
 
+    /// Main session 先冻结本 request 可见的 completion，再由 SessionEngine 将同一批次
+    /// 写入 turn journal。冻结后到 projection 之间新完成的进程留到下一次 request。
+    pub(crate) async fn begin_background_completion_delivery_for_owner(
+        &self,
+        session_id: &SessionId,
+        subagent_id: Option<&str>,
+    ) -> (
+        Vec<ProcessCompletionDeliveryReceipt>,
+        Vec<ProcessCompletion>,
+    ) {
+        let owner = self.process_owner_for_session(session_id, subagent_id);
+        self.process_manager
+            .begin_completion_notification_delivery_snapshot(&owner)
+            .await
+    }
+
+    pub(crate) async fn background_process_projection_for_owner_with_journaled_terminals(
+        &self,
+        session_id: &SessionId,
+        subagent_id: Option<&str>,
+        completion_notifications: Vec<ProcessCompletion>,
+        journaled_terminal_instances: &BTreeSet<(String, u64)>,
+    ) -> Option<String> {
+        let owner = self.process_owner_for_session(session_id, subagent_id);
+        self.background_process_projection_for_owner_with_notifications_inner(
+            &owner,
+            completion_notifications,
+            Some(journaled_terminal_instances),
+        )
+        .await
+    }
+
     pub(super) async fn background_process_projection_for_owner_with_notifications(
         &self,
         owner: &ProcessOwner,
         completion_notifications: Vec<ProcessCompletion>,
     ) -> Option<String> {
+        self.background_process_projection_for_owner_with_notifications_inner(
+            owner,
+            completion_notifications,
+            None,
+        )
+        .await
+    }
+
+    async fn background_process_projection_for_owner_with_notifications_inner(
+        &self,
+        owner: &ProcessOwner,
+        completion_notifications: Vec<ProcessCompletion>,
+        journaled_terminal_instances: Option<&BTreeSet<(String, u64)>>,
+    ) -> Option<String> {
         let entries = self.process_manager.retained_for_owner(owner).await;
         if entries.is_empty() && completion_notifications.is_empty() {
             return None;
         }
-        let mut live = Vec::new();
-        let mut terminal = Vec::new();
+        let mut rows = Vec::new();
         for entry in entries {
             let state = entry.state().await;
-            let started_at = entry
-                .started_at
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_secs())
-                .unwrap_or_default();
-            let live_elapsed_minutes = entry
-                .started_at
-                .elapsed()
-                .map(|duration| duration.as_secs() / 60)
-                .unwrap_or_default();
-            let command = truncate_chars(&entry.command, 400).0;
-            let cwd = truncate_chars(&entry.cwd, 200).0;
-            if state.is_live() {
-                live.push((
-                    state,
-                    started_at,
-                    entry.id.as_str().to_string(),
-                    entry.tty,
-                    live_elapsed_minutes,
-                    command,
-                    cwd,
-                ));
-            } else {
-                let finished_at = entry
-                    .finished_at()
-                    .await
-                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|duration| duration.as_secs())
-                    .unwrap_or(started_at);
-                let elapsed_minutes = entry
-                    .finished_at()
-                    .await
-                    .and_then(|time| time.duration_since(entry.started_at).ok())
-                    .map(|duration| duration.as_secs() / 60)
-                    .unwrap_or_default();
-                let exit = match state {
-                    ProcessState::Finished {
-                        exit_code, signal, ..
-                    }
-                    | ProcessState::Terminated { exit_code, signal } => exit_code
-                        .map(|code| code.to_string())
-                        .or_else(|| signal.map(|signal| format!("SIG{signal}")))
-                        .unwrap_or_else(|| "unknown".into()),
-                    ProcessState::Error => "unknown".into(),
-                    ProcessState::Starting | ProcessState::Running | ProcessState::Terminating => {
-                        "-".into()
-                    }
-                };
-                terminal.push((
-                    finished_at,
-                    entry.id.as_str().to_string(),
-                    entry.instance_id,
-                    state.label().to_string(),
-                    exit,
-                    elapsed_minutes,
-                    command,
-                    entry.final_result_available().await,
-                ));
-            }
-        }
-        let terminal_instances = terminal
-            .iter()
-            .map(|entry| (entry.1.clone(), entry.2))
-            .collect::<BTreeSet<_>>();
-        for completion in completion_notifications {
-            if terminal_instances.contains(&(completion.process_id.clone(), completion.instance_id))
+            if !state.is_live()
+                && journaled_terminal_instances.is_some_and(|instances| {
+                    !instances.contains(&(entry.id.as_str().to_string(), entry.instance_id))
+                })
             {
                 continue;
             }
-            let finished_at = completion
-                .finished_at
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_secs())
-                .unwrap_or_default();
-            terminal.push((
-                finished_at,
-                completion.process_id,
-                completion.instance_id,
-                completion.status,
-                completion
-                    .exit_code
-                    .map(|code| code.to_string())
-                    .or_else(|| completion.signal.map(|signal| format!("SIG{signal}")))
-                    .unwrap_or_else(|| "unknown".into()),
-                completion.elapsed_minutes,
-                "completion notification; entry evicted before final output delivery".into(),
-                false,
+            let final_output_available = !state.is_live();
+            let command = truncate_chars(&entry.command, 400).0;
+            let cwd = truncate_chars(&entry.cwd, 200).0;
+            let (exit_code, signal) = match state {
+                ProcessState::Finished {
+                    exit_code, signal, ..
+                }
+                | ProcessState::Terminated { exit_code, signal } => (exit_code, signal),
+                ProcessState::Starting
+                | ProcessState::Running
+                | ProcessState::Terminating
+                | ProcessState::Error => (None, None),
+            };
+            rows.push((
+                entry.id.as_str().to_string(),
+                entry.instance_id,
+                format!(
+                    "- process_id={} instance_id={} state={} exit_code={} signal={} final_output_available={} tty={} command={:?} cwd={:?}",
+                    entry.id.as_str(),
+                    entry.instance_id,
+                    semantic_process_state_label(state),
+                    exit_code.map_or_else(|| "null".into(), |code| code.to_string()),
+                    signal.map_or_else(|| "null".into(), |value| value.to_string()),
+                    final_output_available,
+                    entry.tty,
+                    command,
+                    cwd,
+                ),
             ));
         }
-        live.sort_by(|left, right| {
-            let rank = |state: ProcessState| match state {
-                ProcessState::Starting | ProcessState::Running => 0_u8,
-                ProcessState::Terminating => 1,
-                ProcessState::Finished { .. }
-                | ProcessState::Terminated { .. }
-                | ProcessState::Error => 2,
-            };
-            rank(left.0)
-                .cmp(&rank(right.0))
-                .then_with(|| right.1.cmp(&left.1))
-                .then_with(|| left.2.cmp(&right.2))
-        });
-        terminal.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        let retained_instances = rows
+            .iter()
+            .map(|entry| (entry.0.clone(), entry.1))
+            .collect::<BTreeSet<_>>();
+        for completion in completion_notifications {
+            if retained_instances.contains(&(completion.process_id.clone(), completion.instance_id))
+            {
+                continue;
+            }
+            rows.push((
+                completion.process_id.clone(),
+                completion.instance_id,
+                format!(
+                    "- process_id={} instance_id={} state={} exit_code={} signal={} final_output_available=false",
+                    completion.process_id,
+                    completion.instance_id,
+                    completion.status,
+                    completion
+                        .exit_code
+                        .map_or_else(|| "null".into(), |code| code.to_string()),
+                    completion
+                        .signal
+                        .map_or_else(|| "null".into(), |value| value.to_string()),
+                ),
+            ));
+        }
+        rows.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
 
         let mut projection = String::from(
             "<background_processes>\nAuthoritative runtime state, not a user request. process_id is not an OS PID.\n",
         );
-        if !live.is_empty() {
-            projection.push_str("Live processes:\n");
-            for (state, started_at, process_id, tty, elapsed_minutes, command, cwd) in live {
-                projection.push_str(&format!(
-                    "- process_id={process_id} state={} tty={tty} started_at={started_at} elapsed={}m command={command:?} cwd={cwd:?}\n",
-                    state.label(), elapsed_minutes
-                ));
-            }
-        }
-        if !terminal.is_empty() {
-            projection.push_str("Recently completed:\n");
-            for (
-                finished_at,
-                process_id,
-                _instance_id,
-                state,
-                exit,
-                elapsed_minutes,
-                command,
-                final_available,
-            ) in terminal
-            {
-                projection.push_str(&format!(
-                    "- process_id={process_id} state={state} exit_code={exit} finished_at={finished_at} elapsed={}m final_output_available={final_available} command={command:?}\n",
-                    elapsed_minutes
-                ));
-            }
+        projection.push_str("Processes:\n");
+        for (_, _, row) in rows {
+            projection.push_str(&row);
+            projection.push('\n');
         }
         projection.push_str(
             "Use process_list for full live-process details and write_stdin with empty chars to read final output.\n</background_processes>",
@@ -346,6 +374,16 @@ impl ToolRegistry {
             .await;
     }
 
+    pub(crate) async fn settle_processes_for_session(
+        &self,
+        session_id: &SessionId,
+        wait: Duration,
+    ) {
+        self.process_manager
+            .settle_root_session(session_id.as_str(), wait)
+            .await;
+    }
+
     /// 当前 ACN runtime 正常退出时收束其注册的所有后台 terminal。
     pub(crate) async fn shutdown_background_processes(&self) {
         self.process_manager.shutdown_all().await;
@@ -433,6 +471,7 @@ impl ToolRegistry {
                     cwd_display,
                     true,
                     spawned.process_group_id,
+                    context.current_turn_id.clone(),
                     context.tool_use_id.clone(),
                 )
                 .await
@@ -517,6 +556,7 @@ impl ToolRegistry {
                     cwd_display,
                     false,
                     process_group_id,
+                    context.current_turn_id.clone(),
                     context.tool_use_id.clone(),
                 )
                 .await
@@ -784,7 +824,7 @@ impl ToolRegistry {
         }
     }
 
-    pub(super) fn process_owner_for_session(
+    pub(crate) fn process_owner_for_session(
         &self,
         session_id: &SessionId,
         subagent_id: Option<&str>,
@@ -813,7 +853,11 @@ impl ToolRegistry {
         };
         let owner = self.process_owner(context);
         self.process_manager
-            .live_ids_for_owner_and_tool_use(&owner, tool_use_id)
+            .live_ids_for_owner_and_tool_use(
+                &owner,
+                context.current_turn_id.as_deref(),
+                tool_use_id,
+            )
             .await
     }
 
@@ -1104,6 +1148,17 @@ impl ToolRegistry {
     }
 }
 
+fn semantic_process_state_label(state: ProcessState) -> &'static str {
+    match state {
+        ProcessState::Starting => "starting",
+        ProcessState::Running => "running",
+        ProcessState::Terminating => "terminating",
+        ProcessState::Finished { .. } => "finished",
+        ProcessState::Terminated { .. } => "terminated",
+        ProcessState::Error => "error",
+    }
+}
+
 /// Spawn 前注册还没有完成时的本地 cleanup guard。登记成功后 watcher 接管 child 生命周期。
 pub(super) struct SpawnedProcessKillGuard {
     process_group_id: Option<i32>,
@@ -1242,6 +1297,11 @@ fn spawn_pipe_watcher(
         }
         let root_reap_gate = process.acquire_root_reap_gate().await;
         let child_status = child.wait().await;
+        if let Ok(status) = &child_status {
+            process
+                .record_observed_root_exit(status.code(), exit_signal(status), status.success())
+                .await;
+        }
         process.retire_process_group_after_root_reap().await;
         drop(root_reap_gate);
         match child_status {
@@ -1496,6 +1556,17 @@ fn spawn_pty_watcher(
         }
         let root_reap_gate = process.acquire_root_reap_gate().await;
         let waited = tokio::task::spawn_blocking(move || child.wait()).await;
+        if let Ok(Ok(status)) = &waited {
+            let signal = status.signal().and_then(pty_signal_number);
+            let exit_code = if signal.is_some() {
+                None
+            } else {
+                i32::try_from(status.exit_code()).ok()
+            };
+            process
+                .record_observed_root_exit(exit_code, signal, status.success())
+                .await;
+        }
         process.retire_process_group_after_root_reap().await;
         drop(root_reap_gate);
         // root 已终态后主动关 master，确保 reader 不会被逃离 terminal 的后代无限挂住。

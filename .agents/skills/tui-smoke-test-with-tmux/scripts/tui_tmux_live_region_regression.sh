@@ -21,8 +21,8 @@ FAKE_ACN_HOME=""
 
 cleanup_live_region() {
   tui_cleanup
-  if [[ -x "$REPO_ROOT/target/debug/acn" && -f "$FAKE_CONFIG" ]]; then
-    "$REPO_ROOT/target/debug/acn" supervisor stop --config "$FAKE_CONFIG" >/dev/null 2>&1 || true
+  if [[ -f "$FAKE_CONFIG" ]]; then
+    tui_terminate_owned_supervisors "$FAKE_CONFIG" "$ACN_BINARY" || true
   fi
   if [[ -n "$FAKE_SERVER_PID" ]]; then
     kill "$FAKE_SERVER_PID" >/dev/null 2>&1 || true
@@ -78,6 +78,8 @@ assert_box_inner_rows() {
 }
 
 tui_build_if_needed
+ACN_BINARY="$(tui_resolve_binary TUI_ACN_BINARY acn bin)"
+FAKE_SERVER_BINARY="$(tui_resolve_binary TUI_FAKE_SERVER_BINARY fake_anthropic_sse_server example)"
 TUI_SKIP_BUILD=1
 
 mkdir -p "$TUI_OUT_DIR"
@@ -87,7 +89,7 @@ FAKE_CONFIG="$TUI_OUT_DIR_ABS/config.toml"
 FAKE_ACN_HOME="$(mktemp -d "$TUI_OUT_DIR_ABS/acn-home.XXXXXX")"
 SUPERVISOR_JOBS_CAPTURE="$TUI_OUT_DIR_ABS/supervisor-jobs.txt"
 rm -f "$FAKE_READY_FILE"
-"$REPO_ROOT/target/debug/examples/fake_anthropic_sse_server" \
+"$FAKE_SERVER_BINARY" \
   --ready-file "$FAKE_READY_FILE" &
 FAKE_SERVER_PID="$!"
 # 确保后续配置或 TUI 启动失败时也能回收 fake server。
@@ -134,11 +136,9 @@ interval_turns = 100
 [agent.session.tui]
 live_response_preview_max_lines = 15
 EOF
-TUI_COMMAND="ACN_FAKE_LLM_API_KEY=test-key target/debug/acn --config '$FAKE_CONFIG'"
+TUI_COMMAND="ACN_FAKE_LLM_API_KEY=test-key '$ACN_BINARY' --config '$FAKE_CONFIG'"
 
 tui_start
-# `tui_start` 会安装自己的 trap，成功后恢复包含 fake server 的清理逻辑。
-trap cleanup_live_region EXIT
 
 INITIAL_SEEN="0"
 for _ in $(seq 1 "$TUI_STARTUP_WAIT"); do
@@ -203,7 +203,7 @@ tui_send_keys "/exit" Enter
 FINALIZE_SUCCEEDED="0"
 for _ in $(seq 1 50); do
   sleep 0.2
-  if "$REPO_ROOT/target/debug/acn" supervisor jobs --config "$FAKE_CONFIG" -l 0 \
+  if "$ACN_BINARY" supervisor jobs --config "$FAKE_CONFIG" -l 0 \
     > "$SUPERVISOR_JOBS_CAPTURE" 2>&1 \
     && [[ "$(rg -c '^job_[0-9]' "$SUPERVISOR_JOBS_CAPTURE" || true)" == "1" ]] \
     && rg -q '^job_[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+session_[0-9a-f]{8}[[:space:]]+succeeded[[:space:]]+' "$SUPERVISOR_JOBS_CAPTURE" \

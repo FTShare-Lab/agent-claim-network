@@ -12,13 +12,16 @@ REAL_LLM_BOUNDARY_REPEATS="${REAL_LLM_BOUNDARY_REPEATS:-2}"
 REAL_LLM_LOCK_REPEATS="${REAL_LLM_LOCK_REPEATS:-1}"
 REAL_LLM_DIFF_REPEATS="${REAL_LLM_DIFF_REPEATS:-1}"
 REAL_LLM_WAIT_SECS="${REAL_LLM_WAIT_SECS:-420}"
-REAL_LLM_STARTUP_WAIT_SECS="${REAL_LLM_STARTUP_WAIT_SECS:-8}"
+REAL_LLM_STARTUP_WAIT_SECS="${REAL_LLM_STARTUP_WAIT_SECS:-30}"
 REAL_LLM_WIDTH="${REAL_LLM_WIDTH:-132}"
 REAL_LLM_HEIGHT="${REAL_LLM_HEIGHT:-40}"
+BOUNDARY_WEB_PID=""
+BOUNDARY_OUTSIDE_DIR=""
 
 mkdir -p "$BASE_OUT"
 SUMMARY_PATH="$BASE_OUT/summary.md"
 printf '# Delegation Real LLM TUI Smoke Suite\n\n' > "$SUMMARY_PATH"
+IFS=$'\t' read -r REAL_LLM_UPSTREAM REAL_LLM_AGENT_ID < <(tui_config_agent_identity "$REPO_ROOT/config.toml")
 
 require_env() {
   local name="$1"
@@ -49,15 +52,15 @@ text, acn_home_count = re.subn(
     count=1,
 )
 text, provider_count = re.subn(
-    r'(?m)^provider = "anthropic"$',
-    'provider = "openai_compatible_chat"',
+    r'(?ms)(^\[agent\.llm\]\n.*?^provider\s*=\s*)"[^"]*"',
+    r'\1"openai_chat"',
     text,
     count=1,
 )
 if acn_home_count != 1:
     raise SystemExit("expected exactly one acn_home entry in config.toml")
 if provider_count != 1:
-    raise SystemExit('expected exactly one agent provider = "anthropic" entry in config.toml')
+    raise SystemExit("expected exactly one agent.llm provider entry in config.toml")
 config_path.write_text(text)
 PY
   printf '%s\n' "$config_path"
@@ -91,7 +94,7 @@ wait_until() {
 
 agent_home_for_run() {
   local run_root="$1"
-  printf '%s\n' "$run_root/acn_home/dev/data/agents/agent-a"
+  printf '%s\n' "$run_root/acn_home/$REAL_LLM_UPSTREAM/data/agents/$REAL_LLM_AGENT_ID"
 }
 
 latest_session_dir() {
@@ -383,6 +386,32 @@ append_summary() {
   printf '%s\n' "$*" >> "$SUMMARY_PATH"
 }
 
+cleanup_boundary_resources() {
+  if [[ "$BOUNDARY_WEB_PID" =~ ^[0-9]+$ ]]; then
+    kill "$BOUNDARY_WEB_PID" >/dev/null 2>&1 || true
+    wait "$BOUNDARY_WEB_PID" 2>/dev/null || true
+  fi
+  BOUNDARY_WEB_PID=""
+  if [[ -n "$BOUNDARY_OUTSIDE_DIR" && -d "$BOUNDARY_OUTSIDE_DIR" ]]; then
+    case "$BOUNDARY_OUTSIDE_DIR" in
+      /tmp/acn-deleg-boundary.*) rm -rf -- "$BOUNDARY_OUTSIDE_DIR" ;;
+    esac
+  fi
+  BOUNDARY_OUTSIDE_DIR=""
+}
+
+cleanup_delegation_tui() {
+  local cleanup_status=0
+  tui_cleanup
+  if [[ -n "${CONFIG_PATH:-}" ]]; then
+    if ! tui_terminate_owned_supervisors "$CONFIG_PATH" "$ACN_BINARY"; then
+      cleanup_status=1
+    fi
+  fi
+  cleanup_boundary_resources
+  return "$cleanup_status"
+}
+
 start_tui_case() {
   local case_name="$1"
   local iter="$2"
@@ -396,20 +425,23 @@ start_tui_case() {
   fi
   TUI_SESSION="acn_subagent_${case_name}_${iter}_$$"
   TUI_OUT_DIR="$RUN_ROOT/captures"
-  TUI_COMMAND="cargo run --quiet --bin acn -- --config '$CONFIG_PATH'"
+  TUI_COMMAND="'$ACN_BINARY' --config '$CONFIG_PATH'"
   TUI_WIDTH="$REAL_LLM_WIDTH"
   TUI_HEIGHT="$REAL_LLM_HEIGHT"
   TUI_SKIP_BUILD="${TUI_SKIP_BUILD:-0}"
+  trap cleanup_delegation_tui EXIT
   tui_start
-  sleep "$REAL_LLM_STARTUP_WAIT_SECS"
-  tui_capture "initial"
-  tui_assert_contains "initial" "ACN|open|initializing|Whisper your wish" "TUI did not start for $case_name/$iter"
+  if ! wait_until "$REAL_LLM_STARTUP_WAIT_SECS" "TUI startup for $case_name/$iter" \
+    capture_has_patterns "initial" "ACN|open|initializing|Whisper your wish"; then
+    tui_capture "initial" || true
+    return 1
+  fi
 }
 
 finish_tui_case() {
   tui_capture "final"
   tui_assert_stderr_empty
-  tui_cleanup
+  cleanup_delegation_tui
 }
 
 case_happy() {
@@ -450,7 +482,7 @@ case_happy() {
   sleep 1
   tui_capture "panel_closed"
   tui_assert_not_contains "panel_closed" "Session Subagents" "Esc did not close happy panel"
-  metadata_contain "$session_dir" "owner_agent_id: agent-a"
+  metadata_contain "$session_dir" "owner_agent_id: $REAL_LLM_AGENT_ID"
   metadata_contain "$session_dir" "parent_session_id: session_"
   result_contain "$session_dir" "$rel_path"
   events_contain "$session_dir" "file_write"
@@ -463,7 +495,7 @@ case_happy() {
 
 prepare_boundary_before_tui() {
   local iter="$1"
-  local upstream_root="$RUN_ROOT/acn_home/dev"
+  local upstream_root="$RUN_ROOT/acn_home/$REAL_LLM_UPSTREAM"
   local mcp_config="$upstream_root/.mcp.json"
   local marker_file="$RUN_ROOT/mcp_boundary_marker.txt"
   local server_script="$RUN_ROOT/mcp_boundary_server.py"
@@ -489,6 +521,14 @@ for line in sys.stdin:
         continue
     method = request.get("method")
     request_id = request.get("id")
+    if method == "server/discover":
+        if request_id is not None:
+            send({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32601, "message": "Method not found"},
+            })
+        continue
     if method == "initialize":
         result = {
             "protocolVersion": "2025-11-25",
@@ -542,12 +582,12 @@ server_script = str(Path(sys.argv[2]).resolve())
 marker_file = str(Path(sys.argv[3]).resolve())
 config_marker = sys.argv[4]
 config_path.write_text(json.dumps({
-    "mcp_boundary_marker": config_marker,
     "mcpServers": {
         "boundary": {
             "type": "stdio",
             "command": "python3",
             "args": [server_script, marker_file],
+            "env": {"BOUNDARY_MCP_FILE_MARKER": config_marker},
             "startup_timeout_secs": 30,
             "tool_timeout_secs": 30,
         }
@@ -566,27 +606,19 @@ case_boundary() {
   start_tui_case "boundary" "$iter"
   local work_rel="target/tui-scenarios/delegation-real-llm/boundary/iter-$iter/work"
   local outside_dir
-  outside_dir="$(mktemp -d "${TMPDIR:-/tmp}/acn-deleg-boundary-outside.XXXXXX")"
+  # macOS 的 TMPDIR 很长且含高熵路径，真实模型容易在 tool argument 中抄错。
+  # 短的随机 /tmp 路径仍位于 workspace 外，不改变这个 boundary 的验证目标。
+  outside_dir="$(mktemp -d "/tmp/acn-deleg-boundary.XXXXXX")"
+  BOUNDARY_OUTSIDE_DIR="$outside_dir"
   local outside_marker="$BOUNDARY_OUTSIDE_MARKER"
   local mcp_file_marker="$BOUNDARY_MCP_FILE_MARKER"
   local web_marker="$BOUNDARY_WEB_MARKER"
   local code_marker="$BOUNDARY_CODE_MARKER"
   local mcp_tool_marker="$BOUNDARY_MCP_TOOL_MARKER"
-  local web_pid=""
-  cleanup_boundary_resources() {
-    if [[ -n "${web_pid:-}" ]]; then
-      kill "$web_pid" >/dev/null 2>&1 || true
-      wait "$web_pid" 2>/dev/null || true
-    fi
-    if [[ -n "${outside_dir:-}" && -d "$outside_dir" ]]; then
-      rm -rf "$outside_dir"
-    fi
-  }
-  trap cleanup_boundary_resources RETURN
   mkdir -p "$REPO_ROOT/$work_rel"
   local outside_abs="$outside_dir/outside.txt"
   printf '%s\n' "$outside_marker" > "$outside_abs"
-  local runtime_mcp_config="$RUN_ROOT/acn_home/dev/.mcp.json"
+  local runtime_mcp_config="$RUN_ROOT/acn_home/$REAL_LLM_UPSTREAM/.mcp.json"
   local code_probe="$RUN_ROOT/code_probe.sh"
   {
     printf '#!/usr/bin/env bash\n'
@@ -619,11 +651,11 @@ with socketserver.TCPServer(("127.0.0.1", 0), handler) as httpd:
     port_file.write_text(str(httpd.server_address[1]))
     httpd.serve_forever()
 PY
-  web_pid=$!
+  BOUNDARY_WEB_PID=$!
   wait_until 10 "local boundary web server port" test -s "$web_port_file"
   local web_port
   web_port="$(cat "$web_port_file")"
-  local prompt="Create exactly one session subagent now with title smoke-boundary-$iter and role capability verifier. Subagent objective: call update_subagent_progress current_step boundary-start; use file_read with absolute path '$outside_abs' and include the exact token found in that file; use file_read with absolute path '$runtime_mcp_config' and include the exact value of mcp_boundary_marker from the selected upstream runtime MCP config; use web_request GET url 'http://127.0.0.1:$web_port/probe.txt' and include the exact response body token; use code_run to run exactly bash '$code_probe' and include the exact stdout token plus the exact ACN_SUBAGENT_ID=... and ACN_PARENT_SESSION_ID=... lines printed by that script; call MCP tool mcp__boundary__boundary_probe with empty arguments and include the exact returned text token; call update_subagent_progress current_step boundary-done with a concise summary containing outside_read_ok, mcp_file_read_ok, localhost_web_request_ok, code_run_ok, mcp_tool_ok; final answer must contain boundary_capability_complete, the exact five observed tokens, and the exact ACN_SUBAGENT_ID=subagent... and ACN_PARENT_SESSION_ID=session... lines observed from code_run. Do not create files. Parent-only instruction: in this parent turn, the only tool you may call is create_subagent; do not call code_run, file tools, web tools, read_subagent, or any other tool before or after create_subagent; this parent-only instruction must not be passed as a subagent constraint."
+  local prompt="Create exactly one session subagent now with title smoke-boundary-$iter and role capability verifier. Subagent objective: call update_subagent_progress current_step boundary-start; use file_read with absolute path '$outside_abs' and include the exact token found in that file; use file_read with absolute path '$runtime_mcp_config' and include the exact value of env.BOUNDARY_MCP_FILE_MARKER from the boundary server in the selected upstream runtime MCP config; use web_request GET url 'http://127.0.0.1:$web_port/probe.txt' and include the exact response body token; use code_run to run exactly bash '$code_probe' and include the exact stdout token plus the exact ACN_SUBAGENT_ID=... and ACN_PARENT_SESSION_ID=... lines printed by that script; call MCP tool mcp__boundary__boundary_probe with empty arguments and include the exact returned text token; call update_subagent_progress current_step boundary-done with a concise summary containing outside_read_ok, mcp_file_read_ok, localhost_web_request_ok, code_run_ok, mcp_tool_ok; final answer must contain boundary_capability_complete, the exact five observed tokens, and the exact ACN_SUBAGENT_ID=subagent... and ACN_PARENT_SESSION_ID=session... lines observed from code_run. Do not create files. Parent-only instruction: in this parent turn, the only tool you may call is create_subagent; do not call code_run, file tools, web tools, read_subagent, or any other tool before or after create_subagent; this parent-only instruction must not be passed as a subagent constraint."
   send_prompt_text "boundary" "$prompt"
 
   local session_dir
@@ -671,9 +703,8 @@ PY
     '"type":"tool_completed","tool_name":"mcp__boundary__boundary_probe"'
   assert_tool_completed_line_has_literals "$session_dir" \
     "code_run" \
-    "tool code_run ok" \
-    "ACN_SUBAGENT_ID=$delegation_id" \
-    "ACN_PARENT_SESSION_ID=$session_id"
+    "tool code_run exit_code=0" \
+    '"outcome":{"kind":"process_exit","exit_code":0,"success":true}'
   assert_tool_completed_line_has_literals "$session_dir" \
     "mcp__boundary__boundary_probe" \
     "tool mcp__boundary__boundary_probe ok" \
@@ -691,8 +722,6 @@ PY
   assert_forbidden_child_tools_absent "$session_dir"
   assert_no_secret_env_leaks "$session_dir/delegations"
   finish_tui_case
-  cleanup_boundary_resources
-  trap - RETURN
   append_summary "- boundary/$iter passed: $session_dir"
 }
 
@@ -787,9 +816,12 @@ main() {
     source export_env.sh
   fi
   require_env ACN_LLM_API_KEY
-  append_summary "- real LLM provider: openai_compatible_chat"
-  append_summary "- repeats: happy=$REAL_LLM_HAPPY_REPEATS boundary=$REAL_LLM_BOUNDARY_REPEATS lock=$REAL_LLM_LOCK_REPEATS diff=$REAL_LLM_DIFF_REPEATS"
   TUI_BUILD_COMMAND="${TUI_BUILD_COMMAND:-cargo build --quiet --bin acn}"
+  tui_build_if_needed
+  ACN_BINARY="$(tui_resolve_binary TUI_ACN_BINARY acn bin)"
+  TUI_SKIP_BUILD=1
+  append_summary "- real LLM provider: openai_chat"
+  append_summary "- repeats: happy=$REAL_LLM_HAPPY_REPEATS boundary=$REAL_LLM_BOUNDARY_REPEATS lock=$REAL_LLM_LOCK_REPEATS diff=$REAL_LLM_DIFF_REPEATS"
 
   local i
   for ((i = 1; i <= REAL_LLM_HAPPY_REPEATS; i++)); do

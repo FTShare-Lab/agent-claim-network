@@ -7,7 +7,7 @@
 use serde_json::Value;
 
 use super::provider::{ContextUsageSnapshot, ContextUsageSource, ToolSpec};
-use super::types::{SessionTurnContentBlock, SessionTurnMessage};
+use super::types::{ProviderReplayState, SessionTurnContentBlock, SessionTurnMessage};
 
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 const APPROX_MEDIA_BLOCK_TOKENS: usize = 2_000;
@@ -42,18 +42,37 @@ pub fn estimate_session_turn_messages_tokens(messages: &[SessionTurnMessage]) ->
 }
 
 fn estimate_session_turn_message_tokens(message: &SessionTurnMessage) -> usize {
-    estimate_text_tokens(&message.role).saturating_add(
-        message
-            .content
+    let canonical_tokens = message
+        .content
+        .iter()
+        .map(estimate_session_turn_content_block_tokens)
+        .fold(0usize, usize::saturating_add);
+    let replay_tokens = message
+        .provider_replay
+        .as_ref()
+        .map(estimate_provider_replay_tokens)
+        .unwrap_or(0);
+    estimate_text_tokens(&message.role).saturating_add(canonical_tokens.max(replay_tokens))
+}
+
+pub fn estimate_provider_replay_tokens(replay: &ProviderReplayState) -> usize {
+    match replay {
+        ProviderReplayState::OpenAiResponses { items, .. } => items
             .iter()
-            .map(estimate_session_turn_content_block_tokens)
+            .map(estimate_json_tokens)
             .fold(0usize, usize::saturating_add),
-    )
+        ProviderReplayState::OpenAiChatCompletions { messages, .. }
+        | ProviderReplayState::AnthropicMessages { messages, .. } => messages
+            .iter()
+            .map(estimate_json_tokens)
+            .fold(0usize, usize::saturating_add),
+    }
 }
 
 fn estimate_session_turn_content_block_tokens(block: &SessionTurnContentBlock) -> usize {
     match block {
-        SessionTurnContentBlock::Text { text } => estimate_text_tokens(text),
+        SessionTurnContentBlock::Text { text }
+        | SessionTurnContentBlock::ModelContext { text, .. } => estimate_text_tokens(text),
         SessionTurnContentBlock::SkillInstructions { instruction } => {
             estimate_text_tokens(&crate::skill::render_skill_instructions(instruction))
         }
@@ -108,5 +127,52 @@ mod tests {
 
         assert!(snapshot.used_tokens >= APPROX_MEDIA_BLOCK_TOKENS * 2);
         assert_eq!(snapshot.source, ContextUsageSource::Estimate);
+    }
+
+    #[test]
+    fn local_context_estimate_counts_provider_replay_without_double_counting_canonical() {
+        let canonical = SessionTurnMessage::assistant_text("visible answer");
+        let replay = canonical
+            .clone()
+            .with_provider_replay(ProviderReplayState::OpenAiResponses {
+                model: Some("test-model".into()),
+                items: vec![json!({
+                    "type": "reasoning",
+                    "encrypted_content": "R".repeat(4_000)
+                })],
+            });
+
+        let canonical_tokens = estimate_session_turn_messages_tokens(&[canonical]);
+        let replay_tokens =
+            estimate_provider_replay_tokens(replay.provider_replay.as_ref().unwrap());
+        let combined_tokens = estimate_session_turn_messages_tokens(&[replay]);
+
+        assert!(combined_tokens >= replay_tokens);
+        assert!(combined_tokens > canonical_tokens);
+        assert!(combined_tokens < replay_tokens.saturating_add(canonical_tokens));
+    }
+
+    #[test]
+    fn local_context_estimate_counts_anthropic_private_messages() {
+        let canonical = SessionTurnMessage::assistant_text("visible answer");
+        let replay =
+            canonical
+                .clone()
+                .with_provider_replay(ProviderReplayState::AnthropicMessages {
+                    model: "test-model".into(),
+                    messages: vec![json!({
+                        "role":"assistant",
+                        "content":[{
+                            "type":"thinking",
+                            "thinking":"R".repeat(4_000),
+                            "signature":"opaque"
+                        }]
+                    })],
+                });
+
+        assert!(
+            estimate_session_turn_messages_tokens(&[replay])
+                > estimate_session_turn_messages_tokens(&[canonical])
+        );
     }
 }

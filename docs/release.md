@@ -64,6 +64,6 @@ scripts/package_release.sh aarch64-apple-darwin
 
 公开 tap 使用独立仓库`FTShare-Lab/homebrew-tap`，Formula 名为`acn`。Formula 根据操作系统和 CPU 选择对应 Release 归档，将`bin/*`安装到 Homebrew bin，将 Workbench 安装到`pkgshare/maintainer-workbench`。
 
-`brew upgrade acn`只负责替换安装文件。新版`acn`首次需要 finalize supervisor 时会比较 supervisor 返回的产品版本与构建提交；不一致或旧协议实例经过 IPC/PID 校验后被终止，并由新版恢复持久化队列。
+`brew upgrade acn`只负责替换安装文件。新版`acn`首次需要 finalize supervisor 时会比较 supervisor 返回的产品版本、构建提交与运行环境指纹；不一致或旧协议实例经过 IPC/PID 校验后被安全接管，并由新版恢复持久化的未完成队列。
 
 首版 Formula 在 Release 三个平台归档全部发布后，根据各归档 SHA-256 写入`FTShare-Lab/homebrew-tap`。后续版本暂时沿用相同步骤更新；如需自动化，再为源码仓库配置仅能写 tap 的 GitHub App 或细粒度 token，不复用个人全局凭据。

@@ -19,24 +19,30 @@ esac
   echo "ACN_LLM_API_KEY is required; source export_env.sh first" >&2
   exit 1
 }
+tui_build_if_needed
+ACN_BINARY="$(tui_resolve_binary TUI_ACN_BINARY acn bin)"
+TUI_SKIP_BUILD=1
 
 BASE_OUT="${SHARED_MCP_OUT_DIR:-target/tui-scenarios/shared-mcp-real-llm}"
 RUN_ROOT="$BASE_OUT/$SCENARIO/$(date +%Y%m%d-%H%M%S)-$$"
+CONFIG_SOURCE="$REPO_ROOT/config.toml"
+IFS=$'\t' read -r SELECTED_UPSTREAM _ < <(tui_config_agent_identity "$CONFIG_SOURCE")
 ACN_HOME="$RUN_ROOT/acn_home"
 CONFIG_PATH="$RUN_ROOT/config.toml"
-MCP_CONFIG_PATH="$ACN_HOME/dev/.mcp.json"
+MCP_CONFIG_PATH="$ACN_HOME/$SELECTED_UPSTREAM/.mcp.json"
 FIXTURE_PATH="$REPO_ROOT/.agents/skills/tui-smoke-test-with-tmux/scripts/shared_mcp_real_llm_fixture.sh"
 LOG_PATH="$RUN_ROOT/fixture.jsonl"
 INIT_COUNT_PATH="$RUN_ROOT/initialize-count.txt"
 TUI_SESSION="acn_shared_mcp_${SCENARIO}_$$"
 TUI_OUT_DIR="$RUN_ROOT"
-TUI_COMMAND="cargo run --quiet --bin acn -- --config $CONFIG_PATH"
+TUI_COMMAND="'$ACN_BINARY' --config '$CONFIG_PATH'"
 TUI_WIDTH=132
 TUI_HEIGHT=40
 WAIT_SECS="${SHARED_MCP_WAIT_SECS:-300}"
+STARTUP_WAIT_SECS="${SHARED_MCP_STARTUP_WAIT_SECS:-30}"
 
 mkdir -p "$RUN_ROOT" "$(dirname "$MCP_CONFIG_PATH")"
-python3 - "$REPO_ROOT/config.toml" "$CONFIG_PATH" "$ACN_HOME" <<'PY'
+python3 - "$CONFIG_SOURCE" "$CONFIG_PATH" "$ACN_HOME" <<'PY'
 import json
 import re
 import sys
@@ -54,7 +60,7 @@ if count != 1:
     raise SystemExit("expected exactly one storage.acn_home in config.toml")
 text, count = re.subn(
     r'(?ms)(^\[agent\.llm\]\n.*?^provider\s*=\s*)"[^"]*"',
-    r'\1"openai_compatible_chat"',
+    r'\1"openai_chat"',
     text,
     count=1,
 )
@@ -85,11 +91,7 @@ PY
 
 cleanup_owned_supervisor() {
   tui_cleanup
-  local pids
-  pids="$(pgrep -f "acn supervisor run --config $CONFIG_PATH" || true)"
-  if [[ -n "$pids" ]]; then
-    kill $pids 2>/dev/null || true
-  fi
+  tui_terminate_owned_supervisors "$CONFIG_PATH" "$ACN_BINARY"
 }
 
 send_prompt() {
@@ -206,11 +208,13 @@ assert_no_active_shared_mcp_tool_cell() {
   tui_assert_not_contains "$capture" "Calling mcp shared/" "shared MCP ToolCell was still calling"
 }
 
-tui_start
 trap cleanup_owned_supervisor EXIT
-sleep 6
-tui_capture "initial"
-tui_assert_contains "initial" "ACN" "TUI did not start"
+tui_start
+if ! wait_for_tui_contains "initial" "ACN" "$STARTUP_WAIT_SECS"; then
+  tui_capture "initial" || true
+  echo "TUI did not start within ${STARTUP_WAIT_SECS}s" >&2
+  exit 1
+fi
 
 case "$SCENARIO" in
   reads)
@@ -242,20 +246,20 @@ case "$SCENARIO" in
     }
     sleep 0.6
     tui_capture "while_slow_writes"
-    tui_assert_contains "while_slow_writes" "2 subagents running in background" "TUI did not show both active subagents"
+    tui_assert_contains "while_slow_writes" "Subagents: 2 running" "TUI did not show both active subagents"
     assert_distinct_progress_tokens "slow_write" 2
     wait_for_count '"event":"end","tool":"slow_write"' 2 || {
       tui_capture "slow_writes_not_completed"; exit 2;
     }
     # 子代理在 MCP response 后还需完成一次真实 LLM 收束；不能仅以 fixture 的 tool end
     # 就断言 UI 已更新为 completed。
-    wait_for_tui_contains "waiting_for_child_completion" "2 subagents completed" "$WAIT_SECS" || {
+    wait_for_tui_contains "waiting_for_child_completion" "Subagents: 2 completed" "$WAIT_SECS" || {
       tui_capture "after_slow_writes"; exit 1;
     }
     tui_capture "after_slow_writes"
     assert_overlap "slow_write"
     assert_one_initialize
-    tui_assert_contains "after_slow_writes" "2 subagents completed" "TUI did not show child completion"
+    tui_assert_contains "after_slow_writes" "Subagents: 2 completed" "TUI did not show child completion"
     ;;
   timeout)
     send_prompt "Create exactly two session subagents now, named timeout-child and peer-child. In this parent turn call only create_subagent twice and do not call MCP tools yourself. Give timeout-child this objective: call mcp__shared__timeout_once exactly once with an empty object, do not call any other tool, then report the error. Give peer-child this objective: call mcp__shared__slow_read exactly once with an empty object, do not call any other tool, then reply only PEER_DONE. Start both children immediately and independently."
@@ -265,7 +269,11 @@ case "$SCENARIO" in
     }
     sleep 0.6
     tui_capture "while_timeout_and_peer"
-    tui_assert_contains "while_timeout_and_peer" "2 subagents running in background" "TUI did not show both timeout peers as active"
+    # peer 可能在 timeout_once 真正进入等待前已完成；这仍然证明共享 client
+    # 没有被慢请求阻塞。同时接受“两者均在运行”和“peer 已完成”两种合法时序。
+    tui_assert_contains "while_timeout_and_peer" \
+      "Subagents: (2 running|1 completed · 1 running)" \
+      "TUI did not show both timeout peers in running/completed state"
     assert_distinct_progress_tokens "timeout_once" 1
     assert_distinct_progress_tokens "slow_read" 1
     wait_for_count '"event":"end","tool":"slow_read"' 1 &&

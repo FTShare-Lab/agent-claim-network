@@ -55,6 +55,7 @@ use crate::mcp::client::McpProgressEvent;
 use crate::mcp::connection_manager::{McpConnectionManager, McpToolProgressReporter};
 use crate::mcp::name::is_mcp_visible_tool_name;
 use crate::mcp::redact::redact_mcp_sensitive_text;
+use crate::mcp::tool::McpToolRoute;
 use crate::router::http_client::RouterClientError;
 use crate::router::{AgentQuery, RouterClient};
 use crate::session::{SessionMetadata, SessionPaths, SessionStatus};
@@ -67,11 +68,11 @@ use diff::{attach_file_change, compute_file_change, FileChange, FileChangeKind};
 pub(crate) use process::{
     configure_process_group, reap_direct_child_blocking, spawn_direct_child_reaper,
     terminate_process_group, wait_for_child_exit_without_reap, BackgroundProcessEvent,
-    ProcessCompletionDeliveryReceipt, ProcessDeliveryReceipt, ProcessOwner,
+    ProcessCompletion, ProcessCompletionDeliveryReceipt, ProcessDeliveryReceipt, ProcessOwner,
 };
 use process::{
-    spawn_pty, ManagedProcess, OutputCursor, ProcessCompletion, ProcessManager, ProcessState,
-    PtyInput, PtySpawned, PtyWatcherParts, TerminateRequestResult,
+    spawn_pty, ManagedProcess, OutputCursor, ProcessManager, ProcessState, PtyInput, PtySpawned,
+    PtyWatcherParts, TerminateRequestResult,
 };
 use read_state::{
     ContentRevision, LineRange, ReadAuthority, ReadEvidence, ReadStateScope, ReadStateStore,
@@ -161,6 +162,7 @@ impl From<ToolDefinition> for crate::api::ToolSpec {
 pub struct ToolLimits {
     file_read_max_chars: usize,
     file_diff_max_changed_lines: usize,
+    file_edit_authority_enabled: bool,
     max_parallel_tool_calls: usize,
     code_run_initial_yield_ms: u64,
     code_run_min_yield_ms: u64,
@@ -188,6 +190,7 @@ impl From<&ToolConfig> for ToolLimits {
         Self {
             file_read_max_chars: cfg.file_read_max_chars,
             file_diff_max_changed_lines: cfg.file_diff_max_changed_lines,
+            file_edit_authority_enabled: cfg.file_edit_authority_enabled,
             max_parallel_tool_calls: cfg.max_parallel_tool_calls,
             code_run_initial_yield_ms: cfg.code_run_initial_yield_ms,
             code_run_min_yield_ms: cfg.code_run_min_yield_ms,
@@ -222,8 +225,9 @@ pub struct ToolDispatchContext {
     pub progress_tx: Option<mpsc::UnboundedSender<ToolProgressUpdate>>,
     /// 仅用于支持当前 turn 可中断的长时间工具调用。
     pub cancellation: Option<CancellationToken>,
-    /// 同一 assistant 响应内，阻止在同路径前序写失败后继续假定中间状态。
-    pub(crate) failed_file_write_paths: Option<Arc<Mutex<BTreeSet<PathBuf>>>>,
+    /// 本次 Provider sampling 实际看到的 MCP 路由。`Some` 表示模型调用必须严格
+    /// 受该快照约束；即使当前 catalog 已出现同名 replacement，也不能改投新 generation。
+    pub(crate) provider_mcp_routes: Option<Arc<BTreeMap<String, McpToolRoute>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -320,6 +324,10 @@ struct DelegationToolHost {
     executor: Arc<dyn DelegationExecutor>,
     config: DelegationRunnerConfig,
     runners: Arc<StdMutex<BTreeMap<SessionId, DelegationRunner>>>,
+    #[cfg(test)]
+    wait_subagents_snapshot_resolved: Option<Arc<tokio::sync::Notify>>,
+    #[cfg(test)]
+    wait_subagents_blocking: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl DelegationToolHost {
@@ -335,6 +343,10 @@ impl DelegationToolHost {
             executor,
             config,
             runners: Arc::new(StdMutex::new(BTreeMap::new())),
+            #[cfg(test)]
+            wait_subagents_snapshot_resolved: None,
+            #[cfg(test)]
+            wait_subagents_blocking: None,
         }
     }
 
@@ -362,11 +374,13 @@ impl DelegationToolHost {
 pub struct ToolRegistry {
     workspace_root: PathBuf,
     http: reqwest::Client,
+    direct_http: reqwest::Client,
     notes: Arc<Mutex<Vec<String>>>,
     web_search_endpoint: String,
     web_search_api_key_env: String,
     web_search_api_key: Option<String>,
     memory_store: Option<Arc<dyn MemoryStore>>,
+    memory_enabled: bool,
     router_client: Option<Arc<dyn RouterClient>>,
     session_search: Option<Arc<SessionSearchService>>,
     mcp_manager: Option<Arc<McpConnectionManager>>,
@@ -390,6 +404,21 @@ fn current_year_web_guidance() -> String {
     let year = Local::now().year();
     format!(
         "Current year is {year}. For latest/current/recent web tasks, include the current year when useful and verify source dates."
+    )
+}
+
+fn file_tool_descriptions(authority_enabled: bool) -> (&'static str, &'static str, &'static str) {
+    if authority_enabled {
+        return (
+            "Read a file by relative or absolute path. UTF-8 text results include page metadata with the exact returned line range, total lines, EOF state, next_start, and stop reason. stop_reason=eof means the file ended; count/max_chars may continue at page.next_start when more content is needed; keyword_not_found/start_after_eof should not repeat the same request. If the effective read or keyword window contains a line that cannot be returned completely, file_read fails without granting read or write authority; use code_run to inspect that line instead. Pages of the same file version accumulate: a unique file_patch needs only its covered target/boundary lines, append needs EOF coverage, while overwrite/prepend/replace_all need complete coverage. Follow page.next_start only when the task needs more content; do not read the whole file merely because truncated=true. Images and PDFs are returned as attached media content.",
+            "Replace exact text in an existing UTF-8 file. By default old_content must match exactly once and only the target plus any affected line boundary must have been returned by file_read for the current file version. If multiple matches exist, expand old_content with nearby context until it is unique. replace_all=true intentionally replaces every match and requires complete file coverage. On a read-permission error, follow required_read.",
+            "Create or overwrite/append/prepend a UTF-8 text file. New files need no prior read. Existing-file append needs a current file_read page that reaches the real EOF; overwrite and prepend require complete accumulated coverage. A complete text @file attachment is equivalent to complete coverage. On a read-permission error, follow required_read.",
+        );
+    }
+    (
+        "Read a file by relative or absolute path. UTF-8 text results include page metadata with the exact returned line range, total lines, EOF state, next_start, and stop reason. stop_reason=eof means the file ended; count/max_chars may continue at page.next_start when more content is needed; keyword_not_found/start_after_eof should not repeat the same request. If the effective read or keyword window contains a line that cannot be returned completely, file_read fails; use code_run to inspect that line instead. Follow page.next_start only when the task needs more content; do not read the whole file merely because truncated=true. Images and PDFs are returned as attached media content.",
+        "Replace exact text in an existing UTF-8 file. By default old_content must match exactly once. If multiple matches exist, expand old_content with nearby context until it is unique. replace_all=true intentionally replaces every exact match.",
+        "Create or overwrite/append/prepend a UTF-8 text file.",
     )
 }
 
@@ -422,6 +451,8 @@ struct FileWriteArgs {
 #[serde(deny_unknown_fields)]
 struct CodeRunArgs {
     script: String,
+    #[serde(default, rename = "description")]
+    _description: String,
     r#type: Option<String>,
     cwd: Option<String>,
     #[serde(default)]
@@ -434,6 +465,8 @@ struct CodeRunArgs {
 #[serde(deny_unknown_fields)]
 struct WriteStdinArgs {
     process_id: String,
+    #[serde(default, rename = "description")]
+    _description: String,
     chars: Option<String>,
     #[serde(default)]
     terminate: bool,

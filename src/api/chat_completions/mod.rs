@@ -7,6 +7,7 @@ mod client;
 mod protocol;
 mod streaming;
 
+pub(crate) use client::is_stream_failure;
 pub use client::{ChatCompletionsClient, ChatCompletionsError, ChatStreamEvent};
 pub use protocol::{
     ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,

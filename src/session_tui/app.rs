@@ -12,8 +12,8 @@ use chrono::Utc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
-use tokio::time::{sleep, Duration, MissedTickBehavior};
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::{sleep, timeout, Duration, MissedTickBehavior};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::{
@@ -55,6 +55,8 @@ const RESIZE_REDRAW_DEBOUNCE: Duration = Duration::from_millis(250);
 /// 这不是进程终止的 timeout；它只保证已经实际 draw 的状态不会在同一个事件循环内被
 /// authoritative snapshot 立即抹掉。
 const PROCESS_TERMINATE_OPTIMISTIC_VISIBLE_FOR: Duration = Duration::from_millis(100);
+/// Enable/Disable 先完成配置持久化；退出窗口只用于收束后续 transport/connection 工作。
+const MCP_OPERATION_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const TURN_CANCEL_PENDING_NOTICE: &str = "Turn cancel pending: settling active tool calls";
 const FIRST_DELEGATION_NOTICE_GRACE_SECS: i64 = 60;
 const DELEGATION_NOTICE_PREFIX: &str = "Subagent ";
@@ -178,6 +180,7 @@ struct SessionTuiApp {
     session_task: SessionTaskState,
     session_picker: Option<SessionPickerState>,
     mcp_manager: Option<Arc<McpConnectionManager>>,
+    mcp_operation_tasks: JoinSet<()>,
     supervisor: Option<SupervisorLaunchConfig>,
     cleanup_housekeeping: Option<SessionCleanupHousekeepingConfig>,
     cleanup_activity: SessionCleanupActivity,
@@ -286,6 +289,7 @@ impl SessionTuiApp {
             session_task: SessionTaskState::default(),
             session_picker: None,
             mcp_manager,
+            mcp_operation_tasks: JoinSet::new(),
             supervisor,
             cleanup_housekeeping,
             cleanup_activity,
@@ -357,14 +361,24 @@ impl SessionTuiApp {
                     }
                     _ = heartbeat_tick.tick() => {
                         self.refresh_delegation_snapshot().await?;
-                        self.refresh_background_process_completions().await;
+                        let rewrite_scrollback = self.refresh_background_process_completions().await;
                         // 底栏的 `Processes:` 与 `/ps` 共用同一份 snapshot；即使面板关闭也要
                         // 刷新，避免后台 entry 的数量在用户重新打开前一直陈旧。
                         self.refresh_process_snapshot();
                         self.refresh_mcp_panel();
                         // 时间型 UI（如 `/ps` ELAPSED 与底栏 focus）不一定改变 snapshot；
                         // heartbeat 仍需请求一帧，避免 turn idle 后画面冻结。
-                        self.tui.render_requester().schedule_render();
+                        if rewrite_scrollback {
+                            // 已提交 turn 的 cell 位于终端原生 scrollback，普通增量帧只能
+                            // 重画底部 live region；复用 resize 的 Purge + 全历史 reflow 才能
+                            // 原位替换旧的 `Process running in background` 投影。
+                            self.tui.draw_after_state_reload(
+                                &mut self.chat_widget,
+                                self.session_picker.as_ref(),
+                            )?;
+                        } else {
+                            self.tui.render_requester().schedule_render();
+                        }
                     }
                     maybe_worker_event = self.worker_rx.recv() => {
                         if let Some(worker_event) = maybe_worker_event {
@@ -397,6 +411,12 @@ impl SessionTuiApp {
 
         self.tui.stop_reader();
         self.stop_cleanup_housekeeping().await;
+        drain_mcp_operation_tasks(
+            &mut self.mcp_operation_tasks,
+            self.mcp_manager.as_deref(),
+            MCP_OPERATION_EXIT_DRAIN_TIMEOUT,
+        )
+        .await;
         if let Some(handle) = self.resize_render_handle.take() {
             handle.abort();
         }
@@ -558,6 +578,19 @@ impl SessionTuiApp {
                 ) || self.session.is_some()
                 {
                     self.chat_widget.handle_session_event(event);
+                }
+                if self
+                    .chat_widget
+                    .state_mut()
+                    .take_scrollback_rewrite_required()
+                {
+                    // completion 也可能由新 turn 的持久化屏障或 `/exit` finalize worker
+                    // 送达，而不是 1 秒 heartbeat；这些路径同样必须重写原生 scrollback。
+                    self.tui.draw_after_state_reload(
+                        &mut self.chat_widget,
+                        self.session_picker.as_ref(),
+                    )?;
+                    return Ok(false);
                 }
                 if should_restore_late_async_inputs {
                     self.mark_pending_async_inputs_for_restore();
@@ -1527,11 +1560,12 @@ impl SessionTuiApp {
             .engine
             .drain_background_process_completions(session)
             .await;
-        let changed = !events.is_empty();
         for event in events {
             self.chat_widget.state_mut().apply_event(event);
         }
-        changed
+        self.chat_widget
+            .state_mut()
+            .take_scrollback_rewrite_required()
     }
 
     fn terminate_process_from_panel(&mut self, target: ProcessTerminationTarget) {
@@ -1606,7 +1640,10 @@ impl SessionTuiApp {
         let operation_generation = runtime_transition.generation();
         let operation_id = self.chat_widget.state_mut().begin_mcp_request(&request);
         let worker_tx = self.worker_tx.clone();
-        tokio::spawn(async move {
+        while let Some(result) = self.mcp_operation_tasks.try_join_next() {
+            report_mcp_operation_task_result(result);
+        }
+        self.mcp_operation_tasks.spawn(async move {
             let (error, is_disable_request) =
                 execute_mcp_panel_request(Arc::clone(&manager), request, runtime_transition).await;
             if let Some(error) = error.as_ref().filter(|_| !is_disable_request) {
@@ -2305,54 +2342,75 @@ async fn execute_mcp_panel_request(
 ) -> (Option<String>, bool) {
     let operation_generation = runtime_transition.generation();
     let is_disable_request = matches!(&request, McpPanelRequest::SetEnabled { enabled: false, .. });
-    // UI 状态已同步切到新 generation；必须先等待旧 transport 真正退出，避免一段时间内
-    // 同 server 同时存在两条 session/stdio child。
-    let error = match (
-        runtime_transition.wait_for_transport_release().await,
-        request,
-    ) {
-        (
-            Err(release_error),
-            McpPanelRequest::SetEnabled {
-                server_name,
-                enabled: false,
-            },
-        ) => {
-            // Disable 的持久化语义优先于 transport 是否能按时关闭；quarantine 仍会阻止本进程
-            // replacement，但重启后必须保持 disabled，不能因关闭超时悄悄重新启用。
+    let error = match request {
+        McpPanelRequest::SetEnabled {
+            server_name,
+            enabled: false,
+        } => {
+            // 用户选择必须先落盘；旧 transport 的完整收束可能接近退出 drain 上限，不能让
+            // 资源回收延迟反过来取消持久化，导致下一次启动重新启用 server。
             let persistence_error = manager.disable_server(&server_name).await.err();
-            Some(persistence_error.unwrap_or(release_error).to_string())
+            let release_error = runtime_transition.wait_for_transport_release().await.err();
+            persistence_error
+                .or(release_error)
+                .map(|error| error.to_string())
         }
-        (Err(error), _) => Some(error.to_string()),
-        (Ok(()), McpPanelRequest::Reconnect { server_name }) => manager
-            .reconnect_server_if_current(&server_name, operation_generation)
-            .await
-            .err()
-            .map(|err| err.to_string()),
-        (
-            Ok(()),
-            McpPanelRequest::SetEnabled {
-                server_name,
-                enabled: true,
-            },
-        ) => manager
-            .enable_server_if_current(&server_name, operation_generation)
-            .await
-            .err()
-            .map(|err| err.to_string()),
-        (
-            Ok(()),
-            McpPanelRequest::SetEnabled {
-                server_name,
-                enabled: false,
-            },
-        ) => manager
-            .disable_server(&server_name)
-            .await
-            .err()
-            .map(|err| err.to_string()),
+        McpPanelRequest::Reconnect { server_name } => {
+            // replacement 必须等待旧 transport 真正退出，避免同 server 同时存在两条 session。
+            match runtime_transition.wait_for_transport_release().await {
+                Ok(()) => manager
+                    .reconnect_server_if_current(&server_name, operation_generation)
+                    .await
+                    .err()
+                    .map(|error| error.to_string()),
+                Err(error) => Some(error.to_string()),
+            }
+        }
+        McpPanelRequest::SetEnabled {
+            server_name,
+            enabled: true,
+        } => match runtime_transition.wait_for_transport_release().await {
+            Ok(()) => manager
+                .enable_server_if_current(&server_name, operation_generation)
+                .await
+                .err()
+                .map(|error| error.to_string()),
+            Err(error) => Some(error.to_string()),
+        },
     };
     (error, is_disable_request)
+}
+
+async fn drain_mcp_operation_tasks(
+    tasks: &mut JoinSet<()>,
+    manager: Option<&McpConnectionManager>,
+    drain_timeout: Duration,
+) {
+    let drain = async {
+        while let Some(result) = tasks.join_next().await {
+            report_mcp_operation_task_result(result);
+        }
+    };
+    if timeout(drain_timeout, drain).await.is_err() {
+        log::warn!(
+            "MCP lifecycle operations did not finish within {:?} during TUI exit",
+            drain_timeout
+        );
+        // Enable/Reconnect 可能仍在 connect handshake 内。先让 manager 标记并取消 attempt，
+        // shutdown 才会等待 pending transport 的 release fence；若先 abort worker，guard 会在
+        // cancellation 标记前完成 fence，异步 close 可能随 Tokio runtime 退出而被截断。
+        if let Some(manager) = manager {
+            manager.shutdown().await;
+        }
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+}
+
+fn report_mcp_operation_task_result(result: Result<(), tokio::task::JoinError>) {
+    if let Err(error) = result {
+        log::warn!("MCP lifecycle operation task failed: {error}");
+    }
 }
 
 #[cfg(test)]
@@ -2380,6 +2438,12 @@ mod tests {
                     post(|Json(payload): Json<Value>| async move {
                         let id = payload.get("id").cloned().unwrap_or(Value::Null);
                         match payload.get("method").and_then(Value::as_str) {
+                            Some("server/discover") => Json(json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {"code": -32601, "message": "Method not found"}
+                            }))
+                            .into_response(),
                             Some("notifications/initialized") => {
                                 StatusCode::ACCEPTED.into_response()
                             }
@@ -2440,15 +2504,35 @@ mod tests {
         manager.refresh_all().await.unwrap();
 
         let transition = manager.begin_server_disabled_runtime("http_server");
-        let (error, is_disable_request) = execute_mcp_panel_request(
-            Arc::clone(&manager),
-            McpPanelRequest::SetEnabled {
-                server_name: "http_server".to_string(),
-                enabled: false,
-            },
-            transition,
-        )
-        .await;
+        let operation_manager = Arc::clone(&manager);
+        let operation = tokio::spawn(async move {
+            execute_mcp_panel_request(
+                operation_manager,
+                McpPanelRequest::SetEnabled {
+                    server_name: "http_server".to_string(),
+                    enabled: false,
+                },
+                transition,
+            )
+            .await
+        });
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if read_mcp_json_config(&path).await.unwrap().servers["http_server"].enabled
+                    == Some(false)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Disable 必须在等待旧 transport 释放前先持久化");
+        assert!(
+            !operation.is_finished(),
+            "fixture 的旧 transport 此时必须仍在关闭窗口内"
+        );
+        let (error, is_disable_request) = operation.await.unwrap();
 
         assert!(is_disable_request);
         assert!(
@@ -2465,6 +2549,177 @@ mod tests {
             Some(false),
             "TUI Disable must persist even if old transport enters quarantine"
         );
+    }
+
+    #[tokio::test]
+    async fn accepted_tui_disable_is_drained_before_app_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        let mut cfg = McpJsonConfig::default();
+        cfg.servers.insert(
+            "stdio_server".to_string(),
+            McpServerConfig::stdio(
+                "sh".to_string(),
+                vec!["-c".to_string(), "exit 0".to_string()],
+                BTreeMap::new(),
+                Vec::new(),
+            ),
+        );
+        write_mcp_json_config_atomic(&path, &cfg).await.unwrap();
+        let manager = Arc::new(McpConnectionManager::new(
+            path.clone(),
+            dir.path().to_path_buf(),
+            None,
+        ));
+        let transition = manager.begin_server_disabled_runtime("stdio_server");
+        let operation_gate = Arc::new(tokio::sync::Notify::new());
+        let operation_release = Arc::clone(&operation_gate);
+        let operation_manager = Arc::clone(&manager);
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            operation_release.notified().await;
+            let (error, is_disable_request) = execute_mcp_panel_request(
+                operation_manager,
+                McpPanelRequest::SetEnabled {
+                    server_name: "stdio_server".to_string(),
+                    enabled: false,
+                },
+                transition,
+            )
+            .await;
+            assert!(is_disable_request);
+            assert!(error.is_none(), "unexpected disable error: {error:?}");
+        });
+        let release = tokio::spawn(async move {
+            sleep(Duration::from_millis(100)).await;
+            operation_gate.notify_one();
+        });
+
+        drain_mcp_operation_tasks(
+            &mut tasks,
+            Some(manager.as_ref()),
+            MCP_OPERATION_EXIT_DRAIN_TIMEOUT,
+        )
+        .await;
+        release.await.unwrap();
+
+        let persisted = read_mcp_json_config(&path).await.unwrap();
+        assert_eq!(persisted.servers["stdio_server"].enabled, Some(false));
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tui_exit_waits_for_cancelled_connect_transport_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("slow_initialize_stdio_mock.sh");
+        let pid_path = dir.path().join("slow_initialize.pid");
+        tokio::fs::write(
+            &script_path,
+            r#"response_id() {
+  printf '%s' "$1" | sed -n 's/.*"id":[[:space:]]*\([0-9][0-9]*\).*/\1/p'
+}
+while IFS= read -r line; do
+  id=$(response_id "$line")
+  case "$line" in
+    *'"method":"server/discover"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id"
+      ;;
+    *'"method":"initialize"'*)
+      printf '%s\n' "$$" > "$MCP_TUI_EXIT_PID_FILE"
+      sleep 30
+      ;;
+  esac
+done
+"#,
+        )
+        .await
+        .unwrap();
+        let path = dir.path().join(".mcp.json");
+        let mut env = BTreeMap::new();
+        env.insert(
+            "MCP_TUI_EXIT_PID_FILE".to_string(),
+            pid_path.display().to_string(),
+        );
+        let mut server = McpServerConfig::stdio(
+            "sh".to_string(),
+            vec![script_path.display().to_string()],
+            env,
+            Vec::new(),
+        );
+        server.startup_timeout_secs = Some(30);
+        let mut cfg = McpJsonConfig::default();
+        cfg.servers.insert("stdio_server".to_string(), server);
+        write_mcp_json_config_atomic(&path, &cfg).await.unwrap();
+        let manager = Arc::new(McpConnectionManager::new(
+            path,
+            dir.path().to_path_buf(),
+            None,
+        ));
+        let transition = manager.begin_server_reconnecting_runtime("stdio_server");
+        let operation_manager = Arc::clone(&manager);
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            execute_mcp_panel_request(
+                operation_manager,
+                McpPanelRequest::Reconnect {
+                    server_name: "stdio_server".to_string(),
+                },
+                transition,
+            )
+            .await;
+        });
+        wait_for_test_file(&pid_path).await;
+        let pid = tokio::fs::read_to_string(&pid_path)
+            .await
+            .unwrap()
+            .trim()
+            .to_string();
+
+        drain_mcp_operation_tasks(
+            &mut tasks,
+            Some(manager.as_ref()),
+            Duration::from_millis(20),
+        )
+        .await;
+        manager.shutdown().await;
+
+        assert!(
+            wait_for_test_pid_exit(&pid, Duration::from_millis(500)).await,
+            "TUI exit returned before the cancelled MCP connect transport released PID {pid}"
+        );
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_test_pid_exit(pid: &str, limit: Duration) -> bool {
+        timeout(limit, async {
+            loop {
+                let status = tokio::process::Command::new("kill")
+                    .args(["-0", pid])
+                    .stderr(Stdio::null())
+                    .status()
+                    .await;
+                if !matches!(status, Ok(status) if status.success()) {
+                    return;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    async fn wait_for_test_file(path: &std::path::Path) {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if tokio::fs::try_exists(path).await.unwrap_or(false) {
+                    return;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("stdio fixture did not create its expected marker file");
     }
 
     #[test]
@@ -2672,6 +2927,7 @@ mod tests {
     fn mcp_startup_warnings_include_top_level_initialization_error() {
         let snapshot = McpRuntimeState {
             servers: BTreeMap::new(),
+            generations: BTreeMap::new(),
             startup_error: Some("bad json Authorization: Bearer secret-token".into()),
             workspace_root: None,
         };

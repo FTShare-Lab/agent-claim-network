@@ -72,7 +72,7 @@ pub struct OpenAiCompatibleEmbeddingClient {
 
 impl OpenAiCompatibleEmbeddingClient {
     pub fn new(cfg: &EmbeddingConfig) -> anyhow::Result<Self> {
-        let http = build_http_client(cfg.timeout_secs, &cfg.api_key_env)?;
+        let http = build_http_client(&cfg.endpoint, cfg.timeout_secs, &cfg.api_key_env)?;
         Ok(Self {
             endpoint: cfg.endpoint.clone(),
             model: cfg.model.clone(),
@@ -128,7 +128,7 @@ pub struct ArkMultimodalEmbeddingClient {
 
 impl ArkMultimodalEmbeddingClient {
     pub fn new(cfg: &EmbeddingConfig) -> anyhow::Result<Self> {
-        let http = build_http_client(cfg.timeout_secs, &cfg.api_key_env)?;
+        let http = build_http_client(&cfg.endpoint, cfg.timeout_secs, &cfg.api_key_env)?;
         Ok(Self {
             endpoint: cfg.endpoint.clone(),
             model: cfg.model.clone(),
@@ -181,7 +181,11 @@ impl EmbeddingClient for ArkMultimodalEmbeddingClient {
     }
 }
 
-fn build_http_client(timeout_secs: u64, api_key_env: &str) -> anyhow::Result<reqwest::Client> {
+fn build_http_client(
+    endpoint: &str,
+    timeout_secs: u64,
+    api_key_env: &str,
+) -> anyhow::Result<reqwest::Client> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     let api_key = resolve_api_key_with(api_key_env, |name| std::env::var(name))?;
@@ -191,7 +195,7 @@ fn build_http_client(timeout_secs: u64, api_key_env: &str) -> anyhow::Result<req
         HeaderValue::from_str(&auth).context("embedding API key header 非法")?,
     );
 
-    reqwest::Client::builder()
+    crate::http_client_builder_for_endpoint(endpoint)
         .default_headers(headers)
         .timeout(Duration::from_secs(timeout_secs))
         .build()
@@ -289,10 +293,12 @@ mod tests {
             ..EmbeddingConfig::default()
         };
         let client = OpenAiCompatibleEmbeddingClient {
+            http: crate::http_client_builder_for_endpoint(&endpoint)
+                .build()
+                .unwrap(),
             endpoint,
             model: cfg.model.clone(),
             cache_fingerprint: EmbeddingCacheFingerprint::from_config(&cfg, "response_length"),
-            http: reqwest::Client::new(),
         };
 
         assert_eq!(client.embed("hello").await.unwrap(), vec![0.25, 0.75]);
@@ -311,10 +317,12 @@ mod tests {
             ..EmbeddingConfig::default()
         };
         let client = ArkMultimodalEmbeddingClient {
+            http: crate::http_client_builder_for_endpoint(&endpoint)
+                .build()
+                .unwrap(),
             endpoint,
             model: cfg.model.clone(),
             cache_fingerprint: EmbeddingCacheFingerprint::from_config(&cfg, "response_length"),
-            http: reqwest::Client::new(),
         };
 
         assert_eq!(client.embed("hello").await.unwrap(), vec![0.5, 0.125]);

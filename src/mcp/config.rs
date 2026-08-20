@@ -6,10 +6,11 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::storage::{write_text_atomic, StorageError};
+use crate::storage::{write_text_atomic, FileLockGuard, StorageError};
 
 pub const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 120;
@@ -50,6 +51,12 @@ pub struct McpServerConfig {
     pub url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bearer_token_env_var: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_callback_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_credentials_store: Option<McpOAuthCredentialsStore>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -58,6 +65,14 @@ pub enum McpTransportKind {
     Stdio,
     #[serde(rename = "streamable_http", alias = "http")]
     StreamableHttp,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpOAuthCredentialsStore {
+    #[default]
+    Keyring,
+    File,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +87,9 @@ pub enum McpTransportConfig {
     StreamableHttp {
         url: String,
         bearer_token_env_var: Option<String>,
+        oauth_client_id: Option<String>,
+        oauth_callback_port: Option<u16>,
+        oauth_credentials_store: McpOAuthCredentialsStore,
     },
 }
 
@@ -101,6 +119,16 @@ pub enum McpConfigError {
     MissingUrl { name: String },
     #[error("MCP server '{name}' 的 {field} 必须大于 0")]
     InvalidTimeout { name: String, field: &'static str },
+    #[error("MCP server '{name}' 的 oauth_callback_port 必须在 1..=65535")]
+    InvalidOAuthCallbackPort { name: String },
+    #[error("MCP server '{name}' 的 oauth_client_id 不能为空")]
+    InvalidOAuthClientId { name: String },
+    #[error("MCP server '{name}' 不能同时配置 bearer_token_env_var 与 OAuth 选项")]
+    ConflictingHttpAuthentication { name: String },
+    #[error("MCP server '{name}' 的 {field} 仅适用于 streamable_http")]
+    HttpOnlyField { name: String, field: &'static str },
+    #[error("无法获取 MCP 配置写锁 ({path:?}): {message}")]
+    WriteLock { path: PathBuf, message: String },
     #[error(transparent)]
     Storage(#[from] StorageError),
 }
@@ -138,6 +166,9 @@ impl McpServerConfig {
             cwd: None,
             url: None,
             bearer_token_env_var: None,
+            oauth_client_id: None,
+            oauth_callback_port: None,
+            oauth_credentials_store: None,
         }
     }
 
@@ -156,6 +187,9 @@ impl McpServerConfig {
             cwd: None,
             url: Some(url),
             bearer_token_env_var,
+            oauth_client_id: None,
+            oauth_callback_port: None,
+            oauth_credentials_store: None,
         }
     }
 
@@ -170,6 +204,13 @@ impl McpServerConfig {
 
     pub fn tool_timeout_secs(&self) -> u64 {
         self.tool_timeout_secs.unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS)
+    }
+
+    /// 是否显式配置过 OAuth。未配置这些字段的普通 HTTP server 不应访问 keyring。
+    pub(crate) fn has_explicit_oauth_options(&self) -> bool {
+        self.oauth_client_id.is_some()
+            || self.oauth_callback_port.is_some()
+            || self.oauth_credentials_store.is_some()
     }
 
     pub fn transport_kind(&self, name: &str) -> Result<McpTransportKind, McpConfigError> {
@@ -196,6 +237,21 @@ impl McpServerConfig {
     pub fn transport_config(&self, name: &str) -> Result<McpTransportConfig, McpConfigError> {
         match self.transport_kind(name)? {
             McpTransportKind::Stdio => {
+                for (field, configured) in [
+                    ("oauth_client_id", self.oauth_client_id.is_some()),
+                    ("oauth_callback_port", self.oauth_callback_port.is_some()),
+                    (
+                        "oauth_credentials_store",
+                        self.oauth_credentials_store.is_some(),
+                    ),
+                ] {
+                    if configured {
+                        return Err(McpConfigError::HttpOnlyField {
+                            name: name.to_string(),
+                            field,
+                        });
+                    }
+                }
                 let command = required_non_empty(&self.command, name, MissingField::Command)?;
                 Ok(McpTransportConfig::Stdio {
                     command,
@@ -207,9 +263,32 @@ impl McpServerConfig {
             }
             McpTransportKind::StreamableHttp => {
                 let url = required_non_empty(&self.url, name, MissingField::Url)?;
+                if self.bearer_token_env_var.is_some() && self.has_explicit_oauth_options() {
+                    return Err(McpConfigError::ConflictingHttpAuthentication {
+                        name: name.to_string(),
+                    });
+                }
+                let oauth_client_id = self
+                    .oauth_client_id
+                    .as_ref()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+                if self.oauth_client_id.is_some() && oauth_client_id.is_none() {
+                    return Err(McpConfigError::InvalidOAuthClientId {
+                        name: name.to_string(),
+                    });
+                }
+                if self.oauth_callback_port == Some(0) {
+                    return Err(McpConfigError::InvalidOAuthCallbackPort {
+                        name: name.to_string(),
+                    });
+                }
                 Ok(McpTransportConfig::StreamableHttp {
                     url,
                     bearer_token_env_var: self.bearer_token_env_var.clone(),
+                    oauth_client_id,
+                    oauth_callback_port: self.oauth_callback_port,
+                    oauth_credentials_store: self.oauth_credentials_store.unwrap_or_default(),
                 })
             }
         }
@@ -250,6 +329,41 @@ pub async fn write_mcp_json_config_atomic(
     json.push('\n');
     write_text_atomic(path, json.as_bytes()).await?;
     Ok(())
+}
+
+/// 获取 `.mcp.json` 的跨进程写锁。所有 read-modify-write 调用方必须在读取前持有。
+pub async fn lock_mcp_json_config(path: &Path) -> Result<FileLockGuard, McpConfigError> {
+    let lock_path = mcp_json_config_lock_path(path);
+    FileLockGuard::lock_exclusive(&lock_path)
+        .await
+        .map_err(|error| config_write_lock_error(lock_path, error))
+}
+
+/// 在有限时间内获取 `.mcp.json` 的跨进程写锁，供必须可退出的长驻进程使用。
+pub async fn lock_mcp_json_config_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<FileLockGuard, McpConfigError> {
+    let lock_path = mcp_json_config_lock_path(path);
+    FileLockGuard::lock_exclusive_timeout(&lock_path, timeout)
+        .await
+        .map_err(|error| config_write_lock_error(lock_path, error))
+}
+
+fn config_write_lock_error(path: PathBuf, error: anyhow::Error) -> McpConfigError {
+    McpConfigError::WriteLock {
+        path,
+        message: error.to_string(),
+    }
+}
+
+fn mcp_json_config_lock_path(path: &Path) -> PathBuf {
+    let mut file_name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new(".mcp.json"))
+        .to_os_string();
+    file_name.push(".lock");
+    path.with_file_name(file_name)
 }
 
 pub fn validate_server_name(name: &str) -> Result<(), McpConfigError> {
@@ -381,6 +495,9 @@ mod tests {
             cwd: None,
             url: None,
             bearer_token_env_var: None,
+            oauth_client_id: None,
+            oauth_callback_port: None,
+            oauth_credentials_store: None,
         };
         let http = McpServerConfig {
             transport: None,
@@ -396,6 +513,9 @@ mod tests {
             cwd: None,
             url: Some("https://example.com/mcp".to_string()),
             bearer_token_env_var: None,
+            oauth_client_id: None,
+            oauth_callback_port: None,
+            oauth_credentials_store: None,
         };
 
         assert_eq!(
@@ -433,6 +553,50 @@ mod tests {
         let encoded = serde_json::to_string(&server).unwrap();
         assert!(encoded.contains(r#""type":"streamable_http""#));
         assert!(!encoded.contains(r#""type":"http""#));
+    }
+
+    #[test]
+    fn validates_http_oauth_options_and_rejects_them_for_stdio() {
+        let mut http = McpServerConfig::streamable_http("https://example.com/mcp".into(), None);
+        http.oauth_client_id = Some("public-client".into());
+        http.oauth_callback_port = Some(8765);
+        http.oauth_credentials_store = Some(McpOAuthCredentialsStore::File);
+
+        assert_eq!(
+            http.transport_config("remote").unwrap(),
+            McpTransportConfig::StreamableHttp {
+                url: "https://example.com/mcp".into(),
+                bearer_token_env_var: None,
+                oauth_client_id: Some("public-client".into()),
+                oauth_callback_port: Some(8765),
+                oauth_credentials_store: McpOAuthCredentialsStore::File,
+            }
+        );
+
+        let mut stdio =
+            McpServerConfig::stdio("server".into(), Vec::new(), BTreeMap::new(), Vec::new());
+        stdio.oauth_client_id = Some("public-client".into());
+        assert!(matches!(
+            stdio.transport_config("local"),
+            Err(McpConfigError::HttpOnlyField {
+                field: "oauth_client_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_bearer_and_oauth_options_together() {
+        let mut server = McpServerConfig::streamable_http(
+            "https://example.com/mcp".into(),
+            Some("SERVICE_API_KEY".into()),
+        );
+        server.oauth_credentials_store = Some(McpOAuthCredentialsStore::File);
+
+        assert!(matches!(
+            server.transport_config("remote"),
+            Err(McpConfigError::ConflictingHttpAuthentication { name }) if name == "remote"
+        ));
     }
 
     #[test]

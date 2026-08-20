@@ -3,8 +3,10 @@
 //! 本模块承接单轮用户输入后的模型调用、工具执行和 tool_result 回灌。
 //! 它只理解 canonical session message，不关心 Anthropic/OpenAI 等后端协议细节。
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,19 +18,26 @@ use chrono::{DateTime, Local, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tokio::time;
 use tokio::time::Instant;
 
+use super::continuation::{append_with_overlap_dedupe, CONTINUATION_TRIGGER};
+use super::provider::{
+    ProviderNoConsumableOutput, ProviderRequestObserver, ProviderRequestPreparationFailure,
+    ProviderStreamFailure, ProviderTerminalFailure,
+};
 use crate::api::{
     estimate_provider_request_context_tokens, CompletedSessionTurnMessage, ContextUsageSnapshot,
-    ProviderAdapter, ProviderEvent, ProviderRequest, ProviderResponse, ProviderStop,
-    SessionAttachment, SessionTurn, SessionTurnContentBlock, SessionTurnEvent,
-    SessionTurnInterrupted, SessionTurnMessage, SessionTurnRequest, ToolBoundaryControl,
-    ToolCallSkipReason, ToolExecutionOutcome,
+    ModelContextSource, ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy,
+    ProviderRecoveryInterrupt, ProviderReplayIdentity, ProviderReplayState, ProviderRequest,
+    ProviderResponse, ProviderRuntimeChainId, ProviderStop, SessionAttachment, SessionTurn,
+    SessionTurnContentBlock, SessionTurnEvent, SessionTurnInterrupted, SessionTurnMessage,
+    SessionTurnRequest, ToolBoundaryControl, ToolCallSkipReason, ToolExecutionOutcome,
 };
 use crate::attachment::{AttachmentKind, AttachmentLimits, NormalizedMedia, FILE_READ_MEDIA_KEY};
 use crate::claim::SessionId;
+use crate::mcp::tool::McpToolRoute;
 use crate::skill::SkillInstructions;
 use crate::tool::diff::{take_file_change, FileChange};
 use crate::tool::{
@@ -43,10 +52,249 @@ const NON_STREAMING_FALLBACK_ERROR_MAX_CHARS: usize = 4096;
 // 产品要求退避保持内部实现细节，不进入 config.toml。
 const NON_STREAMING_FALLBACK_BASE_DELAY: Duration = Duration::from_millis(250);
 const NON_STREAMING_FALLBACK_MAX_DELAY: Duration = Duration::from_secs(4);
+const MAX_CONTEXT_WINDOW_RECOVERIES: usize = 2;
+// Provider WAL 是发起网络 I/O 前的内部保护边界，不与用户可配置的
+// LLM 请求超时共用几分钟的等待时间。
+const PROVIDER_WAL_PREPARATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct ProviderCallOutcome {
     response: ProviderResponse,
+    /// 成功 attempt 最后一次实际发送的精确请求历史。
+    request_messages: Vec<SessionTurnMessage>,
+    /// 相对 `request_messages` 的本次响应 suffix；不重复 adapter
+    /// 内部 continuation 已经放入请求的 partial replay。
+    provider_assistant_message: SessionTurnMessage,
     recovered_with_non_streaming: bool,
+    /// 与该次逻辑 sampling 的 tool definitions 同时冻结；内部 retry、fallback、
+    /// continuation 不得刷新，工具派发也不得落到 replacement generation。
+    provider_mcp_routes: Arc<BTreeMap<String, McpToolRoute>>,
+}
+
+/// 跟踪一次 turn-loop Provider call 内部实际发送的最新请求。
+///
+/// adapter continuation 只能追加 replay message；main 路径在更新内存基线前
+/// 先通过 preflight 写 WAL，child 路径则至少在当前 execution 内保留同一前缀。
+struct ProviderRequestProgress<'a> {
+    latest_messages: Vec<SessionTurnMessage>,
+    preflight: Option<&'a mut dyn SessionTurnPreflight>,
+    canonical_tail_count: usize,
+    preparing_write_ahead: Arc<AtomicBool>,
+    latest_request_started: bool,
+    previous_messages_before_pending: Option<Vec<SessionTurnMessage>>,
+}
+
+impl<'a> ProviderRequestProgress<'a> {
+    fn new(
+        latest_messages: Vec<SessionTurnMessage>,
+        preflight: Option<&'a mut dyn SessionTurnPreflight>,
+        canonical_tail_count: usize,
+    ) -> Self {
+        Self {
+            latest_messages,
+            preflight,
+            canonical_tail_count,
+            preparing_write_ahead: Arc::new(AtomicBool::new(false)),
+            latest_request_started: false,
+            previous_messages_before_pending: None,
+        }
+    }
+
+    fn latest_messages(&self) -> &[SessionTurnMessage] {
+        &self.latest_messages
+    }
+
+    fn take_preflight(&mut self) -> Option<&'a mut dyn SessionTurnPreflight> {
+        self.preflight.take()
+    }
+
+    fn begin_provider_attempt(&mut self) {
+        self.preparing_write_ahead.store(false, Ordering::Release);
+        self.latest_request_started = false;
+    }
+
+    async fn rollback_unsent_request(&mut self) -> anyhow::Result<()> {
+        if self.latest_request_started {
+            return Ok(());
+        }
+        if let Some(preflight) = self.preflight.as_deref_mut() {
+            preflight.provider_request_abandoned_before_send().await?;
+        }
+        if let Some(previous) = self.previous_messages_before_pending.take() {
+            self.latest_messages = previous;
+        }
+        Ok(())
+    }
+
+    fn write_ahead_phase(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.preparing_write_ahead)
+    }
+}
+
+#[async_trait]
+impl ProviderRequestObserver for ProviderRequestProgress<'_> {
+    async fn before_provider_request(
+        &mut self,
+        messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<()> {
+        if messages == self.latest_messages {
+            return Ok(());
+        }
+        if self.previous_messages_before_pending.is_some() {
+            return Err(ProviderRequestPreparationFailure::new(
+                "adapter 在上一份 Provider request 发送或回滚前准备了下一份请求",
+            )
+            .into());
+        }
+        self.latest_request_started = false;
+        self.preparing_write_ahead.store(true, Ordering::Release);
+        if !messages.starts_with(&self.latest_messages) {
+            return Err(ProviderRequestPreparationFailure::new(format!(
+                "adapter continuation 改写了已发送 Provider 前缀: previous={}, current={}",
+                self.latest_messages.len(),
+                messages.len()
+            ))
+            .into());
+        }
+        if let Some(preflight) = self.preflight.as_deref_mut() {
+            match time::timeout(
+                PROVIDER_WAL_PREPARATION_TIMEOUT,
+                preflight.provider_request_ready(messages, self.canonical_tail_count),
+            )
+            .await
+            {
+                Ok(result) => {
+                    result.map_err(ProviderRequestPreparationFailure::from_error)?;
+                }
+                Err(_) => {
+                    return Err(ProviderRequestPreparationFailure::new(
+                        "Provider 请求状态保存超时（10 秒）",
+                    )
+                    .into());
+                }
+            }
+        }
+        self.previous_messages_before_pending = Some(std::mem::replace(
+            &mut self.latest_messages,
+            messages.to_vec(),
+        ));
+        self.preparing_write_ahead.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn provider_request_started(&mut self, messages: &[SessionTurnMessage]) -> anyhow::Result<()> {
+        if messages != self.latest_messages {
+            return Err(ProviderRequestPreparationFailure::new(
+                "adapter 标记发送的 Provider 请求与最新 WAL 不一致",
+            )
+            .into());
+        }
+        if let Some(preflight) = self.preflight.as_deref_mut() {
+            preflight.provider_request_started(messages)?;
+        }
+        self.latest_request_started = true;
+        self.previous_messages_before_pending = None;
+        Ok(())
+    }
+
+    async fn provider_request_abandoned_before_send(
+        &mut self,
+        messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<()> {
+        if messages != self.latest_messages {
+            return Err(ProviderRequestPreparationFailure::new(
+                "adapter 放弃的 Provider 请求与最新 WAL 不一致",
+            )
+            .into());
+        }
+        if self.latest_request_started {
+            return Err(ProviderRequestPreparationFailure::new(
+                "adapter 不能把已经开始发送的 Provider 请求回滚为未发送",
+            )
+            .into());
+        }
+        self.rollback_unsent_request().await
+    }
+}
+
+#[derive(Default)]
+struct ContextWindowContinuation {
+    merged_text: String,
+    replay_model: Option<String>,
+    replay_messages: Vec<Value>,
+}
+
+impl ContextWindowContinuation {
+    fn has_pending(&self) -> bool {
+        self.replay_model.is_some()
+    }
+
+    fn fallback_replacement_text(&self, current: &str) -> String {
+        let mut merged = self.merged_text.clone();
+        append_with_overlap_dedupe(&mut merged, current);
+        merged
+    }
+
+    fn absorb_partial(&mut self, message: &SessionTurnMessage) -> anyhow::Result<()> {
+        append_with_overlap_dedupe(&mut self.merged_text, &assistant_message_text(message));
+        let Some(ProviderReplayState::AnthropicMessages { model, messages }) =
+            message.provider_replay.as_ref()
+        else {
+            anyhow::bail!("模型返回上下文截断，但缺少 Anthropic 续写状态，无法自动恢复");
+        };
+        if let Some(existing_model) = self.replay_model.as_ref() {
+            if existing_model != model {
+                anyhow::bail!("上下文恢复期间模型发生变化，无法继续本轮");
+            }
+        } else {
+            self.replay_model = Some(model.clone());
+        }
+        self.replay_messages.extend(messages.iter().cloned());
+        Ok(())
+    }
+
+    fn push_internal_continuation(&mut self) {
+        self.replay_messages.push(json!({
+            "role": "user",
+            "content": [{"type": "text", "text": CONTINUATION_TRIGGER}],
+        }));
+    }
+
+    fn merge_into(self, message: &mut SessionTurnMessage) -> anyhow::Result<()> {
+        let Some(replay_model) = self.replay_model else {
+            return Ok(());
+        };
+        let mut merged_text = self.merged_text;
+        append_with_overlap_dedupe(&mut merged_text, &assistant_message_text(message));
+        let mut non_text = message
+            .content
+            .drain(..)
+            .filter(|block| !matches!(block, SessionTurnContentBlock::Text { .. }))
+            .collect::<Vec<_>>();
+        if merged_text.trim().is_empty() {
+            message.content = non_text;
+        } else {
+            let mut content = Vec::with_capacity(non_text.len().saturating_add(1));
+            content.push(SessionTurnContentBlock::text(merged_text));
+            content.append(&mut non_text);
+            message.content = content;
+        }
+
+        let Some(ProviderReplayState::AnthropicMessages { model, messages }) =
+            message.provider_replay.take()
+        else {
+            anyhow::bail!("模型续写完成，但缺少 Anthropic 历史状态，无法保存完整结果");
+        };
+        if model != replay_model {
+            anyhow::bail!("模型续写前后的 Anthropic 历史状态不一致，无法保存完整结果");
+        }
+        let mut replay_messages = self.replay_messages;
+        replay_messages.extend(messages);
+        message.provider_replay = Some(ProviderReplayState::AnthropicMessages {
+            model,
+            messages: replay_messages,
+        });
+        Ok(())
+    }
 }
 
 /// 把进程输出回执绑定到生成它的原始 tool_result。只有该原文实际进入 provider
@@ -73,16 +321,121 @@ const MAX_PROGRESS_EVENTS_PER_DRAIN: usize = 64;
 #[async_trait]
 pub trait SessionTurnEventRecorder: Send {
     async fn record(&mut self, event: SessionTurnEvent) -> anyhow::Result<()>;
+
+    /// 在包含该快照的 provider request 发出前写入 owner 的现有 durable transcript。
+    async fn record_completed_message(
+        &mut self,
+        _message: &CompletedSessionTurnMessage,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// 只读观察外部运行态并返回待追加快照；历史替换仍只属于 `SessionTurnPreflight`
+/// 的 compaction 边界。
+#[async_trait]
+pub trait SessionTurnContextAppender: Send {
+    async fn observe_context(
+        &mut self,
+        provider_messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<Vec<SessionTurnMessage>>;
+
+    async fn after_provider_response_success(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
 pub trait SessionTurnPreflight: Send {
+    /// 本轮初始 history 中已经由此前真实 Provider 请求确认、必须原样重放的前缀长度。
+    ///
+    /// turn loop 只会在此前缀之后规范化新后缀，避免 adjacent-user merge 等 wire
+    /// 投影跨过稳定缓存边界、改写上一请求。compaction 显式替换 history 后会清空边界。
+    fn frozen_provider_history_prefix_len(&self) -> usize {
+        0
+    }
+
+    /// 在本次逻辑 Provider 请求观察 runtime/background/delegation 之前执行。
+    ///
+    /// 这里只用于必须先行且本身也是 append-only 的输入（当前为 child steering）；
+    /// compaction 等会替换 history 的动作仍放在 `before_provider_request`，确保预算
+    /// 覆盖本次刚冻结的 context snapshot。
+    async fn before_context_observation(
+        &mut self,
+        _system_prompt: &mut String,
+        _provider_messages: &mut Vec<SessionTurnMessage>,
+        _emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn before_provider_request(
         &mut self,
         system_prompt: &mut String,
         provider_messages: &mut Vec<SessionTurnMessage>,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
     ) -> anyhow::Result<()>;
+
+    /// 当前原始请求是否已经满足 history replacement 的触发条件。
+    ///
+    /// turn loop 据此临时追加一组完整、已冻结的 context baseline，使 compactor
+    /// 的预算和保护边界覆盖新窗口必须重建的 authoritative state。
+    fn history_replacement_expected(
+        &self,
+        _system_prompt: &str,
+        _provider_messages: &[SessionTurnMessage],
+    ) -> bool {
+        false
+    }
+
+    /// 返回并清除本次 preflight 是否实际替换了 provider history。
+    fn take_history_replaced_since_last_check(&mut self) -> bool {
+        false
+    }
+
+    /// 在 adapter retry 边界外、请求发出前 write-ahead 本次逻辑请求的精确
+    /// provider-neutral 历史。`canonical_tail_count` 是本 active turn 已完成、
+    /// 且包含在该请求中的 canonical message 数量。
+    async fn provider_request_ready(
+        &mut self,
+        _provider_messages: &[SessionTurnMessage],
+        _canonical_tail_count: usize,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Provider 已成功返回最终 assistant 后，write-ahead 包含该响应的精确
+    /// provider-neutral 历史。这样 canonical assistant 含有 continuation replay 时，
+    /// 后续请求无需把已经出现在上一请求中的 replay 再追加一次。
+    async fn provider_response_ready(
+        &mut self,
+        _provider_messages: &[SessionTurnMessage],
+        _canonical_tail_count: usize,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// 最新 request WAL 对应的网络发送已经开始；从此不再把它判定为“确定未发送”。
+    fn provider_request_started(
+        &mut self,
+        _provider_messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// 请求在任何网络发送开始前被取消或安全中断，回滚刚准备的 request WAL。
+    async fn provider_request_abandoned_before_send(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// 下一次 provider request 必须先执行上下文窗口恢复压缩。
+    /// 默认实现拒绝恢复，避免没有 compaction owner 的调用方原样重放满窗口请求。
+    fn request_context_window_recovery(
+        &mut self,
+        _assistant_marker: &SessionTurnMessage,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("模型上下文已满，但当前 ACN 调用链未接入自动恢复")
+    }
 
     fn observe_provider_context_usage(
         &mut self,
@@ -97,6 +450,27 @@ pub trait SessionTurnPreflight: Send {
     /// "本 request 已实际交付" 的有界消费；失败、取消和 retry 不会调用它。
     async fn after_provider_response_success(&mut self) -> anyhow::Result<()> {
         Ok(())
+    }
+}
+
+/// 一次 turn 调用可选的持久化、上下文观察与压缩 hook 集合。
+pub(crate) struct SessionTurnHooks<'recorder, 'context, 'preflight> {
+    durable_recorder: Option<&'recorder mut dyn SessionTurnEventRecorder>,
+    context_appender: Option<&'context mut dyn SessionTurnContextAppender>,
+    preflight: Option<&'preflight mut dyn SessionTurnPreflight>,
+}
+
+impl<'recorder, 'context, 'preflight> SessionTurnHooks<'recorder, 'context, 'preflight> {
+    pub(crate) fn new(
+        durable_recorder: Option<&'recorder mut dyn SessionTurnEventRecorder>,
+        context_appender: Option<&'context mut dyn SessionTurnContextAppender>,
+        preflight: Option<&'preflight mut dyn SessionTurnPreflight>,
+    ) -> Self {
+        Self {
+            durable_recorder,
+            context_appender,
+            preflight,
+        }
     }
 }
 
@@ -115,6 +489,7 @@ pub struct AgentTurnLoop {
     tool_input_journal_preview_chars: usize,
     tool_output_journal_preview_chars: usize,
     now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+    runtime_context: Arc<dyn Fn(DateTime<Utc>) -> String + Send + Sync>,
     #[cfg(test)]
     before_tool_dispatch_reservation: Option<Arc<dyn ToolDispatchReservationHook>>,
 }
@@ -135,6 +510,7 @@ impl AgentTurnLoop {
             tool_input_journal_preview_chars: DEFAULT_TOOL_INPUT_JOURNAL_PREVIEW_CHARS,
             tool_output_journal_preview_chars: DEFAULT_TOOL_OUTPUT_JOURNAL_PREVIEW_CHARS,
             now: Arc::new(Utc::now),
+            runtime_context: Arc::new(runtime_context_text),
             #[cfg(test)]
             before_tool_dispatch_reservation: None,
         }
@@ -152,6 +528,18 @@ impl AgentTurnLoop {
 
     pub(crate) fn max_tokens(&self) -> u32 {
         self.max_tokens
+    }
+
+    pub(crate) fn history_media_policy(&self) -> ProviderHistoryMediaPolicy {
+        self.provider.history_media_policy()
+    }
+
+    pub(crate) fn history_replay_identity(&self) -> Option<ProviderReplayIdentity> {
+        self.provider.history_replay_identity()
+    }
+
+    pub(crate) async fn discard_runtime_chain(&self, chain_id: ProviderRuntimeChainId) {
+        self.provider.discard_runtime_chain(chain_id).await;
     }
 
     pub fn with_attachment_limits(mut self, limits: AttachmentLimits) -> Self {
@@ -179,6 +567,15 @@ impl AgentTurnLoop {
     }
 
     #[cfg(test)]
+    fn with_runtime_context_fn<F>(mut self, runtime_context: F) -> Self
+    where
+        F: Fn(DateTime<Utc>) -> String + Send + Sync + 'static,
+    {
+        self.runtime_context = Arc::new(runtime_context);
+        self
+    }
+
+    #[cfg(test)]
     fn with_tool_dispatch_reservation_hook(
         mut self,
         hook: Arc<dyn ToolDispatchReservationHook>,
@@ -191,10 +588,135 @@ impl AgentTurnLoop {
         (self.now)()
     }
 
+    async fn observe_model_context(
+        &self,
+        provider_messages: &[SessionTurnMessage],
+        context_appender: &mut Option<&mut dyn SessionTurnContextAppender>,
+    ) -> anyhow::Result<Vec<CompletedSessionTurnMessage>> {
+        let observed_at = self.now();
+        let mut candidates = vec![SessionTurnMessage::model_context(
+            ModelContextSource::Runtime,
+            (self.runtime_context)(observed_at),
+        )];
+        if let Some(context_appender) = context_appender.as_mut() {
+            candidates.extend(context_appender.observe_context(provider_messages).await?);
+        }
+        let candidates = candidates
+            .into_iter()
+            .map(|message| CompletedSessionTurnMessage::new(message, observed_at))
+            .collect::<Vec<_>>();
+        Ok(candidates)
+    }
+
+    async fn append_frozen_model_context(
+        &self,
+        provider_messages: &mut Vec<SessionTurnMessage>,
+        committed: &mut Vec<CompletedSessionTurnMessage>,
+        durable_recorder: &mut Option<&mut dyn SessionTurnEventRecorder>,
+        candidates: impl IntoIterator<Item = CompletedSessionTurnMessage>,
+    ) -> anyhow::Result<()> {
+        for completed in candidates {
+            let (source, fingerprint, text) = completed
+                .model_context_snapshot()
+                .context("context appender 只能返回独立 ModelContext user message")?;
+            let expected = SessionTurnMessage::model_context(*source, text.to_string());
+            let Some((_, expected_fingerprint, _)) = expected.model_context_snapshot() else {
+                anyhow::bail!("内部 ModelContext 构造失败");
+            };
+            if fingerprint != expected_fingerprint {
+                anyhow::bail!("context appender 返回了与正文不匹配的 fingerprint");
+            }
+            if latest_model_context(provider_messages, *source).is_some_and(
+                |(latest_fingerprint, latest_text)| {
+                    latest_fingerprint == fingerprint && latest_text == text
+                },
+            ) {
+                continue;
+            }
+            if let Some(recorder) = durable_recorder.as_deref_mut() {
+                recorder.record_completed_message(&completed).await?;
+            }
+            provider_messages.push(completed.message.clone());
+            committed.push(completed);
+        }
+        Ok(())
+    }
+
+    /// failed/cancelled turn 的 journal context 即使已经存在于 write-ahead Provider
+    /// 窗口，也仍需在下一次成功 turn 中 materialize 到 canonical transcript；但不能
+    /// 为此在精确 Provider 前缀后重复追加同一份历史快照。
+    async fn materialize_recovered_model_context(
+        &self,
+        provider_messages: &mut Vec<SessionTurnMessage>,
+        committed: &mut Vec<CompletedSessionTurnMessage>,
+        durable_recorder: &mut Option<&mut dyn SessionTurnEventRecorder>,
+        recovered: impl IntoIterator<Item = CompletedSessionTurnMessage>,
+    ) -> anyhow::Result<()> {
+        let recovered = recovered.into_iter().collect::<Vec<_>>();
+        for completed in &recovered {
+            let (source, fingerprint, text) = completed
+                .model_context_snapshot()
+                .context("recovered context 必须是独立 ModelContext user message")?;
+            let expected = SessionTurnMessage::model_context(*source, text.to_string());
+            let Some((_, expected_fingerprint, _)) = expected.model_context_snapshot() else {
+                anyhow::bail!("内部 ModelContext 构造失败");
+            };
+            if fingerprint != expected_fingerprint {
+                anyhow::bail!("recovered context 的 fingerprint 与正文不匹配");
+            }
+        }
+        let visible_context = provider_messages
+            .iter()
+            .filter_map(SessionTurnMessage::model_context_snapshot)
+            .collect::<Vec<_>>();
+        let recovered_context = recovered
+            .iter()
+            .filter_map(|completed| completed.model_context_snapshot())
+            .collect::<Vec<_>>();
+        let already_visible_prefix = (0..=recovered_context.len())
+            .rev()
+            .find(|prefix_len| visible_context.ends_with(&recovered_context[..*prefix_len]))
+            .unwrap_or(0);
+
+        for (index, completed) in recovered.into_iter().enumerate() {
+            if let Some(recorder) = durable_recorder.as_deref_mut() {
+                recorder.record_completed_message(&completed).await?;
+            }
+            if index >= already_visible_prefix {
+                provider_messages.push(completed.message.clone());
+            }
+            committed.push(completed);
+        }
+        Ok(())
+    }
+
+    async fn persist_frozen_model_context(
+        &self,
+        committed: &mut Vec<CompletedSessionTurnMessage>,
+        durable_recorder: &mut Option<&mut dyn SessionTurnEventRecorder>,
+        candidates: impl IntoIterator<Item = CompletedSessionTurnMessage>,
+    ) -> anyhow::Result<()> {
+        for completed in candidates {
+            completed
+                .model_context_snapshot()
+                .context("只能持久化独立 ModelContext user message")?;
+            if let Some(recorder) = durable_recorder.as_deref_mut() {
+                recorder.record_completed_message(&completed).await?;
+            }
+            committed.push(completed);
+        }
+        Ok(())
+    }
+
     /// 按 source order 切分并执行工具；并发 task 只回传结果，所有事件与 journal 写入均由此协调器串行完成。
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "工具协调器需要同时携带本轮 Provider catalog、journal 与取消边界"
+    )]
     async fn execute_tool_uses_in_batches(
         &self,
         tool_uses: &[CanonicalToolUse],
+        provider_mcp_routes: &Arc<BTreeMap<String, McpToolRoute>>,
         current_session_id: &Option<SessionId>,
         current_turn_id: &Option<String>,
         tool_boundary_control: Option<&ToolBoundaryControl>,
@@ -229,7 +751,6 @@ impl AgentTurnLoop {
             .map(|_| None)
             .collect::<Vec<Option<ExecutedToolUse>>>();
         let max_parallel = self.tools.max_parallel_tool_calls();
-        let failed_file_write_paths = Arc::new(Mutex::new(BTreeSet::new()));
         let mut batch_start = 0usize;
 
         while batch_start < tool_uses.len() {
@@ -263,11 +784,11 @@ impl AgentTurnLoop {
                     is_safe_batch,
                     current_session_id,
                     current_turn_id,
+                    provider_mcp_routes,
                     tool_boundary_control,
                     emit,
                     durable_recorder,
                     &mut executions,
-                    Arc::clone(&failed_file_write_paths),
                 )
                 .await?;
             if matches!(outcome, ToolBatchOutcome::Interrupted) {
@@ -304,11 +825,11 @@ impl AgentTurnLoop {
         require_concurrency_safe: bool,
         current_session_id: &Option<SessionId>,
         current_turn_id: &Option<String>,
+        provider_mcp_routes: &Arc<BTreeMap<String, McpToolRoute>>,
         tool_boundary_control: Option<&ToolBoundaryControl>,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
         durable_recorder: &mut Option<&mut dyn SessionTurnEventRecorder>,
         executions: &mut [Option<ExecutedToolUse>],
-        failed_file_write_paths: Arc<Mutex<BTreeSet<std::path::PathBuf>>>,
     ) -> anyhow::Result<ToolBatchOutcome> {
         let batch = &all_tool_uses[batch_start..batch_end];
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
@@ -430,7 +951,7 @@ impl AgentTurnLoop {
                         tool_use_id: Some(tool_use.id.clone()),
                         progress_tx: Some(progress_tx.clone()),
                         cancellation: cancellation.clone(),
-                        failed_file_write_paths: Some(Arc::clone(&failed_file_write_paths)),
+                        provider_mcp_routes: Some(Arc::clone(provider_mcp_routes)),
                     };
                     let tools = Arc::clone(&self.tools);
                     let execution_name = tool_use.name.clone();
@@ -805,6 +1326,74 @@ impl AgentTurnLoop {
         durable_recorder: Option<&mut dyn SessionTurnEventRecorder>,
         preflight: Option<&mut dyn SessionTurnPreflight>,
     ) -> anyhow::Result<SessionTurn> {
+        self.run_session_turn_with_context_hooks(
+            request,
+            Vec::new(),
+            emit,
+            tool_boundary_control,
+            SessionTurnHooks::new(durable_recorder, None, preflight),
+        )
+        .await
+    }
+
+    pub(crate) async fn run_session_turn_with_context_hooks(
+        &self,
+        request: SessionTurnRequest,
+        recovered_model_context: Vec<CompletedSessionTurnMessage>,
+        emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        tool_boundary_control: Option<ToolBoundaryControl>,
+        hooks: SessionTurnHooks<'_, '_, '_>,
+    ) -> anyhow::Result<SessionTurn> {
+        let fallback_root = crate::api::ProviderRuntimeFallbackScope::new_root();
+        self.run_session_turn_with_context_and_runtime_chain_hooks(
+            request,
+            recovered_model_context,
+            ProviderRuntimeChainId::new(),
+            fallback_root.new_child(),
+            emit,
+            tool_boundary_control,
+            hooks,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn run_session_turn_with_runtime_chain_hooks(
+        &self,
+        request: SessionTurnRequest,
+        runtime_chain_id: ProviderRuntimeChainId,
+        emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        tool_boundary_control: Option<ToolBoundaryControl>,
+        durable_recorder: Option<&mut dyn SessionTurnEventRecorder>,
+        preflight: Option<&mut dyn SessionTurnPreflight>,
+    ) -> anyhow::Result<SessionTurn> {
+        let fallback_root = crate::api::ProviderRuntimeFallbackScope::new_root();
+        self.run_session_turn_with_context_and_runtime_chain_hooks(
+            request,
+            Vec::new(),
+            runtime_chain_id,
+            fallback_root.new_child(),
+            emit,
+            tool_boundary_control,
+            SessionTurnHooks::new(durable_recorder, None, preflight),
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "turn runtime 需显式携带 continuation chain、fallback scope 与 hooks"
+    )]
+    pub(crate) async fn run_session_turn_with_context_and_runtime_chain_hooks(
+        &self,
+        request: SessionTurnRequest,
+        recovered_model_context: Vec<CompletedSessionTurnMessage>,
+        runtime_chain_id: ProviderRuntimeChainId,
+        runtime_fallback_scope: crate::api::ProviderRuntimeFallbackScope,
+        emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        tool_boundary_control: Option<ToolBoundaryControl>,
+        hooks: SessionTurnHooks<'_, '_, '_>,
+    ) -> anyhow::Result<SessionTurn> {
         let rollback_context = ToolDispatchContext {
             current_session_id: request.current_session_id.clone(),
             current_turn_id: request.current_turn_id.clone(),
@@ -813,13 +1402,16 @@ impl AgentTurnLoop {
         let result = self
             .run_session_turn_with_hooks_inner(
                 request,
+                recovered_model_context,
                 emit,
                 tool_boundary_control,
-                durable_recorder,
-                preflight,
+                hooks,
+                runtime_chain_id,
+                runtime_fallback_scope,
             )
             .await;
         if result.is_err() {
+            self.provider.discard_runtime_chain(runtime_chain_id).await;
             self.tools
                 .rollback_uncommitted_process_deliveries_for_context(&rollback_context)
                 .await;
@@ -827,14 +1419,25 @@ impl AgentTurnLoop {
         result
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "turn runtime 需显式携带 continuation chain、fallback scope 与 hooks"
+    )]
     async fn run_session_turn_with_hooks_inner(
         &self,
         request: SessionTurnRequest,
+        recovered_model_context: Vec<CompletedSessionTurnMessage>,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
         tool_boundary_control: Option<ToolBoundaryControl>,
-        mut durable_recorder: Option<&mut dyn SessionTurnEventRecorder>,
-        mut preflight: Option<&mut dyn SessionTurnPreflight>,
+        hooks: SessionTurnHooks<'_, '_, '_>,
+        runtime_chain_id: ProviderRuntimeChainId,
+        runtime_fallback_scope: crate::api::ProviderRuntimeFallbackScope,
     ) -> anyhow::Result<SessionTurn> {
+        let SessionTurnHooks {
+            mut durable_recorder,
+            mut context_appender,
+            mut preflight,
+        } = hooks;
         if self.max_tool_loop_turns == Some(0) {
             anyhow::bail!("run_session_turn max_turns 必须大于 0");
         }
@@ -849,44 +1452,149 @@ impl AgentTurnLoop {
             skill_instructions,
         } = request;
         let mut provider_messages = history;
+        let frozen_provider_history_prefix_len = preflight
+            .as_deref()
+            .map(SessionTurnPreflight::frozen_provider_history_prefix_len)
+            .unwrap_or(0);
+        let mut frozen_provider_prefix = FrozenProviderRequestPrefix::new(
+            &provider_messages,
+            frozen_provider_history_prefix_len,
+        )?;
+        let mut committed = Vec::new();
         let (user_message, text_attachment_reads, attachment_warnings) = session_user_message(
             user_text,
             user_attachments,
             skill_instructions,
             &self.attachment_limits,
+            self.tools.file_edit_authority_enabled(),
         )
         .await?;
         for message in attachment_warnings {
             emit(SessionTurnEvent::Warning { message });
         }
+        self.materialize_recovered_model_context(
+            &mut provider_messages,
+            &mut committed,
+            &mut durable_recorder,
+            recovered_model_context,
+        )
+        .await?;
+        let initial_context = self
+            .observe_model_context(&provider_messages, &mut context_appender)
+            .await?;
+        self.append_frozen_model_context(
+            &mut provider_messages,
+            &mut committed,
+            &mut durable_recorder,
+            initial_context,
+        )
+        .await?;
         let turn_started_at = self.now();
-        provider_messages.push(user_message_with_runtime_context(
-            &user_message,
-            turn_started_at,
-        ));
-        let mut committed = vec![CompletedSessionTurnMessage::new(
-            user_message,
-            turn_started_at,
-        )];
+        provider_messages.push(user_message.clone());
+        let completed_user = CompletedSessionTurnMessage::new(user_message, turn_started_at);
+        if let Some(recorder) = durable_recorder.as_deref_mut() {
+            recorder.record_completed_message(&completed_user).await?;
+        }
+        committed.push(completed_user);
         let mut seen_tool_use_ids = HashSet::new();
         let mut pending_process_deliveries = Vec::<PendingProcessDelivery>::new();
+        let mut context_continuation = ContextWindowContinuation::default();
+        let mut context_window_recoveries = 0usize;
 
         let mut turn_idx = 0usize;
+        let mut provider_request_idx = 0usize;
         loop {
             if turn_idx > 0 && tool_boundary_is_cancelled(tool_boundary_control.as_ref()) {
                 return Err(SessionTurnInterrupted.into());
             }
             if let Some(preflight) = preflight.as_mut() {
                 preflight
+                    .before_context_observation(&mut system_prompt, &mut provider_messages, emit)
+                    .await?;
+            }
+            let frozen_context = self
+                .observe_model_context(&provider_messages, &mut context_appender)
+                .await?;
+            let changed_context_start = provider_messages.len();
+            append_new_model_context_messages(
+                &mut provider_messages,
+                frozen_context.iter().map(|completed| &completed.message),
+            )?;
+            let history_replacement_expected = preflight.as_deref().is_some_and(|preflight| {
+                preflight.history_replacement_expected(&system_prompt, &provider_messages)
+            });
+            let context_rebaseline_start = if history_replacement_expected {
+                provider_messages.truncate(changed_context_start);
+                let start = changed_context_start;
+                provider_messages.extend(
+                    frozen_context
+                        .iter()
+                        .map(|completed| completed.message.clone()),
+                );
+                Some(start)
+            } else {
+                provider_messages.truncate(changed_context_start);
+                self.append_frozen_model_context(
+                    &mut provider_messages,
+                    &mut committed,
+                    &mut durable_recorder,
+                    frozen_context.iter().cloned(),
+                )
+                .await?;
+                None
+            };
+            if let Some(preflight) = preflight.as_mut() {
+                preflight
                     .before_provider_request(&mut system_prompt, &mut provider_messages, emit)
                     .await?;
             }
-            // preflight（尤其是 compaction/runtime projection）本身可能让出执行权；若此时
-            // 已收到 steer 或显式取消，就不能再发起一个新的 provider request。
+            let history_replaced = preflight
+                .as_deref_mut()
+                .is_some_and(|preflight| preflight.take_history_replaced_since_last_check());
+            match (context_rebaseline_start, history_replaced) {
+                (Some(_), true) => {
+                    let frozen_messages = frozen_context
+                        .iter()
+                        .map(|completed| completed.message.clone())
+                        .collect::<Vec<_>>();
+                    if !provider_messages.ends_with(&frozen_messages) {
+                        anyhow::bail!("compaction 未保留冻结的 context baseline");
+                    }
+                    self.persist_frozen_model_context(
+                        &mut committed,
+                        &mut durable_recorder,
+                        frozen_context,
+                    )
+                    .await?;
+                }
+                (Some(start), false) => {
+                    provider_messages.truncate(start);
+                    self.append_frozen_model_context(
+                        &mut provider_messages,
+                        &mut committed,
+                        &mut durable_recorder,
+                        frozen_context,
+                    )
+                    .await?;
+                }
+                (None, true) => {
+                    anyhow::bail!("preflight 未声明压缩预期却替换了 provider history");
+                }
+                (None, false) => {}
+            }
+            if history_replaced {
+                // compaction 是允许替换旧 history 的显式缓存断点；其首个新请求重新建立边界。
+                frozen_provider_prefix.clear();
+                // 同时废弃 connection-local previous_response_id；健康 socket 与
+                // runtime-chain sticky HTTP 状态仍可保留，下一请求必须发送完整新窗口。
+                self.provider.discard_runtime_chain(runtime_chain_id).await;
+            }
+            // steering、context 观察和 compaction 都可能让出执行权；若此时已收到
+            // steer 或显式取消，就不能再发起一个新的 provider request。
             if tool_boundary_is_cancelled(tool_boundary_control.as_ref()) {
                 return Err(SessionTurnInterrupted.into());
             }
-            if turn_idx == 0 {
+            if provider_request_idx == 0 {
                 let attachment_context = ToolDispatchContext {
                     current_session_id: current_session_id.clone(),
                     current_turn_id: current_turn_id.clone(),
@@ -905,6 +1613,9 @@ impl AgentTurnLoop {
                         .await;
                 }
             }
+            provider_request_idx = provider_request_idx
+                .checked_add(1)
+                .context("run_session_turn provider 请求轮数溢出")?;
             let mut process_deliveries_for_request = Vec::new();
             let mut process_deliveries_not_in_request = Vec::new();
             for pending in &pending_process_deliveries {
@@ -922,8 +1633,38 @@ impl AgentTurnLoop {
             self.tools
                 .begin_process_deliveries(&process_deliveries_for_request)
                 .await;
+            let request_messages = frozen_provider_prefix.project(&provider_messages)?;
+            if let Some(preflight) = preflight.as_mut() {
+                let request_ready: anyhow::Result<()> = match time::timeout(
+                    PROVIDER_WAL_PREPARATION_TIMEOUT,
+                    preflight.provider_request_ready(&request_messages, committed.len()),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(ProviderRequestPreparationFailure::new(
+                        "Provider 请求状态保存超时（10 秒）",
+                    )
+                    .into()),
+                };
+                if let Err(error) = request_ready {
+                    if let Err(rollback_error) =
+                        preflight.provider_request_abandoned_before_send().await
+                    {
+                        return Err(error.context(format!(
+                            "回滚确定未发送的 Provider request WAL 失败: {rollback_error:#}"
+                        )));
+                    }
+                    return Err(error);
+                }
+            }
             let mut latest_provider_context_usage = None;
             let provider_call = {
+                let mut request_progress = ProviderRequestProgress::new(
+                    request_messages.clone(),
+                    preflight.take(),
+                    committed.len(),
+                );
                 let mut provider_emit = |event| {
                     if let SessionTurnEvent::ContextUsageUpdated { usage } = &event {
                         if usage.source == crate::api::ContextUsageSource::Provider {
@@ -935,27 +1676,95 @@ impl AgentTurnLoop {
                 let provider_interrupt = tool_boundary_control
                     .as_ref()
                     .map(ToolBoundaryControl::cancellation_token);
-                self.call_provider(
-                    &system_prompt,
-                    &provider_messages,
-                    &mut provider_emit,
-                    &mut durable_recorder,
-                    &seen_tool_use_ids,
-                    provider_interrupt.as_ref(),
-                )
-                .await?
+                let provider_recovery_interrupt = tool_boundary_control
+                    .as_ref()
+                    .map(ToolBoundaryControl::recovery_cancellation_token);
+                let result = self
+                    .call_provider(
+                        &system_prompt,
+                        &request_messages,
+                        &context_continuation,
+                        &mut provider_emit,
+                        &mut durable_recorder,
+                        &seen_tool_use_ids,
+                        provider_interrupt.as_ref(),
+                        provider_recovery_interrupt.as_ref(),
+                        runtime_chain_id,
+                        &runtime_fallback_scope,
+                        &mut request_progress,
+                    )
+                    .await;
+                preflight = request_progress.take_preflight();
+                result?
             };
-            let provider_response = provider_call.response;
+            let ProviderCallOutcome {
+                response: provider_response,
+                request_messages: successful_request_messages,
+                provider_assistant_message,
+                recovered_with_non_streaming,
+                provider_mcp_routes,
+            } = provider_call;
+            if recovered_with_non_streaming {
+                // HTTP replacement 不属于旧 WebSocket connection-local history；即使
+                // strict prefix 会在下轮拒绝它，也应在 fallback 成功后立即废弃旧链。
+                self.provider.discard_runtime_chain(runtime_chain_id).await;
+            }
+            let stop = provider_response.stop;
+            let context_window_recovery_marker = if stop == ProviderStop::ContextWindowExceeded {
+                let continuation_suffix = successful_request_messages
+                    .strip_prefix(request_messages.as_slice())
+                    .context("context-window continuation 未保留本轮 Provider 请求前缀")?;
+                Some(
+                    continuation_suffix
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| provider_assistant_message.clone()),
+                )
+            } else {
+                None
+            };
+            if successful_request_messages != request_messages {
+                // adapter 已经完成一次或多次 max-token continuation。
+                // raw history 仍要保留 compactor 的 active boundary；只把 adapter
+                // 新增的 replay suffix 接到尾部。真实发送的规范化 history 由
+                // frozen_provider_prefix 单独保存，不能用 wire vector 覆盖 raw vector。
+                append_adapter_continuation_suffix_to_raw_history(
+                    &mut provider_messages,
+                    &request_messages,
+                    &successful_request_messages,
+                )?;
+            }
+            // Provider 已接受这份精确请求；后续 tool loop 只能在其后追加并规范化 suffix。
+            frozen_provider_prefix.advance(&provider_messages, successful_request_messages);
             let assistant_message = provider_response.assistant_message;
             validate_assistant_message(&assistant_message)?;
             let tool_uses = collect_tool_uses(&assistant_message)?;
-            validate_provider_response_terminal_semantics(provider_response.stop, &tool_uses)?;
+            validate_provider_response_terminal_semantics(stop, &tool_uses)?;
+            if stop == ProviderStop::ContextWindowExceeded {
+                if context_window_recoveries >= MAX_CONTEXT_WINDOW_RECOVERIES {
+                    anyhow::bail!(
+                        "模型上下文已满；自动压缩并续写 {MAX_CONTEXT_WINDOW_RECOVERIES} 次后仍未完成。请简化任务或新建会话重试。"
+                    );
+                }
+                let Some(preflight) = preflight.as_mut() else {
+                    anyhow::bail!("模型上下文已满，但当前 ACN 调用链未接入自动恢复");
+                };
+                preflight.request_context_window_recovery(
+                    context_window_recovery_marker
+                        .as_ref()
+                        .context("context-window response 缺少 recovery marker")?,
+                )?;
+                context_window_recoveries = context_window_recoveries.saturating_add(1);
+            }
             self.tools
                 .commit_process_deliveries(&process_deliveries_for_request)
                 .await;
             pending_process_deliveries.clear();
             if let Some(preflight) = preflight.as_mut() {
                 preflight.after_provider_response_success().await?;
+            }
+            if let Some(context_appender) = context_appender.as_mut() {
+                context_appender.after_provider_response_success().await?;
             }
             for tool_use in &tool_uses {
                 if !seen_tool_use_ids.insert(tool_use.id.clone()) {
@@ -966,17 +1775,26 @@ impl AgentTurnLoop {
                 }
             }
             let assistant_text = assistant_message_text(&assistant_message);
-            if !provider_call.recovered_with_non_streaming && !assistant_text.trim().is_empty() {
+            if stop != ProviderStop::ContextWindowExceeded
+                && !recovered_with_non_streaming
+                && !assistant_text.trim().is_empty()
+            {
+                let completed_text =
+                    context_continuation.fallback_replacement_text(&assistant_text);
                 record_durable_event(
                     &mut durable_recorder,
                     SessionTurnEvent::AssistantMessageCompleted {
-                        text: assistant_text,
+                        text: completed_text,
                     },
                 )
                 .await?;
             }
 
-            if tool_boundary_is_cancelled(tool_boundary_control.as_ref()) {
+            if tool_boundary_is_cancelled(tool_boundary_control.as_ref())
+                && !tool_boundary_control
+                    .as_ref()
+                    .is_some_and(ToolBoundaryControl::should_commit_successful_response)
+            {
                 if !tool_uses.is_empty() {
                     let deadline = tool_boundary_control
                         .as_ref()
@@ -1003,8 +1821,27 @@ impl AgentTurnLoop {
                 return Err(SessionTurnInterrupted.into());
             }
 
-            let canonical_assistant_message = assistant_message.clone();
-            provider_messages.push(assistant_message);
+            if stop == ProviderStop::ContextWindowExceeded && tool_uses.is_empty() {
+                context_continuation.absorb_partial(&assistant_message)?;
+                provider_messages.push(provider_assistant_message);
+                if let Some(preflight) = preflight.as_mut() {
+                    if let Some(usage) = latest_provider_context_usage {
+                        preflight.observe_provider_context_usage(provider_messages.len(), usage);
+                    } else {
+                        preflight.clear_provider_context_usage();
+                    }
+                }
+                provider_messages.push(SessionTurnMessage::user_text(CONTINUATION_TRIGGER));
+                context_continuation.push_internal_continuation();
+                continue;
+            }
+
+            let mut canonical_assistant_message = assistant_message;
+            if context_continuation.has_pending() {
+                std::mem::take(&mut context_continuation)
+                    .merge_into(&mut canonical_assistant_message)?;
+            }
+            provider_messages.push(provider_assistant_message);
             if let Some(preflight) = preflight.as_mut() {
                 if let Some(usage) = latest_provider_context_usage {
                     preflight.observe_provider_context_usage(provider_messages.len(), usage);
@@ -1012,12 +1849,35 @@ impl AgentTurnLoop {
                     preflight.clear_provider_context_usage();
                 }
             }
-            committed.push(CompletedSessionTurnMessage::new(
-                canonical_assistant_message,
-                self.now(),
-            ));
+            let completed_assistant =
+                CompletedSessionTurnMessage::new(canonical_assistant_message, self.now());
+            if let Some(recorder) = durable_recorder.as_deref_mut() {
+                recorder
+                    .record_completed_message(&completed_assistant)
+                    .await?;
+            }
+            committed.push(completed_assistant);
 
             if tool_uses.is_empty() {
+                let completed_provider_history =
+                    frozen_provider_prefix.project(&provider_messages)?;
+                if let Some(preflight) = preflight.as_mut() {
+                    match time::timeout(
+                        PROVIDER_WAL_PREPARATION_TIMEOUT,
+                        preflight
+                            .provider_response_ready(&completed_provider_history, committed.len()),
+                    )
+                    .await
+                    {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            return Err(ProviderRequestPreparationFailure::new(
+                                "Provider 响应状态保存超时（10 秒）",
+                            )
+                            .into());
+                        }
+                    }
+                }
                 return Ok(SessionTurn {
                     messages: committed,
                 });
@@ -1031,6 +1891,7 @@ impl AgentTurnLoop {
             let Some(executed_tool_uses) = self
                 .execute_tool_uses_in_batches(
                     &tool_uses,
+                    &provider_mcp_routes,
                     &current_session_id,
                     &current_turn_id,
                     tool_boundary_control.as_ref(),
@@ -1076,18 +1937,24 @@ impl AgentTurnLoop {
             tool_results.extend(media_blocks);
             let tool_result_message = SessionTurnMessage {
                 role: "user".into(),
+                provider_replay: None,
                 content: tool_results,
             };
             canonical_tool_results.extend(canonical_media_blocks);
             let canonical_tool_result_message = SessionTurnMessage {
                 role: "user".into(),
+                provider_replay: None,
                 content: canonical_tool_results,
             };
             provider_messages.push(tool_result_message.clone());
-            committed.push(CompletedSessionTurnMessage::new(
-                canonical_tool_result_message,
-                self.now(),
-            ));
+            let completed_tool_result =
+                CompletedSessionTurnMessage::new(canonical_tool_result_message, self.now());
+            if let Some(recorder) = durable_recorder.as_deref_mut() {
+                recorder
+                    .record_completed_message(&completed_tool_result)
+                    .await?;
+            }
+            committed.push(completed_tool_result);
             if tool_boundary_is_cancelled(tool_boundary_control.as_ref()) {
                 return Err(SessionTurnInterrupted.into());
             }
@@ -1097,25 +1964,33 @@ impl AgentTurnLoop {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "provider 调用需同时携带 fallback 展示前缀、durable recorder 与中断边界"
+    )]
     async fn call_provider(
         &self,
         system_prompt: &str,
         messages: &[SessionTurnMessage],
+        context_continuation: &ContextWindowContinuation,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
         durable_recorder: &mut Option<&mut dyn SessionTurnEventRecorder>,
         seen_tool_use_ids: &HashSet<String>,
         provider_interrupt: Option<&CancellationToken>,
+        provider_recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
+        runtime_chain_id: ProviderRuntimeChainId,
+        runtime_fallback_scope: &crate::api::ProviderRuntimeFallbackScope,
+        request_progress: &mut ProviderRequestProgress<'_>,
     ) -> anyhow::Result<ProviderCallOutcome> {
-        let messages = normalize_provider_messages(messages);
-        let tools = self
-            .tools
-            .definitions()
+        let (tool_definitions, provider_mcp_routes) = self.tools.definitions_with_mcp_routes();
+        let provider_mcp_routes = Arc::new(provider_mcp_routes);
+        let tools = tool_definitions
             .into_iter()
             .map(Into::into)
             .collect::<Vec<_>>();
         if self.provider.emit_preflight_context_estimate() {
             emit(SessionTurnEvent::ContextUsageUpdated {
-                usage: estimate_provider_request_context_tokens(system_prompt, &messages, &tools),
+                usage: estimate_provider_request_context_tokens(system_prompt, messages, &tools),
             });
         }
         let mut emitted_assistant_text = false;
@@ -1128,36 +2003,78 @@ impl AgentTurnLoop {
                 emit(SessionTurnEvent::AssistantTextDelta { text });
             }
             ProviderEvent::AssistantMessageCompleted { text } => {
-                emit(SessionTurnEvent::AssistantMessageCompleted { text });
+                emit(SessionTurnEvent::AssistantMessageCompleted {
+                    text: context_continuation.fallback_replacement_text(&text),
+                });
             }
         };
 
+        let streaming_attempt_base = request_progress.latest_messages().to_vec();
         let request = ProviderRequest {
             system_prompt: system_prompt.to_string(),
-            messages: messages.clone(),
+            messages: streaming_attempt_base.clone(),
             tools: tools.clone(),
             max_tokens: self.max_tokens,
             stream: true,
+            stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+            runtime_chain_id: Some(runtime_chain_id),
+            runtime_fallback_scope: Some(runtime_fallback_scope.clone()),
+            recovery_interrupt: provider_recovery_interrupt.cloned(),
             retry_count_override: None,
         };
         let streaming_result = self
-            .send_provider_request_interruptible(request, &mut streaming_emit, provider_interrupt)
+            .send_provider_request_interruptible(
+                request,
+                &mut streaming_emit,
+                provider_interrupt,
+                request_progress,
+            )
             .await;
         match streaming_result {
-            Ok(response) => Ok(ProviderCallOutcome {
-                response,
-                recovered_with_non_streaming: false,
-            }),
+            Ok(response) => {
+                let provider_assistant_message = provider_assistant_suffix_for_latest_request(
+                    &response.assistant_message,
+                    &streaming_attempt_base,
+                    request_progress.latest_messages(),
+                )?;
+                Ok(ProviderCallOutcome {
+                    response,
+                    request_messages: request_progress.latest_messages().to_vec(),
+                    provider_assistant_message,
+                    recovered_with_non_streaming: false,
+                    provider_mcp_routes: Arc::clone(&provider_mcp_routes),
+                })
+            }
+            Err(_error)
+                if provider_recovery_interrupt
+                    .is_some_and(ProviderRecoveryInterrupt::is_cancelled) =>
+            {
+                Err(SessionTurnInterrupted.into())
+            }
             Err(error)
-                if !emitted_assistant_text
-                    || error.downcast_ref::<SessionTurnInterrupted>().is_some() =>
+                if error.downcast_ref::<ProviderTerminalFailure>().is_some()
+                    || error.downcast_ref::<SessionTurnInterrupted>().is_some()
+                    || error
+                        .downcast_ref::<ProviderRequestPreparationFailure>()
+                        .is_some() =>
             {
                 Err(error)
             }
-            Err(mut previous_error) => {
+            Err(mut previous_error)
+                if emitted_assistant_text
+                    || previous_error
+                        .downcast_ref::<ProviderStreamFailure>()
+                        .is_some()
+                    || previous_error
+                        .downcast_ref::<ProviderNoConsumableOutput>()
+                        .is_some() =>
+            {
                 for attempt in 1..=NON_STREAMING_FALLBACK_MAX_ATTEMPTS {
-                    // 上一轮失败的 durable 写入期间可能收到 cancel；此时不应虚构下一次已开始。
-                    if provider_interrupt.is_some_and(CancellationToken::is_cancelled) {
+                    // 上一轮失败或 durable 写入期间可能收到 steer/cancel；此时不能
+                    // 虚构下一次已开始，也不能为必定丢弃的 turn 继续计费。
+                    if provider_recovery_interrupt
+                        .is_some_and(ProviderRecoveryInterrupt::is_cancelled)
+                    {
                         return Err(SessionTurnInterrupted.into());
                     }
                     let (previous_error_text, _) = truncate_chars(
@@ -1170,19 +2087,32 @@ impl AgentTurnLoop {
                         previous_error: previous_error_text,
                     };
                     record_durable_event(durable_recorder, started_event.clone()).await?;
-                    if provider_interrupt.is_some_and(CancellationToken::is_cancelled) {
+                    if provider_recovery_interrupt
+                        .is_some_and(ProviderRecoveryInterrupt::is_cancelled)
+                    {
                         return Err(SessionTurnInterrupted.into());
                     }
                     emit(started_event);
-                    self.wait_for_non_streaming_fallback(attempt, provider_interrupt)
+                    self.wait_for_non_streaming_fallback(attempt, provider_recovery_interrupt)
                         .await?;
 
+                    if provider_recovery_interrupt
+                        .is_some_and(ProviderRecoveryInterrupt::is_cancelled)
+                    {
+                        return Err(SessionTurnInterrupted.into());
+                    }
+
+                    let fallback_attempt_base = request_progress.latest_messages().to_vec();
                     let fallback_request = ProviderRequest {
                         system_prompt: system_prompt.to_string(),
-                        messages: messages.clone(),
+                        messages: fallback_attempt_base.clone(),
                         tools: tools.clone(),
                         max_tokens: self.max_tokens,
                         stream: false,
+                        stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                        runtime_chain_id: None,
+                        runtime_fallback_scope: None,
+                        recovery_interrupt: provider_recovery_interrupt.cloned(),
                         // TUI 的 N/5 必须严格对应一次 provider-call attempt，禁止 adapter 再嵌套 retry。
                         retry_count_override: Some(0),
                     };
@@ -1198,6 +2128,7 @@ impl AgentTurnLoop {
                             fallback_request,
                             &mut fallback_emit,
                             provider_interrupt,
+                            request_progress,
                         )
                         .await
                         .and_then(|response| {
@@ -1206,19 +2137,57 @@ impl AgentTurnLoop {
                         });
                     match fallback_result {
                         Ok(response) => {
+                            let provider_assistant_message =
+                                provider_assistant_suffix_for_latest_request(
+                                    &response.assistant_message,
+                                    &fallback_attempt_base,
+                                    request_progress.latest_messages(),
+                                )?;
+                            let mut response = response;
+                            merge_prior_attempt_continuation_text(
+                                &mut response.assistant_message,
+                                messages,
+                                &fallback_attempt_base,
+                            )?;
+                            let replacement_text = context_continuation.fallback_replacement_text(
+                                &assistant_message_text(&response.assistant_message),
+                            );
                             let succeeded_event = SessionTurnEvent::NonStreamingFallbackSucceeded {
                                 attempt,
                                 max_attempts: NON_STREAMING_FALLBACK_MAX_ATTEMPTS,
-                                text: assistant_message_text(&response.assistant_message),
+                                text: replacement_text,
                             };
                             record_durable_event(durable_recorder, succeeded_event.clone()).await?;
                             emit(succeeded_event);
                             return Ok(ProviderCallOutcome {
                                 response,
+                                request_messages: request_progress.latest_messages().to_vec(),
+                                provider_assistant_message,
                                 recovered_with_non_streaming: true,
+                                provider_mcp_routes: Arc::clone(&provider_mcp_routes),
                             });
                         }
-                        Err(error) if error.downcast_ref::<SessionTurnInterrupted>().is_some() => {
+                        Err(error)
+                            if error.downcast_ref::<SessionTurnInterrupted>().is_some()
+                                || error
+                                    .downcast_ref::<ProviderRequestPreparationFailure>()
+                                    .is_some() =>
+                        {
+                            return Err(error);
+                        }
+                        Err(error) if error.downcast_ref::<ProviderTerminalFailure>().is_some() => {
+                            let (error_text, _) = truncate_chars(
+                                &format!("{error:#}"),
+                                NON_STREAMING_FALLBACK_ERROR_MAX_CHARS,
+                            );
+                            let failed_event =
+                                SessionTurnEvent::NonStreamingFallbackAttemptFailed {
+                                    attempt,
+                                    max_attempts: NON_STREAMING_FALLBACK_MAX_ATTEMPTS,
+                                    error: error_text,
+                                };
+                            record_durable_event(durable_recorder, failed_event.clone()).await?;
+                            emit(failed_event);
                             return Err(error);
                         }
                         Err(error) => {
@@ -1244,6 +2213,7 @@ impl AgentTurnLoop {
                     NON_STREAMING_FALLBACK_MAX_ATTEMPTS
                 ))
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -1252,35 +2222,63 @@ impl AgentTurnLoop {
         request: ProviderRequest,
         emit: &mut (dyn FnMut(ProviderEvent) + Send),
         provider_interrupt: Option<&CancellationToken>,
+        request_progress: &mut ProviderRequestProgress<'_>,
     ) -> anyhow::Result<ProviderResponse> {
+        let request_is_streaming = request.stream;
         let request_timeout = self.provider.request_timeout();
-        let provider_send = self.provider.send(request, emit);
-        let provider_call = async {
-            match request_timeout {
-                Some(timeout) => time::timeout(timeout, provider_send).await.map_err(|_| {
-                    anyhow::anyhow!("LLM provider call timeout after {}ms", timeout.as_millis())
-                })?,
-                None => provider_send.await,
+        request_progress.begin_provider_attempt();
+        let write_ahead_phase = request_progress.write_ahead_phase();
+        let result = {
+            let provider_send =
+                self.provider
+                    .send_with_request_observer(request, emit, request_progress);
+            let provider_call = async {
+                match request_timeout {
+                    Some(timeout) => match time::timeout(timeout, provider_send).await {
+                        Ok(result) => result,
+                        Err(_) if write_ahead_phase.load(Ordering::Acquire) => {
+                            Err(ProviderRequestPreparationFailure::new(format!(
+                                "Provider continuation WAL timeout after {}ms",
+                                timeout.as_millis()
+                            ))
+                            .into())
+                        }
+                        Err(_) if request_is_streaming => Err(ProviderStreamFailure::new(format!(
+                            "LLM provider streaming call timeout after {}ms",
+                            timeout.as_millis()
+                        ))
+                        .into()),
+                        Err(_) => Err(anyhow::anyhow!(
+                            "LLM provider call timeout after {}ms",
+                            timeout.as_millis()
+                        )),
+                    },
+                    None => provider_send.await,
+                }
+            };
+            tokio::pin!(provider_call);
+            match provider_interrupt {
+                Some(interrupt) if interrupt.is_cancelled() => Err(SessionTurnInterrupted.into()),
+                Some(interrupt) => {
+                    tokio::select! {
+                        biased;
+                        response = &mut provider_call => response,
+                        _ = interrupt.cancelled() => Err(SessionTurnInterrupted.into()),
+                    }
+                }
+                None => provider_call.await,
             }
         };
-        tokio::pin!(provider_call);
-        match provider_interrupt {
-            Some(interrupt) if interrupt.is_cancelled() => Err(SessionTurnInterrupted.into()),
-            Some(interrupt) => {
-                tokio::select! {
-                    biased;
-                    response = &mut provider_call => response,
-                    _ = interrupt.cancelled() => Err(SessionTurnInterrupted.into()),
-                }
-            }
-            None => provider_call.await,
+        if result.is_err() && !request_progress.latest_request_started {
+            request_progress.rollback_unsent_request().await?;
         }
+        result
     }
 
     async fn wait_for_non_streaming_fallback(
         &self,
         attempt: u32,
-        provider_interrupt: Option<&CancellationToken>,
+        recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
     ) -> anyhow::Result<()> {
         let delay = non_streaming_fallback_delay(attempt);
         log::warn!(
@@ -1292,7 +2290,7 @@ impl AgentTurnLoop {
         );
         let sleep = time::sleep(delay);
         tokio::pin!(sleep);
-        match provider_interrupt {
+        match recovery_interrupt {
             Some(interrupt) if interrupt.is_cancelled() => Err(SessionTurnInterrupted.into()),
             Some(interrupt) => {
                 tokio::select! {
@@ -1411,13 +2409,207 @@ fn normalize_provider_messages(messages: &[SessionTurnMessage]) -> Vec<SessionTu
     out
 }
 
+/// 保存上一份真实发送请求在 raw history 与 wire history 中的对应边界。
+///
+/// raw history 继续服务 compaction/canonical cursor；wire history 则原样冻结，后续只对
+/// raw suffix 应用既有规范化，因而不会为了合并相邻 user 而重写已缓存前缀。
+#[derive(Debug, Default)]
+struct FrozenProviderRequestPrefix {
+    raw_messages: Vec<SessionTurnMessage>,
+    wire_messages: Vec<SessionTurnMessage>,
+}
+
+impl FrozenProviderRequestPrefix {
+    fn new(messages: &[SessionTurnMessage], frozen_prefix_len: usize) -> anyhow::Result<Self> {
+        let raw_messages = messages
+            .get(..frozen_prefix_len)
+            .with_context(|| {
+                format!(
+                    "冻结 provider history 前缀越界: prefix={frozen_prefix_len}, history={}",
+                    messages.len()
+                )
+            })?
+            .to_vec();
+        Ok(Self {
+            wire_messages: raw_messages.clone(),
+            raw_messages,
+        })
+    }
+
+    fn clear(&mut self) {
+        self.raw_messages.clear();
+        self.wire_messages.clear();
+    }
+
+    fn project(&self, messages: &[SessionTurnMessage]) -> anyhow::Result<Vec<SessionTurnMessage>> {
+        if !messages.starts_with(&self.raw_messages) {
+            anyhow::bail!(
+                "provider history 在非 compaction 边界改写了已发送前缀: frozen={}, current={}",
+                self.raw_messages.len(),
+                messages.len()
+            );
+        }
+        let mut projected = Vec::with_capacity(
+            self.wire_messages
+                .len()
+                .saturating_add(messages.len().saturating_sub(self.raw_messages.len())),
+        );
+        projected.extend(self.wire_messages.iter().cloned());
+        projected.extend(normalize_provider_messages(
+            &messages[self.raw_messages.len()..],
+        ));
+        Ok(projected)
+    }
+
+    fn advance(
+        &mut self,
+        raw_messages: &[SessionTurnMessage],
+        wire_messages: Vec<SessionTurnMessage>,
+    ) {
+        self.raw_messages = raw_messages.to_vec();
+        self.wire_messages = wire_messages;
+    }
+}
+
+/// adapter continuation 的最新请求基于 wire history，而 compactor 继续使用 raw
+/// history 的 message boundary。两者前缀已经由 `FrozenProviderRequestPrefix` 对齐；
+/// 这里只追加 adapter 新产生的 replay suffix，避免 normalization 缩短前缀后令
+/// active-start index 漂移。
+fn append_adapter_continuation_suffix_to_raw_history(
+    raw_messages: &mut Vec<SessionTurnMessage>,
+    outer_request: &[SessionTurnMessage],
+    latest_request: &[SessionTurnMessage],
+) -> anyhow::Result<()> {
+    let suffix = latest_request
+        .strip_prefix(outer_request)
+        .context("adapter continuation 的最终请求未保留外层 Provider 请求前缀")?;
+    raw_messages.extend_from_slice(suffix);
+    Ok(())
+}
+
+/// 把 adapter 返回的完整 continuation replay 裁成“最后一次请求之后”
+/// 的响应 suffix。已经出现在 latest request 中的 partial/trigger 不能再放入
+/// provider history，否则下一请求会重复 replay。
+fn provider_assistant_suffix_for_latest_request(
+    assistant: &SessionTurnMessage,
+    attempt_base: &[SessionTurnMessage],
+    latest_request: &[SessionTurnMessage],
+) -> anyhow::Result<SessionTurnMessage> {
+    let Some(continuation_suffix) = latest_request.strip_prefix(attempt_base) else {
+        anyhow::bail!(
+            "adapter continuation 的最终请求未保留 attempt 前缀: base={}, latest={}",
+            attempt_base.len(),
+            latest_request.len()
+        );
+    };
+    let mut assistant = assistant.clone();
+    for message in continuation_suffix {
+        if message.role != "assistant" {
+            anyhow::bail!("adapter continuation suffix 包含非 assistant neutral message");
+        }
+        let prefix = message
+            .provider_replay
+            .as_ref()
+            .context("adapter continuation suffix 缺少 provider replay")?;
+        let replay = assistant
+            .provider_replay
+            .as_mut()
+            .context("adapter continuation response 缺少 provider replay")?;
+        strip_provider_replay_prefix(replay, prefix)?;
+    }
+    Ok(assistant)
+}
+
+fn strip_provider_replay_prefix(
+    replay: &mut ProviderReplayState,
+    prefix: &ProviderReplayState,
+) -> anyhow::Result<()> {
+    let (items, prefix_items, protocol) = match (replay, prefix) {
+        (
+            ProviderReplayState::OpenAiResponses { model, items },
+            ProviderReplayState::OpenAiResponses {
+                model: prefix_model,
+                items: prefix_items,
+            },
+        ) if model == prefix_model => (items, prefix_items, "openai_responses"),
+        (
+            ProviderReplayState::OpenAiChatCompletions { model, messages },
+            ProviderReplayState::OpenAiChatCompletions {
+                model: prefix_model,
+                messages: prefix_messages,
+            },
+        ) if model == prefix_model => (messages, prefix_messages, "openai_chat_completions"),
+        (
+            ProviderReplayState::AnthropicMessages { model, messages },
+            ProviderReplayState::AnthropicMessages {
+                model: prefix_model,
+                messages: prefix_messages,
+            },
+        ) if model == prefix_model => (messages, prefix_messages, "anthropic_messages"),
+        _ => anyhow::bail!("adapter continuation replay 协议或 model 在同一请求内发生变化"),
+    };
+    if !items.starts_with(prefix_items) {
+        anyhow::bail!(
+            "{protocol} continuation response 未保留已发送 replay 前缀: prefix={}, response={}",
+            prefix_items.len(),
+            items.len()
+        );
+    }
+    items.drain(..prefix_items.len());
+    Ok(())
+}
+
+/// non-streaming fallback 从最新 continuation request 继续时，新响应文本只是
+/// 未完成 suffix。canonical assistant 需要合并此前已完成 partial，而精确
+/// Provider history 仍由 `provider_assistant_suffix_for_latest_request` 分开保存。
+fn merge_prior_attempt_continuation_text(
+    assistant: &mut SessionTurnMessage,
+    initial_request: &[SessionTurnMessage],
+    fallback_base: &[SessionTurnMessage],
+) -> anyhow::Result<()> {
+    let Some(prior_continuations) = fallback_base.strip_prefix(initial_request) else {
+        anyhow::bail!(
+            "fallback 请求未保留初始 Provider 前缀: initial={}, fallback={}",
+            initial_request.len(),
+            fallback_base.len()
+        );
+    };
+    let mut prior_text = String::new();
+    for message in prior_continuations {
+        if message.role != "assistant" || message.provider_replay.is_none() {
+            anyhow::bail!("fallback continuation suffix 不是 adapter 上报的 replay message");
+        }
+        append_with_overlap_dedupe(&mut prior_text, &assistant_message_text(message));
+    }
+    if prior_text.trim().is_empty() {
+        return Ok(());
+    }
+    append_with_overlap_dedupe(&mut prior_text, &assistant_message_text(assistant));
+    let first_text_index = assistant
+        .content
+        .iter()
+        .position(|block| matches!(block, SessionTurnContentBlock::Text { .. }))
+        .unwrap_or(0);
+    let mut non_text = std::mem::take(&mut assistant.content)
+        .into_iter()
+        .filter(|block| !matches!(block, SessionTurnContentBlock::Text { .. }))
+        .collect::<Vec<_>>();
+    non_text.insert(
+        first_text_index.min(non_text.len()),
+        SessionTurnContentBlock::text(prior_text),
+    );
+    assistant.content = non_text;
+    Ok(())
+}
+
 fn assistant_message_text(message: &SessionTurnMessage) -> String {
     message
         .content
         .iter()
         .filter_map(|block| match block {
             SessionTurnContentBlock::Text { text } => Some(text.as_str()),
-            SessionTurnContentBlock::SkillInstructions { .. } => None,
+            SessionTurnContentBlock::SkillInstructions { .. }
+            | SessionTurnContentBlock::ModelContext { .. } => None,
             SessionTurnContentBlock::Image { .. }
             | SessionTurnContentBlock::Document { .. }
             | SessionTurnContentBlock::ToolUse { .. }
@@ -1425,28 +2617,6 @@ fn assistant_message_text(message: &SessionTurnMessage) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn user_message_with_runtime_context(
-    user_message: &SessionTurnMessage,
-    now: DateTime<Utc>,
-) -> SessionTurnMessage {
-    let mut message = user_message.clone();
-    let context = runtime_context_text(now);
-    for block in &mut message.content {
-        if let SessionTurnContentBlock::Text { text } = block {
-            if text.is_empty() {
-                *text = context;
-            } else {
-                *text = format!("{context}\n\n{text}");
-            }
-            return message;
-        }
-    }
-    message
-        .content
-        .insert(0, SessionTurnContentBlock::text(context));
-    message
 }
 
 fn runtime_context_text(now: DateTime<Utc>) -> String {
@@ -1457,6 +2627,43 @@ fn runtime_context_text(now: DateTime<Utc>) -> String {
     format!(
         "<runtime_context>\ncurrent_date: {current_date}\ntimezone: {timezone}\n</runtime_context>"
     )
+}
+
+fn latest_model_context(
+    messages: &[SessionTurnMessage],
+    source: ModelContextSource,
+) -> Option<(&str, &str)> {
+    messages.iter().rev().find_map(|message| {
+        let (candidate_source, fingerprint, text) = message.model_context_snapshot()?;
+        (*candidate_source == source).then_some((fingerprint, text))
+    })
+}
+
+fn append_new_model_context_messages<'a>(
+    messages: &mut Vec<SessionTurnMessage>,
+    candidates: impl IntoIterator<Item = &'a SessionTurnMessage>,
+) -> anyhow::Result<()> {
+    for candidate in candidates {
+        let (source, fingerprint, text) = candidate
+            .model_context_snapshot()
+            .context("context appender 只能返回独立 ModelContext user message")?;
+        let expected = SessionTurnMessage::model_context(*source, text.to_string());
+        let Some((_, expected_fingerprint, _)) = expected.model_context_snapshot() else {
+            anyhow::bail!("内部 ModelContext 构造失败");
+        };
+        if fingerprint != expected_fingerprint {
+            anyhow::bail!("context appender 返回了与正文不匹配的 fingerprint");
+        }
+        if latest_model_context(messages, *source).is_some_and(
+            |(latest_fingerprint, latest_text)| {
+                latest_fingerprint == fingerprint && latest_text == text
+            },
+        ) {
+            continue;
+        }
+        messages.push(candidate.clone());
+    }
+    Ok(())
 }
 
 fn local_timezone_name(local_now: &DateTime<Local>) -> String {
@@ -1471,7 +2678,8 @@ fn pure_user_text(message: &SessionTurnMessage) -> Option<String> {
     for block in &message.content {
         match block {
             SessionTurnContentBlock::Text { text } => parts.push(text.as_str()),
-            SessionTurnContentBlock::SkillInstructions { .. } => return None,
+            SessionTurnContentBlock::SkillInstructions { .. }
+            | SessionTurnContentBlock::ModelContext { .. } => return None,
             SessionTurnContentBlock::Image { .. } | SessionTurnContentBlock::Document { .. } => {
                 return None
             }
@@ -1489,6 +2697,7 @@ async fn session_user_message(
     attachments: Vec<SessionAttachment>,
     skill_instructions: Vec<SkillInstructions>,
     limits: &AttachmentLimits,
+    file_edit_authority_enabled: bool,
 ) -> anyhow::Result<(SessionTurnMessage, Vec<TextAttachmentRead>, Vec<String>)> {
     if !limits.enabled && !attachments.is_empty() {
         anyhow::bail!("附件功能已禁用");
@@ -1515,7 +2724,8 @@ async fn session_user_message(
     let mut text_reads = Vec::<TextAttachmentRead>::new();
     let mut warnings = Vec::<String>::new();
     for attachment in attachments {
-        let (block, text_read, warning) = session_attachment_block(attachment, limits).await?;
+        let (block, text_read, warning) =
+            session_attachment_block(attachment, limits, file_edit_authority_enabled).await?;
         blocks.push(block);
         if let Some(text_read) = text_read {
             text_reads.push(text_read);
@@ -1534,6 +2744,7 @@ async fn session_user_message(
 async fn session_attachment_block(
     attachment: SessionAttachment,
     limits: &AttachmentLimits,
+    file_edit_authority_enabled: bool,
 ) -> anyhow::Result<(
     SessionTurnContentBlock,
     Option<TextAttachmentRead>,
@@ -1575,7 +2786,9 @@ async fn session_attachment_block(
                 None,
             ))
         }
-        SessionAttachment::TextFile { path } => read_text_file_block(&path, limits).await,
+        SessionAttachment::TextFile { path } => {
+            read_text_file_block(&path, limits, file_edit_authority_enabled).await
+        }
         SessionAttachment::DocumentFile { path, media_type } => {
             if media_type != "application/pdf" {
                 anyhow::bail!(
@@ -1603,6 +2816,7 @@ async fn session_attachment_block(
 async fn read_text_file_block(
     path: &Path,
     limits: &AttachmentLimits,
+    file_edit_authority_enabled: bool,
 ) -> anyhow::Result<(
     SessionTurnContentBlock,
     Option<TextAttachmentRead>,
@@ -1614,7 +2828,7 @@ async fn read_text_file_block(
         .await
         .context("解析文本附件真实路径失败")?;
     if crate::attachment::is_protected_memory_path(&canonical_path) {
-        anyhow::bail!("MEMORY.md / USER.md 必须通过 memory 工具访问");
+        anyhow::bail!("目标是 agent 私有受保护文件，不能作为附件读取");
     }
     let content = crate::attachment::read_text_attachment(&canonical_path, limits)
         .await
@@ -1625,20 +2839,40 @@ async fn read_text_file_block(
         .unwrap_or("attachment");
     let actual_chars = content.chars().count();
     if actual_chars > limits.max_text_chars {
-        let provider_text = format!(
-            "Attached text file body omitted: {name}\nPath: {}\nCharacters: \
-             {actual_chars}\nThe file exceeds the per-file text attachment limit of {} \
-             characters. Use file_read with this path to inspect it before editing.",
-            path.display(),
-            limits.max_text_chars,
-        );
-        let warning = format!(
-            "文本附件 `{}` 共 {} 个字符，超过单文件上限 {}；已仅向模型提供路径，\
-             未注入正文，也未授予读取许可。",
-            path.display(),
-            actual_chars,
-            limits.max_text_chars,
-        );
+        let provider_text = if file_edit_authority_enabled {
+            format!(
+                "Attached text file body omitted: {name}\nPath: {}\nCharacters: \
+                 {actual_chars}\nThe file exceeds the per-file text attachment limit of {} \
+                 characters. Use file_read with this path to inspect it before editing.",
+                path.display(),
+                limits.max_text_chars,
+            )
+        } else {
+            format!(
+                "Attached text file body omitted: {name}\nPath: {}\nCharacters: \
+                 {actual_chars}\nThe file exceeds the per-file text attachment limit of {} \
+                 characters. Use file_read with this path when its contents are needed.",
+                path.display(),
+                limits.max_text_chars,
+            )
+        };
+        let warning = if file_edit_authority_enabled {
+            format!(
+                "文本附件 `{}` 共 {} 个字符，超过单文件上限 {}；已仅向模型提供路径，\
+                 未注入正文，也未授予读取许可。",
+                path.display(),
+                actual_chars,
+                limits.max_text_chars,
+            )
+        } else {
+            format!(
+                "文本附件 `{}` 共 {} 个字符，超过单文件上限 {}；已仅向模型提供路径，\
+                 未注入正文。",
+                path.display(),
+                actual_chars,
+                limits.max_text_chars,
+            )
+        };
         return Ok((
             SessionTurnContentBlock::text(provider_text),
             None,
@@ -1689,12 +2923,14 @@ fn validate_assistant_message(message: &SessionTurnMessage) -> anyhow::Result<()
     if message.role != "assistant" {
         anyhow::bail!("provider response role 必须是 assistant: {}", message.role);
     }
-    if message
-        .content
-        .iter()
-        .any(|block| matches!(block, SessionTurnContentBlock::ToolResult { .. }))
-    {
-        anyhow::bail!("assistant message 不允许包含 ToolResult block");
+    if message.content.iter().any(|block| {
+        matches!(
+            block,
+            SessionTurnContentBlock::ToolResult { .. }
+                | SessionTurnContentBlock::ModelContext { .. }
+        )
+    }) {
+        anyhow::bail!("assistant message 不允许包含 ToolResult 或 ModelContext block");
     }
     Ok(())
 }
@@ -1774,6 +3010,8 @@ fn validate_provider_response_terminal_semantics(
         (false, ProviderStop::MaxTokens) => {
             anyhow::bail!("provider stop=MaxTokens 且包含 ToolUse，拒绝执行半截工具调用")
         }
+        (true, ProviderStop::ContextWindowExceeded)
+        | (false, ProviderStop::ContextWindowExceeded) => Ok(()),
     }
 }
 
@@ -1889,7 +3127,7 @@ async fn emit_forced_abort_interrupts(
                     tool_use_id: Some(tool_use.id.clone()),
                     progress_tx: None,
                     cancellation: None,
-                    failed_file_write_paths: None,
+                    provider_mcp_routes: None,
                 })
                 .await
         } else {
@@ -2211,11 +3449,26 @@ fn consult_router_output_preview(value: &Value) -> Option<String> {
 }
 
 fn tool_started_summary(name: &str, input: &Value) -> String {
+    let input = tool_input_runtime_projection(name, input);
     format!("tool {name} {}", one_line_preview(&input.to_string(), 160))
 }
 
-fn tool_input_preview(_name: &str, input: &Value, max_chars: usize) -> (String, bool) {
+fn tool_input_preview(name: &str, input: &Value, max_chars: usize) -> (String, bool) {
+    let input = tool_input_runtime_projection(name, input);
     truncate_chars(&input.to_string(), max_chars)
+}
+
+/// `description` 预留给后续用户可见展示；当前执行摘要与 recovery journal 只保留
+/// 实际命令/进程参数，避免说明文本抢占有界 preview。
+fn tool_input_runtime_projection<'a>(name: &str, input: &'a Value) -> Cow<'a, Value> {
+    if !matches!(name, "code_run" | "write_stdin") || input.get("description").is_none() {
+        return Cow::Borrowed(input);
+    }
+    let mut projected = input.clone();
+    if let Some(object) = projected.as_object_mut() {
+        object.remove("description");
+    }
+    Cow::Owned(projected)
 }
 
 fn tool_completed_summary(
@@ -2288,6 +3541,7 @@ fn provider_request_contains_process_tool_result(
                 content,
             } if tool_use_id == &pending.tool_use_id => Some(content),
             SessionTurnContentBlock::Text { .. }
+            | SessionTurnContentBlock::ModelContext { .. }
             | SessionTurnContentBlock::SkillInstructions { .. }
             | SessionTurnContentBlock::Image { .. }
             | SessionTurnContentBlock::Document { .. }
@@ -2300,6 +3554,7 @@ fn provider_request_contains_process_tool_result(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashSet, VecDeque};
+    use std::future::pending;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
 
@@ -2309,13 +3564,21 @@ mod tests {
     use tokio::sync::{oneshot, watch, Mutex, Notify, Semaphore};
     use tokio::time::{sleep, timeout, Duration};
 
+    use super::{
+        assistant_message_text, provider_assistant_suffix_for_latest_request, read_text_file_block,
+        ProviderNoConsumableOutput, ProviderRequestPreparationFailure, ProviderRequestProgress,
+        ProviderStreamFailure, ProviderTerminalFailure, CONTINUATION_TRIGGER,
+    };
     use crate::agent::fs::LocalFsMemoryStore;
     use crate::api::{
-        estimate_provider_request_context_tokens, AgentTurnLoop, ContextUsageSource,
-        ProviderAdapter, ProviderEvent, ProviderRequest, ProviderResponse, ProviderStop,
-        SessionTurnContentBlock, SessionTurnEvent, SessionTurnEventRecorder,
-        SessionTurnInterrupted, SessionTurnMessage, SessionTurnPreflight, SessionTurnRequest,
-        ToolBoundaryControl, ToolCallSkipReason, ToolExecutionOutcome,
+        estimate_provider_request_context_tokens, AgentTurnLoop, CompletedSessionTurnMessage,
+        ContextUsageSource, ModelContextSource, ProviderAdapter, ProviderEvent,
+        ProviderReplayState, ProviderRequest, ProviderRequestObserver, ProviderResponse,
+        ProviderRuntimeChainId, ProviderStop, ProviderTransport, SessionTurn,
+        SessionTurnContentBlock, SessionTurnContextAppender, SessionTurnEvent,
+        SessionTurnEventRecorder, SessionTurnHooks, SessionTurnInterrupted, SessionTurnMessage,
+        SessionTurnPreflight, SessionTurnRequest, ToolBoundaryControl, ToolCallSkipReason,
+        ToolExecutionOutcome,
     };
     use crate::attachment::AttachmentLimits;
     use crate::config::ToolConfig;
@@ -2327,6 +3590,7 @@ mod tests {
         events: Vec<ProviderEvent>,
         emit_preflight_context_estimate: bool,
         cancel_after_response: Option<ToolBoundaryControl>,
+        preserve_safe_steer_after_response: Option<ToolBoundaryControl>,
     }
 
     struct ScriptedProviderAttempt {
@@ -2337,6 +3601,57 @@ mod tests {
     struct ScriptedProvider {
         attempts: Mutex<VecDeque<ScriptedProviderAttempt>>,
         requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    struct TerminalFailureProvider {
+        requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    struct FallbackTerminalFailureProvider {
+        requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    struct ZeroTextRecoverableProvider {
+        requests: Mutex<Vec<ProviderRequest>>,
+        failure_kind: ZeroTextFailureKind,
+        discarded_chains: AtomicUsize,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ContinuationWalTimeoutMode {
+        Streaming,
+        NonStreamingFallback,
+    }
+
+    struct ContinuationWalTimeoutProvider {
+        mode: ContinuationWalTimeoutMode,
+        transport_requests: Mutex<Vec<bool>>,
+    }
+
+    struct BlockingContinuationWalPreflight {
+        provider_request_ready_calls: Arc<AtomicUsize>,
+    }
+
+    struct BlockingInitialWalPreflight {
+        abandoned_requests: Arc<AtomicUsize>,
+    }
+
+    struct FailingInitialWalPreflight {
+        abandoned_requests: Arc<AtomicUsize>,
+    }
+
+    struct CountingAbandonPreflight {
+        abandoned_requests: Arc<AtomicUsize>,
+    }
+
+    struct BlockingResponseWalPreflight;
+
+    #[derive(Clone, Copy)]
+    enum ZeroTextFailureKind {
+        StreamFailure,
+        NoConsumableOutput,
+        Ordinary,
+        Timeout,
     }
 
     struct ReplaceProcessToolResultPreflight {
@@ -2352,6 +3667,36 @@ mod tests {
     }
 
     struct ExternalizingTextAttachmentPreflight;
+
+    #[derive(Default)]
+    struct RecordingContextRecoveryPreflight {
+        requested: bool,
+        applied: usize,
+    }
+
+    #[async_trait]
+    impl SessionTurnPreflight for RecordingContextRecoveryPreflight {
+        async fn before_provider_request(
+            &mut self,
+            _system_prompt: &mut String,
+            _provider_messages: &mut Vec<SessionTurnMessage>,
+            _emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        ) -> anyhow::Result<()> {
+            if self.requested {
+                self.requested = false;
+                self.applied = self.applied.saturating_add(1);
+            }
+            Ok(())
+        }
+
+        fn request_context_window_recovery(
+            &mut self,
+            _assistant_marker: &SessionTurnMessage,
+        ) -> anyhow::Result<()> {
+            self.requested = true;
+            Ok(())
+        }
+    }
 
     #[async_trait]
     impl SessionTurnPreflight for ReplaceProcessToolResultPreflight {
@@ -2453,6 +3798,262 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl ProviderAdapter for TerminalFailureProvider {
+        async fn send(
+            &self,
+            request: ProviderRequest,
+            emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        ) -> anyhow::Result<ProviderResponse> {
+            self.requests.lock().await.push(request);
+            emit(ProviderEvent::AssistantTextDelta {
+                text: "partial".into(),
+            });
+            Err(ProviderTerminalFailure::new("provider refused request").into())
+        }
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for FallbackTerminalFailureProvider {
+        async fn send(
+            &self,
+            request: ProviderRequest,
+            emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        ) -> anyhow::Result<ProviderResponse> {
+            let is_streaming = request.stream;
+            self.requests.lock().await.push(request);
+            if is_streaming {
+                emit(ProviderEvent::AssistantTextDelta {
+                    text: "partial".into(),
+                });
+                return Err(anyhow::anyhow!("stream transport failed"));
+            }
+            Err(ProviderTerminalFailure::new("provider refused request").into())
+        }
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for ZeroTextRecoverableProvider {
+        fn request_timeout(&self) -> Option<Duration> {
+            matches!(self.failure_kind, ZeroTextFailureKind::Timeout)
+                .then_some(Duration::from_millis(1))
+        }
+
+        async fn send(
+            &self,
+            request: ProviderRequest,
+            _emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        ) -> anyhow::Result<ProviderResponse> {
+            let is_streaming = request.stream;
+            self.requests.lock().await.push(request);
+            if !is_streaming {
+                return Ok(response(
+                    vec![SessionTurnContentBlock::text("fallback complete")],
+                    ProviderStop::Done,
+                ));
+            }
+            match self.failure_kind {
+                ZeroTextFailureKind::StreamFailure => {
+                    Err(ProviderStreamFailure::new("stream ended before terminal event").into())
+                }
+                ZeroTextFailureKind::NoConsumableOutput => Err(ProviderNoConsumableOutput::new(
+                    ProviderTransport::ResponsesSse,
+                    "provider returned no consumable output",
+                )
+                .into()),
+                ZeroTextFailureKind::Ordinary => {
+                    Err(anyhow::anyhow!("ordinary zero-text provider error"))
+                }
+                ZeroTextFailureKind::Timeout => {
+                    sleep(Duration::from_secs(60)).await;
+                    Ok(response(
+                        vec![SessionTurnContentBlock::text("late streaming response")],
+                        ProviderStop::Done,
+                    ))
+                }
+            }
+        }
+
+        async fn discard_runtime_chain(&self, _chain_id: ProviderRuntimeChainId) {
+            self.discarded_chains.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for ContinuationWalTimeoutProvider {
+        async fn send(
+            &self,
+            _request: ProviderRequest,
+            _emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        ) -> anyhow::Result<ProviderResponse> {
+            anyhow::bail!("test adapter must use observed send")
+        }
+
+        async fn send_with_request_observer(
+            &self,
+            request: ProviderRequest,
+            emit: &mut (dyn FnMut(ProviderEvent) + Send),
+            observer: &mut (dyn ProviderRequestObserver + Send),
+        ) -> anyhow::Result<ProviderResponse> {
+            observer.before_provider_request(&request.messages).await?;
+            let request_is_streaming = request.stream;
+            self.transport_requests
+                .lock()
+                .await
+                .push(request_is_streaming);
+
+            if matches!(self.mode, ContinuationWalTimeoutMode::NonStreamingFallback)
+                && request_is_streaming
+            {
+                emit(ProviderEvent::AssistantTextDelta {
+                    text: "stream partial".into(),
+                });
+                return Err(ProviderStreamFailure::new("force non-streaming fallback").into());
+            }
+
+            emit(ProviderEvent::AssistantTextDelta {
+                text: "continuation partial".into(),
+            });
+            let mut continued = request.messages;
+            continued.push(SessionTurnMessage {
+                role: "assistant".into(),
+                content: vec![SessionTurnContentBlock::text("continuation partial")],
+                provider_replay: Some(ProviderReplayState::OpenAiResponses {
+                    model: Some("test-model".into()),
+                    items: vec![
+                        json!({"type":"message", "id":"partial"}),
+                        json!({"type":"message", "id":"continue"}),
+                    ],
+                }),
+            });
+            observer.before_provider_request(&continued).await?;
+            self.transport_requests
+                .lock()
+                .await
+                .push(request_is_streaming);
+            Ok(response(
+                vec![SessionTurnContentBlock::text("must not complete")],
+                ProviderStop::Done,
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl SessionTurnPreflight for BlockingContinuationWalPreflight {
+        async fn before_provider_request(
+            &mut self,
+            _system_prompt: &mut String,
+            _provider_messages: &mut Vec<SessionTurnMessage>,
+            _emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn provider_request_ready(
+            &mut self,
+            _provider_messages: &[SessionTurnMessage],
+            _canonical_tail_count: usize,
+        ) -> anyhow::Result<()> {
+            let call = self
+                .provider_request_ready_calls
+                .fetch_add(1, Ordering::SeqCst)
+                .saturating_add(1);
+            if call >= 2 {
+                pending::<()>().await;
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SessionTurnPreflight for BlockingInitialWalPreflight {
+        async fn before_provider_request(
+            &mut self,
+            _system_prompt: &mut String,
+            _provider_messages: &mut Vec<SessionTurnMessage>,
+            _emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn provider_request_ready(
+            &mut self,
+            _provider_messages: &[SessionTurnMessage],
+            _canonical_tail_count: usize,
+        ) -> anyhow::Result<()> {
+            pending::<()>().await;
+            Ok(())
+        }
+
+        async fn provider_request_abandoned_before_send(&mut self) -> anyhow::Result<()> {
+            self.abandoned_requests.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SessionTurnPreflight for FailingInitialWalPreflight {
+        async fn before_provider_request(
+            &mut self,
+            _system_prompt: &mut String,
+            _provider_messages: &mut Vec<SessionTurnMessage>,
+            _emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn provider_request_ready(
+            &mut self,
+            _provider_messages: &[SessionTurnMessage],
+            _canonical_tail_count: usize,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("metadata commit failed after provider WAL replacement")
+        }
+
+        async fn provider_request_abandoned_before_send(&mut self) -> anyhow::Result<()> {
+            self.abandoned_requests.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SessionTurnPreflight for CountingAbandonPreflight {
+        async fn before_provider_request(
+            &mut self,
+            _system_prompt: &mut String,
+            _provider_messages: &mut Vec<SessionTurnMessage>,
+            _emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn provider_request_abandoned_before_send(&mut self) -> anyhow::Result<()> {
+            self.abandoned_requests.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SessionTurnPreflight for BlockingResponseWalPreflight {
+        async fn before_provider_request(
+            &mut self,
+            _system_prompt: &mut String,
+            _provider_messages: &mut Vec<SessionTurnMessage>,
+            _emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn provider_response_ready(
+            &mut self,
+            _provider_messages: &[SessionTurnMessage],
+            _canonical_tail_count: usize,
+        ) -> anyhow::Result<()> {
+            pending::<()>().await;
+            Ok(())
+        }
+    }
+
     impl FakeProvider {
         fn new(responses: Vec<ProviderResponse>) -> Self {
             Self {
@@ -2461,6 +4062,7 @@ mod tests {
                 events: Vec::new(),
                 emit_preflight_context_estimate: true,
                 cancel_after_response: None,
+                preserve_safe_steer_after_response: None,
             }
         }
 
@@ -2478,6 +4080,14 @@ mod tests {
             self.cancel_after_response = Some(control);
             self
         }
+
+        fn with_preserved_safe_steer_after_response(
+            mut self,
+            control: ToolBoundaryControl,
+        ) -> Self {
+            self.preserve_safe_steer_after_response = Some(control);
+            self
+        }
     }
 
     #[async_trait]
@@ -2491,6 +4101,7 @@ mod tests {
             request: ProviderRequest,
             emit: &mut (dyn FnMut(ProviderEvent) + Send),
         ) -> anyhow::Result<ProviderResponse> {
+            let recovery_interrupt = request.recovery_interrupt.clone();
             self.requests.lock().await.push(request);
             for event in &self.events {
                 emit(event.clone());
@@ -2503,6 +4114,13 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("fake provider response exhausted"))?;
             if let Some(control) = &self.cancel_after_response {
                 control.cancel(ToolCallSkipReason::TurnInterruptedBeforeDispatch);
+            }
+            if let Some(control) = &self.preserve_safe_steer_after_response {
+                control.cancel_if_open(ToolCallSkipReason::TurnInterruptedBeforeDispatch);
+                recovery_interrupt
+                    .as_ref()
+                    .expect("controlled turn must pass a recovery interrupt")
+                    .preserve_successful_response();
             }
             Ok(response)
         }
@@ -2768,6 +4386,133 @@ mod tests {
         failed: bool,
     }
 
+    struct RecordingCompletedMessageRecorder {
+        messages: Vec<CompletedSessionTurnMessage>,
+    }
+
+    struct StaticContextAppender {
+        messages: Vec<SessionTurnMessage>,
+    }
+
+    struct ChangingContextAppender {
+        observations: usize,
+    }
+
+    #[derive(Default)]
+    struct ContextAwarePreflight {
+        latest_background_texts: Vec<String>,
+    }
+
+    #[derive(Default)]
+    struct ReplacingContextPreflight {
+        replaced: bool,
+    }
+
+    #[async_trait]
+    impl SessionTurnEventRecorder for RecordingCompletedMessageRecorder {
+        async fn record(&mut self, _event: SessionTurnEvent) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn record_completed_message(
+            &mut self,
+            message: &CompletedSessionTurnMessage,
+        ) -> anyhow::Result<()> {
+            self.messages.push(message.clone());
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SessionTurnContextAppender for StaticContextAppender {
+        async fn observe_context(
+            &mut self,
+            _provider_messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<Vec<SessionTurnMessage>> {
+            Ok(self.messages.clone())
+        }
+    }
+
+    #[async_trait]
+    impl SessionTurnContextAppender for ChangingContextAppender {
+        async fn observe_context(
+            &mut self,
+            _provider_messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<Vec<SessionTurnMessage>> {
+            self.observations = self.observations.saturating_add(1);
+            let state = if self.observations < 3 {
+                "running"
+            } else {
+                "completed"
+            };
+            Ok(vec![SessionTurnMessage::model_context(
+                ModelContextSource::BackgroundProcess,
+                format!("<background_processes>state={state}</background_processes>"),
+            )])
+        }
+    }
+
+    #[async_trait]
+    impl SessionTurnPreflight for ContextAwarePreflight {
+        async fn before_provider_request(
+            &mut self,
+            _system_prompt: &mut String,
+            provider_messages: &mut Vec<SessionTurnMessage>,
+            _emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        ) -> anyhow::Result<()> {
+            let text = provider_messages
+                .iter()
+                .rev()
+                .find_map(|message| {
+                    let (source, _, text) = message.model_context_snapshot()?;
+                    (*source == ModelContextSource::BackgroundProcess).then(|| text.to_string())
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("preflight 应看到本次已经冻结的 background snapshot")
+                })?;
+            self.latest_background_texts.push(text);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SessionTurnPreflight for ReplacingContextPreflight {
+        async fn before_provider_request(
+            &mut self,
+            _system_prompt: &mut String,
+            provider_messages: &mut Vec<SessionTurnMessage>,
+            _emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        ) -> anyhow::Result<()> {
+            if !self.history_replacement_expected("", provider_messages) {
+                return Ok(());
+            }
+            let baseline_start = provider_messages.len().saturating_sub(2);
+            *provider_messages = provider_messages[baseline_start..].to_vec();
+            self.replaced = true;
+            Ok(())
+        }
+
+        fn history_replacement_expected(
+            &self,
+            _system_prompt: &str,
+            provider_messages: &[SessionTurnMessage],
+        ) -> bool {
+            !self.replaced
+                && provider_messages.iter().rev().any(|message| {
+                    message
+                        .model_context_snapshot()
+                        .is_some_and(|(source, _, text)| {
+                            *source == ModelContextSource::BackgroundProcess
+                                && text.contains("state=completed")
+                        })
+                })
+        }
+
+        fn take_history_replaced_since_last_check(&mut self) -> bool {
+            std::mem::take(&mut self.replaced)
+        }
+    }
+
     #[async_trait]
     impl SessionTurnEventRecorder for BlockingCompletedRecorder {
         async fn record(&mut self, event: SessionTurnEvent) -> anyhow::Result<()> {
@@ -2858,6 +4603,28 @@ mod tests {
         ProviderResponse {
             assistant_message: SessionTurnMessage {
                 role: "assistant".into(),
+                provider_replay: None,
+                content,
+            },
+            stop,
+        }
+    }
+
+    fn anthropic_response(
+        content: Vec<SessionTurnContentBlock>,
+        raw_content: Vec<Value>,
+        stop: ProviderStop,
+    ) -> ProviderResponse {
+        ProviderResponse {
+            assistant_message: SessionTurnMessage {
+                role: "assistant".into(),
+                provider_replay: Some(ProviderReplayState::AnthropicMessages {
+                    model: "test-model".into(),
+                    messages: vec![json!({
+                        "role": "assistant",
+                        "content": raw_content,
+                    })],
+                }),
                 content,
             },
             stop,
@@ -2903,12 +4670,21 @@ mod tests {
             .iter()
             .filter_map(|block| match block {
                 SessionTurnContentBlock::Text { text } => Some(text.as_str()),
-                SessionTurnContentBlock::SkillInstructions { .. } => None,
+                SessionTurnContentBlock::SkillInstructions { .. }
+                | SessionTurnContentBlock::ModelContext { .. } => None,
                 SessionTurnContentBlock::Image { .. }
                 | SessionTurnContentBlock::Document { .. }
                 | SessionTurnContentBlock::ToolUse { .. }
                 | SessionTurnContentBlock::ToolResult { .. } => None,
             })
+            .collect()
+    }
+
+    fn non_context_messages(turn: &SessionTurn) -> Vec<&SessionTurnMessage> {
+        turn.messages
+            .iter()
+            .filter(|message| message.model_context_snapshot().is_none())
+            .map(|message| &message.message)
             .collect()
     }
 
@@ -2977,6 +4753,7 @@ mod tests {
     fn delegation_tool_use_inputs_are_preserved_for_canonical_transcript() {
         let message = SessionTurnMessage {
             role: "assistant".into(),
+            provider_replay: None,
             content: vec![tool_use(
                 "toolu_1",
                 "create_subagent",
@@ -3113,6 +4890,37 @@ mod tests {
     }
 
     #[test]
+    fn command_descriptions_do_not_hide_runtime_inputs_in_summaries_or_journal() {
+        let description = "user-facing purpose ".repeat(30);
+        let code_run = json!({
+            "description": description,
+            "script": "printf command-visible",
+            "type": "bash",
+        });
+        let code_summary = super::tool_started_summary("code_run", &code_run);
+        let (code_preview, code_truncated) = super::tool_input_preview("code_run", &code_run, 160);
+        assert!(code_summary.contains("printf command-visible"));
+        assert!(!code_summary.contains("description"));
+        assert!(code_preview.contains("printf command-visible"));
+        assert!(!code_preview.contains("description"));
+        assert!(!code_truncated);
+
+        let write_stdin = json!({
+            "description": "poll the managed command ".repeat(30),
+            "process_id": "deadbeef",
+            "yield_time_ms": 500,
+        });
+        let stdin_summary = super::tool_started_summary("write_stdin", &write_stdin);
+        let (stdin_preview, stdin_truncated) =
+            super::tool_input_preview("write_stdin", &write_stdin, 160);
+        assert!(stdin_summary.contains("deadbeef"));
+        assert!(!stdin_summary.contains("description"));
+        assert!(stdin_preview.contains("deadbeef"));
+        assert!(!stdin_preview.contains("description"));
+        assert!(!stdin_truncated);
+    }
+
+    #[test]
     fn consult_router_preview_uses_stable_counts() {
         let preview = super::tool_output_preview(
             "consult_router",
@@ -3210,13 +5018,16 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(turn.messages.len(), 2);
+        assert_eq!(non_context_messages(&turn).len(), 2);
         assert_eq!(
-            turn.messages[1],
-            SessionTurnMessage::assistant_text("complete replacement")
+            non_context_messages(&turn)[1],
+            &SessionTurnMessage::assistant_text("complete replacement")
         );
         let requests = provider.requests.lock().await;
         assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].system_prompt, requests[1].system_prompt);
+        assert_eq!(requests[0].messages, requests[1].messages);
+        assert_eq!(requests[0].tools, requests[1].tools);
         assert!(requests[0].stream);
         assert_eq!(requests[0].retry_count_override, None);
         assert!(!requests[1].stream);
@@ -3245,6 +5056,289 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn zero_text_stream_failure_falls_back_to_non_streaming() {
+        let provider = Arc::new(ZeroTextRecoverableProvider {
+            requests: Mutex::new(Vec::new()),
+            failure_kind: ZeroTextFailureKind::StreamFailure,
+            discarded_chains: AtomicUsize::new(0),
+        });
+        let turn_loop = tool_loop(provider.clone());
+        let mut events = Vec::new();
+
+        let turn = turn_loop
+            .run_session_turn(request(), &mut |event| events.push(event))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            non_context_messages(&turn)[1],
+            &SessionTurnMessage::assistant_text("fallback complete")
+        );
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].stream);
+        assert!(!requests[1].stream);
+        drop(requests);
+        assert_eq!(provider.discarded_chains.load(Ordering::SeqCst), 1);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::NonStreamingFallbackSucceeded { attempt: 1, .. }
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_text_stream_timeout_falls_back_to_non_streaming() {
+        let provider = Arc::new(ZeroTextRecoverableProvider {
+            requests: Mutex::new(Vec::new()),
+            failure_kind: ZeroTextFailureKind::Timeout,
+            discarded_chains: AtomicUsize::new(0),
+        });
+        let turn_loop = tool_loop(provider.clone());
+
+        let turn = turn_loop
+            .run_session_turn(request(), &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(
+            non_context_messages(&turn)[1],
+            &SessionTurnMessage::assistant_text("fallback complete")
+        );
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].stream);
+        assert!(!requests[1].stream);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_consumable_output_falls_back_without_visible_text() {
+        let provider = Arc::new(ZeroTextRecoverableProvider {
+            requests: Mutex::new(Vec::new()),
+            failure_kind: ZeroTextFailureKind::NoConsumableOutput,
+            discarded_chains: AtomicUsize::new(0),
+        });
+        let turn_loop = tool_loop(provider.clone());
+
+        let turn = turn_loop
+            .run_session_turn(request(), &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(
+            non_context_messages(&turn)[1],
+            &SessionTurnMessage::assistant_text("fallback complete")
+        );
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].stream);
+        assert!(!requests[1].stream);
+    }
+
+    #[tokio::test]
+    async fn ordinary_zero_text_error_does_not_enter_fallback() {
+        let provider = Arc::new(ZeroTextRecoverableProvider {
+            requests: Mutex::new(Vec::new()),
+            failure_kind: ZeroTextFailureKind::Ordinary,
+            discarded_chains: AtomicUsize::new(0),
+        });
+        let turn_loop = tool_loop(provider.clone());
+        let mut events = Vec::new();
+
+        let error = turn_loop
+            .run_session_turn(request(), &mut |event| events.push(event))
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("ordinary zero-text provider error"));
+        assert_eq!(provider.requests.lock().await.len(), 1);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
+                | SessionTurnEvent::NonStreamingFallbackAttemptFailed { .. }
+                | SessionTurnEvent::NonStreamingFallbackSucceeded { .. }
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initial_request_wal_timeout_prevents_provider_send() {
+        let provider = Arc::new(FakeProvider::new(vec![response(
+            vec![SessionTurnContentBlock::text("must not be sent")],
+            ProviderStop::Done,
+        )]));
+        let turn_loop = tool_loop(provider.clone());
+        let abandoned_requests = Arc::new(AtomicUsize::new(0));
+        let mut preflight = BlockingInitialWalPreflight {
+            abandoned_requests: Arc::clone(&abandoned_requests),
+        };
+
+        let error = turn_loop
+            .run_session_turn_with_hooks(request(), &mut |_| {}, None, None, Some(&mut preflight))
+            .await
+            .expect_err("timed-out request WAL must reject the turn");
+
+        assert!(error
+            .downcast_ref::<ProviderRequestPreparationFailure>()
+            .is_some());
+        assert!(error.to_string().contains("请求状态保存超时"));
+        assert!(provider.requests.lock().await.is_empty());
+        assert_eq!(abandoned_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn initial_request_wal_failure_rolls_back_before_returning() {
+        let provider = Arc::new(FakeProvider::new(vec![response(
+            vec![SessionTurnContentBlock::text("must not be sent")],
+            ProviderStop::Done,
+        )]));
+        let turn_loop = tool_loop(provider.clone());
+        let abandoned_requests = Arc::new(AtomicUsize::new(0));
+        let mut preflight = FailingInitialWalPreflight {
+            abandoned_requests: Arc::clone(&abandoned_requests),
+        };
+
+        let error = turn_loop
+            .run_session_turn_with_hooks(request(), &mut |_| {}, None, None, Some(&mut preflight))
+            .await
+            .expect_err("failed initial request WAL must reject the turn");
+
+        assert!(error
+            .to_string()
+            .contains("metadata commit failed after provider WAL replacement"));
+        assert!(provider.requests.lock().await.is_empty());
+        assert_eq!(abandoned_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_response_wal_timeout_rejects_completed_turn() {
+        let provider = Arc::new(FakeProvider::new(vec![response(
+            vec![SessionTurnContentBlock::text("complete but not durable")],
+            ProviderStop::Done,
+        )]));
+        let turn_loop = tool_loop(provider.clone());
+        let mut preflight = BlockingResponseWalPreflight;
+
+        let error = turn_loop
+            .run_session_turn_with_hooks(request(), &mut |_| {}, None, None, Some(&mut preflight))
+            .await
+            .expect_err("timed-out response WAL must reject the turn");
+
+        assert!(error
+            .downcast_ref::<ProviderRequestPreparationFailure>()
+            .is_some());
+        assert!(error.to_string().contains("响应状态保存超时"));
+        assert_eq!(provider.requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn abandoned_continuation_restores_previous_provider_request_baseline() {
+        let initial = vec![SessionTurnMessage::user_text("initial")];
+        let mut continued = initial.clone();
+        continued.push(SessionTurnMessage::assistant_text("partial"));
+        let abandoned_requests = Arc::new(AtomicUsize::new(0));
+        let mut preflight = CountingAbandonPreflight {
+            abandoned_requests: Arc::clone(&abandoned_requests),
+        };
+        let mut progress = ProviderRequestProgress::new(initial.clone(), Some(&mut preflight), 0);
+
+        progress.before_provider_request(&continued).await.unwrap();
+        assert_eq!(progress.latest_messages(), continued);
+
+        progress
+            .provider_request_abandoned_before_send(&continued)
+            .await
+            .unwrap();
+
+        assert_eq!(progress.latest_messages(), initial);
+        assert_eq!(abandoned_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn streaming_continuation_wal_timeout_is_preparation_failure_without_fallback() {
+        let provider = Arc::new(ContinuationWalTimeoutProvider {
+            mode: ContinuationWalTimeoutMode::Streaming,
+            transport_requests: Mutex::new(Vec::new()),
+        });
+        let ready_calls = Arc::new(AtomicUsize::new(0));
+        let mut preflight = BlockingContinuationWalPreflight {
+            provider_request_ready_calls: Arc::clone(&ready_calls),
+        };
+        let turn_loop = tool_loop(provider.clone());
+        let mut events = Vec::new();
+
+        let error = turn_loop
+            .run_session_turn_with_hooks(
+                request(),
+                &mut |event| events.push(event),
+                None,
+                None,
+                Some(&mut preflight),
+            )
+            .await
+            .expect_err("timed-out continuation WAL must reject the turn");
+
+        assert!(error
+            .downcast_ref::<ProviderRequestPreparationFailure>()
+            .is_some());
+        assert!(error.to_string().contains("请求状态保存超时"));
+        assert_eq!(ready_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(*provider.transport_requests.lock().await, vec![true]);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
+                | SessionTurnEvent::NonStreamingFallbackAttemptFailed { .. }
+                | SessionTurnEvent::NonStreamingFallbackSucceeded { .. }
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn non_streaming_continuation_wal_timeout_stops_fallback_attempts() {
+        let provider = Arc::new(ContinuationWalTimeoutProvider {
+            mode: ContinuationWalTimeoutMode::NonStreamingFallback,
+            transport_requests: Mutex::new(Vec::new()),
+        });
+        let ready_calls = Arc::new(AtomicUsize::new(0));
+        let mut preflight = BlockingContinuationWalPreflight {
+            provider_request_ready_calls: Arc::clone(&ready_calls),
+        };
+        let turn_loop = tool_loop(provider.clone());
+        let mut events = Vec::new();
+
+        let error = turn_loop
+            .run_session_turn_with_hooks(
+                request(),
+                &mut |event| events.push(event),
+                None,
+                None,
+                Some(&mut preflight),
+            )
+            .await
+            .expect_err("timed-out fallback WAL must reject the turn");
+
+        assert!(error
+            .downcast_ref::<ProviderRequestPreparationFailure>()
+            .is_some());
+        assert_eq!(ready_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(*provider.transport_requests.lock().await, vec![true, false]);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
+                ))
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::NonStreamingFallbackAttemptFailed { .. }
+                | SessionTurnEvent::NonStreamingFallbackSucceeded { .. }
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn fifth_non_streaming_fallback_can_succeed_after_four_failures() {
         let mut attempts = vec![scripted_failure(
             vec![ProviderEvent::AssistantTextDelta {
@@ -3269,8 +5363,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            turn.messages[1],
-            SessionTurnMessage::assistant_text("fifth attempt completed")
+            non_context_messages(&turn)[1],
+            &SessionTurnMessage::assistant_text("fifth attempt completed")
         );
         let requests = provider.requests.lock().await;
         assert_eq!(requests.len(), 6);
@@ -3292,6 +5386,216 @@ mod tests {
             event,
             SessionTurnEvent::NonStreamingFallbackSucceeded { attempt: 5, .. }
         )));
+    }
+
+    #[tokio::test]
+    async fn terminal_provider_failure_after_visible_delta_does_not_fallback() {
+        let provider = Arc::new(TerminalFailureProvider {
+            requests: Mutex::new(Vec::new()),
+        });
+        let turn_loop = tool_loop(provider.clone());
+        let mut events = Vec::new();
+
+        let error = turn_loop
+            .run_session_turn(request(), &mut |event| events.push(event))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("provider refused request"));
+        assert_eq!(provider.requests.lock().await.len(), 1);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
+                | SessionTurnEvent::NonStreamingFallbackAttemptFailed { .. }
+                | SessionTurnEvent::NonStreamingFallbackSucceeded { .. }
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_provider_failure_stops_non_streaming_fallback_after_current_attempt() {
+        let provider = Arc::new(FallbackTerminalFailureProvider {
+            requests: Mutex::new(Vec::new()),
+        });
+        let turn_loop = tool_loop(provider.clone());
+        let mut events = Vec::new();
+
+        let error = turn_loop
+            .run_session_turn(request(), &mut |event| events.push(event))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("provider refused request"));
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].stream);
+        assert!(!requests[1].stream);
+        drop(requests);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
+                ))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::NonStreamingFallbackAttemptFailed {
+                attempt: 1,
+                error,
+                ..
+            } if error.contains("provider refused request")
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::NonStreamingFallbackAttemptStarted { attempt: 2, .. }
+                | SessionTurnEvent::NonStreamingFallbackAttemptFailed { attempt: 2, .. }
+                | SessionTurnEvent::NonStreamingFallbackSucceeded { .. }
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn context_stop_during_non_streaming_fallback_switches_to_forced_preflight() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            scripted_failure(
+                vec![ProviderEvent::AssistantTextDelta {
+                    text: "streaming-partial".into(),
+                }],
+                "stream transport failed",
+            ),
+            ScriptedProviderAttempt {
+                events: Vec::new(),
+                result: Ok(anthropic_response(
+                    vec![SessionTurnContentBlock::text("fallback-context-")],
+                    vec![
+                        json!({
+                            "type":"thinking",
+                            "thinking":"private-fallback-context",
+                            "signature":"sig-fallback-context"
+                        }),
+                        json!({"type":"text", "text":"fallback-context-"}),
+                    ],
+                    ProviderStop::ContextWindowExceeded,
+                )),
+            },
+            ScriptedProviderAttempt {
+                events: Vec::new(),
+                result: Ok(anthropic_response(
+                    vec![SessionTurnContentBlock::text("final")],
+                    vec![json!({"type":"text", "text":"final"})],
+                    ProviderStop::Done,
+                )),
+            },
+        ]));
+        let turn_loop = tool_loop(provider.clone());
+        let mut preflight = RecordingContextRecoveryPreflight::default();
+        let mut events = Vec::new();
+
+        let turn = turn_loop
+            .run_session_turn_with_hooks(
+                request(),
+                &mut |event| events.push(event),
+                None,
+                None,
+                Some(&mut preflight),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            assistant_message_text(non_context_messages(&turn)[1]),
+            "fallback-context-final"
+        );
+        assert_eq!(preflight.applied, 1);
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].stream);
+        assert!(!requests[1].stream);
+        assert!(requests[2].stream);
+        drop(requests);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
+                ))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::NonStreamingFallbackSucceeded { attempt: 1, .. }
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::NonStreamingFallbackAttemptStarted { attempt: 2, .. }
+                | SessionTurnEvent::NonStreamingFallbackAttemptFailed { attempt: 2, .. }
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continuation_fallback_replacement_includes_prior_context_partial() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ScriptedProviderAttempt {
+                events: Vec::new(),
+                result: Ok(anthropic_response(
+                    vec![SessionTurnContentBlock::text("context-prefix-")],
+                    vec![json!({"type":"text", "text":"context-prefix-"})],
+                    ProviderStop::ContextWindowExceeded,
+                )),
+            },
+            scripted_failure(
+                vec![ProviderEvent::AssistantTextDelta {
+                    text: "failed-continuation-partial".into(),
+                }],
+                "continuation stream failed",
+            ),
+            ScriptedProviderAttempt {
+                events: Vec::new(),
+                result: Ok(anthropic_response(
+                    vec![SessionTurnContentBlock::text("final")],
+                    vec![json!({"type":"text", "text":"final"})],
+                    ProviderStop::Done,
+                )),
+            },
+        ]));
+        let turn_loop = tool_loop(provider.clone());
+        let mut preflight = RecordingContextRecoveryPreflight::default();
+        let mut events = Vec::new();
+
+        let turn = turn_loop
+            .run_session_turn_with_hooks(
+                request(),
+                &mut |event| events.push(event),
+                None,
+                None,
+                Some(&mut preflight),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            assistant_message_text(non_context_messages(&turn)[1]),
+            "context-prefix-final"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::NonStreamingFallbackSucceeded { text, .. }
+                if text == "context-prefix-final"
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::NonStreamingFallbackSucceeded { text, .. }
+                if text == "final"
+        )));
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].stream);
+        assert!(requests[1].stream);
+        assert!(!requests[2].stream);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3322,8 +5626,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            turn.messages[1],
-            SessionTurnMessage::assistant_text("validated replacement")
+            non_context_messages(&turn)[1],
+            &SessionTurnMessage::assistant_text("validated replacement")
         );
         assert_eq!(provider.requests.lock().await.len(), 3);
         assert!(events.iter().any(|event| matches!(
@@ -3367,8 +5671,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            turn.messages[1],
-            SessionTurnMessage::assistant_text("complete replacement")
+            non_context_messages(&turn)[1],
+            &SessionTurnMessage::assistant_text("complete replacement")
         );
         assert_eq!(provider.requests.lock().await.len(), 3);
         assert!(events.iter().any(|event| matches!(
@@ -3647,6 +5951,42 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn safe_steer_after_stream_failure_stops_before_fallback() {
+        let provider = Arc::new(ScriptedProvider::new(vec![scripted_failure(
+            vec![ProviderEvent::AssistantTextDelta {
+                text: "partial".into(),
+            }],
+            "stream failed",
+        )]));
+        let turn_loop = tool_loop(provider.clone());
+        let control = ToolBoundaryControl::new();
+        let control_from_event = control.clone();
+        let mut events = Vec::new();
+
+        let error = turn_loop
+            .run_session_turn_with_tool_boundary_control(
+                request(),
+                &mut |event| {
+                    if matches!(event, SessionTurnEvent::AssistantTextDelta { .. }) {
+                        control_from_event
+                            .cancel_if_open(ToolCallSkipReason::TurnInterruptedBeforeDispatch);
+                    }
+                    events.push(event);
+                },
+                Some(control),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<SessionTurnInterrupted>().is_some());
+        assert_eq!(provider.requests.lock().await.len(), 1);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn cancellation_after_fallback_failure_does_not_start_a_phantom_next_attempt() {
         let provider = Arc::new(ScriptedProvider::new(vec![
             scripted_failure(
@@ -3784,7 +6124,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("MEMORY.md / USER.md 必须通过 memory 工具访问"));
+            .contains("agent 私有受保护文件，不能作为附件读取"));
         assert!(provider.requests.lock().await.is_empty());
     }
 
@@ -3909,7 +6249,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), original);
-        let result = tool_result_content(&turn.messages[2], "toolu_write");
+        let result = tool_result_content(non_context_messages(&turn)[2], "toolu_write");
         assert_eq!(result["outcome"]["kind"], "business_failure");
         let requests = provider.requests.lock().await;
         let first_request_text = requests[0]
@@ -3930,6 +6270,29 @@ mod tests {
                         && message.contains("未授予读取许可")
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn oversized_text_attachment_omits_authority_guidance_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.txt");
+        tokio::fs::write(&path, "12345").await.unwrap();
+        let limits = AttachmentLimits {
+            max_text_chars: 4,
+            ..AttachmentLimits::default()
+        };
+
+        let (block, read, warning) = read_text_file_block(&path, &limits, false).await.unwrap();
+        let SessionTurnContentBlock::Text { text } = block else {
+            panic!("oversized text attachment should remain a text block");
+        };
+
+        assert!(read.is_none());
+        assert!(text.contains("when its contents are needed"));
+        assert!(!text.contains("before editing"));
+        let warning = warning.unwrap();
+        assert!(warning.contains("未注入正文"));
+        assert!(!warning.contains("许可"));
     }
 
     #[tokio::test]
@@ -4011,7 +6374,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "after\n");
-        let result = tool_result_content(&turn.messages[2], "toolu_write");
+        let result = tool_result_content(non_context_messages(&turn)[2], "toolu_write");
         assert_eq!(result["outcome"]["kind"], "completed");
         let requests = provider.requests.lock().await;
         assert!(requests[0]
@@ -4066,7 +6429,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "after\n");
-        let result = tool_result_content(&turn.messages[2], "toolu_write");
+        let result = tool_result_content(non_context_messages(&turn)[2], "toolu_write");
         assert_eq!(result["outcome"]["kind"], "completed");
     }
 
@@ -4110,7 +6473,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "before\n");
-        let result = tool_result_content(&turn.messages[2], "toolu_write");
+        let result = tool_result_content(non_context_messages(&turn)[2], "toolu_write");
         assert_eq!(result["outcome"]["kind"], "business_failure");
         let requests = provider.requests.lock().await;
         assert!(requests[0]
@@ -4163,7 +6526,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "before\n");
-        let result = tool_result_content(&turn.messages[2], "toolu_write");
+        let result = tool_result_content(non_context_messages(&turn)[2], "toolu_write");
         assert_eq!(result["outcome"]["kind"], "business_failure");
     }
 
@@ -4230,8 +6593,8 @@ mod tests {
                 "不同文件的 file_read 应进入同一并发批次"
             );
         }
-        let first = tool_result_content(&turn.messages[2], "toolu_first");
-        let second = tool_result_content(&turn.messages[2], "toolu_second");
+        let first = tool_result_content(non_context_messages(&turn)[2], "toolu_first");
+        let second = tool_result_content(non_context_messages(&turn)[2], "toolu_second");
         for result in [first, second] {
             assert_eq!(
                 result["output"]["content"]
@@ -4289,7 +6652,7 @@ mod tests {
             .run_session_turn(request, &mut |_| {})
             .await
             .unwrap();
-        let patch = tool_result_content(&turn.messages[2], "toolu_patch");
+        let patch = tool_result_content(non_context_messages(&turn)[2], "toolu_patch");
         assert_eq!(patch["outcome"]["kind"], "completed");
         assert_eq!(
             tokio::fs::read_to_string(path).await.unwrap(),
@@ -4298,7 +6661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn later_same_path_write_is_skipped_after_business_failure() {
+    async fn later_same_path_writes_continue_after_business_failure() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("note.txt");
         tokio::fs::write(&path, "original\n").await.unwrap();
@@ -4313,14 +6676,24 @@ mod tests {
             response(
                 vec![
                     tool_use(
+                        "toolu_read",
+                        "file_read",
+                        json!({"path": "note.txt", "show_linenos": false}),
+                    ),
+                    tool_use(
                         "toolu_first",
-                        "file_write",
-                        json!({"path": "note.txt", "content": "first\n"}),
+                        "file_patch",
+                        json!({"path": "note.txt", "old_content": "missing", "new_content": "first"}),
                     ),
                     tool_use(
                         "toolu_second",
-                        "file_write",
-                        json!({"path": "note.txt", "content": "second\n"}),
+                        "file_patch",
+                        json!({"path": "note.txt", "old_content": "original", "new_content": "second"}),
+                    ),
+                    tool_use(
+                        "toolu_third",
+                        "file_patch",
+                        json!({"path": "note.txt", "old_content": "second", "new_content": "third"}),
                     ),
                 ],
                 ProviderStop::ToolUse,
@@ -4338,11 +6711,13 @@ mod tests {
             .run_session_turn(request, &mut |_| {})
             .await
             .unwrap();
-        let first = tool_result_content(&turn.messages[2], "toolu_first");
-        let second = tool_result_content(&turn.messages[2], "toolu_second");
+        let first = tool_result_content(non_context_messages(&turn)[2], "toolu_first");
+        let second = tool_result_content(non_context_messages(&turn)[2], "toolu_second");
+        let third = tool_result_content(non_context_messages(&turn)[2], "toolu_third");
         assert_eq!(first["outcome"]["kind"], "business_failure");
-        assert_eq!(second["output"]["status"], "skipped");
-        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "original\n");
+        assert_eq!(second["outcome"]["kind"], "completed");
+        assert_eq!(third["outcome"]["kind"], "completed");
+        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "third\n");
     }
 
     #[tokio::test]
@@ -4379,18 +6754,18 @@ mod tests {
             .await
             .unwrap();
 
-        let result = tool_result_content(&turn.messages[2], "toolu_1");
+        let result = tool_result_content(non_context_messages(&turn)[2], "toolu_1");
         assert_eq!(result["ok"], true);
         assert_eq!(result["outcome"]["kind"], "completed");
         assert_eq!(result["output"]["kind"], "image");
         // base64 媒体不进 tool_result 文本通道
         assert!(result["output"].get("media").is_none());
         assert!(matches!(
-            &turn.messages[2].content[1],
+            &non_context_messages(&turn)[2].content[1],
             SessionTurnContentBlock::Text { text } if text == "[file_read attachment] shot.png"
         ));
         assert!(matches!(
-            &turn.messages[2].content[2],
+            &non_context_messages(&turn)[2].content[2],
             SessionTurnContentBlock::Image { media_type, data }
                 if media_type == "image/png" && !data.is_empty()
         ));
@@ -4430,11 +6805,11 @@ mod tests {
             .await
             .unwrap();
 
-        let result = tool_result_content(&turn.messages[2], "toolu_1");
+        let result = tool_result_content(non_context_messages(&turn)[2], "toolu_1");
         assert_eq!(result["output"]["kind"], "pdf");
         assert!(result["output"].get("media").is_none());
         assert!(matches!(
-            &turn.messages[2].content[2],
+            &non_context_messages(&turn)[2].content[2],
             SessionTurnContentBlock::Document { media_type, filename, .. }
                 if media_type == "application/pdf"
                     && filename.as_deref() == Some("brief.pdf")
@@ -4460,7 +6835,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            &turn.messages[0].content[1],
+            &non_context_messages(&turn)[0].content[1],
             SessionTurnContentBlock::Image { media_type, data }
                 if media_type == "image/png" && !data.is_empty()
         ));
@@ -4489,20 +6864,21 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            turn.messages,
+            non_context_messages(&turn),
             vec![
-                SessionTurnMessage::user_text("hello"),
-                SessionTurnMessage::assistant_text("done"),
+                &SessionTurnMessage::user_text("hello"),
+                &SessionTurnMessage::assistant_text("done"),
             ]
         );
         let requests = provider.requests.lock().await;
         assert_eq!(requests.len(), 1);
         let expected_provider_messages = vec![
             SessionTurnMessage::assistant_text("prior"),
-            SessionTurnMessage::user_text(format!(
-                "{}\n\nhello",
-                super::runtime_context_text(fixed_now())
-            )),
+            SessionTurnMessage::model_context(
+                ModelContextSource::Runtime,
+                super::runtime_context_text(fixed_now()),
+            ),
+            SessionTurnMessage::user_text("hello"),
         ];
         assert_eq!(
             events,
@@ -4687,6 +7063,7 @@ mod tests {
             SessionTurnMessage::user_text("before tool"),
             SessionTurnMessage {
                 role: "user".into(),
+                provider_replay: None,
                 content: vec![SessionTurnContentBlock::ToolResult {
                     tool_use_id: "toolu_1".into(),
                     content: "tool output".into(),
@@ -4698,6 +7075,59 @@ mod tests {
         let normalized = super::normalize_provider_messages(&messages);
 
         assert_eq!(normalized, messages);
+    }
+
+    #[test]
+    fn frozen_provider_prefix_blocks_cross_boundary_user_merge() {
+        let messages = vec![
+            SessionTurnMessage::user_text("already sent user"),
+            SessionTurnMessage::user_text("new suffix one"),
+            SessionTurnMessage::user_text("new suffix two"),
+        ];
+        let prefix = super::FrozenProviderRequestPrefix::new(&messages, 1).unwrap();
+
+        let projected = prefix.project(&messages).unwrap();
+
+        assert_eq!(
+            projected,
+            vec![
+                SessionTurnMessage::user_text("already sent user"),
+                SessionTurnMessage::user_text("new suffix one\n\nnew suffix two"),
+            ]
+        );
+    }
+
+    #[test]
+    fn adapter_continuation_preserves_raw_active_boundary_after_wire_normalization() {
+        let runtime = SessionTurnMessage::model_context(
+            ModelContextSource::Runtime,
+            "<runtime_context>stable</runtime_context>",
+        );
+        let mut raw_messages = vec![
+            SessionTurnMessage::user_text("compaction summary"),
+            SessionTurnMessage::user_text("preserved raw user"),
+            runtime.clone(),
+            SessionTurnMessage::user_text("current request"),
+        ];
+        let active_start_index = 2;
+        let mut frozen = super::FrozenProviderRequestPrefix::new(&raw_messages, 0).unwrap();
+        let outer_request = frozen.project(&raw_messages).unwrap();
+        assert_eq!(outer_request.len(), 3, "前两条纯 user 应只在 wire 合并");
+
+        let continuation = SessionTurnMessage::assistant_text("partial continuation");
+        let mut latest_request = outer_request.clone();
+        latest_request.push(continuation.clone());
+        super::append_adapter_continuation_suffix_to_raw_history(
+            &mut raw_messages,
+            &outer_request,
+            &latest_request,
+        )
+        .unwrap();
+
+        assert_eq!(raw_messages[active_start_index], runtime);
+        assert_eq!(raw_messages.last(), Some(&continuation));
+        frozen.advance(&raw_messages, latest_request.clone());
+        assert_eq!(frozen.project(&raw_messages).unwrap(), latest_request);
     }
 
     #[tokio::test]
@@ -4721,15 +7151,19 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0].messages,
-            vec![SessionTurnMessage::user_text(format!(
-                "<user_shell_command>...</user_shell_command>\n\n{}\n\nhello",
-                super::runtime_context_text(fixed_now())
-            ))]
+            vec![
+                SessionTurnMessage::user_text("<user_shell_command>...</user_shell_command>"),
+                SessionTurnMessage::model_context(
+                    ModelContextSource::Runtime,
+                    super::runtime_context_text(fixed_now()),
+                ),
+                SessionTurnMessage::user_text("hello"),
+            ]
         );
     }
 
     #[tokio::test]
-    async fn provider_request_injects_runtime_context_without_persisting_it() {
+    async fn provider_request_persists_independent_runtime_context() {
         let provider = Arc::new(FakeProvider::new(vec![response(
             vec![SessionTurnContentBlock::text("done")],
             ProviderStop::Done,
@@ -4742,7 +7176,9 @@ mod tests {
             .unwrap();
 
         let requests = provider.requests.lock().await;
-        let user_text = text_blocks(&requests[0].messages[1]).join("\n");
+        let (_, _, user_text) = requests[0].messages[1]
+            .model_context_snapshot()
+            .expect("runtime context message");
         let expected_date = fixed_now()
             .with_timezone(&Local)
             .format("%Y-%m-%d %A")
@@ -4752,8 +7188,126 @@ mod tests {
         assert!(user_text.contains("timezone: "));
         assert!(!user_text.contains("current_datetime"));
         assert!(!user_text.contains("not a user request"));
-        assert!(user_text.ends_with("\n\nhello"));
-        assert_eq!(turn.messages[0], SessionTurnMessage::user_text("hello"));
+        assert!(user_text.ends_with("</runtime_context>"));
+        assert_eq!(turn.messages[0].message, requests[0].messages[1]);
+        assert_eq!(
+            non_context_messages(&turn)[0],
+            &SessionTurnMessage::user_text("hello")
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_message_recorder_matches_provider_history_order() {
+        let provider = Arc::new(FakeProvider::new(vec![response(
+            vec![SessionTurnContentBlock::text("done")],
+            ProviderStop::Done,
+        )]));
+        let turn_loop = tool_loop(provider.clone()).with_now_fn(fixed_now);
+        let background = SessionTurnMessage::model_context(
+            ModelContextSource::BackgroundProcess,
+            "<background_processes>empty</background_processes>",
+        );
+        let delegation = SessionTurnMessage::model_context(
+            ModelContextSource::Delegation,
+            "<subagent_summary_projection>{\"subagents\":[]}</subagent_summary_projection>",
+        );
+        let mut appender = StaticContextAppender {
+            messages: vec![background.clone(), delegation.clone()],
+        };
+        let mut recorder = RecordingCompletedMessageRecorder {
+            messages: Vec::new(),
+        };
+
+        let turn = turn_loop
+            .run_session_turn_with_context_hooks(
+                request(),
+                Vec::new(),
+                &mut |_| {},
+                None,
+                SessionTurnHooks::new(Some(&mut recorder), Some(&mut appender), None),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(recorder.messages, turn.messages);
+        let recorded = recorder
+            .messages
+            .iter()
+            .map(|message| message.message.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recorded,
+            vec![
+                SessionTurnMessage::model_context(
+                    ModelContextSource::Runtime,
+                    super::runtime_context_text(fixed_now()),
+                ),
+                background,
+                delegation,
+                SessionTurnMessage::user_text("hello"),
+                SessionTurnMessage::assistant_text("done"),
+            ]
+        );
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].messages[1..], recorded[..4]);
+    }
+
+    #[tokio::test]
+    async fn recovered_context_dedup_matches_only_the_trailing_snapshot_sequence() {
+        let provider = Arc::new(FakeProvider::new(Vec::new()));
+        let turn_loop = tool_loop(provider);
+        let runtime_a = SessionTurnMessage::model_context(
+            ModelContextSource::Runtime,
+            "<runtime_context>state=A</runtime_context>",
+        );
+        let runtime_b = SessionTurnMessage::model_context(
+            ModelContextSource::Runtime,
+            "<runtime_context>state=B</runtime_context>",
+        );
+        let recovered_a = CompletedSessionTurnMessage::new(runtime_a.clone(), fixed_now());
+
+        let mut historical_match = vec![runtime_a.clone(), runtime_b.clone()];
+        let mut committed = Vec::new();
+        let mut recorder: Option<&mut dyn SessionTurnEventRecorder> = None;
+        turn_loop
+            .materialize_recovered_model_context(
+                &mut historical_match,
+                &mut committed,
+                &mut recorder,
+                vec![recovered_a.clone()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            historical_match,
+            vec![runtime_a.clone(), runtime_b, runtime_a.clone()]
+        );
+        assert_eq!(committed, vec![recovered_a.clone()]);
+
+        let mut write_ahead_tail = historical_match;
+        let mut committed = Vec::new();
+        turn_loop
+            .materialize_recovered_model_context(
+                &mut write_ahead_tail,
+                &mut committed,
+                &mut recorder,
+                vec![recovered_a.clone()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            write_ahead_tail,
+            vec![
+                runtime_a.clone(),
+                SessionTurnMessage::model_context(
+                    ModelContextSource::Runtime,
+                    "<runtime_context>state=B</runtime_context>",
+                ),
+                runtime_a,
+            ]
+        );
+        assert_eq!(committed, vec![recovered_a]);
     }
 
     #[tokio::test]
@@ -4784,8 +7338,11 @@ mod tests {
         let runtime_context_mentions = requests[1]
             .messages
             .iter()
-            .flat_map(text_blocks)
-            .filter(|text| text.contains("<runtime_context>"))
+            .filter(|message| {
+                message
+                    .model_context_snapshot()
+                    .is_some_and(|(source, _, _)| *source == ModelContextSource::Runtime)
+            })
             .count();
         assert_eq!(runtime_context_mentions, 1);
         assert!(matches!(
@@ -4795,6 +7352,197 @@ mod tests {
                 .map(|message| message.content.as_slice()),
             Some([SessionTurnContentBlock::ToolResult { .. }])
         ));
+    }
+
+    #[tokio::test]
+    async fn runtime_context_appends_once_on_date_or_timezone_change() {
+        let cases = [
+            (
+                "<runtime_context>\ncurrent_date: 2026-06-29 Monday\ntimezone: Asia/Shanghai\n</runtime_context>",
+                "<runtime_context>\ncurrent_date: 2026-06-30 Tuesday\ntimezone: Asia/Shanghai\n</runtime_context>",
+            ),
+            (
+                "<runtime_context>\ncurrent_date: 2026-06-29 Monday\ntimezone: Asia/Shanghai\n</runtime_context>",
+                "<runtime_context>\ncurrent_date: 2026-06-29 Monday\ntimezone: Europe/London\n</runtime_context>",
+            ),
+        ];
+
+        for (before, after) in cases {
+            let provider = Arc::new(FakeProvider::new(vec![
+                response(
+                    vec![tool_use(
+                        "toolu_1",
+                        "working_note",
+                        json!({"action": "add", "note": "remember"}),
+                    )],
+                    ProviderStop::ToolUse,
+                ),
+                response(
+                    vec![SessionTurnContentBlock::text("done")],
+                    ProviderStop::Done,
+                ),
+            ]));
+            let observation = Arc::new(AtomicUsize::new(0));
+            let turn_loop = {
+                let observation = Arc::clone(&observation);
+                let before = before.to_string();
+                let after = after.to_string();
+                tool_loop(provider.clone()).with_runtime_context_fn(move |_| {
+                    if observation.fetch_add(1, Ordering::SeqCst) < 2 {
+                        before.clone()
+                    } else {
+                        after.clone()
+                    }
+                })
+            };
+
+            let turn = turn_loop
+                .run_session_turn(request(), &mut |_| {})
+                .await
+                .unwrap();
+
+            let requests = provider.requests.lock().await;
+            assert_eq!(requests.len(), 2);
+            assert!(requests[1].messages.starts_with(&requests[0].messages));
+            let runtime_texts = requests[1]
+                .messages
+                .iter()
+                .filter_map(|message| {
+                    let (source, _, text) = message.model_context_snapshot()?;
+                    (*source == ModelContextSource::Runtime).then_some(text)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(runtime_texts, vec![before, after]);
+            assert_eq!(
+                turn.messages
+                    .iter()
+                    .filter(|message| {
+                        message
+                            .model_context_snapshot()
+                            .is_some_and(|(source, _, _)| *source == ModelContextSource::Runtime)
+                    })
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn context_observation_precedes_compaction_preflight_on_each_tool_loop() {
+        let provider = Arc::new(FakeProvider::new(vec![
+            response(
+                vec![tool_use(
+                    "toolu_1",
+                    "working_note",
+                    json!({"action": "add", "note": "observe changed context"}),
+                )],
+                ProviderStop::ToolUse,
+            ),
+            response(
+                vec![SessionTurnContentBlock::text("done")],
+                ProviderStop::Done,
+            ),
+        ]));
+        let turn_loop = tool_loop(provider.clone()).with_now_fn(fixed_now);
+        let mut appender = ChangingContextAppender { observations: 0 };
+        let mut preflight = ContextAwarePreflight::default();
+
+        turn_loop
+            .run_session_turn_with_context_hooks(
+                request(),
+                Vec::new(),
+                &mut |_| {},
+                None,
+                SessionTurnHooks::new(None, Some(&mut appender), Some(&mut preflight)),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            preflight.latest_background_texts,
+            vec![
+                "<background_processes>state=running</background_processes>",
+                "<background_processes>state=completed</background_processes>",
+            ]
+        );
+        let requests = provider.requests.lock().await;
+        assert!(requests[1].messages.starts_with(&requests[0].messages));
+        assert!(requests[1].messages.last().is_some_and(|message| message
+            .model_context_snapshot()
+            .is_some_and(
+                |(source, _, text)| *source == ModelContextSource::BackgroundProcess
+                    && text.contains("state=completed")
+            )));
+    }
+
+    #[tokio::test]
+    async fn changed_context_and_same_request_compaction_emit_one_rebaseline_snapshot() {
+        let provider = Arc::new(FakeProvider::new(vec![
+            response(
+                vec![tool_use(
+                    "toolu_1",
+                    "working_note",
+                    json!({"action": "add", "note": "trigger replacement"}),
+                )],
+                ProviderStop::ToolUse,
+            ),
+            response(
+                vec![SessionTurnContentBlock::text("done")],
+                ProviderStop::Done,
+            ),
+        ]));
+        let turn_loop = tool_loop(provider.clone()).with_now_fn(fixed_now);
+        let mut appender = ChangingContextAppender { observations: 0 };
+        let mut preflight = ReplacingContextPreflight::default();
+        let mut recorder = RecordingCompletedMessageRecorder {
+            messages: Vec::new(),
+        };
+
+        let turn = turn_loop
+            .run_session_turn_with_context_hooks(
+                request(),
+                Vec::new(),
+                &mut |_| {},
+                None,
+                SessionTurnHooks::new(
+                    Some(&mut recorder),
+                    Some(&mut appender),
+                    Some(&mut preflight),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        for source in [
+            ModelContextSource::Runtime,
+            ModelContextSource::BackgroundProcess,
+        ] {
+            assert_eq!(
+                requests[1]
+                    .messages
+                    .iter()
+                    .filter(|message| message
+                        .model_context_snapshot()
+                        .is_some_and(|(candidate, _, _)| *candidate == source))
+                    .count(),
+                1,
+                "compact window 中每个 source 只能有一份 authoritative baseline"
+            );
+        }
+        assert_eq!(
+            turn.messages
+                .iter()
+                .filter(|message| message
+                    .model_context_snapshot()
+                    .is_some_and(|(source, _, text)| *source
+                        == ModelContextSource::BackgroundProcess
+                        && text.contains("state=completed")))
+                .count(),
+            1
+        );
+        assert_eq!(recorder.messages, turn.messages);
     }
 
     #[tokio::test]
@@ -4824,16 +7572,19 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(turn.messages.len(), 4);
-        assert_eq!(turn.messages[0], SessionTurnMessage::user_text("hello"));
-        assert_eq!(turn.messages[1].content.len(), 2);
-        assert_eq!(turn.messages[2].role, "user");
-        let tool_result = tool_result_content(&turn.messages[2], "toolu_1");
+        assert_eq!(non_context_messages(&turn).len(), 4);
+        assert_eq!(
+            non_context_messages(&turn)[0],
+            &SessionTurnMessage::user_text("hello")
+        );
+        assert_eq!(non_context_messages(&turn)[1].content.len(), 2);
+        assert_eq!(non_context_messages(&turn)[2].role, "user");
+        let tool_result = tool_result_content(non_context_messages(&turn)[2], "toolu_1");
         assert_eq!(tool_result["ok"], true);
         assert_eq!(tool_result["outcome"]["kind"], "completed");
         assert_eq!(
-            turn.messages[3],
-            SessionTurnMessage::assistant_text("finished")
+            non_context_messages(&turn)[3],
+            &SessionTurnMessage::assistant_text("finished")
         );
         assert!(events.iter().any(|event| {
             matches!(
@@ -4900,10 +7651,10 @@ mod tests {
         release_completed_tx.send(()).unwrap();
 
         let turn = running.await.unwrap();
-        assert_eq!(turn.messages.len(), 4);
+        assert_eq!(non_context_messages(&turn).len(), 4);
         assert_eq!(
-            turn.messages[3],
-            SessionTurnMessage::assistant_text("finished")
+            non_context_messages(&turn)[3],
+            &SessionTurnMessage::assistant_text("finished")
         );
     }
 
@@ -5277,6 +8028,35 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| matches!(event, SessionTurnEvent::ToolCallCompleted { id, .. } if id == "toolu_2")));
+    }
+
+    #[tokio::test]
+    async fn safe_steer_commits_successful_max_token_partial_without_continuation() {
+        let control = ToolBoundaryControl::new();
+        let provider = Arc::new(
+            FakeProvider::new(vec![response(
+                vec![SessionTurnContentBlock::text("successful partial")],
+                ProviderStop::Done,
+            )])
+            .with_preserved_safe_steer_after_response(control.clone()),
+        );
+        let turn_loop = tool_loop(provider.clone());
+
+        let turn = turn_loop
+            .run_session_turn_with_tool_boundary_control(
+                request(),
+                &mut |_| {},
+                Some(control.clone()),
+            )
+            .await
+            .unwrap();
+
+        assert!(control.should_commit_successful_response());
+        assert_eq!(provider.requests.lock().await.len(), 1);
+        assert_eq!(
+            turn.messages.last().map(|message| &message.message),
+            Some(&SessionTurnMessage::assistant_text("successful partial"))
+        );
     }
 
     #[tokio::test]
@@ -5897,7 +8677,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            tool_result_content(&turn.messages[2], "toolu_final")["output"]["stdout"],
+            tool_result_content(non_context_messages(&turn)[2], "toolu_final")["output"]["stdout"],
             "final"
         );
 
@@ -6275,7 +9055,7 @@ mod tests {
                 ProviderStop::Done,
             ),
         ]));
-        let expected_times = vec![
+        let clock_inputs = vec![
             "2026-06-17T09:33:03.718103Z"
                 .parse::<DateTime<Utc>>()
                 .unwrap(),
@@ -6288,8 +9068,24 @@ mod tests {
             "2026-06-17T09:33:06.123456Z"
                 .parse::<DateTime<Utc>>()
                 .unwrap(),
+            "2026-06-17T09:33:07.000003Z"
+                .parse::<DateTime<Utc>>()
+                .unwrap(),
+            "2026-06-17T09:33:08.000004Z"
+                .parse::<DateTime<Utc>>()
+                .unwrap(),
+            "2026-06-17T09:33:09.000005Z"
+                .parse::<DateTime<Utc>>()
+                .unwrap(),
         ];
-        let clock_values = Arc::new(StdMutex::new(VecDeque::from(expected_times.clone())));
+        let expected_times = vec![
+            clock_inputs[0],
+            clock_inputs[1],
+            clock_inputs[3],
+            clock_inputs[4],
+            clock_inputs[6],
+        ];
+        let clock_values = Arc::new(StdMutex::new(VecDeque::from(clock_inputs)));
         let turn_loop = {
             let clock_values = Arc::clone(&clock_values);
             tool_loop(provider).with_now_fn(move || {
@@ -6312,12 +9108,15 @@ mod tests {
             .map(|message| message.completed_at)
             .collect::<Vec<_>>();
         assert_eq!(actual_times, expected_times);
-        assert_eq!(turn.messages[0], SessionTurnMessage::user_text("hello"));
-        assert_eq!(turn.messages[1].role, "assistant");
-        assert_eq!(turn.messages[2].role, "user");
         assert_eq!(
-            turn.messages[3],
-            SessionTurnMessage::assistant_text("finished")
+            non_context_messages(&turn)[0],
+            &SessionTurnMessage::user_text("hello")
+        );
+        assert_eq!(non_context_messages(&turn)[1].role, "assistant");
+        assert_eq!(non_context_messages(&turn)[2].role, "user");
+        assert_eq!(
+            non_context_messages(&turn)[3],
+            &SessionTurnMessage::assistant_text("finished")
         );
         assert!(clock_values.lock().unwrap().is_empty());
     }
@@ -6352,15 +9151,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(turn.messages.len(), 4);
-        assert_eq!(turn.messages[2].role, "user");
-        assert_eq!(turn.messages[2].content.len(), 2);
+        assert_eq!(non_context_messages(&turn).len(), 4);
+        assert_eq!(non_context_messages(&turn)[2].role, "user");
+        assert_eq!(non_context_messages(&turn)[2].content.len(), 2);
         assert_eq!(
-            tool_result_content(&turn.messages[2], "toolu_1")["ok"],
+            tool_result_content(non_context_messages(&turn)[2], "toolu_1")["ok"],
             true
         );
         assert_eq!(
-            tool_result_content(&turn.messages[2], "toolu_2")["ok"],
+            tool_result_content(non_context_messages(&turn)[2], "toolu_2")["ok"],
             true
         );
     }
@@ -6450,7 +9249,7 @@ mod tests {
             vec!["toolu_one", "toolu_two", "toolu_three"]
         );
         assert_eq!(completed_tool_ids(&events).len(), 3);
-        let result_ids = turn.messages[2]
+        let result_ids = non_context_messages(&turn)[2]
             .content
             .iter()
             .filter_map(|block| match block {
@@ -6663,7 +9462,7 @@ mod tests {
             completed_tool_ids(&events),
             vec!["toolu_fast", "toolu_slow"]
         );
-        let result_ids = turn.messages[2]
+        let result_ids = non_context_messages(&turn)[2]
             .content
             .iter()
             .filter_map(|block| match block {
@@ -6727,11 +9526,11 @@ mod tests {
 
         assert_eq!(provider.requests.lock().await.len(), 2);
         assert_eq!(
-            tool_result_content(&turn.messages[2], "toolu_bad_url")["ok"],
+            tool_result_content(non_context_messages(&turn)[2], "toolu_bad_url")["ok"],
             false
         );
         assert_eq!(
-            tool_result_content(&turn.messages[2], "toolu_good_url")["ok"],
+            tool_result_content(non_context_messages(&turn)[2], "toolu_good_url")["ok"],
             true
         );
     }
@@ -7073,7 +9872,7 @@ mod tests {
             .run_session_turn(request(), &mut |_| {})
             .await
             .unwrap();
-        let result = tool_result_content(&turn.messages[2], "toolu_1");
+        let result = tool_result_content(non_context_messages(&turn)[2], "toolu_1");
 
         assert_eq!(result["ok"], false);
         assert_eq!(result["outcome"]["kind"], "dispatch_failure");
@@ -7153,7 +9952,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(provider.requests.lock().await.len(), 34);
-        assert_eq!(turn.messages.len(), 68);
+        assert_eq!(non_context_messages(&turn).len(), 68);
     }
 
     #[tokio::test]
@@ -7200,7 +9999,7 @@ mod tests {
             .run_session_turn(request, &mut |event| events.push(event))
             .await
             .unwrap();
-        let result = tool_result_content(&turn.messages[2], "toolu_1");
+        let result = tool_result_content(non_context_messages(&turn)[2], "toolu_1");
 
         assert_eq!(result["ok"], false);
         assert_eq!(result["outcome"]["kind"], "business_failure");
@@ -7261,7 +10060,7 @@ mod tests {
             .run_session_turn(request(), &mut |event| events.push(event))
             .await
             .unwrap();
-        let result = tool_result_content(&turn.messages[2], "toolu_1");
+        let result = tool_result_content(non_context_messages(&turn)[2], "toolu_1");
 
         assert_eq!(result["ok"], false);
         assert_eq!(result["outcome"]["kind"], "business_failure");
@@ -7311,7 +10110,7 @@ mod tests {
             .run_session_turn(request(), &mut |event| events.push(event))
             .await
             .unwrap();
-        let result = tool_result_content(&turn.messages[2], "toolu_1");
+        let result = tool_result_content(non_context_messages(&turn)[2], "toolu_1");
 
         assert_eq!(result["ok"], false);
         assert_eq!(result["outcome"]["kind"], "process_exit");
@@ -7383,6 +10182,314 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("stop=ToolUse"));
+    }
+
+    #[tokio::test]
+    async fn context_window_stop_compacts_then_commits_merged_anthropic_replay() {
+        let provider = Arc::new(FakeProvider::new(vec![
+            anthropic_response(
+                vec![SessionTurnContentBlock::text("first ")],
+                vec![
+                    json!({"type":"thinking", "thinking":"private", "signature":"sig"}),
+                    json!({"type":"text", "text":"first "}),
+                ],
+                ProviderStop::ContextWindowExceeded,
+            ),
+            anthropic_response(
+                vec![SessionTurnContentBlock::text("second")],
+                vec![json!({"type":"text", "text":"second"})],
+                ProviderStop::Done,
+            ),
+        ]));
+        let turn_loop = tool_loop(provider.clone());
+        let mut preflight = RecordingContextRecoveryPreflight::default();
+        let mut events = Vec::new();
+
+        let turn = turn_loop
+            .run_session_turn_with_hooks(
+                request(),
+                &mut |event| events.push(event),
+                None,
+                None,
+                Some(&mut preflight),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(non_context_messages(&turn).len(), 2);
+        assert_eq!(
+            assistant_message_text(non_context_messages(&turn)[1]),
+            "first second"
+        );
+        let Some(ProviderReplayState::AnthropicMessages { messages, .. }) =
+            non_context_messages(&turn)[1].provider_replay.as_ref()
+        else {
+            panic!("merged assistant must preserve Anthropic replay");
+        };
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"][0]["text"], CONTINUATION_TRIGGER);
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(preflight.applied, 1);
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].messages.last().unwrap().role, "user");
+        assert!(assistant_message_text(requests[1].messages.last().unwrap())
+            .contains(CONTINUATION_TRIGGER));
+    }
+
+    #[tokio::test]
+    async fn context_continuation_completed_event_contains_full_visible_response() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ScriptedProviderAttempt {
+                events: vec![
+                    ProviderEvent::AssistantTextDelta {
+                        text: "first ".into(),
+                    },
+                    ProviderEvent::AssistantMessageCompleted {
+                        text: "first ".into(),
+                    },
+                ],
+                result: Ok(anthropic_response(
+                    vec![SessionTurnContentBlock::text("first ")],
+                    vec![json!({"type":"text", "text":"first "})],
+                    ProviderStop::ContextWindowExceeded,
+                )),
+            },
+            ScriptedProviderAttempt {
+                events: vec![
+                    ProviderEvent::AssistantTextDelta {
+                        text: "second".into(),
+                    },
+                    ProviderEvent::AssistantMessageCompleted {
+                        text: "second".into(),
+                    },
+                ],
+                result: Ok(anthropic_response(
+                    vec![SessionTurnContentBlock::text("second")],
+                    vec![json!({"type":"text", "text":"second"})],
+                    ProviderStop::Done,
+                )),
+            },
+        ]));
+        let turn_loop = tool_loop(provider);
+        let mut preflight = RecordingContextRecoveryPreflight::default();
+        let mut events = Vec::new();
+
+        let turn = turn_loop
+            .run_session_turn_with_hooks(
+                request(),
+                &mut |event| events.push(event),
+                None,
+                None,
+                Some(&mut preflight),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            assistant_message_text(non_context_messages(&turn)[1]),
+            "first second"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionTurnEvent::AssistantMessageCompleted { text }
+                if text == "first second"
+        )));
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_context_partial_is_replayed_without_empty_success() {
+        let provider = Arc::new(FakeProvider::new(vec![
+            anthropic_response(
+                Vec::new(),
+                vec![json!({
+                    "type":"thinking",
+                    "thinking":"private",
+                    "signature":"sig"
+                })],
+                ProviderStop::ContextWindowExceeded,
+            ),
+            anthropic_response(
+                vec![SessionTurnContentBlock::text("visible")],
+                vec![json!({"type":"text", "text":"visible"})],
+                ProviderStop::Done,
+            ),
+        ]));
+        let turn_loop = tool_loop(provider);
+        let mut preflight = RecordingContextRecoveryPreflight::default();
+
+        let turn = turn_loop
+            .run_session_turn_with_hooks(request(), &mut |_| {}, None, None, Some(&mut preflight))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            assistant_message_text(non_context_messages(&turn)[1]),
+            "visible"
+        );
+        let Some(ProviderReplayState::AnthropicMessages { messages, .. }) =
+            non_context_messages(&turn)[1].provider_replay.as_ref()
+        else {
+            panic!("reasoning-only partial must survive in final replay");
+        };
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["content"][0]["type"], "thinking");
+        assert_eq!(preflight.applied, 1);
+    }
+
+    #[tokio::test]
+    async fn context_window_recovery_has_independent_two_attempt_limit() {
+        let context_response = || {
+            anthropic_response(
+                vec![SessionTurnContentBlock::text("partial")],
+                vec![json!({"type":"text", "text":"partial"})],
+                ProviderStop::ContextWindowExceeded,
+            )
+        };
+        let provider = Arc::new(FakeProvider::new(vec![
+            context_response(),
+            context_response(),
+            context_response(),
+        ]));
+        let turn_loop = tool_loop(provider.clone());
+        let mut preflight = RecordingContextRecoveryPreflight::default();
+
+        let error = turn_loop
+            .run_session_turn_with_hooks(request(), &mut |_| {}, None, None, Some(&mut preflight))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("自动压缩并续写 2 次后仍未完成"));
+        assert_eq!(provider.requests.lock().await.len(), 3);
+        assert_eq!(preflight.applied, 2);
+    }
+
+    #[tokio::test]
+    async fn complete_tool_use_at_context_limit_executes_before_forced_compaction() {
+        let provider = Arc::new(FakeProvider::new(vec![
+            anthropic_response(
+                vec![tool_use("toolu_context", "missing_tool", json!({}))],
+                vec![json!({
+                    "type":"tool_use",
+                    "id":"toolu_context",
+                    "name":"missing_tool",
+                    "input":{}
+                })],
+                ProviderStop::ContextWindowExceeded,
+            ),
+            anthropic_response(
+                vec![SessionTurnContentBlock::text("after tool")],
+                vec![json!({"type":"text", "text":"after tool"})],
+                ProviderStop::Done,
+            ),
+        ]));
+        let turn_loop = tool_loop(provider.clone());
+        let mut preflight = RecordingContextRecoveryPreflight::default();
+
+        let turn = turn_loop
+            .run_session_turn_with_hooks(request(), &mut |_| {}, None, None, Some(&mut preflight))
+            .await
+            .unwrap();
+
+        assert_eq!(non_context_messages(&turn).len(), 4);
+        assert!(matches!(
+            non_context_messages(&turn)[1].content.as_slice(),
+            [SessionTurnContentBlock::ToolUse { id, .. }] if id == "toolu_context"
+        ));
+        assert_eq!(non_context_messages(&turn)[2].role, "user");
+        assert_eq!(
+            tool_result_content(non_context_messages(&turn)[2], "toolu_context")["ok"],
+            false
+        );
+        assert_eq!(
+            assistant_message_text(non_context_messages(&turn)[3]),
+            "after tool"
+        );
+        assert_eq!(provider.requests.lock().await.len(), 2);
+        assert_eq!(preflight.applied, 1);
+    }
+
+    #[test]
+    fn provider_response_suffix_strips_sent_internal_replay_for_all_protocols() {
+        let cases = vec![
+            (
+                ProviderReplayState::OpenAiResponses {
+                    model: Some("test-model".into()),
+                    items: vec![json!({"id":"partial"}), json!({"id":"continue"})],
+                },
+                ProviderReplayState::OpenAiResponses {
+                    model: Some("test-model".into()),
+                    items: vec![
+                        json!({"id":"partial"}),
+                        json!({"id":"continue"}),
+                        json!({"id":"final"}),
+                    ],
+                },
+                ProviderReplayState::OpenAiResponses {
+                    model: Some("test-model".into()),
+                    items: vec![json!({"id":"final"})],
+                },
+            ),
+            (
+                ProviderReplayState::OpenAiChatCompletions {
+                    model: "test-model".into(),
+                    messages: vec![json!({"id":"partial"}), json!({"id":"continue"})],
+                },
+                ProviderReplayState::OpenAiChatCompletions {
+                    model: "test-model".into(),
+                    messages: vec![
+                        json!({"id":"partial"}),
+                        json!({"id":"continue"}),
+                        json!({"id":"final"}),
+                    ],
+                },
+                ProviderReplayState::OpenAiChatCompletions {
+                    model: "test-model".into(),
+                    messages: vec![json!({"id":"final"})],
+                },
+            ),
+            (
+                ProviderReplayState::AnthropicMessages {
+                    model: "test-model".into(),
+                    messages: vec![json!({"id":"partial"}), json!({"id":"continue"})],
+                },
+                ProviderReplayState::AnthropicMessages {
+                    model: "test-model".into(),
+                    messages: vec![
+                        json!({"id":"partial"}),
+                        json!({"id":"continue"}),
+                        json!({"id":"final"}),
+                    ],
+                },
+                ProviderReplayState::AnthropicMessages {
+                    model: "test-model".into(),
+                    messages: vec![json!({"id":"final"})],
+                },
+            ),
+        ];
+
+        for (request_replay, response_replay, expected_replay) in cases {
+            let base = vec![SessionTurnMessage::user_text("task")];
+            let mut latest = base.clone();
+            latest.push(SessionTurnMessage {
+                role: "assistant".into(),
+                content: vec![SessionTurnContentBlock::text("partial")],
+                provider_replay: Some(request_replay),
+            });
+            let response = SessionTurnMessage {
+                role: "assistant".into(),
+                content: vec![SessionTurnContentBlock::text("partial final")],
+                provider_replay: Some(response_replay),
+            };
+
+            let suffix =
+                provider_assistant_suffix_for_latest_request(&response, &base, &latest).unwrap();
+
+            assert_eq!(suffix.provider_replay, Some(expected_replay));
+            assert_eq!(assistant_message_text(&suffix), "partial final");
+        }
     }
 
     #[tokio::test]

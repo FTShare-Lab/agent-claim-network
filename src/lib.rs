@@ -21,6 +21,7 @@ pub mod build_info;
 pub mod claim;
 pub mod config;
 pub mod delegation;
+mod http_client;
 pub mod maintainer;
 pub mod mcp;
 pub mod memory;
@@ -47,3 +48,8 @@ pub use tool::read_state as tool_read_state;
 pub mod tracing;
 pub mod update;
 pub mod upstream_migration;
+
+pub(crate) use http_client::{
+    direct_http_client_013_builder, direct_http_client_builder, http_client_013_builder,
+    http_client_builder, http_client_builder_for_endpoint, is_loopback_endpoint,
+};

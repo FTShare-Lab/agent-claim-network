@@ -32,10 +32,10 @@ model = "text-embedding-3-small"
 api_key_env = "EMBEDDING_API_KEY"
 
 [router.rerank]
-provider = "openai_compatible_chat"
-endpoint = "https://api.openai.com/v1/chat/completions"
+provider = "openai_responses"
+endpoint = "https://api.openai.com/v1"
 model = "gpt-5.6-luna"
-api_key_env = "OPENAI_API_KEY"
+api_key_env = "ACN_LLM_API_KEY"
 
 # 默认只监听本机；对外部署时按实际网络边界修改。
 [maintainer.daemon]
@@ -58,7 +58,7 @@ max_source_claims = 20
 
 # 仅在 maintainer.arbitration.enabled=true 时需要；不会回退使用 agent.llm。
 # [maintainer.llm]
-# provider = "openai_compatible_chat"
+# provider = "openai_chat"
 # endpoint = "https://llm.example.com/v1/chat/completions"
 # model = "example-model"
 # reasoning_effort = "none"
@@ -71,9 +71,9 @@ max_source_claims = 20
 # retry_max_delay_ms = 5000
 
 [agent.llm]
-provider = "openai_compatible_chat"
-endpoint = ""
-model = ""
+provider = "openai_responses"
+endpoint = "https://api.openai.com/v1"
+model = "gpt-5.6-luna"
 reasoning_effort = "none"
 api_key_env = "ACN_LLM_API_KEY"
 max_tokens = 65536

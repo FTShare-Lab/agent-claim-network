@@ -36,6 +36,7 @@ fn searchable_text_for_block(
 ) -> String {
     match block {
         SessionContentBlock::Text { text } => text.clone(),
+        SessionContentBlock::ModelContext { .. } => String::new(),
         SessionContentBlock::SkillInstructions { instruction } => {
             format!("[explicit skill /{}]", instruction.name)
         }
@@ -166,6 +167,10 @@ fn evidence_text_for_block(
                 was_truncated,
             }
         }
+        SessionContentBlock::ModelContext { .. } => EvidenceBlock::Text {
+            text: String::new(),
+            was_truncated: false,
+        },
         SessionContentBlock::SkillInstructions { instruction } => EvidenceBlock::Text {
             text: format!("[explicit skill /{}]", instruction.name),
             was_truncated: false,
@@ -233,6 +238,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::ModelContextSource;
     use crate::session::{SessionContentBlock, SessionMessageRole};
     use chrono::Utc;
 
@@ -252,6 +258,7 @@ mod tests {
             ],
             created_at: Utc::now(),
             model: "test-model".into(),
+            provider_replay: None,
         };
         let text = searchable_texts_for_messages(&[message]).remove(0);
         assert!(text.contains("[image attachment media_type=image/png"));
@@ -270,6 +277,7 @@ mod tests {
             ],
             created_at: Utc::now(),
             model: "test-model".into(),
+            provider_replay: None,
         };
         let text = searchable_texts_for_messages(&[message]).remove(0);
         assert!(text.contains("hello"));
@@ -289,6 +297,7 @@ mod tests {
                 )],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 1,
@@ -296,6 +305,7 @@ mod tests {
                 content: vec![SessionContentBlock::tool_result("toolu_1", "docker clue")],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
         ];
 
@@ -317,6 +327,7 @@ mod tests {
                 )],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 1,
@@ -324,6 +335,7 @@ mod tests {
                 content: vec![SessionContentBlock::tool_result("toolu_1", "long output")],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
         ];
         let tool_names = tool_name_map(&messages);
@@ -346,6 +358,7 @@ mod tests {
                 content: vec![SessionContentBlock::text("   ")],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 1,
@@ -353,10 +366,42 @@ mod tests {
                 content: vec![SessionContentBlock::text("useful preview")],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
         ];
 
         assert_eq!(first_user_preview(&messages, 100), "useful preview");
+    }
+
+    #[test]
+    fn model_context_is_not_searchable_or_used_as_first_user_preview() {
+        let messages = vec![
+            SessionMessage {
+                index: 0,
+                role: SessionMessageRole::User,
+                content: vec![SessionContentBlock::ModelContext {
+                    source: ModelContextSource::Runtime,
+                    fingerprint: "sha256-v1:test".into(),
+                    text: "hidden runtime needle".into(),
+                }],
+                created_at: Utc::now(),
+                model: "test-model".into(),
+                provider_replay: None,
+            },
+            SessionMessage {
+                index: 1,
+                role: SessionMessageRole::User,
+                content: vec![SessionContentBlock::text("real user preview")],
+                created_at: Utc::now(),
+                model: "test-model".into(),
+                provider_replay: None,
+            },
+        ];
+
+        let rendered = searchable_texts_for_messages(&messages);
+        assert!(rendered[0].is_empty());
+        assert!(!rendered.join("\n").contains("hidden runtime needle"));
+        assert_eq!(first_user_preview(&messages, 100), "real user preview");
     }
 
     #[test]
@@ -372,6 +417,7 @@ mod tests {
                 ],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 1,
@@ -379,6 +425,7 @@ mod tests {
                 content: vec![SessionContentBlock::text("real user preview")],
                 created_at: Utc::now(),
                 model: "test-model".into(),
+                provider_replay: None,
             },
         ];
 

@@ -16,6 +16,76 @@ async fn acknowledge_process_output(registry: &ToolRegistry, execution: &ToolExe
         .await;
 }
 
+#[cfg(unix)]
+async fn collect_stdout_until_terminal(
+    registry: &ToolRegistry,
+    context: &ToolDispatchContext,
+    mut execution: ToolExecution,
+    timeout: Duration,
+) -> (ToolExecution, String) {
+    let mut stdout = String::new();
+    let settled = tokio::time::timeout(timeout, async {
+        loop {
+            stdout.push_str(execution.output["stdout"].as_str().unwrap_or_default());
+            if execution.outcome != ToolExecutionOutcome::ProcessRunning {
+                break;
+            }
+            let process_id = execution.output["process_id"]
+                .as_str()
+                .expect("running process must expose its process id")
+                .to_string();
+            acknowledge_process_output(registry, &execution).await;
+            execution = registry
+                .dispatch_with_context(
+                    "write_stdin",
+                    json!({
+                        "process_id": process_id,
+                        "yield_time_ms": 250,
+                    }),
+                    context.clone(),
+                )
+                .await
+                .expect("polling a managed process should succeed");
+        }
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "managed process did not reach a terminal state within {timeout:?}; last execution={execution:#?}, stdout={stdout:?}"
+    );
+    (execution, stdout)
+}
+
+#[cfg(unix)]
+async fn wait_for_managed_stdout(
+    registry: &ToolRegistry,
+    context: &ToolDispatchContext,
+    process_id: &str,
+    expected: &str,
+) {
+    let process = registry
+        .process_manager
+        .find_for_owner(&registry.process_owner(context), process_id)
+        .await
+        .expect("managed process must remain registered while running");
+    let mut stdout = String::new();
+    let ready = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let (snapshot, _) = process.output_snapshot().await;
+            stdout = String::from_utf8_lossy(&snapshot.bytes).into_owned();
+            if stdout.contains(expected) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    assert!(
+        ready.is_ok(),
+        "managed stdout did not contain {expected:?}; stdout={stdout:?}"
+    );
+}
+
 #[tokio::test]
 async fn code_run_executes_python_in_workspace() {
     let dir = tempfile::tempdir().unwrap();
@@ -25,6 +95,7 @@ async fn code_run_executes_python_in_workspace() {
             "code_run",
             serde_json::json!({
                 "script": "print('hello')",
+                "description": "Print a greeting from Python",
                 "type": "python",
             }),
         )
@@ -92,10 +163,11 @@ async fn code_run_tty_uses_fixed_size_and_accepts_interactive_input() {
         .unwrap();
     assert_eq!(running.outcome, ToolExecutionOutcome::ProcessRunning);
     assert_eq!(running.output["tty"], true);
-    assert!(running.output["stdout"]
+    let initial_stdout = running.output["stdout"]
         .as_str()
-        .is_some_and(|stdout| stdout.contains("31 97")));
-    let process_id = running.output["process_id"].as_str().unwrap();
+        .unwrap_or_default()
+        .to_string();
+    let process_id = running.output["process_id"].as_str().unwrap().to_string();
     acknowledge_process_output(&registry, &running).await;
     let completed = registry
         .dispatch(
@@ -103,15 +175,23 @@ async fn code_run_tty_uses_fixed_size_and_accepts_interactive_input() {
             json!({
                 "process_id": process_id,
                 "chars": "hello\n",
+                "description": "Send the requested reply to the interactive command",
                 "yield_time_ms": 500
             }),
         )
         .await
         .unwrap();
     assert_eq!(completed.output["success"], true);
-    assert!(completed.output["stdout"]
-        .as_str()
-        .is_some_and(|stdout| stdout.contains("reply=hello")));
+    let completed_stdout = completed.output["stdout"].as_str().unwrap_or_default();
+    let full_stdout = format!("{initial_stdout}{completed_stdout}");
+    assert!(
+        full_stdout.contains("31 97"),
+        "PTY did not report the configured size; stdout={full_stdout:?}"
+    );
+    assert!(
+        full_stdout.contains("reply=hello"),
+        "PTY did not accept interactive input; stdout={full_stdout:?}"
+    );
 }
 
 #[tokio::test]
@@ -167,6 +247,7 @@ async fn pty_ctrl_c_interrupts_the_foreground_process_group() {
 #[cfg(unix)]
 async fn running_pty_output_pages_forward_and_terminate_reuses_managed_kill_path() {
     let dir = tempfile::tempdir().unwrap();
+    let emit_ready = dir.path().join("emit-ready");
     let mut config = test_tool_config(dir.path());
     config.code_run_max_output_chars = 64;
     config.background_process_output_buffer_bytes = 256;
@@ -177,28 +258,52 @@ async fn running_pty_output_pages_forward_and_terminate_reuses_managed_kill_path
         .dispatch_with_context(
             "code_run",
             json!({
-                "script": "printf '0123456789PROMPT>'; sleep 30",
+                "script": "while [ ! -f emit-ready ]; do sleep 0.01; done; printf '0123456789PROMPT>'; sleep 30",
                 "tty": true,
                 "yield_time_ms": 250,
-                "max_output_chars": 5,
             }),
             context.clone(),
         )
         .await
         .unwrap();
     assert_eq!(initial.outcome, ToolExecutionOutcome::ProcessRunning);
-    assert_eq!(initial.output["stdout"], "01234");
-    assert_eq!(initial.output["stdout_cursor"], 5);
-    assert_eq!(initial.output["truncated"], true);
     let process_id = initial.output["process_id"].as_str().unwrap().to_string();
     let initial_receipt = initial
         .process_delivery_receipt
-        .expect("running PTY prefix must await provider delivery");
+        .expect("initial PTY snapshot must await provider delivery");
     registry
         .begin_process_deliveries(std::slice::from_ref(&initial_receipt))
         .await;
     registry
         .commit_process_deliveries(std::slice::from_ref(&initial_receipt))
+        .await;
+    tokio::fs::write(emit_ready, b"ready").await.unwrap();
+    wait_for_managed_stdout(&registry, &context, &process_id, "0123456789PROMPT>").await;
+
+    let first_page = registry
+        .dispatch_with_context(
+            "write_stdin",
+            json!({
+                "process_id": process_id,
+                "max_output_chars": 5,
+                "yield_time_ms": 250,
+            }),
+            context.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_page.outcome, ToolExecutionOutcome::ProcessRunning);
+    assert_eq!(first_page.output["stdout"], "01234");
+    assert_eq!(first_page.output["stdout_cursor"], 5);
+    assert_eq!(first_page.output["truncated"], true);
+    let first_page_receipt = first_page
+        .process_delivery_receipt
+        .expect("running PTY prefix must await provider delivery");
+    registry
+        .begin_process_deliveries(std::slice::from_ref(&first_page_receipt))
+        .await;
+    registry
+        .commit_process_deliveries(std::slice::from_ref(&first_page_receipt))
         .await;
 
     let tail = registry
@@ -502,17 +607,23 @@ async fn process_list_is_owner_scoped_and_write_stdin_reads_terminal_result() {
         .unwrap()
         .is_empty());
 
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    let completed = registry
+    let first_poll = registry
         .dispatch_with_context(
             "write_stdin",
-            json!({"process_id": process_id, "chars": "", "yield_time_ms": 50}),
-            owner_context,
+            json!({"process_id": process_id, "chars": "", "yield_time_ms": 250}),
+            owner_context.clone(),
         )
         .await
         .unwrap();
+    let (completed, stdout) = collect_stdout_until_terminal(
+        &registry,
+        &owner_context,
+        first_poll,
+        Duration::from_secs(3),
+    )
+    .await;
     assert_eq!(completed.output["state"], "finished");
-    assert_eq!(completed.output["stdout"], "complete");
+    assert_eq!(stdout, "complete");
     assert_eq!(completed.output["stdin_open"], false);
 }
 
@@ -547,6 +658,22 @@ async fn main_agent_can_terminate_subagent_process_without_taking_input_ownershi
     acknowledge_process_output(&child_registry, &running).await;
     std::fs::write(emit_tail_marker, b"ready").unwrap();
 
+    let child_projection = child_registry
+        .background_process_projection_for_owner_with_notifications(
+            &child_registry.process_owner_for_session(&session, Some(subagent_id)),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let main_projection = main_registry
+        .background_process_projection_for_owner_with_notifications(
+            &main_registry.process_owner_for_session(&session, None),
+            Vec::new(),
+        )
+        .await;
+    assert!(child_projection.contains(&process_id));
+    assert!(main_projection.is_none());
+
     let child_list = child_registry
         .dispatch_with_context("process_list", json!({}), child_context.clone())
         .await
@@ -563,14 +690,32 @@ async fn main_agent_can_terminate_subagent_process_without_taking_input_ownershi
     assert_eq!(processes[0]["process_id"], process_id);
     assert_eq!(processes[0]["owner"], subagent_id);
 
-    let root_poll = main_registry
-        .dispatch_with_context(
-            "write_stdin",
-            json!({"process_id": process_id, "chars": "", "yield_time_ms": 300}),
-            file_tool_context(&session),
-        )
-        .await
-        .unwrap();
+    let root_poll = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let polled = main_registry
+                .dispatch_with_context(
+                    "write_stdin",
+                    json!({
+                        "process_id": process_id,
+                        "chars": "",
+                        "yield_time_ms": 250,
+                        "stdout_cursor": 0,
+                        "stderr_cursor": 0,
+                    }),
+                    file_tool_context(&session),
+                )
+                .await
+                .unwrap();
+            if polled.output["stdout"]
+                .as_str()
+                .is_some_and(|stdout| stdout.contains("child-tail"))
+            {
+                break polled;
+            }
+        }
+    })
+    .await
+    .expect("main observation must eventually include the child tail");
     assert_eq!(root_poll.outcome, ToolExecutionOutcome::ProcessRunning);
     assert!(root_poll.output["stdout"]
         .as_str()
@@ -655,6 +800,77 @@ async fn main_agent_can_terminate_subagent_process_without_taking_input_ownershi
 }
 
 #[tokio::test]
+#[cfg(unix)]
+async fn background_projection_ignores_elapsed_time_and_output_growth_but_tracks_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
+    let session = SessionId::from_str("session_aaaaaaaa").unwrap();
+    let context = file_tool_context(&session);
+    let running = registry
+        .dispatch_with_context(
+            "code_run",
+            json!({
+                "script": "printf first; sleep 0.3; printf second; sleep 3",
+                "yield_time_ms": 50,
+            }),
+            context.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(running.outcome, ToolExecutionOutcome::ProcessRunning);
+    let process_id = running.output["process_id"].as_str().unwrap().to_string();
+    let owner = registry.process_owner_for_session(&session, None);
+
+    let before = registry
+        .background_process_projection_for_owner_with_notifications(&owner, Vec::new())
+        .await
+        .unwrap();
+    acknowledge_process_output(&registry, &running).await;
+    let after_output_cursor_advance = registry
+        .background_process_projection_for_owner_with_notifications(&owner, Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        after_output_cursor_advance, before,
+        "advancing an ordinary output delivery cursor must not change the semantic projection"
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let after_output_growth = registry
+        .background_process_projection_for_owner_with_notifications(&owner, Vec::new())
+        .await
+        .unwrap();
+
+    assert_eq!(after_output_growth, before);
+    assert!(before.contains(&process_id));
+    assert!(before.contains("state=running"));
+    assert!(!before.contains("elapsed"));
+    assert!(!before.contains("stdout="));
+    assert!(!before.contains("stderr="));
+
+    let terminal = registry
+        .dispatch_with_context(
+            "write_stdin",
+            json!({"process_id": process_id, "terminate": true, "yield_time_ms": 500}),
+            context,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        terminal.outcome,
+        ToolExecutionOutcome::ProcessTerminated { .. }
+    ));
+    let after_terminal = registry
+        .background_process_projection_for_owner_with_notifications(&owner, Vec::new())
+        .await
+        .unwrap();
+
+    assert_ne!(after_terminal, before);
+    assert!(after_terminal.contains("state=terminated"));
+    assert!(after_terminal.contains("final_output_available=true"));
+    registry.cleanup_processes_for_session(&session).await;
+}
+
+#[tokio::test]
 async fn ps_snapshots_hide_starting_entries_until_their_controls_are_attached() {
     let dir = tempfile::tempdir().unwrap();
     let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
@@ -685,19 +901,27 @@ async fn ps_snapshots_hide_starting_entries_until_their_controls_are_attached() 
 #[cfg(unix)]
 async fn pipe_process_rejects_text_but_accepts_ctrl_c() {
     let dir = tempfile::tempdir().unwrap();
+    let ready_pid_path = dir.path().join("sigint-ready.pid");
     let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
     let session = SessionId::from_str("session_aaaaaaaa").unwrap();
     let context = file_tool_context(&session);
     let running = registry
         .dispatch_with_context(
             "code_run",
-            json!({"script": "trap '' INT; while :; do sleep 1; done", "yield_time_ms": 50}),
+            json!({
+                "script": format!(
+                    "trap '' INT; echo $$ > {}; while :; do sleep 1; done",
+                    shell_quote_path(&ready_pid_path),
+                ),
+                "yield_time_ms": 50,
+            }),
             context.clone(),
         )
         .await
         .unwrap();
     let process_id = running.output["process_id"].as_str().unwrap().to_string();
     acknowledge_process_output(&registry, &running).await;
+    let _ready_pid = wait_for_test_pid(&ready_pid_path).await;
     let text_error = registry
         .dispatch_with_context(
             "write_stdin",
@@ -716,10 +940,7 @@ async fn pipe_process_rejects_text_but_accepts_ctrl_c() {
         )
         .await
         .unwrap();
-    assert!(matches!(
-        interrupted.outcome,
-        ToolExecutionOutcome::ProcessExit { .. } | ToolExecutionOutcome::ProcessRunning
-    ));
+    assert_eq!(interrupted.outcome, ToolExecutionOutcome::ProcessRunning);
     let live = registry
         .dispatch_with_context("process_list", json!({}), context)
         .await
@@ -1206,13 +1427,27 @@ async fn terminal_explicit_cursor_uses_committed_cursor_and_cannot_skip_output()
 async fn signal_exit_is_exposed_without_fabricating_an_exit_code() {
     let dir = tempfile::tempdir().unwrap();
     let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
-    let result = registry
+    let initial = registry
         .dispatch(
             "code_run",
             json!({"script": "kill -TERM $$", "yield_time_ms": 500}),
         )
         .await
         .unwrap();
+    let (result, _) = collect_stdout_until_terminal(
+        &registry,
+        &ToolDispatchContext::default(),
+        initial,
+        Duration::from_secs(3),
+    )
+    .await;
+    assert_eq!(
+        result.outcome,
+        ToolExecutionOutcome::ProcessExit {
+            exit_code: None,
+            success: false,
+        }
+    );
     assert_eq!(result.output["exit_code"], Value::Null);
     assert_eq!(result.output["signal"], libc::SIGTERM);
     assert_eq!(result.output["success"], false);
@@ -1220,27 +1455,117 @@ async fn signal_exit_is_exposed_without_fabricating_an_exit_code() {
 
 #[tokio::test]
 #[cfg(unix)]
+async fn external_signal_completion_preserves_originating_tool_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_path = dir.path().join("external-signal.pid");
+    let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
+    let session = SessionId::from_str("session_aaaaaaaa").unwrap();
+    let context = ToolDispatchContext {
+        current_session_id: Some(session.clone()),
+        current_turn_id: Some("turn_external_signal".into()),
+        tool_use_id: Some("toolu_external_signal".into()),
+        ..ToolDispatchContext::default()
+    };
+    let initial = registry
+        .dispatch_with_context(
+            "code_run",
+            json!({
+                "script": format!(
+                    "echo $$ > {}; sleep 30",
+                    shell_quote_path(&pid_path)
+                ),
+                "yield_time_ms": 50,
+            }),
+            context,
+        )
+        .await
+        .unwrap();
+    assert_eq!(initial.outcome, ToolExecutionOutcome::ProcessRunning);
+    let pid = wait_for_test_pid(&pid_path).await;
+
+    // SAFETY: PID 由本测试刚启动、且仍由 registry 持有的进程组 leader 写入。
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let completion = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(completion) = registry
+                .pending_process_completions_for_root_session(&session)
+                .await
+                .into_iter()
+                .next()
+            {
+                break completion;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("external signal must be observed by the independent watcher");
+
+    assert_eq!(completion.status, "finished");
+    assert_eq!(completion.exit_code, None);
+    assert_eq!(completion.signal, Some(libc::SIGTERM));
+    assert!(!completion.success);
+    assert_eq!(
+        completion.originating_turn_id.as_deref(),
+        Some("turn_external_signal")
+    );
+    assert_eq!(
+        completion.originating_tool_use_id.as_deref(),
+        Some("toolu_external_signal")
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
 async fn code_run_cleans_background_process_group_after_parent_exits() {
     let dir = tempfile::tempdir().unwrap();
+    let child_pid_path = dir.path().join("background-child.pid");
     let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
     let started = std::time::Instant::now();
-    let result = registry
+    let initial = registry
         .dispatch(
             "code_run",
             serde_json::json!({
-                "script": "(sleep 10) & echo parent-done",
+                "script": format!(
+                    "sleep 10 & child=$!; echo $child > {}; echo parent-done",
+                    shell_quote_path(&child_pid_path),
+                ),
                 "yield_time_ms": 250
             }),
         )
         .await
         .expect("command should return after parent exits");
+    let (result, stdout) = collect_stdout_until_terminal(
+        &registry,
+        &ToolDispatchContext::default(),
+        initial,
+        Duration::from_secs(3),
+    )
+    .await;
 
     assert!(started.elapsed() < Duration::from_secs(4));
-    assert_eq!(result.output["success"], true);
-    assert!(result.output["stdout"]
-        .as_str()
-        .unwrap()
-        .contains("parent-done"));
+    assert_eq!(
+        result.outcome,
+        ToolExecutionOutcome::ProcessExit {
+            exit_code: Some(0),
+            success: true,
+        }
+    );
+    assert!(
+        stdout.contains("parent-done"),
+        "terminal output did not include the parent marker; stdout={stdout:?}"
+    );
+    let child_pid = wait_for_test_pid(&child_pid_path).await;
+    for _ in 0..40 {
+        // SAFETY: this PID is produced only by this test's background child fixture.
+        if unsafe { libc::kill(child_pid, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("code_run left background child {child_pid} alive");
 }
 
 #[tokio::test]
@@ -1303,14 +1628,28 @@ async fn capacity_eviction_kills_the_evicted_live_process_group() {
     assert_eq!(first.outcome, ToolExecutionOutcome::ProcessRunning);
     let pid = wait_for_test_pid(&pid_path).await;
 
-    let replacement = registry
+    let replacement_initial = registry
         .dispatch(
             "code_run",
             json!({"script": "printf replacement", "yield_time_ms": 500}),
         )
         .await
         .unwrap();
-    assert_eq!(replacement.output["stdout"], "replacement");
+    let (replacement, replacement_stdout) = collect_stdout_until_terminal(
+        &registry,
+        &ToolDispatchContext::default(),
+        replacement_initial,
+        Duration::from_secs(3),
+    )
+    .await;
+    assert_eq!(
+        replacement.outcome,
+        ToolExecutionOutcome::ProcessExit {
+            exit_code: Some(0),
+            success: true,
+        }
+    );
+    assert_eq!(replacement_stdout, "replacement");
     for _ in 0..20 {
         // SAFETY: kill(pid, 0) only probes the PID obtained from this test fixture.
         if unsafe { libc::kill(pid, 0) } == -1
@@ -1553,7 +1892,7 @@ async fn pty_fast_root_exit_still_kills_same_group_descendant() {
     let dir = tempfile::tempdir().unwrap();
     let descendant_pid_path = dir.path().join("pty-same-group.pid");
     let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
-    let result = registry
+    let initial = registry
         .dispatch(
             "code_run",
             json!({
@@ -1567,7 +1906,20 @@ async fn pty_fast_root_exit_still_kills_same_group_descendant() {
         )
         .await
         .unwrap();
-    assert_eq!(result.output["success"], true);
+    let (result, _) = collect_stdout_until_terminal(
+        &registry,
+        &ToolDispatchContext::default(),
+        initial,
+        Duration::from_secs(3),
+    )
+    .await;
+    assert_eq!(
+        result.outcome,
+        ToolExecutionOutcome::ProcessExit {
+            exit_code: Some(0),
+            success: true,
+        }
+    );
     let descendant_pid = wait_for_test_pid(&descendant_pid_path).await;
     for _ in 0..40 {
         // SAFETY: this PID is produced only by the test fixture above.
@@ -1660,7 +2012,7 @@ async fn escaped_descendant_holding_pipe_fd_cannot_block_root_terminal_completio
     config.background_process_output_drain_grace_ms = 1;
     let registry = ToolRegistry::new(&config).unwrap();
     let started = std::time::Instant::now();
-    let result = registry
+    let initial = registry
             .dispatch(
                 "code_run",
                 serde_json::json!({
@@ -1672,13 +2024,27 @@ async fn escaped_descendant_holding_pipe_fd_cannot_block_root_terminal_completio
             )
             .await
             .expect("root terminal should finish even when an escaped descendant holds stdout");
+    let (result, stdout) = collect_stdout_until_terminal(
+        &registry,
+        &ToolDispatchContext::default(),
+        initial,
+        Duration::from_secs(3),
+    )
+    .await;
 
-    assert!(started.elapsed() < Duration::from_secs(3));
-    assert_eq!(result.output["success"], true);
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert_eq!(
+        result.outcome,
+        ToolExecutionOutcome::ProcessExit {
+            exit_code: Some(0),
+            success: true,
+        }
+    );
     assert_eq!(result.output["truncated"], true);
-    assert!(result.output["stdout"]
-        .as_str()
-        .is_some_and(|stdout| stdout.contains("parent-done")));
+    assert!(
+        stdout.contains("parent-done"),
+        "terminal output did not include the parent marker; stdout={stdout:?}"
+    );
 
     let mut escaped_pid = None;
     for _ in 0..50 {

@@ -345,6 +345,8 @@ code_run tool_use
 
 原 `code_run` 在返回 `process_id` 时仍产生自己的 `ToolCallCompleted`，其 outcome 为运行中。后台进程最终完成是独立生命周期事件。
 
+main-owned completion 同时保留创建进程的原始 `turn_id + tool_use_id`，但仍不得伪造第二个工具结果。该终态作为 durable obligation 保留到写入对应 turn journal 并确认，不能按 TUI fanout 容量淘汰；新 turn 在冻结 recovery context 前也必须先完成这一步，因此正常 `ProcessRunning` 与强制中断后继续运行的进程都能在 recovery 中携带后续终态。TUI 每秒独立抽取 watcher 事件，并用组合键把原 `code_run` cell 的 `Process running in background` 展示投影替换为 exit code 或 signal 终态：活动 turn 的虚线框走普通重绘，已提交到终端 scrollback 的历史 cell 走完整历史 reflow；`/exit` 收束 live process 时也必须在退出前发送相同事件并完成 reflow。completion 不在 transcript 末尾追加独立的 `Background process ID=...` 通知行；找不到原 tool cell 时保持静默。subagent-owned completion 不改写 main transcript 中不存在的 child tool cell，也不向 main transcript 插入通知行。finalize recap 额外接收有界的 main completion 投影，避免 canonical transcript 中旧的 running tool result 掩盖实际 exit / signal；该投影同时进入 finalize checkpoint hash 与 trace 证据。
+
 事件至少服务于：
 
 - TUI 状态更新；
@@ -491,6 +493,9 @@ subagent 到达 completed / failed / abandoned、执行 future 被取消，或 p
 - 模型仅看到 `Recently completed` 元数据不算已经读取最终结果，也不能触发 entry 移除。
 - `Recently completed` 的容量和寿命直接复用现有 entry 规则：最终结果成功交付 provider 后移除；尚未确认交付的 entry 受每 owner `64` 个总 entry 上限、最近使用 `8` 个 entry 保护、LRU 淘汰和owner shutdown 约束。因此它有明确容量上限但没有独立时间范围或额外无界历史。
 - `BackgroundProcessCompleted` 产生的最小 completion notification 至少保留到它被包含在一次成功完成的 provider request 中；provider 失败或 turn 在响应前中断时不能视为已投递。若完整 entry在首次成功投递前已因容量压力被淘汰，notification 仍提供 ID、终态、exit code / signal、完成时间和 `final_output_available=false`，但不虚构已丢失的最终输出。
+- main-owned completion 必须先在 turn journal 获得稳定 seq，之后才允许进入 Provider ModelContext；heartbeat 与 request preflight 通过同一线性化边界查重并确认 durable obligation。两个独立 journal seq 游标分别记录“已被一次成功 provider response 接受”和“已被 recap/finalize 消费”。runtime 重启后，尚未越过 provider 游标的新终态会作为新的 ModelContext suffix 投递，不改写既有冻结 Provider 前缀；recap 只消费尚未越过 recap 游标的终态。completion 是已实际启动进程的独立终态，不依赖 originating turn 最终是否 committed；投影只携带有界终态字段，不带回 failed/cancelled turn 的用户输入。旧 session 首次升级时把缺失游标初始化到既有 completion 尾端，不回放升级前历史。
+- TUI 退出时，只要 message cursor 或 completion recap cursor 任一尚未追上，都把 finalize 交给 supervisor；不能因 canonical message 已全部 recap 而在前台执行 completion-only recap。
+- finalize checkpoint 只属于当前 Finalizing 生命周期；Closed session 恢复为 Open 时清理上一代 checkpoint。同一消息区间出现新的 completion 时，已 Applied 的旧 checkpoint 可由新代次替换，Prepared checkpoint 不得覆盖。升级旧 Finalizing session 时，只恢复与当前输入一致的冻结结果；不一致的旧 checkpoint 会被丢弃，旧 completion 推进到现有尾端后继续处理新消息。
 - compaction summary 仍负责保留“为什么启动该任务、预期如何使用结果”的会话意图；动态上下文负责提供当前 ID 和状态。两者职责不能互相替代。
 - 最终结果成功交付 provider 后，该终态 entry 无论之后是否发生 compact，都不再重新出现在runtime context。此后它属于历史会话信息：compaction prompt 必须保留仍会影响后续工作的任务目的、最终成功/失败状态、关键输出、生成或修改的文件以及剩余动作；已经失效的 `process_id`除非仍有审计价值，否则不要求继续保留。
 
@@ -657,6 +662,8 @@ write_stdin_max_poll_timeout_ms = 300000
 59. MCP disable / reconnect 只按共享 MCP generation 语义收束旧连接及其 in-flight request，不会终止任何 `code_run` 进程；后台进程 terminate 也不会改变 MCP server generation 或 ready 状态。
 60. turn 运行期间通过 `/mcp` 主动 Reconnect / Disable 时，该 server 上 main 与 subagent 的全部in-flight MCP 调用都以 `dispatch_failure` 收束且不自动重试；当前 turn 不取消并继续推进，其他 MCP server、后台进程和 agent runtime 继续运行，生命周期切换后的新 generation 不受旧调用迟到结果污染。
 61. active turn 尚未达到自动 compact 触发阈值时，即使其原始工具轨迹大于 compact 后 raw-tail hard limit，也不会因存在后台 runtime projection 而提前失败；实际 compact 时为 runtime projection 预留 soft/hard tail 预算，合并后的投影不越界。
+62. main-owned `code_run` 返回 `ProcessRunning` 后，无论进程自然退出、被 `/ps` 终止或从外部收到信号，TUI heartbeat 都把原 cell 更新为对应 exit / signal 终态；活动虚线框与已提交历史都不残留 `Process running in background`。subagent 进程不改写 main transcript 的 tool cell。
+63. session finalize 会在 recap 前收束并持久化全部 main-owned 后台终态；`/exit` 的最后一帧先更新原 tool cell，再退出 TUI。recap 与 trace 使用至多 64 条最新 completion 事实，并显式记录更早事实的省略数量。
 
 ---
 

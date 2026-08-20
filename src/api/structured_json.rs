@@ -10,9 +10,12 @@ use anyhow::Context;
 use serde_json::Value;
 
 use crate::api::{
-    ProviderAdapter, ProviderEvent, ProviderRequest, ProviderResponse, ProviderStop,
+    send_buffered_with_fallback, BufferedProviderRuntime, ProviderAdapter, ProviderEvent,
+    ProviderRequest, ProviderResponse, ProviderStop, ProviderStreamOutputMode,
     SessionTurnContentBlock, SessionTurnMessage,
 };
+
+use super::provider::{ProviderNoConsumableOutput, ProviderTransport};
 
 const STRUCTURED_JSON_RETRY_RAW_MAX_CHARS: usize = 4000;
 
@@ -25,10 +28,54 @@ pub struct StructuredJsonCaller {
     retry_max_delay: Duration,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("结构化 JSON provider 调用失败: {0}")]
+pub(crate) struct StructuredJsonProviderFailure(String);
+
+#[derive(Debug, thiserror::Error)]
+#[error("结构化 JSON 调用收到不可重试终态: {0}")]
+pub(crate) struct StructuredJsonTerminalFailure(String);
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct StructuredJsonNoConsumableOutput {
+    message: String,
+    transport: ProviderTransport,
+}
+
+impl StructuredJsonNoConsumableOutput {
+    pub(crate) fn new(message: String, transport: ProviderTransport) -> Self {
+        Self { message, transport }
+    }
+}
+
+pub(crate) fn structured_json_no_consumable_transport(
+    error: &anyhow::Error,
+) -> Option<ProviderTransport> {
+    error
+        .downcast_ref::<StructuredJsonNoConsumableOutput>()
+        .map(|error| error.transport)
+        .or_else(|| {
+            error
+                .downcast_ref::<ProviderNoConsumableOutput>()
+                .map(ProviderNoConsumableOutput::transport)
+        })
+}
+
+pub(crate) fn structured_json_business_retryable(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<StructuredJsonProviderFailure>()
+        .is_none()
+        && error
+            .downcast_ref::<StructuredJsonTerminalFailure>()
+            .is_none()
+}
+
 pub(crate) struct StructuredJsonAttemptRequest {
     system_prompt: String,
     messages: Vec<SessionTurnMessage>,
     provider_retry_count_override: Option<u32>,
+    buffered_runtime: Option<BufferedProviderRuntime>,
     enforce_request_timeout: bool,
 }
 
@@ -38,15 +85,46 @@ impl StructuredJsonAttemptRequest {
             system_prompt,
             messages,
             provider_retry_count_override: None,
+            buffered_runtime: None,
             enforce_request_timeout: false,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn compaction(system_prompt: String, messages: Vec<SessionTurnMessage>) -> Self {
         Self {
             system_prompt,
             messages,
             provider_retry_count_override: Some(0),
+            buffered_runtime: None,
+            enforce_request_timeout: false,
+        }
+    }
+
+    pub(crate) fn compaction_streaming(
+        system_prompt: String,
+        messages: Vec<SessionTurnMessage>,
+        runtime: BufferedProviderRuntime,
+    ) -> Self {
+        Self {
+            system_prompt,
+            messages,
+            provider_retry_count_override: None,
+            buffered_runtime: Some(runtime),
+            enforce_request_timeout: false,
+        }
+    }
+
+    fn streaming(
+        system_prompt: String,
+        messages: Vec<SessionTurnMessage>,
+        runtime: BufferedProviderRuntime,
+    ) -> Self {
+        Self {
+            system_prompt,
+            messages,
+            provider_retry_count_override: None,
+            buffered_runtime: Some(runtime),
             enforce_request_timeout: false,
         }
     }
@@ -59,6 +137,7 @@ impl StructuredJsonAttemptRequest {
             system_prompt,
             messages,
             provider_retry_count_override: Some(0),
+            buffered_runtime: None,
             enforce_request_timeout: true,
         }
     }
@@ -124,6 +203,70 @@ impl StructuredJsonCaller {
             .await
     }
 
+    pub(crate) async fn generate_json_streaming_once(
+        &self,
+        system_prompt: String,
+        messages: Vec<SessionTurnMessage>,
+        runtime: BufferedProviderRuntime,
+        preferred_transport: Option<ProviderTransport>,
+    ) -> anyhow::Result<Value> {
+        match self
+            .generate_json_once_observed(
+                system_prompt,
+                messages,
+                None,
+                Some(&runtime),
+                preferred_transport,
+                false,
+            )
+            .await
+        {
+            Ok(parsed) => Ok(parsed.value),
+            Err(failure) => match failure.error {
+                JsonCallError::Provider(error) => {
+                    if let Some(no_output) = provider_no_consumable_output(&error) {
+                        if no_output.transport().is_streaming() {
+                            self.provider.discard_runtime_chain(runtime.chain_id).await;
+                        }
+                        Err(StructuredJsonNoConsumableOutput::new(
+                            format!("{error:#}"),
+                            no_output.transport(),
+                        )
+                        .into())
+                    } else {
+                        Err(StructuredJsonProviderFailure(format!("{error:#}")).into())
+                    }
+                }
+                JsonCallError::Terminal(error) => {
+                    Err(StructuredJsonTerminalFailure(format!("{error:#}")).into())
+                }
+                JsonCallError::Parse(error) | JsonCallError::RetryableShape(error) => Err(error),
+            },
+        }
+    }
+
+    pub(crate) async fn generate_json_streaming_validated_with_retry_notice<T, V, F>(
+        &self,
+        system_prompt: String,
+        messages: Vec<SessionTurnMessage>,
+        runtime: BufferedProviderRuntime,
+        validate: V,
+        on_retry: F,
+    ) -> anyhow::Result<T>
+    where
+        V: FnMut(Value) -> anyhow::Result<T>,
+        F: FnMut(u32, u32, &anyhow::Error),
+    {
+        self.generate_json_validated_with_guarded_attempts(
+            StructuredJsonAttemptRequest::streaming(system_prompt, messages, runtime),
+            validate,
+            on_retry,
+            |_| std::future::ready(()),
+            |_, _| Ok(()),
+        )
+        .await
+    }
+
     /// 请求模型生成 JSON，并在每次 retry 前通知调用方。
     pub async fn generate_json_with_retry_notice<F>(
         &self,
@@ -143,6 +286,18 @@ impl StructuredJsonCaller {
                 .await
             {
                 Ok(value) => return Ok(value),
+                Err(JsonCallError::Provider(error))
+                    if provider_no_consumable_output(&error).is_some()
+                        && attempt < self.retry_count =>
+                {
+                    log_no_consumable_retry(&error, attempt + 1, self.retry_count);
+                    on_retry(attempt + 1, self.retry_count, &error);
+                    let delay = self.retry_delay(attempt);
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    attempt += 1;
+                }
                 Err(JsonCallError::Provider(error) | JsonCallError::Terminal(error)) => {
                     return Err(error);
                 }
@@ -234,11 +389,13 @@ impl StructuredJsonCaller {
             system_prompt,
             messages,
             provider_retry_count_override,
+            buffered_runtime,
             enforce_request_timeout,
         } = request;
         let mut attempt = 0;
         let base_messages = messages;
         let mut attempt_messages = base_messages.clone();
+        let mut preferred_transport = None;
         loop {
             before_attempt(&system_prompt, &attempt_messages)?;
             match self
@@ -246,6 +403,8 @@ impl StructuredJsonCaller {
                     system_prompt.clone(),
                     attempt_messages.clone(),
                     provider_retry_count_override,
+                    buffered_runtime.as_ref(),
+                    preferred_transport,
                     enforce_request_timeout,
                 )
                 .await
@@ -293,11 +452,27 @@ impl StructuredJsonCaller {
                     }
                 },
                 Err(failure) => {
+                    let no_consumable_transport = match &failure.error {
+                        JsonCallError::Provider(error) => {
+                            provider_no_consumable_output(error).map(|error| error.transport())
+                        }
+                        JsonCallError::Terminal(_)
+                        | JsonCallError::RetryableShape(_)
+                        | JsonCallError::Parse(_) => None,
+                    };
+                    if no_consumable_transport.is_some_and(ProviderTransport::is_streaming) {
+                        if let Some(runtime) = &buffered_runtime {
+                            self.provider.discard_runtime_chain(runtime.chain_id).await;
+                        }
+                    }
+                    let retryable_no_consumable = no_consumable_transport.is_some();
                     let retryable = matches!(
                         failure.error,
                         JsonCallError::Parse(_) | JsonCallError::RetryableShape(_)
-                    ) || (provider_retry_count_override.is_some()
-                        && matches!(failure.error, JsonCallError::Provider(_)));
+                    ) || retryable_no_consumable
+                        || (provider_retry_count_override.is_some()
+                            && buffered_runtime.is_none()
+                            && matches!(failure.error, JsonCallError::Provider(_)));
                     let will_retry = retryable && attempt < self.retry_count;
                     let raw_text = failure.raw_text.clone();
                     let parsed_json = failure.parsed_json.clone();
@@ -313,9 +488,13 @@ impl StructuredJsonCaller {
                     .await;
                     match failure.error {
                         JsonCallError::Provider(error) if will_retry => {
+                            if let Some(transport) = no_consumable_transport {
+                                preferred_transport = Some(transport);
+                                log_no_consumable_retry(&error, attempt + 1, self.retry_count);
+                            }
                             on_retry(attempt + 1, self.retry_count, &error);
-                            // Transport/provider 失败没有模型输出，重试同一份最终请求；
-                            // parse/shape 失败才追加纠错消息。
+                            // Provider 失败或完整但不可消费的输出都没有可纠正文本，
+                            // 重试同一份最终请求；parse/shape 失败才追加纠错消息。
                             let delay = self.retry_delay(attempt);
                             if !delay.is_zero() {
                                 tokio::time::sleep(delay).await;
@@ -360,6 +539,10 @@ impl StructuredJsonCaller {
             tools: Vec::new(),
             max_tokens: self.max_tokens,
             stream: false,
+            stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+            runtime_chain_id: None,
+            runtime_fallback_scope: None,
+            recovery_interrupt: None,
             retry_count_override: None,
         };
 
@@ -380,35 +563,59 @@ impl StructuredJsonCaller {
         system_prompt: String,
         messages: Vec<SessionTurnMessage>,
         retry_count_override: Option<u32>,
+        buffered_runtime: Option<&BufferedProviderRuntime>,
+        preferred_transport: Option<ProviderTransport>,
         enforce_request_timeout: bool,
     ) -> Result<JsonCallParsed, JsonCallFailure> {
+        let stream = buffered_runtime.is_some()
+            && preferred_transport.is_none_or(ProviderTransport::is_streaming);
+        let runtime_fallback_scope = buffered_runtime.filter(|_| stream).map(|runtime| {
+            preferred_transport.map_or_else(
+                || runtime.fallback_scope.clone(),
+                |transport| transport.retry_fallback_scope(&runtime.fallback_scope),
+            )
+        });
         let request = ProviderRequest {
             system_prompt,
             messages,
             tools: Vec::new(),
             max_tokens: self.max_tokens,
-            stream: false,
+            stream,
+            stream_output_mode: buffered_runtime
+                .map(|_| ProviderStreamOutputMode::Buffered)
+                .unwrap_or(ProviderStreamOutputMode::Live),
+            runtime_chain_id: buffered_runtime
+                .filter(|_| stream)
+                .map(|runtime| runtime.chain_id),
+            runtime_fallback_scope,
+            recovery_interrupt: None,
             retry_count_override,
         };
 
-        let mut emit = |_event: ProviderEvent| {};
-        let response = if enforce_request_timeout {
+        let response = if buffered_runtime.is_some() && stream {
+            send_buffered_with_fallback(&self.provider, request)
+                .await
+                .map_err(|error| JsonCallFailure::new(JsonCallError::Provider(error), None, None))?
+        } else if enforce_request_timeout {
+            let mut emit = |_event: ProviderEvent| {};
             match self.provider.request_timeout() {
                 Some(timeout) => {
-                    tokio::time::timeout(timeout, self.provider.send(request, &mut emit))
+                    match tokio::time::timeout(timeout, self.provider.send(request, &mut emit))
                         .await
-                        .map_err(|_| {
-                            JsonCallFailure::new(
+                    {
+                        Ok(response) => response.map_err(|error| {
+                            JsonCallFailure::new(JsonCallError::Provider(error), None, None)
+                        })?,
+                        Err(_) => {
+                            return Err(JsonCallFailure::new(
                                 JsonCallError::Provider(anyhow::anyhow!(
                                     "结构化 JSON provider request 超时: {timeout:?}"
                                 )),
                                 None,
                                 None,
-                            )
-                        })?
-                        .map_err(|error| {
-                            JsonCallFailure::new(JsonCallError::Provider(error), None, None)
-                        })?
+                            ));
+                        }
+                    }
                 }
                 None => self
                     .provider
@@ -419,7 +626,7 @@ impl StructuredJsonCaller {
                     })?,
             }
         } else {
-            // 标准调用和 compaction 保留 main 原有 timeout 语义。
+            let mut emit = |_event: ProviderEvent| {};
             self.provider
                 .send(request, &mut emit)
                 .await
@@ -439,6 +646,21 @@ impl StructuredJsonCaller {
             .saturating_mul(multiplier)
             .min(self.retry_max_delay)
     }
+}
+
+fn provider_no_consumable_output(error: &anyhow::Error) -> Option<&ProviderNoConsumableOutput> {
+    error.downcast_ref::<ProviderNoConsumableOutput>()
+}
+
+fn log_no_consumable_retry(error: &anyhow::Error, retry_index: u32, retry_total: u32) {
+    let Some(no_output) = provider_no_consumable_output(error) else {
+        return;
+    };
+    log::warn!(
+        target: "api",
+        "模型响应没有可消费输出，使用相同 transport 原样重试 ({retry_index}/{retry_total}): transport={}; {error:#}",
+        no_output.transport()
+    );
 }
 
 enum JsonCallError {
@@ -570,6 +792,7 @@ fn is_terminal_structured_json_block(block: &SessionTurnContentBlock) -> bool {
         block,
         SessionTurnContentBlock::Image { .. }
             | SessionTurnContentBlock::Document { .. }
+            | SessionTurnContentBlock::ModelContext { .. }
             | SessionTurnContentBlock::SkillInstructions { .. }
             | SessionTurnContentBlock::ToolUse { .. }
             | SessionTurnContentBlock::ToolResult { .. }
@@ -585,6 +808,9 @@ fn structured_text_from_message(message: &SessionTurnMessage) -> anyhow::Result<
     for block in &message.content {
         match block {
             SessionTurnContentBlock::Text { text: part } => text.push_str(part),
+            SessionTurnContentBlock::ModelContext { .. } => {
+                anyhow::bail!("结构化 JSON 响应不能包含 ModelContext block");
+            }
             SessionTurnContentBlock::SkillInstructions { .. } => {
                 anyhow::bail!("结构化文本响应不能包含 SkillInstructions block");
             }
@@ -684,15 +910,23 @@ mod tests {
     use serde_json::json;
     use tokio::sync::Mutex;
 
+    use super::{
+        structured_json_business_retryable, structured_json_no_consumable_transport,
+        StructuredJsonNoConsumableOutput,
+    };
+    use crate::api::provider::{
+        ProviderNoConsumableOutput, ProviderStreamFailure, ProviderTransport,
+    };
     use crate::api::{
-        ProviderAdapter, ProviderEvent, ProviderRequest, ProviderResponse, ProviderStop,
-        SessionTurnContentBlock, SessionTurnMessage, StructuredJsonAttemptRequest,
-        StructuredJsonCaller,
+        BufferedProviderRuntime, ProviderAdapter, ProviderEvent, ProviderRequest, ProviderResponse,
+        ProviderRuntimeFallbackScope, ProviderStop, SessionTurnContentBlock, SessionTurnMessage,
+        StructuredJsonAttemptRequest, StructuredJsonCaller,
     };
 
     struct FakeProvider {
         responses: Mutex<VecDeque<anyhow::Result<ProviderResponse>>>,
         requests: Mutex<Vec<ProviderRequest>>,
+        discarded_chains: Mutex<Vec<crate::api::ProviderRuntimeChainId>>,
     }
 
     struct SlowProvider;
@@ -718,6 +952,7 @@ mod tests {
             Self {
                 responses: Mutex::new(VecDeque::from(responses)),
                 requests: Mutex::new(Vec::new()),
+                discarded_chains: Mutex::new(Vec::new()),
             }
         }
     }
@@ -735,6 +970,10 @@ mod tests {
                 .await
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("fake provider response exhausted"))?
+        }
+
+        async fn discard_runtime_chain(&self, chain_id: crate::api::ProviderRuntimeChainId) {
+            self.discarded_chains.lock().await.push(chain_id);
         }
     }
 
@@ -756,6 +995,7 @@ mod tests {
         Ok(ProviderResponse {
             assistant_message: SessionTurnMessage {
                 role: "assistant".into(),
+                provider_replay: None,
                 content,
             },
             stop,
@@ -766,6 +1006,7 @@ mod tests {
         Ok(ProviderResponse {
             assistant_message: SessionTurnMessage {
                 role: role.into(),
+                provider_replay: None,
                 content: vec![SessionTurnContentBlock::text(text)],
             },
             stop: ProviderStop::Done,
@@ -888,6 +1129,200 @@ mod tests {
 
         assert_eq!(value, json!({"ok": true}));
         assert_eq!(provider.requests.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn generate_json_retries_no_consumable_output_without_correction_context() {
+        let provider = Arc::new(FakeProvider::new(vec![
+            Err(ProviderNoConsumableOutput::new(
+                ProviderTransport::ResponsesNonStreaming,
+                "reasoning only",
+            )
+            .into()),
+            text_response(r#"{"ok":true}"#),
+        ]));
+        let caller = caller(provider.clone());
+
+        let value = caller
+            .generate_json(
+                "system".into(),
+                vec![SessionTurnMessage::user_text("payload")],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(value, json!({"ok": true}));
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].messages, requests[1].messages);
+    }
+
+    #[tokio::test]
+    async fn streaming_no_consumable_round_uses_business_retry_with_fresh_chain() {
+        let provider = Arc::new(FakeProvider::new(vec![
+            Err(ProviderNoConsumableOutput::new(
+                ProviderTransport::ResponsesSse,
+                "stream reasoning only",
+            )
+            .into()),
+            text_response(r#"{"ok":true}"#),
+        ]));
+        let caller = caller(provider.clone());
+        let mut retries = Vec::new();
+        let fallback_scope = ProviderRuntimeFallbackScope::new_root();
+
+        let value = caller
+            .generate_json_streaming_validated_with_retry_notice(
+                "system".into(),
+                vec![SessionTurnMessage::user_text("payload")],
+                BufferedProviderRuntime::new(fallback_scope.clone()),
+                Ok,
+                |retry, total, error| retries.push((retry, total, error.to_string())),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(value, json!({"ok": true}));
+        assert_eq!(retries.len(), 1);
+        assert_eq!(retries[0].0, 1);
+        assert_eq!(retries[0].1, 1);
+        assert!(retries[0].2.contains("reasoning only"));
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].stream);
+        assert!(requests[1].stream);
+        assert!(!requests[0]
+            .runtime_fallback_scope
+            .as_ref()
+            .unwrap()
+            .websocket_sticky());
+        assert!(requests[1]
+            .runtime_fallback_scope
+            .as_ref()
+            .unwrap()
+            .websocket_sticky());
+        assert!(!fallback_scope.websocket_sticky());
+        assert_eq!(requests[0].messages, requests[1].messages);
+        assert_eq!(provider.discarded_chains.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn no_consumable_non_streaming_fallback_retries_non_streaming() {
+        let provider = Arc::new(FakeProvider::new(vec![
+            Err(ProviderStreamFailure::new("broken stream").into()),
+            Err(ProviderNoConsumableOutput::new(
+                ProviderTransport::ResponsesNonStreaming,
+                "non-stream reasoning only",
+            )
+            .into()),
+            text_response(r#"{"ok":true}"#),
+        ]));
+        let caller = caller(provider.clone());
+
+        let value = caller
+            .generate_json_streaming_validated_with_retry_notice(
+                "system".into(),
+                vec![SessionTurnMessage::user_text("payload")],
+                BufferedProviderRuntime::new(ProviderRuntimeFallbackScope::new_root()),
+                Ok,
+                |_, _, _| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(value, json!({"ok": true}));
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].stream);
+        assert!(!requests[1].stream);
+        assert!(!requests[2].stream);
+        assert_eq!(requests[0].messages, requests[1].messages);
+        assert_eq!(requests[0].messages, requests[2].messages);
+        assert_eq!(provider.discarded_chains.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_once_exposes_no_consumable_output_as_business_retryable() {
+        let provider = Arc::new(FakeProvider::new(vec![Err(
+            ProviderNoConsumableOutput::new(
+                ProviderTransport::ResponsesSse,
+                "stream reasoning only",
+            )
+            .into(),
+        )]));
+        let caller = caller(provider.clone());
+
+        let error = caller
+            .generate_json_streaming_once(
+                "system".into(),
+                vec![SessionTurnMessage::user_text("payload")],
+                BufferedProviderRuntime::new(ProviderRuntimeFallbackScope::new_root()),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(structured_json_business_retryable(&error));
+        assert_eq!(error.to_string(), "stream reasoning only");
+        assert_eq!(provider.requests.lock().await.len(), 1);
+        assert_eq!(provider.discarded_chains.lock().await.len(), 1);
+    }
+
+    #[test]
+    fn no_consumable_transport_is_visible_before_and_after_structured_json_wrapping() {
+        let provider_error: anyhow::Error =
+            ProviderNoConsumableOutput::new(ProviderTransport::ResponsesSse, "reasoning only")
+                .into();
+        let wrapped_error: anyhow::Error = StructuredJsonNoConsumableOutput::new(
+            "reasoning only".into(),
+            ProviderTransport::ResponsesNonStreaming,
+        )
+        .into();
+
+        assert_eq!(
+            structured_json_no_consumable_transport(&provider_error),
+            Some(ProviderTransport::ResponsesSse)
+        );
+        assert_eq!(
+            structured_json_no_consumable_transport(&wrapped_error),
+            Some(ProviderTransport::ResponsesNonStreaming)
+        );
+    }
+
+    #[tokio::test]
+    async fn no_consumable_retry_exhaustion_returns_protocol_neutral_error() {
+        let provider = Arc::new(FakeProvider::new(vec![
+            Err(ProviderNoConsumableOutput::new(
+                ProviderTransport::ResponsesSse,
+                "first reasoning only",
+            )
+            .into()),
+            Err(ProviderNoConsumableOutput::new(
+                ProviderTransport::ResponsesSse,
+                "second reasoning only",
+            )
+            .into()),
+        ]));
+        let caller = caller(provider.clone());
+
+        let error = caller
+            .generate_json_streaming_validated_with_retry_notice(
+                "system".into(),
+                vec![SessionTurnMessage::user_text("payload")],
+                BufferedProviderRuntime::new(ProviderRuntimeFallbackScope::new_root()),
+                Ok,
+                |_, _, _| {},
+            )
+            .await
+            .unwrap_err();
+
+        let display = error.to_string();
+        assert_eq!(display, "second reasoning only");
+        assert!(!display.contains("responses_sse"));
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request.stream));
+        assert_eq!(provider.discarded_chains.lock().await.len(), 2);
     }
 
     #[tokio::test]

@@ -16,8 +16,8 @@ ACN 当前已经有 provider-neutral 的工具回环：`ToolRegistry::definition
 
 协议依据：
 
-- 本实现以 MCP 稳定规范 `2025-11-25` 为协议基线。
-- 当前 draft 中的 stateless MCP、`server/discover`、`subscriptions/listen`、MRTR 改造等属于后续兼容方向；当前实现不直接依赖 draft-only 行为。
+- 本实现使用 `rmcp 3.1.2`，建连时优先通过 `server/discover` 协商 `2026-07-28` 协议。
+- 对明确不支持 `server/discover` 的旧 server，自动退回 `initialize`，使用 `2025-11-25` 的旧生命周期；不要求用户在配置中填写版本。
 - 选型 MCP Rust SDK 时优先选择能跟随协议版本演进的实现，避免手写 transport后续迁移成本过高。
 
 ## 目标
@@ -37,11 +37,9 @@ ACN 当前已经有 provider-neutral 的工具回环：`ToolRegistry::definition
 
 - 项目级 `.mcp.json`。
 - 多 scope 合并，例如 user / project / local / enterprise。
-- OAuth login / logout。
-- 浏览器授权回调。
 - MCP elicitation 中途向用户展示 URL / form 并等待确认。
 - SSE / WebSocket transport。
-- MCP Tasks / task-augmented execution。
+- MCP Tasks / task-augmented execution；客户端不宣告 `2026-07-28` Tasks extension，也不承诺识别或自动过滤旧版 task-required 工具。
 - MCP prompts。
 - MCP resources / resource templates 作为模型工具直接暴露。
 - 运行中热重载 MCP 配置；用户修改后重启 TUI 或后续再做 `/mcp reload`。
@@ -55,7 +53,7 @@ ACN 当前已经有 provider-neutral 的工具回环：`ToolRegistry::definition
 4. `acn mcp add-json <name> '<server-json>'` 接受单个 server JSON，复用相同的校验、重复名称检查和原子写入逻辑。
 5. TUI 启动时 MCP server 失败默认 warning，不阻塞 TUI。
 6. 模型可见工具名使用 `mcp__server__tool`。
-7. 不做 OAuth；可用环境变量、bearer token env var 等非交互方式鉴权。
+7. Streamable HTTP server 支持 OAuth login / logout：使用 OAuth discovery、PKCE 和 loopback callback，支持动态 client registration 或预注册 public client ID；token 与 client id 按配置保存到系统 keyring 或 selected upstream runtime 的私有文件。登录合并已有 grant、server challenge 与 resource metadata 的 scope 要求，并在授权、token 交换和 refresh 中携带 `resource`。
 8. `/mcp` 使用 ACN live panel 交互，并提供工具暴露状态诊断。
 9. `/mcp` 是不写 transcript 的 live panel，可在 turn 运行期间打开；session picker 等独占视图仍优先。
 10. TUI tool list 显示 server 发现到的全部工具，并用不同颜色区分`exposed` / `filtered` / `unsupported`。
@@ -64,8 +62,13 @@ ACN 当前已经有 provider-neutral 的工具回环：`ToolRegistry::definition
 13. Reconnect 只做运行时重连和工具刷新，不自动修改配置。
 14. 安装信息可在 TUI 查看，但 env value、bearer token 等敏感值必须隐藏。
 15. Enable / Reconnect 是异步操作；期间不排普通 prompt queue，后续 provider request 只使用发送瞬间 `ready` 的 MCP tool snapshot。
+16. `bearer_token_env_var` 与 OAuth 选项互斥；CLI 和 JSON 配置同时出现时直接拒绝，bearer server 也不能执行 `mcp login`。只有从未配置、从未登记 OAuth 的 HTTP server 可以匿名连接；显式 OAuth 或已登记身份缺少本地凭据时 fail closed，并提示重新登录。显式 `oauth_client_id` 必须与已保存凭据中的 client ID 一致，配置变更后不得继续使用旧 client 的 token。
+17. 每次逻辑 Provider sampling 在入口冻结当时 `ready` 的 MCP 工具定义和路由。该 sampling 内的 transport retry、streaming/non-streaming fallback 与 adapter continuation 复用同一快照；完成工具回环后的下一次 Provider sampling 才重新读取最新 catalog。
+18. 不恢复旧版 `execution.taskSupport=required` 的自定义解析或过滤；新版协议与 SDK 已移除该实验字段，已知 legacy 工具由用户通过 `disabled_tools` 管理。
+19. Provider 工具顺序保持稳定：内置工具是固定前缀，MCP 工具作为后缀按稳定 visible name 排序。server 仅改变 `tools/list` 返回顺序时，不得改变 Provider preamble。
+20. MCP 路由与 connection generation 一起冻结。旧 sampling 返回的 tool call 若遇到 server reconnect/enable/disable 后的 replacement generation，必须 fail closed；不得把同名调用改投新连接，下一次 Provider sampling 再看到新 generation。
 
-项目级配置、OAuth、resources 与运行中 reload 不属于本需求，后续需要时单独拍板。
+项目级配置、resources 与运行中 reload 不属于本需求，后续需要时单独拍板。
 
 ## 用户体验
 
@@ -100,6 +103,7 @@ acn mcp add linear \
 
 - 有 `--url` 时推断为远程 `streamable_http`。
 - `bearer_token_env_var` 只保存环境变量名，不保存真实 token。
+- OAuth server 可改用 `--oauth-client-id <public-id>`、`--oauth-callback-port <port>` 和 `--oauth-credentials-store keyring|file`；未配置 client ID 时登录流程使用动态注册。OAuth 选项不能与 `bearer_token_env_var` 同时配置。
 
 ### 通过单个 JSON 新增 MCP server
 
@@ -125,7 +129,7 @@ acn mcp add-json linear '{
 - 支持 `McpServerConfig` 已有全部字段，包括 `cwd`、超时、工具过滤和 `enabled`。
 - 输入的 `type: "http"` 兼容为 `streamable_http`，落盘统一保存为 `streamable_http`。
 - server 已存在时拒绝覆盖，要求先执行 `remove`。
-- 未实现的 `sse`、`oauth`、`headers` 和其他未知字段均明确拒绝。
+- 未实现的 `sse`、嵌套 `oauth`、`headers` 和其他未知字段均明确拒绝；OAuth 非敏感选项使用顶层 `oauth_client_id`、`oauth_callback_port` 与 `oauth_credentials_store`。
 - 不要在 JSON 中直接写入 token；stdio 使用 `env_vars`，远程 HTTP 使用 `bearer_token_env_var`。
 
 ### 查看配置
@@ -153,13 +157,29 @@ acn mcp status pal
 
 `acn mcp status <name>` 只连接并检查指定 server；`acn mcp status` 不带 name时才连接所有 enabled server。
 
+### OAuth 登录与退出
+
+```bash
+acn mcp login linear
+acn mcp login linear --no-browser
+acn mcp logout linear
+```
+
+`login` 只适用于支持 OAuth discovery，且支持动态 client registration 或配置了预注册 `oauth_client_id` 的 Streamable HTTP server。MCP resource 与 OAuth metadata 中的授权端点必须使用 HTTPS，仅本机 loopback 开发端点可使用 HTTP；authorization server metadata 必须明确声明支持 PKCE `S256`，缺失该字段也拒绝登录。命令使用 PKCE 和 loopback redirect；桌面环境自动打开浏览器并监听 callback，`--no-browser` 则打印授权 URL，并要求用户从浏览器地址栏复制完整 redirect URL 粘贴回终端。scope 会合并已有 grant、server challenge 与 resource metadata 的要求；仅在这些来源均为空时使用 authorization server metadata。授权、token 交换和 refresh 均绑定当前 MCP resource。未登录的 OAuth server 在连接失败时会提示对应的 `login` 命令。
+
+OAuth 凭据按 selected upstream、server name 与 URL 隔离。默认写入系统 keyring；`oauth_credentials_store = "file"` 时写入 selected upstream runtime 的 `.mcp-oauth/` 私有目录，供没有 Secret Service / D-Bus 的 headless Linux 使用。成功保存凭据后另写入不含 secret 的私有登记标记，只有已登记或显式配置 OAuth 的 server 才在运行时访问凭据库；普通匿名 HTTP server 不依赖 keyring。`logout` 只删除本地凭据和登记标记，不请求远端 token revocation。当前不支持 client secret、CIMD 与 device flow。
+
+已登记或显式配置 OAuth 的 server 在运行时找不到凭据记录、凭据库不可用、refresh 要求重新授权、authorization server issuer 变化、已加载身份被删除，或已保存 client ID 与显式 `oauth_client_id` 不一致时必须 fail closed，并保留登记状态以提示重新登录；不得把 OAuth-managed 请求降级为匿名请求。只有既无显式 OAuth 配置、也从未登记 OAuth 的普通 HTTP server 才按匿名连接。
+
+登录失败要区分 discovery / DCR、PKCE、callback state、RFC 9207 issuer 和 token endpoint 阶段；CLI 输出可行动的分类原因，但不直接透传可能包含 URL、响应 body 或凭据的底层错误文本。
+
 ### 删除 server
 
 ```bash
 acn mcp remove pal
 ```
 
-删除只修改 selected upstream runtime 下的 `.mcp.json`。
+删除 Streamable HTTP server 时先锁定该 server 的凭据变更；只有存在 OAuth 登记标记或显式 OAuth 配置时，才写入不含 token 的私有待清理记录。随后删除 selected upstream runtime 下的 server 配置，最后尽力删除本地 OAuth 凭据和登记标记。普通匿名 HTTP server 不访问 keyring，也不产生待清理记录。凭据库不可用时命令返回成功并显示 warning，明确说明配置已删除、凭据清理失败；不能因为 keyring / D-Bus 故障阻止配置删除。待清理记录会保留凭据 backend 与不可逆 account hash，因此配置不存在时仍可执行同名 `acn mcp logout <name>` 重试；清理完成前不允许重新添加同名 server。
 
 ### 启用 / 禁用 server
 
@@ -231,13 +251,17 @@ streamable_http：
 
 - `url`：必填。
 - `bearer_token_env_var`：可选；存在时读取对应环境变量并作为 bearer token。
+- OAuth 顶层选项：可选；与 `bearer_token_env_var` 互斥。
 
 实现细节：
 
 - HTTP 请求带 `Accept: application/json, text/event-stream`。
-- `initialize` 后按协商结果携带 `MCP-Protocol-Version`。
+- 每个 HTTP 请求按当前协商结果携带 `MCP-Protocol-Version`。
 - 如果 server 返回 `MCP-Session-Id`，后续请求继续携带该 header。
 - 支持 server 对 SSE stream 做 polling / reconnect，但不把断线误判为用户取消。
+- 同一次逻辑 Provider sampling 内固定工具定义、排序与 MCP generation；只有下一次 sampling 才刷新 catalog。
+- 内置工具保持固定前缀，MCP 工具按稳定 visible name 排序后追加。仅 `tools/list` 返回顺序变化不会改写请求 preamble。
+- 若 sampling 后 MCP server 已切换 generation，该响应中的旧 tool call 返回可行动错误，不会执行到 replacement connection。
 
 不支持把真实 bearer token 明文写进 `.mcp.json`。
 
@@ -247,19 +271,21 @@ streamable_http：
 
 - stdio server 通过 `env` / `env_vars` 获取 API key。
 - Streamable HTTP server 通过 `bearer_token_env_var` 获取 bearer token。
+- 支持 OAuth discovery、动态 client registration 或预注册 public client ID、严格要求 metadata 声明 PKCE `S256`、桌面 loopback callback 与 headless redirect URL 粘贴；OAuth 端点使用 HTTPS，仅本机 loopback 可使用 HTTP。
+- OAuth token / client id 可持久化到系统 keyring，或 selected upstream runtime 下权限受限的文件；凭据按 upstream、server name 与 URL 隔离。
+- OAuth scope 合并已有 grant、`WWW-Authenticate` 的 `scope` 与 resource metadata 的 `scopes_supported`；仅当前述来源均为空时，使用授权服务器 metadata 的 `scopes_supported`。授权服务器声明支持且请求 scope 非空时追加 `offline_access`。
+- OAuth discovery 优先使用 protected resource metadata 声明的 `resource`；没有声明时才使用 MCP server URL。authorization code exchange 与 refresh token 请求始终使用同一个值，保证 token audience 绑定。
 
 当前不支持：
 
-- OAuth discovery / login / refresh / logout。
-- MCP server 主动发起的浏览器授权。
 - MCP elicitation 的 URL / form 用户确认。
 
-遇到需要 OAuth 或 elicitation 的 server/tool 时，应返回明确错误：
+OAuth server 缺少本地登录凭据、或 tool 需要 elicitation 时，应返回明确且可行动的错误：
 
 ```json
 {
   "ok": false,
-  "error": "MCP server requires OAuth or interactive elicitation, which is not supported yet"
+  "error": "MCP server requires interactive elicitation, which is not supported"
 }
 ```
 
@@ -287,8 +313,9 @@ MCP 普通 `tools/call` 的最终结果按 JSON-RPC request / response 模型返
   - 不因单项 timeout 关闭 ready client/session；同连接的其他 in-flight 请求和后续请求继续由各自request 收束。
   - 只有 transport/connection 错误、disable/reconnect 或 ACN shutdown 才摘除并清理共享 client。
 - 超时错误要作为 tool_result 回灌给模型，不能 panic 或卡住 turn loop。
-- 如果工具声明 `execution.taskSupport = "required"`，不暴露给模型，并在TUI tool list 中标记 `unsupported: task_required`。
-- 如果工具声明 `execution.taskSupport = "optional"` 或未声明，则按普通`tools/call` 调用。
+- 当前不实现 MCP Tasks，也不宣告 `2026-07-28` Tasks extension。普通工具仍按 `tools/call` 调用。
+- 直接使用 crates.io `rmcp 3.1.2`，不 vendoring SDK 源码。该版本不暴露旧版 `execution.taskSupport` 字段，ACN 不增加旁路协议解析或自动过滤。
+- `taskSupport = "required"` 的 legacy 工具可能仍被分类为 `exposed`，随后因 ACN 发送普通 `tools/call` 而被 server 拒绝；这不影响同一 `2025-11-25` server 上的普通工具。已知的 legacy Tasks 工具由用户通过 `disabled_tools` 手动关闭。
 
 后续如果需要支持长任务，可单独设计 task-augmented execution 或 idle timeout；当前不做。
 
@@ -358,6 +385,7 @@ src/mcp/
   mod.rs
   config.rs              # .mcp.json DTO、读取、原子写、校验
   name.rs                # mcp__server__tool 归一化、解析、冲突处理
+  oauth.rs               # OAuth login/logout、loopback/headless callback、凭据存储
   client.rs              # 单个 MCP client lifecycle
   connection_manager.rs  # 多 server 聚合、tools/list、tools/call、status
   tool.rs                # MCP tool -> ToolDefinition / tool_result 转换
@@ -396,7 +424,7 @@ src/mcp/
 - 对 ready server 调 `tools/list`。
 - 支持 `tools/list` pagination，直到取完或命中安全上限。
 - 按 allowlist / denylist 过滤 raw tool。
-- 过滤 task-required 工具，避免模型调用当前无法完成的工具。
+- 不宣告 Tasks extension，也不为旧版 `execution.taskSupport` 增加独立解析路径或自动过滤承诺。
 - 生成 visible name 映射。
 - 执行 `tools/call`，并通过 progress callback 把进度事件交给 TUI / 日志层。
 - 对 `initialize`、`tools/list`、`tools/call` 分别套 timeout。
@@ -568,7 +596,7 @@ provider request 规则：
 - 状态 chip：
   - `exposed`：绿色；已进入后续 provider request 的 `tools` 字段。
   - `filtered`：黄色；被 `enabled_tools` / `disabled_tools` 配置过滤。
-  - `unsupported`：红色或 warning 色；因 task-required、schema 无法转换等原因当前 ACN 不能暴露。
+  - `unsupported`：红色或 warning 色；因 schema 无法转换等原因当前 ACN 不能暴露。
 
 操作：
 
@@ -582,7 +610,7 @@ provider request 规则：
 - `Tool name`。
 - `Full name`。
 - 暴露状态：`exposed` / `filtered` / `unsupported`，使用与 list 一致的颜色。
-- 未暴露原因，例如 `disabled_tools`、`not_in_enabled_tools`、`task_required`、`invalid_schema`。
+- 未暴露原因，例如 `disabled_tools`、`not_in_enabled_tools`、`invalid_schema`。
 - title。
 - description。
 - input schema。
@@ -616,7 +644,7 @@ MCP tool cell：
 
 - [x] 写入本 PRD。
 - [x] 确认 selected upstream runtime 配置位置：`<base_acn_home>/<upstream>/.mcp.json`。
-- [x] 确认不做项目级配置和 OAuth。
+- [x] 确认不做项目级配置；OAuth 仅覆盖 Streamable HTTP 的 authorization code + PKCE 登录，桌面使用 loopback callback，headless 使用完整 redirect URL 粘贴。
 
 验收：
 
@@ -636,7 +664,7 @@ MCP tool cell：
 - [x] 新增 `acn mcp list`。
 - [x] 新增 `acn mcp get <name> [--json]`。
 - [x] 新增 `acn mcp add <name> -- <command...>`。
-- [x] 新增 `acn mcp add <name> --url <url> [--bearer-token-env-var ENV]`。
+- [x] 新增 `acn mcp add <name> --url <url> [--bearer-token-env-var ENV] [--oauth-client-id ID] [--oauth-callback-port PORT] [--oauth-credentials-store keyring|file]`。
 - [x] 新增 `acn mcp add-json <name> '<server-json>'`，支持单 server DTO 和 `http` 输入别名。
 - [x] 新增 `-e KEY=VALUE` 和 `--env-var KEY`。
 - [x] 新增 `acn mcp remove <name>`。
@@ -673,7 +701,7 @@ MCP tool cell：
 - [x] 实现 `tools/call`。
 - [x] 实现 startup timeout 和 tool timeout。
 - [x] 实现 tool allowlist / denylist。
-- [x] 识别 `execution.taskSupport`，task-required 工具标为 unsupported。
+- [x] 明确不支持 MCP Tasks、不宣告 `2026-07-28` Tasks extension；普通旧协议工具继续兼容，legacy task-required 工具不保证识别或自动过滤。
 - [x] Streamable HTTP 支持 `MCP-Protocol-Version` 和 `MCP-Session-Id`。
 - [x] Streamable HTTP 支持 request-scoped SSE notification。
 - [x] 实现状态快照：
@@ -723,7 +751,6 @@ MCP tool cell：
 - [x] 模型发起 MCP tool_use 后能成功调用 MCP server。
 - [x] raw MCP tool 名和 visible tool 名映射正确。
 - [x] 未 ready server 的工具不会出现在 `tools` 字段。
-- [x] `execution.taskSupport = "required"` 的工具不会出现在 `tools` 字段。
 - [x] MCP tool 失败能作为 tool_result 返回模型，而不是 panic。
 
 ### Phase 4: TUI 状态展示
@@ -736,7 +763,7 @@ MCP tool cell：
 - [x] 实现 MCP server list view。
 - [x] 实现 MCP server detail view，展示只读安装信息并隐藏敏感值。
 - [x] 实现 View tools 的 tool list view，展示全部 discovered tools。
-- [x] 实现 tool detail view，展示名称、描述、参数 schema、output schema、annotations、execution metadata。
+- [x] 实现 tool detail view，展示名称、描述、参数 schema、output schema 与 annotations。
 - [x] 实现 Reconnect action，并刷新当前 session 的 tools snapshot。
 - [x] 实现 Disable action，写入 `enabled: false` 并从当前 session 移除工具。
 - [x] 实现 Enable action，写入 `enabled: true` 并进入 reconnect / pending 流程。
@@ -778,7 +805,7 @@ MCP tool cell：
 - [x] 增加远程 Streamable HTTP 示例。
 - [x] 增加 `pal` 示例。
 - [x] 说明 `-e` 与 `--env-var` 的安全区别。
-- [x] 说明 OAuth / elicitation 暂不支持。
+- [x] 说明 OAuth login/logout 的适用范围，并说明 elicitation 暂不支持。
 - [x] 说明修改 `.mcp.json` 后需要重启 TUI。
 - [x] 说明 `acn mcp enable/disable` 与 TUI Enable/Disable 都是持久配置开关。
 - [x] 说明外部 CLI 修改 `.mcp.json` 不热加载已运行 TUI；需重启或后续实现 reload。
@@ -800,8 +827,8 @@ MCP tool cell：
   - enable / disable 写入 `enabled` 字段且保留 server 配置
   - visible name 归一化和冲突处理
   - MCP tool filter
-  - task-required tool 过滤
   - MCP result 转 tool_result
+  - OAuth discovery scope 与 `resource` 参数
   - progress notification 转 TUI event
   - TUI active-turn panel 优先级与独占视图判定
   - reconnecting server 的交互禁用状态
@@ -878,7 +905,7 @@ MCP tool cell：
   - 不刷屏和截断
 - [x] 测试覆盖和安全边界
   - token 不落明文
-  - 不支持 OAuth/elicitation 时错误清晰
+  - OAuth scope/resource 与 elicitation 错误清晰
   - failed server 不阻塞 TUI
   - mock MCP server 覆盖足够
 
@@ -896,3 +923,25 @@ MCP tool cell：
 - MCP tool schema 来自外部 server，必须做基本结构修正和大小限制，避免超长描述撑爆上下文。
 - MCP tool 名可能与内置工具或其他 MCP server 冲突，必须使用 `mcp__server__tool` 和冲突 hash。
 - 原始设计中的 `.mcp.json` 是全局配置；合入 upstream 隔离后，agent / `acn mcp` 都先激活 selected upstream，因此实际位置为 `<base_acn_home>/<upstream>/.mcp.json`，不同 upstream 不共享。
+
+## 附录：ACN 怎样连接不同版本的 MCP Server
+
+这里有两种版本，含义不同：
+
+- `rmcp 3.1.2` 是 ACN 内部使用的 Rust SDK 版本。
+- `2025-03-26`、`2025-11-25`、`2026-07-28` 是 ACN 与 MCP server 在网络上说的协议版本。
+
+升级 `rmcp` 不会要求所有 MCP server 一起升级。ACN 建连时由 SDK 和 server 协商共同支持的协议版本，不让用户在 `.mcp.json` 中手动填写版本。
+
+```text
+新 server：ACN 请求 2026-07-28，server 也支持 → 使用 2026-07-28
+旧 server：ACN 先发 server/discover，明确收到“不支持”
+          → 再以 2025-11-25 发 initialize
+          → server 选择 2025-03-26 → 后续按 2025-03-26 通信
+```
+
+连接新 server 时，ACN 先请求 `server/discover`；当前新协议使用 `2026-07-28`。连接旧 server 时，对方返回 JSON-RPC `Method not found`，或在尚无 session 时以 HTTP `400` / `404` 和非 JSON-RPC body 拒绝 discovery，ACN 会退回传统的 `initialize` 流程；其他认证、限流、服务端和网络错误不会触发协议降级。旧 server 会在初始化响应中选定实际版本，ACN 随后按该版本发送 `tools/list`、`tools/call` 和 progress 消息；新协议专属字段不会发给旧 server。
+
+如果双方没有共同版本，ACN 应明确报协议不兼容，而不是尝试发送可能被误解的数据。
+
+协议协商和 OAuth 是两件事。前者只决定 MCP 消息格式；后者决定 token 申请给哪个 resource。即使 ACN 回退到旧的 `initialize` 协议，OAuth 仍使用 `rmcp 3.1.2` 的实现：从 protected resource metadata 取到的 `resource` 会同时用于授权、换 token 和 refresh token。因此“旧协议回退”不会把 refresh token 也回退到旧 SDK 的丢值行为。若 server 自己没有提供 resource metadata，SDK 才按规范使用 MCP URL 作为 fallback；这时失败会作为认证错误明确返回，不会静默换一种协议重试。

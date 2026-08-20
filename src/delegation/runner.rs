@@ -18,6 +18,7 @@ use super::types::{
     DelegationCreateRequest, DelegationId, DelegationMetadata, DelegationResult, DelegationStatus,
     DelegationSteering, DelegationSummary, DelegationTranscriptEntry, DelegationUpdate,
 };
+use crate::api::ProviderRuntimeFallbackScope;
 use crate::claim::SessionId;
 use crate::config::{
     DEFAULT_SESSION_DELEGATION_MAX_CONCURRENT,
@@ -68,6 +69,13 @@ impl Default for DelegationRunnerConfig {
 pub struct DelegationExecutionContext {
     pub metadata: DelegationMetadata,
     pub initial_steering: Vec<DelegationSteering>,
+    pub(crate) runtime_fallback_scope: ProviderRuntimeFallbackScope,
+}
+
+impl DelegationExecutionContext {
+    pub(crate) fn runtime_fallback_scope(&self) -> ProviderRuntimeFallbackScope {
+        self.runtime_fallback_scope.clone()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -286,6 +294,7 @@ struct DelegationRunnerInner {
     activity: DelegationActivityHub,
     state: tokio::sync::Mutex<RunnerState>,
     pump_lock: tokio::sync::Mutex<()>,
+    fallback_root: tokio::sync::RwLock<ProviderRuntimeFallbackScope>,
 }
 
 #[derive(Default)]
@@ -319,6 +328,7 @@ impl DelegationRunner {
                 activity: DelegationActivityHub::new(),
                 state: tokio::sync::Mutex::new(RunnerState::default()),
                 pump_lock: tokio::sync::Mutex::new(()),
+                fallback_root: tokio::sync::RwLock::new(ProviderRuntimeFallbackScope::new_root()),
             }),
         })
     }
@@ -333,6 +343,10 @@ impl DelegationRunner {
 
     pub fn subscribe_activity(&self) -> watch::Receiver<u64> {
         self.inner.activity.subscribe()
+    }
+
+    pub(crate) async fn bind_fallback_root(&self, root: ProviderRuntimeFallbackScope) {
+        *self.inner.fallback_root.write().await = root;
     }
 
     pub async fn create(
@@ -507,19 +521,22 @@ impl DelegationRunner {
 
     #[cfg(test)]
     async fn wait_until_idle(&self) {
-        for _ in 0..200usize {
-            let idle = {
-                let state = self.inner.state.lock().await;
-                state.queued.is_empty()
-                    && state.starting == 0
-                    && state.running.values().all(JoinHandle::is_finished)
-            };
-            if idle {
-                return;
+        time::timeout(Duration::from_secs(10), async {
+            loop {
+                let idle = {
+                    let state = self.inner.state.lock().await;
+                    state.queued.is_empty()
+                        && state.starting == 0
+                        && state.running.values().all(JoinHandle::is_finished)
+                };
+                if idle {
+                    return;
+                }
+                time::sleep(Duration::from_millis(10)).await;
             }
-            time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("delegation runner did not become idle");
+        })
+        .await
+        .expect("delegation runner should become idle");
     }
 }
 
@@ -714,6 +731,7 @@ impl DelegationRunnerInner {
         let context = DelegationExecutionContext {
             metadata,
             initial_steering,
+            runtime_fallback_scope: self.fallback_root.read().await.new_child(),
         };
         let (executed, mut task_checkpoint_guard) = match self.executor.begin_task(&context).await {
             Ok(()) => {
@@ -799,6 +817,26 @@ mod tests {
 
     use super::*;
     use crate::claim::{AgentId, SessionId};
+
+    const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    async fn wait_for_status(
+        runner: &DelegationRunner,
+        id: &DelegationId,
+        expected: DelegationStatus,
+    ) -> DelegationMetadata {
+        time::timeout(TEST_EVENT_TIMEOUT, async {
+            loop {
+                let metadata = runner.store().load(id).await.expect("load delegation");
+                if metadata.status == expected || metadata.status.is_terminal() {
+                    return metadata;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("delegation {id} should reach {expected:?}"))
+    }
 
     struct RecordingExecutor {
         active: Arc<AtomicUsize>,
@@ -963,12 +1001,13 @@ mod tests {
                 .await
                 .expect("create delegation");
         }
-        for _ in 0..100usize {
-            if max_active.load(Ordering::SeqCst) == 4 {
-                break;
+        time::timeout(TEST_EVENT_TIMEOUT, async {
+            while max_active.load(Ordering::SeqCst) != 4 {
+                time::sleep(Duration::from_millis(10)).await;
             }
-            time::sleep(Duration::from_millis(10)).await;
-        }
+        })
+        .await
+        .expect("runner should fill all four execution slots");
         assert_eq!(max_active.load(Ordering::SeqCst), 4);
         release.store(1, Ordering::SeqCst);
         runner.wait_until_idle().await;
@@ -1008,8 +1047,20 @@ mod tests {
             .await
             .expect_err("cancelled creation should not register a subagent");
         assert!(matches!(error, DelegationRunnerError::Interrupted));
-        time::sleep(Duration::from_millis(30)).await;
-        let summaries = runner.list().await.expect("list");
+        let summaries = time::timeout(TEST_EVENT_TIMEOUT, async {
+            loop {
+                let summaries = runner.list().await.expect("list");
+                if summaries
+                    .iter()
+                    .all(|summary| summary.status == DelegationStatus::Abandoned)
+                {
+                    return summaries;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("pre-registration cancellation should finish rollback");
         assert!(
             summaries.iter().all(|summary| summary.status == DelegationStatus::Abandoned),
             "pre-registration cancellation may retain an audit record, but it must not leave a queued/running subagent: {summaries:?}"
@@ -1042,7 +1093,6 @@ mod tests {
             .await
             .expect("queue insertion is successful registration");
         cancellation.cancel();
-        time::sleep(Duration::from_millis(30)).await;
         let persisted = runner.store().load(&metadata.id).await.expect("load");
         assert!(
             matches!(
@@ -1252,19 +1302,8 @@ mod tests {
         );
         let first = runner.create(request("turn-a")).await.expect("create");
         let second = runner.create(request("turn-b")).await.expect("create");
-        for _ in 0..50usize {
-            if runner
-                .store()
-                .load(&first.id)
-                .await
-                .expect("load first")
-                .status
-                == DelegationStatus::Running
-            {
-                break;
-            }
-            time::sleep(Duration::from_millis(10)).await;
-        }
+        let running = wait_for_status(&runner, &first.id, DelegationStatus::Running).await;
+        assert_eq!(running.status, DelegationStatus::Running);
         let corrupt_dir = runner.store().delegations_dir().join("subagent_badbadbad");
         tokio::fs::create_dir_all(&corrupt_dir)
             .await
@@ -1347,14 +1386,8 @@ mod tests {
             .await
             .expect("steer queued");
 
-        for _ in 0..100usize {
-            if runner.store().load(&first.id).await.expect("load").status
-                == DelegationStatus::Running
-            {
-                break;
-            }
-            time::sleep(Duration::from_millis(5)).await;
-        }
+        let running = wait_for_status(&runner, &first.id, DelegationStatus::Running).await;
+        assert_eq!(running.status, DelegationStatus::Running);
         release.store(1, Ordering::SeqCst);
         runner.wait_until_idle().await;
         let seen = seen.lock().expect("steering lock");

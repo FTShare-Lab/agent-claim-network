@@ -97,6 +97,19 @@ Memory 写入遵循：
 
 这样可以保持 provider prefix 稳定，并使历史 session 可重复恢复。
 
+## 配置开关与 Resume
+
+Memory 有两个启动时开关，默认均为 `true`：
+
+- `[agent.memory].enabled` 控制 Memory prompt、冻结快照、Memory 工具和子代理的只读 Memory 上下文。
+- `[agent.session.memory_review].enabled` 只控制后台 review 调度。
+
+Memory 关闭但 review 开启的 `false/true` 组合在启动时拒绝。
+
+两个开关不热加载。resume 时既有 system prompt 与已完成历史保持原样；当前配置只影响后续请求的工具列表、新子代理、后续 compact/recap/finalize prompt 和后台 review 调度。因此在已有 session 中从开启改为关闭时，冻结 system prompt 仍可能保留旧 Memory 说明，但后续请求不再提供 Memory 工具。
+
+关闭不会删除 `MEMORY.md` 或 `USER.md`。文件继续受路径保护，不能通过附件或普通文件工具访问；重新启用后内容再次可用。
+
 ## Memory 与 Claim
 
 二者职责不同：
@@ -122,7 +135,7 @@ Current Analysis、Resolution、observation 与 inbox effect journal 是执行�
 - 不把 review 自身写入 canonical 用户对话
 - 失败只记录 warning，不让已完成的用户 turn 失败
 
-Fork session 可以使用独立 cadence。Review 默认行为和间隔由 `[agent.session.memory_review]` 配置。
+Fork session 可以使用独立 cadence。Review 是否运行和间隔由 `[agent.session.memory_review]` 配置。
 
 ## Session Search 的关系
 

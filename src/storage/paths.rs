@@ -323,6 +323,10 @@ pub fn agent_home_supervisor_launch_lock_path(agent_home: &Path) -> PathBuf {
     agent_home_supervisor_dir(agent_home).join("launch.lock")
 }
 
+pub fn agent_home_supervisor_transition_lock_path(agent_home: &Path) -> PathBuf {
+    agent_home_supervisor_dir(agent_home).join("transition.lock")
+}
+
 pub fn agent_home_reported_dispute_claim_sets_path(agent_home: &Path) -> PathBuf {
     agent_home_disputes_dir(agent_home).join("reported_claim_sets.yaml")
 }
@@ -487,6 +491,10 @@ mod tests {
         assert_eq!(
             agent_home_supervisor_launch_lock_path(&home),
             PathBuf::from("/tmp/agents/agent-a/runtime/supervisor/launch.lock")
+        );
+        assert_eq!(
+            agent_home_supervisor_transition_lock_path(&home),
+            PathBuf::from("/tmp/agents/agent-a/runtime/supervisor/transition.lock")
         );
         assert_eq!(
             agent_home_memory_path(&home),

@@ -24,6 +24,7 @@ pub struct McpToolRoute {
     pub visible_name: String,
     pub server_name: String,
     pub raw_tool_name: String,
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +51,10 @@ impl McpToolCatalog {
 
     pub fn route(&self, visible_name: &str) -> Option<&McpToolRoute> {
         self.routes.get(visible_name)
+    }
+
+    pub fn routes(&self) -> &BTreeMap<String, McpToolRoute> {
+        &self.routes
     }
 
     pub fn visible_name_for(&self, server_name: &str, raw_tool_name: &str) -> Option<&str> {
@@ -92,16 +97,22 @@ pub fn visible_tool_is_read_only(snapshot: &McpRuntimeState, visible_name: &str)
 
 pub fn tool_catalog(snapshot: &McpRuntimeState) -> McpToolCatalog {
     let mut ready_tools = Vec::<(&str, &McpToolSnapshot)>::new();
-    let mut name_pairs = Vec::<(String, String)>::new();
     for (server_name, server) in &snapshot.servers {
         if server.status != McpServerStatus::Ready {
             continue;
         }
         for tool in &server.tools {
             ready_tools.push((server_name.as_str(), tool));
-            name_pairs.push((server_name.clone(), tool.raw_name.clone()));
         }
     }
+    ready_tools.sort_by(|(left_server, left_tool), (right_server, right_tool)| {
+        (*left_server, left_tool.raw_name.as_str())
+            .cmp(&(*right_server, right_tool.raw_name.as_str()))
+    });
+    let name_pairs = ready_tools
+        .iter()
+        .map(|(server_name, tool)| ((*server_name).to_string(), tool.raw_name.clone()))
+        .collect::<Vec<_>>();
 
     let visible_names = build_visible_tool_names(&name_pairs);
     let mut definitions = Vec::new();
@@ -121,7 +132,10 @@ pub fn tool_catalog(snapshot: &McpRuntimeState) -> McpToolCatalog {
         let description = tool_description(server_name, tool);
         routes.insert(
             visible.visible_name.clone(),
-            route_from_visible_name(&visible),
+            route_from_visible_name(
+                &visible,
+                snapshot.generations.get(server_name).copied().unwrap_or(0),
+            ),
         );
         definitions.push(McpToolDefinitionSnapshot {
             visible_name: visible.visible_name,
@@ -132,6 +146,7 @@ pub fn tool_catalog(snapshot: &McpRuntimeState) -> McpToolCatalog {
             input_schema,
         });
     }
+    definitions.sort_by(|left, right| left.visible_name.cmp(&right.visible_name));
 
     McpToolCatalog {
         definitions,
@@ -149,11 +164,12 @@ pub fn mcp_tool_result_to_value(result: &CallToolResult) -> Value {
     bounded_tool_result_value(value, is_error)
 }
 
-fn route_from_visible_name(visible: &McpVisibleToolName) -> McpToolRoute {
+fn route_from_visible_name(visible: &McpVisibleToolName, generation: u64) -> McpToolRoute {
     McpToolRoute {
         visible_name: visible.visible_name.clone(),
         server_name: visible.server_name.clone(),
         raw_tool_name: visible.raw_tool_name.clone(),
+        generation,
     }
 }
 
@@ -256,7 +272,6 @@ fn redact_value_strings(value: &mut Value) {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
     use std::sync::Arc;
 
     use rmcp::model::{Tool, ToolAnnotations};
@@ -436,14 +451,9 @@ mod tests {
 
     #[test]
     fn mcp_tool_result_is_bounded() {
-        let result = CallToolResult {
-            content: vec![rmcp::model::Content::text(
-                "x".repeat(MAX_MCP_TOOL_RESULT_JSON_CHARS + 100),
-            )],
-            structured_content: None,
-            is_error: Some(false),
-            meta: None,
-        };
+        let result = CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+            "x".repeat(MAX_MCP_TOOL_RESULT_JSON_CHARS + 100),
+        )]);
 
         let value = mcp_tool_result_to_value(&result);
         let raw = serde_json::to_string(&value).unwrap();
@@ -454,16 +464,12 @@ mod tests {
 
     #[test]
     fn mcp_error_tool_result_is_redacted_before_model_visibility() {
-        let result = CallToolResult {
-            content: vec![rmcp::model::Content::text(
-                "Authorization: Bearer secret-token url=https://user:pass@example.test/mcp?token=abc",
-            )],
-            structured_content: Some(json!({
-                "OPENAI_API_KEY=secret-token": "OPENAI_API_KEY=secret-token"
-            })),
-            is_error: Some(true),
-            meta: None,
-        };
+        let mut result = CallToolResult::error(vec![rmcp::model::ContentBlock::text(
+            "Authorization: Bearer secret-token url=https://user:pass@example.test/mcp?token=abc",
+        )]);
+        result.structured_content = Some(json!({
+            "SERVICE_API_KEY=fixture-secret": "SERVICE_API_KEY=fixture-secret"
+        }));
 
         let value = mcp_tool_result_to_value(&result);
         let raw = serde_json::to_string(&value).unwrap();
@@ -473,7 +479,31 @@ mod tests {
         assert!(!raw.contains("secret-token"));
         assert!(!raw.contains("user:pass"));
         assert!(!raw.contains("token=abc"));
-        assert!(!raw.contains("OPENAI_API_KEY=secret"));
+        assert!(!raw.contains("SERVICE_API_KEY=fixture-secret"));
+    }
+
+    #[test]
+    fn catalog_order_is_stable_when_server_reorders_tools() {
+        let tools = vec![
+            tool_snapshot("zeta", json!({"type": "object"}), McpToolExposure::Exposed),
+            tool_snapshot("alpha", json!({"type": "object"}), McpToolExposure::Exposed),
+        ];
+        let mut reversed = tools.clone();
+        reversed.reverse();
+
+        let first = tool_catalog(&runtime_snapshot(tools));
+        let second = tool_catalog(&runtime_snapshot(reversed));
+
+        assert_eq!(first.definitions(), second.definitions());
+        assert_eq!(first.routes(), second.routes());
+        assert_eq!(
+            first
+                .definitions()
+                .iter()
+                .map(|tool| tool.visible_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mcp__pal__alpha", "mcp__pal__zeta"]
+        );
     }
 
     fn runtime_snapshot(tools: Vec<McpToolSnapshot>) -> McpRuntimeState {
@@ -490,6 +520,7 @@ mod tests {
         };
         McpRuntimeState {
             servers: BTreeMap::from([("pal".to_string(), server)]),
+            generations: BTreeMap::from([("pal".to_string(), 7)]),
             startup_error: None,
             workspace_root: None,
         }
@@ -505,17 +536,11 @@ mod tests {
             title: None,
             description: Some("Test tool".to_string()),
             exposure,
-            raw_tool: Tool {
-                name: Cow::Borrowed(name),
-                title: None,
-                description: Some(Cow::Borrowed("Test tool")),
-                input_schema: Arc::new(schema.as_object().cloned().unwrap_or_default()),
-                output_schema: None,
-                annotations: None,
-                execution: None,
-                icons: None,
-                meta: None,
-            },
+            raw_tool: Tool::new(
+                name,
+                "Test tool",
+                Arc::new(schema.as_object().cloned().unwrap_or_default()),
+            ),
         }
     }
 

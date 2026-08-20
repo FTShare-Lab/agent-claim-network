@@ -13,6 +13,7 @@ use crate::agent::{
 };
 use crate::claim::SessionId;
 use crate::mcp::connection_manager::McpRuntimeState;
+use crate::session::TurnJournalEventKind;
 
 use super::input_queue::QueuedInput;
 
@@ -1034,11 +1035,22 @@ fn spawn_finalize_enqueue_worker(
 ) {
     tokio::spawn(async move {
         match async {
+            let event_tx = worker_tx.clone();
+            let mut emit = move |event| {
+                let _ = event_tx.send(WorkerEvent::Session {
+                    task_id: Some(task_id),
+                    event,
+                });
+            };
+            engine
+                .mark_session_finalizing(&mut session, &mut emit)
+                .await?;
+            // 先收束 live/pending process 并持久化终态，再判断是否需要后台 recap；
+            // 否则 completion 尚未进入 journal 时会误走 TUI 前台 finalize。
             let metadata = session.read_metadata().await?;
-            if !finalize_needs_background_job(&metadata) {
+            if !finalize_needs_background_job(&session.paths.turn_events_jsonl, &metadata).await {
                 return anyhow::Ok(None);
             }
-            engine.mark_session_finalizing(&mut session).await?;
             let job_id =
                 crate::supervisor::enqueue_finalize(&supervisor, session.metadata.id.clone())
                     .await?;
@@ -1077,8 +1089,25 @@ fn spawn_finalize_enqueue_worker(
     });
 }
 
-fn finalize_needs_background_job(metadata: &crate::session::SessionMetadata) -> bool {
-    metadata.message_count > metadata.recapped_until
+async fn finalize_needs_background_job(
+    turn_journal_path: &std::path::Path,
+    metadata: &crate::session::SessionMetadata,
+) -> bool {
+    if metadata.message_count > metadata.recapped_until {
+        return true;
+    }
+    let recap_until = metadata.recap_background_completion_until_seq.unwrap_or(0);
+    crate::session::read_session_turn_journal(turn_journal_path)
+        .await
+        .events
+        .iter()
+        .any(|event| {
+            event.seq > recap_until
+                && matches!(
+                    event.kind,
+                    TurnJournalEventKind::BackgroundProcessCompleted { .. }
+                )
+        })
 }
 
 #[cfg(test)]
@@ -1120,6 +1149,7 @@ mod tests {
             content: vec![SessionContentBlock::text("old session")],
             created_at: Utc::now(),
             model: "test-model".into(),
+            provider_replay: None,
         }];
 
         assert_eq!(
@@ -1149,6 +1179,7 @@ mod tests {
                 ],
                 created_at: now,
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 1,
@@ -1156,6 +1187,7 @@ mod tests {
                 content: vec![SessionContentBlock::text("已检查")],
                 created_at: now,
                 model: "test-model".into(),
+                provider_replay: None,
             },
         ];
         let journal_read = TurnJournalRead {
@@ -1223,6 +1255,7 @@ mod tests {
             ],
             created_at: now,
             model: "test-model".into(),
+            provider_replay: None,
         };
         let assistant = |index| SessionMessage {
             index,
@@ -1230,6 +1263,7 @@ mod tests {
             content: vec![SessionContentBlock::text("完成")],
             created_at: now,
             model: "test-model".into(),
+            provider_replay: None,
         };
         let messages = vec![
             user(0, "first"),
@@ -1334,6 +1368,7 @@ mod tests {
                 content: vec![SessionContentBlock::text(stored_text)],
                 created_at: now,
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 1,
@@ -1341,6 +1376,7 @@ mod tests {
                 content: vec![SessionContentBlock::text("已检查目录")],
                 created_at: now,
                 model: "test-model".into(),
+                provider_replay: None,
             },
         ];
         let journal_read = TurnJournalRead {
@@ -1403,6 +1439,7 @@ mod tests {
             content: vec![SessionContentBlock::text(text)],
             created_at: now,
             model: "test-model".into(),
+            provider_replay: None,
         };
         let messages = vec![
             message(0, SessionMessageRole::User, "仅存在于 canonical 的请求"),
@@ -1502,6 +1539,7 @@ mod tests {
                 content: vec![SessionContentBlock::text(request.clone())],
                 created_at: now,
                 model: "test-model".into(),
+                provider_replay: None,
             });
             messages.push(SessionMessage {
                 index: message_index.saturating_add(1),
@@ -1509,6 +1547,7 @@ mod tests {
                 content: vec![SessionContentBlock::text(response.clone())],
                 created_at: now,
                 model: "test-model".into(),
+                provider_replay: None,
             });
 
             let turn_id = format!("turn_{turn_number}");
@@ -1571,6 +1610,7 @@ mod tests {
                 content: vec![SessionContentBlock::text("request")],
                 created_at: now,
                 model: "test-model".into(),
+                provider_replay: None,
             },
             SessionMessage {
                 index: 1,
@@ -1578,6 +1618,7 @@ mod tests {
                 content: vec![SessionContentBlock::text("partial response")],
                 created_at: now,
                 model: "test-model".into(),
+                provider_replay: None,
             },
         ];
         let journal_read = TurnJournalRead {
@@ -1610,6 +1651,7 @@ mod tests {
     #[test]
     fn ambiguous_duplicate_user_text_keeps_journal_diff_separate() {
         let canonical_turn = || crate::session::HistoricalTimelineTurn {
+            turn_id: None,
             user_text: "重试".into(),
             canonical_user_content_hash: None,
             assistant_text: None,
@@ -1644,8 +1686,10 @@ mod tests {
             output_preview: None,
             output_truncated: false,
             file_change: Some(change),
+            background_completion: None,
         };
         let journal = crate::session::HistoricalTimelineTurn {
+            turn_id: Some("turn_1".into()),
             user_text: "重试".into(),
             canonical_user_content_hash: None,
             assistant_text: None,
@@ -1676,6 +1720,7 @@ mod tests {
     #[test]
     fn missing_journal_assistant_is_explicit_recovery_content_without_fabricated_timeline_order() {
         let canonical = crate::session::HistoricalTimelineTurn {
+            turn_id: None,
             user_text: "改文件".into(),
             canonical_user_content_hash: None,
             assistant_text: Some("canonical 最终回复".into()),
@@ -1702,8 +1747,10 @@ mod tests {
             output_preview: None,
             output_truncated: false,
             file_change: None,
+            background_completion: None,
         };
         let journal = crate::session::HistoricalTimelineTurn {
+            turn_id: Some("turn_1".into()),
             user_text: "改文件".into(),
             canonical_user_content_hash: None,
             assistant_text: None,
@@ -1746,6 +1793,7 @@ mod tests {
     #[test]
     fn missing_journal_assistant_without_timeline_renders_canonical_once() {
         let canonical = crate::session::HistoricalTimelineTurn {
+            turn_id: None,
             user_text: "恢复请求".into(),
             canonical_user_content_hash: None,
             assistant_text: Some("canonical 完整回复".into()),
@@ -1758,6 +1806,7 @@ mod tests {
             turn_status_detail: None,
         };
         let journal = crate::session::HistoricalTimelineTurn {
+            turn_id: Some("turn_1".into()),
             user_text: "恢复请求".into(),
             canonical_user_content_hash: None,
             assistant_text: None,
@@ -1792,6 +1841,7 @@ mod tests {
     #[test]
     fn missing_journal_assistant_with_incomplete_tool_keeps_recovery_in_scrollback() {
         let canonical = crate::session::HistoricalTimelineTurn {
+            turn_id: None,
             user_text: "恢复请求".into(),
             canonical_user_content_hash: None,
             assistant_text: Some("canonical 工具后回复".into()),
@@ -1818,8 +1868,10 @@ mod tests {
             output_preview: None,
             output_truncated: false,
             file_change: None,
+            background_completion: None,
         };
         let journal = crate::session::HistoricalTimelineTurn {
+            turn_id: Some("turn_1".into()),
             user_text: "恢复请求".into(),
             canonical_user_content_hash: None,
             assistant_text: None,
@@ -1860,6 +1912,7 @@ mod tests {
         let canonical = ["canonical 回复一", "canonical 回复二"]
             .into_iter()
             .map(|assistant| crate::session::HistoricalTimelineTurn {
+                turn_id: None,
                 user_text: "重试".into(),
                 canonical_user_content_hash: None,
                 assistant_text: Some(assistant.into()),
@@ -1874,6 +1927,7 @@ mod tests {
             .collect::<Vec<_>>();
         let journal = (0..2)
             .map(|_| crate::session::HistoricalTimelineTurn {
+                turn_id: Some("turn_journal".into()),
                 user_text: "重试".into(),
                 canonical_user_content_hash: None,
                 assistant_text: None,
@@ -1909,6 +1963,7 @@ mod tests {
             content: vec![SessionContentBlock::text(text)],
             created_at: now,
             model: "test-model".into(),
+            provider_replay: None,
         };
         let messages = vec![
             message(0, SessionMessageRole::User, "first"),
@@ -2000,8 +2055,9 @@ mod tests {
         assert!(interrupted.tool_calls[0].file_change.is_some());
     }
 
-    #[test]
-    fn finalize_background_job_only_needed_for_unrecapped_messages() {
+    #[tokio::test]
+    async fn finalize_background_job_covers_unrecapped_messages_and_completions() {
+        let temp = tempfile::tempdir().unwrap();
         let mut metadata = crate::session::SessionMetadata {
             id: SessionId::from_str("session_1234abcd").unwrap(),
             agent_id: AgentId::new("agent-a").unwrap(),
@@ -2015,17 +2071,46 @@ mod tests {
             message_count: 2,
             finalized_at: None,
             recapped_until: 2,
+            provider_background_completion_until_seq: Some(0),
+            recap_background_completion_until_seq: Some(0),
             compaction: None,
         };
+        let paths = crate::session::SessionPaths::new(temp.path(), &metadata.id);
+        tokio::fs::create_dir_all(&paths.dir).await.unwrap();
 
-        assert!(!finalize_needs_background_job(&metadata));
+        assert!(!finalize_needs_background_job(&paths.turn_events_jsonl, &metadata).await);
 
         metadata.recapped_until = 1;
-        assert!(finalize_needs_background_job(&metadata));
+        assert!(finalize_needs_background_job(&paths.turn_events_jsonl, &metadata).await);
 
         metadata.message_count = 0;
         metadata.recapped_until = 0;
-        assert!(!finalize_needs_background_job(&metadata));
+        assert!(!finalize_needs_background_job(&paths.turn_events_jsonl, &metadata).await);
+
+        let mut writer = crate::session::TurnJournalWriter::open(paths.turn_events_jsonl.clone())
+            .await
+            .unwrap();
+        let completion = writer
+            .append(
+                "turn-background",
+                Utc::now(),
+                TurnJournalEventKind::BackgroundProcessCompleted {
+                    tool_use_id: "tool-background".into(),
+                    process_id: "process-background".into(),
+                    instance_id: 7,
+                    status: "finished".into(),
+                    exit_code: Some(0),
+                    signal: None,
+                    success: true,
+                },
+                crate::session::TurnJournalFlush::Immediate,
+            )
+            .await
+            .unwrap();
+        assert!(finalize_needs_background_job(&paths.turn_events_jsonl, &metadata).await);
+
+        metadata.recap_background_completion_until_seq = Some(completion.seq);
+        assert!(!finalize_needs_background_job(&paths.turn_events_jsonl, &metadata).await);
     }
 
     #[tokio::test]

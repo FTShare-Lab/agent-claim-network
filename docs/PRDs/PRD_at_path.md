@@ -207,7 +207,7 @@ max_files_per_turn = 5
 
 文本附件还复用 `[agent.tool].file_read_max_chars` 作为单个文件的 Unicode 字符上限，默认 `100000`。多个文本文件分别判断，不设置单轮合计字符预算。正文不超过上限时完整内联，并可形成等价的完整读取许可；超过上限时不截断、不注入预览，只向模型提供路径、实际字符数和 `file_read` 提示，同时在 TUI 显示非致命 warning，不发放读取许可。文本仍同时受 5 MiB 文件大小限制；该字符上限不适用于 PDF、磁盘图片或剪贴板图片。
 
-`memories/MEMORY.md` 和 `memories/USER.md`（先按词法消解 `.` / `..` 后判断）是受保护路径。它们必须通过 memory 工具访问，`@路径`、附件公共读取层和 `file_read` 都拒绝读取。
+`memories/MEMORY.md` 和 `memories/USER.md`（先按词法消解 `.` / `..` 后判断）是受保护路径。`@路径`、附件公共读取层和 `file_read` 始终拒绝读取；Memory 子系统启用时只能通过专用 memory 工具访问，关闭时则不提供任何 agent 访问通道。
 
 ### 4.3 目录引用
 

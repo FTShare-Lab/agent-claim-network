@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use std::{error::Error, fmt};
 
 use chrono::{DateTime, Utc};
+use ring::digest::{digest, SHA256};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -321,11 +322,63 @@ pub enum SessionTurnEvent {
     },
 }
 
-/// Anthropic Messages API 对齐的 session message。
+/// provider 私有、只用于同协议历史重放的完整状态。
+///
+/// 该状态不参与 transcript、Memory 或跨协议语义投影；未知 item 字段通过
+/// `serde_json::Value` 原样保存，避免协议适配层丢失 reasoning 等连续性信息。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "protocol", rename_all = "snake_case")]
+pub enum ProviderReplayState {
+    #[serde(rename = "openai_responses")]
+    OpenAiResponses {
+        /// 当前分支早期落盘未携带 model；缺失时按未绑定旧 replay 处理。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        items: Vec<Value>,
+    },
+    #[serde(rename = "openai_chat_completions")]
+    OpenAiChatCompletions {
+        model: String,
+        /// max-token continuation 期间实际进入后续请求的 Chat message 序列。
+        messages: Vec<Value>,
+    },
+    #[serde(rename = "anthropic_messages")]
+    AnthropicMessages {
+        model: String,
+        /// 完整、按顺序保存的 provider-private Messages API message。
+        messages: Vec<Value>,
+    },
+}
+
+impl ProviderReplayState {
+    pub fn matches_identity(&self, identity: &super::ProviderReplayIdentity) -> bool {
+        match self {
+            Self::OpenAiResponses {
+                model: Some(model), ..
+            } => {
+                identity.protocol == super::ProviderReplayProtocol::OpenAiResponses
+                    && model == &identity.model
+            }
+            Self::OpenAiChatCompletions { model, .. } => {
+                identity.protocol == super::ProviderReplayProtocol::OpenAiChatCompletions
+                    && model == &identity.model
+            }
+            Self::AnthropicMessages { model, .. } => {
+                identity.protocol == super::ProviderReplayProtocol::AnthropicMessages
+                    && model == &identity.model
+            }
+            Self::OpenAiResponses { model: None, .. } => false,
+        }
+    }
+}
+
+/// provider-neutral session message。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTurnMessage {
     pub role: String,
     pub content: Vec<SessionTurnContentBlock>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_replay: Option<ProviderReplayState>,
 }
 
 impl SessionTurnMessage {
@@ -333,6 +386,7 @@ impl SessionTurnMessage {
         Self {
             role: "user".into(),
             content: vec![SessionTurnContentBlock::text(text)],
+            provider_replay: None,
         }
     }
 
@@ -340,6 +394,7 @@ impl SessionTurnMessage {
         Self {
             role: "user".into(),
             content,
+            provider_replay: None,
         }
     }
 
@@ -347,8 +402,78 @@ impl SessionTurnMessage {
         Self {
             role: "assistant".into(),
             content: vec![SessionTurnContentBlock::text(text)],
+            provider_replay: None,
         }
     }
+
+    /// 构造一条可持久化、provider 可见但不属于真实用户输入的上下文快照。
+    pub fn model_context(source: ModelContextSource, text: impl Into<String>) -> Self {
+        let text = text.into();
+        let fingerprint = model_context_fingerprint(source, &text);
+        Self {
+            role: "user".into(),
+            content: vec![SessionTurnContentBlock::ModelContext {
+                source,
+                fingerprint,
+                text,
+            }],
+            provider_replay: None,
+        }
+    }
+
+    pub fn model_context_snapshot(&self) -> Option<(&ModelContextSource, &str, &str)> {
+        if self.role != "user" || self.content.len() != 1 {
+            return None;
+        }
+        match &self.content[0] {
+            SessionTurnContentBlock::ModelContext {
+                source,
+                fingerprint,
+                text,
+            } => Some((source, fingerprint, text)),
+            _ => None,
+        }
+    }
+
+    pub fn with_provider_replay(mut self, provider_replay: ProviderReplayState) -> Self {
+        self.provider_replay = Some(provider_replay);
+        self
+    }
+
+    pub fn without_provider_replay(mut self) -> Self {
+        self.provider_replay = None;
+        self
+    }
+}
+
+/// 模型可见、但不属于真实用户输入的动态上下文来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelContextSource {
+    Runtime,
+    BackgroundProcess,
+    Delegation,
+}
+
+impl ModelContextSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Runtime => "runtime",
+            Self::BackgroundProcess => "background_process",
+            Self::Delegation => "delegation",
+        }
+    }
+}
+
+fn model_context_fingerprint(source: ModelContextSource, text: &str) -> String {
+    let mut input = Vec::with_capacity(source.as_str().len().saturating_add(text.len() + 1));
+    input.extend_from_slice(source.as_str().as_bytes());
+    input.push(0);
+    input.extend_from_slice(text.as_bytes());
+    format!(
+        "sha256-v1:{}",
+        hex::encode(digest(&SHA256, &input).as_ref())
+    )
 }
 
 /// Provider-neutral session content block。
@@ -356,6 +481,13 @@ impl SessionTurnMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionTurnContentBlock {
     Text {
+        text: String,
+    },
+    /// 动态运行态的完整有界快照。adapter 只把 `text` 映射到 provider；其余字段用于
+    /// 稳定去重、持久化恢复和真实用户 turn 过滤。
+    ModelContext {
+        source: ModelContextSource,
+        fingerprint: String,
         text: String,
     },
     /// 用户显式调用的 Skill 正文快照，不同于用户自由文本。

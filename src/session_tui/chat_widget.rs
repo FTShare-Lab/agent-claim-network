@@ -638,7 +638,7 @@ impl ChatWidget {
             || self.state.status == SessionRuntimeStatus::Compacting;
         if show_live_box {
             lines.extend(live_box_lines(
-                live_box_title(&self.state),
+                &live_box_title(&self.state),
                 &activity_lines,
                 width,
                 &animation_lines,
@@ -1069,17 +1069,35 @@ pub(super) fn composer_hint(state: &SessionTuiState) -> String {
     )
 }
 
-fn live_box_title(state: &SessionTuiState) -> &'static str {
+fn live_box_title(state: &SessionTuiState) -> String {
     match state.status {
-        SessionRuntimeStatus::Initializing => "Initializing · Syncing inbox",
-        SessionRuntimeStatus::Running if state.shell_in_flight() => "Shell · Running command",
-        SessionRuntimeStatus::Running => "Working · Streaming response",
-        SessionRuntimeStatus::SyncingInbox => "Inbox · Syncing updates",
-        SessionRuntimeStatus::Compacting => "Compacting · Session history",
-        SessionRuntimeStatus::Finalizing => "Finalizing · Committing contribution",
-        SessionRuntimeStatus::Open => "Idle",
-        SessionRuntimeStatus::Error => "Attention · Last turn failed",
-        SessionRuntimeStatus::Closed => "Session closed",
+        SessionRuntimeStatus::Initializing => format!(
+            "Initializing · Syncing inbox · {}s",
+            state.foreground_task_elapsed_secs()
+        ),
+        SessionRuntimeStatus::Running if state.shell_in_flight() => format!(
+            "Shell · Running command · {}s",
+            state.foreground_task_elapsed_secs()
+        ),
+        SessionRuntimeStatus::Running => format!(
+            "Working · Streaming response · {}s",
+            state.foreground_task_elapsed_secs()
+        ),
+        SessionRuntimeStatus::SyncingInbox => format!(
+            "Inbox · Syncing updates · {}s",
+            state.foreground_task_elapsed_secs()
+        ),
+        SessionRuntimeStatus::Compacting => format!(
+            "Compacting · Session history · {}s",
+            state.foreground_task_elapsed_secs()
+        ),
+        SessionRuntimeStatus::Finalizing => format!(
+            "Finalizing · Committing contribution · {}s",
+            state.foreground_task_elapsed_secs()
+        ),
+        SessionRuntimeStatus::Open => "Idle".into(),
+        SessionRuntimeStatus::Error => "Attention · Last turn failed".into(),
+        SessionRuntimeStatus::Closed => "Session closed".into(),
     }
 }
 

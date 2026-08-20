@@ -1,6 +1,6 @@
 # 配置参数说明
 
-本文说明 `config.template.toml` / `config.toml` 的配置方法。实际运行配置文件只保留常用字段和值；完整字段含义、默认值和注意事项统一放在这里维护。
+本文说明 `config.toml` 的配置方法。实际运行配置文件只保留常用字段和值；完整字段含义、默认值和注意事项统一放在这里维护。
 
 阅读建议：
 
@@ -78,10 +78,15 @@ agent_id = "agent-a"
 
 ### `[agent.llm]`
 
-- `provider`：agent 主对话 LLM provider。当前支持 `anthropic`、`openai_compatible_chat`。
-- `endpoint`：与所选 provider 兼容的 LLM HTTP 地址，必须是绝对 HTTP(S) URL。可以填写服务 base URL，也可以填写完整请求 URL；OpenAI-compatible 的常见 base URL 形如 `https://llm.example.com/v1`，Anthropic-compatible 的常见 base URL 形如 `https://llm.example.com`。
+- `provider`：agent 主对话 LLM provider。模板默认推荐 `openai_responses`，也支持 `openai_chat` 和 `anthropic`。Chat 与 Responses 是彼此独立的 wire protocol，ACN 不在两者之间自动降级。
+- `endpoint`：与所选 provider 兼容的 LLM HTTP 地址，必须是绝对 HTTP(S) URL。可以填写服务 base URL，也可以填写完整请求 URL；OpenAI-compatible 的常见 base URL 形如 `https://llm.example.com/v1`，Anthropic-compatible 的常见 base URL 形如 `https://llm.example.com`。根 URL 会分别补全为 `/v1/chat/completions`、`/v1/responses` 或 `/v1/messages`；已有路径的 base URL 会追加相应末段，完整请求 URL 保持不变。
 - `model`：模型名，以配置文件为准。
-- `reasoning_effort`：控制 agent 主 LLM 的推理强度，可选值为 `none`、`low`、`medium`、`high`、`xhigh`、`max`，未配置时默认 `none`。未配置或设为 `none` 时不发送推理强度参数；其余值在 `provider = "openai_compatible_chat"` 时作为顶层 `reasoning_effort` 发送，在 `provider = "anthropic"` 时作为 `output_config.effort` 发送。ACN 不判断上游或具体模型是否支持该值，不支持时保留上游原始报错。该配置不改变 thinking / `reasoning_content` 的解析或历史回传行为。
+- `supports_websockets`：可选，默认 `false`。仅 `openai_responses` 可设为 `true`；请只在 endpoint 明确支持 Responses WebSocket 协议时开启。
+- `reasoning_effort`：控制 agent 主 LLM 的推理强度，可选值为 `none`、`low`、`medium`、`high`、`xhigh`、`max`，未配置时默认 `none`。未配置或设为 `none` 时不发送推理强度参数。
+- `temperature`：浮点数，作用于所有使用 `[agent.llm]` 的 Agent LLM 请求。未配置时不发送该参数。
+- `top_p`：浮点数，作用范围与 `temperature` 相同。未配置时不发送该参数。
+- `anthropic_thinking`：只作用于 `provider = "anthropic"`，可选值为 `auto`、`enabled`、`adaptive`、`disabled`，默认 `auto`。`auto` 不发送 `thinking`，沿用上游默认行为；其他值显式发送对应 `thinking.type`。不作用于 Responses 或 Chat。
+- `anthropic_thinking_budget_tokens`：只作用于 `anthropic_thinking = "enabled"` 的可选 `thinking.budget_tokens`。未配置时不发送；选择 `adaptive`、`disabled` 或 `auto` 时也不发送。它不从 `reasoning_effort` 或 `max_tokens` 推导。
 - `api_key_env`：读取 agent LLM API key 的环境变量名，默认空字符串；真实 provider 必须填写。
 - `max_tokens`：单次模型响应的最大输出 token 数，默认 `65536`。
 - `context_window`：模型上下文窗口 token 数，默认 `200000`，必须大于 0。用于 TUI ctx 总量展示以及自动压缩阈值计算。
@@ -89,6 +94,8 @@ agent_id = "agent-a"
 - `retry_count`：首次失败后的额外重试次数，默认 `1`。`0` 表示一共只尝试一次，`1` 表示一共最多尝试两次。
 - `retry_base_delay_ms`：重试退避基础间隔，默认 `200`ms。第 N 次等待约为 `base * 2^(N-1)`，并叠加随机抖动。
 - `retry_max_delay_ms`：重试退避等待上限，默认 `5000`ms。
+
+特别说明：`openai_chat` 会丢弃厂商扩展 Reasoning 字段，要求 Reasoning 回传的模型应改用 `openai_responses` 或 `anthropic`。
 
 ### `[agent.inbox]`
 
@@ -99,6 +106,8 @@ agent_id = "agent-a"
 - `id_mint_max_retries`：session id 创建时的最大重抽次数。总尝试次数为 `1 + id_mint_max_retries`。
 - `notify_on_finalize_completion`：后台 supervisor finalize 完成后是否发送系统通知。默认 `true`；设为 `false` 后成功和失败都只写 job/session 日志，不弹系统通知。
 - `cleanup_retention_days`：旧 Closed sessions 的保留天数，默认 `30`，最大 `36500`。自动后台清理按该值判断，`0` 表示禁用自动后台清理；手动 `acn session cleanup` 不受此禁用影响，配置为 `0` 时仍按默认 30 天判断，配置为非 0 时按配置值判断。
+
+ACN 会用有效配置、选中的 upstream 和 finalize 所需凭据摘要生成 supervisor 运行环境指纹。相关内容变化后，下次启动会接管旧 supervisor；该行为无需配置额外参数，凭据明文不会写入指纹或状态输出。工具工作目录不参与指纹，`--cd` 只属于交互式 agent，所有 `acn supervisor` 子命令均不接受该参数。
 
 ### `[agent.session.compaction]`
 
@@ -111,6 +120,7 @@ agent_id = "agent-a"
 
 ### `[agent.session.memory_review]`
 
+- `enabled`：是否启动后台 fork memory review，默认 `true`；设为 `false` 时不启动 review。
 - `interval_turns`：后台 fork memory review 的触发间隔；触发时也只 review 最近同样数量的 user turn。必须大于 0。
 
 ### `[agent.session.subagents]`
@@ -175,6 +185,11 @@ agent_id = "agent-a"
       "type": "streamable_http",
       "url": "https://mcp.linear.app/mcp",
       "bearer_token_env_var": "LINEAR_API_KEY"
+    },
+    "oauth-server": {
+      "type": "streamable_http",
+      "url": "https://example.com/mcp",
+      "oauth_client_id": "public-client-id"
     }
   }
 }
@@ -183,7 +198,7 @@ agent_id = "agent-a"
 MCP server 按连接方式分两类：
 
 - `stdio`：进程型 MCP server。ACN 会按 `command` / `args` 启动一个子进程，并通过 stdin/stdout 与它通信；适合 `npx`、`uvx`、本机脚本或本机二进制。它的文件、网络和环境变量权限等同 ACN 进程。
-- `streamable_http`：HTTP endpoint 型 MCP server。ACN 不启动子进程，只向 `url` 发 HTTP MCP 请求；这个 endpoint 可以是 localhost、内网地址或公网服务。需要 token 时通过 `bearer_token_env_var` 指定环境变量，不建议把真实 token 写进配置文件。
+- `streamable_http`：远程 HTTP MCP server。可匿名访问，也可使用 bearer token 或 OAuth。
 
 常用命令：
 
@@ -191,13 +206,15 @@ MCP server 按连接方式分两类：
 - `acn mcp get <name> [--json]`
 - `acn mcp add <name> [-e KEY=VALUE] [--env-var KEY] -- <command...>`
 - `acn mcp add <name> --url <url> [--bearer-token-env-var ENV]`
+- `acn mcp add <name> --url <url> [--oauth-client-id ID] [--oauth-callback-port PORT] [--oauth-credentials-store keyring|file]`
 - `acn mcp add-json <name> '<server-json>'`
 - `acn mcp remove <name>`
 - `acn mcp enable <name>` / `acn mcp disable <name>`
+- `acn mcp login <name> [--no-browser]` / `acn mcp logout <name>`
 
 字段要点：
 
-- `enabled` 可选，默认 `true`；disable / enable 只切换这个字段，不删除 server 配置。
+- `enabled` 可选，默认 `true`。
 - 默认 enabled 的 server 会在 TUI 启动时被自动连接；`acn mcp status` 不带 server name 时会连接所有 enabled server。
 - `acn mcp status <name>` 只连接并检查指定 server，不会启动其他 enabled server。
 - `stdio` MCP server 会作为本地子进程运行，权限等同 ACN 进程。只添加可信 server；不确定来源建议先 disable，确认后再 enable/status。
@@ -205,12 +222,19 @@ MCP server 按连接方式分两类：
 - `enabled_tools` / `disabled_tools` 按 MCP server 原始 tool name 过滤。
 - `-e KEY=VALUE` 会把 value 写入 `.mcp.json`，真实 token 推荐用 `--env-var KEY` 或 `--bearer-token-env-var ENV`。
 - `add-json` 接受单个 `McpServerConfig` JSON，支持上文列出的全部字段，不接受完整的 `{"mcpServers": {...}}`。输入的 `type: "http"` 会规范化并保存为 `type: "streamable_http"`。
-- 不要在 `add-json` 中直接写入 token；stdio 使用 `env_vars`，远程 HTTP 使用 `bearer_token_env_var`。未知字段以及尚未支持的 `sse`、`oauth`、`headers` 会被拒绝。
-- 当前不支持 OAuth、浏览器授权回调和 MCP elicitation；需要这类交互鉴权的 server 暂时不能完成登录。
-- 外部修改 `.mcp.json` 后，已运行的 TUI 不会热加载；需要重启 TUI，或后续使用专门的 reload 能力。
+- 不要在 `add-json` 中写入 token；stdio 使用 `env_vars`，远程 HTTP 使用 `bearer_token_env_var`。
+- `oauth_client_id` 仅用于服务方提供的预注册 public client ID；未配置时登录会动态注册 public client。
+- `oauth_callback_port` 仅在服务方要求固定 redirect URI 时配置；否则使用随机端口。
+- `oauth_credentials_store` 可取 `keyring`（默认）或 `file`；没有系统 keyring 的 headless 环境使用 `file`。
+- bearer 与 OAuth 选项互斥。OAuth server 添加后执行 `acn mcp login <name>`；SSH/headless 环境使用 `--no-browser`。
+- OAuth access token 会在 MCP 调用前按授权服务器返回的有效期自动刷新；静态 bearer token 不会由 ACN 刷新。登录失效或修改 `oauth_client_id` 后需要重新执行 `login`。
+- `logout` 删除本地 OAuth 凭据；`remove` 删除配置并清理对应的本地凭据。
+- 当前不支持旧版独立 SSE transport、自定义 HTTP headers、OAuth client secret、device flow、MCP Tasks 与 MCP elicitation；Streamable HTTP 返回的 SSE event stream 正常支持。
+- `.mcp.json` 不会自动热加载；修改已有 server 后可在 `/mcp` 中 Reconnect，新增、删除或重命名 server 需要重启 TUI 后生效。
 
 ### `[agent.memory]`
 
+- `enabled`：是否启用 Memory，默认 `true`。
 - `memory_char_limit`：agent 私有 `MEMORY.md` 容量上限。超限时 memory 工具拒绝写入。
 - `user_char_limit`：agent 私有 `USER.md` 容量上限。超限时 memory 工具拒绝写入。
 - `memory_safety_scan`：写入 MEMORY / USER 前是否拦截明显 prompt injection、密钥外传和后门持久化内容。
@@ -219,6 +243,7 @@ MCP server 按连接方式分两类：
 
 - `file_read_max_chars`：`file_read` 单页及单个 `@` 文本文件可返回的最大字符数，默认 `100000`。`file_read` 超限时可按 `page.next_start` 继续分页；`@` 文本超限时只提供路径和字符数，并引导模型改用 `file_read`。
 - `file_diff_max_changed_lines`：`file_write` / `file_patch` 修改成功后采集并在 TUI 历史区展示的 diff 最大**改动行数**（仅统计 +/- 行，上下文行不占额度），超出部分截断并提示剩余改动行数。
+- `file_edit_authority_enabled`：是否要求模型先通过 `file_read` 或完整文本附件取得已有文件当前版本的修改许可，默认 `true`。设为 `false` 时，`file_patch` / `file_write` 不执行读取许可与覆盖范围校验，也不维护许可 evidence/checkpoint；精确匹配、路径保护、文件锁、并发变化检测、原子写入和 diff 等其余行为不变。
 - `max_parallel_tool_calls`：一个 agent 当前 turn 内、连续可并发工具批次的最大活跃调用数，默认 `5`，必须大于 `0`。它不跨 turn、session 或 agent 共享，也不限制 provider 的 fallback 尝试次数。
 - `code_run_max_output_chars`：单次 `code_run` / `write_stdin` 工具中每个 stdout/stderr stream 回传允许的最大输出字符数，默认 `1048576`，最多 `2097152`；pipe 模式两个 stream 各自适用该上限，PTY 只有 stdout。
 - `write_stdin_max_poll_timeout_ms`：`write_stdin` 空轮询的最大观察窗口，默认且最大 `300000`ms。它必须不小于内部 `code_run` 最大观察窗口 `30000`ms；非空写入仍受内部 `30000`ms 上限约束。
@@ -297,15 +322,17 @@ background-shell 其余时序、容量和 PTY 参数是 `config.rs` 内部默认
 
 ### `[router.rerank]`
 
-- `provider`：候选 Claim 的重排方式。`heuristic` 使用本地启发式规则；`openai_compatible_chat` 把查询和候选 Claim 交给通用 Chat 模型排序，不要求使用专用 rerank 模型。
-- `endpoint`：`openai_compatible_chat` 使用的 Chat Completions 服务地址，必须是绝对 HTTP(S) URL。可以填写常见的 base URL（例如 `https://llm.example.com/v1`），也可以填写完整的 Chat Completions 请求 URL。
-- `model`：执行重排任务的 Chat 模型名。
-- `api_key_env`：读取该 Chat Completions 服务 API key 的环境变量名。
+- `provider`：候选 Claim 的重排方式，默认 `openai_responses`。`heuristic` 使用本地启发式规则；`openai_chat` 使用 Chat Completions；`openai_responses` 使用 Responses；`anthropic` 使用 Anthropic Messages。远端协议都把 query 和候选 Claim 交给通用模型排序，不要求使用专用 rerank 模型。
+- `endpoint`：远端重排服务地址，必须是绝对 HTTP(S) URL。可以填写 host root、常见的 `/v1` base URL 或完整的 `/v1/chat/completions`、`/v1/responses`、`/v1/messages` 请求 URL；ACN 按所选 provider 补全缺失路径，不在协议间自动切换。
+- `model`：执行重排任务的模型名。
+- `api_key_env`：读取远端重排服务 API key 的环境变量名。
 - `timeout_secs`：单次 rerank 请求超时秒数。
-- `max_tokens`：Chat 模型返回排序结果时的最大输出 token 数。
-- `retry_count`：rerank 请求首次失败后的额外重试次数。
+- `max_tokens`：模型返回排序结果时的最大输出 token 数。
+- `retry_count`：远端请求失败或排序结果无效时的额外重试次数。
 - `retry_base_delay_ms`：rerank 请求重试退避基础间隔毫秒数。
 - `retry_max_delay_ms`：rerank 请求重试退避上限毫秒数。
+
+远端 rerank 默认使用流式请求；流式不可用时会尝试普通请求。rerank 不启用模型的 reasoning/thinking；最终失败时，Router 继续使用原有检索排序。
 
 ### `[maintainer.sweep]`
 
@@ -391,5 +418,5 @@ Maintainer 启动时会自动 ensure `router-service` 内部 key：hash 写在 `
 ### Router / Maintainer 侧环境变量
 
 - `[router.embedding].api_key_env`：真实 embedding 路径必需，配置为要读取的 embedding API key 环境变量名。
-- `[router.rerank].api_key_env`：`provider = "openai_compatible_chat"` 时必需，配置为要读取的 Chat Completions 服务 API key 环境变量名。
+- `[router.rerank].api_key_env`：`provider = "openai_chat"`、`provider = "openai_responses"` 或 `provider = "anthropic"` 时必需，配置为要读取的远端重排服务 API key 环境变量名。
 - `[maintainer.auth.admin].password_env`：启用 maintainer 管理台管理员鉴权时必需，配置为要读取的 Basic Auth 密码环境变量名。

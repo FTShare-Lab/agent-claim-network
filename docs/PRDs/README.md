@@ -4,6 +4,8 @@
 
 ## Session 与恢复
 
+- [OpenAI Responses API 支持](PRD_openai_responses.md)
+- [Prompt Cache 前缀稳定性修复](PRD_fix_cache_hit.md)
 - [Provider Request 前统一压缩](PRD_compact_in_turn.md)
 - [Turn Journal 与 Mid-Turn 恢复](PRD_turn2message.md)
 - [流式失败回退非流式重试](PRD_retry_non_streaming.md)

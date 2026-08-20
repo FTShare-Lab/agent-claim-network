@@ -7,11 +7,14 @@
   - `instruction`：触发复盘输出的指令
   - `transcript`：上一阶段自然语言推理的完整消息记录
     - transcript 中可能包含 router 工具调用结果，其中 `candidate_claims` 是候选 claim，`disputes` 是候选 claim 相关的 dispute 摘要；仅当候选中存在冲突时，disputes 才会被提供。
+  - `background_process_completions`（可选）：transcript 中 main agent `code_run` 曾返回后台运行后，由独立 watcher 确认的最终 exit / signal 事实；它只补充对应工具的终态，不是新的用户请求或第二个工具结果
   - `local_claims`：你当前持有的完整本地 claim
 - 复盘阶段只输出 claim / dispute JSON；不要提出或执行其他动作
 - 不引用用户身份 / 私密 / 偏好/ 喜好 / 爱好
+- agent 私有用户画像、偏好与私密信息不得成为 claim/dispute 内容或证据来源
 - 你拥有 `local_claims[*].id`，以及 transcript 中真实出现过的 claim id；这些都是 **真实的、已存在的 claim id**
 
+{% if memory_enabled %}
 # persistent memory 边界
 上一阶段 transcript 中可能包含 `memory` 工具调用。该工具会更新 agent 私有的两个长期记忆文件；复盘阶段只能看到 transcript 里保留下来的 memory 工具调用摘要，不等于能看到完整记忆文件内容。
 
@@ -24,14 +27,27 @@ claim / dispute 是团队可共享知识，必须与私有 memory 脱敏和解�
 - 是否发生 memory 更新都不是生成 claim/dispute 的前置条件。
 - `USER.md` 相关更新内容绝对不能生成 claim/dispute。
 - `MEMORY.md` 相关更新不能单独作为证据；但可以结合 transcript 中的当前任务内容一起评估，若脱敏、泛化后适合作为团队知识，则可以生成 claim/dispute。
+{% endif %}
 
-claim/dispute 的生成应基于 transcript 或 local_claims 中的当前任务证据；如果 transcript 中包含 router 工具结果，可以参考其中的 `candidate_claims` 与 `disputes`。
+claim/dispute 的生成应基于 transcript、`background_process_completions` 或 local_claims 中的当前任务证据；如果 transcript 中包含 router 工具结果，可以参考其中的 `candidate_claims` 与 `disputes`。后台进程终态只能用于修正 transcript 中对应 `code_run` 的实际完成结果，不能脱离原任务单独推断无关结论。
 
 不要把 local_claims 或 transcript 中已有的 claim，包括 router `candidate_claims`，原样复制为 `new_claim`。如果只是参考、采用或复述已有 claim，请只把真实 claim id 放入 `used_claim_ids`，不要生成新的 claim。
 如果本 session 为某条 local claim 带来了实质性的新证据、语义修订或生命周期判断，请在 `updated_claims` 中按原 id 输出更新后的完整属性；不要为同一语义另建 claim。
 只有当本 session 基于已有 claim 形成了新的结论、局部适配、组合判断、执行经验或更具体的范围化断言时，才生成 `new_claim`。此时必须在 `source_claim_ids` 中引用被借用/综合的已有 claim id。
 如果 router candidate 已经完整表达了结论，且本 session 没有增加实质新信息，不要新增 claim。
 时间或日期约束、ddl 和会过期内容如果确实需要保存，必须写成绝对时间。时间总会一直推进，因此不要记录一些不能复用的、能简单得到的、或者是会快速变化的不稳定内容，如“当前时间/日期/星期/天气是xx”等。
+
+# claim 提炼步骤
+输出前，先检查 transcript 中是否存在以下候选信息：
+
+- 围绕真正影响任务结果或后续判断的关键决策节点，包含核心约束、不变量或决策边界的完整判断；不要把这些要素单独摘成缺少判断含义的碎片。
+- 核心机制、重要接口、依赖关系或架构边界背后的因果结论。
+- 已显著消耗探索成本，并形成了可验证结论的重要成功或失败路径。
+- 尚未充分验证但会显著影响后续行动的关键假设；如果确有保留价值，必须按证据降低 `confidence` 并明确适用边界。
+
+上述内容只是候选检查清单。应先把候选提炼成可独立理解的判断，再按下方 claim 标准筛选；不要把检查过程、任务流水或 transcript 摘要写入 claim。不要为了覆盖清单而为每一类凑 claim，也不要为了记录“做过什么”而生成 claim；没有足够高价值的新增或更新时，相应数组应为空。
+
+避免为通用环境噪音生成claim，例如:围绕 Git identity/commit author、离线、网络或沙箱测试环境的内容。
 
 # claim
 {% include "what_is_claim.j2" %}

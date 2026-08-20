@@ -121,7 +121,7 @@ pub enum AttachmentError {
     NotUtf8(String),
     #[error("单轮附件数量超限: {actual} 个，最多 {limit} 个")]
     TooManyFiles { actual: usize, limit: usize },
-    #[error("受保护的 memory 文件必须通过 memory 工具访问: {0}")]
+    #[error("agent 私有受保护文件不能作为附件访问: {0}")]
     ProtectedMemoryPath(String),
     #[error("附件处理任务失败: {0}")]
     Task(String),
@@ -181,8 +181,9 @@ pub fn attachment_kind_for_path(path: &Path) -> AttachmentKind {
     }
 }
 
-/// 受保护的 memory 文件（`memories/MEMORY.md` / `memories/USER.md`）只允许
-/// memory 工具访问，附件与 file_read 一律拒绝。判定先消解 `..`，固定名称忽略 ASCII 大小写。
+/// 受保护的 memory 文件（`memories/MEMORY.md` / `memories/USER.md`）不允许附件与
+/// file_read 访问。启用 memory 子系统时另有专用工具访问；关闭时文件仍受保护。
+/// 判定先消解 `..`，固定名称忽略 ASCII 大小写。
 pub fn is_protected_memory_path(path: &Path) -> bool {
     let normalized = normalize_path_lexically(path);
     let is_memory_file = normalized
@@ -499,8 +500,10 @@ mod tests {
     #[test]
     fn text_attachment_limit_reuses_file_read_max_chars() {
         let attachment = AttachmentConfig::default();
-        let mut tool = ToolConfig::default();
-        tool.file_read_max_chars = 17;
+        let tool = ToolConfig {
+            file_read_max_chars: 17,
+            ..ToolConfig::default()
+        };
 
         let limits = AttachmentLimits::from_configs(&attachment, &tool);
 

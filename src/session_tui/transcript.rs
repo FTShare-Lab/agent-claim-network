@@ -30,6 +30,13 @@ enum ActiveTimelineChunk {
     Fixed(Vec<Line<'static>>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BackgroundToolUpdate {
+    Updated { was_flushed: bool },
+    AwaitingToolResult,
+    Ignored,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct TranscriptState {
     history: Vec<HistoryEntry>,
@@ -298,9 +305,16 @@ impl TranscriptState {
         }
     }
 
-    pub(super) fn push_tool_started(&mut self, id: String, name: String, summary: String) {
+    pub(super) fn push_tool_started(
+        &mut self,
+        turn_id: Option<String>,
+        id: String,
+        name: String,
+        summary: String,
+    ) {
         self.active_assistant = None;
         self.history.push(HistoryEntry::Tool(ToolCell {
+            turn_id,
             id,
             name,
             summary: summary.clone(),
@@ -350,6 +364,7 @@ impl TranscriptState {
         }
 
         self.history.push(HistoryEntry::Tool(ToolCell {
+            turn_id: None,
             id,
             name: "tool".into(),
             summary,
@@ -363,6 +378,47 @@ impl TranscriptState {
             started_at: Instant::now(),
             file_change,
         }));
+    }
+
+    /// watcher 的终态不是第二个模型 tool result，只更新原 code_run 的展示投影。
+    /// 完成事件可能抢在原 ToolCallCompleted / ToolCallInterrupted 前到达，调用方需在
+    /// `AwaitingToolResult` 时暂存并于原 tool result 落地后重试。
+    pub(super) fn complete_background_tool(
+        &mut self,
+        turn_id: &str,
+        id: &str,
+        outcome: ToolExecutionOutcome,
+    ) -> BackgroundToolUpdate {
+        let Some((index, cell)) =
+            self.history
+                .iter_mut()
+                .enumerate()
+                .rev()
+                .find_map(|(index, entry)| match entry {
+                    HistoryEntry::Tool(cell)
+                        if cell.turn_id.as_deref() == Some(turn_id) && cell.id == id =>
+                    {
+                        Some((index, cell))
+                    }
+                    _ => None,
+                })
+        else {
+            return BackgroundToolUpdate::AwaitingToolResult;
+        };
+        if !cell.completed {
+            return BackgroundToolUpdate::AwaitingToolResult;
+        }
+        if !cell.interrupted && !matches!(cell.outcome, Some(ToolExecutionOutcome::ProcessRunning))
+        {
+            return BackgroundToolUpdate::Ignored;
+        }
+
+        cell.summary = format!("tool {} background_completed", cell.name);
+        cell.outcome = Some(outcome);
+        cell.progress_summary = None;
+        BackgroundToolUpdate::Updated {
+            was_flushed: index < self.flushed_until,
+        }
     }
 
     pub(super) fn interrupt_tool(&mut self, id: String, summary: String) {
@@ -381,6 +437,7 @@ impl TranscriptState {
         }
 
         self.history.push(HistoryEntry::Tool(ToolCell {
+            turn_id: None,
             id,
             name: "tool".into(),
             summary,
@@ -405,6 +462,7 @@ impl TranscriptState {
     ) {
         self.active_assistant = None;
         self.history.push(HistoryEntry::Tool(ToolCell {
+            turn_id: None,
             id,
             name,
             summary,

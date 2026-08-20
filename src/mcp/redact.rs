@@ -145,7 +145,18 @@ fn is_sensitive_name(name: &str) -> bool {
         || lowered == "key"
         || lowered.ends_with("_key")
         || lowered.contains("bearer")
-        || lowered.contains("auth")
+        || is_structured_auth_name(&lowered)
+}
+
+fn is_structured_auth_name(name: &str) -> bool {
+    name == "auth"
+        || name == "authorization"
+        || name.starts_with("auth_")
+        || name.ends_with("_auth")
+        || name.contains("_auth_")
+        || name.starts_with("authorization_")
+        || name.ends_with("_authorization")
+        || name.contains("_authorization_")
 }
 
 #[cfg(test)]
@@ -191,5 +202,17 @@ mod tests {
             redact_mcp_sensitive_text("Authorization: Bearer abc"),
             "<redacted>"
         );
+        assert_eq!(redact_mcp_sensitive_text("auth abc"), "auth <redacted>");
+        assert_eq!(
+            redact_mcp_sensitive_text("authorization_code=abc"),
+            "authorization_code=<redacted>"
+        );
+    }
+
+    #[test]
+    fn preserves_oauth_prose_and_server_names() {
+        let message = "MCP server 'oauthdcr' OAuth 凭据读取失败: MCP server 'oauthdcr' 需要 OAuth 登录；请执行 `acn mcp login oauthdcr`";
+
+        assert_eq!(redact_mcp_sensitive_text(message), message);
     }
 }

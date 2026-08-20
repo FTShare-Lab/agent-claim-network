@@ -12,7 +12,7 @@
 <p align="center">
   <img alt="license: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg">
   <img alt="rust 1.90" src="https://img.shields.io/badge/rust-1.90-orange.svg">
-  <img alt="version 0.2.1" src="https://img.shields.io/badge/version-0.2.1-brightgreen.svg">
+  <img alt="version 0.2.4" src="https://img.shields.io/badge/version-0.2.4-brightgreen.svg">
   <a href="README_EN.md"><img alt="English README" src="https://img.shields.io/badge/README-English-blue.svg"></a>
 </p>
 
@@ -56,7 +56,7 @@
 - `/exit` 后复盘进后台，终端马上归还
 - 子代理可并行干活：创建、等待、插话、看进度都在 TUI 里
 - 支持 MCP（stdio / Streamable HTTP，进程内共享连接）和 Skill（`/技能名` 显式注入）
-- 主对话支持 Anthropic 与 OpenAI-compatible；流式中断会自动改走非流式重试
+- 主对话支持 Anthropic Messages、OpenAI-compatible Chat Completions 与 Responses；流式中断会自动改走同协议非流式重试
 
 更详细的交互说明见 [使用指南](docs/user_guide.md)。
 
@@ -118,11 +118,14 @@ maintainer_endpoint = ""         # 都留空 = 单人模式
 router_endpoint = ""
 
 [agent.llm]
-provider = "openai_compatible_chat"
+provider = "openai_responses"
 endpoint = "https://your-llm-endpoint/v1"
 model = "your-model"
 api_key_env = "ACN_LLM_API_KEY"  # 环境变量名
 ```
+
+> [!NOTE]
+> `openai_responses` 支持 Reasoning 的私有落盘和同模型连续回传；当前 TUI 只显示最终回答、后续将支持 Reasoning 的逐步推理过程显示。
 
 `upstream` 是 Agent 侧的一份配置：身份、团队地址、本机数据目录。团队地址都留空即为单人模式（不连 Router / Maintainer）。
 
@@ -145,10 +148,28 @@ provider = "anthropic"
 endpoint = "https://your-llm-endpoint"
 model = "your-model"
 reasoning_effort = "none"                # none | low | medium | high | xhigh | max
+anthropic_thinking = "auto"              # auto | enabled | adaptive | disabled
+# anthropic_thinking_budget_tokens = 4096 # enabled 时可选
 api_key_env = "ACN_LLM_API_KEY"
 ```
 
 `reasoning_effort` 会按协议字段发出去；ACN 不检查模型是否真支持。
+
+</details>
+
+<details>
+<summary><b>改用 OpenAI Chat 协议</b></summary>
+
+```toml
+[agent.llm]
+provider = "openai_chat"
+endpoint = "https://your-llm-endpoint/v1"
+model = "your-model"
+reasoning_effort = "none"                # none | low | medium | high | xhigh | max
+api_key_env = "ACN_LLM_API_KEY"
+```
+
+`openai_chat` 适用于只提供 Chat Completions 的兼容服务，但会丢弃厂商扩展的 Reasoning 字段。要求在后续请求或工具回环中回传 Reasoning 时，应使用 `openai_responses` 或 `anthropic`。
 
 </details>
 
@@ -180,14 +201,15 @@ acn session cleanup --apply
 
 acn supervisor status
 acn supervisor jobs
+acn supervisor retry session_1234abcd
 
 acn mcp list
-acn mcp add / add-json / remove / enable / disable / status
+acn mcp add / add-json / remove / enable / disable / login / logout / status
 
 acn update
 ```
 
-若启动时用了自定义 `--config` 或 `--upstream`，查 supervisor 时带上同样参数。
+若启动时用了自定义 `--config` 或 `--upstream`，管理 supervisor 时带上同样参数。ACN 会按有效配置、upstream 和 finalize 所需凭据摘要识别 supervisor 运行环境；这些内容变化后，下次启动会安全接管旧 supervisor，并由新环境继续未完成的 finalize job。失败的 finalize 可优先按用户可见的 session ID 执行 `acn supervisor retry <session_id>`，也可使用 `jobs` 显示的 job ID。
 
 </details>
 

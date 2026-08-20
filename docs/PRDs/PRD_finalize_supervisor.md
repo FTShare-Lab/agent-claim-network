@@ -23,6 +23,14 @@
 11. executor 初版全局串行，job metadata 保留 agent/session/upstream 维度，方便后续扩展。
 12. 通知内容参考当前 TUI finalize 完成时打印的 trace/claim/dispute 摘要，改写为系统通知文案。
 13. supervisor idle timeout 不进 `config.toml`，但必须集中放在 `src/config.rs` 的代码常量中。
+14. 同一 agent 运行目录只允许一个活动 supervisor。构建或运行环境指纹变化时安全接管旧实例；运行环境指纹覆盖有效配置、upstream 和 finalize 所需凭据摘要，不包含工具工作区或 Web 工具凭据。
+15. 接管后由新运行环境继续 `queued` job；中断的 `running` job 仅在成功读取 session metadata 且状态仍为 `Finalizing` 时重新排队，并保留已计入的执行次数。若 session 已是 `Closed`，或已经 resume 为 `Open`，说明 finalize 的 session 提交已经完成，旧 job 直接对账为 `succeeded`，不得再次处理新的会话周期。metadata 无法读取时停止本次接管并保持 job 原状，不猜测 session 状态；其他终态 job 不自动重跑。
+16. TUI 启动阶段负责运行环境接管；退出 enqueue 优先投递给当前健康 supervisor，防止较早启动的 TUI 用缓存指纹反向接管新实例。
+17. 一个 session 可以保留多轮 finalize 的历史成功 job，但同时至多有一个未成功的 finalize job（`queued`、`running` 或 `failed`）。重复 enqueue 返回同一个 `queued` / `running` job；历史 `succeeded` job 不阻止 resume 后的新一轮 finalize；发现多个未成功 job 时按不变量损坏拒绝处理。
+18. `acn supervisor retry <session_id|job_id>` 只重试唯一的失败 job：复用原 job，保留失败记录并将 attempts 清零，记录 `manual_retries`，获得新的完整自动尝试预算。`queued`、`running`、`succeeded` 均拒绝 retry。
+19. session ID 是 retry 的首选入口；它只解析当前唯一的未成功 job，并忽略历史 `succeeded` job。当 `Finalizing` session 没有未成功 job 时，retry 必须先确认 `finalize.lock` 未被真实执行中的前台或后台 finalize 占用，再创建新的恢复 job。job ID 只精确定位已有 job；`succeeded` job 永远不能 retry。两种入口解析成功后的输出均包含 session ID 和 job ID。
+20. retry 使用本次命令的 `--config` / `--upstream` 并先确保对应指纹的 supervisor 已接管；`--cd` 仅属于交互式 TUI，所有 supervisor 命令均不支持。
+21. 直接 resume 前先确保当前运行环境的 supervisor 已启动或接管，使崩溃遗留的 `queued` / `running` job 能继续推进；目标仍为 `Finalizing` 时，提示必须区分 job 状态：`queued` / `running` 说明 finalize 尚在进行；`failed` 显示真实 job ID，并给出 `acn supervisor retry <真实 session_id>`；没有未成功 job 时说明 finalize 未完成并给出同一恢复命令。提示命令不附加 `--config` / `--upstream`。
 
 ## 用户体验
 
@@ -32,6 +40,7 @@
 - session 在本地状态中显示为 `Finalizing`。
 - finalize 成功后发送 macOS 通知，并写 job/session 日志。
 - finalize 失败后发送 macOS 通知，并保留失败状态/日志，便于后续 retry 或排查。
+- finalize 失败或形成孤儿 `Finalizing` 状态时，直接 resume 会显示带真实 session ID 的 retry 命令；仍在排队或执行时只提示等待，不误导用户重复 retry。
 
 enqueue 失败时：
 
@@ -95,6 +104,11 @@ supervisor 启动失败时：
 - [x] 已有 supervisor 时，只连接不重复启动。
 - [x] supervisor 崩溃后，下一次 ensure 可以清理 stale socket 并重启。
 - [x] queued/running stale finalize job 可恢复执行。
+- [x] supervisor 在 session 已提交 `Closed`、但 job 尚未提交 `succeeded` 的窗口崩溃时，重启会将旧 job 对账为成功；已 resume 为 `Open` 的新周期不会被旧 job 再次关闭。
+- [x] 构建或运行环境变化后安全接管旧 supervisor，且不阻塞 TUI 启动。
+- [x] enqueue 强制一个 session 同时至多有一个未成功 job，保留多轮历史成功 job，并能报告未成功 job 的重复记录。
+- [x] 失败 job 可按 session ID 或 job ID 手动 retry；孤儿 `Finalizing` session 仅在 `finalize.lock` 空闲时可按 session ID 恢复。
+- [x] finalize 成功、resume、继续对话并再次退出时创建新的 job，完成后再次进入 `Closed`。
 
 ### Phase 3: TUI exit 接入和通知
 

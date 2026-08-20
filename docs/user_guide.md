@@ -40,7 +40,7 @@ maintainer_endpoint = ""
 router_endpoint = ""
 
 [agent.llm]
-provider = "openai_compatible_chat"
+provider = "openai_responses"
 endpoint = "https://your-llm-endpoint/v1"
 model = "your-model"
 api_key_env = "ACN_LLM_API_KEY"
@@ -50,12 +50,19 @@ api_key_env = "ACN_LLM_API_KEY"
 
 | 字段 | 含义 |
 | --- | --- |
-| `provider` | 请求协议，目前支持 `openai_compatible_chat` 和 `anthropic`；它不是厂商名。 |
+| `provider` | 请求协议，默认推荐 `openai_responses`；也支持 `openai_chat` 和 `anthropic`。 |
 | `endpoint` | 与所选协议兼容的 base URL 或完整请求 URL。OpenAI-compatible 的常见 base URL 形如 `https://llm.example.com/v1`，Anthropic-compatible 的常见 base URL 形如 `https://llm.example.com`。 |
 | `model` | 该服务实际接受的模型 ID。 |
 | `api_key_env` | 保存这个 LLM API key 的环境变量名，不是 key 本身。 |
 
 `provider`、`endpoint` 和 `model` 必须属于同一个兼容服务。`endpoint` 必须是绝对 HTTP(S) URL；`model` 不能为空。
+
+ACN 默认使用流式输出；流式失败时可能改用同协议的非流式请求重试，不会自动切换协议。
+
+`openai_responses` 和 `anthropic` 支持在同一模型的连续会话中保存并回传 Reasoning，但 TUI 只显示最终回答；切换协议或模型后会使用新的 Reasoning 上下文。
+
+
+`openai_chat` 不保留厂商扩展的 Reasoning；依赖这类上下文的模型建议使用 `openai_responses` 或 `anthropic`。Anthropic Thinking 的开关与预算配置见 [配置参数](config_parameters.md)。
 
 `agent_id` 只能使用小写字母、数字、`_` 和 `-`，在团队内应保持唯一。它还决定本地数据目录，开始使用后不要随意修改。
 
@@ -110,7 +117,7 @@ acn
 
 ## Agent Upstream 与持久文件
 
-`upstream` 是 Agent 侧的一份运行与团队连接配置：它决定 Agent 身份、Router/Maintainer 地址、团队凭据来源和本地私有数据目录。名称只是本机别名，不是服务端团队 ID；Router 和 Maintainer 共同提供团队服务，但它们自身不选择 upstream。两个 endpoint 都留空时，这份配置对应单人模式。
+`upstream` 是 Agent 侧的一份运行与团队连接配置：它决定 Agent 身份、Router/Maintainer 地址、团队凭据来源和本地私有数据目录。名称只是本机别名，不是服务端团队 ID。两个 endpoint 都留空时，这份配置对应单人模式。
 
 顶层 `upstream` 决定 Agent 默认使用哪组 `[upstreams.<name>]`。也可以在启动时临时选择：
 
@@ -215,6 +222,19 @@ acn mcp add linear \
   --bearer-token-env-var LINEAR_API_KEY
 ```
 
+添加并登录 OAuth server：
+
+```bash
+acn mcp add oauth-server --url https://example.com/mcp
+acn mcp login oauth-server
+```
+
+常用可选项：
+
+- 服务方提供预注册 public client ID 时，添加 server 时传入 `--oauth-client-id <id>`。
+- SSH/headless 环境添加 server 时传入 `--oauth-credentials-store file`，登录时使用 `--no-browser`。
+- 服务方要求固定 redirect URI 时，添加 server 时传入 `--oauth-callback-port <port>`。
+
 添加单个 JSON 配置：
 
 ```bash
@@ -246,14 +266,20 @@ acn mcp status my-server
 acn mcp disable my-server
 acn mcp enable my-server
 acn mcp remove my-server
+acn mcp login my-server
+acn mcp login my-server --no-browser
+acn mcp logout my-server
 ```
 
 注意：
 
 - `-e KEY=VALUE` 会把值写入 `.mcp.json`，不要用于敏感 token。
 - stdio server 继承 ACN 进程权限，只添加可信命令。
-- 当前支持 stdio 与 Streamable HTTP；不支持 OAuth 登录、浏览器授权回调、SSE transport、自定义 HTTP headers 和 MCP elicitation。
-- 外部修改 `.mcp.json` 后需要重启 TUI。TUI 内启用或禁用 server 会持久化 `enabled` 字段。
+- bearer 与 OAuth 配置互斥；bearer server 不需要执行 `mcp login`。
+- OAuth access token 会在 MCP 调用前按授权服务器返回的有效期自动刷新；静态 bearer token 不会由 ACN 刷新。登录失效或修改 `--oauth-client-id` 后，重新执行 `acn mcp login <name>`。
+- `acn mcp logout <name>` 删除本地 OAuth 凭据；`remove` 同时删除配置和对应的本地凭据。
+- 当前不支持旧版独立 SSE transport、自定义 HTTP headers、OAuth client secret、device flow、MCP Tasks 与 MCP elicitation；Streamable HTTP 返回的 SSE event stream 正常支持。
+- `.mcp.json` 不会自动热加载；修改已有 server 后可在 `/mcp` 中 Reconnect，新增、删除或重命名 server 需要重启 TUI 后生效。
 
 ## 后台进程
 
@@ -270,6 +296,7 @@ acn mcp remove my-server
 ```bash
 acn supervisor status
 acn supervisor jobs
+acn supervisor retry <session_id>
 ```
 
 停止 supervisor：
@@ -278,7 +305,9 @@ acn supervisor jobs
 acn supervisor stop
 ```
 
-使用自定义 `--config` 或 `--upstream` 启动时，查询 supervisor 也应传相同参数。
+使用自定义 `--config` 或 `--upstream` 启动时，管理 supervisor 也应传相同参数。
+
+失败的 finalize 可按 session ID 重试，也可使用 `jobs` 显示的 job ID；若 session 已进入 `Finalizing` 但尚未创建 job，也可用 session ID 恢复。配置、相关凭据或 ACN 版本变化后，下次启动对应 upstream 时会自动接管旧 supervisor 并继续未完成任务。supervisor 连续空闲 5 分钟后会自行退出。
 
 ## 会话维护与更新
 
@@ -290,9 +319,7 @@ acn session cleanup
 acn session cleanup --apply
 ```
 
-`update` 默认从 `https://github.com/FTShare-Lab/agent-claim-network.git` 更新 Cargo 安装的 `acn`、`acn-router` 和 `acn-maintainer`；`--url` 用于临时改为其他可信的 ACN Git 仓库。不传 `--branch` 时默认拉取 `main` branch。该命令会核对 Cargo 的安装记录，不修改 Homebrew Cellar；Homebrew 安装使用 `brew upgrade acn`。
-
-无论通过 Cargo 还是 Homebrew 替换 binary，新版 ACN 第一次需要 supervisor 时都会比较版本与构建提交。旧版或构建不一致的 supervisor 会在确认 PID 身份后被终止，其持久化 job 由新版 supervisor 恢复；运行中的 finalize 最多消耗一次重试机会。
+`acn update` 用于更新 Cargo 安装，`--url` 可临时指定其他可信仓库；Homebrew 安装请使用 `brew upgrade acn`。升级后 ACN 会自动更新后台 supervisor，并继续处理待完成任务。
 
 `session cleanup` 默认只预览；加 `--apply` 才会删除符合保留期与状态条件的旧 session。
 

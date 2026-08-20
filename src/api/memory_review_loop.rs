@@ -4,15 +4,20 @@
 //! 和 canonical tool_use 消息，但只暴露并执行 `memory` 工具，不写 session history。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use serde_json::{json, Value};
 
 use crate::api::{
-    MemoryReviewRequest, ProviderAdapter, ProviderEvent, ProviderRequest, ProviderResponse,
-    ProviderStop, SessionTurnContentBlock, SessionTurnMessage, ToolExecutionOutcome, ToolSpec,
+    send_buffered_with_fallback, BufferedProviderRuntime, MemoryReviewRequest, ProviderAdapter,
+    ProviderRequest, ProviderResponse, ProviderRuntimeFallbackScope, ProviderStop,
+    ProviderStreamOutputMode, SessionTurnContentBlock, SessionTurnMessage, ToolExecutionOutcome,
+    ToolSpec,
 };
 use crate::tool::ToolRegistry;
+
+use super::provider::ProviderNoConsumableOutput;
 
 /// 后台记忆审阅的独立内部 tool 回环上限，不对用户配置开放。
 pub const MEMORY_REVIEW_MAX_TOOL_LOOP_TURNS: usize = 32;
@@ -22,6 +27,9 @@ pub struct MemoryReviewLoop {
     tools: Arc<ToolRegistry>,
     max_turns: usize,
     max_tokens: u32,
+    retry_count: u32,
+    retry_base_delay: Duration,
+    retry_max_delay: Duration,
 }
 
 impl MemoryReviewLoop {
@@ -30,12 +38,18 @@ impl MemoryReviewLoop {
         tools: Arc<ToolRegistry>,
         max_turns: usize,
         max_tokens: u32,
+        retry_count: u32,
+        retry_base_delay: Duration,
+        retry_max_delay: Duration,
     ) -> Self {
         Self {
             provider,
             tools,
             max_turns,
             max_tokens,
+            retry_count,
+            retry_base_delay,
+            retry_max_delay,
         }
     }
 
@@ -43,6 +57,17 @@ impl MemoryReviewLoop {
         &self,
         request: MemoryReviewRequest,
         review_prompt: String,
+    ) -> anyhow::Result<()> {
+        let root = ProviderRuntimeFallbackScope::new_root();
+        self.run_with_scope(request, review_prompt, root.new_child())
+            .await
+    }
+
+    pub async fn run_with_scope(
+        &self,
+        request: MemoryReviewRequest,
+        review_prompt: String,
+        fallback_scope: ProviderRuntimeFallbackScope,
     ) -> anyhow::Result<()> {
         if self.max_turns == 0 {
             anyhow::bail!("review_memory max_turns 必须大于 0");
@@ -58,10 +83,11 @@ impl MemoryReviewLoop {
 
         let mut messages = request.transcript;
         messages.push(SessionTurnMessage::user_text(review_prompt));
+        let runtime = BufferedProviderRuntime::new(fallback_scope);
 
         for turn_idx in 0..self.max_turns {
             let provider_response = self
-                .call_provider(&request.system_prompt, &messages, &memory_tools)
+                .call_provider(&request.system_prompt, &messages, &memory_tools, &runtime)
                 .await?;
             let assistant_message = provider_response.assistant_message;
             validate_assistant_message(&assistant_message)?;
@@ -78,13 +104,22 @@ impl MemoryReviewLoop {
                     ProviderStop::MaxTokens => {
                         anyhow::bail!("review_memory provider stop=MaxTokens，无法安全完成")
                     }
+                    ProviderStop::ContextWindowExceeded => {
+                        anyhow::bail!("Memory review 上下文已满，本次后台整理已停止。")
+                    }
                 };
             }
 
-            if provider_response.stop == ProviderStop::MaxTokens {
-                anyhow::bail!(
-                    "review_memory provider stop=MaxTokens 且包含 ToolUse，拒绝执行半截工具调用"
-                );
+            match provider_response.stop {
+                ProviderStop::MaxTokens => {
+                    anyhow::bail!(
+                        "review_memory provider stop=MaxTokens 且包含 ToolUse，拒绝执行半截工具调用"
+                    );
+                }
+                ProviderStop::ContextWindowExceeded => {
+                    anyhow::bail!("Memory review 上下文已满，本次后台整理已停止，未执行工具。");
+                }
+                ProviderStop::Done | ProviderStop::ToolUse => {}
             }
             if turn_idx + 1 == self.max_turns {
                 anyhow::bail!("review_memory 达到最大 tool 循环轮数: {}", self.max_turns);
@@ -102,6 +137,7 @@ impl MemoryReviewLoop {
             }
             messages.push(SessionTurnMessage {
                 role: "user".into(),
+                provider_replay: None,
                 content: tool_results,
             });
         }
@@ -123,21 +159,72 @@ impl MemoryReviewLoop {
         system_prompt: &str,
         messages: &[SessionTurnMessage],
         tools: &[ToolSpec],
+        runtime: &BufferedProviderRuntime,
     ) -> anyhow::Result<ProviderResponse> {
-        let mut emit = |_event: ProviderEvent| {};
-        self.provider
-            .send(
-                ProviderRequest {
-                    system_prompt: system_prompt.to_string(),
-                    messages: messages.to_vec(),
-                    tools: tools.to_vec(),
-                    max_tokens: self.max_tokens,
-                    stream: false,
-                    retry_count_override: None,
-                },
-                &mut emit,
-            )
-            .await
+        let mut request = ProviderRequest {
+            system_prompt: system_prompt.to_string(),
+            messages: messages.to_vec(),
+            tools: tools.to_vec(),
+            max_tokens: self.max_tokens,
+            stream: true,
+            stream_output_mode: ProviderStreamOutputMode::Buffered,
+            runtime_chain_id: Some(runtime.chain_id),
+            runtime_fallback_scope: Some(runtime.fallback_scope.clone()),
+            recovery_interrupt: None,
+            retry_count_override: None,
+        };
+        let mut attempt = 0;
+        loop {
+            let result = if request.stream {
+                send_buffered_with_fallback(&self.provider, request.clone()).await
+            } else {
+                let mut noop = |_event: crate::api::ProviderEvent| {};
+                self.provider.send(request.clone(), &mut noop).await
+            };
+            match result {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    let Some(no_output) = error.downcast_ref::<ProviderNoConsumableOutput>() else {
+                        return Err(error);
+                    };
+                    let transport = no_output.transport();
+                    if transport.is_streaming() {
+                        self.provider.discard_runtime_chain(runtime.chain_id).await;
+                    }
+                    if attempt >= self.retry_count {
+                        return Err(error);
+                    }
+                    log::warn!(
+                        target: "api",
+                        "background memory review 没有可消费输出，使用相同 transport 原样重试 ({}/{}): transport={}; {error:#}",
+                        attempt + 1,
+                        self.retry_count,
+                        transport
+                    );
+                    request.stream = transport.is_streaming();
+                    request.runtime_chain_id = request.stream.then_some(runtime.chain_id);
+                    request.runtime_fallback_scope = request
+                        .stream
+                        .then(|| transport.retry_fallback_scope(&runtime.fallback_scope));
+                    let delay = self.retry_delay(attempt);
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    fn retry_delay(&self, attempt: u32) -> Duration {
+        let multiplier = if attempt >= u32::BITS {
+            u32::MAX
+        } else {
+            1_u32 << attempt
+        };
+        self.retry_base_delay
+            .saturating_mul(multiplier)
+            .min(self.retry_max_delay)
     }
 }
 
@@ -152,12 +239,14 @@ fn validate_assistant_message(message: &SessionTurnMessage) -> anyhow::Result<()
     if message.role != "assistant" {
         anyhow::bail!("provider response role 必须是 assistant: {}", message.role);
     }
-    if message
-        .content
-        .iter()
-        .any(|block| matches!(block, SessionTurnContentBlock::ToolResult { .. }))
-    {
-        anyhow::bail!("assistant message 不允许包含 ToolResult block");
+    if message.content.iter().any(|block| {
+        matches!(
+            block,
+            SessionTurnContentBlock::ToolResult { .. }
+                | SessionTurnContentBlock::ModelContext { .. }
+        )
+    }) {
+        anyhow::bail!("assistant message 不允许包含 ToolResult 或 ModelContext block");
     }
     Ok(())
 }
@@ -224,13 +313,15 @@ mod tests {
 
     use super::*;
     use crate::agent::fs::LocalFsMemoryStore;
+    use crate::api::provider::ProviderTransport;
     use crate::api::{ProviderEvent, ProviderResponse};
     use crate::config::{ToolConfig, DEFAULT_MEMORY_CHAR_LIMIT, DEFAULT_USER_CHAR_LIMIT};
     use crate::tool::ToolRegistry;
 
     struct RecordingProvider {
         requests: Arc<Mutex<Vec<ProviderRequest>>>,
-        responses: Mutex<VecDeque<ProviderResponse>>,
+        responses: Mutex<VecDeque<anyhow::Result<ProviderResponse>>>,
+        discarded_chains: Arc<Mutex<Vec<crate::api::ProviderRuntimeChainId>>>,
     }
 
     #[async_trait]
@@ -245,7 +336,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pop_front()
-                .ok_or_else(|| anyhow::anyhow!("missing test response"))
+                .unwrap_or_else(|| anyhow::bail!("missing test response"))
+        }
+
+        async fn discard_runtime_chain(&self, chain_id: crate::api::ProviderRuntimeChainId) {
+            self.discarded_chains.lock().unwrap().push(chain_id);
         }
     }
 
@@ -255,9 +350,10 @@ mod tests {
         let provider: Arc<dyn ProviderAdapter> = Arc::new(RecordingProvider {
             requests: requests.clone(),
             responses: Mutex::new(VecDeque::from([
-                ProviderResponse {
+                Ok(ProviderResponse {
                     assistant_message: SessionTurnMessage {
                         role: "assistant".into(),
+                        provider_replay: None,
                         content: vec![SessionTurnContentBlock::ToolUse {
                             id: "toolu_file_1".into(),
                             name: "file_read".into(),
@@ -265,12 +361,13 @@ mod tests {
                         }],
                     },
                     stop: ProviderStop::ToolUse,
-                },
-                ProviderResponse {
+                }),
+                Ok(ProviderResponse {
                     assistant_message: SessionTurnMessage::assistant_text("Nothing to save."),
                     stop: ProviderStop::Done,
-                },
+                }),
             ])),
+            discarded_chains: Arc::new(Mutex::new(Vec::new())),
         });
         let home = tempfile::tempdir().unwrap();
         let memory_store = Arc::new(LocalFsMemoryStore::new(
@@ -284,7 +381,8 @@ mod tests {
                 .unwrap()
                 .with_memory_store(memory_store),
         );
-        let review_loop = MemoryReviewLoop::new(provider, tools, 4, 1024);
+        let review_loop =
+            MemoryReviewLoop::new(provider, tools, 4, 1024, 1, Duration::ZERO, Duration::ZERO);
 
         review_loop
             .run(
@@ -299,7 +397,11 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert!(!requests[0].stream);
+        assert!(requests[0].stream);
+        assert_eq!(
+            requests[0].stream_output_mode,
+            ProviderStreamOutputMode::Buffered
+        );
         assert_eq!(requests[0].tools.len(), 1);
         assert_eq!(requests[0].tools[0].name, "memory");
         let last = requests[1].messages.last().unwrap();
@@ -309,5 +411,58 @@ mod tests {
         };
         assert!(content.contains("background memory review 禁止调用非 memory 工具"));
         assert!(content.contains("file_read"));
+    }
+
+    #[tokio::test]
+    async fn memory_review_retries_reasoning_only_round_with_unchanged_request() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let discarded_chains = Arc::new(Mutex::new(Vec::new()));
+        let provider: Arc<dyn ProviderAdapter> = Arc::new(RecordingProvider {
+            requests: requests.clone(),
+            responses: Mutex::new(VecDeque::from([
+                Err(ProviderNoConsumableOutput::new(
+                    ProviderTransport::ResponsesSse,
+                    "stream reasoning only",
+                )
+                .into()),
+                Ok(ProviderResponse {
+                    assistant_message: SessionTurnMessage::assistant_text("Nothing to save."),
+                    stop: ProviderStop::Done,
+                }),
+            ])),
+            discarded_chains: discarded_chains.clone(),
+        });
+        let home = tempfile::tempdir().unwrap();
+        let memory_store = Arc::new(LocalFsMemoryStore::new(
+            home.path().to_path_buf(),
+            DEFAULT_MEMORY_CHAR_LIMIT,
+            DEFAULT_USER_CHAR_LIMIT,
+            false,
+        ));
+        let tools = Arc::new(
+            ToolRegistry::new(&ToolConfig::default())
+                .unwrap()
+                .with_memory_store(memory_store),
+        );
+        let review_loop =
+            MemoryReviewLoop::new(provider, tools, 4, 1024, 1, Duration::ZERO, Duration::ZERO);
+
+        review_loop
+            .run(
+                MemoryReviewRequest {
+                    system_prompt: "review system".into(),
+                    transcript: vec![SessionTurnMessage::user_text("hello")],
+                },
+                "review prompt".into(),
+            )
+            .await
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].stream);
+        assert!(requests[1].stream);
+        assert_eq!(requests[0].messages, requests[1].messages);
+        assert_eq!(discarded_chains.lock().unwrap().len(), 1);
     }
 }
