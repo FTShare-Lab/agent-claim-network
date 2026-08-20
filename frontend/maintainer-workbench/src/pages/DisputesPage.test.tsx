@@ -185,32 +185,49 @@ const resolvedDetail: DisputeDetail = {
     observed_at: '2026-05-15T12:30:00Z',
     summary: {
       notified_holders: 5,
-      delivered: 4,
-      converged: 1,
-      diverged: 1,
-      unobserved: 1,
-      unknown: 1,
+      delivered_holders: 4,
+      updated_claims: 1,
+      unchanged_claims: 1,
+      unavailable_claims: 1,
     },
     holders: [
       {
-        agent_id: 'agent-converged',
+        agent_id: 'agent-unchanged',
         delivery_state: 'delivered',
-        observation_state: 'observed_converged',
-        assessment_count: 1,
-        matched_count: 1,
-        reasons: ['The holder mirror matches the recommendation.'],
+        observation_state: 'no_update_observed',
+        claim_count: 1,
+        updated_claim_count: 0,
+        unchanged_claim_count: 1,
+        unavailable_claim_count: 0,
+        reasons: [],
         last_delivered_at: '2026-05-15T11:10:00Z',
         last_observed_at: '2026-05-15T12:30:00Z',
-        claims: [],
-        technical: { policy_id: 'policy_resolution', inbox_id: 'inbox_converged' },
+        claims: [{
+          claim_id: 'claim_b',
+          claim_name: 'claim-b-name',
+          snapshot_status: 'active',
+          snapshot_scope: 'payments',
+          snapshot_statement: 'claim b statement',
+          recommended_status: 'deprecated',
+          current_status: 'active',
+          current_scope: 'payments',
+          current_statement: 'claim b statement',
+          policy_provenance_present: false,
+          update_observed: false,
+          changed_fields: [],
+          notes: [],
+        }],
+        technical: { policy_id: 'policy_resolution', inbox_id: 'inbox_unchanged' },
       },
       {
-        agent_id: 'agent-diverged',
+        agent_id: 'agent-updated',
         delivery_state: 'delivered',
-        observation_state: 'observed_diverged',
-        assessment_count: 1,
-        matched_count: 0,
-        reasons: ['The holder updated the Claim but retained a different operational boundary.'],
+        observation_state: 'update_observed',
+        claim_count: 1,
+        updated_claim_count: 1,
+        unchanged_claim_count: 0,
+        unavailable_claim_count: 0,
+        reasons: [],
         last_delivered_at: '2026-05-15T11:12:00Z',
         last_observed_at: '2026-05-15T12:30:00Z',
         claims: [{
@@ -226,8 +243,9 @@ const resolvedDetail: DisputeDetail = {
           recommended_statement: longSnapshotStatement,
           current_statement: longCurrentStatement,
           policy_provenance_present: false,
-          matches: false,
-          mismatch_reasons: ['Status, scope, statement, and provenance do not match the recommendation.'],
+          update_observed: true,
+          changed_fields: ['scope', 'statement'],
+          notes: [],
         }],
         technical: {
           policy_id: 'policy_resolution',
@@ -236,21 +254,25 @@ const resolvedDetail: DisputeDetail = {
         },
       },
       {
-        agent_id: 'agent-unobserved',
+        agent_id: 'agent-no-update',
         delivery_state: 'delivered',
-        observation_state: 'delivered_unobserved',
-        assessment_count: 1,
-        matched_count: 0,
-        reasons: ['No ACK-after-update mirror is visible.'],
+        observation_state: 'no_update_observed',
+        claim_count: 0,
+        updated_claim_count: 0,
+        unchanged_claim_count: 0,
+        unavailable_claim_count: 0,
+        reasons: [],
         claims: [],
-        technical: { policy_id: 'policy_resolution', inbox_id: 'inbox_unobserved' },
+        technical: { policy_id: 'policy_resolution', inbox_id: 'inbox_no_update' },
       },
       {
         agent_id: 'agent-unknown',
         delivery_state: 'delivered',
         observation_state: 'unknown',
-        assessment_count: 1,
-        matched_count: 0,
+        claim_count: 1,
+        updated_claim_count: 0,
+        unchanged_claim_count: 0,
+        unavailable_claim_count: 1,
         reasons: ['The holder mirror is missing or duplicated.'],
         claims: [],
         technical: { policy_id: 'policy_resolution', inbox_id: 'inbox_unknown' },
@@ -259,8 +281,10 @@ const resolvedDetail: DisputeDetail = {
         agent_id: 'agent-not-delivered',
         delivery_state: 'not_delivered',
         observation_state: 'not_delivered',
-        assessment_count: 1,
-        matched_count: 0,
+        claim_count: 0,
+        updated_claim_count: 0,
+        unchanged_claim_count: 0,
+        unavailable_claim_count: 0,
         reasons: ['The inbox has not been acknowledged.'],
         claims: [],
         technical: { policy_id: 'policy_resolution', inbox_id: 'inbox_not_delivered' },
@@ -311,7 +335,7 @@ function buildFetch(overrides?: {
     }
     if (path === '/api/disputes/dispute_resolved/analyses' && method === 'GET') {
       return new Response(JSON.stringify({
-        current_analysis: resolvedDetail.current_analysis,
+        current_analysis: overrides?.resolvedDetail?.current_analysis ?? resolvedDetail.current_analysis,
       }))
     }
     const analysisMatch = path.match(/^\/api\/disputes\/dispute_(open|resolved)\/analyses\/([^/]+)$/)
@@ -320,7 +344,7 @@ function buildFetch(overrides?: {
       const analysis = [
         unresolvedAnalysis,
         approvedAnalysis,
-        resolvedDetail.current_analysis!,
+        overrides?.resolvedDetail?.current_analysis ?? resolvedDetail.current_analysis!,
       ].find((item) => item.analysis_id === analysisId)
       if (!analysis) return new Response('analysis not found', { status: 404 })
       return new Response(JSON.stringify(analysisDetail(analysis)))
@@ -553,6 +577,33 @@ describe('DisputesPage', () => {
     fireEvent.click(analysisToggle)
     expect(collapsedAnalysis).toHaveAttribute('open')
     expect(within(drawer).getByRole('article', { name: 'Current analysis analysis_resolved' })).toBeInTheDocument()
+    expect(within(drawer).getByText('Historical analysis')).toBeInTheDocument()
+  })
+
+  it('never presents a resolved analysis as an active reanalysis wait', async () => {
+    const waitingResolvedDetail: DisputeDetail = {
+      ...resolvedDetail,
+      current_analysis: {
+        ...resolvedDetail.current_analysis!,
+        state: 'waiting_reanalysis',
+        analysis_round: 2,
+        context_change_count: 1,
+        next_retry_at: '2026-05-15T11:09:00Z',
+        context_change_reason: 'The analysis input changed.',
+      },
+    }
+    vi.stubGlobal('fetch', buildFetch({ resolvedDetail: waitingResolvedDetail }))
+    render(renderWorkbenchRoute('/disputes'))
+    fireEvent.click(await screen.findByText('Already resolved'))
+    const drawer = await screen.findByRole('dialog', { name: 'Already resolved' })
+    const analysisToggle = await within(drawer).findByText('View analysis process')
+
+    expect(analysisToggle).not.toHaveTextContent('waiting reanalysis')
+    fireEvent.click(analysisToggle)
+    const analysis = await within(drawer).findByRole('article', { name: 'Current analysis analysis_resolved' })
+    expect(analysis).toHaveTextContent('Historical analysis')
+    expect(analysis).not.toHaveTextContent('等待 5 分钟后重新分析')
+    expect(analysis).not.toHaveTextContent('下次重试')
   })
 
   it('summarizes observed updates without scoring recommendation compliance', async () => {
@@ -560,20 +611,20 @@ describe('DisputesPage', () => {
     fireEvent.click(await screen.findByText('Already resolved'))
     const panel = await screen.findByRole('region', { name: 'Delivery and holder adoption' })
 
-    await waitFor(() => expect(panel).toHaveTextContent('Notified5'))
+    await waitFor(() => expect(panel).toHaveTextContent('Notified holders5'))
     expect(panel).toHaveClass('border-amber-700', 'bg-amber-50/40')
-    expect(panel).toHaveTextContent('Delivered4')
-    expect(panel).toHaveTextContent('Observed updates2')
-    expect(panel).toHaveTextContent('Awaiting update1')
-    expect(panel).toHaveTextContent('Mirror unavailable1')
+    expect(panel).toHaveTextContent('Delivered holders4')
+    expect(panel).toHaveTextContent('Updated Claims1')
+    expect(panel).toHaveTextContent('Unchanged Claims1')
+    expect(panel).toHaveTextContent('Unavailable Claims1')
     expect(panel).not.toHaveTextContent('Converged')
     expect(panel).not.toHaveTextContent('Diverged')
-    expect(within(panel).queryByText('agent-diverged')).not.toBeInTheDocument()
+    expect(within(panel).queryByText('agent-updated')).not.toBeInTheDocument()
 
     fireEvent.click(within(panel).getByRole('button', { name: 'Show holder adoption' }))
-    expect(within(panel).getByText('Awaiting delivery')).toBeInTheDocument()
-    expect(within(panel).getByText('Delivered, awaiting Agent update')).toBeInTheDocument()
-    expect(within(panel).getAllByText('Agent update observed')).toHaveLength(2)
+    expect(within(panel).getAllByText('Not delivered')).not.toHaveLength(0)
+    expect(within(panel).getAllByText('No update observed')).not.toHaveLength(0)
+    expect(within(panel).getByText('Update observed')).toBeInTheDocument()
     expect(within(panel).getByText('Claim mirror unavailable')).toBeInTheDocument()
   })
 
@@ -581,14 +632,14 @@ describe('DisputesPage', () => {
     render(renderWorkbenchRoute('/disputes'))
     fireEvent.click(await screen.findByText('Already resolved'))
     const panel = await screen.findByRole('region', { name: 'Delivery and holder adoption' })
-    await waitFor(() => expect(panel).toHaveTextContent('Notified5'))
+    await waitFor(() => expect(panel).toHaveTextContent('Notified holders5'))
     fireEvent.click(within(panel).getByRole('button', { name: 'Show holder adoption' }))
-    const holder = within(panel).getByRole('article', { name: 'Holder adoption agent-diverged' })
+    const holder = within(panel).getByRole('article', { name: 'Holder adoption agent-updated' })
 
-    fireEvent.click(within(holder).getByText('Before / after (1)'))
+    fireEvent.click(within(holder).getByText('Resolution snapshot / current mirror (1)'))
     const comparison = within(holder).getByRole('article', { name: 'Claim adoption claim_a' })
-    expect(comparison).toHaveTextContent('Before · Resolution snapshot')
-    expect(comparison).toHaveTextContent('After · Current Agent Claim')
+    expect(comparison).toHaveTextContent('At Resolution')
+    expect(comparison).toHaveTextContent('Current Mirror')
     expect(comparison).toHaveTextContent('payments / previous')
     expect(comparison).toHaveTextContent('payments / legacy')
     expect(comparison).not.toHaveTextContent('Recommended status')
@@ -611,7 +662,7 @@ describe('DisputesPage', () => {
     render(renderWorkbenchRoute('/disputes'))
     fireEvent.click(await screen.findByText('Already resolved'))
     const panel = await screen.findByRole('region', { name: 'Delivery and holder adoption' })
-    expect(panel).toHaveTextContent('Notified0')
+    expect(panel).toHaveTextContent('Notified holders0')
     fireEvent.click(within(panel).getByRole('button', { name: 'Show holder adoption' }))
     expect(panel).toHaveTextContent('No holder delivery or adoption data is available.')
     expect(panel).not.toHaveTextContent('{')
@@ -621,12 +672,13 @@ describe('DisputesPage', () => {
     render(renderWorkbenchRoute('/disputes'))
     fireEvent.click(await screen.findByText('Scope mismatch'))
     fireEvent.change(await screen.findByLabelText('Resolve Note'), { target: { value: '  Human conclusion.  ' } })
+    expect(screen.getByRole('checkbox', { name: /Notify Affected Agents/ })).toBeChecked()
     fireEvent.click(screen.getByRole('button', { name: 'Resolve Dispute' }))
     await waitFor(() => expect(fetch).toHaveBeenCalledWith(
       '/disputes/dispute_open/resolve',
       expect.objectContaining({
         method: 'POST',
-        body: JSON.stringify({ resolve_note: 'Human conclusion.', notify_affected_agents: false }),
+        body: JSON.stringify({ resolve_note: 'Human conclusion.', notify_affected_agents: true }),
       }),
     ))
 

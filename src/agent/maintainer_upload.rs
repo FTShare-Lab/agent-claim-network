@@ -160,6 +160,7 @@ impl AgentRunner {
         let mut rejected_failures = 0usize;
         let mut rejected_sample: Option<String> = None;
         let mut conflicting_dispute_ids = Vec::new();
+        let mut deprecated_direct_claim_conflicts = 0usize;
 
         let mut claim_results =
             futures::stream::iter(attempted.claims.clone().into_iter().map(|claim| {
@@ -234,7 +235,11 @@ impl AgentRunner {
                         failed.disputes.push(dispute);
                     }
                     UploadErrorKind::Conflict => {
-                        conflicting_dispute_ids.push(dispute.id.to_string());
+                        if is_deprecated_direct_claim_conflict(&err) {
+                            deprecated_direct_claim_conflicts += 1;
+                        } else {
+                            conflicting_dispute_ids.push(dispute.id.to_string());
+                        }
                     }
                     // 其他 client/未知错误继续保留本地待传并记 warning，绝不中断会话。
                     UploadErrorKind::Client | UploadErrorKind::Unknown => {
@@ -286,6 +291,11 @@ impl AgentRunner {
             warnings.push(format!(
                 "{} dispute report(s) already exist in the team with the same ID. The team version was kept, so no action is needed.",
                 conflicting_dispute_ids.len()
+            ));
+        }
+        if deprecated_direct_claim_conflicts > 0 {
+            warnings.push(format!(
+                "Maintainer rejected {deprecated_direct_claim_conflicts} dispute report(s) because a direct Claim is deprecated. They were not queued for retry."
             ));
         }
         if rejected_failures > 0 {
@@ -343,6 +353,14 @@ fn classify_upload_error(err: &anyhow::Error) -> UploadErrorKind {
         Some(MaintainerClientError::Client { .. }) => UploadErrorKind::Client,
         Some(_) | None => UploadErrorKind::Unknown,
     }
+}
+
+fn is_deprecated_direct_claim_conflict(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<MaintainerClientError>(),
+        Some(MaintainerClientError::Client { status: 409, body, .. })
+            if body.contains("deprecated direct claim")
+    )
 }
 
 fn upload_error_timeout_secs(err: &anyhow::Error) -> Option<u64> {
@@ -500,10 +518,12 @@ mod tests {
         auth_error_disputes: Mutex<BTreeSet<String>>,
         forbidden_disputes: Mutex<BTreeSet<String>>,
         conflicting_disputes: Mutex<BTreeSet<String>>,
+        deprecated_direct_claim_disputes: Mutex<BTreeSet<String>>,
         client_error_claims: Mutex<BTreeSet<String>>,
         unknown_error_claims: Mutex<BTreeSet<String>>,
         uploaded_claims: Mutex<Vec<String>>,
         uploaded_disputes: Mutex<Vec<String>>,
+        reported_dispute_attempts: Mutex<Vec<String>>,
         pending_path_to_observe: Mutex<Option<PathBuf>>,
         observed_write_ahead: Mutex<bool>,
         pull_retryable: Mutex<bool>,
@@ -601,6 +621,10 @@ mod tests {
 
         async fn report_dispute(&self, dispute: &Dispute) -> anyhow::Result<()> {
             let id = dispute.id.to_string();
+            self.reported_dispute_attempts
+                .lock()
+                .unwrap()
+                .push(id.clone());
             if self.auth_error_disputes.lock().unwrap().contains(&id) {
                 return Err(MaintainerClientError::Auth {
                     operation: "disputes/report".into(),
@@ -621,6 +645,19 @@ mod tests {
                     operation: "disputes/report".into(),
                     status: 409,
                     body: "dispute payload conflict".into(),
+                }
+                .into());
+            }
+            if self
+                .deprecated_direct_claim_disputes
+                .lock()
+                .unwrap()
+                .contains(&id)
+            {
+                return Err(MaintainerClientError::Client {
+                    operation: "disputes/report".into(),
+                    status: 409,
+                    body: "deprecated direct claim".into(),
                 }
                 .into());
             }
@@ -1376,6 +1413,49 @@ mod tests {
             .unwrap();
         assert_eq!(repeated, MaintainerUploadReport::default());
         assert!(!fs::try_exists(path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn upload_batch_drops_deprecated_direct_claim_dispute_without_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let maintainer = Arc::new(TestMaintainerClient::default());
+        let runner = build_runner(&dir, maintainer.clone());
+        let rejected = dispute("dispute_66666666", "2026-06-22T00:00:00Z");
+        maintainer
+            .deprecated_direct_claim_disputes
+            .lock()
+            .unwrap()
+            .insert(rejected.id.to_string());
+
+        let report = runner
+            .upload_maintainer_batch(Vec::new(), vec![rejected.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(report.pending_disputes, 0);
+        let warning = report.warning.unwrap();
+        assert!(warning.contains("direct Claim is deprecated"));
+        assert!(warning.contains("not queued for retry"));
+        assert_eq!(
+            maintainer
+                .reported_dispute_attempts
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &[rejected.id.to_string()]
+        );
+        let pending_path = paths::agent_home_pending_maintainer_uploads_path(dir.path());
+        assert!(!fs::try_exists(&pending_path).await.unwrap());
+
+        let repeated = runner
+            .upload_maintainer_batch(Vec::new(), Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(repeated, MaintainerUploadReport::default());
+        assert_eq!(
+            maintainer.reported_dispute_attempts.lock().unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]

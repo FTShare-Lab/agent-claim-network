@@ -120,18 +120,6 @@ pub fn team_store_arbitrations_dir(team_root: &Path) -> PathBuf {
     team_root.join("maintainer").join("arbitrations")
 }
 
-/// `team_root/maintainer/arbitrations/semantic-inputs.lock`：Claim、治理 Policy、
-/// Dispute 与 Resolution 写入同自动采用最终复核之间的跨进程协调锁。
-pub fn team_store_arbitration_semantic_inputs_lock_path(team_root: &Path) -> PathBuf {
-    team_store_arbitrations_dir(team_root).join("semantic-inputs.lock")
-}
-
-/// `team_root/maintainer/arbitrations/semantic-inputs-revision.yaml`：所有会改变
-/// 仲裁语义输入的写入在持锁时递增，用于 Adopt 的乐观两阶段复核。
-pub fn team_store_arbitration_semantic_inputs_revision_path(team_root: &Path) -> PathBuf {
-    team_store_arbitrations_dir(team_root).join("semantic-inputs-revision.yaml")
-}
-
 pub fn team_store_arbitration_dispute_dir(
     team_root: &Path,
     dispute_id: &crate::claim::DisputeId,
@@ -434,14 +422,6 @@ mod tests {
         assert_eq!(
             team_store_disputes_dir(&root),
             PathBuf::from("/tmp/team/maintainer/disputes")
-        );
-        assert_eq!(
-            team_store_arbitration_semantic_inputs_lock_path(&root),
-            PathBuf::from("/tmp/team/maintainer/arbitrations/semantic-inputs.lock")
-        );
-        assert_eq!(
-            team_store_arbitration_semantic_inputs_revision_path(&root),
-            PathBuf::from("/tmp/team/maintainer/arbitrations/semantic-inputs-revision.yaml")
         );
         assert_eq!(
             team_store_auth_keys_path(&root),

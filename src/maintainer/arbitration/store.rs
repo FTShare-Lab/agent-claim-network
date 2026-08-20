@@ -40,36 +40,6 @@ impl ArbitrationStore {
             .with_context(|| format!("获取 dispute 仲裁锁失败: {path:?}"))
     }
 
-    pub async fn lock_semantic_inputs(&self) -> anyhow::Result<FileLockGuard> {
-        let path = paths::team_store_arbitration_semantic_inputs_lock_path(&self.team_root);
-        FileLockGuard::lock_exclusive(&path)
-            .await
-            .with_context(|| format!("获取仲裁语义输入锁失败: {path:?}"))
-    }
-
-    /// 读取全局语义输入版本。旧 team root 没有版本文件时从 0 开始。
-    pub async fn read_semantic_inputs_revision(&self) -> anyhow::Result<u64> {
-        let path = paths::team_store_arbitration_semantic_inputs_revision_path(&self.team_root);
-        Ok(read_optional_yaml::<u64>(&path).await?.unwrap_or(0))
-    }
-
-    /// 调用方必须已经持有 semantic-inputs.lock；先递增版本再写权威数据，崩溃时
-    /// 最多产生一次保守的 context_changed/retry，不会漏掉已经发生的语义变化。
-    pub async fn bump_semantic_inputs_revision(
-        &self,
-        _guard: &FileLockGuard,
-    ) -> anyhow::Result<u64> {
-        let current = self.read_semantic_inputs_revision().await?;
-        let next = current
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("仲裁语义输入 revision 已耗尽"))?;
-        let path = paths::team_store_arbitration_semantic_inputs_revision_path(&self.team_root);
-        write_yaml_atomic(&path, &next)
-            .await
-            .with_context(|| format!("写仲裁语义输入 revision 失败: {path:?}"))?;
-        Ok(next)
-    }
-
     pub async fn read_dispute(
         &self,
         dispute_id: &DisputeId,
@@ -934,21 +904,6 @@ mod tests {
                 analysis_id: manual.analysis_id,
             }]
         );
-    }
-
-    #[tokio::test]
-    async fn semantic_input_revision_starts_at_zero_and_increments_under_lock() {
-        let root = tempfile::tempdir().unwrap();
-        let store = ArbitrationStore::new(root.path().to_path_buf());
-        assert_eq!(store.read_semantic_inputs_revision().await.unwrap(), 0);
-
-        let guard = store.lock_semantic_inputs().await.unwrap();
-        assert_eq!(
-            store.bump_semantic_inputs_revision(&guard).await.unwrap(),
-            1
-        );
-        drop(guard);
-        assert_eq!(store.read_semantic_inputs_revision().await.unwrap(), 1);
     }
 
     #[tokio::test]

@@ -25,6 +25,7 @@ Agent 会在团队 Claim 互相冲突、适用范围不清或发生生命周期�
 8. Maintainer 分析与 Agent 仲裁 inbox 都不读取 `MEMORY.md`、`USER.md`、session transcript、Trace 或工具上下文。
 9. Router 补充上下文通过现有 `RouterClient` 获取。
 10. Receipt ACK 表示 Agent 已安全持久化消息，不表示 Claim 已完成内化。
+11. 新 Dispute 首次上报时，任何 direct Claim 已在团队 mirror 中标记为 deprecated 都会被拒绝；相同 ID、相同原始内容的既有 Dispute 网络重放仍保持幂等。
 
 ## 术语
 
@@ -86,7 +87,7 @@ Dispute 上报只持久化 open Dispute。管理者可以：
 
 Analysis 由有界、单 consumer 的持久事件调度器处理。Analysis 先落盘，再进入队列；请求在两步之间取消时会唤醒持久恢复扫描。队列容量只限制内存工作集，持久状态是恢复依据。每个执行阶段使用 lease token fencing，完成的 Proposal 与 Verification 在恢复时复用。
 
-Current Analysis 被新的 Analyze 覆盖，或其 Dispute 被 Resolution 关闭时，执行中的 provider 调用会在短周期状态检查后被丢弃，不继续占用唯一 consumer；保存 Proposal、进入 Verification 和最终采用前都会再次确认 Analysis ID 与 open 状态。
+Current Analysis 被新的 Analyze 覆盖，或其 Dispute 被 Resolution 关闭时，执行中的 provider 调用会在短周期状态检查后被丢弃，不继续占用唯一 consumer；持久化的上下文等待与重分析等待同时转为审计终态并清除调度时间。启动恢复也会在 Router 或模型调用前完成该检查。保存 Proposal、进入 Verification 和最终采用前都会再次确认 Analysis ID 与 open 状态。
 
 ## 冻结上下文与稳定输入判定
 
@@ -154,9 +155,9 @@ direct mirror 暂未到齐时，Analysis 进入 `waiting_context` 并按有限�
 
 Adopt 只接受双阶段通过、resolution type 非 unresolved、状态为 approved 的当前 Analysis：
 
-1. 在短临界区读取 open Dispute、当前 Analysis 与 semantic-input revision。
+1. 在 per-dispute 临界区确认 open Dispute、当前 Analysis 和当前 Resolution。
 2. 锁外通过 RouterClient 构建当前上下文。
-3. 重新进入 per-dispute 与 semantic-input 临界区，复核 revision、Analysis ID、当前 Resolution 和稳定输入 fingerprint。
+3. 重新进入 per-dispute 临界区，复核 Analysis ID、当前 Resolution 和稳定输入 fingerprint。
 4. 输入一致时使用固定 Analysis 输出形成 Resolution 与稳定 delivery intent。
 5. 输入变化或 Resolution 已由其他操作提交时返回 409，并刷新 Workbench 当前数据。
 
@@ -177,27 +178,34 @@ Resolution 在提交前固定以下内容：
 固定锁顺序：
 
 ```text
-per-dispute lock → semantic-input 文件锁 → outbox 进程锁 → outbox 文件锁
+per-dispute lock → outbox 进程锁 → outbox 文件锁
 ```
 
 Resolution、Policy 和 outbox entry 都使用 create-or-verify 语义。相同 ID 和 immutable payload 幂等成功，不同 payload 报冲突。已经固定的人类 Resolution 优先于尚未提交的 Analysis。
 
-## Agent 仲裁 Inbox 内化
+## Agent Claim Attribute Update 内化
 
-带 `arbitration_resolution` 的 Claim Attribute Update 单条处理，不与普通 CAU 合批。一次专用结构化模型调用输入：
+普通建议、自动 Resolution、人工 Resolve 与 Reject & Replace 统一为 Claim Attribute Update。每条 CAU 单独处理，一次结构化模型调用输入：
 
 ```text
 agent_id
-arbitration_message
+claim_attribute_update
+conclusion
+resolution?
+dispute?
 local_claims
 direct_claims
 ```
 
-- `arbitration_message` 包含完整 Policy、Resolution、原始 Dispute 与 direct Claim 快照。
-- `local_claims` 是当前 Agent 全部非 deprecated 本地 Claim，并补入由当前 Agent 持有的任意 status direct Claim；这些 Claim 均可由当前 holder 修改。
-- `direct_claims` 是原 Dispute 的全部 direct Claim 快照，保留任意 status 与 holder。
+- `claim_attribute_update` 保留完整 inbox 消息和 Policy。
+- `conclusion` 始终存在；普通 CAU 取自 `policy.statement`，结构化 CAU 取自 Resolution conclusion。
+- `resolution` 与 `dispute` 按消息是否包含结构化治理结果提供；Resolution 保留 type、basis、assessment 等信息。
+- `local_claims` 是唯一可编辑集合：当前 Agent 全部非 deprecated 本地 Claim，加上由它持有的任意 status direct Claim。
+- `direct_claims` 是可选 Dispute 的全部 direct Claim 快照，保留任意 status 与 holder；其他 holder 的快照只读。
 
-该调用不读取 Memory、USER、session transcript 或工具上下文。模型先判断当前 Claim 是否已经符合 Resolution；已有等价、正确的非 deprecated 本地 Claim 时，不创建重复知识，错误 direct Claim可按 assessment 变为 deprecated；没有等价本地替代且属于同一知识单元时，优先原地更新 direct Claim；只有无法由现有 Claim 准确表达的独立、可复用知识单元才创建新 Claim。没有必要变更时可以保持不变，不能为了记录 Resolution 或提高可观察性而制造更新。模型也可在发现新的实质冲突时报告新 Dispute。后端校验输出 JSON、占位符、ID 格式、当前 holder、更新目标确实存在于本地输入，以及 Claim/Dispute 基本领域约束；Claim/Policy source ID 不从 Memory 或隐藏上下文派生。
+该调用不读取 Memory、USER、session transcript 或工具上下文。模型可以保持不变、更新 `local_claims` 中的对象、创建新 Claim，或在发现新的实质冲突时报告新 Dispute。存在 Resolution 时，模型先判断当前 Claim 是否已经符合结论；已有等价、正确的本地 Claim 时不创建重复知识，同一知识单元优先原地更新，只有明确存在正确承载对象时才将错误 direct Claim deprecated。不能为了记录 Resolution 或提高可观察性而制造更新。
+
+后端重新按 holder、status 与 direct Claim 集合构造编辑白名单，不信任模型对权限的理解：更新目标必须属于当前 Agent，且必须是非 deprecated 本地 Claim或当前 Dispute 的本地 direct Claim。Claim source 只允许输入中可见 Claim、它们已有的 Claim 来源和本批新 Claim；Policy source 只允许当前 CAU 及可见 Claim 中出现的 Policy；Dispute 只允许引用实际可见 Claim和本批新 Claim。仅作为历史来源出现的 Claim不能升格为 Dispute 对象，其他 holder 的 direct Claim不能更新。
 
 每条消息在 `<agent_home>/inbox/effects/<inbox_id>.yaml` 保存稳定 Effect Journal：
 
@@ -219,15 +227,14 @@ Observation 由以下事件定向刷新当前 Resolution：
 
 索引把 inbox ID 和 direct Claim ID 映射到受影响的当前 Resolution。被替换 Resolution 的 observation cache 保留，后续事件只更新当前 Resolution。
 
-Observation 依据 receipt、通知 Policy provenance、mirror 更新时间和 assessment 对比派生：
+Observation 以 Resolution 中冻结的 direct Claim 快照为基线，逐 Claim 对比当前 holder mirror 的 status、scope 和 statement；assessment 只提供可选的建议元数据，不决定比较对象，因此不含 assessment 的人工 Resolution 仍能展示完整快照对比。receipt 独立表示是否送达；通知 Policy provenance 只作为技术事实保留，不作为识别更新的门槛。状态为：
 
 - `not_delivered`
-- `delivered_unobserved`
-- `observed_converged`
-- `observed_diverged`
+- `no_update_observed`
+- `update_observed`
 - `unknown`
 
-Observation 只用于治理可见性，不触发 Analysis、Resolution、通知或 Claim 修改。
+updated、unchanged 和 unavailable 以 Claim 为单位汇总，notified 与 delivered 以 holder 为单位汇总。Observation 不评价 holder 是否逐字段服从 assessment，只用于治理可见性，不触发 Analysis、Resolution、通知或 Claim 修改。
 
 ## Workbench
 
@@ -266,6 +273,7 @@ Proposal 与 Verification 使用同一份 Maintainer LLM 配置，但执行两�
 - Analyze 覆盖 Current Analysis，不产生 history/chain；Adopt 不重新调用模型。
 - Resolution 与投递 ID 在并发、请求取消、进程重启和部分 outbox 写入后保持幂等。
 - pending delivery 退避恢复；ACK、Claim upload 与 Resolution switch 只刷新相关当前 Resolution；旧 observation cache 保持冻结。
-- Agent 仲裁调用只收到完整消息、非 deprecated 本地 Claim、当前 holder 持有的任意状态 direct Claim 与全部 direct Claim，不读取 Memory；当前 holder 可修改自己实际持有的 direct Claim，Effect Journal 崩溃恢复不重复调用模型。
+- 所有 CAU 使用统一单消息输入与 Effect Journal，不读取 Memory；当前 Agent 可修改全部非 deprecated 本地 Claim和自己持有的任意状态 direct Claim，其他 holder 快照只读，崩溃恢复不重复调用模型。
+- Policy 内化已消除的冲突不生成 Dispute；Agent 在本地落盘和上传前按整批最终 Claim 状态校验，Maintainer 再对含 deprecated direct Claim 的新上报返回确定性冲突，Agent 单次发送后不自动重试。
 - Workbench 在 Resolution 提交后立即刷新当前 Dispute、Analysis 与 Resolution 视图。
 - Rust 与 Workbench 的格式、静态检查、测试、构建及独立 code review 通过。

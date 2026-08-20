@@ -13,7 +13,7 @@ use crate::config::{ArbitrationMode, MaintainerArbitrationConfig};
 
 use super::context::{is_context_not_ready, ArbitrationContextBuilder, BuiltArbitrationContext};
 use super::evaluator::ArbitrationEvaluator;
-use super::resolution::{validate_assessments, AdoptionGuards, ResolutionService};
+use super::resolution::{preempt_analysis_for_resolution, validate_assessments, ResolutionService};
 use super::store::ArbitrationStore;
 use super::types::{
     AnalysisError, AnalysisJob, AnalysisLease, AnalysisPhase, AnalysisRound, AnalysisState,
@@ -25,7 +25,6 @@ use super::types::{
 const LEASE_SAFETY_MARGIN: Duration = Duration::from_secs(30);
 const DEFAULT_CONTEXT_PREPARE_MAX_ATTEMPTS: usize = 6;
 const DEFAULT_CONTEXT_PREPARE_RETRY_DELAY: Duration = Duration::from_millis(500);
-const ADOPTION_SNAPSHOT_MAX_ATTEMPTS: usize = 3;
 const FIRST_REANALYSIS_DELAY: Duration = Duration::from_secs(5 * 60);
 const SECOND_REANALYSIS_DELAY: Duration = Duration::from_secs(15 * 60);
 const ANALYSIS_PREEMPTION_CHECK_INTERVAL: Duration = Duration::from_millis(100);
@@ -53,18 +52,6 @@ pub fn is_analysis_conflict(error: &anyhow::Error) -> bool {
 
 fn conflict(message: impl Into<String>) -> anyhow::Error {
     AnalysisConflict(message.into()).into()
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct AnalysisRetry(pub String);
-
-pub fn is_analysis_retry(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<AnalysisRetry>().is_some()
-}
-
-fn retry(message: impl Into<String>) -> anyhow::Error {
-    AnalysisRetry(message.into()).into()
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +115,10 @@ impl ArbitrationService {
         &self.store
     }
 
+    pub(crate) fn automatic_adoption_enabled(&self) -> bool {
+        self.config.mode == ArbitrationMode::Auto
+    }
+
     pub(crate) fn wake_preemption_checks(&self) {
         self.preemption_wake.notify_waiters();
     }
@@ -161,7 +152,6 @@ impl ArbitrationService {
     pub async fn report_dispute(&self, dispute: &Dispute) -> anyhow::Result<ReportDisputeResult> {
         dispute.validate_agent_report()?;
         let _dispute_guard = self.store.lock_dispute(&dispute.id).await?;
-        let semantic_guard = self.store.lock_semantic_inputs().await?;
         match self.store.read_dispute(&dispute.id).await {
             Ok(existing) => {
                 if !crate::maintainer::same_report_payload(&existing.dispute, dispute) {
@@ -190,6 +180,8 @@ impl ArbitrationService {
             Err(error) if is_not_found(&error) => {}
             Err(error) => return Err(error),
         }
+        crate::maintainer::validate_new_dispute_direct_claims(self.store.team_root(), dispute)
+            .await?;
         if self.config.mode == ArbitrationMode::Manual {
             let orphan = self.store.read_current_analysis(&dispute.id).await?;
             if let Some(existing) = orphan.as_ref() {
@@ -203,9 +195,6 @@ impl ArbitrationService {
                     )));
                 }
             }
-            self.store
-                .bump_semantic_inputs_revision(&semantic_guard)
-                .await?;
             self.store
                 .write_dispute(&MaintainerDisputeRecord::from(dispute.clone()))
                 .await?;
@@ -239,9 +228,6 @@ impl ArbitrationService {
                 analysis
             }
         };
-        self.store
-            .bump_semantic_inputs_revision(&semantic_guard)
-            .await?;
         self.store
             .write_dispute(&MaintainerDisputeRecord::from(dispute.clone()))
             .await?;
@@ -297,6 +283,13 @@ impl ArbitrationService {
                 return self.store.read_analysis(job).await;
             }
             let analysis = self.store.read_analysis(job).await?;
+            if analysis.state != AnalysisState::Adopting && analysis.state.is_recoverable() {
+                let dispute = self.store.read_dispute(&job.dispute_id).await?;
+                if dispute.dispute.status != DisputeStatus::Open || dispute.resolution.is_some() {
+                    self.mark_analysis_preempted(job).await?;
+                    return self.store.read_analysis(job).await;
+                }
+            }
             match analysis.state {
                 AnalysisState::WaitingReanalysis => {
                     if analysis
@@ -380,52 +373,16 @@ impl ArbitrationService {
         job: &AnalysisJob,
         resolved_by: ResolvedBy,
     ) -> anyhow::Result<ArbitrationResolutionRecord> {
-        for attempt in 0..ADOPTION_SNAPSHOT_MAX_ATTEMPTS {
-            // 第一段只在短临界区内确认可采用并记录语义版本。Router 检索随后在锁外
-            // 进行；写入面不再被每个 scope 的 HTTP timeout/retry 阻塞。
-            let baseline_revision = {
-                let dispute_guard = self.store.lock_dispute(&job.dispute_id).await?;
-                let semantic_guard = self.store.lock_semantic_inputs().await?;
-                if let Some(resolution) = self
-                    .resolution_service
-                    .resume_matching_analysis_adoption_locked(
-                        job,
-                        resolved_by,
-                        AdoptionGuards {
-                            dispute: &dispute_guard,
-                            semantic_inputs: &semantic_guard,
-                        },
-                        self.clock.now(),
-                    )
-                    .await
-                    .map_err(map_adoption_commit_error)?
-                {
-                    return Ok(resolution);
-                }
-                let analysis = self.store.read_analysis(job).await?;
-                let dispute = self.store.read_dispute(&job.dispute_id).await?;
-                ensure_adoption_preconditions(job, &analysis, &dispute)?;
-                self.store.read_semantic_inputs_revision().await?
-            };
-
-            let current = self
-                .context_builder
-                .build(&job.dispute_id, self.clock.now())
-                .await;
-
-            // 第二段按固定锁序重新取得提交边界。只要期间有 Claim、治理 Policy、
-            // Dispute 或 Resolution 写入，revision 就会变化，本轮 Router 快照作废重试。
+        // 第一段只确认目标 Dispute 与 Current Analysis 仍可采用；Router 查询和上下文
+        // 构建保持在锁外，不阻塞 Claim、Policy 或其他 Dispute 的原有并行写入。
+        {
             let dispute_guard = self.store.lock_dispute(&job.dispute_id).await?;
-            let semantic_guard = self.store.lock_semantic_inputs().await?;
             if let Some(resolution) = self
                 .resolution_service
                 .resume_matching_analysis_adoption_locked(
                     job,
                     resolved_by,
-                    AdoptionGuards {
-                        dispute: &dispute_guard,
-                        semantic_inputs: &semantic_guard,
-                    },
+                    &dispute_guard,
                     self.clock.now(),
                 )
                 .await
@@ -433,66 +390,68 @@ impl ArbitrationService {
             {
                 return Ok(resolution);
             }
-            let current_revision = self.store.read_semantic_inputs_revision().await?;
-            if current_revision != baseline_revision {
-                drop(semantic_guard);
-                drop(dispute_guard);
-                if attempt + 1 < ADOPTION_SNAPSHOT_MAX_ATTEMPTS {
-                    continue;
-                }
-                return Err(retry("Adopt 最终复核期间团队知识持续变化，请稍后重试"));
-            }
-
-            let mut analysis = self.store.read_analysis(job).await?;
+            let analysis = self.store.read_analysis(job).await?;
             let dispute = self.store.read_dispute(&job.dispute_id).await?;
             ensure_adoption_preconditions(job, &analysis, &dispute)?;
-            let current = match current {
-                Ok(current) => current,
-                Err(error) if is_context_not_ready(&error) => {
-                    let reason =
-                        "Analysis 完成后 direct Claim 上下文已不完整，请修复 mirror 后重新 Analyze"
-                            .to_string();
-                    analysis.adoption_blocked_reason = Some(reason.clone());
-                    analysis.updated_at = self.clock.now();
-                    self.store.write_analysis(&analysis).await?;
-                    return Err(conflict(reason));
-                }
-                Err(error) => return Err(error),
-            };
-            if analysis.semantic_fingerprint.as_deref()
-                != Some(current.semantic_fingerprint.as_str())
-            {
-                let reason = self
-                    .context_builder
-                    .describe_changes(analysis.context.as_ref(), &current.frozen)?;
-                if analysis.mode == ArbitrationMode::Auto
-                    && self.config.mode == ArbitrationMode::Auto
-                {
-                    self.schedule_reanalysis(&mut analysis, reason).await?;
-                    return Err(conflict("Current Analysis 的分析输入已变化"));
-                }
-                let message = format!("Analysis 的分析输入已变化，请重新 Analyze：{reason}");
-                analysis.adoption_blocked_reason = Some(message.clone());
-                analysis.context_change_reason = Some(reason);
+        }
+
+        let current = self
+            .context_builder
+            .build(&job.dispute_id, self.clock.now())
+            .await;
+
+        // 第二段重新锁定目标 Dispute，复核 Current Analysis 与 fingerprint 后立即固定
+        // Resolution intent。同一 Dispute 的并发 Adopt/Human Resolve 仍由该锁串行化。
+        let dispute_guard = self.store.lock_dispute(&job.dispute_id).await?;
+        if let Some(resolution) = self
+            .resolution_service
+            .resume_matching_analysis_adoption_locked(
+                job,
+                resolved_by,
+                &dispute_guard,
+                self.clock.now(),
+            )
+            .await
+            .map_err(map_adoption_commit_error)?
+        {
+            return Ok(resolution);
+        }
+
+        let mut analysis = self.store.read_analysis(job).await?;
+        let dispute = self.store.read_dispute(&job.dispute_id).await?;
+        ensure_adoption_preconditions(job, &analysis, &dispute)?;
+        let current = match current {
+            Ok(current) => current,
+            Err(error) if is_context_not_ready(&error) => {
+                let reason =
+                    "Analysis 完成后 direct Claim 上下文已不完整，请修复 mirror 后重新 Analyze"
+                        .to_string();
+                analysis.adoption_blocked_reason = Some(reason.clone());
                 analysis.updated_at = self.clock.now();
                 self.store.write_analysis(&analysis).await?;
-                return Err(conflict(message));
+                return Err(conflict(reason));
             }
-            return self
-                .resolution_service
-                .begin_analysis_adoption_locked(
-                    job,
-                    resolved_by,
-                    AdoptionGuards {
-                        dispute: &dispute_guard,
-                        semantic_inputs: &semantic_guard,
-                    },
-                    self.clock.now(),
-                )
-                .await
-                .map_err(map_adoption_commit_error);
+            Err(error) => return Err(error),
+        };
+        if analysis.semantic_fingerprint.as_deref() != Some(current.semantic_fingerprint.as_str()) {
+            let reason = self
+                .context_builder
+                .describe_changes(analysis.context.as_ref(), &current.frozen)?;
+            if analysis.mode == ArbitrationMode::Auto && self.config.mode == ArbitrationMode::Auto {
+                self.schedule_reanalysis(&mut analysis, reason).await?;
+                return Err(conflict("Current Analysis 的分析输入已变化"));
+            }
+            let message = format!("Analysis 的分析输入已变化，请重新 Analyze：{reason}");
+            analysis.adoption_blocked_reason = Some(message.clone());
+            analysis.context_change_reason = Some(reason);
+            analysis.updated_at = self.clock.now();
+            self.store.write_analysis(&analysis).await?;
+            return Err(conflict(message));
         }
-        Err(retry("Adopt 最终复核未能取得稳定团队知识快照"))
+        self.resolution_service
+            .begin_analysis_adoption_locked(job, resolved_by, &dispute_guard, self.clock.now())
+            .await
+            .map_err(map_adoption_commit_error)
     }
 
     async fn schedule_reanalysis(
@@ -862,7 +821,14 @@ impl ArbitrationService {
                     if record.dispute.status == DisputeStatus::Open
                         && record.resolution.is_none() => {}
                 Ok(_) => {
-                    self.mark_analysis_preempted(job).await;
+                    if let Err(error) = self.mark_analysis_preempted(job).await {
+                        log::warn!(
+                            target: "maintainer_arbitration",
+                            "记录 dispute={} analysis={} 被 Resolution 终止失败: {error:#}",
+                            job.dispute_id,
+                            job.analysis_id
+                        );
+                    }
                     return;
                 }
                 Err(_) => return,
@@ -870,31 +836,13 @@ impl ArbitrationService {
         }
     }
 
-    async fn mark_analysis_preempted(&self, job: &AnalysisJob) {
-        let Ok(_guard) = self.store.lock_dispute(&job.dispute_id).await else {
-            return;
-        };
-        let Ok(mut analysis) = self.store.read_analysis(job).await else {
-            return;
-        };
-        if !analysis.state.is_recoverable() {
-            return;
+    async fn mark_analysis_preempted(&self, job: &AnalysisJob) -> anyhow::Result<()> {
+        let _guard = self.store.lock_dispute(&job.dispute_id).await?;
+        let mut analysis = self.store.read_analysis(job).await?;
+        if preempt_analysis_for_resolution(&mut analysis, self.clock.now()) {
+            self.store.write_analysis(&analysis).await?;
         }
-        analysis.state = AnalysisState::Failed;
-        analysis.lease = None;
-        analysis.error = Some(AnalysisError {
-            code: "analysis_preempted".into(),
-            message: "Dispute 已由 Resolution 处理".into(),
-        });
-        analysis.updated_at = self.clock.now();
-        if let Err(error) = self.store.write_analysis(&analysis).await {
-            log::warn!(
-                target: "maintainer_arbitration",
-                "记录 dispute={} analysis={} 被 Resolution 终止失败: {error:#}",
-                job.dispute_id,
-                job.analysis_id
-            );
-        }
+        Ok(())
     }
 
     async fn finish_failed(
@@ -1744,6 +1692,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn report_with_deprecated_direct_claim_creates_neither_dispute_nor_analysis() {
+        let fixture = Fixture::new(ArbitrationMode::Auto, ScriptedEvaluator::approved()).await;
+        for (index, claim) in fixture.claims.iter().enumerate() {
+            let mut claim = claim.clone();
+            if index == 0 {
+                claim.status = ClaimStatus::Deprecated;
+            }
+            let path = paths::team_store_agent_claims_dir(fixture.store.team_root(), &claim.holder)
+                .join(format!("{}.yaml", claim.id));
+            write_yaml_atomic(&path, &claim).await.unwrap();
+        }
+
+        let error = fixture
+            .service
+            .report_dispute(&fixture.dispute)
+            .await
+            .unwrap_err();
+        assert!(is_analysis_conflict(&error));
+        assert!(error.to_string().contains("deprecated direct claim"));
+        assert!(fixture
+            .store
+            .read_current_analysis(&fixture.dispute.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(fixture
+            .store
+            .read_dispute(&fixture.dispute.id)
+            .await
+            .is_err());
+        assert_eq!(fixture.evaluator.calls(), (0, 0));
+    }
+
+    #[tokio::test]
     async fn manual_mode_report_is_idempotent_without_current_analysis() {
         let fixture = Fixture::new(ArbitrationMode::Manual, ScriptedEvaluator::approved()).await;
 
@@ -1770,10 +1752,6 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        assert_eq!(
-            fixture.store.read_semantic_inputs_revision().await.unwrap(),
-            1
-        );
         assert_eq!(fixture.evaluator.calls(), (0, 0));
 
         let mut changed = fixture.dispute.clone();
@@ -2695,7 +2673,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adoption_router_query_does_not_hold_the_global_semantic_write_lock() {
+    async fn adoption_router_query_does_not_block_claim_upload() {
         let fixture = Fixture::new(ArbitrationMode::Shadow, ScriptedEvaluator::approved()).await;
         fixture.seed_claims().await;
         let job = fixture.report().await;
@@ -2981,6 +2959,124 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+        assert!(!fixture
+            .service
+            .recoverable_jobs()
+            .await
+            .unwrap()
+            .contains(&job));
+    }
+
+    #[tokio::test]
+    async fn human_resolution_terminalizes_persisted_reanalysis_wait() {
+        let fixture = Fixture::new(ArbitrationMode::Auto, ScriptedEvaluator::approved()).await;
+        fixture.seed_claims().await;
+        let job = fixture.report().await;
+        let token = fixture
+            .service
+            .prepare_context(&job, &CancellationToken::new())
+            .await
+            .unwrap()
+            .unwrap();
+        fixture
+            .service
+            .run_proposal(&job, &token, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let mut changed = fixture.claims[0].clone();
+        changed.statement.push_str(" substantively changed");
+        let path = paths::team_store_agent_claims_dir(fixture.store.team_root(), &changed.holder)
+            .join(format!("{}.yaml", changed.id));
+        write_yaml_atomic(&path, &changed).await.unwrap();
+        let waiting = fixture
+            .service
+            .process_analysis(&job, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(waiting.state, AnalysisState::WaitingReanalysis);
+        assert!(waiting.next_retry_at.is_some());
+
+        fixture
+            .service
+            .resolution_service()
+            .resolve_human(
+                &fixture.dispute.id,
+                human_input("管理员在等待期间直接解决冲突"),
+                fixture.clock.now(),
+            )
+            .await
+            .unwrap();
+
+        let stopped = fixture.store.read_analysis(&job).await.unwrap();
+        assert_eq!(stopped.state, AnalysisState::Failed);
+        assert_eq!(stopped.next_retry_at, None);
+        assert_eq!(
+            stopped.error.as_ref().map(|error| error.code.as_str()),
+            Some("analysis_preempted")
+        );
+        assert_eq!(fixture.evaluator.calls(), (1, 1));
+        assert!(!fixture
+            .service
+            .recoverable_jobs()
+            .await
+            .unwrap()
+            .contains(&job));
+    }
+
+    #[tokio::test]
+    async fn recovered_resolved_dispute_terminalizes_wait_before_context_or_model_work() {
+        let fixture = Fixture::new(ArbitrationMode::Auto, ScriptedEvaluator::approved()).await;
+        fixture.seed_claims().await;
+        let job = fixture.report().await;
+        let token = fixture
+            .service
+            .prepare_context(&job, &CancellationToken::new())
+            .await
+            .unwrap()
+            .unwrap();
+        fixture
+            .service
+            .run_proposal(&job, &token, &CancellationToken::new())
+            .await
+            .unwrap();
+        let mut changed = fixture.claims[0].clone();
+        changed.statement.push_str(" substantively changed");
+        let path = paths::team_store_agent_claims_dir(fixture.store.team_root(), &changed.holder)
+            .join(format!("{}.yaml", changed.id));
+        write_yaml_atomic(&path, &changed).await.unwrap();
+        let waiting = fixture
+            .service
+            .process_analysis(&job, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(waiting.state, AnalysisState::WaitingReanalysis);
+
+        // 模拟 Resolution 已持久化、Analysis 终止写尚未发生时进程退出。
+        let mut dispute = fixture
+            .store
+            .read_dispute(&fixture.dispute.id)
+            .await
+            .unwrap();
+        dispute.dispute.status = DisputeStatus::Resolved;
+        dispute.dispute.resolved_at = Some(fixture.clock.now());
+        fixture.store.write_dispute(&dispute).await.unwrap();
+        assert!(fixture
+            .service
+            .recoverable_jobs()
+            .await
+            .unwrap()
+            .contains(&job));
+
+        let calls_before_recovery = fixture.evaluator.calls();
+        let recovered = fixture
+            .service
+            .process_analysis(&job, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(recovered.state, AnalysisState::Failed);
+        assert_eq!(recovered.next_retry_at, None);
+        assert_eq!(fixture.evaluator.calls(), calls_before_recovery);
         assert!(!fixture
             .service
             .recoverable_jobs()

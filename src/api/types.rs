@@ -16,9 +16,9 @@
 //! 校验格式，给出更精准的错误上下文（哪条 claim 哪个字段挂了）。
 //!
 //! ## InboxMessage 直接复用领域实体
-//! 普通 `InternalizeRequest` 和仲裁专用请求都把完整 `InboxMessage` 交给 Agent
-//! 自己的模型，而不是改成 PolicySummary。仲裁请求额外保留完整结构化裁决、当前
-//! Agent 的本地知识和原 Dispute 的 direct Claim 快照。
+//! inbox 内化请求把完整 `InboxMessage` 交给 Agent 自己的模型，而不是改成
+//! PolicySummary。ClaimAttributeUpdate 在入模边界统一为单消息请求；普通建议只提供
+//! conclusion，带 Resolution 的建议再补充结构化裁决、Dispute 与 direct Claim 快照。
 
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -29,7 +29,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::api::ContextUsageSnapshot;
-use crate::claim::{AgentId, Claim, ClaimId, Confidence, DisputeId, InboxMessage, SessionId};
+use crate::claim::{
+    AgentId, Claim, ClaimId, Confidence, Dispute, DisputeId, DisputeResolution, InboxMessage,
+    SessionId,
+};
 use crate::skill::SkillInstructions;
 use crate::tool::diff::FileChange;
 
@@ -418,10 +421,9 @@ impl SessionTurnContentBlock {
     }
 }
 
-/// `internalize_inbox` 的请求：把同类型 inbox 消息和 agent 自己的本地 claim
+/// 批量 PolicyUpdate 内化请求：把同类型 inbox 消息和 agent 自己的本地 claim
 /// 一并喂给 LLM，由 LLM 决定要不要新增 / 更新 claim、是否产生 dispute。
-///
-/// runner 只把 `PolicyUpdate` 或 `ClaimAttributeUpdate` 塞进来。
+/// ClaimAttributeUpdate 使用下面的单消息请求和 Effect Journal。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InternalizeRequest {
     pub agent_id: AgentId,
@@ -431,11 +433,19 @@ pub struct InternalizeRequest {
     pub local_claims: Vec<Claim>,
 }
 
-/// 带结构化裁决的 ClaimAttributeUpdate 专用单次内化输入。
+/// ClaimAttributeUpdate 的统一单次内化输入。
+///
+/// `conclusion` 对所有 CAU 都存在：普通 CAU 取自 `policy.statement`，结构化裁决
+/// 取自 Resolution。其余裁决与 Dispute 字段按消息实际携带的上下文增量提供。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ArbitrationInternalizeRequest {
+pub struct ClaimAttributeUpdateInternalizeRequest {
     pub agent_id: AgentId,
-    pub arbitration_message: InboxMessage,
+    pub claim_attribute_update: InboxMessage,
+    pub conclusion: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<DisputeResolution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispute: Option<Dispute>,
     #[serde(default)]
     pub local_claims: Vec<Claim>,
     #[serde(default)]

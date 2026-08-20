@@ -79,21 +79,25 @@ resolved assessment 描述 direct Claim 的最小目标变更：`coexist` 通常
 
 `shadow`/`auto` 下，新 Dispute create-once 写入 Current Analysis并进入有界串行调度器；`manual` 只保存 Dispute。显式 Analyze 原子替换 Current Analysis，也可直接 Human Resolve。direct Claim 暂未准备好时，同一 Analysis 先等待上下文，最终仍不完整才标为 failed。
 
-被新的 Analyze 覆盖或已由 Resolution 关闭的 Analysis 会停止当前模型等待。Resolution 的固定提交意图先持久化，再幂等补齐 Dispute、投递与治理历史；进程重启沿用原 ID 恢复。
+被新的 Analyze 覆盖或已由 Resolution 关闭的 Analysis 会停止当前模型等待；持久化的上下文等待或重分析等待会转为审计终态并清除调度时间，启动恢复不会为 resolved Dispute 再调用 Router 或模型。Resolution 的固定提交意图先持久化，再幂等补齐 Dispute、投递与治理历史；进程重启沿用原 ID 恢复。
 
 稳定语义投影对 direct/source Claim、治理 Policy、目标 Dispute、Router candidate Claim 内容及真实 Router Dispute 内容/status 的变化敏感，并忽略 Router candidate 的派生 lifecycle ID 列表。创建于 `auto` 且当前配置仍为 `auto` 的 Current Analysis 在采用前发现输入变化时，会新增 5 分钟和 15 分钟的重分析计划；第三次仍变化就停止自动处理、保持 open。已持久化的等待轮次按原时间恢复。切换到其他模式会暂停尚未固定 intent 的自动采用；创建于 `shadow` 或 `manual` 的 Analysis 不会因后来切到 `auto` 而自动采用。每轮 Proposal、Verification、fingerprint、时间和变化原因都保留在同一 Analysis。unresolved、failed、低置信和 Verification 不通过不使用该自动重分析流程。
 
 Dispute 属于团队治理流：只有配置团队服务时，Agent 才把 finalize 或 inbox 内化形成的 dispute 报告给 Maintainer。单人模式不创建待日后补传的 dispute 队列。
 
-Maintainer 对相同 ID、相同原始内容的 Dispute 重放做幂等接收；相同 ID 对应不同原始内容时保留团队中已有记录并返回冲突。Agent 会显示一次 warning，并将该冲突从待上传队列移除，不再自动重试。
+Policy 内化在整批输出上推演最终 Claim 状态：如果更正或 deprecated 已经消除矛盾，就不再创建 Dispute；新 Dispute 只能引用最终仍为非 deprecated 的冲突 Claim。Agent 在写本地文件和发起团队请求前按整批最终状态执行同一校验，避免 Claim 更新与 Dispute 并发上传形成短暂旧 mirror 窗口。Maintainer 在首次接收新 Dispute 时再次检查团队 mirror，任一 direct Claim 已是 deprecated 就返回冲突且不落盘。Agent 对该确定性拒绝只发送一次请求，不加入自动重试队列。
+
+Maintainer 对相同 ID、相同原始内容的既有 Dispute 重放做幂等接收；该重放不因之后的 Claim 生命周期变化而失效。相同 ID 对应不同原始内容时保留团队中已有记录并返回冲突。Agent 会显示一次 warning，并将该冲突从待上传队列移除，不再自动重试。
 
 ## Inbox
 
 Inbox 是 Maintainer 到 Agent 的下行通道。当前支持 `PolicyUpdate` 和 `ClaimAttributeUpdate`，两类消息都内嵌完整 Policy。
 
-带 `arbitration_resolution` 的 ClaimAttributeUpdate 会单条内化，并只发起一次专用结构化模型调用；配置内的纠错重试共享同一个总预算。输入包含完整仲裁消息、当前 Agent 全部非 deprecated 本地 Claim、由当前 Agent 持有的任意 status direct Claim，以及原 Dispute 全部 direct Claim 快照；不读取 Memory、USER、session transcript 或工具上下文。当前 holder 可以修改自己实际持有的 direct Claim，不受其当前 status 限制；其他 holder 的 direct Claim 只读。Agent 优先保持已符合 Resolution 的 Claim；已有等价正确本地 Claim 时避免重复创建，并可将错误 direct Claim deprecated；没有等价本地替代且仍属同一知识单元时优先原地更新 direct Claim；只有独立、可复用的新知识单元才创建新 Claim。后端校验输出协议、holder、更新目标与基本引用格式。每条消息在 `<agent_home>/inbox/effects/` 保存已校验 Effect Journal，崩溃后直接重放 plan，不再次调用模型；若本地 Claim 已被后续操作修改则记录 superseded warning，不覆盖新内容。仲裁造成的 Claim 更新在 pending 上传中保留 durable 标记，鉴权恢复后继续补传。
+所有 ClaimAttributeUpdate 都按单条消息走同一内化流程。模型输入包含完整 CAU、始终存在的 conclusion、可选 Resolution 与 Dispute、当前 Agent 的可编辑 `local_claims`，以及可选的全部 direct Claim 快照；不读取 Memory、USER、session transcript 或工具上下文。普通 CAU 的 conclusion 取自 `policy.statement`，结构化 Resolution 再提供 type、basis、assessment 等字段。`local_claims` 精确等于当前 Agent 的全部非 deprecated 本地 Claim，加上由它持有的任意 status direct Claim；这些对象均可更新，因此相关的非 direct 当前知识可以原地修正，人工驳回也能恢复 deprecated direct Claim。其他 holder 的 direct Claim 只读，非 direct deprecated Claim 不可见且不可修改。
 
-Maintainer 以 receipt ACK、通知 Policy provenance、mirror 更新时间和 assessment 字段派生 `not_delivered`、`delivered_unobserved`、`observed_converged`、`observed_diverged` 或 `unknown`。ACK、相关 Claim 上传与 Resolution 切换定向刷新当前 Resolution；详情读取可按需刷新。旧 Resolution 的 cache 保留且不再更新。Observation 只用于治理可见性。
+后端按同一规则重新构造编辑白名单，并分别校验 Claim source 与 Dispute 引用：Claim source 可引用输入中可见 Claim、它们已有的 Claim 来源和本批新 Claim；Policy source 必须在当前 CAU 或可见 Claim 中出现；Dispute 只能引用实际可见 Claim 和本批新 Claim。模型可以保持不变、原地更新、创建新 Claim 或报告新的实质冲突。存在 Resolution 时仍遵循最小知识变更原则：保持已经正确的 Claim，同一知识单元优先原地修正，只有明确存在正确承载对象时才将错误 direct Claim deprecated。每条 CAU 在 `<agent_home>/inbox/effects/` 保存独立的已校验 Effect Journal；崩溃后重放固定 plan，不再次调用模型，且不会覆盖 prepare 后发生的本地新变更。CAU 产生的 Claim 更新使用 durable pending upload，鉴权恢复后继续补传。
+
+Maintainer 将 Resolution 中冻结的 direct Claim 快照与当前 holder mirror 的 status、scope、statement 做逐 Claim 对比，派生 `not_delivered`、`no_update_observed`、`update_observed` 或 `unknown`。assessment 只作为可选建议展示，不决定观测对象；人工 Resolution 没有 assessment 时仍按全部 direct Claim 快照观察。通知 Policy provenance 作为技术事实展示，但不决定是否观察到更新；正确 Claim 无需修改时会明确显示 `no_update_observed`。汇总中的 updated、unchanged、unavailable 都按 Claim 计数，通知与送达按 holder 计数。ACK、相关 Claim 上传与 Resolution 切换定向刷新当前 Resolution；详情读取可按需刷新。旧 Resolution 的 cache 保留且不再更新。Observation 只用于治理可见性。
 
 Workbench 将 Observation 展示为 Resolution 时的 Claim 快照与当前 holder mirror 的前后对照。底层状态仍用于判断送达、是否观察到更新和数据是否可用；界面不把 Agent 是否逐字段采用 Resolution 建议作为评分。
 

@@ -17,11 +17,11 @@ use crate::claim::{
     ResolutionBasis, ResolutionType,
 };
 use crate::maintainer::arbitration::{
-    is_analysis_conflict, is_analysis_retry, AnalysisError, AnalysisJob, AnalysisPhase,
-    AnalysisState, ArbitrationAnalysis, ArbitrationAnalysisId, ArbitrationProposal,
-    ArbitrationResolutionRecord, ArbitrationStore, ArbitrationVerification, ClaimObservation,
-    FrozenArbitrationContext, HumanResolutionInput, MaintainerDisputeRecord, ObservationService,
-    ObservationState, RejectResolutionInput, ResolutionObservation, ResolutionService,
+    is_analysis_conflict, AnalysisError, AnalysisJob, AnalysisPhase, AnalysisState,
+    ArbitrationAnalysis, ArbitrationAnalysisId, ArbitrationProposal, ArbitrationResolutionRecord,
+    ArbitrationStore, ArbitrationVerification, ClaimObservation, FrozenArbitrationContext,
+    HumanResolutionInput, MaintainerDisputeRecord, ObservationService, ObservationState,
+    RejectResolutionInput, ResolutionObservation, ResolutionService,
 };
 use crate::maintainer::history::{
     fresh_record_id, AgentActivityKind, AgentActivityRecord, HttpAuditRecord, PolicyEventKind,
@@ -111,6 +111,7 @@ pub struct ArbitrationAnalysisSummary {
     pub resolution_id: Option<ArbitrationResolutionId>,
     pub error: Option<AnalysisError>,
     pub adoptable: bool,
+    pub automatic_progress_pending: bool,
     pub adoption_blocker: Option<String>,
     pub analysis_round: u32,
     pub context_change_count: u32,
@@ -123,6 +124,7 @@ impl ArbitrationAnalysisSummary {
         analysis: &ArbitrationAnalysis,
         dispute: &MaintainerDisputeRecord,
         adoption_enabled: bool,
+        automatic_adoption_enabled: bool,
     ) -> Self {
         let resolved_proposal = analysis
             .proposal
@@ -134,6 +136,13 @@ impl ArbitrationAnalysisSummary {
             && dispute.resolution.is_none()
             && analysis.adoption_blocked_reason.is_none()
             && adoption_enabled;
+        let automatic_progress_pending = analysis.state == AnalysisState::Approved
+            && resolved_proposal
+            && dispute.dispute.status == crate::claim::DisputeStatus::Open
+            && dispute.resolution.is_none()
+            && analysis.adoption_blocked_reason.is_none()
+            && analysis.mode == crate::config::ArbitrationMode::Auto
+            && automatic_adoption_enabled;
         let adoption_blocker = if dispute.dispute.status != crate::claim::DisputeStatus::Open
             || dispute.resolution.is_some()
         {
@@ -164,6 +173,7 @@ impl ArbitrationAnalysisSummary {
             resolution_id: analysis.resolution_id.clone(),
             error: analysis.error.clone(),
             adoptable,
+            automatic_progress_pending,
             adoption_blocker,
             analysis_round: analysis.analysis_round,
             context_change_count: analysis.context_change_count,
@@ -206,11 +216,10 @@ pub struct ArbitrationAnalysesResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct HolderAdoptionSummary {
     pub notified_holders: usize,
-    pub delivered: usize,
-    pub converged: usize,
-    pub diverged: usize,
-    pub unobserved: usize,
-    pub unknown: usize,
+    pub delivered_holders: usize,
+    pub updated_claims: usize,
+    pub unchanged_claims: usize,
+    pub unavailable_claims: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -220,15 +229,16 @@ pub struct HolderClaimAdoptionView {
     pub snapshot_status: Option<ClaimStatus>,
     pub snapshot_scope: Option<String>,
     pub snapshot_statement: Option<String>,
-    pub recommended_status: ClaimStatus,
+    pub recommended_status: Option<ClaimStatus>,
     pub current_status: Option<ClaimStatus>,
     pub recommended_scope: Option<String>,
     pub current_scope: Option<String>,
     pub recommended_statement: Option<String>,
     pub current_statement: Option<String>,
     pub policy_provenance_present: bool,
-    pub matches: bool,
-    pub mismatch_reasons: Vec<String>,
+    pub update_observed: bool,
+    pub changed_fields: Vec<String>,
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -243,8 +253,10 @@ pub struct HolderAdoptionItem {
     pub agent_id: AgentId,
     pub delivery_state: String,
     pub observation_state: ObservationState,
-    pub assessment_count: usize,
-    pub matched_count: usize,
+    pub claim_count: usize,
+    pub updated_claim_count: usize,
+    pub unchanged_claim_count: usize,
+    pub unavailable_claim_count: usize,
     pub reasons: Vec<String>,
     pub last_delivered_at: Option<chrono::DateTime<chrono::Utc>>,
     pub last_observed_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -488,6 +500,10 @@ pub async fn get_dispute(
                 analysis,
                 &record,
                 state.arbitration.is_some(),
+                state
+                    .arbitration
+                    .as_ref()
+                    .is_some_and(|service| service.automatic_adoption_enabled()),
             )
         }),
         holder_adoption,
@@ -515,6 +531,10 @@ pub async fn list_dispute_analyses(
                 analysis,
                 &dispute,
                 state.arbitration.is_some(),
+                state
+                    .arbitration
+                    .as_ref()
+                    .is_some_and(|service| service.automatic_adoption_enabled()),
             )
         });
     Ok(Json(ArbitrationAnalysesResponse { current_analysis }))
@@ -543,6 +563,10 @@ pub async fn get_dispute_analysis(
             &analysis,
             &dispute,
             state.arbitration.is_some(),
+            state
+                .arbitration
+                .as_ref()
+                .is_some_and(|service| service.automatic_adoption_enabled()),
         ),
         frozen_context: analysis.context.clone(),
         verification: analysis.verification,
@@ -584,11 +608,10 @@ fn holder_adoption_view(
             observed_at: observation.observed_at,
             summary: HolderAdoptionSummary {
                 notified_holders: 0,
-                delivered: 0,
-                converged: 0,
-                diverged: 0,
-                unobserved: 0,
-                unknown: 0,
+                delivered_holders: 0,
+                updated_claims: 0,
+                unchanged_claims: 0,
+                unavailable_claims: 0,
             },
             holders: Vec::new(),
         };
@@ -601,6 +624,13 @@ fn holder_adoption_view(
                 .targets
                 .iter()
                 .find(|target| target.target_agent == holder.agent_id)?;
+            let claims: Vec<HolderClaimAdoptionView> = holder
+                .claims
+                .iter()
+                .map(|claim| {
+                    holder_claim_adoption_view(&resolution_record.direct_claim_snapshots, claim)
+                })
+                .collect();
             Some(HolderAdoptionItem {
                 agent_id: holder.agent_id.clone(),
                 delivery_state: if holder.delivery_observed {
@@ -609,18 +639,20 @@ fn holder_adoption_view(
                     "not_delivered".to_string()
                 },
                 observation_state: holder.state,
-                assessment_count: holder.assessment_count,
-                matched_count: holder.matched_count,
+                claim_count: claims.len(),
+                updated_claim_count: claims.iter().filter(|claim| claim.update_observed).count(),
+                unchanged_claim_count: claims
+                    .iter()
+                    .filter(|claim| claim.current_status.is_some() && !claim.update_observed)
+                    .count(),
+                unavailable_claim_count: claims
+                    .iter()
+                    .filter(|claim| claim.current_status.is_none())
+                    .count(),
                 reasons: holder.reasons.clone(),
                 last_delivered_at: holder.delivered_at,
                 last_observed_at: holder.last_observed_at.or(Some(observation.observed_at)),
-                claims: holder
-                    .claims
-                    .iter()
-                    .map(|claim| {
-                        holder_claim_adoption_view(&resolution_record.direct_claim_snapshots, claim)
-                    })
-                    .collect(),
+                claims,
                 technical: HolderAdoptionTechnicalView {
                     policy_id: intent.policy.id.clone(),
                     inbox_id: target.inbox_id.clone(),
@@ -633,26 +665,22 @@ fn holder_adoption_view(
         observed_at: observation.observed_at,
         summary: HolderAdoptionSummary {
             notified_holders: intent.targets.len(),
-            delivered: holders
+            delivered_holders: holders
                 .iter()
                 .filter(|holder| holder.delivery_state == "delivered")
                 .count(),
-            converged: holders
+            updated_claims: holders
                 .iter()
-                .filter(|holder| holder.observation_state == ObservationState::ObservedConverged)
-                .count(),
-            diverged: holders
+                .map(|holder| holder.updated_claim_count)
+                .sum(),
+            unchanged_claims: holders
                 .iter()
-                .filter(|holder| holder.observation_state == ObservationState::ObservedDiverged)
-                .count(),
-            unobserved: holders
+                .map(|holder| holder.unchanged_claim_count)
+                .sum(),
+            unavailable_claims: holders
                 .iter()
-                .filter(|holder| holder.observation_state == ObservationState::DeliveredUnobserved)
-                .count(),
-            unknown: holders
-                .iter()
-                .filter(|holder| holder.observation_state == ObservationState::Unknown)
-                .count(),
+                .map(|holder| holder.unavailable_claim_count)
+                .sum(),
         },
         holders,
     }
@@ -678,8 +706,9 @@ fn holder_claim_adoption_view(
         recommended_statement: claim.recommended_statement.clone(),
         current_statement: claim.current_statement.clone(),
         policy_provenance_present: claim.policy_provenance_present,
-        matches: claim.matched,
-        mismatch_reasons: claim.mismatch_reasons.clone(),
+        update_observed: claim.update_observed,
+        changed_fields: claim.changed_fields.clone(),
+        notes: claim.notes.clone(),
     }
 }
 
@@ -730,7 +759,10 @@ pub async fn create_analysis(
     Ok((
         StatusCode::ACCEPTED,
         Json(ArbitrationAnalysisSummary::from_analysis(
-            &analysis, &dispute, true,
+            &analysis,
+            &dispute,
+            true,
+            service.automatic_adoption_enabled(),
         )),
     ))
 }
@@ -1739,7 +1771,7 @@ fn arbitration_error_is_not_found(error: &anyhow::Error) -> bool {
 
 fn arbitration_mutation_error(error: anyhow::Error) -> (StatusCode, String) {
     let not_found = arbitration_error_is_not_found(&error);
-    let conflict = is_analysis_conflict(&error) || is_analysis_retry(&error);
+    let conflict = is_analysis_conflict(&error);
     let message = format!("{error:#}");
     let lowered = message.to_ascii_lowercase();
     let status = if not_found {
@@ -1984,15 +2016,16 @@ mod tests {
         let observation = ClaimObservation {
             claim_id: snapshot.id.clone(),
             claim_name: snapshot.name.clone(),
-            recommended_status: ClaimStatus::Deprecated,
+            recommended_status: Some(ClaimStatus::Deprecated),
             current_status: Some(ClaimStatus::Stale),
             recommended_scope: None,
             current_scope: Some("runtime / current".into()),
             recommended_statement: None,
             current_statement: Some("current production behavior".into()),
             policy_provenance_present: true,
-            matched: false,
-            mismatch_reasons: vec!["recommendation mismatch".into()],
+            update_observed: true,
+            changed_fields: vec!["status".into(), "scope".into(), "statement".into()],
+            notes: Vec::new(),
         };
 
         let view = holder_claim_adoption_view(&[snapshot], &observation);
@@ -2009,6 +2042,55 @@ mod tests {
             view.current_statement.as_deref(),
             Some("current production behavior")
         );
+        assert!(view.update_observed);
+        assert_eq!(view.changed_fields, ["status", "scope", "statement"]);
+    }
+
+    #[tokio::test]
+    async fn analysis_summary_only_marks_unblocked_auto_adoption_as_pending() {
+        let (state, ..) = build_state();
+        let service = test_arbitration_service_with_mode(&state, ArbitrationMode::Auto);
+        let dispute = Dispute {
+            id: DisputeId::random(),
+            name: "auto adoption handoff".into(),
+            reporter_agent_id: AgentId::new("agent-a").unwrap(),
+            claims: Vec::new(),
+            summary: "approved analysis is waiting for automatic adoption".into(),
+            status: crate::claim::DisputeStatus::Open,
+            created_at: now_seconds(),
+            resolved_at: None,
+        };
+        let record = MaintainerDisputeRecord::from(dispute.clone());
+        service.store().write_dispute(&record).await.unwrap();
+        let mut analysis = service.create_analysis(&dispute.id).await.unwrap();
+        analysis.state = AnalysisState::Approved;
+        analysis.proposal = Some(ArbitrationProposal {
+            resolution_type: ResolutionType::ConflictResolved,
+            resolution_basis: ResolutionBasis::Evidence,
+            conclusion: "use the supported claim".into(),
+            claim_assessments: Vec::new(),
+            confidence: 0.95,
+            evidence_refs: Vec::new(),
+            missing_evidence: Vec::new(),
+            human_review_reason: None,
+            reasoning: "direct evidence is sufficient".into(),
+        });
+
+        let summary = ArbitrationAnalysisSummary::from_analysis(&analysis, &record, true, true);
+        assert!(summary.automatic_progress_pending);
+
+        let auto_disabled =
+            ArbitrationAnalysisSummary::from_analysis(&analysis, &record, true, false);
+        assert!(!auto_disabled.automatic_progress_pending);
+
+        analysis.mode = ArbitrationMode::Manual;
+        let manual = ArbitrationAnalysisSummary::from_analysis(&analysis, &record, true, true);
+        assert!(!manual.automatic_progress_pending);
+
+        analysis.mode = ArbitrationMode::Auto;
+        analysis.adoption_blocked_reason = Some("waiting for human review".into());
+        let blocked = ArbitrationAnalysisSummary::from_analysis(&analysis, &record, true, true);
+        assert!(!blocked.automatic_progress_pending);
     }
 
     async fn seed_claim(team_root: &std::path::Path, claim: &Claim) {
@@ -2219,6 +2301,51 @@ mod tests {
             AgentActivityKind::DisputeReported
         );
         assert!(activities[0].summary.contains(dispute.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn report_dispute_with_deprecated_direct_claim_returns_conflict_without_analysis() {
+        let (mut state, ..) = build_state();
+        enable_test_arbitration(&mut state);
+        let reporter = AgentId::new("agent-a").unwrap();
+        let created_at = now_seconds();
+        let deprecated = sample_claim(&reporter, ClaimStatus::Deprecated, created_at);
+        let active = sample_claim(&reporter, ClaimStatus::Active, created_at);
+        seed_claim(state.maintainer.team_root(), &deprecated).await;
+        seed_claim(state.maintainer.team_root(), &active).await;
+        let dispute = Dispute {
+            id: DisputeId::random(),
+            name: "deprecated_direct_claim".into(),
+            reporter_agent_id: reporter.clone(),
+            claims: vec![deprecated.id, active.id],
+            summary: "the deprecated Claim must not open a new dispute".into(),
+            status: crate::claim::DisputeStatus::Open,
+            created_at,
+            resolved_at: None,
+        };
+
+        let error = report_dispute(
+            State(state.clone()),
+            Json(envelope(&reporter, "", dispute.clone())),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(error.1.contains("deprecated direct claim"));
+        assert!(
+            ArbitrationStore::new(state.maintainer.team_root().to_path_buf())
+                .read_current_analysis(&dispute.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(state
+            .history_store
+            .list_agent_activity_events()
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

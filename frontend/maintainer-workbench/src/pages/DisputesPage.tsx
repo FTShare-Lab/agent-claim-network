@@ -280,7 +280,7 @@ export function DisputesPage() {
     routeDrawerResource ? { current: routeDrawerResource } : null,
   )
   const [resolveNote, setResolveNote] = useState('')
-  const [notifyAffectedAgents, setNotifyAffectedAgents] = useState(false)
+  const [notifyAffectedAgents, setNotifyAffectedAgents] = useState(true)
   const [resolveError, setResolveError] = useState<string | null>(null)
   const [rejectReason, setRejectReason] = useState('')
   const [replacementConclusion, setReplacementConclusion] = useState('')
@@ -344,7 +344,7 @@ export function DisputesPage() {
 
   function resetResolveForm() {
     setResolveNote('')
-    setNotifyAffectedAgents(false)
+    setNotifyAffectedAgents(true)
     setResolveError(null)
     setRejectReason('')
     setReplacementConclusion('')
@@ -701,7 +701,7 @@ export function DisputesPage() {
                 {selectedDispute.status === 'resolved' ? (
                   <details className="rounded-lg border border-violet-200 bg-white p-3">
                     <summary className="cursor-pointer text-xs font-semibold text-violet-800">
-                      View analysis process · {formatResolutionValue(currentAnalysis?.state)}
+                      View analysis process
                     </summary>
                     <div className="mt-3">{currentAnalysisContent}</div>
                   </details>

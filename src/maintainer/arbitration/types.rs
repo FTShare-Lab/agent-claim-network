@@ -403,9 +403,10 @@ pub struct ArbitrationResolutionRecord {
 #[serde(rename_all = "snake_case")]
 pub enum ObservationState {
     NotDelivered,
-    DeliveredUnobserved,
-    ObservedConverged,
-    ObservedDiverged,
+    #[serde(alias = "delivered_unobserved")]
+    NoUpdateObserved,
+    #[serde(alias = "observed_converged", alias = "observed_diverged")]
+    UpdateObserved,
     Unknown,
 }
 
@@ -414,7 +415,8 @@ pub struct ClaimObservation {
     pub claim_id: ClaimId,
     #[serde(default)]
     pub claim_name: String,
-    pub recommended_status: ClaimStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_status: Option<ClaimStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_status: Option<ClaimStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -428,9 +430,11 @@ pub struct ClaimObservation {
     #[serde(default)]
     pub policy_provenance_present: bool,
     #[serde(default)]
-    pub matched: bool,
+    pub update_observed: bool,
     #[serde(default)]
-    pub mismatch_reasons: Vec<String>,
+    pub changed_fields: Vec<String>,
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -445,10 +449,6 @@ pub struct HolderObservation {
     pub delivered_at: Option<DateTime<Utc>>,
     #[serde(default, with = "serde_utc_opt")]
     pub last_observed_at: Option<DateTime<Utc>>,
-    #[serde(default)]
-    pub assessment_count: usize,
-    #[serde(default)]
-    pub matched_count: usize,
     #[serde(default)]
     pub claims: Vec<ClaimObservation>,
 }

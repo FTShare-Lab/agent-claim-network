@@ -31,10 +31,15 @@ const IN_PROGRESS_ANALYSIS_STATES = new Set<AnalysisState>([
   'adopting',
 ])
 const ACTIVE_POLL_INTERVAL_MS = 1_000
-const IDLE_POLL_INTERVAL_MS = 5_000
 
 function isAnalysisInProgress(state?: AnalysisState) {
   return state ? IN_PROGRESS_ANALYSIS_STATES.has(state) : false
+}
+
+function shouldPollAnalysis(analysis?: ArbitrationAnalysisSummary | null) {
+  return Boolean(analysis && (
+    isAnalysisInProgress(analysis.state) || analysis.automatic_progress_pending
+  ))
 }
 
 function applyResolutionToCache(
@@ -67,7 +72,6 @@ export function useDisputesQuery() {
   const query = useQuery({
     queryKey: ['disputes'],
     queryFn: listDisputes,
-    refetchInterval: IDLE_POLL_INTERVAL_MS,
   })
 
   useEffect(() => {
@@ -120,9 +124,9 @@ export function useAnalysesQuery(id?: string) {
     queryFn: () => listAnalyses(id!),
     enabled: Boolean(id),
     refetchInterval: (currentQuery) => (
-      allAnalyses(currentQuery.state.data).some((analysis) => isAnalysisInProgress(analysis.state))
+      allAnalyses(currentQuery.state.data).some(shouldPollAnalysis)
         ? ACTIVE_POLL_INTERVAL_MS
-        : IDLE_POLL_INTERVAL_MS
+        : false
     ),
   })
 
@@ -139,7 +143,13 @@ export function useAnalysesQuery(id?: string) {
       states: new Map(analyses.map((analysis) => [analysis.analysis_id, analysis.state])),
     }
     if (progressed) {
-      void invalidateDisputeQueries(queryClient, id, false)
+      void Promise.all([
+        invalidateDisputeQueries(queryClient, id, false),
+        ...analyses.map((analysis) => queryClient.invalidateQueries({
+          queryKey: ['disputes', id, 'analyses', analysis.analysis_id],
+          exact: true,
+        })),
+      ])
     }
   }, [id, query.data, queryClient])
 
@@ -152,7 +162,7 @@ export function useAnalysisDetailQuery(id?: string, analysisId?: string) {
     queryFn: () => getAnalysis(id!, analysisId!),
     enabled: Boolean(id && analysisId),
     refetchInterval: (query) => (
-      isAnalysisInProgress(query.state.data?.state) ? ACTIVE_POLL_INTERVAL_MS : false
+      shouldPollAnalysis(query.state.data) ? ACTIVE_POLL_INTERVAL_MS : false
     ),
   })
 }

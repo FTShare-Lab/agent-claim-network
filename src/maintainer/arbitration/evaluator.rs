@@ -82,7 +82,7 @@ impl LlmArbitrationEvaluator {
         let context_window = self.context_window;
         let max_tokens = self.max_tokens;
         let call = self.caller.generate_json_validated_with_guarded_attempts(
-            StructuredJsonAttemptRequest::retryable_provider(system_prompt, messages),
+            StructuredJsonAttemptRequest::arbitration(system_prompt, messages),
             |value| serde_json::from_value(value).map_err(anyhow::Error::from),
             |_, _, _| {},
             |_| std::future::ready(()),

@@ -29,6 +29,7 @@ pub(crate) struct StructuredJsonAttemptRequest {
     system_prompt: String,
     messages: Vec<SessionTurnMessage>,
     provider_retry_count_override: Option<u32>,
+    enforce_request_timeout: bool,
 }
 
 impl StructuredJsonAttemptRequest {
@@ -37,15 +38,20 @@ impl StructuredJsonAttemptRequest {
             system_prompt,
             messages,
             provider_retry_count_override: None,
+            enforce_request_timeout: false,
         }
     }
 
     pub(crate) fn compaction(system_prompt: String, messages: Vec<SessionTurnMessage>) -> Self {
-        Self::retryable_provider(system_prompt, messages)
+        Self {
+            system_prompt,
+            messages,
+            provider_retry_count_override: Some(0),
+            enforce_request_timeout: false,
+        }
     }
 
-    /// 由结构化调用层统一承担 provider/解析/shape 重试，避免 adapter 与上层重复放大预算。
-    pub(crate) fn retryable_provider(
+    fn guarded_with_request_timeout(
         system_prompt: String,
         messages: Vec<SessionTurnMessage>,
     ) -> Self {
@@ -53,7 +59,21 @@ impl StructuredJsonAttemptRequest {
             system_prompt,
             messages,
             provider_retry_count_override: Some(0),
+            enforce_request_timeout: true,
         }
+    }
+
+    /// 仲裁由结构化调用层统一承担 provider/解析/shape 重试，并限制每次真实请求时长。
+    pub(crate) fn arbitration(system_prompt: String, messages: Vec<SessionTurnMessage>) -> Self {
+        Self::guarded_with_request_timeout(system_prompt, messages)
+    }
+
+    /// CAU 单消息内化共享一个 provider/解析/业务校验预算，并限制每次真实请求时长。
+    pub(crate) fn claim_attribute_update(
+        system_prompt: String,
+        messages: Vec<SessionTurnMessage>,
+    ) -> Self {
+        Self::guarded_with_request_timeout(system_prompt, messages)
     }
 }
 
@@ -214,6 +234,7 @@ impl StructuredJsonCaller {
             system_prompt,
             messages,
             provider_retry_count_override,
+            enforce_request_timeout,
         } = request;
         let mut attempt = 0;
         let base_messages = messages;
@@ -225,6 +246,7 @@ impl StructuredJsonCaller {
                     system_prompt.clone(),
                     attempt_messages.clone(),
                     provider_retry_count_override,
+                    enforce_request_timeout,
                 )
                 .await
             {
@@ -358,6 +380,7 @@ impl StructuredJsonCaller {
         system_prompt: String,
         messages: Vec<SessionTurnMessage>,
         retry_count_override: Option<u32>,
+        enforce_request_timeout: bool,
     ) -> Result<JsonCallParsed, JsonCallFailure> {
         let request = ProviderRequest {
             system_prompt,
@@ -369,7 +392,7 @@ impl StructuredJsonCaller {
         };
 
         let mut emit = |_event: ProviderEvent| {};
-        let response = if retry_count_override == Some(0) {
+        let response = if enforce_request_timeout {
             match self.provider.request_timeout() {
                 Some(timeout) => {
                     tokio::time::timeout(timeout, self.provider.send(request, &mut emit))
@@ -396,7 +419,7 @@ impl StructuredJsonCaller {
                     })?,
             }
         } else {
-            // None 保留 adapter 内部完整 retry 语义，与普通 ProviderRequest 一致。
+            // 标准调用和 compaction 保留 main 原有 timeout 语义。
             self.provider
                 .send(request, &mut emit)
                 .await
@@ -806,10 +829,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_request_timeout_bounds_explicit_single_attempt_calls() {
+    async fn provider_request_timeout_does_not_change_compaction_semantics() {
         let caller = caller(Arc::new(SlowProvider));
 
-        let error = caller
+        let value = caller
             .generate_json_validated_with_guarded_attempts(
                 StructuredJsonAttemptRequest::compaction("system".into(), Vec::new()),
                 Ok,
@@ -818,7 +841,25 @@ mod tests {
                 |_, _| Ok(()),
             )
             .await
-            .expect_err("explicit single-provider attempts must use request_timeout");
+            .expect("compaction must preserve main timeout semantics");
+
+        assert_eq!(value, json!({"ok": true}));
+    }
+
+    #[tokio::test]
+    async fn provider_request_timeout_bounds_claim_attribute_update_attempts() {
+        let caller = caller(Arc::new(SlowProvider));
+
+        let error = caller
+            .generate_json_validated_with_guarded_attempts(
+                StructuredJsonAttemptRequest::claim_attribute_update("system".into(), Vec::new()),
+                Ok,
+                |_, _, _| {},
+                |_| std::future::ready(()),
+                |_, _| Ok(()),
+            )
+            .await
+            .expect_err("CAU provider attempts must use request_timeout");
 
         assert!(error.to_string().contains("provider request 超时"));
     }

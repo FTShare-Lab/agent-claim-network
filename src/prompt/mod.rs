@@ -540,24 +540,45 @@ mod tests {
     }
 
     #[test]
-    fn repository_arbitration_inbox_prompt_defines_simple_single_call_context() {
+    fn repository_policy_inbox_prompt_rejects_resolved_or_deprecated_disputes() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let reg = PromptRegistry::new(&root).unwrap();
+        let prompt = reg.render("inbox_policy_update_internalize", ()).unwrap();
+
+        assert!(prompt.contains("推演最终 Claim 状态"));
+        assert!(prompt.contains("仍有至少两条非 deprecated Claim"));
+        assert!(prompt.contains("policy 本身不足以判断"));
+        assert!(prompt.contains("不得再为新旧表达创建 Dispute"));
+        assert!(prompt.contains("deprecated Claim 不能成为新 Dispute 的 direct Claim"));
+    }
+
+    #[test]
+    fn repository_claim_attribute_update_prompt_defines_unified_single_call_context() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
         let reg = PromptRegistry::new(&root).unwrap();
         let prompt = reg
             .render("inbox_claim_attribute_update_internalize", ())
             .unwrap();
 
-        for field in ["arbitration_message", "local_claims", "direct_claims"] {
-            assert!(prompt.contains(field), "missing arbitration field {field}");
+        for field in [
+            "claim_attribute_update",
+            "conclusion",
+            "resolution",
+            "dispute",
+            "local_claims",
+            "direct_claims",
+        ] {
+            assert!(prompt.contains(field), "missing CAU field {field}");
         }
         assert!(prompt.contains("不读取 Memory、USER、session transcript 或工具上下文"));
-        assert!(prompt.contains("全部非 deprecated 本地 Claims"));
-        assert!(prompt.contains("当前 Agent 持有的任意 status 的 direct Claims"));
+        assert!(prompt.contains("全部非 deprecated 本地 Claim"));
+        assert!(prompt.contains("即使其当前为 deprecated"));
         assert!(prompt.contains("全部 direct Claim 冻结快照"));
-        assert!(prompt.contains("只能更新 `local_claims`"));
+        assert!(prompt.contains("`updated_claims` 只能引用 `local_claims`"));
+        assert!(prompt.contains("非 direct 的非 deprecated 本地 Claim 同样可以在相关时原地更新"));
         assert!(prompt.contains("仍可见、可修改并可恢复"));
         assert!(prompt.contains("非直接 deprecated Claim 不可见"));
-        assert!(prompt.contains("仅仅选择不采纳 Resolution"));
+        assert!(prompt.contains("仅仅选择不采纳 CAU 或 Resolution"));
         assert!(prompt.contains("新的实质证据"));
         assert!(prompt.contains("语义输入完全相同，不要重复创建"));
     }

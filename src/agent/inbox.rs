@@ -13,6 +13,7 @@ use opentelemetry::KeyValue;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
+use super::fs::reported_dispute_claim_set_key;
 use super::prepare::{
     llm_visible_claims, prepare_claim_updates, prepare_claims, prepare_disputes, sorted_source_ids,
     validate_visible_policy_sources,
@@ -20,8 +21,9 @@ use super::prepare::{
 use super::runner::{AgentRunner, InboxProcessReport, TeamServiceConnectionStatus};
 use super::traits::ClaimedInboxMessage;
 use crate::api::{
-    resolve_placeholders, ArbitrationInternalizeRequest, InboxInternalizeKind, InternalizeOutcome,
-    InternalizeRequest, SessionTurnMessage, StructuredJsonAttemptRequest, StructuredJsonCaller,
+    resolve_placeholders, ClaimAttributeUpdateInternalizeRequest, InboxInternalizeKind,
+    InternalizeOutcome, InternalizeRequest, SessionTurnMessage, StructuredJsonAttemptRequest,
+    StructuredJsonCaller,
 };
 use crate::claim::{
     ArbitrationResolutionContext, ArbitrationResolutionId, Claim, ClaimId, ClaimStatus, Dispute,
@@ -33,9 +35,10 @@ use crate::prompt::PromptRegistry;
 use crate::storage::{paths, read_yaml, write_yaml_atomic, FileLockGuard, StorageError};
 use crate::tracing::tracer;
 
-pub(crate) type PreparedArbitration = (DateTime<Utc>, Vec<Claim>, Vec<Claim>, Vec<Dispute>);
-pub(crate) type ArbitrationJsonValidator<'a> =
-    dyn FnMut(serde_json::Value) -> anyhow::Result<PreparedArbitration> + Send + 'a;
+pub(crate) type PreparedClaimAttributeUpdate =
+    (DateTime<Utc>, Vec<Claim>, Vec<Claim>, Vec<Dispute>);
+pub(crate) type ClaimAttributeUpdateJsonValidator<'a> =
+    dyn FnMut(serde_json::Value) -> anyhow::Result<PreparedClaimAttributeUpdate> + Send + 'a;
 
 #[async_trait]
 pub(crate) trait InboxJsonGenerator: Send + Sync {
@@ -45,19 +48,19 @@ pub(crate) trait InboxJsonGenerator: Send + Sync {
         request: InternalizeRequest,
     ) -> anyhow::Result<serde_json::Value>;
 
-    async fn generate_arbitration_json(
+    async fn generate_claim_attribute_update_json(
         &self,
-        _request: ArbitrationInternalizeRequest,
+        _request: ClaimAttributeUpdateInternalizeRequest,
     ) -> anyhow::Result<serde_json::Value> {
-        anyhow::bail!("当前 inbox generator 未实现 arbitration 内化输入")
+        anyhow::bail!("当前 inbox generator 未实现 ClaimAttributeUpdate 单消息内化输入")
     }
 
-    async fn generate_validated_arbitration_json(
+    async fn generate_validated_claim_attribute_update_json(
         &self,
-        request: ArbitrationInternalizeRequest,
-        validator: &mut ArbitrationJsonValidator<'_>,
-    ) -> anyhow::Result<PreparedArbitration> {
-        let value = self.generate_arbitration_json(request).await?;
+        request: ClaimAttributeUpdateInternalizeRequest,
+        validator: &mut ClaimAttributeUpdateJsonValidator<'_>,
+    ) -> anyhow::Result<PreparedClaimAttributeUpdate> {
+        let value = self.generate_claim_attribute_update_json(request).await?;
         validator(value)
     }
 }
@@ -105,9 +108,9 @@ impl InboxJsonGenerator for PromptInboxJsonGenerator {
             .await
     }
 
-    async fn generate_arbitration_json(
+    async fn generate_claim_attribute_update_json(
         &self,
-        request: ArbitrationInternalizeRequest,
+        request: ClaimAttributeUpdateInternalizeRequest,
     ) -> anyhow::Result<serde_json::Value> {
         let system_prompt = self
             .prompt_registry
@@ -122,11 +125,11 @@ impl InboxJsonGenerator for PromptInboxJsonGenerator {
             .await
     }
 
-    async fn generate_validated_arbitration_json(
+    async fn generate_validated_claim_attribute_update_json(
         &self,
-        request: ArbitrationInternalizeRequest,
-        validator: &mut ArbitrationJsonValidator<'_>,
-    ) -> anyhow::Result<PreparedArbitration> {
+        request: ClaimAttributeUpdateInternalizeRequest,
+        validator: &mut ClaimAttributeUpdateJsonValidator<'_>,
+    ) -> anyhow::Result<PreparedClaimAttributeUpdate> {
         let agent_id = request.agent_id.clone();
         let system_prompt = self
             .prompt_registry
@@ -135,7 +138,7 @@ impl InboxJsonGenerator for PromptInboxJsonGenerator {
         let user_text = serde_json::to_string_pretty(&request)?;
         self.json_caller
             .generate_json_validated_with_guarded_attempts(
-                StructuredJsonAttemptRequest::retryable_provider(
+                StructuredJsonAttemptRequest::claim_attribute_update(
                     system_prompt,
                     vec![SessionTurnMessage::user_text(user_text)],
                 ),
@@ -143,7 +146,7 @@ impl InboxJsonGenerator for PromptInboxJsonGenerator {
                 |retry, total, error| {
                     log::warn!(
                         target: "agent",
-                        "agent {} arbitration inbox 输出校验失败，重试 ({retry}/{total}): {error:#}",
+                        "agent {} ClaimAttributeUpdate 输出校验失败，重试 ({retry}/{total}): {error:#}",
                         agent_id
                     );
                 },
@@ -180,7 +183,8 @@ struct PlannedClaimUpdate {
 struct InboxEffectPlan {
     schema_version: u32,
     inbox_id: InboxId,
-    resolution_id: ArbitrationResolutionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolution_id: Option<ArbitrationResolutionId>,
     message_hash: String,
     state: InboxEffectState,
     #[serde(with = "crate::time::serde_utc")]
@@ -199,8 +203,8 @@ impl AgentRunner {
     /// 排空 inbox 中所有 pending 消息。
     ///
     /// 处理纪律：
-    /// - 连续同类型的 `PolicyUpdate` / `ClaimAttributeUpdate` 收集成 batch 后交给 LLM；
-    ///   一旦遇到其它消息类型，先 flush 已缓冲 batch，保证 inbox 事件顺序不被重排
+    /// - 连续 `PolicyUpdate` 收集成 batch 后交给 LLM；ClaimAttributeUpdate 为保证每条
+    ///   消息有独立 Effect Journal，统一按消息单独处理
     /// - 单次最多处理 1024 条，避免极端 inbox 堆积让一次 session 卡太久
     pub async fn process_inbox(&self) -> anyhow::Result<InboxProcessReport> {
         self.process_inbox_with(self.inbox_generator.as_ref()).await
@@ -409,14 +413,11 @@ impl AgentRunner {
                     )
                     .await?;
                 }
-                InboxMessageKind::ClaimAttributeUpdate {
-                    arbitration_resolution: Some(_),
-                    ..
-                } => {
+                InboxMessageKind::ClaimAttributeUpdate { .. } => {
                     self.flush_internalize_updates(generator, batch_kind, llm_msgs, report)
                         .await?;
                     let summary = self
-                        .internalize_arbitration_message(generator, &claimed_msg.message)
+                        .internalize_claim_attribute_update_message(generator, &claimed_msg.message)
                         .await?;
                     self.inbox.ack_claimed(&claimed_msg).await?;
                     report.claim_attribute_count += 1;
@@ -430,17 +431,6 @@ impl AgentRunner {
                         .extend(summary.deprecated_claim_ids);
                     report.new_dispute_ids.extend(summary.new_dispute_ids);
                     report.warnings.extend(summary.warnings);
-                }
-                InboxMessageKind::ClaimAttributeUpdate { .. } => {
-                    self.push_internalize_message(
-                        generator,
-                        InboxInternalizeKind::ClaimAttributeUpdate,
-                        claimed_msg,
-                        batch_kind,
-                        llm_msgs,
-                        report,
-                    )
-                    .await?;
                 }
             }
             report.total += 1;
@@ -575,7 +565,7 @@ impl AgentRunner {
         })
     }
 
-    async fn internalize_arbitration_message(
+    async fn internalize_claim_attribute_update_message(
         &self,
         generator: &dyn InboxJsonGenerator,
         message: &InboxMessage,
@@ -583,11 +573,13 @@ impl AgentRunner {
         let (policy, resolution_context) = match &message.kind {
             InboxMessageKind::ClaimAttributeUpdate {
                 policy,
-                arbitration_resolution: Some(resolution_context),
-            } => (policy, resolution_context.as_ref()),
-            _ => anyhow::bail!("期望带 arbitration resolution 的 ClaimAttributeUpdate"),
+                arbitration_resolution,
+            } => (policy, arbitration_resolution.as_deref()),
+            _ => anyhow::bail!("期望 ClaimAttributeUpdate inbox 消息"),
         };
-        validate_arbitration_message(message, resolution_context)?;
+        if let Some(resolution_context) = resolution_context {
+            validate_arbitration_message(message, resolution_context)?;
+        }
         let effect_path = paths::agent_home_inbox_effect_path(
             self.maintainer_upload_queue.agent_home(),
             &message.id,
@@ -604,14 +596,16 @@ impl AgentRunner {
             }
             Err(error) => return Err(error.into()),
         };
+        let resolution_id =
+            resolution_context.map(|context| context.resolution.resolution_id.clone());
         let mut plan = if let Some(plan) = existing {
             if plan.schema_version != INBOX_EFFECT_SCHEMA_VERSION
                 || plan.inbox_id != message.id
-                || plan.resolution_id != resolution_context.resolution.resolution_id
+                || plan.resolution_id != resolution_id
                 || plan.message_hash != message_hash
             {
                 anyhow::bail!(
-                    "inbox effect 冲突: inbox_id={} 已存在不同 resolution 或 message payload",
+                    "inbox effect 冲突: inbox_id={} 已存在不同 CAU context 或 message payload",
                     message.id
                 );
             }
@@ -621,28 +615,33 @@ impl AgentRunner {
             plan
         } else {
             let prepared = self
-                .prepare_arbitration_effect(generator, message, policy, resolution_context)
+                .prepare_claim_attribute_update_effect(
+                    generator,
+                    message,
+                    policy,
+                    resolution_context,
+                )
                 .await?;
             write_yaml_atomic(&effect_path, &prepared).await?;
             prepared
         };
-        self.apply_arbitration_effect(&mut plan).await?;
+        self.apply_claim_attribute_update_effect(&mut plan).await?;
         plan.state = InboxEffectState::Applied;
         write_yaml_atomic(&effect_path, &plan).await?;
         Ok(effect_summary(&plan))
     }
 
-    async fn prepare_arbitration_effect(
+    async fn prepare_claim_attribute_update_effect(
         &self,
         generator: &dyn InboxJsonGenerator,
         message: &InboxMessage,
         policy: &Policy,
-        resolution_context: &ArbitrationResolutionContext,
+        resolution_context: Option<&ArbitrationResolutionContext>,
     ) -> anyhow::Result<InboxEffectPlan> {
         let all_local = self.claim_store.list_local_claims().await?;
         let direct_ids: FxHashSet<ClaimId> = resolution_context
-            .direct_claim_snapshots
-            .iter()
+            .into_iter()
+            .flat_map(|context| &context.direct_claim_snapshots)
             .map(|claim| claim.id.clone())
             .collect();
         let mut local_claims = Vec::new();
@@ -664,37 +663,46 @@ impl AgentRunner {
             }
         }
         local_claims.sort_by(|left, right| left.id.cmp(&right.id));
-        let mut direct_claims = resolution_context.direct_claim_snapshots.clone();
+        let mut direct_claims = resolution_context
+            .map(|context| context.direct_claim_snapshots.clone())
+            .unwrap_or_default();
         direct_claims.sort_by(|left, right| left.id.cmp(&right.id));
         let local_by_id: FxHashMap<ClaimId, Claim> = local_claims
             .iter()
             .map(|claim| (claim.id.clone(), claim.clone()))
             .collect();
-        let request = ArbitrationInternalizeRequest {
+        let request = ClaimAttributeUpdateInternalizeRequest {
             agent_id: self.agent_id.clone(),
-            arbitration_message: message.clone(),
+            claim_attribute_update: message.clone(),
+            conclusion: resolution_context
+                .map(|context| context.resolution.conclusion.clone())
+                .unwrap_or_else(|| policy.statement.clone()),
+            resolution: resolution_context.map(|context| context.resolution.clone()),
+            dispute: resolution_context.map(|context| context.dispute_snapshot.clone()),
             local_claims,
             direct_claims,
         };
         let (now, mut new_claims, mut updated_claims, mut new_disputes) = self
-            .arbitration_internalize_and_prepare_once(generator, request, &local_by_id)
+            .claim_attribute_update_internalize_and_prepare_once(generator, request, &local_by_id)
             .await?;
-        let before_repeat_filter = new_disputes.len();
-        new_disputes.retain(|dispute| {
-            !repeats_resolved_arbitration_input(
-                dispute,
-                resolution_context,
-                &local_by_id,
-                &updated_claims,
-            )
-        });
-        if new_disputes.len() != before_repeat_filter {
-            log::info!(
-                target: "agent",
-                "agent {} 跳过与已 resolved dispute={} 语义输入相同的重复 dispute",
-                self.agent_id,
-                resolution_context.dispute_id
-            );
+        if let Some(resolution_context) = resolution_context {
+            let before_repeat_filter = new_disputes.len();
+            new_disputes.retain(|dispute| {
+                !repeats_resolved_arbitration_input(
+                    dispute,
+                    resolution_context,
+                    &local_by_id,
+                    &updated_claims,
+                )
+            });
+            if new_disputes.len() != before_repeat_filter {
+                log::info!(
+                    target: "agent",
+                    "agent {} 跳过与已 resolved dispute={} 语义输入相同的重复 dispute",
+                    self.agent_id,
+                    resolution_context.dispute_id
+                );
+            }
         }
         let provenance = SourceId::Policy(policy.id.clone());
         for claim in new_claims.iter_mut().chain(updated_claims.iter_mut()) {
@@ -744,13 +752,18 @@ impl AgentRunner {
                     .flat_map(|update| update.target.source_claim_ids.iter().cloned()),
             );
             let input_claims = sorted_source_ids(inputs);
-            let name = "inbox_arbitration_internalization".to_string();
+            let name = "inbox_claim_attribute_update".to_string();
             Some(Trace {
                 id: TraceId::from_trace_parts(now, &name, &input_claims, &output_claims),
                 name,
-                task: format!(
-                    "内化 maintainer arbitration resolution {}",
-                    resolution_context.resolution.resolution_id
+                task: resolution_context.map_or_else(
+                    || "内化 ClaimAttributeUpdate".to_string(),
+                    |context| {
+                        format!(
+                            "内化 ClaimAttributeUpdate resolution {}",
+                            context.resolution.resolution_id
+                        )
+                    },
                 ),
                 agent: self.agent_id.clone(),
                 input_claims,
@@ -761,7 +774,8 @@ impl AgentRunner {
         Ok(InboxEffectPlan {
             schema_version: INBOX_EFFECT_SCHEMA_VERSION,
             inbox_id: message.id.clone(),
-            resolution_id: resolution_context.resolution.resolution_id.clone(),
+            resolution_id: resolution_context
+                .map(|context| context.resolution.resolution_id.clone()),
             message_hash: inbox_effect_hash(message)?,
             state: InboxEffectState::Prepared,
             prepared_at: now,
@@ -774,33 +788,133 @@ impl AgentRunner {
         })
     }
 
-    async fn arbitration_internalize_and_prepare_once(
+    async fn claim_attribute_update_internalize_and_prepare_once(
         &self,
         generator: &dyn InboxJsonGenerator,
-        request: ArbitrationInternalizeRequest,
-        local_by_id: &FxHashMap<ClaimId, Claim>,
+        request: ClaimAttributeUpdateInternalizeRequest,
+        editable_local_by_id: &FxHashMap<ClaimId, Claim>,
     ) -> anyhow::Result<(DateTime<Utc>, Vec<Claim>, Vec<Claim>, Vec<Dispute>)> {
         let agent_id = self.agent_id.clone();
+        let mut visible_claims_by_id: FxHashMap<ClaimId, Claim> = request
+            .direct_claims
+            .iter()
+            .map(|claim| (claim.id.clone(), claim.clone()))
+            .collect();
+        // 当前 holder 的本地状态比 resolution 中的历史快照更新，应覆盖同 ID 快照。
+        visible_claims_by_id.extend(
+            request
+                .local_claims
+                .iter()
+                .map(|claim| (claim.id.clone(), claim.clone())),
+        );
+        let visible_claims = request.direct_claims.iter().chain(&request.local_claims);
+        let mut allowed_policy_ids =
+            inbox_policy_ids(std::slice::from_ref(&request.claim_attribute_update))
+                .into_iter()
+                .collect::<FxHashSet<_>>();
+        let mut allowed_source_claim_ids = FxHashSet::default();
+        let mut allowed_dispute_claim_ids = FxHashSet::default();
+        for claim in visible_claims {
+            allowed_source_claim_ids.insert(claim.id.clone());
+            allowed_dispute_claim_ids.insert(claim.id.clone());
+            for source in &claim.source_claim_ids {
+                match source {
+                    SourceId::Claim(claim_id) => {
+                        allowed_source_claim_ids.insert(claim_id.clone());
+                    }
+                    SourceId::Policy(policy_id) => {
+                        allowed_policy_ids.insert(policy_id.clone());
+                    }
+                }
+            }
+        }
         let mut validator = move |raw| {
+            // 每次 structured retry 都从同一份只读输入权限开始，失败输出不能扩张白名单。
+            let mut attempt_source_claim_ids = allowed_source_claim_ids.clone();
+            let mut attempt_dispute_claim_ids = allowed_dispute_claim_ids.clone();
             let now = Utc::now();
             let resolved = resolve_placeholders(raw, now)?;
             let outcome: InternalizeOutcome = serde_json::from_value(resolved)
-                .map_err(|error| anyhow::anyhow!("arbitration inbox 输出无法解析: {error}"))?;
-            let new_claims = prepare_claims(outcome.new_claims, None, &agent_id, now)?;
-            let updated_claims =
-                prepare_claim_updates(outcome.updated_claims, local_by_id, None, now)?;
-            if updated_claims.iter().any(|claim| claim.holder != agent_id) {
-                anyhow::bail!("arbitration updated_claims 只能由当前 holder 修改");
+                .map_err(|error| anyhow::anyhow!("ClaimAttributeUpdate 输出无法解析: {error}"))?;
+            validate_visible_policy_sources(
+                "new_claims",
+                &outcome.new_claims,
+                &allowed_policy_ids,
+            )?;
+            validate_visible_policy_sources(
+                "updated_claims",
+                &outcome.updated_claims,
+                &allowed_policy_ids,
+            )?;
+            for (index, draft) in outcome.new_claims.iter().enumerate() {
+                let claim_id = ClaimId::from_str(&draft.id).map_err(|error| {
+                    anyhow::anyhow!(
+                        "ClaimAttributeUpdate new_claims[{index}].id 不是合法 ClaimId: {error}"
+                    )
+                })?;
+                attempt_source_claim_ids.insert(claim_id.clone());
+                attempt_dispute_claim_ids.insert(claim_id);
             }
-            let new_disputes = prepare_disputes(outcome.new_disputes, None, &agent_id, now)?;
+            let new_claims = prepare_claims(
+                outcome.new_claims,
+                Some(&attempt_source_claim_ids),
+                &agent_id,
+                now,
+            )?;
+            let updated_claims = prepare_claim_updates(
+                outcome.updated_claims,
+                editable_local_by_id,
+                Some(&attempt_source_claim_ids),
+                now,
+            )?;
+            if updated_claims.iter().any(|claim| claim.holder != agent_id) {
+                anyhow::bail!("ClaimAttributeUpdate updated_claims 只能由当前 holder 修改");
+            }
+            let new_disputes = prepare_disputes(
+                outcome.new_disputes,
+                Some(&attempt_dispute_claim_ids),
+                &agent_id,
+                now,
+            )?;
+            validate_new_disputes_against_final_claim_status(
+                &visible_claims_by_id,
+                &new_claims,
+                &updated_claims,
+                &new_disputes,
+            )?;
             Ok((now, new_claims, updated_claims, new_disputes))
         };
         generator
-            .generate_validated_arbitration_json(request, &mut validator)
+            .generate_validated_claim_attribute_update_json(request, &mut validator)
             .await
     }
 
-    async fn apply_arbitration_effect(&self, plan: &mut InboxEffectPlan) -> anyhow::Result<()> {
+    async fn apply_claim_attribute_update_effect(
+        &self,
+        plan: &mut InboxEffectPlan,
+    ) -> anyhow::Result<()> {
+        if self.team_services_configured() {
+            let mut unreported = Vec::with_capacity(plan.new_disputes.len());
+            let mut accepted_claim_sets = FxHashSet::default();
+            for dispute in &plan.new_disputes {
+                if self.dispute_claim_set_reported(dispute).await? {
+                    plan.warnings.push(format!(
+                        "dispute={} 的 claim-set 已报告，未再次上报",
+                        dispute.id
+                    ));
+                } else if !accepted_claim_sets
+                    .insert(reported_dispute_claim_set_key(&dispute.claims))
+                {
+                    plan.warnings.push(format!(
+                        "dispute={} 的 claim-set 在当前 CAU 中重复，未再次上报",
+                        dispute.id
+                    ));
+                } else {
+                    unreported.push(dispute.clone());
+                }
+            }
+            plan.new_disputes = unreported;
+        }
         let mut current: FxHashMap<ClaimId, Claim> = self
             .claim_store
             .list_local_claims()
@@ -836,11 +950,11 @@ impl AgentRunner {
                     claims_to_upload.push(update.target.clone());
                 }
                 Some(_) => plan.warnings.push(format!(
-                    "claim={} 在 effect prepared 后已变更，裁决更新已 superseded",
+                    "claim={} 在 effect prepared 后已变更，CAU 更新已 superseded",
                     update.target.id
                 )),
                 None => plan.warnings.push(format!(
-                    "claim={} 在 effect prepared 后已缺失，裁决更新已 superseded",
+                    "claim={} 在 effect prepared 后已缺失，CAU 更新已 superseded",
                     update.target.id
                 )),
             }
@@ -1034,8 +1148,12 @@ impl AgentRunner {
         if self.team_services_configured() {
             written_dispute_ids.reserve(prepared_disputes.len());
             disputes_to_upload.reserve(prepared_disputes.len());
+            let mut accepted_claim_sets = FxHashSet::default();
             for dispute in prepared_disputes {
                 if self.dispute_claim_set_reported(&dispute).await? {
+                    continue;
+                }
+                if !accepted_claim_sets.insert(reported_dispute_claim_set_key(&dispute.claims)) {
                     continue;
                 }
                 log::warn!(
@@ -1145,8 +1263,52 @@ impl AgentRunner {
             &self.agent_id,
             now,
         )?;
+        validate_new_disputes_against_final_claim_status(
+            local_by_id,
+            &prepared_claims,
+            &prepared_updates,
+            &prepared_disputes,
+        )?;
         Ok((now, prepared_claims, prepared_updates, prepared_disputes))
     }
+}
+
+/// 以整批内化完成后的状态校验新 Dispute，避免 Claim 更新与 Dispute 并发上传时，
+/// Maintainer 在旧 mirror 仍为 active 的短暂窗口内接受已失效的冲突。
+fn validate_new_disputes_against_final_claim_status(
+    existing_claims: &FxHashMap<ClaimId, Claim>,
+    new_claims: &[Claim],
+    updated_claims: &[Claim],
+    new_disputes: &[Dispute],
+) -> anyhow::Result<()> {
+    let mut final_statuses: FxHashMap<ClaimId, ClaimStatus> = existing_claims
+        .iter()
+        .map(|(id, claim)| (id.clone(), claim.status))
+        .collect();
+    final_statuses.extend(
+        new_claims
+            .iter()
+            .chain(updated_claims)
+            .map(|claim| (claim.id.clone(), claim.status)),
+    );
+
+    for dispute in new_disputes {
+        let mut deprecated: Vec<_> = dispute
+            .claims
+            .iter()
+            .filter(|claim_id| final_statuses.get(*claim_id) == Some(&ClaimStatus::Deprecated))
+            .map(ToString::to_string)
+            .collect();
+        if !deprecated.is_empty() {
+            deprecated.sort();
+            anyhow::bail!(
+                "new_disputes 不得引用本批内化后最终状态为 deprecated 的 Claim: dispute={} claims={}",
+                dispute.id,
+                deprecated.join(", ")
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_arbitration_message(
@@ -1416,6 +1578,17 @@ mod tests {
             assert_eq!(kind, self.expected_kind);
             Ok(self.response.clone())
         }
+
+        async fn generate_claim_attribute_update_json(
+            &self,
+            _request: ClaimAttributeUpdateInternalizeRequest,
+        ) -> anyhow::Result<Value> {
+            assert_eq!(
+                self.expected_kind,
+                InboxInternalizeKind::ClaimAttributeUpdate
+            );
+            Ok(self.response.clone())
+        }
     }
 
     struct CountingInboxGenerator {
@@ -1460,24 +1633,24 @@ mod tests {
         })
     }
 
-    struct RecordingArbitrationGenerator {
+    struct RecordingClaimAttributeUpdateGenerator {
         response: Value,
-        requests: Mutex<Vec<ArbitrationInternalizeRequest>>,
+        requests: Mutex<Vec<ClaimAttributeUpdateInternalizeRequest>>,
     }
 
     #[async_trait]
-    impl InboxJsonGenerator for RecordingArbitrationGenerator {
+    impl InboxJsonGenerator for RecordingClaimAttributeUpdateGenerator {
         async fn generate_json(
             &self,
             _kind: InboxInternalizeKind,
             _request: InternalizeRequest,
         ) -> anyhow::Result<Value> {
-            anyhow::bail!("arbitration fixture must use the dedicated request")
+            anyhow::bail!("CAU fixture must use the dedicated request")
         }
 
-        async fn generate_arbitration_json(
+        async fn generate_claim_attribute_update_json(
             &self,
-            request: ArbitrationInternalizeRequest,
+            request: ClaimAttributeUpdateInternalizeRequest,
         ) -> anyhow::Result<Value> {
             self.requests.lock().unwrap().push(request);
             Ok(self.response.clone())
@@ -1496,9 +1669,9 @@ mod tests {
             Ok(self.response.clone())
         }
 
-        async fn generate_arbitration_json(
+        async fn generate_claim_attribute_update_json(
             &self,
-            _request: ArbitrationInternalizeRequest,
+            _request: ClaimAttributeUpdateInternalizeRequest,
         ) -> anyhow::Result<Value> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.response.clone())
@@ -1975,7 +2148,7 @@ mod tests {
         let runner = arbitration_retry_budget_runner(&dir, &local, generator.clone(), 1).await;
 
         runner
-            .internalize_arbitration_message(generator.as_ref(), &message)
+            .internalize_claim_attribute_update_message(generator.as_ref(), &message)
             .await
             .unwrap();
 
@@ -2027,7 +2200,7 @@ mod tests {
         let runner = arbitration_retry_budget_runner(&dir, &local, generator.clone(), 2).await;
 
         let error = runner
-            .internalize_arbitration_message(generator.as_ref(), &message)
+            .internalize_claim_attribute_update_message(generator.as_ref(), &message)
             .await
             .err()
             .unwrap();
@@ -2055,9 +2228,9 @@ mod tests {
         let mut local_direct =
             arbitration_claim("agent-a", "local_direct", ClaimStatus::Deprecated);
         local_direct.source_claim_ids = vec![SourceId::Claim(historical_source_id.clone())];
-        let remote_direct = arbitration_claim("agent-b", "remote_direct", ClaimStatus::Deprecated);
-        let readonly_active = arbitration_claim("agent-a", "readonly_active", ClaimStatus::Active);
-        let readonly_stale = arbitration_claim("agent-a", "readonly_stale", ClaimStatus::Stale);
+        let remote_direct = arbitration_claim("agent-b", "remote_direct", ClaimStatus::Active);
+        let editable_active = arbitration_claim("agent-a", "editable_active", ClaimStatus::Active);
+        let editable_stale = arbitration_claim("agent-a", "editable_stale", ClaimStatus::Stale);
         let hidden_deprecated =
             arbitration_claim("agent-a", "hidden_deprecated", ClaimStatus::Deprecated);
         let policy = Policy {
@@ -2075,8 +2248,8 @@ mod tests {
         let claim_store = Arc::new(LocalFsClaimStore::new(agent_home.clone()));
         for claim in [
             &local_direct,
-            &readonly_active,
-            &readonly_stale,
+            &editable_active,
+            &editable_stale,
             &hidden_deprecated,
         ] {
             claim_store.write_claim(claim).await.unwrap();
@@ -2104,7 +2277,7 @@ mod tests {
             ])
             .await
             .unwrap();
-        let generator = Arc::new(RecordingArbitrationGenerator {
+        let generator = Arc::new(RecordingClaimAttributeUpdateGenerator {
             response: json!({
                 "new_claims": [{
                     "id": "$new_claim_0$",
@@ -2113,7 +2286,11 @@ mod tests {
                     "scope": "knowledge / shared",
                     "confidence": "high",
                     "evidence_summary": "based on visible local and remote claims",
-                    "source_claim_ids": [readonly_active.id.as_str(), remote_direct.id.as_str()]
+                    "source_claim_ids": [
+                        editable_active.id.as_str(),
+                        remote_direct.id.as_str(),
+                        policy.id.as_str()
+                    ]
                 }],
                 "updated_claims": [{
                     "id": local_direct.id.as_str(),
@@ -2128,7 +2305,7 @@ mod tests {
                 "new_disputes": [{
                     "id": "$new_dispute_0$",
                     "name": "follow_up_conflict",
-                    "claims": [readonly_active.id.as_str(), remote_direct.id.as_str(), "$new_claim_0$"],
+                    "claims": [editable_active.id.as_str(), remote_direct.id.as_str(), "$new_claim_0$"],
                     "summary": "newly created knowledge conflicts with visible local and remote evidence"
                 }]
             }),
@@ -2150,7 +2327,7 @@ mod tests {
         );
 
         let summary = runner
-            .internalize_arbitration_message(generator.as_ref(), &message)
+            .internalize_claim_attribute_update_message(generator.as_ref(), &message)
             .await
             .unwrap();
 
@@ -2158,7 +2335,13 @@ mod tests {
             let requests = generator.requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
             let request = &requests[0];
-            assert_eq!(request.arbitration_message, message);
+            assert_eq!(request.claim_attribute_update, message);
+            assert_eq!(
+                request.conclusion,
+                "keep current local facts where evidence supports them"
+            );
+            assert!(request.resolution.is_some());
+            assert!(request.dispute.is_some());
             assert_eq!(
                 request
                     .local_claims
@@ -2167,8 +2350,8 @@ mod tests {
                     .collect::<FxHashSet<_>>(),
                 FxHashSet::from_iter([
                     local_direct.id.clone(),
-                    readonly_active.id.clone(),
-                    readonly_stale.id.clone(),
+                    editable_active.id.clone(),
+                    editable_stale.id.clone(),
                 ])
             );
             assert!(request
@@ -2214,7 +2397,7 @@ mod tests {
             .contains(&SourceId::Policy(policy.id)));
         let uploaded_disputes = maintainer.disputes.lock().unwrap().clone();
         assert_eq!(uploaded_disputes.len(), 1);
-        assert!(uploaded_disputes[0].claims.contains(&readonly_active.id));
+        assert!(uploaded_disputes[0].claims.contains(&editable_active.id));
         assert!(uploaded_disputes[0].claims.contains(&remote_direct.id));
 
         let effect_text = tokio::fs::read_to_string(paths::agent_home_inbox_effect_path(
@@ -2228,7 +2411,7 @@ mod tests {
         let trace: Trace = read_yaml(&trace_path).await.unwrap();
         assert!(trace
             .input_claims
-            .contains(&SourceId::Claim(readonly_active.id.clone())));
+            .contains(&SourceId::Claim(editable_active.id.clone())));
         assert!(trace
             .input_claims
             .contains(&SourceId::Claim(remote_direct.id.clone())));
@@ -2242,7 +2425,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn arbitration_accepts_valid_claim_ids_without_a_context_whitelist() {
+    async fn arbitration_rejects_history_only_source_as_dispute_reference() {
         let dir = tempfile::tempdir().unwrap();
         let agent_home = dir.path().to_path_buf();
         let historical_source_id = ClaimId::random();
@@ -2263,7 +2446,7 @@ mod tests {
         let message = arbitration_message(&local_direct, &remote_direct, policy);
         let claim_store = Arc::new(LocalFsClaimStore::new(agent_home.clone()));
         claim_store.write_claim(&local_direct).await.unwrap();
-        let generator = Arc::new(RecordingArbitrationGenerator {
+        let generator = Arc::new(RecordingClaimAttributeUpdateGenerator {
             response: json!({
                 "new_claims": [],
                 "updated_claims": [],
@@ -2293,13 +2476,16 @@ mod tests {
             Vec::<SkillSummary>::new(),
         );
 
-        let summary = runner
-            .internalize_arbitration_message(generator.as_ref(), &message)
+        let error = runner
+            .internalize_claim_attribute_update_message(generator.as_ref(), &message)
             .await
+            .err()
             .unwrap();
 
-        assert_eq!(summary.new_dispute_ids.len(), 1);
-        assert!(tokio::fs::try_exists(paths::agent_home_inbox_effect_path(
+        assert!(error
+            .to_string()
+            .contains("不在本次上下文/本批新生成中的 claim id"));
+        assert!(!tokio::fs::try_exists(paths::agent_home_inbox_effect_path(
             &agent_home,
             &message.id,
         ))
@@ -2341,7 +2527,7 @@ mod tests {
             }])
             .await
             .unwrap();
-        let generator = Arc::new(RecordingArbitrationGenerator {
+        let generator = Arc::new(RecordingClaimAttributeUpdateGenerator {
             response: json!({
                 "new_claims": [{
                     "id": "$new_claim_0$",
@@ -2369,14 +2555,15 @@ mod tests {
             Vec::<SkillSummary>::new(),
         );
 
-        let summary = runner
-            .internalize_arbitration_message(generator.as_ref(), &message)
+        let error = runner
+            .internalize_claim_attribute_update_message(generator.as_ref(), &message)
             .await
+            .err()
             .unwrap();
 
-        assert_eq!(summary.new_claim_ids.len(), 1);
+        assert!(error.to_string().contains("不在本次上下文/本批新生成中"));
         assert_eq!(generator.requests.lock().unwrap().len(), 1);
-        assert!(tokio::fs::try_exists(paths::agent_home_inbox_effect_path(
+        assert!(!tokio::fs::try_exists(paths::agent_home_inbox_effect_path(
             &agent_home,
             &message.id,
         ))
@@ -2385,11 +2572,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn arbitration_can_update_any_non_deprecated_local_claim() {
+    async fn arbitration_rejects_invented_policy_source_before_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = arbitration_claim("agent-a", "local_direct", ClaimStatus::Active);
+        let remote = arbitration_claim("agent-b", "remote_direct", ClaimStatus::Active);
+        let policy = Policy {
+            id: PolicyId::random(),
+            message_type: PolicyMessageType::ClaimAttributeUpdate,
+            name: "dispute_arbitration".into(),
+            statement: "structured resolution".into(),
+            scope: "knowledge / shared".into(),
+            status: PolicyStatus::Active,
+            created_at: "2026-08-02T00:00:00Z".parse().unwrap(),
+            updated_at: None,
+            target_agents: Some(vec![local.holder.clone()]),
+        };
+        let message = arbitration_message(&local, &remote, policy);
+        let invented_policy = PolicyId::random();
+        let generator = Arc::new(RecordingClaimAttributeUpdateGenerator {
+            response: json!({
+                "new_claims": [{
+                    "id": "$new_claim_0$",
+                    "name": "invented_policy_source",
+                    "statement": "must not be persisted",
+                    "scope": "knowledge / shared",
+                    "confidence": "high",
+                    "evidence_summary": "invented provenance",
+                    "source_claim_ids": [invented_policy.as_str()]
+                }],
+                "updated_claims": [],
+                "new_disputes": []
+            }),
+            requests: Mutex::new(Vec::new()),
+        });
+        let runner = arbitration_retry_budget_runner(&dir, &local, generator.clone(), 0).await;
+
+        let error = runner
+            .internalize_claim_attribute_update_message(generator.as_ref(), &message)
+            .await
+            .err()
+            .unwrap();
+
+        assert!(error
+            .to_string()
+            .contains("不是本次 LLM 输入中可见的 PolicyId"));
+        assert!(!tokio::fs::try_exists(paths::agent_home_inbox_effect_path(
+            dir.path(),
+            &message.id,
+        ))
+        .await
+        .unwrap());
+    }
+
+    #[tokio::test]
+    async fn claim_attribute_update_can_edit_non_deprecated_non_direct_local_claims() {
         let dir = tempfile::tempdir().unwrap();
         let agent_home = dir.path().to_path_buf();
         let local_direct = arbitration_claim("agent-a", "local_direct", ClaimStatus::Active);
-        let readonly_local = arbitration_claim("agent-a", "readonly_local", ClaimStatus::Stale);
+        let editable_local = arbitration_claim("agent-a", "editable_local", ClaimStatus::Stale);
         let remote_direct = arbitration_claim("agent-b", "remote_direct", ClaimStatus::Active);
         let policy = Policy {
             id: PolicyId::random(),
@@ -2405,18 +2645,18 @@ mod tests {
         let message = arbitration_message(&local_direct, &remote_direct, policy);
         let claim_store = Arc::new(LocalFsClaimStore::new(agent_home.clone()));
         claim_store.write_claim(&local_direct).await.unwrap();
-        claim_store.write_claim(&readonly_local).await.unwrap();
-        let generator = Arc::new(RecordingArbitrationGenerator {
+        claim_store.write_claim(&editable_local).await.unwrap();
+        let generator = Arc::new(RecordingClaimAttributeUpdateGenerator {
             response: json!({
                 "new_claims": [],
                 "updated_claims": [{
-                    "id": readonly_local.id.as_str(),
-                    "name": readonly_local.name,
-                    "statement": readonly_local.statement,
-                    "scope": readonly_local.scope,
+                    "id": editable_local.id.as_str(),
+                    "name": editable_local.name,
+                    "statement": editable_local.statement,
+                    "scope": editable_local.scope,
                     "confidence": "high",
                     "status": "active",
-                    "evidence_summary": "invalid readonly edit",
+                    "evidence_summary": "valid non-direct edit",
                     "source_claim_ids": []
                 }],
                 "new_disputes": []
@@ -2441,22 +2681,92 @@ mod tests {
         );
 
         let summary = runner
-            .internalize_arbitration_message(generator.as_ref(), &message)
+            .internalize_claim_attribute_update_message(generator.as_ref(), &message)
             .await
             .unwrap();
 
-        assert_eq!(summary.updated_claim_ids, vec![readonly_local.id.clone()]);
+        assert_eq!(summary.updated_claim_ids, vec![editable_local.id.clone()]);
         let updated = claim_store
             .list_local_claims()
             .await
             .unwrap()
             .into_iter()
-            .find(|claim| claim.id == readonly_local.id)
+            .find(|claim| claim.id == editable_local.id)
             .unwrap();
         assert_eq!(updated.status, ClaimStatus::Active);
-        assert_eq!(updated.confidence, crate::claim::Confidence::High);
-        assert_eq!(updated.evidence_summary, "invalid readonly edit");
         assert!(tokio::fs::try_exists(paths::agent_home_inbox_effect_path(
+            &agent_home,
+            &message.id,
+        ))
+        .await
+        .unwrap());
+    }
+
+    #[tokio::test]
+    async fn claim_attribute_update_rejects_deprecated_non_direct_local_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_home = dir.path().to_path_buf();
+        let local_direct = arbitration_claim("agent-a", "local_direct", ClaimStatus::Active);
+        let deprecated_local =
+            arbitration_claim("agent-a", "deprecated_local", ClaimStatus::Deprecated);
+        let remote_direct = arbitration_claim("agent-b", "remote_direct", ClaimStatus::Active);
+        let policy = Policy {
+            id: PolicyId::random(),
+            message_type: PolicyMessageType::ClaimAttributeUpdate,
+            name: "dispute_resolution".into(),
+            statement: "structured resolution".into(),
+            scope: "knowledge / shared".into(),
+            status: PolicyStatus::Active,
+            created_at: "2026-08-02T00:00:00Z".parse().unwrap(),
+            updated_at: None,
+            target_agents: Some(vec![local_direct.holder.clone()]),
+        };
+        let message = arbitration_message(&local_direct, &remote_direct, policy);
+        let claim_store = Arc::new(LocalFsClaimStore::new(agent_home.clone()));
+        claim_store.write_claim(&local_direct).await.unwrap();
+        claim_store.write_claim(&deprecated_local).await.unwrap();
+        let generator = Arc::new(RecordingClaimAttributeUpdateGenerator {
+            response: json!({
+                "new_claims": [],
+                "updated_claims": [{
+                    "id": deprecated_local.id.as_str(),
+                    "name": deprecated_local.name,
+                    "statement": deprecated_local.statement,
+                    "scope": deprecated_local.scope,
+                    "confidence": "high",
+                    "status": "active",
+                    "evidence_summary": "must remain outside the editable set",
+                    "source_claim_ids": []
+                }],
+                "new_disputes": []
+            }),
+            requests: Mutex::new(Vec::new()),
+        });
+        let runner = AgentRunner::new_local(
+            local_direct.holder.clone(),
+            generator.clone(),
+            claim_store.clone(),
+            Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home.clone())),
+            Arc::new(LocalFsInboxReader::new(agent_home.clone())),
+            Arc::new(LocalFsMemoryStore::new(
+                agent_home.clone(),
+                1600,
+                1000,
+                false,
+            )),
+            Arc::new(LocalFsMaintainerUploadQueue::new(agent_home.clone())),
+            0,
+            Vec::<SkillSummary>::new(),
+        );
+
+        let error = runner
+            .internalize_claim_attribute_update_message(generator.as_ref(), &message)
+            .await
+            .err()
+            .unwrap();
+
+        assert!(error.to_string().contains("不是当前 agent 本地已有 claim"));
+        assert!(!tokio::fs::try_exists(paths::agent_home_inbox_effect_path(
             &agent_home,
             &message.id,
         ))
@@ -2645,7 +2955,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn arbitration_effect_journal_replays_without_second_model_call() {
+    async fn ordinary_claim_attribute_updates_are_individual_and_journaled() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_home = dir.path().to_path_buf();
+        let agent_id = AgentId::new("agent-a").unwrap();
+        let inbox = Arc::new(LocalFsInboxReader::new(agent_home.clone()));
+        let messages = ["first", "second"].map(|name| InboxMessage {
+            id: InboxId::random(),
+            kind: InboxMessageKind::ClaimAttributeUpdate {
+                policy: Policy {
+                    id: PolicyId::random(),
+                    message_type: PolicyMessageType::ClaimAttributeUpdate,
+                    name: format!("{name}_cau"),
+                    statement: format!("{name} conclusion"),
+                    scope: "tests / cau".into(),
+                    status: PolicyStatus::Active,
+                    created_at: Utc::now(),
+                    updated_at: None,
+                    target_agents: Some(vec![agent_id.clone()]),
+                },
+                arbitration_resolution: None,
+            },
+            handled_at: None,
+        });
+        for message in &messages {
+            inbox.accept_pulled(message).await.unwrap();
+        }
+        let generator = Arc::new(CountingInboxGenerator {
+            response: json!({
+                "new_claims": [],
+                "updated_claims": [],
+                "new_disputes": []
+            }),
+            calls: AtomicUsize::new(0),
+        });
+        let runner = AgentRunner::new_local(
+            agent_id,
+            generator.clone(),
+            Arc::new(LocalFsClaimStore::new(agent_home.clone())),
+            Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home.clone())),
+            inbox,
+            Arc::new(LocalFsMemoryStore::new(
+                agent_home.clone(),
+                1600,
+                1000,
+                false,
+            )),
+            Arc::new(LocalFsMaintainerUploadQueue::new(agent_home.clone())),
+            0,
+            Vec::<SkillSummary>::new(),
+        );
+
+        let report = runner.process_inbox_with(generator.as_ref()).await.unwrap();
+
+        assert_eq!(report.total, 2);
+        assert_eq!(report.claim_attribute_count, 2);
+        assert_eq!(generator.calls.load(Ordering::SeqCst), 2);
+        for message in &messages {
+            let plan: InboxEffectPlan = read_yaml(&paths::agent_home_inbox_effect_path(
+                &agent_home,
+                &message.id,
+            ))
+            .await
+            .unwrap();
+            assert_eq!(plan.state, InboxEffectState::Applied);
+            assert_eq!(plan.resolution_id, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_attribute_update_effect_journal_replays_without_second_model_call() {
         let dir = tempfile::tempdir().unwrap();
         let agent_home = dir.path().to_path_buf();
         let local = arbitration_claim("agent-a", "legacy", ClaimStatus::Active);
@@ -2677,12 +3056,7 @@ mod tests {
                     "evidence_summary": "holder accepted the replacement resolution",
                     "source_claim_ids": [remote.id.as_str()]
                 }],
-                "new_disputes": [{
-                    "id": "$new_dispute_0$",
-                    "name": "resolution evidence still conflicts",
-                    "claims": [local.id.as_str(), remote.id.as_str()],
-                    "summary": "holder retains a follow-up dispute using both direct snapshots"
-                }]
+                "new_disputes": []
             }),
             calls: AtomicUsize::new(0),
         });
@@ -2706,7 +3080,7 @@ mod tests {
         );
 
         let first = runner
-            .internalize_arbitration_message(generator.as_ref(), &message)
+            .internalize_claim_attribute_update_message(generator.as_ref(), &message)
             .await
             .unwrap();
         let effect_path = paths::agent_home_inbox_effect_path(&agent_home, &message.id);
@@ -2714,7 +3088,7 @@ mod tests {
         interrupted.state = InboxEffectState::Prepared;
         write_yaml_atomic(&effect_path, &interrupted).await.unwrap();
         let replay = runner
-            .internalize_arbitration_message(generator.as_ref(), &message)
+            .internalize_claim_attribute_update_message(generator.as_ref(), &message)
             .await
             .unwrap();
 
@@ -2738,8 +3112,7 @@ mod tests {
         let effect: InboxEffectPlan = read_yaml(&effect_path).await.unwrap();
         assert_eq!(effect.state, InboxEffectState::Applied);
         assert_eq!(effect.deprecated_claim_ids, vec![local.id.clone()]);
-        assert_eq!(effect.new_disputes.len(), 1);
-        assert!(effect.new_disputes[0].claims.contains(&remote.id));
+        assert!(effect.new_disputes.is_empty());
     }
 
     #[tokio::test]
@@ -2987,7 +3360,7 @@ mod tests {
         );
 
         let error = runner
-            .internalize_arbitration_message(generator.as_ref(), &message)
+            .internalize_claim_attribute_update_message(generator.as_ref(), &message)
             .await
             .err()
             .unwrap();
@@ -3192,6 +3565,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_update_rejects_dispute_that_references_same_batch_deprecation() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_home = dir.path().to_path_buf();
+        let agent_id = AgentId::new("agent-a").unwrap();
+        let existing = arbitration_claim("agent-a", "legacy_default", ClaimStatus::Active);
+        let policy = Policy {
+            id: PolicyId::random(),
+            message_type: PolicyMessageType::PolicyUpdate,
+            name: "current_baseline".into(),
+            statement: "use the current supported baseline".into(),
+            scope: "runtime / current".into(),
+            status: PolicyStatus::Active,
+            created_at: Utc::now(),
+            updated_at: None,
+            target_agents: None,
+        };
+        let generator = Arc::new(StaticInboxGenerator {
+            expected_kind: InboxInternalizeKind::PolicyUpdate,
+            response: json!({
+                "new_claims": [{
+                    "id": "$new_claim_0$",
+                    "name": "supported_default",
+                    "statement": "use the current supported runtime",
+                    "scope": "runtime / current",
+                    "confidence": "high",
+                    "evidence_summary": "team policy",
+                    "source_claim_ids": []
+                }],
+                "updated_claims": [{
+                    "id": existing.id.as_str(),
+                    "name": existing.name,
+                    "statement": existing.statement,
+                    "scope": existing.scope,
+                    "confidence": "high",
+                    "status": "deprecated",
+                    "evidence_summary": "superseded by the current baseline",
+                    "source_claim_ids": []
+                }],
+                "new_disputes": [{
+                    "id": "$new_dispute_0$",
+                    "name": "redundant_baseline_conflict",
+                    "claims": [existing.id.as_str(), "$new_claim_0$"],
+                    "summary": "the old and current baselines disagree"
+                }]
+            }),
+        });
+        let runner = AgentRunner::new_local(
+            agent_id.clone(),
+            generator.clone(),
+            Arc::new(LocalFsClaimStore::new(agent_home.clone())),
+            Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home.clone())),
+            Arc::new(LocalFsInboxReader::new(agent_home.clone())),
+            Arc::new(LocalFsMemoryStore::new(
+                agent_home.clone(),
+                1600,
+                1000,
+                false,
+            )),
+            Arc::new(LocalFsMaintainerUploadQueue::new(agent_home)),
+            0,
+            Vec::<SkillSummary>::new(),
+        );
+        let request = InternalizeRequest {
+            agent_id,
+            inbox_messages: vec![InboxMessage {
+                id: InboxId::random(),
+                kind: InboxMessageKind::PolicyUpdate { policy },
+                handled_at: None,
+            }],
+            local_claims: vec![existing.clone()],
+        };
+        let local_by_id = FxHashMap::from_iter([(existing.id.clone(), existing)]);
+
+        let error = runner
+            .internalize_and_prepare_once(
+                generator.as_ref(),
+                InboxInternalizeKind::PolicyUpdate,
+                request,
+                &local_by_id,
+            )
+            .await
+            .err()
+            .unwrap();
+
+        assert!(error.to_string().contains("最终状态为 deprecated 的 Claim"));
+    }
+
+    #[tokio::test]
     async fn policy_update_can_clear_existing_sources_and_write_trace() {
         let dir = tempfile::tempdir().unwrap();
         let agent_home = dir.path().to_path_buf();
@@ -3343,8 +3804,16 @@ mod tests {
             updated_at: None,
             target_agents: Some(vec![agent_id.clone()]),
         };
-        let generator = Arc::new(StaticInboxGenerator {
-            expected_kind: InboxInternalizeKind::ClaimAttributeUpdate,
+        let policy_id = policy.id.clone();
+        let message = InboxMessage {
+            id: InboxId::random(),
+            kind: InboxMessageKind::ClaimAttributeUpdate {
+                policy,
+                arbitration_resolution: None,
+            },
+            handled_at: None,
+        };
+        let generator = Arc::new(RecordingClaimAttributeUpdateGenerator {
             response: json!({
                 "new_claims": [],
                 "updated_claims": [{
@@ -3362,11 +3831,14 @@ mod tests {
                 }],
                 "new_disputes": []
             }),
+            requests: Mutex::new(Vec::new()),
         });
+        let claim_store = Arc::new(LocalFsClaimStore::new(agent_home.clone()));
+        claim_store.write_claim(&existing).await.unwrap();
         let runner = AgentRunner::new(
             agent_id.clone(),
             generator.clone(),
-            Arc::new(LocalFsClaimStore::new(agent_home.clone())),
+            claim_store.clone(),
             Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home.clone())),
             Arc::new(LocalFsInboxReader::new(agent_home.clone())),
             Arc::new(LocalFsMemoryStore::new(
@@ -3377,46 +3849,248 @@ mod tests {
             )),
             Arc::new(EmptyRouterClient),
             Arc::new(NoopMaintainerClient),
+            Arc::new(LocalFsMaintainerUploadQueue::new(agent_home.clone())),
+            0,
+            Vec::<SkillSummary>::new(),
+        );
+        let summary = runner
+            .internalize_claim_attribute_update_message(generator.as_ref(), &message)
+            .await
+            .unwrap();
+
+        assert!(summary.new_claim_ids.is_empty());
+        assert!(summary.new_dispute_ids.is_empty());
+        assert_eq!(summary.updated_claim_ids, vec![existing.id.clone()]);
+        let request = generator.requests.lock().unwrap().pop().unwrap();
+        assert_eq!(request.agent_id, agent_id);
+        assert_eq!(request.claim_attribute_update, message);
+        assert_eq!(request.conclusion, "建议将旧规则标记为 deprecated");
+        assert!(request.resolution.is_none());
+        assert!(request.dispute.is_none());
+        assert_eq!(request.local_claims, vec![existing.clone()]);
+        assert!(request.direct_claims.is_empty());
+
+        let updated = claim_store
+            .list_local_claims()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|claim| claim.id == existing.id)
+            .unwrap();
+        assert_eq!(updated.status, ClaimStatus::Deprecated);
+        assert!(updated.updated_at.is_some());
+        assert_eq!(
+            updated.source_claim_ids,
+            vec![
+                SourceId::Policy(historical_policy_id),
+                SourceId::Claim(historical_claim_id),
+                SourceId::Policy(policy_id),
+            ]
+        );
+        let plan: InboxEffectPlan = read_yaml(&paths::agent_home_inbox_effect_path(
+            &agent_home,
+            &message.id,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(plan.state, InboxEffectState::Applied);
+        assert_eq!(plan.resolution_id, None);
+    }
+
+    #[tokio::test]
+    async fn claim_attribute_update_filters_duplicate_claim_sets_before_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_home = dir.path().to_path_buf();
+        let agent_id = AgentId::new("agent-a").unwrap();
+        let first_claim = arbitration_claim("agent-a", "first", ClaimStatus::Active);
+        let second_claim = arbitration_claim("agent-a", "second", ClaimStatus::Active);
+        let claim_store = Arc::new(LocalFsClaimStore::new(agent_home.clone()));
+        claim_store.write_claim(&first_claim).await.unwrap();
+        claim_store.write_claim(&second_claim).await.unwrap();
+        let maintainer = Arc::new(PayloadRecordingMaintainerClient::default());
+        let runner = AgentRunner::new(
+            agent_id.clone(),
+            empty_receipt_generator(),
+            claim_store,
+            Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home.clone())),
+            Arc::new(LocalFsInboxReader::new(agent_home.clone())),
+            Arc::new(LocalFsMemoryStore::new(
+                agent_home.clone(),
+                1600,
+                1000,
+                false,
+            )),
+            Arc::new(EmptyRouterClient),
+            maintainer.clone(),
+            Arc::new(LocalFsMaintainerUploadQueue::new(agent_home.clone())),
+            0,
+            Vec::<SkillSummary>::new(),
+        );
+        let policy = Policy {
+            id: PolicyId::random(),
+            message_type: PolicyMessageType::ClaimAttributeUpdate,
+            name: "review_claim_conflict".into(),
+            statement: "review the conflicting local knowledge".into(),
+            scope: "knowledge / shared".into(),
+            status: PolicyStatus::Active,
+            created_at: "2026-08-02T00:00:00Z".parse().unwrap(),
+            updated_at: None,
+            target_agents: Some(vec![agent_id]),
+        };
+        let first_message = InboxMessage {
+            id: InboxId::random(),
+            kind: InboxMessageKind::ClaimAttributeUpdate {
+                policy: policy.clone(),
+                arbitration_resolution: None,
+            },
+            handled_at: None,
+        };
+        let second_message = InboxMessage {
+            id: InboxId::random(),
+            kind: InboxMessageKind::ClaimAttributeUpdate {
+                policy,
+                arbitration_resolution: None,
+            },
+            handled_at: None,
+        };
+        let first_generator = Arc::new(RecordingClaimAttributeUpdateGenerator {
+            response: json!({
+                "new_claims": [],
+                "updated_claims": [],
+                "new_disputes": [
+                    {
+                        "id": "$new_dispute_0$",
+                        "name": "first_report",
+                        "claims": [first_claim.id.as_str(), second_claim.id.as_str()],
+                        "summary": "the local claims conflict"
+                    },
+                    {
+                        "id": "$new_dispute_1$",
+                        "name": "same_effect_duplicate",
+                        "claims": [second_claim.id.as_str(), first_claim.id.as_str()],
+                        "summary": "the same output repeated the claim set"
+                    }
+                ]
+            }),
+            requests: Mutex::new(Vec::new()),
+        });
+        let second_generator = Arc::new(RecordingClaimAttributeUpdateGenerator {
+            response: json!({
+                "new_claims": [],
+                "updated_claims": [],
+                "new_disputes": [{
+                    "id": "$new_dispute_0$",
+                    "name": "duplicate_report",
+                    "claims": [second_claim.id.as_str(), first_claim.id.as_str()],
+                    "summary": "the same local claims still conflict"
+                }]
+            }),
+            requests: Mutex::new(Vec::new()),
+        });
+
+        let first = runner
+            .internalize_claim_attribute_update_message(first_generator.as_ref(), &first_message)
+            .await
+            .unwrap();
+        let second = runner
+            .internalize_claim_attribute_update_message(second_generator.as_ref(), &second_message)
+            .await
+            .unwrap();
+
+        assert_eq!(first.new_dispute_ids.len(), 1);
+        assert!(second.new_dispute_ids.is_empty());
+        let uploaded = maintainer.disputes.lock().unwrap();
+        assert_eq!(uploaded.len(), 1);
+        assert_eq!(uploaded[0].id, first.new_dispute_ids[0]);
+        drop(uploaded);
+        let second_plan: InboxEffectPlan = read_yaml(&paths::agent_home_inbox_effect_path(
+            &agent_home,
+            &second_message.id,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(second_plan.state, InboxEffectState::Applied);
+        assert!(second_plan.new_disputes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn policy_update_filters_duplicate_claim_sets_before_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_home = dir.path().to_path_buf();
+        let agent_id = AgentId::new("agent-a").unwrap();
+        let first_claim = arbitration_claim("agent-a", "first", ClaimStatus::Active);
+        let second_claim = arbitration_claim("agent-a", "second", ClaimStatus::Active);
+        let claim_store = Arc::new(LocalFsClaimStore::new(agent_home.clone()));
+        claim_store.write_claim(&first_claim).await.unwrap();
+        claim_store.write_claim(&second_claim).await.unwrap();
+        let maintainer = Arc::new(PayloadRecordingMaintainerClient::default());
+        let generator = Arc::new(StaticInboxGenerator {
+            expected_kind: InboxInternalizeKind::PolicyUpdate,
+            response: json!({
+                "new_claims": [],
+                "updated_claims": [],
+                "new_disputes": [
+                    {
+                        "id": "$new_dispute_0$",
+                        "name": "first_report",
+                        "claims": [first_claim.id.as_str(), second_claim.id.as_str()],
+                        "summary": "the local claims conflict"
+                    },
+                    {
+                        "id": "$new_dispute_1$",
+                        "name": "same_batch_duplicate",
+                        "claims": [second_claim.id.as_str(), first_claim.id.as_str()],
+                        "summary": "the same batch repeated the claim set"
+                    }
+                ]
+            }),
+        });
+        let runner = AgentRunner::new(
+            agent_id.clone(),
+            generator.clone(),
+            claim_store,
+            Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home.clone())),
+            Arc::new(LocalFsInboxReader::new(agent_home.clone())),
+            Arc::new(LocalFsMemoryStore::new(
+                agent_home.clone(),
+                1600,
+                1000,
+                false,
+            )),
+            Arc::new(EmptyRouterClient),
+            maintainer.clone(),
             Arc::new(LocalFsMaintainerUploadQueue::new(agent_home)),
             0,
             Vec::<SkillSummary>::new(),
         );
-        let request = InternalizeRequest {
-            agent_id,
-            inbox_messages: vec![InboxMessage {
-                id: InboxId::random(),
-                kind: InboxMessageKind::ClaimAttributeUpdate {
-                    policy,
-                    arbitration_resolution: None,
+        let message = InboxMessage {
+            id: InboxId::random(),
+            kind: InboxMessageKind::PolicyUpdate {
+                policy: Policy {
+                    id: PolicyId::random(),
+                    message_type: PolicyMessageType::PolicyUpdate,
+                    name: "review_claim_conflict".into(),
+                    statement: "review the conflicting local knowledge".into(),
+                    scope: "knowledge / shared".into(),
+                    status: PolicyStatus::Active,
+                    created_at: "2026-08-02T00:00:00Z".parse().unwrap(),
+                    updated_at: None,
+                    target_agents: Some(vec![agent_id]),
                 },
-                handled_at: None,
-            }],
-            local_claims: vec![existing.clone()],
+            },
+            handled_at: None,
         };
-        let local_by_id = FxHashMap::from_iter([(existing.id.clone(), existing.clone())]);
 
-        let (_, new_claims, updates, disputes) = runner
-            .internalize_and_prepare_once(
+        let summary = runner
+            .internalize_inbox_updates(
                 generator.as_ref(),
-                InboxInternalizeKind::ClaimAttributeUpdate,
-                request,
-                &local_by_id,
+                InboxInternalizeKind::PolicyUpdate,
+                vec![message],
             )
             .await
             .unwrap();
 
-        assert!(new_claims.is_empty());
-        assert!(disputes.is_empty());
-        assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].id, existing.id);
-        assert_eq!(updates[0].status, ClaimStatus::Deprecated);
-        assert!(updates[0].updated_at.is_some());
-        assert_eq!(
-            updates[0].source_claim_ids,
-            vec![
-                SourceId::Policy(historical_policy_id),
-                SourceId::Claim(historical_claim_id)
-            ]
-        );
+        assert_eq!(summary.new_dispute_ids.len(), 1);
+        assert_eq!(maintainer.disputes.lock().unwrap().len(), 1);
     }
 }

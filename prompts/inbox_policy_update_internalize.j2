@@ -22,7 +22,7 @@
 1. 更新本地已有 claim：在 `updated_claims` 中输出完整的新属性，id 必须是 local_claims 中已有的 claim id。
 
 2. 仅生成新 claim：根据 policy 内容，在 `new_claims` 中产出新 claim。
-3. 生成新 claim 并生成 dispute：根据 policy 内容，在 `new_claims` 中产出新 claim。当该新 claim 与本地已有 claim 冲突时，在 `new_disputes` 中产出 dispute。
+3. 报告仍未解决的新冲突：仅当 policy 本身不足以判断哪条 Claim 应被采用，且整批内化后仍有至少两条非 deprecated Claim 存在独立、实质冲突时，在 `new_disputes` 中产出 dispute。不要为了把 policy 内容与旧 Claim 对立展示而平行创建新 Claim 和 Dispute。
 4. 跳过：本地已有完全等价含义的 claim，或你不认可这条 policy。
 
 
@@ -79,6 +79,9 @@
 - 如果涉及 claim 的更新，只能更新当前 agent 本地已有 claim；不要凭空发明要更新的 claim id。
 - `new_claims` 不要返回 `status`；即使误传，后端也会忽略并把新 claim 初始化为 `active`。
 - `updated_claims` 必须返回 `status`。内容更新后可以恢复为 `active`、继续保持 `stale`，或明确变为 `deprecated`。
+- 先按整批输出推演最终 Claim 状态。只有全部 `updated_claims` 和 `new_claims` 生效后，仍有至少两条非 deprecated Claim 存在实质冲突时，才能生成 `new_disputes`。
+- 如果你接受一条团队 policy，而某条本地 Claim 在同一知识单元和适用范围内直接违背它，优先在 `updated_claims` 原地修正该 Claim；只有旧 Claim 已无当前价值、且正确知识由另一条已有或确有必要的新 Claim 承载时，才将旧 Claim 设为 deprecated。此时 policy 已经给出治理结论，不得再为新旧表达创建 Dispute。
+- 如果本批已经通过原地修正或将错误 Claim 设为 deprecated 消除冲突，不要再为这些 Claim 生成 Dispute。deprecated Claim 不能成为新 Dispute 的 direct Claim。
 - `source_claim_ids` 可以为空。引用的 policy id 只能来自当前 inbox policy，或输入 claim 的已有来源；引用的 claim id 只能是输入 claim、本批声明的新 claim，或输入 claim 的已有来源。不能发明其他 id。
 - 更新已有 claim 时，`source_claim_ids` 是完整替换值；需要保留的历史来源必须在本次输出中显式返回，未返回的旧来源会被删除。
 - 没有需要产出的内容时，对应数组给空 `[]`。

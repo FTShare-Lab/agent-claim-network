@@ -55,7 +55,7 @@ export function AnalysisCard({ analysis, label, onAdopt, adopting = false, compa
           <div className="mt-1 break-all font-mono text-[11px] text-slate-700">{analysis.analysis_id}</div>
         </div>
         <div className="flex flex-wrap gap-1.5">
-          <StatusBadge>{formatValue(analysis.state)}</StatusBadge>
+          <StatusBadge>{resolutionClosed ? 'Historical analysis' : formatValue(analysis.state)}</StatusBadge>
         </div>
       </div>
 

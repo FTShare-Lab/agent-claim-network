@@ -15,7 +15,9 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use super::context::AgentContext;
-use super::inbox::{ArbitrationJsonValidator, InboxJsonGenerator, PreparedArbitration};
+use super::inbox::{
+    ClaimAttributeUpdateJsonValidator, InboxJsonGenerator, PreparedClaimAttributeUpdate,
+};
 use super::runner::{AgentRunner, InboxProcessReport};
 use super::runner_trace::trace_name_from_task;
 use super::user_shell::{
@@ -23,7 +25,7 @@ use super::user_shell::{
 };
 use crate::api::{
     ensure_compaction_request_within_context_window, estimate_session_turn_messages_tokens,
-    project_compaction_input_media, AgentTurnLoop, ArbitrationInternalizeRequest,
+    project_compaction_input_media, AgentTurnLoop, ClaimAttributeUpdateInternalizeRequest,
     ContextUsageSnapshot, ContextUsageSource, InboxInternalizeKind, InternalizeRequest,
     MemoryReviewLoop, SessionAttachment, SessionCompactionOutcome, SessionTurn, SessionTurnEvent,
     SessionTurnEventRecorder, SessionTurnInterrupted, SessionTurnMessage, SessionTurnPreflight,
@@ -879,9 +881,9 @@ impl InboxJsonGenerator for SessionInboxJsonGenerator<'_> {
             .await
     }
 
-    async fn generate_arbitration_json(
+    async fn generate_claim_attribute_update_json(
         &self,
-        request: ArbitrationInternalizeRequest,
+        request: ClaimAttributeUpdateInternalizeRequest,
     ) -> anyhow::Result<serde_json::Value> {
         let system_prompt = self
             .prompt_registry
@@ -896,11 +898,11 @@ impl InboxJsonGenerator for SessionInboxJsonGenerator<'_> {
             .await
     }
 
-    async fn generate_validated_arbitration_json(
+    async fn generate_validated_claim_attribute_update_json(
         &self,
-        request: ArbitrationInternalizeRequest,
-        validator: &mut ArbitrationJsonValidator<'_>,
-    ) -> anyhow::Result<PreparedArbitration> {
+        request: ClaimAttributeUpdateInternalizeRequest,
+        validator: &mut ClaimAttributeUpdateJsonValidator<'_>,
+    ) -> anyhow::Result<PreparedClaimAttributeUpdate> {
         let agent_id = request.agent_id.clone();
         let system_prompt = self
             .prompt_registry
@@ -909,7 +911,7 @@ impl InboxJsonGenerator for SessionInboxJsonGenerator<'_> {
         let user_text = serde_json::to_string_pretty(&request)?;
         self.json_caller
             .generate_json_validated_with_guarded_attempts(
-                StructuredJsonAttemptRequest::retryable_provider(
+                StructuredJsonAttemptRequest::claim_attribute_update(
                     system_prompt,
                     vec![SessionTurnMessage::user_text(user_text)],
                 ),
@@ -917,7 +919,7 @@ impl InboxJsonGenerator for SessionInboxJsonGenerator<'_> {
                 |retry, total, error| {
                     log::warn!(
                         target: "agent",
-                        "agent {} arbitration inbox 输出校验失败，重试 ({retry}/{total}): {error:#}",
+                        "agent {} ClaimAttributeUpdate 输出校验失败，重试 ({retry}/{total}): {error:#}",
                         agent_id
                     );
                 },

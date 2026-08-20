@@ -56,17 +56,9 @@ impl ObservationService {
         }
         let mirrors = load_team_claims(self.store.team_root()).await?;
         let outbox = outbox_io::list(self.store.team_root()).await?;
-        let mut assessments = BTreeMap::<AgentId, Vec<&ClaimAssessment>>::new();
+        let mut assessments = BTreeMap::new();
         for assessment in &record.resolution.claim_assessments {
-            let holders: Vec<AgentId> = record
-                .direct_claim_snapshots
-                .iter()
-                .filter(|claim| claim.id == assessment.claim_id)
-                .map(|claim| claim.holder.clone())
-                .collect();
-            for holder in holders {
-                assessments.entry(holder).or_default().push(assessment);
-            }
+            assessments.insert(assessment.claim_id.clone(), assessment);
         }
         let mut holders = Vec::new();
         if let Some(intent) = record.delivery_intent.as_ref() {
@@ -86,10 +78,7 @@ impl ObservationService {
                     delivered_at,
                     observed_at,
                     &intent.policy.id,
-                    assessments
-                        .get(&target.target_agent)
-                        .map(Vec::as_slice)
-                        .unwrap_or_default(),
+                    &assessments,
                     &record.direct_claim_snapshots,
                     &mirrors,
                 ));
@@ -107,8 +96,6 @@ impl ObservationService {
                         && existing.reasons == holder.reasons
                         && existing.delivery_observed == holder.delivery_observed
                         && existing.delivered_at == holder.delivered_at
-                        && existing.assessment_count == holder.assessment_count
-                        && existing.matched_count == holder.matched_count
                         && existing.claims == holder.claims
                 }) {
                     holder.last_observed_at = existing.last_observed_at;
@@ -174,7 +161,7 @@ fn observe_holder(
     delivered_at: Option<DateTime<Utc>>,
     observed_at: DateTime<Utc>,
     policy_id: &crate::claim::PolicyId,
-    assessments: &[&ClaimAssessment],
+    assessments: &BTreeMap<crate::claim::ClaimId, &ClaimAssessment>,
     snapshots: &[Claim],
     mirrors: &[(AgentId, Claim)],
 ) -> HolderObservation {
@@ -186,56 +173,35 @@ fn observe_holder(
             delivery_observed: false,
             delivered_at: None,
             last_observed_at: Some(observed_at),
-            assessment_count: assessments.len(),
-            matched_count: 0,
-            claims: claim_observations(holder, policy_id, assessments, snapshots, mirrors, None),
+            claims: claim_observations(holder, policy_id, assessments, snapshots, mirrors),
         };
     };
-    if assessments.is_empty() {
+    let claims = claim_observations(holder, policy_id, assessments, snapshots, mirrors);
+    if claims.is_empty() {
         return HolderObservation {
             agent_id: holder.clone(),
             state: ObservationState::Unknown,
-            reasons: vec!["resolution 没有 holder assessment".into()],
+            reasons: vec!["resolution 没有 holder direct Claim snapshot".into()],
             delivery_observed: true,
             delivered_at: Some(delivered_at),
             last_observed_at: Some(observed_at),
-            assessment_count: 0,
-            matched_count: 0,
-            claims: Vec::new(),
+            claims,
         };
     }
-    let claims = claim_observations(
-        holder,
-        policy_id,
-        assessments,
-        snapshots,
-        mirrors,
-        Some(delivered_at),
-    );
-    let matched_count = claims.iter().filter(|claim| claim.matched).count();
-    let divergent = claims.iter().any(|claim| {
-        claim.current_status.is_some()
-            && claim.policy_provenance_present
-            && claim
-                .mismatch_reasons
-                .iter()
-                .any(|reason| reason.contains("不一致"))
-    });
-    let unknown = claims.iter().any(|claim| claim.current_status.is_none());
+    let update_observed = claims.iter().any(|claim| claim.update_observed);
+    let unavailable = claims.iter().any(|claim| claim.current_status.is_none());
     let mut reasons = claims
         .iter()
-        .flat_map(|claim| claim.mismatch_reasons.iter().cloned())
+        .flat_map(|claim| claim.notes.iter().cloned())
         .collect::<Vec<_>>();
     reasons.sort();
     reasons.dedup();
-    let state = if divergent {
-        ObservationState::ObservedDiverged
-    } else if unknown {
+    let state = if update_observed {
+        ObservationState::UpdateObserved
+    } else if unavailable {
         ObservationState::Unknown
-    } else if matched_count == assessments.len() {
-        ObservationState::ObservedConverged
     } else {
-        ObservationState::DeliveredUnobserved
+        ObservationState::NoUpdateObserved
     };
     HolderObservation {
         agent_id: holder.clone(),
@@ -244,8 +210,6 @@ fn observe_holder(
         delivery_observed: true,
         delivered_at: Some(delivered_at),
         last_observed_at: Some(observed_at),
-        assessment_count: assessments.len(),
-        matched_count,
         claims,
     }
 }
@@ -253,43 +217,44 @@ fn observe_holder(
 fn claim_observations(
     holder: &AgentId,
     policy_id: &crate::claim::PolicyId,
-    assessments: &[&ClaimAssessment],
+    assessments: &BTreeMap<crate::claim::ClaimId, &ClaimAssessment>,
     snapshots: &[Claim],
     mirrors: &[(AgentId, Claim)],
-    delivered_at: Option<DateTime<Utc>>,
 ) -> Vec<ClaimObservation> {
-    let mut observations = Vec::with_capacity(assessments.len());
-    for assessment in assessments {
+    let holder_snapshots = snapshots
+        .iter()
+        .filter(|claim| claim.holder == *holder)
+        .collect::<Vec<_>>();
+    let mut observations = Vec::with_capacity(holder_snapshots.len());
+    for snapshot in holder_snapshots {
+        let assessment = assessments.get(&snapshot.id).copied();
         let matches: Vec<&Claim> = mirrors
             .iter()
             .filter(|(path_holder, claim)| {
-                path_holder == holder && claim.holder == *holder && claim.id == assessment.claim_id
+                path_holder == holder && claim.holder == *holder && claim.id == snapshot.id
             })
             .map(|(_, claim)| claim)
             .collect();
-        let snapshot_name = snapshots
-            .iter()
-            .find(|claim| claim.id == assessment.claim_id)
-            .map(|claim| claim.name.clone())
-            .unwrap_or_default();
         let mut observation = ClaimObservation {
-            claim_id: assessment.claim_id.clone(),
-            claim_name: snapshot_name,
-            recommended_status: assessment.recommended_status,
+            claim_id: snapshot.id.clone(),
+            claim_name: snapshot.name.clone(),
+            recommended_status: assessment.map(|assessment| assessment.recommended_status),
             current_status: None,
-            recommended_scope: assessment.recommended_scope.clone(),
+            recommended_scope: assessment
+                .and_then(|assessment| assessment.recommended_scope.clone()),
             current_scope: None,
-            recommended_statement: assessment.recommended_statement.clone(),
+            recommended_statement: assessment
+                .and_then(|assessment| assessment.recommended_statement.clone()),
             current_statement: None,
             policy_provenance_present: false,
-            matched: false,
-            mismatch_reasons: Vec::new(),
+            update_observed: false,
+            changed_fields: Vec::new(),
+            notes: Vec::new(),
         };
         if matches.len() != 1 {
-            observation.mismatch_reasons.push(format!(
-                "claim={} 的 holder mirror 缺失或重复",
-                assessment.claim_id
-            ));
+            observation
+                .notes
+                .push(format!("claim={} 的 holder mirror 缺失或重复", snapshot.id));
             observations.push(observation);
             continue;
         }
@@ -301,45 +266,16 @@ fn claim_observations(
         observation.policy_provenance_present = claim
             .source_claim_ids
             .contains(&SourceId::Policy(policy_id.clone()));
-        if delivered_at.is_some_and(|delivered_at| claim.effective_updated_at() < delivered_at) {
-            observation
-                .mismatch_reasons
-                .push(format!("claim={} 尚无 ACK 后更新", claim.id));
-            observations.push(observation);
-            continue;
+        if claim.status != snapshot.status {
+            observation.changed_fields.push("status".into());
         }
-        if !observation.policy_provenance_present {
-            observation.mismatch_reasons.push(format!(
-                "claim={} 没有 resolution policy provenance",
-                claim.id
-            ));
-            observations.push(observation);
-            continue;
+        if claim.scope != snapshot.scope {
+            observation.changed_fields.push("scope".into());
         }
-        if claim.status != assessment.recommended_status {
-            observation
-                .mismatch_reasons
-                .push("推荐 status 与当前 status 不一致".into());
+        if claim.statement != snapshot.statement {
+            observation.changed_fields.push("statement".into());
         }
-        if assessment
-            .recommended_scope
-            .as_ref()
-            .is_some_and(|scope| claim.scope != *scope)
-        {
-            observation
-                .mismatch_reasons
-                .push("推荐 scope 与当前 scope 不一致".into());
-        }
-        if assessment
-            .recommended_statement
-            .as_ref()
-            .is_some_and(|statement| claim.statement != *statement)
-        {
-            observation
-                .mismatch_reasons
-                .push("推荐 statement 与当前 statement 不一致".into());
-        }
-        observation.matched = observation.mismatch_reasons.is_empty();
+        observation.update_observed = !observation.changed_fields.is_empty();
         observations.push(observation);
     }
     observations.sort_by(|left, right| left.claim_id.cmp(&right.claim_id));
@@ -371,6 +307,13 @@ mod tests {
         }
     }
 
+    fn assessment_lookup(assessments: &[ClaimAssessment]) -> BTreeMap<ClaimId, &ClaimAssessment> {
+        assessments
+            .iter()
+            .map(|assessment| (assessment.claim_id.clone(), assessment))
+            .collect()
+    }
+
     fn mirror(holder: &AgentId, claim_id: ClaimId, policy_id: &PolicyId) -> Claim {
         Claim {
             id: claim_id,
@@ -388,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn divergence_has_priority_over_unknown_assessment() {
+    fn missing_resolution_snapshots_are_unknown() {
         let holder = AgentId::new("agent-a").unwrap();
         let policy_id = PolicyId::random();
         let present_id = ClaimId::random();
@@ -404,13 +347,13 @@ mod tests {
             Some("2026-08-02T00:00:00Z".parse().unwrap()),
             "2026-08-03T00:00:00Z".parse().unwrap(),
             &policy_id,
-            &assessments.iter().collect::<Vec<_>>(),
+            &assessment_lookup(&assessments),
             &[],
             &[(holder.clone(), present)],
         );
 
-        assert_eq!(observed.state, ObservationState::ObservedDiverged);
-        assert_eq!(observed.reasons.len(), 2);
+        assert_eq!(observed.state, ObservationState::Unknown);
+        assert_eq!(observed.reasons.len(), 1);
     }
 
     #[test]
@@ -421,7 +364,7 @@ mod tests {
             None,
             "2026-08-03T00:00:00Z".parse().unwrap(),
             &PolicyId::random(),
-            &[],
+            &BTreeMap::new(),
             &[],
             &[],
         );
@@ -429,7 +372,45 @@ mod tests {
     }
 
     #[test]
-    fn delivered_holder_distinguishes_unobserved_and_converged() {
+    fn delivered_holder_without_assessments_still_compares_direct_snapshot() {
+        let holder = AgentId::new("agent-a").unwrap();
+        let policy_id = PolicyId::random();
+        let claim_id = ClaimId::random();
+        let snapshot = mirror(&holder, claim_id, &policy_id);
+        let delivered_at = "2026-08-02T00:00:00Z".parse().unwrap();
+        let observed_at = "2026-08-03T00:00:00Z".parse().unwrap();
+
+        let unchanged = observe_holder(
+            &holder,
+            Some(delivered_at),
+            observed_at,
+            &policy_id,
+            &BTreeMap::new(),
+            std::slice::from_ref(&snapshot),
+            &[(holder.clone(), snapshot.clone())],
+        );
+        assert_eq!(unchanged.state, ObservationState::NoUpdateObserved);
+        assert_eq!(unchanged.claims.len(), 1);
+        assert!(!unchanged.claims[0].update_observed);
+
+        let mut changed_mirror = snapshot.clone();
+        changed_mirror.status = ClaimStatus::Deprecated;
+        let changed = observe_holder(
+            &holder,
+            Some(delivered_at),
+            observed_at,
+            &policy_id,
+            &BTreeMap::new(),
+            &[snapshot],
+            &[(holder.clone(), changed_mirror)],
+        );
+        assert_eq!(changed.state, ObservationState::UpdateObserved);
+        assert_eq!(changed.claims.len(), 1);
+        assert_eq!(changed.claims[0].changed_fields, ["status"]);
+    }
+
+    #[test]
+    fn delivered_holder_compares_snapshot_and_current_mirror_without_provenance_gate() {
         let holder = AgentId::new("agent-a").unwrap();
         let policy_id = PolicyId::random();
         let claim_id = ClaimId::random();
@@ -437,34 +418,38 @@ mod tests {
         let delivered_at = "2026-08-02T00:00:00Z".parse().unwrap();
         let observed_at = "2026-08-03T00:00:00Z".parse().unwrap();
 
-        let mut before_ack = mirror(&holder, claim_id.clone(), &policy_id);
-        before_ack.updated_at = Some("2026-08-01T12:00:00Z".parse().unwrap());
-        let unobserved = observe_holder(
+        let mut snapshot = mirror(&holder, claim_id.clone(), &policy_id);
+        snapshot.source_claim_ids.clear();
+        let unchanged = observe_holder(
             &holder,
             Some(delivered_at),
             observed_at,
             &policy_id,
-            &[&assessment],
-            &[],
-            &[(holder.clone(), before_ack)],
+            &assessment_lookup(std::slice::from_ref(&assessment)),
+            std::slice::from_ref(&snapshot),
+            &[(holder.clone(), snapshot.clone())],
         );
-        assert_eq!(unobserved.state, ObservationState::DeliveredUnobserved);
-        assert_eq!(unobserved.assessment_count, 1);
-        assert_eq!(unobserved.matched_count, 0);
+        assert_eq!(unchanged.state, ObservationState::NoUpdateObserved);
+        assert!(!unchanged.claims[0].update_observed);
+        assert!(unchanged.claims[0].changed_fields.is_empty());
+        assert!(!unchanged.claims[0].policy_provenance_present);
 
-        let converged_mirror = mirror(&holder, claim_id, &policy_id);
-        let converged = observe_holder(
+        let mut changed_mirror = snapshot.clone();
+        changed_mirror.status = ClaimStatus::Deprecated;
+        changed_mirror.statement = "new current knowledge".into();
+        let changed = observe_holder(
             &holder,
             Some(delivered_at),
             observed_at,
             &policy_id,
-            &[&assessment],
-            &[],
-            &[(holder.clone(), converged_mirror)],
+            &assessment_lookup(std::slice::from_ref(&assessment)),
+            &[snapshot],
+            &[(holder.clone(), changed_mirror)],
         );
-        assert_eq!(converged.state, ObservationState::ObservedConverged);
-        assert_eq!(converged.matched_count, 1);
-        assert!(converged.claims[0].matched);
+        assert_eq!(changed.state, ObservationState::UpdateObserved);
+        assert!(changed.claims[0].update_observed);
+        assert_eq!(changed.claims[0].changed_fields, ["status", "statement"]);
+        assert!(!changed.claims[0].policy_provenance_present);
     }
 
     #[test]
@@ -481,9 +466,8 @@ holders:
 "#;
         let observation: ResolutionObservation = serde_yaml_ng::from_str(yaml).unwrap();
         let holder = &observation.holders[0];
+        assert_eq!(holder.state, ObservationState::NoUpdateObserved);
         assert!(!holder.delivery_observed);
-        assert_eq!(holder.assessment_count, 0);
-        assert_eq!(holder.matched_count, 0);
         assert!(holder.claims.is_empty());
         assert!(holder.delivered_at.is_none());
     }
@@ -618,7 +602,7 @@ holders:
                 .unwrap(),
             Some(first.clone())
         );
-        assert_eq!(first.holders[0].state, ObservationState::ObservedConverged);
+        assert_eq!(first.holders[0].state, ObservationState::NoUpdateObserved);
         assert_eq!(
             history
                 .list_resolution_observation_events()
@@ -635,7 +619,7 @@ holders:
             .refresh(&record, "2026-08-03T03:00:00Z".parse().unwrap())
             .await
             .unwrap();
-        assert_eq!(changed.holders[0].state, ObservationState::ObservedDiverged);
+        assert_eq!(changed.holders[0].state, ObservationState::UpdateObserved);
         assert_eq!(
             history
                 .list_resolution_observation_events()
@@ -659,7 +643,7 @@ holders:
         );
         assert_eq!(
             ignored_older.holders[0].state,
-            ObservationState::ObservedDiverged
+            ObservationState::UpdateObserved
         );
         assert_eq!(
             history
@@ -686,7 +670,7 @@ holders:
             frozen.observed_at,
             "2026-08-03T03:00:00Z".parse::<DateTime<Utc>>().unwrap()
         );
-        assert_eq!(frozen.holders[0].state, ObservationState::ObservedDiverged);
+        assert_eq!(frozen.holders[0].state, ObservationState::UpdateObserved);
         assert_eq!(
             history
                 .list_resolution_observation_events()

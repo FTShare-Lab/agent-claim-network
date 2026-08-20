@@ -275,15 +275,6 @@ impl Maintainer {
         Ok(guard)
     }
 
-    /// 对会改变仲裁语义的权威文件写入加跨进程锁。锁顺序固定为
-    /// per-dispute（若有）→ semantic inputs → outbox 进程锁 → outbox 文件锁。
-    async fn lock_arbitration_semantic_inputs(&self) -> anyhow::Result<FileLockGuard> {
-        let path = paths::team_store_arbitration_semantic_inputs_lock_path(&self.team_root);
-        FileLockGuard::lock_exclusive(&path)
-            .await
-            .with_context(|| format!("获取仲裁语义输入锁失败: {path:?}"))
-    }
-
     /// 子进程回归测试专用：确认真实 Maintainer 已拿锁后暂停，供另一进程验证等待语义。
     #[cfg(test)]
     async fn pause_after_outbox_lock_for_subprocess_test(&self) -> anyhow::Result<()> {
@@ -318,7 +309,6 @@ impl Maintainer {
         now: DateTime<Utc>,
         target_agents: Option<Vec<AgentId>>,
     ) -> anyhow::Result<(crate::claim::PolicyId, usize)> {
-        let semantic_guard = self.lock_arbitration_semantic_inputs().await?;
         let _guard = self.outbox_lock.lock().await;
         let _file_guard = self.lock_outbox_file().await?;
         let action_id = self.mint_action_id_for_outbox().await?;
@@ -334,9 +324,6 @@ impl Maintainer {
             updated_at: None,
             target_agents: normalize_target_agents(target_agents),
         };
-        arbitration::ArbitrationStore::new(self.team_root.clone())
-            .bump_semantic_inputs_revision(&semantic_guard)
-            .await?;
         self.write_policy(&policy).await?;
         let pushed = self.create_outbox_entries(&policy, &action_id, now).await?;
         log::info!(
@@ -360,7 +347,6 @@ impl Maintainer {
         policy_id: &crate::claim::PolicyId,
         now: DateTime<Utc>,
     ) -> anyhow::Result<usize> {
-        let semantic_guard = self.lock_arbitration_semantic_inputs().await?;
         let _guard = self.outbox_lock.lock().await;
         let _file_guard = self.lock_outbox_file().await?;
         let p = paths::team_store_policies_dir(&self.team_root).join(format!("{policy_id}.yaml"));
@@ -369,9 +355,6 @@ impl Maintainer {
         policy.updated_at = Some(now);
         policy.target_agents = normalize_target_agents(policy.target_agents);
         let action_id = self.mint_action_id_for_outbox().await?;
-        arbitration::ArbitrationStore::new(self.team_root.clone())
-            .bump_semantic_inputs_revision(&semantic_guard)
-            .await?;
         write_yaml_atomic(&p, &policy).await?;
         let pushed = self.create_outbox_entries(&policy, &action_id, now).await?;
         log::info!(
@@ -392,14 +375,12 @@ impl Maintainer {
     ) -> anyhow::Result<()> {
         let store = arbitration::ArbitrationStore::new(self.team_root.clone());
         let _guard = store.lock_dispute(dispute_id).await?;
-        let semantic_guard = store.lock_semantic_inputs().await?;
         let mut record = store.read_dispute(dispute_id).await?;
         if record.dispute.status != DisputeStatus::Open {
             anyhow::bail!("dispute={dispute_id} 已 resolved");
         }
         record.dispute.status = DisputeStatus::Resolved;
         record.dispute.resolved_at = Some(now);
-        store.bump_semantic_inputs_revision(&semantic_guard).await?;
         store.write_dispute(&record).await?;
         log::info!(
             target: "maintainer",
@@ -411,7 +392,6 @@ impl Maintainer {
 
     /// 接收 agent 主动上传的 claim mirror。
     pub async fn upload_claim(&self, claim: &Claim) -> anyhow::Result<()> {
-        let semantic_guard = self.lock_arbitration_semantic_inputs().await?;
         let lock_path = paths::team_store_agent_claim_mirror_lock_path(
             &self.team_root,
             &claim.holder,
@@ -423,9 +403,6 @@ impl Maintainer {
             .with_context(|| format!("获取 Claim 镜像写入锁失败: {lock_path:?}"))?;
         let dir = paths::team_store_agent_claims_dir(&self.team_root, &claim.holder);
         let path = dir.join(format!("{}.yaml", claim.id));
-        arbitration::ArbitrationStore::new(self.team_root.clone())
-            .bump_semantic_inputs_revision(&semantic_guard)
-            .await?;
         write_yaml_atomic(&path, claim).await?;
         Ok(())
     }
@@ -435,7 +412,6 @@ impl Maintainer {
         dispute.validate_agent_report()?;
         let store = arbitration::ArbitrationStore::new(self.team_root.clone());
         let _guard = store.lock_dispute(&dispute.id).await?;
-        let semantic_guard = store.lock_semantic_inputs().await?;
         match store.read_dispute(&dispute.id).await {
             Ok(existing) => {
                 if !same_report_payload(&existing.dispute, dispute) {
@@ -450,7 +426,7 @@ impl Maintainer {
             Err(error) if arbitration_not_found(&error) => {}
             Err(error) => return Err(error),
         }
-        store.bump_semantic_inputs_revision(&semantic_guard).await?;
+        validate_new_dispute_direct_claims(&self.team_root, dispute).await?;
         store
             .write_dispute(&arbitration::MaintainerDisputeRecord::from(dispute.clone()))
             .await?;
@@ -1139,6 +1115,29 @@ impl Maintainer {
         }
         Ok(count)
     }
+}
+
+pub(crate) async fn validate_new_dispute_direct_claims(
+    team_root: &Path,
+    dispute: &Dispute,
+) -> anyhow::Result<()> {
+    let mirrors = arbitration::load_team_claims(team_root).await?;
+    let deprecated: Vec<String> = mirrors
+        .iter()
+        .filter(|(_, claim)| {
+            claim.status == ClaimStatus::Deprecated && dispute.claims.contains(&claim.id)
+        })
+        .map(|(_, claim)| claim.id.to_string())
+        .collect();
+    if deprecated.is_empty() {
+        return Ok(());
+    }
+    Err(arbitration::AnalysisConflict(format!(
+        "dispute id={} 包含 deprecated direct claim: {}",
+        dispute.id,
+        deprecated.join(", ")
+    ))
+    .into())
 }
 
 fn build_action_rows_from_entries(entries: &[OutboxEntry]) -> Vec<MaintainerActionRow> {
@@ -1847,7 +1846,7 @@ mod tests {
         assert!(matches!(entries[0].target, OutboxTarget::Broadcast));
     }
 
-    /// 底层状态写入会保留文件并递增语义输入 revision。
+    /// 底层状态写入会保留原文件。
     #[tokio::test]
     async fn resolve_dispute_updates_status_and_keeps_file() {
         let (m, _team) = build(7, 30);
@@ -1863,15 +1862,6 @@ mod tests {
         };
         let p = paths::team_store_disputes_dir(m.team_root()).join(format!("{}.yaml", dispute.id));
         write_yaml_atomic(&p, &dispute).await.unwrap();
-        let arbitration_store = arbitration::ArbitrationStore::new(m.team_root().to_path_buf());
-        assert_eq!(
-            arbitration_store
-                .read_semantic_inputs_revision()
-                .await
-                .unwrap(),
-            0
-        );
-
         let now: DateTime<Utc> = "2026-04-22T10:00:00Z".parse().unwrap();
         m.mark_dispute_resolved_for_test(&dispute.id, now)
             .await
@@ -1882,13 +1872,6 @@ mod tests {
         assert_eq!(after.resolved_at, Some(now));
         assert_eq!(after.summary, "原始 summary");
         assert!(p.exists(), "不应物理删除 dispute 文件");
-        assert_eq!(
-            arbitration_store
-                .read_semantic_inputs_revision()
-                .await
-                .unwrap(),
-            1
-        );
     }
 
     #[tokio::test]
@@ -1913,6 +1896,43 @@ mod tests {
         dispute.status = DisputeStatus::Open;
         dispute.resolved_at = Some("2026-04-22T00:00:00Z".parse().unwrap());
         assert!(m.report_dispute(&dispute).await.is_err());
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn new_dispute_rejects_deprecated_direct_claim_but_exact_replay_stays_idempotent() {
+        let (m, _team) = build(7, 30);
+        let holder = AgentId::new("agent-a").unwrap();
+        let created_at: DateTime<Utc> = "2026-04-21T00:00:00Z".parse().unwrap();
+        let mut first = sample_claim_at(&holder, created_at, ClaimStatus::Active);
+        let second = sample_claim_at(&holder, created_at, ClaimStatus::Active);
+        seed_claim(m.team_root(), &first).await;
+        seed_claim(m.team_root(), &second).await;
+        let dispute = Dispute {
+            id: DisputeId::random(),
+            name: "valid_before_claim_deprecation".into(),
+            reporter_agent_id: holder,
+            claims: vec![first.id.clone(), second.id.clone()],
+            summary: "same-scope conflict".into(),
+            status: DisputeStatus::Open,
+            created_at,
+            resolved_at: None,
+        };
+        m.report_dispute(&dispute).await.unwrap();
+
+        first.status = ClaimStatus::Deprecated;
+        first.updated_at = Some("2026-04-22T00:00:00Z".parse().unwrap());
+        m.upload_claim(&first).await.unwrap();
+
+        // 已持久化上报的网络重放仍按原 payload 幂等，不因之后的 Claim 生命周期变化失败。
+        m.report_dispute(&dispute).await.unwrap();
+
+        let mut new_dispute = dispute.clone();
+        new_dispute.id = DisputeId::random();
+        let error = m.report_dispute(&new_dispute).await.unwrap_err();
+        assert!(error.to_string().contains("deprecated direct claim"));
+        let path =
+            paths::team_store_disputes_dir(m.team_root()).join(format!("{}.yaml", new_dispute.id));
         assert!(!path.exists());
     }
 

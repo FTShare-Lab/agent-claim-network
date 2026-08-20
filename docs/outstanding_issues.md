@@ -19,3 +19,5 @@
 8. TUI running turn 期间 queued input 只按普通文本草稿恢复：ESC 会逐条取回最新 queued input 到 composer；Ctrl-C 中断 turn 后会把剩余 queued input 用换行合并回 composer。若 queued input 原本是 slash command（如 `/compact`），恢复后再次提交可能会被当作自然语言或多行普通输入处理。当前接受该语义；后续如果要保留 command 类型，需要把 queued input 从纯文本草稿升级为带 action/mode 的结构。
 
 9. @附件 功能目前支持 PNG/JPEG/GIF/WebP/PDF/任意UTF-8文件，但不支持 DOCX/XLSX/ZIP 等二进制，他们会被当成文本读取，随后因不是 UTF-8 而失败。这些内容目前上游 Anthropic 协议尚未支持，推荐引导模型采用 code_run 等方式读取解析。参考[Anthropic 附件支持文档](https://platform.claude.com/docs/en/build-with-claude/files)。
+
+10. Maintainer 的 Resolution Observation 与 Agent 实际执行 CAU 的修改边界尚未严格对齐。当前 Observation 只比较 Resolution 冻结的 direct Claim 快照与当前 holder mirror，因此能展示 direct Claim 的 `status`、`scope`、`statement` 前后差异，但不会展示同一次 CAU 内化对其他本地 Claim 的更新或新建，也不能仅凭 mirror 差异严格证明修改由该次 CAU 导致。Agent 本地的 `<agent_home>/inbox/effects/<inbox_id>.yaml` 已按 inbox/Resolution 绑定稳定的 CAU 执行计划，并用于崩溃恢复；后续可在 Effect 应用完成时补充实际创建、实际更新、未变更和 superseded 的 Claim 结果，生成不包含私有上下文的最小共享投影并传给 Maintainer。Maintainer 可将该投影与现有 direct Claim mirror 对比合并展示：Effect 负责说明该次 CAU 实际触及了哪些 Claim，mirror 负责说明这些 Claim 当前的团队可见状态。原始 Effect、模型输入和 Agent 私有上下文仍只保留在 Agent 本地。

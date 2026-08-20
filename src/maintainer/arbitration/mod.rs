@@ -10,14 +10,14 @@ mod store;
 mod types;
 mod worker;
 
-pub(crate) use context::ArbitrationContextBuilder;
+pub(crate) use context::{load_team_claims, ArbitrationContextBuilder};
 pub use evaluator::{phase_timeout, ArbitrationEvaluator, LlmArbitrationEvaluator};
 pub use observation::ObservationService;
 pub use resolution::{HumanResolutionInput, RejectResolutionInput, ResolutionService};
 pub use resolution_events::{spawn_resolution_event_scheduler, ResolutionEventScheduler};
 pub use service::{
-    is_analysis_conflict, is_analysis_retry, AnalysisConflict, AnalysisRetry, ArbitrationService,
-    ReportDisputeResult, SystemArbitrationClock,
+    is_analysis_conflict, AnalysisConflict, ArbitrationService, ReportDisputeResult,
+    SystemArbitrationClock,
 };
 pub use store::ArbitrationStore;
 pub use types::{

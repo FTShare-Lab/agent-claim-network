@@ -42,6 +42,8 @@ Agent 是用户直接运行的 `acn` TUI：
 
 Agent 是自己 claim 的 holder。Maintainer 可以发送属性调整建议，但不能绕过 Agent 直接修改其本地权威 claim。
 
+所有 ClaimAttributeUpdate 在 Agent 侧按单消息进入同一结构化内化与 Effect Journal 边界。普通建议只要求 conclusion；Resolution 可以附加 type、basis、assessment、Dispute 和 direct Claim 快照。Agent 可编辑当前全部非 deprecated 本地 Claim，以及由自己持有的任意状态 direct Claim；其他 holder 快照只读。后端在落盘前独立校验 holder、编辑目标、Claim source 与 Dispute 引用，Prepared effect 在崩溃后幂等重放。
+
 ### Router
 
 Router 是团队知识的检索服务：
@@ -70,9 +72,9 @@ Maintainer 不以 trace 引用次数直接修改 claim，也不删除已经解�
 
 `manual` 上报只保存 Dispute。`shadow`/`auto` 为每个 Dispute 创建 Current Analysis，并由有界单 consumer 调度器执行。Analysis 先持久化再入队，请求取消时由持久恢复唤醒补齐两者之间的窗口。稳定语义投影跟踪真实知识内容；Router candidate 以 Claim 内容参与上下文和 fingerprint，其检索索引关联的 Dispute ID 列表属于派生检索元数据。创建于 `auto` 且当前配置仍为 `auto` 的 Analysis 在采用前发现输入变化时，会新增 5 分钟和 15 分钟的重分析计划；第三轮仍变化则停止自动处理并保持 open。切换到其他模式会暂停尚未固定 intent 的自动采用；已经持久化的延迟轮次仍按原 `next_retry_at` 恢复，完成后停留为可审阅结果。持久延迟队列允许其他 Analysis 继续运行。
 
-显式 Analyze 原子替换该 Dispute 的 Current Analysis，不修改 Dispute、Policy、outbox 或 Resolution。被覆盖或已由 Resolution 关闭的 Analysis 会终止当前模型等待，不继续占用串行 consumer。Adopt 不重新调用模型；它锁外重建 Router 上下文，再在短提交边界复核 revision、fingerprint、open 状态与当前 Resolution。提交形成当前 Resolution 和固定 delivery intent。同一 Analysis 的重复或并发 Adopt 复用同一固定 Resolution。固定锁序为 per-dispute → semantic-input 文件锁 → outbox 进程锁 → outbox 文件锁。
+显式 Analyze 原子替换该 Dispute 的 Current Analysis，不修改 Dispute、Policy、outbox 或 Resolution。被覆盖或已由 Resolution 关闭的 Analysis 会终止当前模型等待；持久上下文等待和重分析等待转为审计终态并退出恢复队列，不继续占用串行 consumer。Adopt 不重新调用模型；它锁外重建 Router 上下文，再在 per-dispute 提交边界复核 fingerprint、open 状态与当前 Resolution。提交形成当前 Resolution 和固定 delivery intent。同一 Analysis 的重复或并发 Adopt 复用同一固定 Resolution。固定锁序为 per-dispute → outbox 进程锁 → outbox 文件锁。
 
-所有 Resolution 在切换 Dispute 前持久化 pending commit/delivery；它保存固定 Resolution intent，无 holder 通知时同样存在。独立有界事件调度器退避补齐 Resolution、Dispute、可选 Policy/inbox 与幂等治理历史，完成后消费任务。分析服务关闭时，该调度器也会在启动时恢复已经固定的采用意图，沿用原有 Analysis、Resolution、Policy 与 inbox ID。ACK、相关 Claim mirror 上传、Resolution 切换和详情读取定向刷新当前 Resolution 的 observation；被替换 Resolution 的历史 cache 不再更新。Observation 只供治理审计，不触发重新分析、通知或 Claim 修改。
+所有 Resolution 在切换 Dispute 前持久化 pending commit/delivery；它保存固定 Resolution intent，无 holder 通知时同样存在。独立有界事件调度器退避补齐 Resolution、Dispute、可选 Policy/inbox 与幂等治理历史，完成后消费任务。分析服务关闭时，该调度器也会在启动时恢复已经固定的采用意图，沿用原有 Analysis、Resolution、Policy 与 inbox ID。ACK、相关 Claim mirror 上传、Resolution 切换和详情读取定向刷新当前 Resolution 的 observation；被替换 Resolution 的历史 cache 不再更新。Observation 按 Claim 对比 Resolution 冻结快照与当前 mirror 的 status、scope、statement，assessment 仅提供可选建议元数据，Policy provenance 只作为技术事实，不作为更新识别门槛。Observation 只供治理审计，不触发重新分析、通知或 Claim 修改。
 
 ### Finalize Supervisor
 

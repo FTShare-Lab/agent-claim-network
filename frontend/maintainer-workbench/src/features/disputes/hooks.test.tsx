@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
+import { act, cleanup, renderHook } from '@testing-library/react'
 import type { PropsWithChildren } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -35,7 +35,7 @@ const disputeId = 'dispute_1234abcd'
 const analysisId = 'analysis_1234abcd1234abcd'
 const createdAt = '2026-08-10T08:00:00Z'
 
-function analysis(state: AnalysisState): ArbitrationAnalysisSummary {
+function analysis(state: AnalysisState, automaticProgressPending = false): ArbitrationAnalysisSummary {
   return {
     analysis_id: analysisId,
     state,
@@ -43,6 +43,7 @@ function analysis(state: AnalysisState): ArbitrationAnalysisSummary {
     updated_at: createdAt,
     semantic_fingerprint: 'sha256-v1:test',
     adoptable: state === 'approved',
+    automatic_progress_pending: automaticProgressPending,
   }
 }
 
@@ -97,25 +98,19 @@ afterEach(() => {
 })
 
 describe('dispute analysis queries', () => {
-  it('refreshes the dispute list while the Workbench remains mounted', async () => {
+  it('does not poll the dispute list while the Workbench remains mounted', async () => {
     vi.useFakeTimers()
-    vi.mocked(disputeApi.listDisputes)
-      .mockResolvedValueOnce([dispute('open')])
-      .mockResolvedValue([dispute('resolved')])
+    vi.mocked(disputeApi.listDisputes).mockResolvedValue([dispute('open')])
     const queryClient = createQueryClient()
-    queryClient.setQueryData(['disputes', disputeId], dispute('open'))
     const { result } = renderHook(() => useDisputesQuery(), { wrapper: wrapper(queryClient) })
 
     await vi.waitFor(() => expect(result.current.data?.[0]?.status).toBe('open'))
-    await act(async () => vi.advanceTimersByTimeAsync(5_000))
-    await vi.waitFor(() => expect(result.current.data?.[0]?.status).toBe('resolved'))
-    expect(queryClient.getQueryData<Dispute>(['disputes', disputeId])).toMatchObject({
-      status: 'resolved',
-      resolved_at: '2026-08-10T08:05:00Z',
-    })
+    await act(async () => vi.advanceTimersByTimeAsync(10_000))
+    expect(disputeApi.listDisputes).toHaveBeenCalledTimes(1)
   })
 
-  it('polls the current analysis and refreshes dependent views after progress', async () => {
+  it('polls the current analysis only while active and refreshes dependent views after progress', async () => {
+    vi.useFakeTimers()
     vi.mocked(disputeApi.listAnalyses)
       .mockResolvedValueOnce({ current_analysis: analysis('proposing') })
       .mockResolvedValue({ current_analysis: analysis('approved') })
@@ -123,13 +118,17 @@ describe('dispute analysis queries', () => {
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
     const { result } = renderHook(() => useAnalysesQuery(disputeId), { wrapper: wrapper(queryClient) })
 
-    await waitFor(() => expect(result.current.data?.current_analysis?.state).toBe('proposing'))
-    await act(async () => { await result.current.refetch() })
-    await waitFor(() => expect(result.current.data?.current_analysis?.state).toBe('approved'))
+    await vi.waitFor(() => expect(result.current.data?.current_analysis?.state).toBe('proposing'))
+    await act(async () => vi.advanceTimersByTimeAsync(1_000))
+    await vi.waitFor(() => expect(result.current.data?.current_analysis?.state).toBe('approved'))
+    expect(disputeApi.listAnalyses).toHaveBeenCalledTimes(2)
+    await act(async () => vi.advanceTimersByTimeAsync(10_000))
+    expect(disputeApi.listAnalyses).toHaveBeenCalledTimes(2)
 
     for (const queryKey of [
       ['disputes'],
       ['disputes', disputeId],
+      ['disputes', disputeId, 'analyses', analysisId],
       ['claims'],
       ['overview'],
       ['policies'],
@@ -137,6 +136,25 @@ describe('dispute analysis queries', () => {
     ]) {
       expect(invalidate).toHaveBeenCalledWith(expect.objectContaining({ queryKey }))
     }
+  })
+
+  it('continues polling an auto-approved analysis through automatic adoption', async () => {
+    vi.useFakeTimers()
+    vi.mocked(disputeApi.listAnalyses)
+      .mockResolvedValueOnce({ current_analysis: analysis('proposing') })
+      .mockResolvedValueOnce({ current_analysis: analysis('approved', true) })
+      .mockResolvedValue({ current_analysis: analysis('adopted') })
+    const queryClient = createQueryClient()
+    const { result } = renderHook(() => useAnalysesQuery(disputeId), { wrapper: wrapper(queryClient) })
+
+    await vi.waitFor(() => expect(result.current.data?.current_analysis?.state).toBe('proposing'))
+    await act(async () => vi.advanceTimersByTimeAsync(1_000))
+    await vi.waitFor(() => expect(result.current.data?.current_analysis?.state).toBe('approved'))
+    await act(async () => vi.advanceTimersByTimeAsync(1_000))
+    await vi.waitFor(() => expect(result.current.data?.current_analysis?.state).toBe('adopted'))
+    await act(async () => vi.advanceTimersByTimeAsync(10_000))
+
+    expect(disputeApi.listAnalyses).toHaveBeenCalledTimes(3)
   })
 
   it('does not fetch analyses without a selected dispute', async () => {
@@ -161,6 +179,30 @@ describe('dispute analysis queries', () => {
     await act(async () => vi.advanceTimersByTimeAsync(1_000))
     await vi.waitFor(() => expect(result.current.data?.state).toBe('approved'))
     expect(disputeApi.getAnalysis).toHaveBeenCalledTimes(2)
+  })
+
+  it('continues polling auto-approved analysis detail until adoption completes', async () => {
+    vi.useFakeTimers()
+    vi.mocked(disputeApi.getAnalysis)
+      .mockResolvedValueOnce(analysisDetail('verifying'))
+      .mockResolvedValueOnce({
+        ...analysisDetail('approved'),
+        automatic_progress_pending: true,
+      })
+      .mockResolvedValue(analysisDetail('adopted'))
+    const queryClient = createQueryClient()
+    const { result } = renderHook(
+      () => useAnalysisDetailQuery(disputeId, analysisId),
+      { wrapper: wrapper(queryClient) },
+    )
+
+    await vi.waitFor(() => expect(result.current.data?.state).toBe('verifying'))
+    await act(async () => vi.advanceTimersByTimeAsync(1_000))
+    await vi.waitFor(() => expect(result.current.data?.state).toBe('approved'))
+    await act(async () => vi.advanceTimersByTimeAsync(1_000))
+    await vi.waitFor(() => expect(result.current.data?.state).toBe('adopted'))
+
+    expect(disputeApi.getAnalysis).toHaveBeenCalledTimes(3)
   })
 
   it('invalidates analysis, resolution, delivery, observation, policy, and overview data after adopt', async () => {

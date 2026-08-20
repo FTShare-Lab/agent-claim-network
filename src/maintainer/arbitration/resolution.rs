@@ -54,9 +54,24 @@ pub struct RejectResolutionInput {
     pub claim_assessments: Vec<ClaimAssessment>,
 }
 
-pub(super) struct AdoptionGuards<'a> {
-    pub dispute: &'a FileLockGuard,
-    pub semantic_inputs: &'a FileLockGuard,
+/// Resolution 已经关闭 Dispute 后，仍在运行或等待的 Analysis 只能作为审计记录保留，
+/// 不能继续携带可调度状态。Adopting 拥有固定 Resolution intent，由其恢复路径处理。
+pub(super) fn preempt_analysis_for_resolution(
+    analysis: &mut ArbitrationAnalysis,
+    now: DateTime<Utc>,
+) -> bool {
+    if !analysis.state.is_recoverable() || analysis.state == AnalysisState::Adopting {
+        return false;
+    }
+    analysis.state = AnalysisState::Failed;
+    analysis.lease = None;
+    analysis.next_retry_at = None;
+    analysis.error = Some(AnalysisError {
+        code: "analysis_preempted".into(),
+        message: "Dispute 已由 Resolution 处理".into(),
+    });
+    analysis.updated_at = now;
+    true
 }
 
 #[derive(Clone)]
@@ -153,14 +168,14 @@ impl ResolutionService {
     ) -> anyhow::Result<ArbitrationResolutionRecord> {
         validate_human_input(&input)?;
         let _dispute_guard = self.store.lock_dispute(dispute_id).await?;
-        let semantic_guard = self.store.lock_semantic_inputs().await?;
         let mut dispute = self.store.read_dispute(dispute_id).await?;
         validate_assessments(&dispute.dispute.claims, &input.claim_assessments)?;
         if dispute.dispute.status == DisputeStatus::Open {
             if let Some(record) = self
-                .recover_human_resolution_locked(dispute_id, &mut dispute, &semantic_guard)
+                .recover_human_resolution_locked(dispute_id, &mut dispute)
                 .await?
             {
+                self.preempt_current_analysis_locked(dispute_id, now).await;
                 let same_input = human_resolution_matches_input(&record, &input);
                 self.persist_pending_delivery(&record, record.created_at)
                     .await?;
@@ -241,9 +256,6 @@ impl ResolutionService {
             delivery_intent,
             snapshot_source_resolution_id: None,
         };
-        self.store
-            .bump_semantic_inputs_revision(&semantic_guard)
-            .await?;
         self.persist_pending_delivery(&record, now).await?;
         self.store.write_resolution_record(&record).await?;
         #[cfg(test)]
@@ -252,6 +264,7 @@ impl ResolutionService {
         dispute.dispute.resolved_at = Some(now);
         dispute.resolution = Some(resolution);
         self.store.write_dispute(&dispute).await?;
+        self.preempt_current_analysis_locked(dispute_id, now).await;
         if let Err(error) = self.ensure_delivery(&record).await {
             log::warn!(
                 target: "maintainer_arbitration",
@@ -270,17 +283,17 @@ impl ResolutionService {
     ) -> anyhow::Result<ArbitrationResolutionRecord> {
         validate_reject_input(&input)?;
         let _dispute_guard = self.store.lock_dispute(dispute_id).await?;
-        let semantic_guard = self.store.lock_semantic_inputs().await?;
         let mut dispute = self.store.read_dispute(dispute_id).await?;
         let prior_resolution_id = dispute
             .resolution
             .as_ref()
             .map(|resolution| resolution.resolution_id.clone());
         if let Some(record) = self
-            .recover_human_resolution_locked(dispute_id, &mut dispute, &semantic_guard)
+            .recover_human_resolution_locked(dispute_id, &mut dispute)
             .await?
         {
             if prior_resolution_id.as_ref() != Some(&record.resolution_id) {
+                self.preempt_current_analysis_locked(dispute_id, now).await;
                 let same_input = replacement_resolution_matches_input(&record, &input);
                 self.persist_pending_delivery(&record, record.created_at)
                     .await?;
@@ -383,9 +396,6 @@ impl ResolutionService {
             delivery_intent,
             snapshot_source_resolution_id,
         };
-        self.store
-            .bump_semantic_inputs_revision(&semantic_guard)
-            .await?;
         self.persist_pending_delivery(&record, now).await?;
         self.store.write_resolution_record(&record).await?;
         #[cfg(test)]
@@ -394,6 +404,7 @@ impl ResolutionService {
         dispute.dispute.resolved_at = Some(now);
         dispute.resolution = Some(resolution);
         self.store.write_dispute(&dispute).await?;
+        self.preempt_current_analysis_locked(dispute_id, now).await;
         if let Err(error) = self.ensure_delivery(&record).await {
             log::warn!(
                 target: "maintainer_arbitration",
@@ -404,26 +415,44 @@ impl ResolutionService {
         Ok(record)
     }
 
-    /// 调用方已按顺序持有 per-dispute 与 semantic-input guard。
+    /// 调用方持有 per-dispute lock。Resolution 已经 durable，因此 Analysis 审计状态
+    /// 写入失败只记录 warning；启动恢复仍会在执行模型前再次终止它。
+    async fn preempt_current_analysis_locked(&self, dispute_id: &DisputeId, now: DateTime<Utc>) {
+        let result = async {
+            let Some(mut analysis) = self.store.read_current_analysis(dispute_id).await? else {
+                return Ok::<(), anyhow::Error>(());
+            };
+            if preempt_analysis_for_resolution(&mut analysis, now) {
+                self.store.write_analysis(&analysis).await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            log::warn!(
+                target: "maintainer_arbitration",
+                "Resolution 已提交但终止 current analysis 失败: dispute={} error={error:#}",
+                dispute_id
+            );
+        }
+    }
+
+    /// 调用方持有 per-dispute guard。
     pub(super) async fn begin_analysis_adoption_locked(
         &self,
         job: &AnalysisJob,
         resolved_by: ResolvedBy,
-        guards: AdoptionGuards<'_>,
+        dispute_guard: &FileLockGuard,
         now: DateTime<Utc>,
     ) -> anyhow::Result<ArbitrationResolutionRecord> {
-        let AdoptionGuards {
-            dispute: dispute_guard,
-            semantic_inputs: semantic_guard,
-        } = guards;
-        let _held_locks = (dispute_guard, semantic_guard);
+        let _held_lock = dispute_guard;
         let mut analysis = self.store.read_analysis(job).await?;
         if analysis.state != AnalysisState::Approved {
             anyhow::bail!("analysis state={:?} 不能采用", analysis.state);
         }
         let mut dispute = self.store.read_dispute(&job.dispute_id).await?;
         if let Some(human) = self
-            .recover_human_resolution_locked(&job.dispute_id, &mut dispute, semantic_guard)
+            .recover_human_resolution_locked(&job.dispute_id, &mut dispute)
             .await?
         {
             if let Err(error) = self.ensure_delivery(&human).await {
@@ -503,9 +532,6 @@ impl ResolutionService {
         analysis.pending_resolution = Some(record.clone());
         analysis.lease = None;
         analysis.updated_at = now;
-        self.store
-            .bump_semantic_inputs_revision(semantic_guard)
-            .await?;
         self.store.write_analysis(&analysis).await?;
         #[cfg(test)]
         if let Some(barrier) = self.adoption_persisted_barrier.as_ref() {
@@ -524,7 +550,6 @@ impl ResolutionService {
         now: DateTime<Utc>,
     ) -> anyhow::Result<AnalysisState> {
         let _dispute_guard = self.store.lock_dispute(&job.dispute_id).await?;
-        let _semantic_guard = self.store.lock_semantic_inputs().await?;
         let mut analysis = self.store.read_analysis(job).await?;
         if analysis.state != AnalysisState::Adopting {
             return Ok(analysis.state);
@@ -576,20 +601,16 @@ impl ResolutionService {
         Ok(analysis.state)
     }
 
-    /// 调用方已按顺序持有 per-dispute 与 semantic-input guard。若显式
-    /// Adopt 已经固定 intent，重复请求只恢复该 Resolution，不重建上下文或 mint ID。
+    /// 调用方持有 per-dispute guard。若显式 Adopt 已经固定 intent，重复请求只恢复
+    /// 该 Resolution，不重建上下文或 mint ID。
     pub(super) async fn resume_matching_analysis_adoption_locked(
         &self,
         job: &AnalysisJob,
         expected_resolved_by: ResolvedBy,
-        guards: AdoptionGuards<'_>,
+        dispute_guard: &FileLockGuard,
         now: DateTime<Utc>,
     ) -> anyhow::Result<Option<ArbitrationResolutionRecord>> {
-        let AdoptionGuards {
-            dispute: dispute_guard,
-            semantic_inputs: semantic_guard,
-        } = guards;
-        let _held_locks = (dispute_guard, semantic_guard);
+        let _held_lock = dispute_guard;
         if let Some(owner) = self
             .find_human_analysis_adoption_owner(&job.dispute_id)
             .await?
@@ -857,7 +878,6 @@ impl ResolutionService {
         target: &ResolutionEventTarget,
     ) -> anyhow::Result<()> {
         let _guard = self.store.lock_dispute(&target.dispute_id).await?;
-        let semantic_guard = self.store.lock_semantic_inputs().await?;
         let pending = self
             .store
             .read_pending_delivery(&target.resolution_id)
@@ -896,9 +916,6 @@ impl ResolutionService {
                     .as_ref()
                     .is_some_and(|current| current.resolved_by == ResolvedBy::Automatic));
         if !is_current && can_recover_commit {
-            self.store
-                .bump_semantic_inputs_revision(&semantic_guard)
-                .await?;
             self.store.write_resolution_record(&record).await?;
             dispute.dispute.status = DisputeStatus::Resolved;
             dispute.dispute.resolved_at = Some(record.resolution.resolved_at);
@@ -958,7 +975,6 @@ impl ResolutionService {
         now: DateTime<Utc>,
     ) -> anyhow::Result<()> {
         let _dispute_guard = self.store.lock_dispute(&target.dispute_id).await?;
-        let _semantic_guard = self.store.lock_semantic_inputs().await?;
         let Some(record) = self
             .store
             .read_current_resolution_record(&target.dispute_id)
@@ -1013,7 +1029,6 @@ impl ResolutionService {
         &self,
         dispute_id: &DisputeId,
         dispute: &mut MaintainerDisputeRecord,
-        semantic_guard: &FileLockGuard,
     ) -> anyhow::Result<Option<ArbitrationResolutionRecord>> {
         let current = self
             .store
@@ -1045,9 +1060,6 @@ impl ResolutionService {
                         && current.resolution_id != record.resolution_id
                 });
             if recovers_open || recovers_replacement {
-                self.store
-                    .bump_semantic_inputs_revision(semantic_guard)
-                    .await?;
                 self.store.write_resolution_record(record).await?;
                 dispute.dispute.status = DisputeStatus::Resolved;
                 dispute.dispute.resolved_at = Some(record.resolution.resolved_at);

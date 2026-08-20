@@ -265,7 +265,7 @@ describe('public demo data contract', () => {
 
     expect(detail.resolution).toEqual(resolved!.resolution)
     expect(detail.current_analysis).toEqual(analyses.current_analysis)
-    expect(detail.holder_adoption?.summary.converged).toBe(1)
+    expect(detail.holder_adoption?.summary.updated_claims).toBe(1)
     expect(analysis.analysis_id).toBe(analysisId)
     expect(analysis.resolution_id).toBe(resolved!.resolution!.resolution_id)
 

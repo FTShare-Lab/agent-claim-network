@@ -143,13 +143,13 @@ pub use token_estimate::{
 pub(crate) use tool_boundary::ToolBoundaryControl;
 pub use turn_loop::{AgentTurnLoop, SessionTurnEventRecorder, SessionTurnPreflight};
 pub use types::{
-    ArbitrationInternalizeRequest, AvailableSkill, ClaimDraft, CompletedSessionTurnMessage,
-    DisputeDraft, InboxInternalizeKind, InternalizeOutcome, InternalizeRequest,
-    MemoryReviewRequest, RecapOutcome, SessionAttachment, SessionCompactionOutcome,
-    SessionCompactionRequest, SessionRecapRequest, SessionSearchSummaryOutcome,
-    SessionSearchSummaryRequest, SessionTurn, SessionTurnContentBlock, SessionTurnEvent,
-    SessionTurnInterrupted, SessionTurnMessage, SessionTurnRequest, ToolCallSkipReason,
-    ToolExecutionOutcome, TurnMessage,
+    AvailableSkill, ClaimAttributeUpdateInternalizeRequest, ClaimDraft,
+    CompletedSessionTurnMessage, DisputeDraft, InboxInternalizeKind, InternalizeOutcome,
+    InternalizeRequest, MemoryReviewRequest, RecapOutcome, SessionAttachment,
+    SessionCompactionOutcome, SessionCompactionRequest, SessionRecapRequest,
+    SessionSearchSummaryOutcome, SessionSearchSummaryRequest, SessionTurn, SessionTurnContentBlock,
+    SessionTurnEvent, SessionTurnInterrupted, SessionTurnMessage, SessionTurnRequest,
+    ToolCallSkipReason, ToolExecutionOutcome, TurnMessage,
 };
 
 #[cfg(test)]

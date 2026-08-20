@@ -72,6 +72,7 @@ export type ArbitrationAnalysisSummary = {
   resolution_id?: string | null
   error?: AnalysisError | null
   adoptable: boolean
+  automatic_progress_pending?: boolean
   adoption_blocker?: string | null
   analysis_round?: number
   context_change_count?: number
@@ -121,23 +122,26 @@ export type ClaimAdoptionComparison = {
   snapshot_status?: 'active' | 'stale' | 'deprecated' | null
   snapshot_scope?: string | null
   snapshot_statement?: string | null
-  recommended_status: 'active' | 'stale' | 'deprecated'
+  recommended_status?: 'active' | 'stale' | 'deprecated' | null
   current_status?: 'active' | 'stale' | 'deprecated' | null
   recommended_scope?: string | null
   current_scope?: string | null
   recommended_statement?: string | null
   current_statement?: string | null
   policy_provenance_present: boolean
-  matches: boolean
-  mismatch_reasons: string[]
+  update_observed: boolean
+  changed_fields: string[]
+  notes: string[]
 }
 
 export type HolderAdoption = {
   agent_id: string
   delivery_state: 'not_delivered' | 'delivered'
-  observation_state: 'not_delivered' | 'delivered_unobserved' | 'observed_converged' | 'observed_diverged' | 'unknown'
-  assessment_count: number
-  matched_count: number
+  observation_state: 'not_delivered' | 'no_update_observed' | 'update_observed' | 'unknown'
+  claim_count: number
+  updated_claim_count: number
+  unchanged_claim_count: number
+  unavailable_claim_count: number
   reasons: string[]
   last_delivered_at?: string | null
   last_observed_at?: string | null
@@ -151,11 +155,10 @@ export type HolderAdoption = {
 
 export type HolderAdoptionSummary = {
   notified_holders: number
-  delivered: number
-  converged: number
-  diverged: number
-  unobserved: number
-  unknown: number
+  delivered_holders: number
+  updated_claims: number
+  unchanged_claims: number
+  unavailable_claims: number
 }
 
 export type HolderAdoptionView = {
