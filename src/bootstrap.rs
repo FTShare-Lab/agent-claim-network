@@ -31,7 +31,7 @@ use crate::claim::AgentId;
 use crate::config::{Config, LlmChatConfig, LlmProvider, ResolvedUpstream};
 use crate::delegation::{DelegationRunnerConfig, DelegationWaitConfig, LlmDelegationExecutor};
 use crate::maintainer::arbitration::{
-    phase_timeout, ArbitrationContextBuilder, ArbitrationService, ArbitrationStore,
+    lease_base_duration, ArbitrationContextBuilder, ArbitrationService, ArbitrationStore,
     LlmArbitrationEvaluator, ResolutionService, SystemArbitrationClock,
 };
 use crate::maintainer::http_client::HttpMaintainerClient;
@@ -466,7 +466,7 @@ pub fn build_maintainer_arbitration_service(
         resolution_service,
         cfg.maintainer.arbitration.clone(),
         llm.model.clone(),
-        phase_timeout(llm)?,
+        lease_base_duration(llm)?,
         cfg.maintainer.id_mint_max_attempts(),
         Arc::new(SystemArbitrationClock),
     ))))

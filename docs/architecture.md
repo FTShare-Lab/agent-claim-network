@@ -90,7 +90,7 @@ TUI 退出非空 session 时，可将 finalize job 交给独立 supervisor。Sup
 - OpenAI-compatible Chat Completions
 - OpenAI-compatible Responses（HTTP SSE/JSON，`store = false`）
 
-普通 turn、compact、finalize recap、inbox 内化和 memory review 共享 provider-neutral DTO，但使用各自的 prompt 和工具权限。
+普通 turn、compact、finalize recap、inbox 内化、memory review 和 Maintainer 仲裁共享 provider-neutral DTO，但使用各自的 prompt 和工具权限。内部结构化任务优先使用缓冲式流式传输，只有完整终态通过解析和业务校验后才消费结果。
 
 工具按职责组织在 `src/tool/`，包括文件、受管进程、Web、working note、Memory、session search、MCP、subagent 与团队 Router 查询。MCP server 连接由 session 共享的 connection manager 管理；subagent 只能获得其权限边界允许的工具。
 

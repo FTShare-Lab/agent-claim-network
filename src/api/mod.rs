@@ -138,6 +138,8 @@ pub use openai_compatible_responses::{
     OpenAiCompatibleResponsesError, OpenAiCompatibleResponsesProviderAdapter,
 };
 pub use placeholder::{resolve_placeholders, PlaceholderError};
+#[cfg(test)]
+pub(crate) use provider::ProviderStreamFailure;
 pub(crate) use provider::ProviderTransport;
 pub use provider::{
     assistant_text_from_message, context_usage_from_anthropic_committed_usage,

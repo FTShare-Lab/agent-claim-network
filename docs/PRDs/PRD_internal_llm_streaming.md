@@ -4,9 +4,9 @@
 
 ## 范围
 
-以下调用改为 streaming-first，并只在完整终态后消费或提交结果：Inbox 内化、Session compact summary、Subagent compact summary、Recap、Memory review、Router LLM rerank。
+以下调用采用 streaming-first，并只在完整终态后消费或提交结果：Inbox 内化、Session compact summary、Subagent compact summary、Recap、Memory review、Router LLM rerank，以及 Maintainer 仲裁的 Proposal 与 Verification。
 
-Agent 内部任务复用 `[agent.llm]` 的 provider、timeout 与 retry 配置；Router rerank 复用 `[router.rerank]`，支持 `openai_chat`、`openai_responses` 与 `anthropic`。Router 不启用 WebSocket，也不发送 thinking/reasoning。
+Agent 内部任务复用 `[agent.llm]` 的 provider、timeout 与 retry 配置；Router rerank 复用 `[router.rerank]`；Maintainer 仲裁复用 `[maintainer.llm]`。三者都支持 `openai_chat`、`openai_responses` 与 `anthropic`。Router 不启用 WebSocket，也不发送 thinking/reasoning。
 
 ## 重试与降级
 

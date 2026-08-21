@@ -11,7 +11,7 @@ mod types;
 mod worker;
 
 pub(crate) use context::{load_team_claims, ArbitrationContextBuilder};
-pub use evaluator::{phase_timeout, ArbitrationEvaluator, LlmArbitrationEvaluator};
+pub use evaluator::{lease_base_duration, ArbitrationEvaluator, LlmArbitrationEvaluator};
 pub use observation::ObservationService;
 pub use resolution::{HumanResolutionInput, RejectResolutionInput, ResolutionService};
 pub use resolution_events::{spawn_resolution_event_scheduler, ResolutionEventScheduler};

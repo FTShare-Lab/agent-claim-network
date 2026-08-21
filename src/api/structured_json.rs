@@ -142,11 +142,6 @@ impl StructuredJsonAttemptRequest {
         }
     }
 
-    /// 仲裁由结构化调用层统一承担 provider/解析/shape 重试，并限制每次真实请求时长。
-    pub(crate) fn arbitration(system_prompt: String, messages: Vec<SessionTurnMessage>) -> Self {
-        Self::guarded_with_request_timeout(system_prompt, messages)
-    }
-
     /// CAU 单消息内化共享一个 provider/解析/业务校验预算，并限制每次真实请求时长。
     pub(crate) fn claim_attribute_update(
         system_prompt: String,
@@ -263,6 +258,31 @@ impl StructuredJsonCaller {
             on_retry,
             |_| std::future::ready(()),
             |_, _| Ok(()),
+        )
+        .await
+    }
+
+    /// 缓冲式流式生成 JSON，并在每次结构化重试前检查最终请求。
+    pub(crate) async fn generate_json_streaming_validated_with_guarded_attempts<T, V, F, G>(
+        &self,
+        system_prompt: String,
+        messages: Vec<SessionTurnMessage>,
+        runtime: BufferedProviderRuntime,
+        validate: V,
+        on_retry: F,
+        before_attempt: G,
+    ) -> anyhow::Result<T>
+    where
+        V: FnMut(Value) -> anyhow::Result<T>,
+        F: FnMut(u32, u32, &anyhow::Error),
+        G: FnMut(&str, &[SessionTurnMessage]) -> anyhow::Result<()>,
+    {
+        self.generate_json_validated_with_guarded_attempts(
+            StructuredJsonAttemptRequest::streaming(system_prompt, messages, runtime),
+            validate,
+            on_retry,
+            |_| std::future::ready(()),
+            before_attempt,
         )
         .await
     }

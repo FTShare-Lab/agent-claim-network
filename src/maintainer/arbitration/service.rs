@@ -85,7 +85,7 @@ impl ArbitrationService {
         resolution_service: ResolutionService,
         config: MaintainerArbitrationConfig,
         model: String,
-        phase_timeout: Duration,
+        lease_base_duration: Duration,
         _id_mint_max_attempts: usize,
         clock: Arc<dyn ArbitrationClock>,
     ) -> Self {
@@ -96,7 +96,7 @@ impl ArbitrationService {
             resolution_service,
             config,
             model,
-            lease_duration: phase_timeout.saturating_add(LEASE_SAFETY_MARGIN),
+            lease_duration: lease_base_duration.saturating_add(LEASE_SAFETY_MARGIN),
             clock,
             context_prepare_max_attempts: DEFAULT_CONTEXT_PREPARE_MAX_ATTEMPTS,
             context_prepare_retry_delay: DEFAULT_CONTEXT_PREPARE_RETRY_DELAY,
@@ -734,7 +734,7 @@ impl ArbitrationService {
         let _guard = self.store.lock_dispute(&job.dispute_id).await?;
         let now = self.clock.now();
         let mut analysis = self.store.read_analysis(job).await?;
-        ensure_lease(&analysis, token, AnalysisPhase::Proposal, now)?;
+        ensure_lease(&analysis, token, AnalysisPhase::Proposal)?;
         let dispute = self.store.read_dispute(&job.dispute_id).await?;
         if dispute.dispute.status != DisputeStatus::Open || dispute.resolution.is_some() {
             analysis.state = AnalysisState::Failed;
@@ -766,7 +766,7 @@ impl ArbitrationService {
         let _guard = self.store.lock_dispute(&job.dispute_id).await?;
         let now = self.clock.now();
         let mut analysis = self.store.read_analysis(job).await?;
-        ensure_lease(&analysis, token, AnalysisPhase::Verification, now)?;
+        ensure_lease(&analysis, token, AnalysisPhase::Verification)?;
         analysis.verification = Some(verification);
         analysis.state = if analysis_is_approved(&analysis, self.config.confidence_threshold) {
             AnalysisState::Approved
@@ -861,7 +861,7 @@ impl ArbitrationService {
             .as_ref()
             .map(|lease| lease.phase)
             .ok_or_else(|| anyhow::anyhow!("analysis lease 缺失"))?;
-        ensure_lease(&analysis, token, phase, now)?;
+        ensure_lease(&analysis, token, phase)?;
         set_failed(&mut analysis, code, error, now);
         self.store.write_analysis(&analysis).await
     }
@@ -962,14 +962,15 @@ fn ensure_lease(
     analysis: &ArbitrationAnalysis,
     expected_token: &str,
     expected_phase: AnalysisPhase,
-    now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     let lease = analysis
         .lease
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("analysis lease 缺失"))?;
-    if lease.phase != expected_phase || lease.token != expected_token || lease.expires_at <= now {
-        anyhow::bail!("analysis lease 已过期或被接管");
+    // expires_at 只决定其他 worker 何时可以接管。只要 fencing token 未变化，
+    // 原 owner 即使越过预计时长也仍可提交；接管后旧 token 会在这里被拒绝。
+    if lease.phase != expected_phase || lease.token != expected_token {
+        anyhow::bail!("analysis lease 已被接管或 phase 不匹配");
     }
     Ok(())
 }
@@ -1974,6 +1975,37 @@ mod tests {
             .await
             .unwrap());
         assert_eq!(evaluator.calls(), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn unchanged_fencing_token_can_finish_after_lease_expiry() {
+        let evaluator = ScriptedEvaluator::approved();
+        evaluator.block_next_proposal();
+        let fixture = Fixture::new(ArbitrationMode::Shadow, evaluator.clone()).await;
+        fixture.seed_claims().await;
+        let job = fixture.report().await;
+        let service = fixture.service.clone();
+        let running_job = job.clone();
+        let task = tokio::spawn(async move {
+            service
+                .process_analysis(&running_job, &CancellationToken::new())
+                .await
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            evaluator.proposal_entered.notified(),
+        )
+        .await
+        .unwrap();
+
+        fixture.clock.advance(chrono::Duration::minutes(1));
+        let expired = fixture.store.read_analysis(&job).await.unwrap();
+        assert!(ensure_lease(&expired, "replacement-token", AnalysisPhase::Proposal).is_err());
+        evaluator.proposal_release.notify_one();
+
+        let completed = task.await.unwrap().unwrap();
+        assert_eq!(completed.state, AnalysisState::Approved);
+        assert_eq!(evaluator.calls(), (1, 1));
     }
 
     #[tokio::test]
