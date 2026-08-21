@@ -30,6 +30,10 @@ const IN_PROGRESS_ANALYSIS_STATES = new Set<AnalysisState>([
   'verifying',
   'adopting',
 ])
+const RESOLUTION_FENCE_ANALYSIS_STATES = new Set<AnalysisState>([
+  'adopting',
+  'adopted',
+])
 const ACTIVE_POLL_INTERVAL_MS = 1_000
 
 function isAnalysisInProgress(state?: AnalysisState) {
@@ -40,6 +44,33 @@ function shouldPollAnalysis(analysis?: ArbitrationAnalysisSummary | null) {
   return Boolean(analysis && (
     isAnalysisInProgress(analysis.state) || analysis.automatic_progress_pending
   ))
+}
+
+function disputeNeedsResolutionRefresh(
+  dispute: Dispute | undefined,
+  analysis: ArbitrationAnalysisSummary,
+) {
+  if (!dispute) return false
+  if (dispute.status !== 'resolved') return true
+  return Boolean(
+    analysis.resolution_id
+    && dispute.resolution?.resolution_id !== analysis.resolution_id
+  )
+}
+
+function resolutionCachesNeedRefresh(
+  queryClient: ReturnType<typeof useQueryClient>,
+  id: string,
+  analysis: ArbitrationAnalysisSummary,
+) {
+  const listDispute = queryClient
+    .getQueryData<Dispute[]>(['disputes'])
+    ?.find((dispute) => dispute.id === id)
+  const detail = queryClient.getQueryData<DisputeDetail>(['disputes', id])
+  return (
+    disputeNeedsResolutionRefresh(listDispute, analysis)
+    || disputeNeedsResolutionRefresh(detail, analysis)
+  )
 }
 
 function applyResolutionToCache(
@@ -57,7 +88,13 @@ function applyResolutionToCache(
     current?.map((dispute) => dispute.id === id ? closeDispute(dispute) : dispute)
   ))
   queryClient.setQueryData<DisputeDetail>(['disputes', id], (current) => (
-    current ? closeDispute(current) : current
+    current ? {
+      ...closeDispute(current),
+      holder_adoption: current.resolution?.resolution_id
+        === record.resolution.resolution_id
+        ? current.holder_adoption
+        : null,
+    } : current
   ))
 }
 
@@ -87,11 +124,16 @@ export function useDisputesQuery() {
       )
       if (!resolutionChanged) continue
 
+      const resolutionIdChanged = (
+        current.resolution?.resolution_id !== dispute.resolution?.resolution_id
+      )
+
       queryClient.setQueryData<DisputeDetail>(detailKey, {
         ...current,
         status: 'resolved',
         resolved_at: dispute.resolved_at,
         resolution: dispute.resolution,
+        holder_adoption: resolutionIdChanged ? null : current.holder_adoption,
       })
       void Promise.all([
         queryClient.invalidateQueries({ queryKey: detailKey, exact: true }),
@@ -150,8 +192,20 @@ export function useAnalysesQuery(id?: string) {
           exact: true,
         })),
       ])
+      return
     }
-  }, [id, query.data, queryClient])
+
+    const resolutionFence = analyses.find((analysis) => (
+      RESOLUTION_FENCE_ANALYSIS_STATES.has(analysis.state)
+      && resolutionCachesNeedRefresh(queryClient, id, analysis)
+    ))
+    if (resolutionFence) {
+      void Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['disputes'], exact: true }),
+        queryClient.invalidateQueries({ queryKey: ['disputes', id], exact: true }),
+      ])
+    }
+  }, [id, query.data, query.dataUpdatedAt, queryClient])
 
   return query
 }

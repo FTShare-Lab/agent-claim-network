@@ -10,6 +10,7 @@ import {
   useAnalysesQuery,
   useAnalysisDetailQuery,
   useDisputesQuery,
+  useRejectResolutionMutation,
   useResolveDisputeMutation,
 } from './hooks'
 import type {
@@ -18,6 +19,9 @@ import type {
   ArbitrationAnalysisDetail,
   ArbitrationAnalysisSummary,
   Dispute,
+  DisputeDetail,
+  DisputeResolution,
+  HolderAdoptionView,
 } from './types'
 
 vi.mock('./api', () => ({
@@ -76,6 +80,36 @@ function dispute(status: Dispute['status']): Dispute {
     status,
     created_at: createdAt,
     resolved_at: status === 'resolved' ? '2026-08-10T08:05:00Z' : undefined,
+  }
+}
+
+function resolution(id: string, resolvedBy: DisputeResolution['resolved_by']): DisputeResolution {
+  return {
+    resolution_id: id,
+    resolved_by: resolvedBy,
+    resolved_at: createdAt,
+    conclusion: `${id} conclusion`,
+  }
+}
+
+function resolvedDispute(id: string, resolvedBy: DisputeResolution['resolved_by']): Dispute {
+  return {
+    ...dispute('resolved'),
+    resolution: resolution(id, resolvedBy),
+  }
+}
+
+function holderAdoption(): HolderAdoptionView {
+  return {
+    observed_at: createdAt,
+    summary: {
+      notified_holders: 1,
+      delivered_holders: 1,
+      updated_claims: 1,
+      unchanged_claims: 0,
+      unavailable_claims: 0,
+    },
+    holders: [],
   }
 }
 
@@ -155,6 +189,52 @@ describe('dispute analysis queries', () => {
     await act(async () => vi.advanceTimersByTimeAsync(10_000))
 
     expect(disputeApi.listAnalyses).toHaveBeenCalledTimes(3)
+  })
+
+  it('refreshes open dispute caches when the first analysis response is adopted', async () => {
+    vi.mocked(disputeApi.listAnalyses).mockResolvedValue({
+      current_analysis: {
+        ...analysis('adopted'),
+        resolution_id: 'resolution_1234abcd',
+      },
+    })
+    const queryClient = createQueryClient()
+    queryClient.setQueryData(['disputes'], [dispute('open')])
+    queryClient.setQueryData(['disputes', disputeId], dispute('open'))
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+    const { result } = renderHook(() => useAnalysesQuery(disputeId), { wrapper: wrapper(queryClient) })
+
+    await vi.waitFor(() => expect(result.current.data?.current_analysis?.state).toBe('adopted'))
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['disputes'], exact: true })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['disputes', disputeId], exact: true })
+  })
+
+  it('rechecks unchanged adopting state until dispute caches converge', async () => {
+    vi.useFakeTimers()
+    vi.mocked(disputeApi.listAnalyses).mockResolvedValue({
+      current_analysis: {
+        ...analysis('adopting'),
+        resolution_id: 'resolution_1234abcd',
+      },
+    })
+    const queryClient = createQueryClient()
+    queryClient.setQueryData(['disputes'], [dispute('open')])
+    queryClient.setQueryData(['disputes', disputeId], dispute('open'))
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+    const { result } = renderHook(() => useAnalysesQuery(disputeId), { wrapper: wrapper(queryClient) })
+
+    await vi.waitFor(() => expect(result.current.data?.current_analysis?.state).toBe('adopting'))
+    await vi.waitFor(() => expect(invalidate).toHaveBeenCalledTimes(2))
+    await act(async () => vi.advanceTimersByTimeAsync(1_000))
+    await vi.waitFor(() => expect(disputeApi.listAnalyses).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(invalidate).toHaveBeenCalledTimes(4))
+
+    const resolved = resolvedDispute('resolution_1234abcd', 'automatic')
+    queryClient.setQueryData(['disputes'], [resolved])
+    queryClient.setQueryData(['disputes', disputeId], resolved)
+    await act(async () => vi.advanceTimersByTimeAsync(1_000))
+    await vi.waitFor(() => expect(disputeApi.listAnalyses).toHaveBeenCalledTimes(3))
+    expect(invalidate).toHaveBeenCalledTimes(4)
   })
 
   it('does not fetch analyses without a selected dispute', async () => {
@@ -249,6 +329,64 @@ describe('dispute analysis queries', () => {
     ]) {
       expect(invalidate).toHaveBeenCalledWith(expect.objectContaining({ queryKey }))
     }
+  })
+
+  it('clears holder adoption when Reject & Replace installs a new resolution', async () => {
+    const oldResolution = resolution('resolution_1111aaaa', 'automatic')
+    const replacement = resolution('resolution_2222bbbb', 'human')
+    const replacementRecord: ArbitrationResolutionRecord = {
+      resolution_id: replacement.resolution_id,
+      dispute_id: disputeId,
+      created_at: createdAt,
+      resolution: replacement,
+      dispute_snapshot: resolvedDispute(oldResolution.resolution_id, 'automatic'),
+      direct_claim_snapshots: [],
+    }
+    vi.mocked(disputeApi.rejectResolution).mockResolvedValue(replacementRecord)
+    const queryClient = createQueryClient()
+    queryClient.setQueryData<DisputeDetail>(['disputes', disputeId], {
+      ...resolvedDispute(oldResolution.resolution_id, 'automatic'),
+      holder_adoption: holderAdoption(),
+    })
+    const { result } = renderHook(() => useRejectResolutionMutation(), { wrapper: wrapper(queryClient) })
+
+    await act(async () => {
+      await result.current.mutateAsync({
+        id: disputeId,
+        request: {
+          expected_resolution_id: oldResolution.resolution_id,
+          rejection_reason: 'superseded evidence',
+          conclusion: replacement.conclusion,
+        },
+      })
+    })
+
+    expect(queryClient.getQueryData<DisputeDetail>(['disputes', disputeId])).toMatchObject({
+      resolution: replacement,
+      holder_adoption: null,
+    })
+  })
+
+  it('clears holder adoption when the dispute list observes a replacement resolution', async () => {
+    const oldResolution = resolution('resolution_1111aaaa', 'automatic')
+    const replacement = resolvedDispute('resolution_2222bbbb', 'human')
+    vi.mocked(disputeApi.listDisputes).mockResolvedValue([replacement])
+    const queryClient = createQueryClient()
+    queryClient.setQueryData<DisputeDetail>(['disputes', disputeId], {
+      ...resolvedDispute(oldResolution.resolution_id, 'automatic'),
+      holder_adoption: holderAdoption(),
+    })
+    const { result } = renderHook(() => useDisputesQuery(), { wrapper: wrapper(queryClient) })
+
+    await vi.waitFor(() => expect(result.current.data?.[0]?.resolution?.resolution_id).toBe(
+      replacement.resolution?.resolution_id,
+    ))
+    await vi.waitFor(() => expect(
+      queryClient.getQueryData<DisputeDetail>(['disputes', disputeId]),
+    ).toMatchObject({
+      resolution: replacement.resolution,
+      holder_adoption: null,
+    }))
   })
 
   it('immediately refreshes fencing data after an adoption conflict', async () => {
