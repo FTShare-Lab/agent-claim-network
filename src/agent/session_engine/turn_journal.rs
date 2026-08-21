@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::api::{CompletedSessionTurnMessage, SessionTurnEvent, SessionTurnEventRecorder};
 use crate::session::{
     TurnJournalEventKind, TurnJournalFlush, TurnJournalStatus, TurnJournalWriter,
+    TURN_JOURNAL_DURABILITY_TIMEOUT,
 };
 
 pub(super) struct TurnJournalCommand {
@@ -60,11 +61,29 @@ impl TurnJournalSink {
                 ack: Some(ack_tx),
             })
             .map_err(|_| anyhow::anyhow!("turn journal writer is closed"))?;
-        match ack_rx.await {
+        await_turn_journal_ack(ack_rx, Some(TURN_JOURNAL_DURABILITY_TIMEOUT)).await
+    }
+}
+
+async fn await_turn_journal_ack(
+    ack_rx: oneshot::Receiver<Result<(), String>>,
+    timeout: Option<Duration>,
+) -> anyhow::Result<()> {
+    let Some(timeout) = timeout else {
+        return match ack_rx.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => anyhow::bail!(error),
             Err(_) => anyhow::bail!("turn journal writer stopped before durable ack"),
-        }
+        };
+    };
+    match time::timeout(timeout, ack_rx).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(error))) => anyhow::bail!(error),
+        Ok(Err(_)) => anyhow::bail!("turn journal writer stopped before durable ack"),
+        Err(_) => anyhow::bail!(
+            "turn journal durable ack exceeded {}s; current run must stop",
+            timeout.as_secs()
+        ),
     }
 }
 
@@ -464,5 +483,24 @@ mod tests {
         let ack = fallback.ack.expect("fallback state requires durable ack");
         ack.send(Ok(())).expect("record task still waits for ack");
         assert!(record.await.expect("record task join").is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn durable_sink_ack_timeout_stops_waiting_after_ten_seconds() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(TurnJournalCommand {
+            created_at: Utc::now(),
+            kind: TurnJournalEventKind::TurnStarted,
+            flush: TurnJournalFlush::Immediate,
+            ack: Some(ack_tx),
+        })
+        .unwrap();
+        let error = await_turn_journal_ack(ack_rx, Some(TURN_JOURNAL_DURABILITY_TIMEOUT))
+            .await
+            .expect_err("missing writer ack should fail the current run");
+        assert!(error
+            .to_string()
+            .contains("durable ack exceeded 10s; current run must stop"));
     }
 }

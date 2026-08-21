@@ -242,6 +242,20 @@ fn wait_subagents_and_code_run_descriptions_use_runtime_limits() {
     let code_run = tools.iter().find(|tool| tool.name == "code_run").unwrap();
     assert!(code_run.description.contains("logical process_id"));
     assert_eq!(
+        code_run.input_schema["properties"]["description"]["minLength"],
+        1
+    );
+    assert!(
+        code_run.input_schema["properties"]["description"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("without repeating commands, passwords, tokens")
+    );
+    assert_eq!(
+        code_run.input_schema["required"],
+        serde_json::json!(["script", "description"])
+    );
+    assert_eq!(
         code_run.input_schema["properties"]["yield_time_ms"]["maximum"],
         3210
     );
@@ -258,6 +272,20 @@ fn wait_subagents_and_code_run_descriptions_use_runtime_limits() {
     assert!(write_stdin.input_schema.get("oneOf").is_none());
     assert!(write_stdin.input_schema.get("anyOf").is_none());
     assert!(write_stdin.input_schema.get("allOf").is_none());
+    assert_eq!(
+        write_stdin.input_schema["properties"]["description"]["minLength"],
+        1
+    );
+    assert!(
+        write_stdin.input_schema["properties"]["description"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("polling, sending input, interrupting, or terminating")
+    );
+    assert_eq!(
+        write_stdin.input_schema["required"],
+        serde_json::json!(["process_id", "description"])
+    );
     assert!(write_stdin.input_schema["properties"]["chars"]
         .get("maxLength")
         .is_none());

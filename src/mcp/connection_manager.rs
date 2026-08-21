@@ -6108,7 +6108,7 @@ mod tests {
   printf '%s' "$1" | sed -n 's/.*"id":[[:space:]]*\([0-9][0-9]*\).*/\1/p'
 }
 progress_token() {
-  printf '%s' "$1" | sed -n 's/.*"progressToken":[[:space:]]*"\{0,1\}\([^",}]*\).*/\1/p'
+  printf '%s' "$1" | sed -En 's/.*"progressToken":[[:space:]]*("[^"]*"|-?[0-9]+(\.[0-9]+)?).*/\1/p'
 }
 while IFS= read -r line; do
 id=$(response_id "$line")
@@ -6124,7 +6124,7 @@ case "$line" in
     ;;
   *'"method":"tools/call"'*)
     token=$(progress_token "$line")
-    printf '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"%s","progress":1,"total":2,"message":"half"}}\n' "$token"
+    printf '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":%s,"progress":1,"total":2,"message":"half"}}\n' "$token"
     printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}\n' "$id"
     ;;
 esac

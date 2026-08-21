@@ -25,8 +25,8 @@ mod unix {
     use tokio::process::Command;
 
     use crate::tool::{
-        configure_process_group, reap_direct_child_blocking, spawn_direct_child_reaper,
-        terminate_process_group, wait_for_child_exit_without_reap,
+        configure_process_group, observe_child_exit_without_reap, reap_direct_child_blocking,
+        spawn_direct_child_reaper, terminate_process_group,
     };
 
     /// 为 root 建立独立 PGID，并把 rmcp 的 kill/wait 扩展到同组后代。
@@ -118,15 +118,7 @@ mod unix {
                 }
 
                 let process_group_id = self.process_group_id;
-                let observed = tokio::task::spawn_blocking(move || {
-                    wait_for_child_exit_without_reap(process_group_id)
-                })
-                .await
-                .map_err(|error| {
-                    io::Error::other(format!(
-                        "观察 stdio MCP root child 退出的 worker 失败: {error}"
-                    ))
-                })?;
+                let observed = observe_child_exit_without_reap(process_group_id).await;
 
                 if let Err(error) = observed {
                     // 观察失败时仍优先清理整组并回收 root，避免把诊断错误升级成进程泄漏。

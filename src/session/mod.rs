@@ -35,6 +35,7 @@ pub use cleanup::{
     cleanup_old_sessions, SessionCleanupAbortCheck, SessionCleanupConfig, SessionCleanupEntry,
     SessionCleanupOutcome, SessionCleanupReport,
 };
+pub(crate) use turn_journal::TURN_JOURNAL_DURABILITY_TIMEOUT;
 pub use turn_journal::{
     canonical_user_content_hash, replay_turn_journal, turn_journal_recovery_context,
     turn_journal_recovery_context_for_chain, CompactionAssetKind, CompactionAssetReference,
@@ -150,6 +151,10 @@ pub enum SessionStoreError {
         #[source]
         source: anyhow::Error,
     },
+    #[error("turn journal 持久化执行器不可用: {0}")]
+    TurnJournalWriterUnavailable(String),
+    #[error("turn journal 持久化超过 {seconds}s，当前运行必须停止")]
+    TurnJournalDurabilityTimeout { seconds: u64 },
 }
 
 impl SessionStoreError {

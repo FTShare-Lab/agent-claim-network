@@ -1,5 +1,7 @@
 use tokio::process::Command;
 
+const EXIT_OBSERVER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// 向受管 PGID 发送信号后的内核确认结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProcessGroupSignalResult {
@@ -16,41 +18,32 @@ pub(crate) fn configure_process_group(command: &mut Command) {
     }
 }
 
-/// 等待直属 root child 退出但保留其 waitable 状态。调用方可在随后 `Child::wait()` 真正
-/// reap 前安全地向同组后代发信号：root zombie 仍占用原 PID/PGID，不会命中后来复用该数值
-/// 的无关进程组。
-pub(crate) fn wait_for_child_exit_without_reap(process_id: i32) -> std::io::Result<()> {
-    #[cfg(unix)]
+/// 异步等待直属 root child 退出但保留其 waitable 状态。
+///
+/// Linux 优先通过 pidfd 接入 Tokio reactor；其他 Unix 或 pidfd 不可用时，以
+/// `waitid(WNOHANG | WNOWAIT)` 低频轮询。两条路径都不会长期占用 blocking worker。
+pub(crate) async fn observe_child_exit_without_reap(process_id: i32) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
     {
-        let process_id = libc::id_t::try_from(process_id).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "root child PID cannot be represented as libc::id_t",
-            )
-        })?;
-        loop {
-            // SAFETY: `process_id` is the PID returned by a child process spawned directly by
-            // ACN. WNOWAIT asks the kernel to leave it waitable; no other code waits this child
-            // before the caller later invokes the owning Child::wait().
-            let result = unsafe {
-                let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-                libc::waitid(
-                    libc::P_PID,
-                    process_id,
-                    info.as_mut_ptr(),
-                    libc::WEXITED | libc::WNOWAIT,
-                )
-            };
-            if result == 0 {
-                return Ok(());
+        match observe_child_exit_with_pidfd(process_id).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                log::debug!(
+                    target: "tool",
+                    "pidfd observer unavailable for child {process_id}; falling back to waitid polling: {error}"
+                );
             }
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(error);
         }
     }
+
+    #[cfg(unix)]
+    loop {
+        if child_exit_waitable(process_id)? {
+            return Ok(());
+        }
+        tokio::time::sleep(EXIT_OBSERVER_POLL_INTERVAL).await;
+    }
+
     #[cfg(not(unix))]
     {
         let _ = process_id;
@@ -58,6 +51,64 @@ pub(crate) fn wait_for_child_exit_without_reap(process_id: i32) -> std::io::Resu
             std::io::ErrorKind::Unsupported,
             "background process groups are only supported on Unix",
         ))
+    }
+}
+
+#[cfg(unix)]
+fn child_exit_waitable(process_id: i32) -> std::io::Result<bool> {
+    let process_id_as_id = libc::id_t::try_from(process_id).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "root child PID cannot be represented as libc::id_t",
+        )
+    })?;
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: process_id 是 ACN 直属 child。WNOHANG 保证这里不会阻塞；WNOWAIT
+        // 保留 waitable 状态，后续仍由持有 Child handle 的 watcher 唯一 reap。
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                process_id_as_id,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if result == 0 {
+            // POSIX 要求 WNOHANG 未观察到状态时不返回 child 事件。缓冲区预先清零，
+            // 因而 si_signo!=0 表示本次确实取得了 SIGCHLD 状态。
+            let info = unsafe { info.assume_init() };
+            return Ok(info.si_signo != 0);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return Err(error);
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn observe_child_exit_with_pidfd(process_id: i32) -> std::io::Result<()> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    // SAFETY: pidfd_open 不转移其他 fd 的所有权；成功返回的新 fd 立即交给 OwnedFd。
+    let raw_fd = unsafe { libc::syscall(libc::SYS_pidfd_open, process_id, 0) };
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let raw_fd = i32::try_from(raw_fd)
+        .map_err(|_| std::io::Error::other("pidfd cannot be represented as a raw fd"))?;
+    // SAFETY: raw_fd 是本函数刚刚成功创建且尚未被任何 owner 接管的 pidfd。
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let pidfd = tokio::io::unix::AsyncFd::new(pidfd)?;
+    loop {
+        let mut ready = pidfd.readable().await?;
+        if child_exit_waitable(process_id)? {
+            return Ok(());
+        }
+        // 极少数伪就绪时重新向 reactor 注册；真正退出后的 pidfd 会持续 readable。
+        ready.clear_ready();
     }
 }
 
@@ -148,8 +199,8 @@ mod tests {
     use tokio::process::Command;
 
     use super::{
-        configure_process_group, reap_direct_child_blocking, signal_process_group,
-        wait_for_child_exit_without_reap, ProcessGroupSignalResult,
+        configure_process_group, observe_child_exit_without_reap, reap_direct_child_blocking,
+        signal_process_group, ProcessGroupSignalResult,
     };
 
     #[tokio::test]
@@ -167,9 +218,8 @@ mod tests {
             .and_then(|pid| i32::try_from(pid).ok())
             .expect("Unix child PID should fit the managed PGID type");
 
-        tokio::task::spawn_blocking(move || wait_for_child_exit_without_reap(process_group_id))
+        observe_child_exit_without_reap(process_group_id)
             .await
-            .expect("exit observer worker should join")
             .expect("waitid WNOWAIT should preserve the root child for later reap");
 
         assert_eq!(
@@ -197,6 +247,50 @@ mod tests {
         })
         .await
         .expect("residual process group should be gone after cleanup");
+    }
+
+    #[test]
+    fn async_exit_observer_does_not_depend_on_tokio_blocking_capacity() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("fixture runtime should build");
+        runtime.block_on(async {
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let occupied = tokio::task::spawn_blocking(move || {
+                let _ = release_rx.recv();
+            });
+            tokio::task::yield_now().await;
+
+            let mut command = Command::new("bash");
+            command
+                .args(["-lc", "exit 0"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            configure_process_group(&mut command);
+            let mut child = command.spawn().expect("fixture should spawn");
+            let process_id = child
+                .id()
+                .and_then(|pid| i32::try_from(pid).ok())
+                .expect("fixture PID should fit");
+
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                observe_child_exit_without_reap(process_id),
+            )
+            .await
+            .expect("observer should not wait for blocking capacity")
+            .expect("observer should see child exit");
+            child.wait().await.expect("child should remain reapable");
+
+            let _ = release_tx.send(());
+            occupied
+                .await
+                .expect("blocking capacity fixture should stop");
+        });
     }
 
     #[tokio::test]

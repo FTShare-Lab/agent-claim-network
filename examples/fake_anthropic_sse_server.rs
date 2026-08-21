@@ -103,11 +103,17 @@ async fn messages(State(state): State<ServerState>, Json(request): Json<Value>) 
     }
 
     if request.get("stream").and_then(Value::as_bool) == Some(true) {
+        if state.response_mode == ResponseMode::SlowStructured
+            && request_is_session_compaction(&request)
+        {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            return slow_compaction_messages().into_response();
+        }
+        if request_is_session_recap(&request) {
+            return session_recap_messages().into_response();
+        }
         return match state.response_mode {
             ResponseMode::StreamingText => streaming_messages().into_response(),
-            ResponseMode::BackgroundProcess if request_is_session_recap(&request) => {
-                session_recap_messages().into_response()
-            }
             ResponseMode::BackgroundProcess if request_contains_tool_result(&request) => {
                 background_process_completed_messages().into_response()
             }
@@ -154,6 +160,13 @@ fn request_is_session_recap(request: &Value) -> bool {
     request
         .get("system")
         .is_some_and(|system| system.to_string().contains("复盘阶段"))
+}
+
+fn request_is_session_compaction(request: &Value) -> bool {
+    request.get("system").is_some_and(|system| {
+        let text = system.to_string();
+        text.contains("committed_summary") && text.contains("active_turn_summary")
+    })
 }
 
 fn tool_result_content<'a>(request: &'a Value, tool_use_id: &str) -> Option<&'a str> {
@@ -221,6 +234,39 @@ fn slow_compaction_message() -> Value {
         "stop_sequence": null,
         "usage": {"input_tokens": 1, "output_tokens": 1},
     })
+}
+
+fn slow_compaction_messages() -> Sse<impl Stream<Item = SseItem>> {
+    let outcome = json!({
+        "committed_summary": "fake compact queue regression summary",
+        "active_turn_summary": null,
+    });
+    sse_from_events(vec![
+        json!({
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 1}}
+        }),
+        json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""}
+        }),
+        json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "text_delta",
+                "text": outcome.to_string()
+            }
+        }),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 1}
+        }),
+        json!({"type": "message_stop"}),
+    ])
 }
 
 fn streaming_messages() -> Sse<impl Stream<Item = SseItem>> {
@@ -305,7 +351,7 @@ fn background_process_tool_messages() -> Sse<impl Stream<Item = SseItem>> {
             "index": 0,
             "delta": {
                 "type": "input_json_delta",
-                "partial_json": "{\"script\":\"sleep 30\",\"yield_time_ms\":1000}"
+                "partial_json": "{\"description\":\"Start the background-process fixture.\",\"script\":\"sleep 30\",\"yield_time_ms\":1000}"
             }
         }),
         json!({"type": "content_block_stop", "index": 0}),
@@ -631,7 +677,17 @@ fn tool_messages_many(tools: Vec<(&str, &str, Value)>) -> Sse<impl Stream<Item =
         "type": "message_start",
         "message": {"usage": {"input_tokens": 1}}
     })];
-    for (index, (tool_use_id, tool_name, input)) in tools.into_iter().enumerate() {
+    for (index, (tool_use_id, tool_name, mut input)) in tools.into_iter().enumerate() {
+        if let Some(object) = input.as_object_mut() {
+            let description = match tool_name {
+                "code_run" => Some("Run the deterministic process-control fixture command."),
+                "write_stdin" => Some("Poll or control the deterministic fixture process."),
+                _ => None,
+            };
+            if let Some(description) = description {
+                object.insert("description".into(), Value::String(description.into()));
+            }
+        }
         events.extend([
             json!({
                 "type": "content_block_start",

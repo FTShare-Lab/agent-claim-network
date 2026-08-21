@@ -95,6 +95,7 @@ async fn code_run_executes_python_in_workspace() {
             "code_run",
             serde_json::json!({
                 "script": "print('hello')",
+                "description": "Print a greeting from Python",
                 "type": "python",
             }),
         )
@@ -174,6 +175,7 @@ async fn code_run_tty_uses_fixed_size_and_accepts_interactive_input() {
             json!({
                 "process_id": process_id,
                 "chars": "hello\n",
+                "description": "Send the requested reply to the interactive command",
                 "yield_time_ms": 500
             }),
         )
@@ -497,6 +499,40 @@ async fn long_code_run_yields_process_id_without_timeout_kill() {
         .unwrap();
     assert_eq!(completed.output["success"], true);
     assert_eq!(completed.output["stdout"], "complete");
+}
+
+#[tokio::test(start_paused = true)]
+#[cfg(unix)]
+async fn initial_yield_watchdog_terminates_a_stuck_handoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(ToolRegistry::new(&test_tool_config(dir.path())).unwrap());
+    let gate = registry.process_manager.pause_next_handoff_for_test().await;
+    let dispatch_registry = Arc::clone(&registry);
+    let dispatch = tokio::spawn(async move {
+        dispatch_registry
+            .dispatch(
+                "code_run",
+                json!({
+                    "script": "sleep 30",
+                    "yield_time_ms": 250,
+                }),
+            )
+            .await
+    });
+
+    gate.wait_until_entered().await;
+    let error = dispatch
+        .await
+        .expect("dispatch task should not panic")
+        .expect_err("stuck handoff should trip the initial yield watchdog");
+    assert!(matches!(
+        error,
+        ToolError::CodeRunInternalTimeout { grace_ms: 5_000 }
+    ));
+
+    gate.release();
+    tokio::task::yield_now().await;
+    registry.shutdown_background_processes().await;
 }
 
 #[tokio::test]

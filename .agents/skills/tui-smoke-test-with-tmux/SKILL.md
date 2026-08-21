@@ -15,6 +15,9 @@ cargo run --quiet --bin acn -- --config config.toml
 
 The TUI uses `ratatui` + `crossterm`, so verify it in a real tty. Prefer tmux capture files over screenshots because they can be inspected with `rg`, `sed`, and diffs.
 
+The bundled runners that inspect TOML config use Python's standard library and require Python
+3.11+ (`tomllib`). Their shared preflight reports this requirement before starting a TUI.
+
 ## Workflow
 
 1. Review the TUI change and decide the expected screen states or key flow.
@@ -121,10 +124,17 @@ Use a different agent or config:
   --command "cargo run --quiet --bin acn -- --config config.toml --upstream agent_hub"
 ```
 
-Skip the pre-build only when the binary is already known to be current:
+自定义命令默认不管理 supervisor，避免终止共享 config 下原本存在或后来复用该
+supervisor 的其他 TUI。只有 config 与 `acn_home` 都是本次测试独占的临时资源时，
+才传 `--supervisor-config` 启用回收；其值必须与自定义命令传给 `--config` 的参数
+文本一致。直接使用已构建二进制时还可传 `--supervisor-binary
+/absolute/path/to/acn`，加强进程候选过滤。
+
+Skip the pre-build only when an explicit binary is already known to be current:
 
 ```bash
-.agents/skills/tui-smoke-test-with-tmux/scripts/tui_tmux_smoke.sh --skip-build
+TUI_ACN_BINARY=/absolute/path/to/acn \
+  .agents/skills/tui-smoke-test-with-tmux/scripts/tui_tmux_smoke.sh --skip-build
 ```
 
 Keep ANSI escape codes for color/style review:
