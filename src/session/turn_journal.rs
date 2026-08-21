@@ -5,15 +5,17 @@
 //! 负责，业务派生不直接消费这里的 raw 事件。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::ErrorKind;
-use std::io::SeekFrom;
+use std::fs as std_fs;
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc as std_mpsc, OnceLock};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use ring::digest::{digest, SHA256};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::oneshot;
 
 use crate::api::{ModelContextSource, ToolCallSkipReason, ToolExecutionOutcome};
 use crate::config::COMPACTION_ASSET_REFERENCES_PER_TURN_MAX;
@@ -24,6 +26,7 @@ use crate::tool::diff::FileChange;
 use super::{SessionContentBlock, SessionStoreError};
 
 const CANONICAL_USER_CONTENT_HASH_PREFIX: &str = "sha256-v1:";
+pub(crate) const TURN_JOURNAL_DURABILITY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 为 canonical user content 生成稳定哈希，用于关联 journal 与 transcript。
 pub fn canonical_user_content_hash(
@@ -219,21 +222,58 @@ pub struct TurnJournalWriter {
     path: PathBuf,
     next_seq: u64,
     known_len: u64,
+    failed: bool,
 }
 
+#[derive(Debug)]
+struct TurnJournalAppendResult {
+    event: TurnJournalEvent,
+    next_seq: u64,
+    known_len: u64,
+}
+
+enum TurnJournalIoRequest {
+    Open {
+        path: PathBuf,
+        ack: oneshot::Sender<Result<(u64, u64), SessionStoreError>>,
+    },
+    Append {
+        path: PathBuf,
+        next_seq: u64,
+        known_len: u64,
+        turn_id: String,
+        created_at: DateTime<Utc>,
+        kind: Box<TurnJournalEventKind>,
+        flush: TurnJournalFlush,
+        ack: oneshot::Sender<Result<TurnJournalAppendResult, SessionStoreError>>,
+    },
+}
+
+struct TurnJournalIoExecutor {
+    tx: Option<std_mpsc::Sender<TurnJournalIoRequest>>,
+    startup_error: Option<String>,
+}
+
+static TURN_JOURNAL_IO_EXECUTOR: OnceLock<TurnJournalIoExecutor> = OnceLock::new();
+
 impl TurnJournalWriter {
+    pub(crate) fn initialize_executor() -> Result<(), SessionStoreError> {
+        turn_journal_io_sender().map(|_| ())
+    }
+
     pub async fn open(path: impl Into<PathBuf>) -> Result<Self, SessionStoreError> {
         let path = path.into();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|source| session_io(parent, source))?;
-        }
-        let (next_seq, known_len) = next_turn_journal_seq_and_len(&path).await?;
+        let (ack, reply) = oneshot::channel();
+        send_turn_journal_io_request(TurnJournalIoRequest::Open {
+            path: path.clone(),
+            ack,
+        })?;
+        let (next_seq, known_len) = await_turn_journal_io(reply).await?;
         Ok(Self {
             path,
             next_seq,
             known_len,
+            failed: false,
         })
     }
 
@@ -244,23 +284,125 @@ impl TurnJournalWriter {
         kind: TurnJournalEventKind,
         flush: TurnJournalFlush,
     ) -> Result<TurnJournalEvent, SessionStoreError> {
-        let _guard = lock_turn_journal(&self.path).await?;
-        let current_len = turn_journal_file_len(&self.path).await?;
-        if current_len != self.known_len {
-            let (next_seq, known_len) = next_turn_journal_seq_and_len(&self.path).await?;
-            self.next_seq = next_seq;
-            self.known_len = known_len;
+        if self.failed {
+            return Err(SessionStoreError::TurnJournalWriterUnavailable(
+                "writer 已因之前的持久化失败失效".into(),
+            ));
         }
-        let event = TurnJournalEvent {
-            seq: self.next_seq,
+        let (ack, reply) = oneshot::channel();
+        let request = TurnJournalIoRequest::Append {
+            path: self.path.clone(),
+            next_seq: self.next_seq,
+            known_len: self.known_len,
             turn_id: turn_id.into(),
             created_at,
-            kind,
+            kind: Box::new(kind),
+            flush,
+            ack,
         };
-        append_turn_journal_event(&self.path, &event, flush).await?;
-        self.next_seq = self.next_seq.saturating_add(1);
-        self.known_len = turn_journal_file_len(&self.path).await?;
-        Ok(event)
+        if let Err(error) = send_turn_journal_io_request(request) {
+            self.failed = true;
+            return Err(error);
+        }
+        match await_turn_journal_io(reply).await {
+            Ok(result) => {
+                self.next_seq = result.next_seq;
+                self.known_len = result.known_len;
+                Ok(result.event)
+            }
+            Err(error) => {
+                self.failed = true;
+                Err(error)
+            }
+        }
+    }
+}
+
+impl TurnJournalIoExecutor {
+    fn start() -> Self {
+        let (tx, rx) = std_mpsc::channel();
+        match std::thread::Builder::new()
+            .name("acn-turn-journal-writer".into())
+            .spawn(move || run_turn_journal_io(rx))
+        {
+            Ok(_) => Self {
+                tx: Some(tx),
+                startup_error: None,
+            },
+            Err(error) => Self {
+                tx: None,
+                startup_error: Some(error.to_string()),
+            },
+        }
+    }
+}
+
+fn turn_journal_io_sender(
+) -> Result<&'static std_mpsc::Sender<TurnJournalIoRequest>, SessionStoreError> {
+    let executor = TURN_JOURNAL_IO_EXECUTOR.get_or_init(TurnJournalIoExecutor::start);
+    executor.tx.as_ref().ok_or_else(|| {
+        SessionStoreError::TurnJournalWriterUnavailable(
+            executor
+                .startup_error
+                .clone()
+                .unwrap_or_else(|| "writer thread 启动失败".into()),
+        )
+    })
+}
+
+fn send_turn_journal_io_request(request: TurnJournalIoRequest) -> Result<(), SessionStoreError> {
+    turn_journal_io_sender()?
+        .send(request)
+        .map_err(|_| SessionStoreError::TurnJournalWriterUnavailable("writer thread 已停止".into()))
+}
+
+async fn await_turn_journal_io<T>(
+    reply: oneshot::Receiver<Result<T, SessionStoreError>>,
+) -> Result<T, SessionStoreError> {
+    await_turn_journal_io_with_timeout(reply, Some(TURN_JOURNAL_DURABILITY_TIMEOUT)).await
+}
+
+async fn await_turn_journal_io_with_timeout<T>(
+    reply: oneshot::Receiver<Result<T, SessionStoreError>>,
+    timeout: Option<Duration>,
+) -> Result<T, SessionStoreError> {
+    let Some(timeout) = timeout else {
+        return reply.await.map_err(|_| {
+            SessionStoreError::TurnJournalWriterUnavailable("writer thread 未返回持久化确认".into())
+        })?;
+    };
+    match tokio::time::timeout(timeout, reply).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(SessionStoreError::TurnJournalWriterUnavailable(
+            "writer thread 未返回持久化确认".into(),
+        )),
+        Err(_) => Err(SessionStoreError::TurnJournalDurabilityTimeout {
+            seconds: timeout.as_secs(),
+        }),
+    }
+}
+
+fn run_turn_journal_io(rx: std_mpsc::Receiver<TurnJournalIoRequest>) {
+    while let Ok(request) = rx.recv() {
+        match request {
+            TurnJournalIoRequest::Open { path, ack } => {
+                let _ = ack.send(open_turn_journal_blocking(&path));
+            }
+            TurnJournalIoRequest::Append {
+                path,
+                next_seq,
+                known_len,
+                turn_id,
+                created_at,
+                kind,
+                flush,
+                ack,
+            } => {
+                let _ = ack.send(append_turn_journal_blocking(
+                    &path, next_seq, known_len, turn_id, created_at, *kind, flush,
+                ));
+            }
+        }
     }
 }
 
@@ -761,71 +903,94 @@ fn json_for_tag_payload(value: &serde_json::Value) -> String {
         .replace('>', "\\u003e")
 }
 
-async fn lock_turn_journal(path: &Path) -> Result<FileLockGuard, SessionStoreError> {
+fn lock_turn_journal_blocking(path: &Path) -> Result<FileLockGuard, SessionStoreError> {
     let lock_path = path.with_extension("jsonl.lock");
-    FileLockGuard::lock_exclusive(&lock_path)
-        .await
-        .map_err(|source| SessionStoreError::Io {
-            path: lock_path,
-            source: std::io::Error::other(source.to_string()),
-        })
+    FileLockGuard::lock_exclusive_blocking(&lock_path).map_err(|source| SessionStoreError::Io {
+        path: lock_path,
+        source: std::io::Error::other(source.to_string()),
+    })
 }
 
-async fn append_turn_journal_event(
+fn open_turn_journal_blocking(path: &Path) -> Result<(u64, u64), SessionStoreError> {
+    if let Some(parent) = path.parent() {
+        std_fs::create_dir_all(parent).map_err(|source| session_io(parent, source))?;
+    }
+    next_turn_journal_seq_and_len_blocking(path)
+}
+
+fn append_turn_journal_blocking(
+    path: &Path,
+    mut next_seq: u64,
+    mut known_len: u64,
+    turn_id: String,
+    created_at: DateTime<Utc>,
+    kind: TurnJournalEventKind,
+    flush: TurnJournalFlush,
+) -> Result<TurnJournalAppendResult, SessionStoreError> {
+    let _guard = lock_turn_journal_blocking(path)?;
+    let current_len = turn_journal_file_len_blocking(path)?;
+    if current_len != known_len {
+        next_seq = next_turn_journal_seq_and_len_blocking(path)?.0;
+    }
+    let event = TurnJournalEvent {
+        seq: next_seq,
+        turn_id,
+        created_at,
+        kind,
+    };
+    append_turn_journal_event_blocking(path, &event, flush)?;
+    known_len = turn_journal_file_len_blocking(path)?;
+    Ok(TurnJournalAppendResult {
+        event,
+        next_seq: next_seq.saturating_add(1),
+        known_len,
+    })
+}
+
+fn append_turn_journal_event_blocking(
     path: &Path,
     event: &TurnJournalEvent,
     flush: TurnJournalFlush,
 ) -> Result<(), SessionStoreError> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .await
-            .map_err(|source| session_io(parent, source))?;
+        std_fs::create_dir_all(parent).map_err(|source| session_io(parent, source))?;
     }
-    let needs_parent_sync_after_immediate = match fs::metadata(path).await {
+    let needs_parent_sync_after_immediate = match std_fs::metadata(path) {
         Ok(metadata) => metadata.len() == 0,
         Err(err) if err.kind() == ErrorKind::NotFound => true,
         Err(err) => return Err(session_io(path, err)),
     };
-    ensure_turn_journal_append_boundary(path).await?;
-    let mut file = fs::OpenOptions::new()
+    ensure_turn_journal_append_boundary_blocking(path)?;
+    let mut file = std_fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .await
         .map_err(|source| session_io(path, source))?;
     let mut line = serde_json::to_vec(event)?;
     line.push(b'\n');
     file.write_all(&line)
-        .await
         .map_err(|source| session_io(path, source))?;
-    file.flush()
-        .await
-        .map_err(|source| session_io(path, source))?;
+    file.flush().map_err(|source| session_io(path, source))?;
     if flush == TurnJournalFlush::Immediate {
         file.sync_data()
-            .await
             .map_err(|source| session_io(path, source))?;
         drop(file);
         if needs_parent_sync_after_immediate {
             if let Some(parent) = path.parent() {
-                sync_parent_dir(parent).await?;
+                sync_parent_dir_blocking(parent)?;
             }
         }
     }
     Ok(())
 }
 
-async fn sync_parent_dir(parent: &Path) -> Result<(), SessionStoreError> {
-    let dir = fs::File::open(parent)
-        .await
-        .map_err(|source| session_io(parent, source))?;
-    dir.sync_all()
-        .await
-        .map_err(|source| session_io(parent, source))
+fn sync_parent_dir_blocking(parent: &Path) -> Result<(), SessionStoreError> {
+    let dir = std_fs::File::open(parent).map_err(|source| session_io(parent, source))?;
+    dir.sync_all().map_err(|source| session_io(parent, source))
 }
 
-async fn ensure_turn_journal_append_boundary(path: &Path) -> Result<(), SessionStoreError> {
-    let metadata = match fs::metadata(path).await {
+fn ensure_turn_journal_append_boundary_blocking(path: &Path) -> Result<(), SessionStoreError> {
+    let metadata = match std_fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(session_io(path, err)),
@@ -833,36 +998,29 @@ async fn ensure_turn_journal_append_boundary(path: &Path) -> Result<(), SessionS
     if metadata.len() == 0 {
         return Ok(());
     }
-    let mut file = fs::OpenOptions::new()
+    let mut file = std_fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)
-        .await
         .map_err(|source| session_io(path, source))?;
     file.seek(SeekFrom::End(-1))
-        .await
         .map_err(|source| session_io(path, source))?;
     let mut last = [0u8; 1];
     file.read_exact(&mut last)
-        .await
         .map_err(|source| session_io(path, source))?;
     if last[0] == b'\n' {
         return Ok(());
     }
     file.seek(SeekFrom::End(0))
-        .await
         .map_err(|source| session_io(path, source))?;
     file.write_all(b"\n")
-        .await
         .map_err(|source| session_io(path, source))?;
-    file.flush()
-        .await
-        .map_err(|source| session_io(path, source))?;
+    file.flush().map_err(|source| session_io(path, source))?;
     Ok(())
 }
 
-async fn next_turn_journal_seq_and_len(path: &Path) -> Result<(u64, u64), SessionStoreError> {
-    let bytes = match fs::read(path).await {
+fn next_turn_journal_seq_and_len_blocking(path: &Path) -> Result<(u64, u64), SessionStoreError> {
+    let bytes = match std_fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok((1, 0)),
         Err(err) => return Err(session_io(path, err)),
@@ -878,8 +1036,8 @@ async fn next_turn_journal_seq_and_len(path: &Path) -> Result<(u64, u64), Sessio
     Ok((max_seq.saturating_add(1), len))
 }
 
-async fn turn_journal_file_len(path: &Path) -> Result<u64, SessionStoreError> {
-    match fs::metadata(path).await {
+fn turn_journal_file_len_blocking(path: &Path) -> Result<u64, SessionStoreError> {
+    match std_fs::metadata(path) {
         Ok(metadata) => Ok(metadata.len()),
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(0),
         Err(err) => Err(session_io(path, err)),
@@ -1754,6 +1912,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(event.seq, 3);
+    }
+
+    #[test]
+    fn journal_writer_does_not_depend_on_tokio_blocking_capacity() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let occupied = tokio::task::spawn_blocking(move || {
+                let _ = release_rx.recv();
+            });
+            tokio::task::yield_now().await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("turn_events.jsonl");
+            let write = tokio::time::timeout(Duration::from_secs(3), async {
+                let mut writer = TurnJournalWriter::open(path.clone()).await?;
+                writer
+                    .append(
+                        "turn_1",
+                        ts(1),
+                        TurnJournalEventKind::TurnStarted,
+                        TurnJournalFlush::Immediate,
+                    )
+                    .await
+            })
+            .await;
+
+            let _ = release_tx.send(());
+            occupied.await.unwrap();
+            write
+                .expect("journal I/O should not wait for Tokio blocking capacity")
+                .expect("journal append should succeed");
+            assert_eq!(read_turn_journal(&path).await.events.len(), 1);
+        });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn durable_io_ack_has_a_fixed_ten_second_timeout() {
+        let (_ack, reply) = oneshot::channel::<Result<(), SessionStoreError>>();
+        let error =
+            await_turn_journal_io_with_timeout(reply, Some(TURN_JOURNAL_DURABILITY_TIMEOUT))
+                .await
+                .expect_err("missing durability ack should time out");
+        assert!(matches!(
+            error,
+            SessionStoreError::TurnJournalDurabilityTimeout { seconds: 10 }
+        ));
     }
 
     #[tokio::test]

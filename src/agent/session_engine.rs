@@ -108,7 +108,6 @@ const COMPACTION_AUDIT_SUMMARY_PREVIEW_CHARS: usize = 8_000;
 const DELEGATION_PROJECTION_MAX_ITEMS: usize = 12;
 /// Esc/Ctrl-C 的 turn 收束必须和 tool batch 共用同一个有界 grace。journal 是尽力
 /// 持久化，不能反过来阻塞 TUI 从 cancelling 恢复 idle。
-const EXPLICIT_CANCEL_JOURNAL_SETTLE_GRACE: Duration = Duration::from_millis(100);
 const DELEGATION_PROJECTION_MAX_CHARS: usize = 6_000;
 const STABLE_HASH_OFFSET: u64 = 0xcbf29ce484222325;
 const STABLE_HASH_PRIME: u64 = 0x100000001b3;
@@ -1292,15 +1291,15 @@ impl InboxJsonGenerator for SessionInboxJsonGenerator<'_> {
     }
 }
 
-/// explicit cancel 已经允许放弃未完成的 tool future；turn journal 的 forwarder / writer
-/// 同样不能无限等待。尽量在同一个 100ms 窗口内写完 PendingCancel 和 TurnFinished，超时后
-/// abort 本地 task 即可，绝不据此宣称外部工具副作用被回滚。
+/// explicit cancel 已经允许放弃未完成的 tool future，但不能放弃用于恢复判定的 journal
+/// 终态。控制事件、Cancelled marker 与 writer ack 共用固定 durability deadline；失败时
+/// 当前 run 必须以持久化错误收束，绝不据此宣称外部工具副作用被回滚。
 async fn finish_cancelled_turn_journal(
     emitter: TurnJournalEmitter,
     writer: JoinHandle<anyhow::Result<()>>,
     control_forwarder: Option<TurnControlJournalForwarder>,
-) {
-    let deadline = Instant::now() + EXPLICIT_CANCEL_JOURNAL_SETTLE_GRACE;
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + crate::session::TURN_JOURNAL_DURABILITY_TIMEOUT;
     if let Some(forwarder) = control_forwarder {
         forwarder.set_drain_on_shutdown(true);
         forwarder.shutdown.cancel();
@@ -1308,60 +1307,53 @@ async fn finish_cancelled_turn_journal(
         match time::timeout_at(deadline, &mut handle).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                log::warn!(
-                    target: "agent",
-                    "cancelled turn control journal forwarder failed: {error:#}"
-                );
+                anyhow::bail!("cancelled turn control journal forwarder failed: {error:#}");
             }
             Err(_) => {
                 handle.abort();
-                log::warn!(
-                    target: "agent",
-                    "cancelled turn control journal forwarder exceeded bounded settle grace"
+                anyhow::bail!(
+                    "cancelled turn journal durability exceeded {}s while draining control events",
+                    crate::session::TURN_JOURNAL_DURABILITY_TIMEOUT.as_secs()
                 );
             }
         }
     }
 
-    if Instant::now() < deadline {
-        let finish = emitter.finish(TurnJournalStatus::Cancelled);
-        tokio::pin!(finish);
-        if time::timeout_at(deadline, &mut finish).await.is_err() {
-            log::warn!(
-                target: "agent",
-                "cancelled turn journal emitter exceeded bounded settle grace"
-            );
-        }
+    let finish = emitter.finish(TurnJournalStatus::Cancelled);
+    tokio::pin!(finish);
+    if time::timeout_at(deadline, &mut finish).await.is_err() {
+        anyhow::bail!(
+            "cancelled turn journal durability exceeded {}s while enqueueing terminal marker",
+            crate::session::TURN_JOURNAL_DURABILITY_TIMEOUT.as_secs()
+        );
     }
 
     let mut writer = writer;
     if Instant::now() >= deadline {
         writer.abort();
-        log::warn!(
-            target: "agent",
-            "cancelled turn journal writer skipped after bounded settle grace"
+        anyhow::bail!(
+            "cancelled turn journal durability exceeded {}s before writer ack",
+            crate::session::TURN_JOURNAL_DURABILITY_TIMEOUT.as_secs()
         );
-        return;
     }
     match time::timeout_at(deadline, &mut writer).await {
-        Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(error))) => {
-            log::warn!(target: "agent", "cancelled turn journal write failed: {error:#}");
-        }
-        Ok(Err(error)) => {
-            log::warn!(
-                target: "agent",
-                "cancelled turn journal writer task failed: {error:#}"
-            );
-        }
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(error))) => Err(error.context("cancelled turn journal write failed")),
+        Ok(Err(error)) => Err(anyhow::anyhow!(
+            "cancelled turn journal writer task failed: {error:#}"
+        )),
         Err(_) => {
             writer.abort();
-            log::warn!(
-                target: "agent",
-                "cancelled turn journal writer exceeded bounded settle grace"
+            anyhow::bail!(
+                "cancelled turn journal durability exceeded {}s before writer ack",
+                crate::session::TURN_JOURNAL_DURABILITY_TIMEOUT.as_secs()
             );
         }
     }
+}
+
+fn journal_failure_overrides_turn_result(turn_succeeded: bool, turn_interrupted: bool) -> bool {
+    turn_succeeded || turn_interrupted
 }
 
 impl SessionEngine {
@@ -1374,6 +1366,12 @@ impl SessionEngine {
         session_store: SessionStore,
         options: SessionEngineOptions,
     ) -> Self {
+        if let Err(error) = crate::session::TurnJournalWriter::initialize_executor() {
+            log::error!(
+                target: "agent",
+                "turn journal dedicated writer failed to start: {error}"
+            );
+        }
         let agent = runner.context();
         Self {
             agent,
@@ -2147,10 +2145,9 @@ impl SessionEngine {
         writer: JoinHandle<anyhow::Result<()>>,
         control_forwarder: Option<TurnControlJournalForwarder>,
         status: TurnJournalStatus,
-    ) {
+    ) -> anyhow::Result<()> {
         if status == TurnJournalStatus::Cancelled {
-            finish_cancelled_turn_journal(emitter, writer, control_forwarder).await;
-            return;
+            return finish_cancelled_turn_journal(emitter, writer, control_forwarder).await;
         }
         if let Some(forwarder) = control_forwarder {
             forwarder.set_drain_on_shutdown(status != TurnJournalStatus::Committed);
@@ -2164,18 +2161,16 @@ impl SessionEngine {
         }
         emitter.finish(status).await;
         match writer.await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {
                 let message = format!("Turn journal write failed: {e:#}");
                 log::warn!(target: "agent", "{message}");
-                self.append_session_event_log(session, "WARN", message)
-                    .await;
+                Err(e.context(message))
             }
             Err(e) => {
                 let message = format!("Turn journal writer task failed: {e:#}");
                 log::warn!(target: "agent", "{message}");
-                self.append_session_event_log(session, "WARN", message)
-                    .await;
+                Err(anyhow::anyhow!(message))
             }
         }
     }
@@ -2633,7 +2628,7 @@ impl SessionEngine {
             assistant_delta_flusher: journal_emitter.assistant_delta_flusher(),
         };
         let runtime_chain_id = session.runtime_chain_id();
-        let result = async {
+        let mut result = async {
             checkpoint_result?;
             let mut turn_emit = |event| match event {
                 SessionTurnEvent::Warning { message } => {
@@ -2827,14 +2822,26 @@ impl SessionEngine {
             TurnJournalStatus::Failed
         };
         drop(durable_recorder);
-        self.finish_turn_journal(
-            session,
-            journal_emitter,
-            journal_writer,
-            control_forwarder,
-            journal_status,
-        )
-        .await;
+        let journal_finish_result = self
+            .finish_turn_journal(
+                session,
+                journal_emitter,
+                journal_writer,
+                control_forwarder,
+                journal_status,
+            )
+            .await;
+        if let Err(journal_error) = journal_finish_result {
+            if journal_failure_overrides_turn_result(result.is_ok(), turn_interrupted) {
+                result = Err(journal_error.context("turn journal 未能可靠持久化；当前运行已停止"));
+            } else {
+                log::warn!(
+                    target: "agent",
+                    "turn 失败后的 journal 收束也失败 (session={}): {journal_error:#}",
+                    session.metadata.id
+                );
+            }
+        }
         if let Some(checkpoint_guard) = checkpoint_guard.as_mut() {
             let checkpoint_finalize = if journal_status == TurnJournalStatus::Committed {
                 self.turn_loop

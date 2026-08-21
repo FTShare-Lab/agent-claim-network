@@ -66,9 +66,9 @@ use delegation::{
 };
 use diff::{attach_file_change, compute_file_change, FileChange, FileChangeKind};
 pub(crate) use process::{
-    configure_process_group, reap_direct_child_blocking, spawn_direct_child_reaper,
-    terminate_process_group, wait_for_child_exit_without_reap, BackgroundProcessEvent,
-    ProcessCompletion, ProcessCompletionDeliveryReceipt, ProcessDeliveryReceipt, ProcessOwner,
+    configure_process_group, observe_child_exit_without_reap, reap_direct_child_blocking,
+    spawn_direct_child_reaper, terminate_process_group, BackgroundProcessEvent, ProcessCompletion,
+    ProcessCompletionDeliveryReceipt, ProcessDeliveryReceipt, ProcessOwner,
 };
 use process::{
     spawn_pty, ManagedProcess, OutputCursor, ProcessManager, ProcessState, PtyInput, PtySpawned,
@@ -99,6 +99,12 @@ pub enum ToolError {
     MissingWebSearchApiKey { env: String },
     #[error("命令超时: {0}s")]
     CommandTimeout(u64),
+    #[error("runtime_resource_exhausted: {0}")]
+    RuntimeResourceExhausted(String),
+    #[error(
+        "code_run_internal_timeout: initial yield 后 {grace_ms}ms 内未能安全返回工具结果；对应进程组已终止，不存在可继续轮询的后台进程，可降低并发后重试"
+    )]
+    CodeRunInternalTimeout { grace_ms: u128 },
     #[error("memory: {0}")]
     Memory(String),
     #[error("router: {0}")]
@@ -113,6 +119,16 @@ pub enum ToolError {
     ProcessContinuesInBackground { process_id: String },
     #[error("mcp: {0}")]
     Mcp(String),
+}
+
+impl ToolError {
+    pub(crate) fn code(&self) -> Option<&'static str> {
+        match self {
+            Self::RuntimeResourceExhausted(_) => Some("runtime_resource_exhausted"),
+            Self::CodeRunInternalTimeout { .. } => Some("code_run_internal_timeout"),
+            _ => None,
+        }
+    }
 }
 
 /// ToolRegistry dispatch 的类型化返回值。

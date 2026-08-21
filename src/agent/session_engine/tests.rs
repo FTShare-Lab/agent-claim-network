@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 use super::super::fs::{
@@ -28,7 +28,8 @@ use super::{
     compacted_context_for_turn, compaction_tail_token_limit, compaction_transcript_projection,
     delegation_summary_projection, estimate_compacted_committed_summary_message_tokens,
     estimated_session_message_tokens_projected, finish_cancelled_turn_journal,
-    hash_session_segment, is_canonical_messages_committed_error, latest_model_context_matches,
+    hash_session_segment, is_canonical_messages_committed_error,
+    journal_failure_overrides_turn_result, latest_model_context_matches,
     parse_compaction_summary_outcome, persist_main_background_process_completions,
     project_provider_context, select_compaction_summary_end_index,
     session_compaction_transcript_projection,
@@ -102,6 +103,12 @@ enum ProviderStep {
         response: ProviderResponse,
         events: Vec<ProviderEvent>,
         control: SessionTurnControl,
+    },
+    ResponseAndSteerThenBreakJournal {
+        response: ProviderResponse,
+        events: Vec<ProviderEvent>,
+        control: SessionTurnControl,
+        journal_path: PathBuf,
     },
     ResponseAndPreservedSteer {
         response: ProviderResponse,
@@ -207,6 +214,27 @@ impl ProviderAdapter for RecordingProvider {
                         .request_tool_boundary_steer("steer after provider response")
                         .await
                 );
+                Ok(response)
+            }
+            Some(ProviderStep::ResponseAndSteerThenBreakJournal {
+                response,
+                events,
+                control,
+                journal_path,
+            }) => {
+                for event in events {
+                    emit(event);
+                }
+                assert!(
+                    control
+                        .request_tool_boundary_steer("steer before journal failure")
+                        .await
+                );
+                let saved_path = journal_path.with_extension("jsonl.before_terminal_failure");
+                std::fs::rename(&journal_path, &saved_path)
+                    .expect("fixture should move the journal before terminal append");
+                std::fs::create_dir(&journal_path)
+                    .expect("fixture should replace the journal with a directory");
                 Ok(response)
             }
             Some(ProviderStep::ResponseAndPreservedSteer {
@@ -1090,23 +1118,49 @@ async fn tool_boundary_cancel_returns_before_journal_forwarder_drains() {
     );
 }
 
-#[tokio::test]
-async fn cancelled_turn_journal_settlement_is_bounded_when_writer_stalls() {
+#[tokio::test(start_paused = true)]
+async fn cancelled_turn_journal_uses_fixed_durability_timeout_when_writer_stalls() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let emitter = TurnJournalEmitter::new(tx, Duration::from_secs(3600), usize::MAX);
     let writer = tokio::spawn(async { std::future::pending::<anyhow::Result<()>>().await });
-    let started = std::time::Instant::now();
 
-    tokio::time::timeout(
-        Duration::from_millis(250),
-        finish_cancelled_turn_journal(emitter, writer, None),
-    )
-    .await
-    .expect("cancelled turn must not wait indefinitely for a stalled journal writer");
-    assert!(
-        started.elapsed() < Duration::from_millis(180),
-        "cancelled journal settlement exceeded the shared 100ms grace"
-    );
+    let error = finish_cancelled_turn_journal(emitter, writer, None)
+        .await
+        .expect_err("stalled cancellation journal must fail the current run");
+    assert!(error
+        .to_string()
+        .contains("cancelled turn journal durability exceeded 10s"));
+}
+
+#[tokio::test]
+async fn cancelled_turn_waits_past_old_grace_and_records_terminal_marker() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let emitter = TurnJournalEmitter::new(tx, Duration::from_secs(3600), usize::MAX);
+    let (terminal_tx, terminal_rx) = oneshot::channel();
+    let writer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut terminal_tx = Some(terminal_tx);
+        while let Some(command) = rx.recv().await {
+            if matches!(
+                command.kind,
+                TurnJournalEventKind::TurnFinished {
+                    status: TurnJournalStatus::Cancelled
+                }
+            ) {
+                if let Some(terminal_tx) = terminal_tx.take() {
+                    let _ = terminal_tx.send(());
+                }
+            }
+        }
+        Ok(())
+    });
+
+    finish_cancelled_turn_journal(emitter, writer, None)
+        .await
+        .expect("ordinary writer contention should not drop cancellation journal");
+    terminal_rx
+        .await
+        .expect("cancelled terminal marker should reach the writer");
 }
 
 fn build_test_engine(
@@ -4444,7 +4498,7 @@ async fn preflight_errors_after_single_retry_when_plain_user_text_remains_over_h
     assert!(session.read_metadata().await.unwrap().compaction.is_none());
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn run_turn_failure_writes_failed_journal_without_canonical_messages() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(exhausted_stream_failure_steps(
@@ -4521,7 +4575,7 @@ async fn committed_turn_keeps_file_read_authority() {
     );
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn failed_turn_rolls_back_new_file_read_authority() {
     let dir = tempfile::tempdir().unwrap();
     tokio::fs::write(dir.path().join("note.txt"), "before\n")
@@ -4812,7 +4866,7 @@ async fn late_cancel_rolls_back_file_read_authority_before_commit() {
     assert_eq!(write.output["status"], "error");
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn run_turn_fallback_success_commits_only_complete_non_streaming_response() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(vec![
@@ -4894,7 +4948,9 @@ async fn run_turn_fallback_success_commits_only_complete_non_streaming_response(
     )));
 }
 
-#[tokio::test(start_paused = true)]
+// 该用例会断言专用 OS journal writer 的真实落盘结果，不能使用会瞬间推进
+// cancellation grace 的 Tokio 虚拟时钟。
+#[tokio::test]
 async fn fallback_tool_use_cancel_before_dispatch_writes_skipped_journal_without_canonical() {
     let dir = tempfile::tempdir().unwrap();
     let (control, control_rx) = SessionTurnControl::channel();
@@ -6926,6 +6982,64 @@ async fn pre_provider_interrupt_writes_interrupted_journal_without_canonical_mes
 }
 
 #[tokio::test]
+async fn interrupted_turn_terminal_journal_failure_is_fatal() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_aaaaaa19").await;
+    let journal_path = session.paths.turn_events_jsonl.clone();
+    let saved_path = journal_path.with_extension("jsonl.before_terminal_failure");
+    let (control, control_rx) = SessionTurnControl::channel();
+    provider
+        .steps
+        .lock()
+        .await
+        .push_back(ProviderStep::ResponseAndSteerThenBreakJournal {
+            response: provider_response("must not commit"),
+            events: Vec::new(),
+            control,
+            journal_path: journal_path.clone(),
+        });
+    let mut events = Vec::new();
+
+    let error = engine
+        .run_turn_with_attachments_controlled(
+            &mut session,
+            "original request",
+            Vec::new(),
+            Some(control_rx),
+            |event| events.push(event),
+        )
+        .await
+        .expect_err("steer journal failure must stop the current run");
+
+    assert!(error.to_string().contains("session 存储 I/O 失败"));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, SessionEvent::TurnFailed { .. })));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::StatusChanged {
+            status: SessionRuntimeStatus::Error
+        }
+    )));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, SessionEvent::TurnInterrupted { .. })));
+    assert!(session.read_messages().await.unwrap().is_empty());
+
+    tokio::fs::remove_dir(&journal_path).await.unwrap();
+    tokio::fs::rename(&saved_path, &journal_path).await.unwrap();
+}
+
+#[test]
+fn interrupted_turn_journal_failure_overrides_successful_interruption_result() {
+    assert!(journal_failure_overrides_turn_result(false, true));
+    assert!(journal_failure_overrides_turn_result(true, false));
+    assert!(!journal_failure_overrides_turn_result(false, false));
+}
+
+#[tokio::test]
 async fn pre_provider_cancel_writes_cancelled_journal_without_canonical_messages() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(vec![ProviderStep::Response {
@@ -7557,7 +7671,7 @@ async fn multiple_delegation_changes_coalesce_into_one_next_snapshot() {
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn continuation_commits_recovery_wrapper_once_after_failed_tail() {
     let dir = tempfile::tempdir().unwrap();
     let mut steps =
@@ -8256,7 +8370,7 @@ fn recovery_chain_reconciles_attachment_turn_without_committed_marker() {
     assert!(chain.is_empty());
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn failed_continuation_chain_preserves_earlier_unresolved_context() {
     let dir = tempfile::tempdir().unwrap();
     let mut steps = exhausted_stream_failure_steps("first provider failure", "first partial");

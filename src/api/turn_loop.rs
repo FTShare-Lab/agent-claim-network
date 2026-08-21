@@ -3364,11 +3364,8 @@ async fn execute_tool_use(
         Err(err) => {
             let error = err.to_string();
             let outcome = ToolExecutionOutcome::DispatchFailure;
-            let content = serde_json::to_string(&json!({
-                "ok": false,
-                "outcome": outcome,
-                "error": error.clone(),
-            }))
+            let payload = tool_dispatch_failure_payload(&err, outcome, &error);
+            let content = serde_json::to_string(&payload)
             .unwrap_or_else(|_| {
                 r#"{"ok":false,"outcome":{"kind":"dispatch_failure"},"error":"tool result serialization failed"}"#.into()
             });
@@ -3383,6 +3380,22 @@ async fn execute_tool_use(
             })
         }
     }
+}
+
+fn tool_dispatch_failure_payload(
+    error: &ToolError,
+    outcome: ToolExecutionOutcome,
+    message: &str,
+) -> Value {
+    let mut payload = json!({
+        "ok": false,
+        "outcome": outcome,
+        "error": message,
+    });
+    if let Some(code) = error.code() {
+        payload["code"] = Value::String(code.into());
+    }
+    payload
 }
 
 /// 从工具输出 JSON 中取走保留键 `media`，转换为媒体内容块（前置一条说明文本）。
@@ -3566,8 +3579,9 @@ mod tests {
 
     use super::{
         assistant_message_text, provider_assistant_suffix_for_latest_request, read_text_file_block,
-        ProviderNoConsumableOutput, ProviderRequestPreparationFailure, ProviderRequestProgress,
-        ProviderStreamFailure, ProviderTerminalFailure, CONTINUATION_TRIGGER,
+        tool_dispatch_failure_payload, ProviderNoConsumableOutput,
+        ProviderRequestPreparationFailure, ProviderRequestProgress, ProviderStreamFailure,
+        ProviderTerminalFailure, CONTINUATION_TRIGGER,
     };
     use crate::agent::fs::LocalFsMemoryStore;
     use crate::api::{
@@ -3582,7 +3596,26 @@ mod tests {
     };
     use crate::attachment::AttachmentLimits;
     use crate::config::ToolConfig;
-    use crate::tool::{ToolDispatchContext, ToolProgressUpdate, ToolRegistry};
+    use crate::tool::{ToolDispatchContext, ToolError, ToolProgressUpdate, ToolRegistry};
+
+    #[test]
+    fn resource_and_watchdog_failures_expose_machine_readable_codes() {
+        let resource_error = ToolError::RuntimeResourceExhausted("pid limit".into());
+        let resource_payload = tool_dispatch_failure_payload(
+            &resource_error,
+            ToolExecutionOutcome::DispatchFailure,
+            &resource_error.to_string(),
+        );
+        assert_eq!(resource_payload["code"], "runtime_resource_exhausted");
+
+        let watchdog_error = ToolError::CodeRunInternalTimeout { grace_ms: 5_000 };
+        let watchdog_payload = tool_dispatch_failure_payload(
+            &watchdog_error,
+            ToolExecutionOutcome::DispatchFailure,
+            &watchdog_error.to_string(),
+        );
+        assert_eq!(watchdog_payload["code"], "code_run_internal_timeout");
+    }
 
     struct FakeProvider {
         responses: Mutex<VecDeque<ProviderResponse>>,

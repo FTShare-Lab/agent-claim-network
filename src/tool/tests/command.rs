@@ -501,6 +501,40 @@ async fn long_code_run_yields_process_id_without_timeout_kill() {
     assert_eq!(completed.output["stdout"], "complete");
 }
 
+#[tokio::test(start_paused = true)]
+#[cfg(unix)]
+async fn initial_yield_watchdog_terminates_a_stuck_handoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(ToolRegistry::new(&test_tool_config(dir.path())).unwrap());
+    let gate = registry.process_manager.pause_next_handoff_for_test().await;
+    let dispatch_registry = Arc::clone(&registry);
+    let dispatch = tokio::spawn(async move {
+        dispatch_registry
+            .dispatch(
+                "code_run",
+                json!({
+                    "script": "sleep 30",
+                    "yield_time_ms": 250,
+                }),
+            )
+            .await
+    });
+
+    gate.wait_until_entered().await;
+    let error = dispatch
+        .await
+        .expect("dispatch task should not panic")
+        .expect_err("stuck handoff should trip the initial yield watchdog");
+    assert!(matches!(
+        error,
+        ToolError::CodeRunInternalTimeout { grace_ms: 5_000 }
+    ));
+
+    gate.release();
+    tokio::task::yield_now().await;
+    registry.shutdown_background_processes().await;
+}
+
 #[tokio::test]
 #[cfg(unix)]
 async fn terminal_code_run_waits_for_provider_delivery_before_entry_removal() {

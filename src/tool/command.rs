@@ -4,6 +4,8 @@
 
 use super::*;
 
+const INITIAL_YIELD_SETTLE_GRACE: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Copy)]
 struct ProcessExecutionDelivery {
     track: bool,
@@ -432,7 +434,8 @@ impl ToolRegistry {
             }
         }
         let owner = self.process_owner(context);
-        let process = if args.tty {
+        let yield_time = self.clamp_yield_time(args.yield_time_ms);
+        let (process, handoff_ready) = if args.tty {
             let pty_program = program.clone();
             let pty_args = command_args.clone();
             let pty_cwd = cwd.clone();
@@ -452,8 +455,8 @@ impl ToolRegistry {
                 )
             })
             .await
-            .map_err(|error| ToolError::InvalidArgs(format!("PTY spawn task failed: {error}")))?
-            .map_err(ToolError::InvalidArgs)?;
+            .map_err(classify_pty_spawn_task_error)?
+            .map_err(classify_pty_spawn_error)?;
             if context
                 .cancellation
                 .as_ref()
@@ -513,12 +516,7 @@ impl ToolRegistry {
                     receiver,
                 },
             );
-            ready.await.map_err(|_| {
-                ToolError::InvalidArgs(
-                    "PTY background process handoff task stopped unexpectedly".into(),
-                )
-            })?;
-            process
+            (process, ready)
         } else {
             let mut cmd = Command::new(&program);
             cmd.args(&command_args).current_dir(&cwd);
@@ -537,7 +535,7 @@ impl ToolRegistry {
                 // pipe backend 不提供文本 stdin；立即 EOF 能避免 `cat` 等命令被错误地
                 // 挂成后台常驻任务，Ctrl-C 仍通过受管 PGID 发送。
                 .stdin(Stdio::null());
-            let child = cmd.spawn()?;
+            let child = cmd.spawn().map_err(classify_process_spawn_error)?;
             let process_group_id = child.id().and_then(|pid| i32::try_from(pid).ok());
             let mut spawn_guard = SpawnedProcessKillGuard::new(child, process_group_id);
             if context
@@ -586,55 +584,67 @@ impl ToolRegistry {
                 Arc::clone(&self.process_manager),
                 Duration::from_millis(self.limits.background_process_output_drain_grace_ms),
             );
-            ready.await.map_err(|_| {
-                ToolError::InvalidArgs(
-                    "pipe background process handoff task stopped unexpectedly".into(),
-                )
-            })?;
-            process
+            (process, ready)
         };
 
-        let yield_time = self.clamp_yield_time(args.yield_time_ms);
-        let finished = match wait_for_initial_result(
-            &process,
-            yield_time,
-            context.cancellation.as_ref(),
-        )
-        .await
-        {
-            Ok(finished) => finished,
-            Err(ToolError::Interrupted) => {
+        let initial_result = async {
+            handoff_ready.await.map_err(|_| {
+                ToolError::InvalidArgs(
+                    "background process handoff task stopped unexpectedly".into(),
+                )
+            })?;
+            let finished =
+                match wait_for_initial_result(&process, yield_time, context.cancellation.as_ref())
+                    .await
+                {
+                    Ok(finished) => finished,
+                    Err(ToolError::Interrupted) => {
+                        return Err(ToolError::ProcessContinuesInBackground {
+                            process_id: process.id.as_str().to_string(),
+                        });
+                    }
+                    Err(error) => return Err(error),
+                };
+            // initial yield 正常返回与 Esc/Ctrl-C 可以同一时刻 ready。登记后的进程寿命已
+            // 独立于 tool call；取消优先让 turn 收束为 Interrupted，不能再构造 Completed/Running。
+            if context
+                .cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
                 return Err(ToolError::ProcessContinuesInBackground {
                     process_id: process.id.as_str().to_string(),
                 });
             }
-            Err(error) => return Err(error),
+            let max_output_chars = self.clamp_output_chars(args.max_output_chars);
+            let execution = self
+                .process_execution(Arc::clone(&process), &code_type, max_output_chars, finished)
+                .await?;
+            if context
+                .cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                return Err(ToolError::ProcessContinuesInBackground {
+                    process_id: process.id.as_str().to_string(),
+                });
+            }
+            Ok(execution)
         };
-        // initial yield 正常返回与 Esc/Ctrl-C 可以同一时刻 ready。登记后的进程寿命已
-        // 独立于 tool call；取消优先让 turn 收束为 Interrupted，不能再构造 Completed/Running。
-        if context
-            .cancellation
-            .as_ref()
-            .is_some_and(CancellationToken::is_cancelled)
+        match tokio::time::timeout(
+            yield_time.saturating_add(INITIAL_YIELD_SETTLE_GRACE),
+            initial_result,
+        )
+        .await
         {
-            return Err(ToolError::ProcessContinuesInBackground {
-                process_id: process.id.as_str().to_string(),
-            });
+            Ok(result) => result,
+            Err(_) => {
+                terminate_after_initial_yield_timeout(&process).await;
+                Err(ToolError::CodeRunInternalTimeout {
+                    grace_ms: INITIAL_YIELD_SETTLE_GRACE.as_millis(),
+                })
+            }
         }
-        let max_output_chars = self.clamp_output_chars(args.max_output_chars);
-        let execution = self
-            .process_execution(Arc::clone(&process), &code_type, max_output_chars, finished)
-            .await?;
-        if context
-            .cancellation
-            .as_ref()
-            .is_some_and(CancellationToken::is_cancelled)
-        {
-            return Err(ToolError::ProcessContinuesInBackground {
-                process_id: process.id.as_str().to_string(),
-            });
-        }
-        Ok(execution)
     }
 
     pub(super) async fn write_stdin(
@@ -1252,19 +1262,12 @@ async fn observe_root_exit_without_reap(root_pid: Option<i32>) -> bool {
         );
         return false;
     };
-    match tokio::task::spawn_blocking(move || wait_for_child_exit_without_reap(root_pid)).await {
-        Ok(Ok(())) => true,
-        Ok(Err(error)) => {
-            log::warn!(
-                target: "tool",
-                "failed to observe root child {root_pid} before reap; skipping residual process-group cleanup: {error}"
-            );
-            false
-        }
+    match observe_child_exit_without_reap(root_pid).await {
+        Ok(()) => true,
         Err(error) => {
             log::warn!(
                 target: "tool",
-                "root exit observer worker for child {root_pid} failed; skipping residual process-group cleanup: {error}"
+                "failed to observe root child {root_pid} before reap; skipping residual process-group cleanup: {error}"
             );
             false
         }
@@ -1764,5 +1767,65 @@ async fn wait_for_initial_result(
         }
     } else {
         Ok(process.wait_for_terminal(yield_time).await)
+    }
+}
+
+fn classify_process_spawn_error(error: std::io::Error) -> ToolError {
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::EAGAIN) | Some(libc::ENOMEM)
+    ) || matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::OutOfMemory
+    ) {
+        ToolError::RuntimeResourceExhausted(format!(
+            "code_run 无法创建子进程: {error}；请降低并发或测试 worker 数量后重试"
+        ))
+    } else {
+        ToolError::Io(error)
+    }
+}
+
+fn classify_pty_spawn_error(error: String) -> ToolError {
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("resource temporarily unavailable")
+        || normalized.contains("cannot allocate memory")
+        || normalized.contains("os error 11")
+        || normalized.contains("os error 12")
+    {
+        ToolError::RuntimeResourceExhausted(format!(
+            "code_run 无法创建 PTY 子进程: {error}；请降低并发或测试 worker 数量后重试"
+        ))
+    } else {
+        ToolError::InvalidArgs(error)
+    }
+}
+
+fn classify_pty_spawn_task_error(error: tokio::task::JoinError) -> ToolError {
+    if !error.is_panic() {
+        return ToolError::InvalidArgs(format!("PTY spawn task failed: {error}"));
+    }
+    let panic = error.into_panic();
+    let message = panic
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".into());
+    classify_pty_spawn_error(format!("PTY spawn task panicked: {message}"))
+}
+
+async fn terminate_after_initial_yield_timeout(process: &ManagedProcess) {
+    match process.request_terminate(libc::SIGKILL).await {
+        Ok(TerminateRequestResult::Requested | TerminateRequestResult::AlreadyTerminating) => {
+            let _ = process.wait_for_terminal(Duration::from_secs(1)).await;
+        }
+        Ok(TerminateRequestResult::AlreadyExited) => {}
+        Err(error) => {
+            log::warn!(
+                target: "tool",
+                "failed to terminate process {} after initial yield watchdog: {error}",
+                process.id.as_str()
+            );
+        }
     }
 }

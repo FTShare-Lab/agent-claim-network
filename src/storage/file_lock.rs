@@ -18,23 +18,26 @@ pub struct FileLockGuard {
 }
 
 impl FileLockGuard {
+    /// 在调用方已经隔离出的 blocking 线程中同步取得文件锁。
+    pub(crate) fn lock_exclusive_blocking(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        file.lock_exclusive()?;
+        Ok(Self { file, path })
+    }
+
     /// 获取 `path` 对应的独占锁，必要时创建父目录和 lock 文件。
     pub async fn lock_exclusive(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::task::spawn_blocking(move || {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&path)?;
-            file.lock_exclusive()?;
-            Ok(Self { file, path })
-        })
-        .await?
+        tokio::task::spawn_blocking(move || Self::lock_exclusive_blocking(path)).await?
     }
 
     /// 在指定时间内轮询尝试获取独占锁，超时后返回错误。

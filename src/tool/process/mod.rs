@@ -15,7 +15,7 @@ pub(crate) use manager::{
 };
 pub(crate) use output::OutputCursor;
 pub(crate) use process_group::{
-    configure_process_group, reap_direct_child_blocking, spawn_direct_child_reaper,
-    terminate_process_group, wait_for_child_exit_without_reap,
+    configure_process_group, observe_child_exit_without_reap, reap_direct_child_blocking,
+    spawn_direct_child_reaper, terminate_process_group,
 };
 pub(crate) use pty::{spawn_pty, PtySpawned, PtyWatcherParts};
