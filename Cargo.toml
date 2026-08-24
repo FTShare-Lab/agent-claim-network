@@ -1,7 +1,7 @@
 [package]
 name = "agent-claim-network"
 # ACN 产品版本的唯一来源；展示、锁文件与发布 tag 由版本一致性检查约束。
-version = "0.2.4"
+version = "0.2.5"
 description = "A terminal agent and claim-based knowledge collaboration system"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
