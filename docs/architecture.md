@@ -68,7 +68,7 @@ Maintainer 是团队治理与投递服务：
 
 Maintainer 不以 trace 引用次数直接修改 claim，也不删除已经解决的历史 dispute。
 
-自裁决的 Proposal 与 Verification system prompt 都注入项目统一的 Claim、Dispute、Policy 领域定义。模型输入使用原始 Dispute、`direct_claims`、有上限的 `source_claims`、全部治理 `policy_update`、Router candidate Claim、Router 返回的真实 Dispute 与相同 direct Claim 集合的已有 Resolution。Proposal 的 `evidence_refs` 必须唯一覆盖全部 direct Claim，可附加引用上下文中的其他决定性对象。resolved assessment 遵循最小知识变更原则：保持已正确的 Claim，同一知识单元优先原地修正，只有已无当前价值且存在明确正确承载对象时才建议 deprecated；Maintainer 不要求 holder 创建新 Claim。Proposal 与 Verification 分开调用；任一阶段低置信、不同意或返回 unresolved 都使 Dispute 保持 open，且 unresolved 不携带 Claim 修改建议。
+自裁决的 Proposal 与 Verification system prompt 都注入项目统一的 Claim、Dispute、Policy 领域定义。模型输入使用原始 Dispute、`direct_claims`、有上限的 `source_claims`、全部 active 治理 `policy_update`、Router candidate Claim、Router 返回的真实 Dispute 与相同 direct Claim 集合的已有 Resolution。Proposal 的 `evidence_refs` 必须唯一覆盖全部 direct Claim，可附加引用上下文中的其他决定性对象。resolved assessment 遵循最小知识变更原则：保持已正确的 Claim，同一知识单元优先原地修正，只有已无当前价值且存在明确正确承载对象时才建议 deprecated；Maintainer 不要求 holder 创建新 Claim。Proposal 与 Verification 分开调用；任一阶段低置信、不同意或返回 unresolved 都使 Dispute 保持 open，且 unresolved 不携带 Claim 修改建议。
 
 `manual` 上报只保存 Dispute。`shadow`/`auto` 为每个 Dispute 创建 Current Analysis，并由有界单 consumer 调度器执行。Analysis 先持久化再入队，请求取消时由持久恢复唤醒补齐两者之间的窗口。稳定语义投影跟踪真实知识内容；Router candidate 以 Claim 内容参与上下文和 fingerprint，其检索索引关联的 Dispute ID 列表属于派生检索元数据。创建于 `auto` 且当前配置仍为 `auto` 的 Analysis 在采用前发现输入变化时，会新增 5 分钟和 15 分钟的重分析计划；第三轮仍变化则停止自动处理并保持 open。切换到其他模式会暂停尚未固定 intent 的自动采用；已经持久化的延迟轮次仍按原 `next_retry_at` 恢复，完成后停留为可审阅结果。持久延迟队列允许其他 Analysis 继续运行。
 

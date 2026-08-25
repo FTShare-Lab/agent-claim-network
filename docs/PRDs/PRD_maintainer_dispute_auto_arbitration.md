@@ -21,7 +21,7 @@ Agent 会在团队 Claim 互相冲突、适用范围不清或发生生命周期�
 4. Claim 的 `active`、`stale`、`deprecated` 建议由模型结合证据判断；Rust 只校验协议，不增加关键词风险门、单调状态门或固定 type/status 组合。
 5. 原始 Dispute `summary` 保持不变；当前 Resolution 单独存储。
 6. Maintainer 使用独立 `[maintainer.llm]`，不回退 Agent LLM。
-7. 治理上下文包含全部真正的 `policy_update` Policy，排除 `claim_attribute_update` 通知 Policy。
+7. 治理上下文包含全部处于 `active` 状态的真正 `policy_update` Policy，排除 `deprecated` Policy 与 `claim_attribute_update` 通知 Policy。
 8. Maintainer 分析与 Agent 仲裁 inbox 都不读取 `MEMORY.md`、`USER.md`、session transcript、Trace 或工具上下文。
 9. Router 补充上下文通过现有 `RouterClient` 获取。
 10. Receipt ACK 表示 Agent 已安全持久化消息，不表示 Claim 已完成内化。
@@ -98,7 +98,7 @@ Proposal 与 Verification 的 system prompt 都先注入项目统一的 Claim、
 1. 原始目标 Dispute。
 2. 唯一解析的全部 direct Claim。
 3. 稳定 BFS 展开的 source Claim。
-4. 全部治理 `policy_update` Policy。
+4. 全部处于 `active` 状态的治理 `policy_update` Policy。
 5. 按 direct Claim scope 查询、合并并去重的 Router candidate Claim。
 6. Router 返回的真实相关 Dispute 内容与 status。
 7. direct Claim 集合相同的已有 Resolution。
@@ -116,7 +116,7 @@ Proposal 与 Verification 的 system prompt 都先注入项目统一的 Claim、
 
 Router candidate 以 Claim 的稳定内容参与上下文与 fingerprint；其检索索引关联的 Dispute ID 列表属于派生检索元数据，不参与二者。`updated_at`、运行时间、lease、provider 错误和随机 ID 等运行噪声也不进入 semantic fingerprint。完整实际快照另由 context snapshot hash 标识。
 
-direct mirror 暂未到齐时，Analysis 进入 `waiting_context` 并按有限预算重试上下文准备；该阶段不调用 LLM。Router 补充来源失败形成稳定 warning；完整治理 Policy 超过 context window 时 Analysis 进入 `failed`。
+direct mirror 暂未到齐时，Analysis 进入 `waiting_context` 并按有限预算重试上下文准备；该阶段不调用 LLM。Router 补充来源失败形成稳定 warning；完整 active 治理 Policy 超过 context window 时 Analysis 进入 `failed`。
 
 ## `auto` 模式的输入变化重分析
 

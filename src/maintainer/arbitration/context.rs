@@ -698,7 +698,9 @@ async fn load_governance_policies(team_root: &Path) -> anyhow::Result<Vec<Policy
             continue;
         }
         let policy: Policy = read_yaml(&path).await?;
-        if policy.message_type == PolicyMessageType::PolicyUpdate {
+        if policy.message_type == PolicyMessageType::PolicyUpdate
+            && policy.status == PolicyStatus::Active
+        {
             policies.push(policy);
         }
     }
@@ -979,7 +981,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn governance_context_loads_every_policy_update_and_excludes_cau() {
+    async fn governance_context_loads_only_active_policy_updates_and_excludes_cau() {
         let root = tempfile::tempdir().unwrap();
         let dir = paths::team_store_policies_dir(root.path());
         for index in 0..25 {
@@ -1021,10 +1023,11 @@ mod tests {
 
         let policies = load_governance_policies(root.path()).await.unwrap();
 
-        assert_eq!(policies.len(), 25);
-        assert!(policies
-            .iter()
-            .all(|policy| policy.message_type == PolicyMessageType::PolicyUpdate));
+        assert_eq!(policies.len(), 13);
+        assert!(policies.iter().all(|policy| {
+            policy.message_type == PolicyMessageType::PolicyUpdate
+                && policy.status == PolicyStatus::Active
+        }));
         assert!(policies.windows(2).all(|pair| pair[0].id < pair[1].id));
     }
 

@@ -511,6 +511,7 @@ impl ArbitrationService {
         analysis.context = None;
         analysis.proposal = None;
         analysis.verification = None;
+        analysis.context_change_reason = None;
         analysis.lease = None;
         analysis.next_retry_at = None;
         analysis.state = AnalysisState::Pending;
@@ -2912,6 +2913,9 @@ mod tests {
 
         fixture.clock.advance(chrono::Duration::minutes(5));
         fixture.service.start_reanalysis_round(&job).await.unwrap();
+        let restarted = fixture.store.read_analysis(&job).await.unwrap();
+        assert_eq!(restarted.context_change_reason, None);
+        assert!(restarted.rounds[0].context_change_reason.is_some());
         let token = fixture
             .service
             .prepare_context(&job, &CancellationToken::new())
@@ -2923,6 +2927,9 @@ mod tests {
             .run_proposal(&job, &token, &CancellationToken::new())
             .await
             .unwrap();
+        let stable_round = fixture.store.read_analysis(&job).await.unwrap();
+        assert_eq!(stable_round.context_change_reason, None);
+        assert_eq!(stable_round.rounds[1].context_change_reason, None);
         changed.statement.push_str(" changed again");
         write_yaml_atomic(&path, &changed).await.unwrap();
         let blocked = fixture
@@ -2941,6 +2948,15 @@ mod tests {
 
         fixture.clock.advance(chrono::Duration::minutes(15));
         fixture.service.start_reanalysis_round(&job).await.unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .read_analysis(&job)
+                .await
+                .unwrap()
+                .context_change_reason,
+            None
+        );
         let token = fixture
             .service
             .prepare_context(&job, &CancellationToken::new())
@@ -2952,6 +2968,9 @@ mod tests {
             .run_proposal(&job, &token, &CancellationToken::new())
             .await
             .unwrap();
+        let stable_round = fixture.store.read_analysis(&job).await.unwrap();
+        assert_eq!(stable_round.context_change_reason, None);
+        assert_eq!(stable_round.rounds[2].context_change_reason, None);
         changed.statement.push_str(" changed a third time");
         write_yaml_atomic(&path, &changed).await.unwrap();
         let stopped = fixture

@@ -73,7 +73,7 @@ Dispute 表示多个 claim 之间可能存在冲突、不兼容或适用范围�
 
 新 Resolution 不改写 Dispute 的原始 `summary`。自动模型可选择 `coexist`、`lifecycle_update`、`conflict_resolved` 或 `unresolved`；前三种在双阶段高置信且一致时可关闭 Dispute，`unresolved` 本身表示等待人类管理者处理并始终保持 open，不输出 Claim assessment 或 status、scope、statement 修改建议，可选交接说明缺失也不会把它变成技术失败。`lifecycle_update` 用于团队当前基线已迁移、旧默认失效或旧路径被替代的演进；只有新旧路径当前仍受支持且 scope 明确不同时才使用 `coexist`。Reject & Replace 通过 `expected_resolution_id` 替换当前 automatic Resolution。
 
-Proposal 与独立 Verification 都使用仲裁专用 system prompt，并包含项目统一的 Claim、Dispute、Policy 定义，确保两阶段按同一领域语义解释输入对象；实际团队 Policy 仍只取上下文中的 `policy_update` 记录。Proposal 的 `evidence_refs` 唯一覆盖全部 direct Claim，也可引用上下文中其他决定性对象，使 resolved 与 unresolved 结论都能追溯到争议主体和依据。
+Proposal 与独立 Verification 都使用仲裁专用 system prompt，并包含项目统一的 Claim、Dispute、Policy 定义，确保两阶段按同一领域语义解释输入对象；实际团队 Policy 只取上下文中处于 active 状态的 `policy_update` 记录。Proposal 的 `evidence_refs` 唯一覆盖全部 direct Claim，也可引用上下文中其他决定性对象，使 resolved 与 unresolved 结论都能追溯到争议主体和依据。
 
 resolved assessment 描述 direct Claim 的最小目标变更：`coexist` 通常保持当前有效 Claim，只在边界含混时澄清 scope/statement；`lifecycle_update` 与 `conflict_resolved` 在同一知识单元可以准确修正时优先建议原地更新，只有 Claim 已无当前价值且正确知识已有明确承载对象时才建议 deprecated。Maintainer 不假设 holder 的完整本地知识，也不要求创建新 Claim；Verification 独立检查建议是否有证据且符合 Resolution Type。
 
