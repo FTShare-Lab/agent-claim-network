@@ -282,7 +282,9 @@ def load_terminal_task_results(
         if not isinstance(manifest_path, str) or not Path(manifest_path).is_absolute():
             continue
         if status == "passed":
-            if _is_completed_task_manifest(spec, Path(manifest_path)):
+            if _is_completed_task_manifest(
+                spec, Path(manifest_path)
+            ) or _is_a_only_task_manifest(spec, Path(manifest_path)):
                 terminal.append(
                     PresmokeTaskResult(
                         spec.task_id,
@@ -431,9 +433,56 @@ def _terminal_result_from_task_manifest(
         return PresmokeTaskResult(spec.task_id, "failed", str(path), failure)
     if _is_completed_task_manifest(spec, path):
         return PresmokeTaskResult(spec.task_id, "passed", str(path), None)
+    if _is_a_only_task_manifest(spec, path):
+        return PresmokeTaskResult(spec.task_id, "passed", str(path), None)
     if _is_no_eligible_claim_task_manifest(spec, path):
         return PresmokeTaskResult(spec.task_id, "no_eligible_claim", str(path), None)
     return None
+
+
+def _is_a_only_task_manifest(spec: PresmokeTaskSpec, path: Path) -> bool:
+    """确认只跑了 A 并完成 Gate，其余臂按 A-only 协议未运行；freeze 仍会留下 claim bundle。"""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(raw, Mapping) or raw.get("failure") is not None:
+        return False
+    records = raw.get("attempt_results")
+    if not isinstance(records, list) or len(records) != 4:
+        return False
+    expected = {attempt.attempt_id: attempt.variant for attempt in spec.experiment.attempts}
+    observed: dict[str, Mapping[str, object]] = {}
+    for record in records:
+        if not isinstance(record, Mapping):
+            return False
+        attempt_id = record.get("attempt_id")
+        variant = record.get("variant")
+        if (
+            not isinstance(attempt_id, str)
+            or expected.get(attempt_id) != variant
+            or attempt_id in observed
+        ):
+            return False
+        observed[attempt_id] = record
+    if set(observed) != set(expected):
+        return False
+    for attempt_id, variant in expected.items():
+        record = observed[attempt_id]
+        if variant == "A":
+            if record.get("status") not in {"passed", "agent_failed"} or not _has_valid_gated_attempt_evidence(
+                attempt_id, variant, record
+            ):
+                return False
+            continue
+        if (
+            record.get("status") != "not_run"
+            or record.get("reason") != "A_ONLY"
+            or record.get("result_path") is not None
+            or record.get("gate_path") is not None
+        ):
+            return False
+    return True
 
 
 def _is_no_eligible_claim_task_manifest(spec: PresmokeTaskSpec, path: Path) -> bool:

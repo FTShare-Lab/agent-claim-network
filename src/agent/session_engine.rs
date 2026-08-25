@@ -6,10 +6,11 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -59,7 +60,7 @@ use crate::tool::{BackgroundProcessEvent, ProcessCompletion, ToolRegistry};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::{self, Instant};
+use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 mod compaction_assets;
@@ -87,6 +88,8 @@ use turn_journal::{run_turn_journal_writer, TurnJournalDurableEventRecorder, Tur
 use turn_journal::{TurnJournalCommand, TurnJournalSink};
 
 const PROMPT_AGENT_SYSTEM: &str = "agent_system";
+const PROMPT_EVALUATION_AGENT_SYSTEM: &str = "evaluation_agent_system";
+const PROMPT_EVALUATION_MINIMAL_AGENT_SYSTEM: &str = "evaluation_minimal_agent_system";
 const PROMPT_INBOX_POLICY_UPDATE_INTERNALIZE: &str = "inbox_policy_update_internalize";
 const PROMPT_INBOX_CLAIM_ATTRIBUTE_UPDATE_INTERNALIZE: &str =
     "inbox_claim_attribute_update_internalize";
@@ -144,11 +147,18 @@ pub struct SessionEngine {
     runtime_profile: SessionRuntimeProfile,
 }
 
-/// session 的运行边界。评测模式不读取 inbox、私有 memory 或 ACN.md。
+/// session 的运行边界。两种评测模式都不读取 inbox 或私有 memory；minimal 也不注入 ACN.md。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionRuntimeProfile {
     Interactive,
     Evaluation,
+    EvaluationMinimal,
+}
+
+impl SessionRuntimeProfile {
+    fn is_evaluation(self) -> bool {
+        matches!(self, Self::Evaluation | Self::EvaluationMinimal)
+    }
 }
 
 /// 运行时直接 abort 会跳过 turn 的正常收束路径；此 guard 只回滚本轮新增或扩展的
@@ -473,15 +483,17 @@ impl SessionTurnContextAppender for MainModelContextAppender {
             self.background_completion_delivery_seq
                 .store(delivered_through, Ordering::Release);
         }
-        match background {
-            Some(text) => pending.push(SessionTurnMessage::model_context(
-                ModelContextSource::BackgroundProcess,
-                text,
-            )),
-            None => pending.push(SessionTurnMessage::model_context(
-                ModelContextSource::BackgroundProcess,
-                ToolRegistry::empty_background_process_projection(),
-            )),
+        if self.tools.background_process_context_enabled() {
+            match background {
+                Some(text) => pending.push(SessionTurnMessage::model_context(
+                    ModelContextSource::BackgroundProcess,
+                    text,
+                )),
+                None => pending.push(SessionTurnMessage::model_context(
+                    ModelContextSource::BackgroundProcess,
+                    ToolRegistry::empty_background_process_projection(),
+                )),
+            }
         }
 
         let activity_revision = self
@@ -1313,12 +1325,12 @@ async fn finish_cancelled_turn_journal(
         forwarder.set_drain_on_shutdown(true);
         forwarder.shutdown.cancel();
         let mut handle = forwarder.handle;
-        match time::timeout_at(deadline, &mut handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
+        match settle_before_wall_deadline(deadline, &mut handle).await {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
                 anyhow::bail!("cancelled turn control journal forwarder failed: {error:#}");
             }
-            Err(_) => {
+            None => {
                 handle.abort();
                 anyhow::bail!(
                     "cancelled turn journal durability exceeded {}s while draining control events",
@@ -1328,9 +1340,18 @@ async fn finish_cancelled_turn_journal(
         }
     }
 
+    if Instant::now() >= deadline {
+        anyhow::bail!(
+            "cancelled turn journal durability exceeded {}s before enqueueing terminal marker",
+            crate::session::TURN_JOURNAL_DURABILITY_TIMEOUT.as_secs()
+        );
+    }
     let finish = emitter.finish(TurnJournalStatus::Cancelled);
     tokio::pin!(finish);
-    if time::timeout_at(deadline, &mut finish).await.is_err() {
+    if settle_before_wall_deadline(deadline, &mut finish)
+        .await
+        .is_none()
+    {
         anyhow::bail!(
             "cancelled turn journal durability exceeded {}s while enqueueing terminal marker",
             crate::session::TURN_JOURNAL_DURABILITY_TIMEOUT.as_secs()
@@ -1345,13 +1366,13 @@ async fn finish_cancelled_turn_journal(
             crate::session::TURN_JOURNAL_DURABILITY_TIMEOUT.as_secs()
         );
     }
-    match time::timeout_at(deadline, &mut writer).await {
-        Ok(Ok(Ok(()))) => Ok(()),
-        Ok(Ok(Err(error))) => Err(error.context("cancelled turn journal write failed")),
-        Ok(Err(error)) => Err(anyhow::anyhow!(
+    match settle_before_wall_deadline(deadline, &mut writer).await {
+        Some(Ok(Ok(()))) => Ok(()),
+        Some(Ok(Err(error))) => Err(error.context("cancelled turn journal write failed")),
+        Some(Err(error)) => Err(anyhow::anyhow!(
             "cancelled turn journal writer task failed: {error:#}"
         )),
-        Err(_) => {
+        None => {
             writer.abort();
             anyhow::bail!(
                 "cancelled turn journal durability exceeded {}s before writer ack",
@@ -1363,6 +1384,23 @@ async fn finish_cancelled_turn_journal(
 
 fn journal_failure_overrides_turn_result(turn_succeeded: bool, turn_interrupted: bool) -> bool {
     turn_succeeded || turn_interrupted
+}
+
+/// cancel 收束包含专用 OS persistence thread，不能用可暂停的 Tokio 虚拟时钟衡量。
+/// 短 sleep 只让出 executor；真实上限始终由 wall-clock deadline 决定。
+async fn settle_before_wall_deadline<F>(deadline: Instant, future: F) -> Option<F::Output>
+where
+    F: Future,
+{
+    tokio::pin!(future);
+    loop {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        tokio::select! {
+            biased;
+            output = &mut future => return Some(output),
+            _ = time::sleep(remaining.min(Duration::from_millis(1))) => {}
+        }
+    }
 }
 
 impl SessionEngine {
@@ -2362,7 +2400,7 @@ impl SessionEngine {
         &self,
         session: &SessionHandle,
     ) -> anyhow::Result<InboxProcessReport> {
-        if self.runtime_profile == SessionRuntimeProfile::Evaluation {
+        if self.runtime_profile.is_evaluation() {
             anyhow::bail!("evaluation session 不支持 inbox 同步");
         }
         let inbox_generator = SessionInboxJsonGenerator {
@@ -2435,7 +2473,9 @@ impl SessionEngine {
                 self.emit_local_claims_updated(&mut emit).await;
                 report
             }
-            SessionRuntimeProfile::Evaluation => InboxProcessReport::default(),
+            SessionRuntimeProfile::Evaluation | SessionRuntimeProfile::EvaluationMinimal => {
+                InboxProcessReport::default()
+            }
         };
         emit(SessionEvent::StartupProgress {
             label: "preparing session prompt...".into(),
@@ -3144,7 +3184,7 @@ impl SessionEngine {
     where
         F: FnMut(SessionEvent) + Send,
     {
-        if self.runtime_profile == SessionRuntimeProfile::Evaluation {
+        if self.runtime_profile.is_evaluation() {
             let error = "evaluation session 不支持 inbox 同步".to_string();
             emit(SessionEvent::InboxFailed {
                 error: error.clone(),

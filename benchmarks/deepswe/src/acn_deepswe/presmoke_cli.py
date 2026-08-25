@@ -27,6 +27,7 @@ from .host_runner import (
     EVALUATION_FILE_READ_MAX_CHARS,
     HostArtifacts,
     Task1ExecutionConfig,
+    Task1HostRunner,
 )
 from .plan import AttemptPlan
 from .presmoke import (
@@ -77,6 +78,7 @@ class PresmokeConfig:
     response_model: str
     reasoning_effort: str
     model_egress_mode: str
+    harness_mode: str
     resources: dict[str, int]
     timeouts: dict[str, int]
     llm_retry: dict[str, int]
@@ -84,6 +86,8 @@ class PresmokeConfig:
     acn_revision: str
     task_workers: int = 1
     run_all_variants_without_claims: bool = False
+    run_a_only: bool = False
+    b_only_from_a_output_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -164,6 +168,7 @@ def main(argv: list[str] | None = None) -> int:
                 resolve_image_digests=True,
                 frozen_runtime=frozen_runtime,
             )
+            validate_b_only_sources(all_specs)
             completion_manifest_path = config.output_dir / "task-completions.json"
             completed = (
                 load_terminal_task_results(all_specs, completion_manifest_path)
@@ -302,12 +307,25 @@ def load_config(path: Path) -> PresmokeConfig:
     }
     if progress["stall_after_secs"] < progress["poll_secs"]:
         raise PresmokeCliError("config.progress.stall_after_secs 不得小于 poll_secs")
+    run_a_only = _boolean(raw.get("run_a_only", False), "run_a_only")
+    b_only_from_a_output_dir = _optional_absolute_path(
+        raw, "b_only_from_a_output_dir"
+    )
+    if run_a_only and b_only_from_a_output_dir is not None:
+        raise PresmokeCliError(
+            "run_a_only 与 b_only_from_a_output_dir 不能同时启用"
+        )
+    if b_only_from_a_output_dir is not None and _paths_overlap(
+        paths["output_dir"], b_only_from_a_output_dir
+    ):
+        raise PresmokeCliError("B-only output_dir 与 A-only source output 必须完全隔离")
     return PresmokeConfig(
         **paths,
         model=_nonempty_string(raw, "model"),
         response_model=_nonempty_string(raw, "response_model"),
         reasoning_effort=_nonempty_string(raw, "reasoning_effort"),
         model_egress_mode=_model_egress_mode(raw),
+        harness_mode=_harness_mode(raw),
         resources=resources,
         timeouts=timeouts,
         llm_retry=llm_retry,
@@ -318,6 +336,8 @@ def load_config(path: Path) -> PresmokeConfig:
             raw.get("run_all_variants_without_claims", False),
             "run_all_variants_without_claims",
         ),
+        run_a_only=run_a_only,
+        b_only_from_a_output_dir=b_only_from_a_output_dir,
     )
 
 
@@ -472,6 +492,23 @@ def build_task_specs(
                 )
                 for attempt in attempts
             )
+        if config.b_only_from_a_output_dir is not None:
+            source_a = attempts[0]
+            attempts = (
+                AttemptManifest(
+                    source_a.schema_version,
+                    source_a.attempt_id,
+                    source_a.task_id,
+                    source_a.variant,
+                    str(
+                        config.b_only_from_a_output_dir
+                        / "attempts"
+                        / source_a.attempt_id
+                        / "output"
+                    ),
+                ),
+                *attempts[1:],
+            )
         task_plan = AttemptPlan(1, plan.freeze_candidates_hash, plan.seed, attempts)
         experiment = build_experiment_manifest(
             f"{config.frozen_manifest.stem}-{task_id}",
@@ -481,6 +518,16 @@ def build_task_specs(
         )
         task_output_root = attempt_output_root if attempt_output_root is not None else config.output_dir
         task_output = task_output_root / "tasks" / task_id
+        a_only_source_manifest = (
+            config.b_only_from_a_output_dir / "tasks" / task_id / "manifest.json"
+            if config.b_only_from_a_output_dir is not None
+            else None
+        )
+        claim_bundle = (
+            config.b_only_from_a_output_dir / "tasks" / task_id / "claims.json"
+            if config.b_only_from_a_output_dir is not None
+            else task_output / "claims.json"
+        )
         specs.append(
             PresmokeTaskSpec(
                 task_id=task_id,
@@ -489,7 +536,7 @@ def build_task_specs(
                     artifacts=HostArtifacts(
                         acn_eval=config.acn_eval,
                         frozen_skill=frozen_skill,
-                        claim_bundle=task_output / "claims.json",
+                        claim_bundle=claim_bundle,
                         normalized_task_dir=(config.normalized_root / task_id),
                     ),
                     task_prompt=prompt,
@@ -500,8 +547,12 @@ def build_task_specs(
                     frozen_acn_source_root=acn_source_root,
                     frozen_pier_source_root=pier_source_root,
                     model_egress_mode=config.model_egress_mode,
+                    harness_mode=config.harness_mode,
+                    task_workers=config.task_workers,
                     require_eligible_claim=False,
                     run_all_variants_without_claims=config.run_all_variants_without_claims,
+                    run_a_only=config.run_a_only,
+                    a_only_source_manifest=a_only_source_manifest,
                     progress_poll_secs=config.progress["poll_secs"],
                     progress_stall_after_secs=config.progress["stall_after_secs"],
                 ),
@@ -510,6 +561,16 @@ def build_task_specs(
             )
         )
     return tuple(specs), frozen_task_ids
+
+
+def validate_b_only_sources(specs: tuple[PresmokeTaskSpec, ...]) -> None:
+    """在创建任何 attempt 目录前一次性验证全部 A-only 来源。"""
+    for spec in specs:
+        Task1HostRunner(
+            spec.experiment,
+            spec.jobs_directory,
+            spec.execution,
+        ).validate_b_only_source()
 
 
 def verify_checkout_revision(checkout: Path, expected_revision: str) -> None:
@@ -681,8 +742,13 @@ def _next_resume_root(output_dir: Path) -> Path:
 
 def _task_has_partial_artifacts(spec: PresmokeTaskSpec) -> bool:
     """原 task 目录或任一 arm 输出已出现，即视为中断而非尚未调度。"""
+    source_manifest = (
+        spec.execution.a_only_source_manifest if spec.execution is not None else None
+    )
     return spec.manifest_path.exists() or any(
-        Path(attempt.output_path).exists() for attempt in spec.experiment.attempts
+        Path(attempt.output_path).exists()
+        for attempt in spec.experiment.attempts
+        if source_manifest is None or attempt.variant != "A"
     )
 
 
@@ -851,14 +917,30 @@ def dry_run_summary(
         "response_model": config.response_model,
         "reasoning_effort": config.reasoning_effort,
         "model_egress_mode": config.model_egress_mode,
+        "harness_mode": config.harness_mode,
         "task_workers": config.task_workers,
         "run_all_variants_without_claims": config.run_all_variants_without_claims,
+        "run_a_only": config.run_a_only,
+        "phase_mode": (
+            "b_only_from_a"
+            if config.b_only_from_a_output_dir is not None
+            else ("a_only" if config.run_a_only else "full")
+        ),
+        "b_only_from_a_output_dir": (
+            str(config.b_only_from_a_output_dir)
+            if config.b_only_from_a_output_dir is not None
+            else None
+        ),
         "progress": config.progress,
         "task_order": list(frozen_task_ids),
         "tasks": [
             {
                 "task_id": spec.task_id,
-                "arms": [attempt.variant for attempt in spec.experiment.attempts],
+                "arms": [
+                    attempt.variant
+                    for attempt in spec.experiment.attempts
+                    if config.b_only_from_a_output_dir is None or attempt.variant != "A"
+                ],
             }
             for spec in specs
         ],
@@ -907,6 +989,28 @@ def _absolute_path(raw: Mapping[str, object], field: str) -> Path:
     return path
 
 
+def _optional_absolute_path(raw: Mapping[str, object], field: str) -> Path | None:
+    value = raw.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise PresmokeCliError(f"{field} 必须是绝对路径字符串或 null")
+    path = Path(value)
+    if not path.is_absolute():
+        raise PresmokeCliError(f"{field} 必须是绝对路径: {path}")
+    return path
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    resolved_left = left.resolve()
+    resolved_right = right.resolve()
+    return (
+        resolved_left == resolved_right
+        or resolved_left.is_relative_to(resolved_right)
+        or resolved_right.is_relative_to(resolved_left)
+    )
+
+
 def _nonempty_string(raw: Mapping[str, object], field: str) -> str:
     value = raw.get(field)
     if not isinstance(value, str) or not value:
@@ -919,6 +1023,13 @@ def _model_egress_mode(raw: Mapping[str, object]) -> str:
     value = raw.get("model_egress_mode", "pier")
     if value not in {"pier", "direct"}:
         raise PresmokeCliError("config.model_egress_mode 仅支持 pier 或 direct")
+    return value
+
+
+def _harness_mode(raw: Mapping[str, object]) -> str:
+    value = raw.get("harness_mode", "standard")
+    if value not in {"standard", "minimal"}:
+        raise PresmokeCliError("config.harness_mode 仅支持 standard 或 minimal")
     return value
 
 
@@ -1011,11 +1122,18 @@ def _effective_config_hash(config: PresmokeConfig) -> str:
         "response_model": config.response_model,
         "reasoning_effort": config.reasoning_effort,
         "model_egress_mode": config.model_egress_mode,
+        "harness_mode": config.harness_mode,
         "resources": config.resources,
         "timeouts": config.timeouts,
         "llm_retry": config.llm_retry,
         "progress": config.progress,
         "run_all_variants_without_claims": config.run_all_variants_without_claims,
+        "run_a_only": config.run_a_only,
+        "phase_mode": (
+            "b_only_from_a"
+            if config.b_only_from_a_output_dir is not None
+            else ("a_only" if config.run_a_only else "full")
+        ),
         "auto_compact_ctx_ratio": EVALUATION_AUTO_COMPACT_CTX_RATIO,
         "file_read_max_chars": EVALUATION_FILE_READ_MAX_CHARS,
         "code_run_max_output_chars": EVALUATION_CODE_RUN_MAX_OUTPUT_CHARS,

@@ -48,9 +48,9 @@ enabled = false
 enabled = false
 [agent.tool]
 file_read_max_chars = 20000
-file_diff_max_changed_lines = 20
+file_diff_max_changed_lines = 200
 file_edit_authority_enabled = false
-max_parallel_tool_calls = 1
+max_parallel_tool_calls = 5
 code_run_max_output_chars = 20000
 [agent.attachment]
 enabled = false

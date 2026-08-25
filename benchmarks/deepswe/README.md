@@ -33,7 +33,13 @@ token 计量由 `acn_eval` 自己从上游响应的 `usage` 累计，写进 `res
 官方 `mini-swe-agent` 不设 output cap，本 runner 默认给 65536。
 
 四臂注入同一份冻结 `assets/coding-benchmark/SKILL.md`（hash 写入 manifest），路径为
-`/logs/agent/runtime/skills/coding-benchmark`。容器 attempt TOML 固定
+`/logs/agent/runtime/skills/coding-benchmark`。评测生成的 `acn.toml` 将
+`max_parallel_tool_calls` 设为 `5`、`file_diff_max_changed_lines` 设为 `200`；
+`code_run` 观察窗口仍用产品内部护栏，不开放 TOML。A-only 短评测 prompt 与提交纪律的决策记录见
+[reports/a-only-minimal-harness-adjustments-20260820.md](reports/a-only-minimal-harness-adjustments-20260820.md)。
+51 分轮的 PID 耗尽、持久化阻塞与修正见
+[reports/a-only-minimal-timeout-and-gap-fixes-20260820.md](reports/a-only-minimal-timeout-and-gap-fixes-20260820.md)。
+容器 attempt TOML 固定
 `workspace_root=/app`、`runtime_root=/logs/agent/runtime`、`output_dir=/logs/agent/evaluation`、
 `acn_config=/opt/acn-eval/acn.toml`；`B_claim` 和 `B_forced_claim` 设置
 `claim_bundle=/opt/acn-eval/claims.json`，A / B_empty 容器中不存在该文件。前者只在模型调用

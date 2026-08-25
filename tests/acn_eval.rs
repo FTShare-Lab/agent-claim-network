@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use agent_claim_network::claim::{AgentId, Claim, ClaimId, ClaimStatus, Confidence};
 use agent_claim_network::config::Config;
 use agent_claim_network::evaluation::{
-    run_attempt, EvaluationAttemptConfig, EvaluationEvent, EvaluationResult, EvaluationRunPaths,
-    FrozenClaimBundle, FrozenClaimBundleRouter, EVALUATION_MODEL_KEY_ENV,
+    run_attempt, EvaluationAttemptConfig, EvaluationEvent, EvaluationHarnessMode, EvaluationResult,
+    EvaluationRunPaths, FrozenClaimBundle, FrozenClaimBundleRouter, EVALUATION_MODEL_KEY_ENV,
     EVALUATION_SCHEMA_VERSION,
 };
 use agent_claim_network::router::{AgentQuery, RouterClient};
@@ -48,6 +48,7 @@ async fn evaluation_rejects_model_key_env_other_than_isolated_env() {
         variant: "A".into(),
         attempt_deadline_secs: 1,
         model_egress_mode: "pier".into(),
+        harness_mode: EvaluationHarnessMode::Standard,
         claim_bundle: None,
     };
     tokio::fs::create_dir_all(&config.workspace_root)
@@ -83,6 +84,7 @@ async fn invalid_claim_bundle_still_writes_failed_attempt_artifacts() {
         variant: "B_claim".into(),
         attempt_deadline_secs: 1,
         model_egress_mode: "pier".into(),
+        harness_mode: EvaluationHarnessMode::Standard,
         claim_bundle: Some(bundle.clone()),
     };
     tokio::fs::create_dir_all(&config.workspace_root)
@@ -115,6 +117,14 @@ async fn invalid_claim_bundle_still_writes_failed_attempt_artifacts() {
     assert!(events.contains("attempt_started"));
     assert!(events.contains("attempt_failed"));
     assert!(events.contains("attempt_finished"));
+    let ledger = events
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(ledger
+        .iter()
+        .enumerate()
+        .all(|(index, event)| event["seq"] == index + 1));
     assert!(result_json.contains("\"exit_type\": \"failed\""));
     // bundle 已在 parse 前消费并删除，保持模型无法绕过 router 读取原文件的边界。
     assert!(!bundle.exists());
@@ -134,6 +144,7 @@ fn evaluation_paths_are_absolute_and_versioned() {
         variant: "A".into(),
         attempt_deadline_secs: 5100,
         model_egress_mode: "pier".into(),
+        harness_mode: EvaluationHarnessMode::Minimal,
         claim_bundle: None,
     };
 

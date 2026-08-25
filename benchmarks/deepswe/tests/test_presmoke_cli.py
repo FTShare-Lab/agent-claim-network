@@ -11,6 +11,7 @@ from acn_deepswe.presmoke_cli import (
     PresmokeCliError,
     _ensure_frozen_task_images_available,
     _effective_config_hash,
+    _task_has_partial_artifacts,
     build_task_specs,
     load_config,
     main,
@@ -123,6 +124,9 @@ class PresmokeCliTests(unittest.TestCase):
     def test_plan_seed_is_independent_of_dataset_sampling_seed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = write_fixture(Path(directory))
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw.update({"harness_mode": "minimal", "run_a_only": True})
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
             config = load_config(config_path)
             plan = json.loads(config.attempt_plan.read_text(encoding="utf-8"))
             plan["seed"] = 20260727
@@ -139,6 +143,101 @@ class PresmokeCliTests(unittest.TestCase):
         self.assertTrue(
             all(spec.execution is None or not spec.execution.require_eligible_claim for spec in specs)
         )
+        self.assertTrue(
+            all(
+                spec.execution is None
+                or (spec.execution.harness_mode == "minimal" and spec.execution.run_a_only)
+                for spec in specs
+            )
+        )
+
+    def test_b_only_config_uses_source_a_and_current_b_output_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = write_fixture(root)
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            source_output = root / "a-only-output"
+            raw.update(
+                {
+                    "b_only_from_a_output_dir": str(source_output),
+                    "run_all_variants_without_claims": True,
+                }
+            )
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            config = load_config(config_path)
+
+            with patch("acn_deepswe.presmoke_cli.verify_checkout_revision"):
+                specs, _ = build_task_specs(config, "https://upstream.invalid")
+
+        spec = specs[0]
+        assert spec.execution is not None
+        self.assertEqual(
+            spec.execution.a_only_source_manifest,
+            source_output / "tasks" / spec.task_id / "manifest.json",
+        )
+        self.assertEqual(
+            spec.execution.artifacts.claim_bundle,
+            source_output / "tasks" / spec.task_id / "claims.json",
+        )
+        self.assertEqual(
+            Path(spec.experiment.attempts[0].output_path),
+            source_output
+            / "attempts"
+            / spec.experiment.attempts[0].attempt_id
+            / "output",
+        )
+        self.assertTrue(
+            all(
+                Path(attempt.output_path).is_relative_to(root / "attempts")
+                for attempt in spec.experiment.attempts[1:]
+            )
+        )
+
+    def test_b_only_config_is_mutually_exclusive_with_run_a_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = write_fixture(root)
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw.update(
+                {
+                    "run_a_only": True,
+                    "b_only_from_a_output_dir": str(root / "a-only-output"),
+                }
+            )
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+            with self.assertRaisesRegex(PresmokeCliError, "不能同时启用"):
+                load_config(config_path)
+
+    def test_b_only_config_rejects_overlapping_output_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = write_fixture(root)
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw["b_only_from_a_output_dir"] = raw["output_dir"]
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+            with self.assertRaisesRegex(PresmokeCliError, "必须完全隔离"):
+                load_config(config_path)
+
+    def test_b_only_source_a_output_is_not_mistaken_for_an_interrupted_b_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = write_fixture(root)
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            source_output = root / "a-only-output"
+            raw["b_only_from_a_output_dir"] = str(source_output)
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            with patch("acn_deepswe.presmoke_cli.verify_checkout_revision"):
+                specs, _ = build_task_specs(
+                    load_config(config_path), "https://upstream.invalid"
+                )
+            spec = specs[0]
+            Path(spec.experiment.attempts[0].output_path).mkdir(parents=True)
+
+            self.assertFalse(_task_has_partial_artifacts(spec))
+            Path(spec.experiment.attempts[1].output_path).mkdir(parents=True)
+            self.assertTrue(_task_has_partial_artifacts(spec))
 
     def test_checkout_revision_rejects_dirty_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

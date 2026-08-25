@@ -14,7 +14,7 @@ import subprocess
 import threading
 import time
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,12 +34,42 @@ CONTAINER_MODEL_KEY_ENV = "ACN_EVAL_MODEL_KEY"
 EVALUATION_AUTO_COMPACT_CTX_RATIO = 0.80
 EVALUATION_FILE_READ_MAX_CHARS = 20_000
 EVALUATION_CODE_RUN_MAX_OUTPUT_CHARS = 20_000
+# 评测原先钉死 parallel=1 / diff=20，单次修补和同轮读文件都偏碎。
+# parallel 回到 ACN 默认 5；diff 提到 200，让一处函数级改动能一次 file_patch 落地。
+# code_run yield 是产品内部护栏，评测不覆盖。
+EVALUATION_FILE_DIFF_MAX_CHANGED_LINES = 200
+EVALUATION_MAX_PARALLEL_TOOL_CALLS = 5
 # 与 MiniSWE Responses 对照请求对齐：temperature=1.0、top_p=0.95。
 EVALUATION_TEMPERATURE = 1.0
 EVALUATION_TOP_P = 0.95
 CLAIM_BUNDLE_VARIANTS = frozenset(("B_claim", "B_forced_claim"))
 DEFAULT_PROGRESS_POLL_SECS = 30
 DEFAULT_PROGRESS_STALL_AFTER_SECS = 600
+EVALUATION_HARNESS_MODES = frozenset(("standard", "minimal"))
+MINIMAL_TASK_GUIDANCE = """
+
+You can execute shell commands and edit files to implement the necessary changes.
+
+## Recommended Workflow
+
+Work step-by-step so you can iterate on the implementation and any failures:
+
+1. Analyze the codebase by finding and reading relevant files.
+2. Reproduce the issue or required behavior.
+3. Edit the source code with the smallest complete change.
+4. Verify the fix with targeted tests, then run the complete project test suite when feasible.
+5. Check edge cases and inspect the final diff.
+6. Submit by calling the no-argument `submit_task` tool. It must be the only tool call in that response; do not continue after it.
+
+## Command Execution Rules
+
+- Every response before submission must include reasoning text and at least one tool call that gathers evidence or advances the implementation.
+- Use `code_run` for shell commands and file edits. Each call starts in a fresh shell, so include any required `cd` in the command.
+- If a command returns a `process_id`, poll it with `write_stdin`; use `process_list` only to rediscover managed processes.
+- Bound exploratory commands and malformed-input reproductions with a short timeout; this does not replace the complete project test suite.
+- The container has a strict process/thread budget. Before a full test command that starts workers, inspect `/sys/fs/cgroup/pids.max` and use the test runner's worker option to stay below it. If you see `EAGAIN` or a thread/process creation failure, retry with fewer workers.
+- Do not call `submit_task` while implementation, verification, or diff inspection remains.
+""".strip()
 
 
 @dataclass(frozen=True)
@@ -80,8 +110,12 @@ class Task1ExecutionConfig:
     frozen_acn_source_root: Path
     frozen_pier_source_root: Path
     model_egress_mode: str = "pier"
+    harness_mode: str = "standard"
+    task_workers: int = 1
     require_eligible_claim: bool = False
     run_all_variants_without_claims: bool = False
+    run_a_only: bool = False
+    a_only_source_manifest: Path | None = None
     progress_poll_secs: int = DEFAULT_PROGRESS_POLL_SECS
     progress_stall_after_secs: int = DEFAULT_PROGRESS_STALL_AFTER_SECS
 
@@ -97,6 +131,8 @@ class AttemptExecutionRecord:
     verifier_passed: bool | None = None
     claim_observation: dict[str, object] | None = None
     progress_path: str | None = None
+    result_hash: str | None = None
+    gate_hash: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -109,7 +145,21 @@ class AttemptExecutionRecord:
             "verifier_passed": self.verifier_passed,
             "claim_observation": self.claim_observation,
             "progress_path": self.progress_path,
+            "result_hash": self.result_hash,
+            "gate_hash": self.gate_hash,
         }
+
+
+@dataclass(frozen=True)
+class AOnlySourceEvidence:
+    """B-only 阶段从已完成 A-only task 中验证并绑定的不可变证据。"""
+
+    a_record: AttemptExecutionRecord
+    cohort: str
+    claim_ids: tuple[str, ...]
+    claim_bundle_hash: str
+    pier_task_checksum: str
+    source_manifest_hash: str
 
 
 @dataclass(frozen=True)
@@ -239,11 +289,18 @@ def build_attempt_toml(
     task_prompt: str,
     attempt_deadline_secs: int,
     model_egress_mode: str = "pier",
+    harness_mode: str = "standard",
 ) -> str:
-    """容器内 attempt 配置；模型出口模式必须随输入一起冻结。"""
+    """容器内 attempt 配置；模型出口与 harness 模式必须随输入一起冻结。"""
     if model_egress_mode not in {"pier", "direct"}:
         raise ValueError("model_egress_mode 仅支持 pier 或 direct")
-    prompt = "先读取并遵循 /coding-benchmark skill。\n\n" + task_prompt
+    if harness_mode not in EVALUATION_HARNESS_MODES:
+        raise ValueError("harness_mode 仅支持 standard 或 minimal")
+    prompt = (
+        f"Please solve this issue:\n\n{task_prompt}\n\n{MINIMAL_TASK_GUIDANCE}"
+        if harness_mode == "minimal"
+        else "先读取并遵循 /coding-benchmark skill。\n\n" + task_prompt
+    )
     lines = [
         "schema_version = 1",
         f"attempt_id = {json.dumps(attempt.attempt_id)}",
@@ -256,6 +313,7 @@ def build_attempt_toml(
         f"variant = {json.dumps(attempt.variant)}",
         f"attempt_deadline_secs = {attempt_deadline_secs}",
         f"model_egress_mode = {json.dumps(model_egress_mode)}",
+        f"harness_mode = {json.dumps(harness_mode)}",
     ]
     if attempt.variant in CLAIM_BUNDLE_VARIANTS:
         lines.append('claim_bundle = "/opt/acn-eval/claims.json"')
@@ -335,9 +393,9 @@ def build_acn_config(provenance: EvaluationProvenance, upstream_base_url: str) -
         "agent.memory": {"enabled": False},
         "agent.tool": {
             "file_read_max_chars": EVALUATION_FILE_READ_MAX_CHARS,
-            "file_diff_max_changed_lines": 20,
+            "file_diff_max_changed_lines": EVALUATION_FILE_DIFF_MAX_CHANGED_LINES,
             "file_edit_authority_enabled": False,
-            "max_parallel_tool_calls": 1,
+            "max_parallel_tool_calls": EVALUATION_MAX_PARALLEL_TOOL_CALLS,
             "code_run_max_output_chars": EVALUATION_CODE_RUN_MAX_OUTPUT_CHARS,
         },
         "agent.attachment": {
@@ -370,6 +428,7 @@ def write_attempt_files(
     provenance: EvaluationProvenance,
     upstream_base_url: str,
     model_egress_mode: str = "pier",
+    harness_mode: str = "standard",
 ) -> AttemptFiles:
     """写入不含 credential 的容器 attempt TOML 与 ACN 配置。"""
     directory.mkdir(parents=True, exist_ok=True)
@@ -382,6 +441,7 @@ def write_attempt_files(
             task_prompt,
             attempt_deadline_secs(provenance),
             model_egress_mode,
+            harness_mode,
         ),
     )
     _atomic_write_text(acn_path, build_acn_config(provenance, upstream_base_url))
@@ -479,16 +539,26 @@ class Task1HostRunner:
         self._pier_trial_uris: set[str] = set()
         self._pier_trial_directories: set[Path] = set()
         self._pier_task_checksum: str | None = None
+        self._a_only_source_manifest_hash: str | None = None
 
     def run_task1(self, *, execute: bool = False) -> tuple[HostRunStep, ...] | TaskExecutionResult:
         attempts = self._ordered_attempts()
-        steps = tuple(
-            [
-                HostRunStep("A", attempts[0].attempt_id, execute),
-                HostRunStep("freeze", None, execute),
-            ]
-            + [HostRunStep(attempt.variant, attempt.attempt_id, execute) for attempt in attempts[1:]]
-        )
+        if self.execution is not None and self.execution.a_only_source_manifest is not None:
+            steps = tuple(
+                HostRunStep(attempt.variant, attempt.attempt_id, execute)
+                for attempt in attempts[1:]
+            )
+        else:
+            steps = tuple(
+                [
+                    HostRunStep("A", attempts[0].attempt_id, execute),
+                    HostRunStep("freeze", None, execute),
+                ]
+                + [
+                    HostRunStep(attempt.variant, attempt.attempt_id, execute)
+                    for attempt in attempts[1:]
+                ]
+            )
         if execute:
             return self._execute_attempts(attempts)
         return steps
@@ -526,20 +596,45 @@ class Task1HostRunner:
         self._pier_trial_uris.clear()
         self._pier_trial_directories.clear()
         self._pier_task_checksum = None
+        self._a_only_source_manifest_hash = None
         records: list[AttemptExecutionRecord] = []
         cohort: str | None = None
         try:
-            a_record = self._run_one_attempt(attempts[0], execution)
-            records.append(a_record)
-            if a_record.status in {"gate_failed", "infrastructure_failed"}:
-                raise TaskExecutionError(a_record.reason)
-            self._freeze_after_a(attempts[0], execution)
+            if execution.a_only_source_manifest is not None:
+                source = self._load_a_only_source(attempts, execution)
+                records.append(source.a_record)
+                cohort = source.cohort
+                self._frozen_claim_ids = source.claim_ids
+                self._frozen_claim_bundle_hash = source.claim_bundle_hash
+                self._pier_task_checksum = source.pier_task_checksum
+                self._a_only_source_manifest_hash = source.source_manifest_hash
+            else:
+                a_record = self._run_one_attempt(attempts[0], execution)
+                records.append(a_record)
+                if a_record.status in {"gate_failed", "infrastructure_failed"}:
+                    raise TaskExecutionError(a_record.reason)
+                self._freeze_after_a(attempts[0], execution)
+                has_frozen_claims = bool(self._frozen_claim_ids)
+                cohort = (
+                    "success_efficiency"
+                    if a_record.verifier_passed is True
+                    else "failure_recovery"
+                ) if has_frozen_claims else "unpaired_no_claim"
+            if execution.run_a_only:
+                for attempt in attempts[1:]:
+                    records.append(
+                        AttemptExecutionRecord(
+                            attempt.attempt_id,
+                            attempt.variant,
+                            "not_run",
+                            "A_ONLY",
+                            None,
+                            None,
+                        )
+                    )
+                self._write_execution_manifest(execution, records, None, cohort)
+                return TaskExecutionResult("passed")
             has_frozen_claims = bool(self._frozen_claim_ids)
-            cohort = (
-                "success_efficiency"
-                if a_record.verifier_passed is True
-                else "failure_recovery"
-            ) if has_frozen_claims else "unpaired_no_claim"
             if not has_frozen_claims and not execution.run_all_variants_without_claims:
                 if execution.require_eligible_claim:
                     raise TaskExecutionError("NO_ELIGIBLE_CLAIM")
@@ -576,6 +671,7 @@ class Task1HostRunner:
     def _run_one_attempt(
         self, attempt: AttemptManifest, execution: Task1ExecutionConfig
     ) -> AttemptExecutionRecord:
+        self._assert_a_only_source_still_bound(execution)
         self._validate_frozen_inputs(execution)
         attempt_dir = Path(attempt.output_path).resolve()
         attempt_dir.mkdir(parents=True, exist_ok=False)
@@ -586,6 +682,7 @@ class Task1HostRunner:
             self.experiment.provenance,
             execution.upstream_base_url,
             execution.model_egress_mode,
+            execution.harness_mode,
         )
         progress = AttemptProgressMonitor(
             attempt,
@@ -647,6 +744,7 @@ class Task1HostRunner:
             progress.finish("evidence_parse_failed", reason=reason)
             return self._write_failed_attempt(attempt, attempt_dir, reason, progress.progress_path)
         progress.finish("pier_completed", pier_return_code=completed.returncode)
+        self._assert_a_only_source_still_bound(execution)
         return replace(record, progress_path=str(progress.progress_path.resolve()))
 
     def _collect_and_gate(
@@ -914,16 +1012,182 @@ class Task1HostRunner:
                     "host_model_key_env": HOST_MODEL_KEY_ENV,
                     "container_model_key_env": CONTAINER_MODEL_KEY_ENV,
                     "model_egress_mode": execution.model_egress_mode,
+                    "harness_mode": execution.harness_mode,
+                    "task_workers": execution.task_workers,
+                    "progress_poll_secs": execution.progress_poll_secs,
+                    "progress_stall_after_secs": execution.progress_stall_after_secs,
                     "pier_executable": str(execution.pier_executable),
                     "task_prompt_hash": hashlib.sha256(
                         execution.task_prompt.encode("utf-8")
                     ).hexdigest(),
                     "run_all_variants_without_claims": execution.run_all_variants_without_claims,
+                    "run_a_only": execution.run_a_only,
+                    "phase_mode": (
+                        "b_only_from_a"
+                        if execution.a_only_source_manifest is not None
+                        else ("a_only" if execution.run_a_only else "full")
+                    ),
+                    "a_only_source_manifest": (
+                        str(execution.a_only_source_manifest.resolve())
+                        if execution.a_only_source_manifest is not None
+                        else None
+                    ),
+                    "a_only_source_manifest_hash": (
+                        self._a_only_source_manifest_hash
+                        if execution.a_only_source_manifest is not None
+                        else None
+                    ),
                 },
-                "attempt_results": [record.to_dict() for record in records],
+                "attempt_results": [_attempt_record_dict(record) for record in records],
                 "failure": failure,
             },
         )
+
+    def validate_b_only_source(self) -> AOnlySourceEvidence | None:
+        """在批量调度前验证 A-only 来源，避免部分 task 已启动后才发现漂移。"""
+        execution = self.execution
+        if execution is None or execution.a_only_source_manifest is None:
+            return None
+        attempts = self._ordered_attempts()
+        self._validate_execution(execution)
+        return self._load_a_only_source(attempts, execution)
+
+    def _assert_a_only_source_still_bound(self, execution: Task1ExecutionConfig) -> None:
+        if execution.a_only_source_manifest is None:
+            return
+        source = self._load_a_only_source(self._ordered_attempts(), execution)
+        if self._a_only_source_manifest_hash is None:
+            return
+        if (
+            source.source_manifest_hash != self._a_only_source_manifest_hash
+            or source.claim_bundle_hash != self._frozen_claim_bundle_hash
+        ):
+            raise TaskExecutionError("A-only source 在 B-only 执行期间发生漂移")
+
+    def _load_a_only_source(
+        self,
+        attempts: tuple[AttemptManifest, ...],
+        execution: Task1ExecutionConfig,
+    ) -> AOnlySourceEvidence:
+        source_manifest = execution.a_only_source_manifest
+        if source_manifest is None:
+            raise TaskExecutionError("B-only 阶段缺少 A-only source manifest")
+        source_manifest = source_manifest.resolve()
+        try:
+            source = _read_json_mapping(source_manifest, "A-only source manifest")
+            if source.get("schema_version") != 1 or source.get("failure") is not None:
+                raise TaskExecutionError("A-only source manifest 未成功完成或 schema 无效")
+            source_experiment = _required_mapping(source, "experiment")
+            source_execution = _required_mapping(source, "execution")
+            source_output = _source_output_root(source_manifest, attempts[0].task_id)
+            expected_bundle = source_manifest.parent / "claims.json"
+            if execution.artifacts.claim_bundle.resolve() != expected_bundle.resolve():
+                raise TaskExecutionError("B-only claim bundle 必须来自同一个 A-only task 目录")
+            self._validate_source_experiment(
+                source_experiment, source_execution, source_output, attempts, execution
+            )
+            records = _source_attempt_records(source, attempts)
+            a_record = records[0]
+            source_result, source_gate = _validate_source_a_record(
+                a_record, attempts[0], source_output
+            )
+            bundle_hash, claim_ids = _validate_source_claim_bundle(
+                expected_bundle,
+                attempts[0].attempt_id,
+                source_result,
+            )
+            if source.get("frozen_claim_bundle_hash") != bundle_hash:
+                raise TaskExecutionError("A-only source manifest 的 claim bundle hash 不一致")
+            if source_experiment.get("claim_bundle_hash") != bundle_hash:
+                raise TaskExecutionError("A-only experiment 的 claim bundle hash 不一致")
+            verifier_passed = source_result.get("verifier_passed")
+            if not isinstance(verifier_passed, bool) or a_record.verifier_passed != verifier_passed:
+                raise TaskExecutionError("A-only verifier 证据与 attempt record 不一致")
+            cohort = source.get("experiment_cohort")
+            expected_cohort = (
+                ("success_efficiency" if verifier_passed else "failure_recovery")
+                if claim_ids
+                else "unpaired_no_claim"
+            )
+            if cohort != expected_cohort:
+                raise TaskExecutionError("A-only experiment cohort 与冻结证据不一致")
+            pier_trial = _required_mapping(source_result, "pier_trial")
+            task_checksum = pier_trial.get("task_checksum")
+            if not isinstance(task_checksum, str) or not task_checksum:
+                raise TaskExecutionError("A-only Pier 证据缺少 task_checksum")
+            if source_gate.get("decision") != "pass":
+                raise TaskExecutionError("A-only Gate 未通过")
+            return AOnlySourceEvidence(
+                a_record=a_record,
+                cohort=expected_cohort,
+                claim_ids=claim_ids,
+                claim_bundle_hash=bundle_hash,
+                pier_task_checksum=task_checksum,
+                source_manifest_hash=_sha256_file(source_manifest),
+            )
+        except TaskExecutionError:
+            raise
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            raise TaskExecutionError(f"A-only source 证据无效: {error}") from error
+
+    def _validate_source_experiment(
+        self,
+        source_experiment: Mapping[str, object],
+        source_execution: Mapping[str, object],
+        source_output: Path,
+        attempts: tuple[AttemptManifest, ...],
+        execution: Task1ExecutionConfig,
+    ) -> None:
+        source_attempts = source_experiment.get("attempts")
+        if not isinstance(source_attempts, list) or len(source_attempts) != len(attempts):
+            raise TaskExecutionError("A-only source attempt plan 数量不一致")
+        for raw, expected in zip(source_attempts, attempts, strict=True):
+            if not isinstance(raw, Mapping):
+                raise TaskExecutionError("A-only source attempt plan 含无效记录")
+            if any(
+                raw.get(field) != value
+                for field, value in (
+                    ("attempt_id", expected.attempt_id),
+                    ("task_id", expected.task_id),
+                    ("variant", expected.variant),
+                )
+            ):
+                raise TaskExecutionError("A-only source attempt identity 与 B-only plan 不一致")
+            expected_output = source_output / "attempts" / expected.attempt_id / "output"
+            raw_output = raw.get("output_path")
+            if not isinstance(raw_output, str) or Path(raw_output).resolve() != expected_output:
+                raise TaskExecutionError("A-only source attempt output_path 越出冻结 run 边界")
+        source_provenance = _required_mapping(source_experiment, "provenance")
+        current_provenance = self.experiment.provenance.to_dict()
+        for name, value in current_provenance.items():
+            # 两阶段的 config hash 因 phase flag 不同；其余公平性输入必须完全一致。
+            if name != "acn_config_hash" and source_provenance.get(name) != value:
+                raise TaskExecutionError(f"A-only source provenance 漂移: {name}")
+        expected_execution: tuple[tuple[str, object], ...] = (
+            ("model", self.experiment.provenance.model),
+            ("response_model", execution.expected_response_model),
+            ("upstream_base_url", execution.upstream_base_url),
+            ("model_egress_mode", execution.model_egress_mode),
+            ("harness_mode", execution.harness_mode),
+            ("task_workers", execution.task_workers),
+            ("progress_poll_secs", execution.progress_poll_secs),
+            ("progress_stall_after_secs", execution.progress_stall_after_secs),
+            (
+                "task_prompt_hash",
+                hashlib.sha256(execution.task_prompt.encode("utf-8")).hexdigest(),
+            ),
+            ("run_a_only", True),
+        )
+        for name, value in expected_execution:
+            if source_execution.get(name) != value:
+                raise TaskExecutionError(f"A-only source execution 配置漂移: {name}")
+        source_pier = source_execution.get("pier_executable")
+        if (
+            not isinstance(source_pier, str)
+            or not Path(source_pier).is_absolute()
+            or _sha256_file(Path(source_pier)) != _sha256_file(execution.pier_executable)
+        ):
+            raise TaskExecutionError("A-only source execution 配置漂移: pier_executable")
 
     def _validate_execution(self, execution: Task1ExecutionConfig) -> None:
         if not execution.upstream_base_url or not execution.expected_response_model:
@@ -932,14 +1196,22 @@ class Task1HostRunner:
             raise TaskExecutionError(f"宿主环境缺少模型 key: {HOST_MODEL_KEY_ENV}")
         if execution.progress_poll_secs <= 0 or execution.progress_stall_after_secs <= 0:
             raise TaskExecutionError("progress_poll_secs 与 progress_stall_after_secs 必须为正整数")
+        if execution.task_workers <= 0:
+            raise TaskExecutionError("task_workers 必须为正整数")
         if execution.progress_stall_after_secs < execution.progress_poll_secs:
             raise TaskExecutionError("progress_stall_after_secs 不得小于 progress_poll_secs")
         if execution.require_eligible_claim and execution.run_all_variants_without_claims:
             raise TaskExecutionError(
                 "require_eligible_claim 与 run_all_variants_without_claims 不能同时启用"
             )
+        if execution.run_a_only and execution.require_eligible_claim:
+            raise TaskExecutionError("run_a_only 与 require_eligible_claim 不能同时启用")
+        if execution.run_a_only and execution.a_only_source_manifest is not None:
+            raise TaskExecutionError("run_a_only 与 a_only_source_manifest 不能同时启用")
         if execution.model_egress_mode not in {"pier", "direct"}:
             raise TaskExecutionError("model_egress_mode 仅支持 pier 或 direct")
+        if execution.harness_mode not in EVALUATION_HARNESS_MODES:
+            raise TaskExecutionError("harness_mode 仅支持 standard 或 minimal")
         for path in (
             execution.artifacts.acn_eval,
             execution.artifacts.frozen_skill,
@@ -952,6 +1224,13 @@ class Task1HostRunner:
         ):
             if not path.is_absolute():
                 raise TaskExecutionError(f"真实执行路径必须是绝对路径: {path}")
+        if (
+            execution.a_only_source_manifest is not None
+            and not execution.a_only_source_manifest.is_absolute()
+        ):
+            raise TaskExecutionError(
+                f"A-only source manifest 必须是绝对路径: {execution.a_only_source_manifest}"
+            )
         if not execution.pier_executable.is_file():
             raise TaskExecutionError(
                 f"pier_executable 必须是存在的可执行文件: {execution.pier_executable}"
@@ -960,10 +1239,13 @@ class Task1HostRunner:
         bundle_metadata = execution.artifacts.claim_bundle.with_name(
             execution.artifacts.claim_bundle.name + ".manifest.json"
         )
-        if execution.artifacts.claim_bundle.exists() or bundle_metadata.exists():
-            raise TaskExecutionError(
-                f"claim bundle 输出已存在，拒绝复用旧产物: {execution.artifacts.claim_bundle}"
-            )
+        if execution.a_only_source_manifest is None:
+            if execution.artifacts.claim_bundle.exists() or bundle_metadata.exists():
+                raise TaskExecutionError(
+                    f"claim bundle 输出已存在，拒绝复用旧产物: {execution.artifacts.claim_bundle}"
+                )
+        else:
+            self._load_a_only_source(self._ordered_attempts(), execution)
         if (
             self.experiment.provenance.agent_image_content_digest is None
             or self.experiment.provenance.verifier_image_content_digest is None
@@ -1009,6 +1291,193 @@ class Task1HostRunner:
                 ) from error
             if actual_hash != expected_hash:
                 raise TaskExecutionError(f"frozen {label} source tree 与 provenance 不一致")
+
+
+def _read_json_mapping(path: Path, label: str) -> dict[str, object]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise TaskExecutionError(f"{label} 无法读取: {path}") from error
+    if not isinstance(raw, dict) or not all(isinstance(key, str) for key in raw):
+        raise TaskExecutionError(f"{label} 必须是 JSON 对象")
+    return raw
+
+
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value
+    )
+
+
+def _required_mapping(data: Mapping[str, object], name: str) -> Mapping[str, object]:
+    value = data.get(name)
+    if not isinstance(value, Mapping) or not all(isinstance(key, str) for key in value):
+        raise TaskExecutionError(f"A-only source 缺少对象字段: {name}")
+    return value
+
+
+def _source_output_root(source_manifest: Path, task_id: str) -> Path:
+    try:
+        source_output = source_manifest.parents[2]
+    except IndexError as error:
+        raise TaskExecutionError("A-only source manifest 路径层级无效") from error
+    expected = source_output / "tasks" / task_id / "manifest.json"
+    if source_manifest != expected:
+        raise TaskExecutionError("A-only source manifest 不在标准 task 输出目录")
+    return source_output
+
+
+def _source_attempt_records(
+    source: Mapping[str, object], attempts: tuple[AttemptManifest, ...]
+) -> tuple[AttemptExecutionRecord, ...]:
+    raw_records = source.get("attempt_results")
+    if not isinstance(raw_records, list) or len(raw_records) != len(attempts):
+        raise TaskExecutionError("A-only source attempt_results 数量无效")
+    records: list[AttemptExecutionRecord] = []
+    for index, (raw, expected) in enumerate(zip(raw_records, attempts, strict=True)):
+        if not isinstance(raw, Mapping):
+            raise TaskExecutionError("A-only source attempt_results 含无效记录")
+        if raw.get("attempt_id") != expected.attempt_id or raw.get("variant") != expected.variant:
+            raise TaskExecutionError("A-only source attempt_results identity 不一致")
+        if index == 0:
+            if raw.get("status") not in {"passed", "agent_failed"}:
+                raise TaskExecutionError("A-only source A 臂未形成有效实验结果")
+            if not isinstance(raw.get("reason"), str):
+                raise TaskExecutionError("A-only source A 臂缺少 reason")
+            if not isinstance(raw.get("verifier_passed"), bool):
+                raise TaskExecutionError("A-only source A 臂缺少 verifier_passed")
+        elif any(
+            (
+                raw.get("status") != "not_run",
+                raw.get("reason") != "A_ONLY",
+                raw.get("result_path") is not None,
+                raw.get("gate_path") is not None,
+            )
+        ):
+            raise TaskExecutionError("A-only source 中存在已执行或状态异常的 B 臂")
+        result_path = raw.get("result_path")
+        gate_path = raw.get("gate_path")
+        progress_path = raw.get("progress_path")
+        claim_observation = raw.get("claim_observation")
+        if result_path is not None and not isinstance(result_path, str):
+            raise TaskExecutionError("A-only source result_path 无效")
+        if gate_path is not None and not isinstance(gate_path, str):
+            raise TaskExecutionError("A-only source gate_path 无效")
+        if progress_path is not None and not isinstance(progress_path, str):
+            raise TaskExecutionError("A-only source progress_path 无效")
+        if claim_observation is not None and not isinstance(claim_observation, dict):
+            raise TaskExecutionError("A-only source claim_observation 无效")
+        status = raw.get("status")
+        reason = raw.get("reason")
+        if not isinstance(status, str) or not isinstance(reason, str):
+            raise TaskExecutionError("A-only source attempt status/reason 无效")
+        verifier_passed = raw.get("verifier_passed")
+        if verifier_passed is not None and not isinstance(verifier_passed, bool):
+            raise TaskExecutionError("A-only source verifier_passed 无效")
+        result_hash = raw.get("result_hash")
+        gate_hash = raw.get("gate_hash")
+        if index == 0 and (
+            not _is_sha256(result_hash) or not _is_sha256(gate_hash)
+        ):
+            raise TaskExecutionError("A-only source A 臂缺少 result/gate hash")
+        if result_hash is not None and not _is_sha256(result_hash):
+            raise TaskExecutionError("A-only source result_hash 无效")
+        if gate_hash is not None and not _is_sha256(gate_hash):
+            raise TaskExecutionError("A-only source gate_hash 无效")
+        records.append(
+            AttemptExecutionRecord(
+                attempt_id=expected.attempt_id,
+                variant=expected.variant,
+                status=status,
+                reason=reason,
+                result_path=result_path,
+                gate_path=gate_path,
+                verifier_passed=verifier_passed,
+                claim_observation=claim_observation,
+                progress_path=progress_path,
+                result_hash=result_hash,
+                gate_hash=gate_hash,
+            )
+        )
+    return tuple(records)
+
+
+def _validate_source_a_record(
+    record: AttemptExecutionRecord,
+    attempt: AttemptManifest,
+    source_output: Path,
+) -> tuple[dict[str, object], dict[str, object]]:
+    attempt_output = source_output / "attempts" / attempt.attempt_id / "output"
+    expected_result = attempt_output / "attempt-result.json"
+    expected_gate = attempt_output / "gate.json"
+    if record.result_path is None or Path(record.result_path).resolve() != expected_result:
+        raise TaskExecutionError("A-only source A result_path 越出冻结 attempt 目录")
+    if record.gate_path is None or Path(record.gate_path).resolve() != expected_gate:
+        raise TaskExecutionError("A-only source A gate_path 越出冻结 attempt 目录")
+    result = _read_json_mapping(expected_result, "A-only A attempt result")
+    gate = _read_json_mapping(expected_gate, "A-only A Gate")
+    if record.result_hash != _sha256_file(expected_result):
+        raise TaskExecutionError("A-only A attempt result 内容已漂移")
+    if record.gate_hash != _sha256_file(expected_gate):
+        raise TaskExecutionError("A-only A Gate 内容已漂移")
+    if result.get("attempt_id") != attempt.attempt_id or result.get("variant") != "A":
+        raise TaskExecutionError("A-only A attempt result identity 不一致")
+    if gate.get("attempt_id") != attempt.attempt_id or gate.get("decision") != "pass":
+        raise TaskExecutionError("A-only A Gate identity 或 decision 无效")
+    return result, gate
+
+
+def _validate_source_claim_bundle(
+    bundle_path: Path,
+    attempt_id: str,
+    source_result: Mapping[str, object],
+) -> tuple[str, tuple[str, ...]]:
+    metadata_path = bundle_path.with_name(bundle_path.name + ".manifest.json")
+    metadata = _read_json_mapping(metadata_path, "A-only claim bundle manifest")
+    bundle_hash, content_hashes = _frozen_bundle_evidence(bundle_path)
+    if metadata.get("schema_version") != 1 or metadata.get("attempt_id") != attempt_id:
+        raise TaskExecutionError("A-only claim bundle manifest identity 无效")
+    if metadata.get("bundle_hash") != bundle_hash:
+        raise TaskExecutionError("A-only claim bundle 内容已漂移")
+    raw_claims = json.loads(bundle_path.read_text(encoding="utf-8")).get("claims")
+    metadata_claims = metadata.get("claims")
+    if not isinstance(raw_claims, list) or not isinstance(metadata_claims, list):
+        raise TaskExecutionError("A-only claim bundle claims schema 无效")
+    if len(content_hashes) != len(raw_claims) or len(metadata_claims) != len(raw_claims):
+        raise TaskExecutionError("A-only claim bundle 含重复或缺失 claim")
+    claim_ids: list[str] = []
+    for raw_claim, raw_metadata in zip(raw_claims, metadata_claims, strict=True):
+        if not isinstance(raw_claim, Mapping) or not isinstance(raw_metadata, Mapping):
+            raise TaskExecutionError("A-only claim bundle 含无效 claim 记录")
+        claim_id = raw_claim.get("id")
+        if not isinstance(claim_id, str) or not claim_id:
+            raise TaskExecutionError("A-only claim bundle claim.id 无效")
+        if raw_metadata.get("claim_id") != claim_id:
+            raise TaskExecutionError("A-only claim bundle claim 顺序或 identity 漂移")
+        if raw_metadata.get("content_hash") != _canonical_json_hash(raw_claim):
+            raise TaskExecutionError("A-only claim bundle claim 内容已漂移")
+        claim_ids.append(claim_id)
+    rust_events = source_result.get("rust_events")
+    if not isinstance(rust_events, str) or not Path(rust_events).is_absolute():
+        raise TaskExecutionError("A-only A result 缺少绝对 rust_events 路径")
+    ledger_path = Path(rust_events).resolve()
+    source_attempt_output = bundle_path.parents[2] / "attempts" / attempt_id / "output"
+    if not ledger_path.is_relative_to(source_attempt_output):
+        raise TaskExecutionError("A-only event ledger 越出冻结 attempt 目录")
+    if metadata.get("source_ledger_hash") != _sha256_file(ledger_path):
+        raise TaskExecutionError("A-only event ledger 与 claim bundle manifest 不一致")
+    events = tuple(event for event in read_rust_event_ledger(ledger_path) if event.attempt_id == attempt_id)
+    barriers = tuple(event for event in events if event.event_type == "claim_freeze_barrier")
+    if (
+        len(barriers) != 1
+        or barriers[0].seq != metadata.get("barrier_seq")
+        or not events
+        or events[-1] != barriers[0]
+        or len(events) < 2
+        or events[-2].event_type != "attempt_finished"
+    ):
+        raise TaskExecutionError("A-only freeze barrier 与 event ledger 不一致")
+    return bundle_hash, tuple(claim_ids)
 
 
 def _positive_int(values: dict[str, int], key: str) -> int:
@@ -1067,6 +1536,16 @@ def _last_turn_event(path: Path) -> dict[str, object] | None:
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_text(path, json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+
+
+def _attempt_record_dict(record: AttemptExecutionRecord) -> dict[str, object]:
+    """manifest 绑定 attempt result/Gate 内容，不只记录可被替换的绝对路径。"""
+    raw = record.to_dict()
+    if record.result_path is not None:
+        raw["result_hash"] = _sha256_file(Path(record.result_path))
+    if record.gate_path is not None:
+        raw["gate_hash"] = _sha256_file(Path(record.gate_path))
+    return raw
 
 
 def _atomic_write_text(path: Path, content: str) -> None:

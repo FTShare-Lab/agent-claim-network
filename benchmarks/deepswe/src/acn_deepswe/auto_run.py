@@ -41,6 +41,7 @@ class AutomatedRunConfig:
     response_model: str
     reasoning_effort: str
     model_egress_mode: str
+    harness_mode: str
     task_workers: int
     smoke_size: int
     full_size: int
@@ -52,6 +53,8 @@ class AutomatedRunConfig:
     llm_retry: dict[str, int]
     progress: dict[str, int]
     run_all_variants_without_claims: bool = False
+    run_a_only: bool = False
+    b_only_from_a_output_dir: Path | None = None
     reuse_local_agent_image_fingerprint: str | None = None
 
 
@@ -154,12 +157,27 @@ def load_config(path: Path) -> AutomatedRunConfig:
     full_size = _positive_int(raw.get("full_size"), "full_size")
     if smoke_size >= full_size:
         raise AutomatedRunError("smoke_size 必须小于 full_size，才能避免全量重复执行 Smoke")
+    run_a_only = _boolean(raw.get("run_a_only", False), "run_a_only")
+    b_only_from_a_output_dir = _optional_absolute_path(
+        raw, "b_only_from_a_output_dir"
+    )
+    if run_a_only and b_only_from_a_output_dir is not None:
+        raise AutomatedRunError(
+            "run_a_only 与 b_only_from_a_output_dir 不能同时启用"
+        )
+    if b_only_from_a_output_dir is not None and smoke_size != 0:
+        raise AutomatedRunError("B-only 接续必须设置 smoke_size=0，保持 A/B task 集合完全一致")
+    if b_only_from_a_output_dir is not None and _paths_overlap(
+        paths["run_root"] / "full" / "output", b_only_from_a_output_dir
+    ):
+        raise AutomatedRunError("B-only run_root 与 A-only source output 必须完全隔离")
     return AutomatedRunConfig(
         **paths,
         model=_nonempty_string(raw, "model"),
         response_model=_nonempty_string(raw, "response_model"),
         reasoning_effort=_nonempty_string(raw, "reasoning_effort"),
         model_egress_mode=_model_egress_mode(raw),
+        harness_mode=_harness_mode(raw),
         task_workers=_positive_int(raw.get("task_workers"), "task_workers"),
         smoke_size=smoke_size,
         full_size=full_size,
@@ -174,6 +192,8 @@ def load_config(path: Path) -> AutomatedRunConfig:
             raw.get("run_all_variants_without_claims", False),
             "run_all_variants_without_claims",
         ),
+        run_a_only=run_a_only,
+        b_only_from_a_output_dir=b_only_from_a_output_dir,
         reuse_local_agent_image_fingerprint=_optional_fingerprint(
             raw.get("reuse_local_agent_image_fingerprint")
         ),
@@ -249,7 +269,13 @@ def prepare_run(config: AutomatedRunConfig) -> dict[str, object]:
             "model": config.model,
             "response_model": config.response_model,
             "model_egress_mode": config.model_egress_mode,
+            "harness_mode": config.harness_mode,
             "task_workers": config.task_workers,
+            "phase_mode": (
+                "b_only_from_a"
+                if config.b_only_from_a_output_dir is not None
+                else ("a_only" if config.run_a_only else "full")
+            ),
             "smoke": smoke,
             "full": full,
         }
@@ -486,9 +512,16 @@ def _prepare_phase(
         "response_model": config.response_model,
         "reasoning_effort": config.reasoning_effort,
         "model_egress_mode": config.model_egress_mode,
+        "harness_mode": config.harness_mode,
         "acn_revision": acn_revision,
         "task_workers": config.task_workers,
         "run_all_variants_without_claims": config.run_all_variants_without_claims,
+        "run_a_only": config.run_a_only,
+        "b_only_from_a_output_dir": (
+            str(config.b_only_from_a_output_dir)
+            if config.b_only_from_a_output_dir is not None
+            else None
+        ),
         "progress": config.progress,
         "resources": config.resources,
         "timeouts": config.timeouts,
@@ -632,6 +665,28 @@ def _absolute_path(raw: Mapping[str, object], field: str) -> Path:
     return path
 
 
+def _optional_absolute_path(raw: Mapping[str, object], field: str) -> Path | None:
+    value = raw.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise AutomatedRunError(f"{field} 必须是绝对路径字符串或 null")
+    path = Path(value)
+    if not path.is_absolute():
+        raise AutomatedRunError(f"{field} 必须是绝对路径: {path}")
+    return path
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    resolved_left = left.resolve()
+    resolved_right = right.resolve()
+    return (
+        resolved_left == resolved_right
+        or resolved_left.is_relative_to(resolved_right)
+        or resolved_right.is_relative_to(resolved_left)
+    )
+
+
 def _nonempty_string(raw: Mapping[str, object], field: str) -> str:
     value = raw.get(field)
     if not isinstance(value, str) or not value:
@@ -654,6 +709,13 @@ def _model_egress_mode(raw: Mapping[str, object]) -> str:
     value = raw.get("model_egress_mode", "pier")
     if value not in {"pier", "direct"}:
         raise AutomatedRunError("model_egress_mode 仅支持 pier 或 direct")
+    return value
+
+
+def _harness_mode(raw: Mapping[str, object]) -> str:
+    value = raw.get("harness_mode", "standard")
+    if value not in {"standard", "minimal"}:
+        raise AutomatedRunError("harness_mode 仅支持 standard 或 minimal")
     return value
 
 

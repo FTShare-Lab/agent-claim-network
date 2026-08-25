@@ -30,6 +30,7 @@ use crate::attachment::AttachmentLimits;
 use crate::claim::{AgentId, Claim, Dispute, InboxId, InboxMessage};
 use crate::config::{Config, LlmChatConfig, LlmProvider, ResolvedUpstream};
 use crate::delegation::{DelegationRunnerConfig, DelegationWaitConfig, LlmDelegationExecutor};
+use crate::evaluation::EvaluationHarnessMode;
 use crate::maintainer::http_client::HttpMaintainerClient;
 use crate::maintainer::traits::MaintainerClient;
 use crate::maintainer::Maintainer;
@@ -50,6 +51,8 @@ const ROUTER_VECTOR_WORKER_TASK_NAME: &str = "router_vector_worker";
 const ROUTER_REFRESH_WORKER_TASK_NAME: &str = "router_refresh_worker";
 const REQUIRED_SESSION_PROMPTS: &[&str] = &[
     "agent_system",
+    "evaluation_agent_system",
+    "evaluation_minimal_agent_system",
     "inbox_policy_update_internalize",
     "inbox_claim_attribute_update_internalize",
     "memory_review",
@@ -245,13 +248,14 @@ pub fn build_agent_cli_session_engine_with_mcp(
     Ok(engine)
 }
 
-/// 构造非交互评测 session engine。评测使用冻结 router，不读取 inbox 或私有 memory，
-/// 只读取 runtime 写入的固定 ACN.md Claim 使用引导。
+/// 构造非交互评测 session engine。两种 profile 都保留冻结 router 与 claim finalize；
+/// minimal 不加载 skill、文件工具、working note 或 ACN.md。
 pub(crate) fn build_evaluation_session_engine(
     cfg: &Config,
     upstream: &ResolvedUpstream,
     router: Arc<dyn RouterClient>,
     submission: EvaluationSubmission,
+    harness_mode: EvaluationHarnessMode,
 ) -> anyhow::Result<SessionEngine> {
     if !matches!(
         cfg.agent.llm.provider,
@@ -267,7 +271,12 @@ pub(crate) fn build_evaluation_session_engine(
         Arc::new(LocalFsClaimStore::new(agent_home.clone()));
     let reported_dispute_claim_sets: Arc<dyn ReportedDisputeClaimSetStore> =
         Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home.clone()));
-    let available_skills = load_available_skills(cfg)?;
+    let minimal = harness_mode == EvaluationHarnessMode::Minimal;
+    let available_skills = if minimal {
+        Vec::new()
+    } else {
+        load_available_skills(cfg)?
+    };
     let runner = Arc::new(AgentRunner::new(
         upstream.agent_id.clone(),
         Arc::new(PromptInboxJsonGenerator::new(
@@ -298,12 +307,17 @@ pub(crate) fn build_evaluation_session_engine(
         Duration::from_millis(chat.retry_max_delay_ms),
     ));
     let attachment_limits = AttachmentLimits::from(&cfg.agent.attachment);
+    let tools = ToolRegistry::new(&cfg.agent.tool)?
+        .with_process_id_attempts(cfg.agent.session.id_mint_max_attempts())
+        .with_process_owner_agent_id(upstream.agent_id.clone())
+        .with_router_client(router);
+    let tools = if minimal {
+        tools.for_minimal_evaluation(cfg.agent.llm.api_key_env.clone())
+    } else {
+        tools.for_evaluation(cfg.agent.llm.api_key_env.clone())
+    };
     let tools = Arc::new(
-        ToolRegistry::new(&cfg.agent.tool)?
-            .with_process_id_attempts(cfg.agent.session.id_mint_max_attempts())
-            .with_process_owner_agent_id(upstream.agent_id.clone())
-            .with_router_client(router)
-            .for_evaluation(cfg.agent.llm.api_key_env.clone())
+        tools
             .with_evaluation_submission(submission)
             .with_attachment_limits(attachment_limits),
     );
@@ -327,7 +341,7 @@ pub(crate) fn build_evaluation_session_engine(
         Duration::from_millis(chat.retry_base_delay_ms),
         Duration::from_millis(chat.retry_max_delay_ms),
     ));
-    Ok(SessionEngine::new(
+    let engine = SessionEngine::new(
         runner,
         turn_loop,
         memory_review_loop,
@@ -342,16 +356,24 @@ pub(crate) fn build_evaluation_session_engine(
             workspace_root: cfg.agent.tool.workspace_root.clone(),
             turn_journal: cfg.agent.session.turn_journal.clone(),
             subagent_max_concurrent: cfg.agent.session.subagents.max_concurrent,
-            runtime_profile: crate::agent::SessionRuntimeProfile::Evaluation,
+            runtime_profile: if minimal {
+                crate::agent::SessionRuntimeProfile::EvaluationMinimal
+            } else {
+                crate::agent::SessionRuntimeProfile::Evaluation
+            },
         },
     )
-    .with_acn_md_path(cfg.storage.acn_md_path())
     .with_session_metadata("evaluation", cfg.agent.llm.model.clone())
     .with_session_search_sqlite_busy_timeout(std::time::Duration::from_millis(
         cfg.agent.tool.session_search_sqlite_busy_timeout_ms,
     ))
     .with_fork_memory_review(false)
-    .with_attachment_config(cfg.agent.attachment.clone()))
+    .with_attachment_config(cfg.agent.attachment.clone());
+    Ok(if minimal {
+        engine
+    } else {
+        engine.with_acn_md_path(cfg.storage.acn_md_path())
+    })
 }
 
 struct EvaluationInboxReader;
@@ -1011,9 +1033,14 @@ mod tests {
             )
             .unwrap(),
         );
-        let engine =
-            build_evaluation_session_engine(&c, &upstream, router, EvaluationSubmission::new())
-                .unwrap();
+        let engine = build_evaluation_session_engine(
+            &c,
+            &upstream,
+            router,
+            EvaluationSubmission::new(),
+            EvaluationHarnessMode::Standard,
+        )
+        .unwrap();
         let names: Vec<_> = engine
             .available_skills()
             .iter()
@@ -1029,7 +1056,42 @@ mod tests {
         let system_prompt = tokio::fs::read_to_string(start.session.paths.system_prompt)
             .await
             .unwrap();
+        assert!(system_prompt.contains("test evaluation_agent_system"));
         assert!(system_prompt.contains("Claim guidance marker"));
+        assert!(!system_prompt.contains("test agent_system"));
+
+        let minimal_router = Arc::new(
+            crate::evaluation::FrozenClaimBundleRouter::new(
+                crate::evaluation::FrozenClaimBundle {
+                    schema_version: crate::evaluation::EVALUATION_SCHEMA_VERSION,
+                    claims: Vec::new(),
+                },
+                "attempt-002".into(),
+                Some("0000000000000000000000000000000000000000000000000000000000000000".into()),
+            )
+            .unwrap(),
+        );
+        let minimal_engine = build_evaluation_session_engine(
+            &c,
+            &upstream,
+            minimal_router,
+            EvaluationSubmission::new(),
+            EvaluationHarnessMode::Minimal,
+        )
+        .unwrap();
+        assert!(minimal_engine.available_skills().is_empty());
+
+        let minimal_start = minimal_engine
+            .start_session_with_id_factory(|| "session_abcdef02".parse().unwrap(), 1, |_| {})
+            .await
+            .unwrap();
+        let minimal_system_prompt =
+            tokio::fs::read_to_string(minimal_start.session.paths.system_prompt)
+                .await
+                .unwrap();
+        assert!(minimal_system_prompt.contains("test evaluation_minimal_agent_system"));
+        assert!(!minimal_system_prompt.contains("Claim guidance marker"));
+        assert!(!minimal_system_prompt.contains("test evaluation_agent_system"));
     }
 
     #[test]

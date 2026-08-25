@@ -295,6 +295,7 @@ pub(crate) struct ProcessSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ToolAccessProfile {
     local_tools: bool,
+    file_tools: bool,
     web_tools: bool,
     working_note: bool,
     ask_user: bool,
@@ -305,12 +306,14 @@ struct ToolAccessProfile {
     delegation: bool,
     delegation_progress: bool,
     delegation_child: bool,
+    background_process_context: bool,
 }
 
 impl ToolAccessProfile {
     fn parent() -> Self {
         Self {
             local_tools: true,
+            file_tools: true,
             web_tools: true,
             working_note: true,
             ask_user: true,
@@ -321,12 +324,14 @@ impl ToolAccessProfile {
             delegation: true,
             delegation_progress: false,
             delegation_child: false,
+            background_process_context: true,
         }
     }
 
     fn delegation() -> Self {
         Self {
             local_tools: true,
+            file_tools: true,
             web_tools: true,
             working_note: false,
             ask_user: false,
@@ -337,12 +342,14 @@ impl ToolAccessProfile {
             delegation: false,
             delegation_progress: true,
             delegation_child: true,
+            background_process_context: true,
         }
     }
 
     fn memory_review() -> Self {
         Self {
             local_tools: false,
+            file_tools: false,
             web_tools: false,
             working_note: false,
             ask_user: false,
@@ -353,12 +360,14 @@ impl ToolAccessProfile {
             delegation: false,
             delegation_progress: false,
             delegation_child: false,
+            background_process_context: false,
         }
     }
 
     fn evaluation() -> Self {
         Self {
             local_tools: true,
+            file_tools: true,
             web_tools: false,
             working_note: true,
             ask_user: false,
@@ -369,6 +378,26 @@ impl ToolAccessProfile {
             delegation: false,
             delegation_progress: false,
             delegation_child: false,
+            background_process_context: true,
+        }
+    }
+
+    /// 评测上限对照只保留 shell、claim 查询与显式提交；普通 evaluation profile 不受影响。
+    fn minimal_evaluation() -> Self {
+        Self {
+            local_tools: true,
+            file_tools: false,
+            web_tools: false,
+            working_note: false,
+            ask_user: false,
+            memory: false,
+            router: true,
+            session_search: false,
+            mcp: false,
+            delegation: false,
+            delegation_progress: false,
+            delegation_child: false,
+            background_process_context: false,
         }
     }
 }
