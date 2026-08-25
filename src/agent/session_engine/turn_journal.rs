@@ -292,10 +292,6 @@ impl TurnJournalEmitter {
         });
     }
 
-    pub(super) fn send_immediate(&self, kind: TurnJournalEventKind) {
-        self.send(kind, TurnJournalFlush::Immediate);
-    }
-
     pub(super) fn send_buffered(&self, kind: TurnJournalEventKind) {
         self.send(kind, TurnJournalFlush::Buffered);
     }
@@ -338,7 +334,29 @@ impl TurnJournalEmitter {
             let _ = handle.await;
         }
         self.flush_assistant_delta();
-        self.send_immediate(TurnJournalEventKind::TurnFinished { status });
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(TurnJournalCommand {
+                created_at: Utc::now(),
+                kind: TurnJournalEventKind::TurnFinished { status },
+                flush: TurnJournalFlush::Immediate,
+                ack: Some(ack_tx),
+            })
+            .is_err()
+        {
+            log::warn!(target: "agent", "turn journal writer closed before TurnFinished");
+            return;
+        }
+        match ack_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                log::warn!(target: "agent", "TurnFinished durable write failed: {error}");
+            }
+            Err(_) => {
+                log::warn!(target: "agent", "turn journal writer stopped before TurnFinished ack");
+            }
+        }
     }
 }
 
@@ -502,5 +520,61 @@ mod tests {
         assert!(error
             .to_string()
             .contains("durable ack exceeded 10s; current run must stop"));
+    }
+
+    #[test]
+    fn durable_ack_does_not_depend_on_the_tokio_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("test runtime should build");
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().expect("tempdir should be created");
+            let journal_path = directory.path().join("turn_events.jsonl");
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (blocking_started_tx, blocking_started_rx) = oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = blocking_started_tx.send(());
+                let _ = release_rx.recv();
+            });
+            blocking_started_rx
+                .await
+                .expect("blocking worker should start");
+
+            let (tx, rx) = mpsc::unbounded_channel();
+            let writer = tokio::spawn(run_turn_journal_writer(
+                journal_path.clone(),
+                "turn-1".into(),
+                rx,
+            ));
+            let sink = TurnJournalSink { tx };
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                sink.send_immediate_durable(TurnJournalEventKind::ToolCallCompleted {
+                    tool_use_id: "tool-1".into(),
+                    summary: "process is still running".into(),
+                    output_preview: "process_id=process-1".into(),
+                    output_truncated: false,
+                    outcome: Some(crate::api::ToolExecutionOutcome::ProcessRunning),
+                    file_change: None,
+                }),
+            )
+            .await
+            .expect("durable ack should not wait for Tokio blocking capacity")
+            .expect("journal append should succeed");
+            drop(sink);
+            writer
+                .await
+                .expect("writer bridge should join")
+                .expect("writer thread should finish");
+
+            let _ = release_tx.send(());
+            blocker.await.expect("blocking probe should finish");
+            let persisted = tokio::fs::read_to_string(journal_path)
+                .await
+                .expect("journal should be readable");
+            assert!(persisted.contains("tool_call_completed"));
+        });
     }
 }

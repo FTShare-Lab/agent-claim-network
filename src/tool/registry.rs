@@ -199,6 +199,18 @@ impl ToolRegistry {
         self
     }
 
+    /// MiniSWE 对照用的最小评测工具面。底层继续复用受管进程实现，不改变等待与清理语义。
+    pub fn for_minimal_evaluation(mut self, secret_env: String) -> Self {
+        self.access = ToolAccessProfile::minimal_evaluation();
+        self.evaluation_secret_env = Some(secret_env);
+        self.memory_store = None;
+        self.session_search = None;
+        self.mcp_manager = None;
+        self.delegation_host = None;
+        self.delegation_progress = None;
+        self
+    }
+
     /// 为单个非交互评测 attempt 装配显式提交控制器。
     ///
     /// 该方法不自行提升权限；调用方仍须先选择 evaluation profile。普通 session 从不调用它，
@@ -228,6 +240,10 @@ impl ToolRegistry {
 
     pub(crate) fn memory_enabled(&self) -> bool {
         self.memory_enabled
+    }
+
+    pub(crate) fn background_process_context_enabled(&self) -> bool {
+        self.access.background_process_context
     }
 
     /// 为一次逻辑 Provider sampling 同时冻结工具定义与 MCP 路由 generation。
@@ -582,7 +598,7 @@ impl ToolRegistry {
         ];
         definitions.retain(|definition| match definition.name.as_str() {
             "code_run" | "write_stdin" | "process_list" => self.access.local_tools,
-            "file_read" | "file_patch" | "file_write" => self.access.local_tools,
+            "file_read" | "file_patch" | "file_write" => self.access.file_tools,
             "web_search" | "web_fetch" => self.access.web_tools,
             "web_request" => self.access.web_tools,
             "working_note" => self.access.working_note,
@@ -740,7 +756,7 @@ impl ToolRegistry {
         }
 
         match name {
-            "file_read" if self.access.local_tools => {
+            "file_read" if self.access.file_tools => {
                 serde_json::from_value::<FileReadArgs>(input.clone()).is_ok()
             }
             "code_run" if self.access.local_tools => {
@@ -831,9 +847,9 @@ impl ToolRegistry {
             "code_run" if self.access.local_tools => self.code_run(input, &context).await,
             "write_stdin" if self.access.local_tools => self.write_stdin(input, &context).await,
             "process_list" if self.access.local_tools => self.process_list(input, &context).await,
-            "file_read" if self.access.local_tools => self.file_read(input, &context).await,
-            "file_patch" if self.access.local_tools => self.file_patch(input, &context).await,
-            "file_write" if self.access.local_tools => self.file_write(input, &context).await,
+            "file_read" if self.access.file_tools => self.file_read(input, &context).await,
+            "file_patch" if self.access.file_tools => self.file_patch(input, &context).await,
+            "file_write" if self.access.file_tools => self.file_write(input, &context).await,
             "web_search" if self.access.web_tools => self.web_search(input).await,
             "web_fetch" if self.access.web_tools => self.web_fetch(input).await,
             "web_request" if self.access.web_tools => self.web_request(input).await,

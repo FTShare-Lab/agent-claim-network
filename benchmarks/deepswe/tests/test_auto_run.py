@@ -28,6 +28,78 @@ class AutomatedRunTests(unittest.TestCase):
             with self.assertRaisesRegex(AutomatedRunError, "不能为空"):
                 _read_upstream_key_stdin()
 
+    def test_config_forwards_run_a_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = load_config(
+                write_config(
+                    root,
+                    harness_mode="minimal",
+                    run_a_only=True,
+                    smoke_size=0,
+                    full_size=len(TASK_IDS),
+                )
+            )
+            with (
+                patch("acn_deepswe.auto_run.freeze_execution_dataset", side_effect=freeze_fixture),
+                patch("acn_deepswe.auto_run._current_acn_revision", return_value="acn@fixture"),
+            ):
+                prepare_run(config)
+            full_config = json.loads((config.run_root / "full" / "presmoke-run.json").read_text())
+
+        self.assertTrue(config.run_a_only)
+        self.assertEqual(config.harness_mode, "minimal")
+        self.assertTrue(full_config["run_a_only"])
+        self.assertEqual(full_config["harness_mode"], "minimal")
+
+    def test_config_forwards_b_only_source_for_full_task_set(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_output = root / "a-only-output"
+            config = load_config(
+                write_config(
+                    root,
+                    b_only_from_a_output_dir=str(source_output),
+                    run_all_variants_without_claims=True,
+                    smoke_size=0,
+                    full_size=len(TASK_IDS),
+                )
+            )
+            with (
+                patch("acn_deepswe.auto_run.freeze_execution_dataset", side_effect=freeze_fixture),
+                patch("acn_deepswe.auto_run._current_acn_revision", return_value="acn@fixture"),
+            ):
+                summary = prepare_run(config)
+            full_config = json.loads((config.run_root / "full" / "presmoke-run.json").read_text())
+
+        self.assertEqual(summary["phase_mode"], "b_only_from_a")
+        self.assertEqual(full_config["b_only_from_a_output_dir"], str(source_output))
+        self.assertTrue(full_config["run_all_variants_without_claims"])
+
+    def test_b_only_source_rejects_smoke_partition(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_config(
+                root,
+                b_only_from_a_output_dir=str(root / "a-only-output"),
+                smoke_size=1,
+                full_size=len(TASK_IDS),
+            )
+            with self.assertRaisesRegex(AutomatedRunError, "smoke_size=0"):
+                load_config(path)
+
+    def test_b_only_source_rejects_overlapping_output_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_config(
+                root,
+                b_only_from_a_output_dir=str(root / "run" / "full" / "output"),
+                smoke_size=0,
+                full_size=len(TASK_IDS),
+            )
+            with self.assertRaisesRegex(AutomatedRunError, "必须完全隔离"):
+                load_config(path)
+
     def test_config_rejects_credential_field(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = write_config(Path(directory), api_key="must-not-be-here")
@@ -57,6 +129,8 @@ class AutomatedRunTests(unittest.TestCase):
         self.assertEqual(smoke_config["model"], "deepseek-v4-flash-local-exp")
         self.assertEqual(smoke_config["response_model"], "deepseek-v4-flash-local-exp")
         self.assertEqual(smoke_config["task_workers"], 30)
+        self.assertEqual(smoke_config["harness_mode"], "standard")
+        self.assertFalse(smoke_config["run_a_only"])
         self.assertNotIn("ACN_EVAL_UPSTREAM_KEY", smoke_config)
         self.assertEqual(
             Path(smoke_config["frozen_manifest"]),

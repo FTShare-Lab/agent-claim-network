@@ -15,7 +15,10 @@ use crate::claim::{Claim, ClaimId};
 use crate::memory::{render_prompt_block, MemoryTarget};
 use crate::router::ScopesOverviewSnapshot;
 
-use super::{SessionEngine, PROMPT_AGENT_SYSTEM, PROMPT_MEMORY_REVIEW_SYSTEM};
+use super::{
+    SessionEngine, PROMPT_AGENT_SYSTEM, PROMPT_EVALUATION_AGENT_SYSTEM,
+    PROMPT_EVALUATION_MINIMAL_AGENT_SYSTEM, PROMPT_MEMORY_REVIEW_SYSTEM,
+};
 
 const SOLO_TEAM_SERVICES_OVERVIEW: &str = "【当前团队服务状态】用户未配置 maintainer_endpoint 和 router_endpoint，本 session 以单人模式运行；团队 maintainer、router 与 consult_router 均不可用，不会进行任何团队服务交互。请忽略本 prompt 下文关于团队服务和 consult_router 的通用操作说明。如需访问团队服务，请参考 docs/config_parameters.md，同时配置 maintainer_endpoint 和 router_endpoint。";
 
@@ -125,8 +128,14 @@ impl SessionEngine {
         &self,
         inbox_report: &InboxProcessReport,
     ) -> anyhow::Result<String> {
-        if self.runtime_profile == super::SessionRuntimeProfile::Evaluation {
-            return self.render_evaluation_session_system_prompt().await;
+        match self.runtime_profile {
+            super::SessionRuntimeProfile::Evaluation => {
+                return self.render_evaluation_session_system_prompt().await;
+            }
+            super::SessionRuntimeProfile::EvaluationMinimal => {
+                return self.render_minimal_evaluation_session_system_prompt().await;
+            }
+            super::SessionRuntimeProfile::Interactive => {}
         }
         let router_scopes_overview = match inbox_report.team_services.router {
             TeamServiceConnectionStatus::Unknown => SOLO_TEAM_SERVICES_OVERVIEW.into(),
@@ -213,9 +222,36 @@ impl SessionEngine {
         };
         let system_prompt = self
             .prompt_registry
-            .render(PROMPT_AGENT_SYSTEM, context)
+            .render(PROMPT_EVALUATION_AGENT_SYSTEM, context)
             .context("渲染 evaluation session system prompt 失败")?;
         Ok(append_acn_md(system_prompt, self.read_acn_md().await?))
+    }
+
+    async fn render_minimal_evaluation_session_system_prompt(&self) -> anyhow::Result<String> {
+        let router = self
+            .agent
+            .router
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("minimal evaluation session 缺少冻结 router"))?;
+        let overview = router
+            .scopes_overview()
+            .await
+            .context("读取 minimal evaluation 冻结 router scope overview 失败")?;
+        let router_scopes_overview = format_router_scopes_overview(&overview);
+        let context = SessionSystemPromptContext {
+            agent_id: &self.agent.agent_id,
+            memory_enabled: false,
+            memory_md: "",
+            user_md: "",
+            local_claims_snapshot: "",
+            router_scopes_overview: &router_scopes_overview,
+            available_skills: Vec::new(),
+            subagent_max_concurrent: 0,
+            file_edit_authority_enabled: false,
+        };
+        self.prompt_registry
+            .render(PROMPT_EVALUATION_MINIMAL_AGENT_SYSTEM, context)
+            .context("渲染 minimal evaluation session system prompt 失败")
     }
 
     pub(super) async fn read_acn_md(&self) -> anyhow::Result<Option<String>> {

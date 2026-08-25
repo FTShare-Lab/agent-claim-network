@@ -15,7 +15,9 @@ from acn_deepswe.host_runner import (
     CONTAINER_MODEL_KEY_ENV,
     EVALUATION_AUTO_COMPACT_CTX_RATIO,
     EVALUATION_CODE_RUN_MAX_OUTPUT_CHARS,
+    EVALUATION_FILE_DIFF_MAX_CHANGED_LINES,
     EVALUATION_FILE_READ_MAX_CHARS,
+    EVALUATION_MAX_PARALLEL_TOOL_CALLS,
     HOST_MODEL_KEY_ENV,
     HostArtifacts,
     Task1ExecutionConfig,
@@ -28,9 +30,10 @@ from acn_deepswe.host_runner import (
     build_pier_job_config,
     write_attempt_files,
 )
-from acn_deepswe.plan import build_attempt_plan
+from acn_deepswe.plan import AttemptPlan, build_attempt_plan
 from acn_deepswe.provenance import EvaluationProvenance
 from acn_deepswe.runner import (
+    ExperimentManifest,
     build_experiment_manifest,
 )
 from acn_deepswe.schemas import AttemptManifest
@@ -64,6 +67,7 @@ class ConfigGenerationTests(unittest.TestCase):
                 )
                 self.assertEqual(rendered["attempt_deadline_secs"], 5100)
                 self.assertEqual(rendered["model_egress_mode"], "pier")
+                self.assertEqual(rendered["harness_mode"], "standard")
                 self.assertEqual(
                     rendered.get("claim_bundle"),
                     (
@@ -72,6 +76,23 @@ class ConfigGenerationTests(unittest.TestCase):
                         else None
                     ),
                 )
+
+    def test_minimal_attempt_uses_single_shell_workflow_without_loading_skill(self) -> None:
+        attempt = build_attempt_plan(DATASET, Path("/tmp/acn-eval-plan"), seed=2).attempts[0]
+
+        rendered = tomllib.loads(
+            build_attempt_toml(attempt, "fix the bug", 5100, harness_mode="minimal")
+        )
+
+        self.assertEqual(rendered["harness_mode"], "minimal")
+        self.assertTrue(rendered["task_prompt"].startswith("Please solve this issue:"))
+        self.assertIn("Use `code_run` for shell commands and file edits", rendered["task_prompt"])
+        self.assertIn("complete project test suite", rendered["task_prompt"])
+        self.assertIn("malformed-input reproductions with a short timeout", rendered["task_prompt"])
+        self.assertIn("/sys/fs/cgroup/pids.max", rendered["task_prompt"])
+        self.assertIn("retry with fewer workers", rendered["task_prompt"])
+        self.assertNotIn("/coding-benchmark", rendered["task_prompt"])
+        self.assertNotIn("不要扫整个仓库", rendered["task_prompt"])
 
     def test_attempt_deadline_leaves_room_before_the_pier_wall_clock(self) -> None:
         self.assertEqual(attempt_deadline_secs(provenance()), 240)
@@ -105,6 +126,14 @@ class ConfigGenerationTests(unittest.TestCase):
         self.assertEqual(
             parsed["agent"]["tool"]["file_read_max_chars"],
             EVALUATION_FILE_READ_MAX_CHARS,
+        )
+        self.assertEqual(
+            parsed["agent"]["tool"]["file_diff_max_changed_lines"],
+            EVALUATION_FILE_DIFF_MAX_CHANGED_LINES,
+        )
+        self.assertEqual(
+            parsed["agent"]["tool"]["max_parallel_tool_calls"],
+            EVALUATION_MAX_PARALLEL_TOOL_CALLS,
         )
         self.assertFalse(parsed["agent"]["tool"]["file_edit_authority_enabled"])
         self.assertFalse(parsed["agent"]["memory"]["enabled"])
@@ -623,6 +652,175 @@ class ProvenanceTests(unittest.TestCase):
         )
         self.assertTrue(manifest["execution"]["run_all_variants_without_claims"])
 
+    def test_run_a_only_freezes_claims_and_skips_b_arms(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = build_attempt_plan(DATASET, root / "run", seed=2)
+            experiment = build_experiment_manifest("experiment-1", plan, "b" * 64, provenance())
+            artifacts = _artifacts(root, claim_bundle=root / "claims.json")
+            execution = replace(_execution(root, artifacts), run_a_only=True)
+            variants: list[str] = []
+
+            def run(command: list[str], **_kwargs: object) -> FakeCompleted:
+                job = json.loads(Path(command[-1]).read_text())
+                attempt = next(item for item in plan.attempts if item.attempt_id == job["job_name"])
+                variants.append(attempt.variant)
+                _write_fake_trial(
+                    Path(job["jobs_dir"]),
+                    attempt,
+                    bundle_path=artifacts.claim_bundle,
+                )
+                return FakeCompleted(0)
+
+            with patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True):
+                Task1HostRunner(experiment, root / "jobs", execution, run=run).run_task1(
+                    execute=True
+                )
+            manifest = json.loads(execution.manifest_path.read_text())
+            self.assertTrue(artifacts.claim_bundle.is_file())
+
+        self.assertEqual(variants, ["A"])
+        self.assertEqual(
+            [item["variant"] for item in manifest["attempt_results"]],
+            ["A", "B_empty", "B_claim", "B_forced_claim"],
+        )
+        self.assertEqual(manifest["attempt_results"][0]["status"], "passed")
+        self.assertEqual(
+            [item["status"] for item in manifest["attempt_results"][1:]],
+            ["not_run", "not_run", "not_run"],
+        )
+        self.assertEqual(
+            [item["reason"] for item in manifest["attempt_results"][1:]],
+            ["A_ONLY", "A_ONLY", "A_ONLY"],
+        )
+        self.assertTrue(manifest["execution"]["run_a_only"])
+        self.assertIsNone(manifest["failure"])
+
+    def test_b_only_followup_reuses_a_evidence_and_runs_only_three_b_arms(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_plan, source_execution = _run_a_only_source(root / "source")
+            b_plan, b_execution, b_experiment = _b_only_followup(
+                root / "followup", source_execution, provenance()
+            )
+            variants: list[str] = []
+
+            def run(command: list[str], **_kwargs: object) -> FakeCompleted:
+                job = json.loads(Path(command[-1]).read_text())
+                attempt = next(
+                    item for item in b_plan.attempts if item.attempt_id == job["job_name"]
+                )
+                variants.append(attempt.variant)
+                _write_fake_trial(
+                    Path(job["jobs_dir"]),
+                    attempt,
+                    bundle_path=b_execution.artifacts.claim_bundle,
+                )
+                return FakeCompleted(0)
+
+            with patch.dict(
+                "os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True
+            ):
+                Task1HostRunner(
+                    b_experiment, root / "followup" / "jobs", b_execution, run=run
+                ).run_task1(execute=True)
+            manifest = json.loads(b_execution.manifest_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(variants, [attempt.variant for attempt in b_plan.attempts[1:]])
+        self.assertEqual(
+            manifest["attempt_results"][0]["result_path"],
+            str(Path(source_plan.attempts[0].output_path) / "attempt-result.json"),
+        )
+        self.assertEqual([item["status"] for item in manifest["attempt_results"]], ["passed"] * 4)
+        self.assertEqual(manifest["execution"]["phase_mode"], "b_only_from_a")
+        self.assertEqual(
+            manifest["execution"]["a_only_source_manifest"],
+            str(source_execution.manifest_path),
+        )
+        self.assertRegex(manifest["execution"]["a_only_source_manifest_hash"], r"^[0-9a-f]{64}$")
+
+    def test_b_only_followup_rejects_tampered_claim_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, source_execution = _run_a_only_source(root / "source")
+            bundle = json.loads(source_execution.artifacts.claim_bundle.read_text())
+            bundle["claims"][0]["statement"] = "tampered"
+            source_execution.artifacts.claim_bundle.write_text(json.dumps(bundle))
+            _, b_execution, b_experiment = _b_only_followup(
+                root / "followup", source_execution, provenance()
+            )
+
+            with (
+                patch.dict(
+                    "os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True
+                ),
+                self.assertRaisesRegex(TaskExecutionError, "claim bundle 内容已漂移"),
+            ):
+                Task1HostRunner(
+                    b_experiment, root / "followup" / "jobs", b_execution
+                ).validate_b_only_source()
+
+    def test_b_only_followup_rejects_fairness_configuration_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, source_execution = _run_a_only_source(root / "source")
+            drifted = replace(provenance(), reasoning_effort="high")
+            _, b_execution, b_experiment = _b_only_followup(
+                root / "followup", source_execution, drifted
+            )
+
+            with (
+                patch.dict(
+                    "os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True
+                ),
+                self.assertRaisesRegex(TaskExecutionError, "provenance 漂移: reasoning_effort"),
+            ):
+                Task1HostRunner(
+                    b_experiment, root / "followup" / "jobs", b_execution
+                ).validate_b_only_source()
+
+    def test_b_only_followup_runs_all_three_arms_with_empty_claim_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, source_execution = _run_a_only_source(root / "source", emit_claim=False)
+            b_plan, b_execution, b_experiment = _b_only_followup(
+                root / "followup", source_execution, provenance()
+            )
+            variants: list[str] = []
+
+            def run(command: list[str], **_kwargs: object) -> FakeCompleted:
+                job = json.loads(Path(command[-1]).read_text())
+                attempt = next(
+                    item for item in b_plan.attempts if item.attempt_id == job["job_name"]
+                )
+                variants.append(attempt.variant)
+                _write_fake_trial(
+                    Path(job["jobs_dir"]),
+                    attempt,
+                    bundle_path=b_execution.artifacts.claim_bundle,
+                    emit_claim=False,
+                )
+                return FakeCompleted(0)
+
+            with patch.dict(
+                "os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True
+            ):
+                result = Task1HostRunner(
+                    b_experiment, root / "followup" / "jobs", b_execution, run=run
+                ).run_task1(execute=True)
+            manifest = json.loads(b_execution.manifest_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result.status, "passed")
+        self.assertEqual(variants, [attempt.variant for attempt in b_plan.attempts[1:]])
+        self.assertEqual(manifest["experiment_cohort"], "unpaired_no_claim")
+        self.assertTrue(
+            all(
+                "EMPTY_CLAIM_BUNDLE" in item["reason"]
+                for item in manifest["attempt_results"]
+                if item["variant"] in {"B_claim", "B_forced_claim"}
+            )
+        )
+
     def test_a_verifier_failure_with_claims_runs_failure_recovery_pair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -924,6 +1122,62 @@ def _write_fake_trial(
             }
         )
     )
+
+
+def _run_a_only_source(
+    root: Path, *, emit_claim: bool = True
+) -> tuple[AttemptPlan, Task1ExecutionConfig]:
+    root.mkdir(parents=True)
+    output = root / "output"
+    plan = build_attempt_plan(DATASET, output, seed=2)
+    experiment = build_experiment_manifest("a-only-source", plan, None, provenance())
+    fixture = root / "fixture"
+    fixture.mkdir()
+    artifacts = _artifacts(
+        fixture,
+        claim_bundle=output / "tasks" / "task-1" / "claims.json",
+    )
+    execution = replace(
+        _execution(fixture, artifacts),
+        manifest_path=output / "tasks" / "task-1" / "manifest.json",
+        run_a_only=True,
+    )
+
+    def run(command: list[str], **_kwargs: object) -> FakeCompleted:
+        job = json.loads(Path(command[-1]).read_text())
+        attempt = next(item for item in plan.attempts if item.attempt_id == job["job_name"])
+        _write_fake_trial(
+            Path(job["jobs_dir"]),
+            attempt,
+            bundle_path=artifacts.claim_bundle,
+            emit_claim=emit_claim,
+        )
+        return FakeCompleted(0)
+
+    with patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True):
+        Task1HostRunner(experiment, root / "jobs", execution, run=run).run_task1(execute=True)
+    return plan, execution
+
+
+def _b_only_followup(
+    root: Path,
+    source_execution: Task1ExecutionConfig,
+    followup_provenance: EvaluationProvenance,
+) -> tuple[AttemptPlan, Task1ExecutionConfig, ExperimentManifest]:
+    root.mkdir(parents=True)
+    output = root / "output"
+    plan = build_attempt_plan(DATASET, output, seed=2)
+    experiment = build_experiment_manifest("b-only-followup", plan, None, followup_provenance)
+    fixture = root / "fixture"
+    fixture.mkdir()
+    artifacts = _artifacts(fixture, claim_bundle=source_execution.artifacts.claim_bundle)
+    execution = replace(
+        _execution(fixture, artifacts),
+        manifest_path=output / "tasks" / "task-1" / "manifest.json",
+        run_all_variants_without_claims=True,
+        a_only_source_manifest=source_execution.manifest_path,
+    )
+    return plan, execution, experiment
 
 
 def provenance() -> EvaluationProvenance:

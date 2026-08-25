@@ -7,14 +7,15 @@
 mod bundle_router;
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{mpsc as std_mpsc, Arc};
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::AsyncWriteExt;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::fs::LocalFsClaimStore;
 use crate::agent::{LocalClaimStore, SessionEvent, SessionFinalizeReport};
@@ -29,8 +30,17 @@ use crate::tool::EvaluationSubmission;
 pub const EVALUATION_SCHEMA_VERSION: u32 = 1;
 pub const EVALUATION_MODEL_KEY_ENV: &str = "ACN_EVAL_MODEL_KEY";
 
+/// 评测 harness 的模型可见面。默认保持既有 profile，minimal 只用于显式上限对照。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationHarnessMode {
+    #[default]
+    Standard,
+    Minimal,
+}
+
 /// 评测 runtime 的 ACN.md 对所有 arm 固定注入相同的解题纪律与 Claim 使用边界。
-const EVALUATION_ACN_MD_GUIDANCE: &str = r#"对于需要修改代码的任务，按“定位相关代码、构造最小复现、实施最小修复、复跑验证、检查边界或回归、检查 diff、提交”逐步推进。任何尚未准备结束的 assistant 回复，都必须通过至少一个工具调用取得新的可证伪证据或推进实际修改；不得只给出计划，也不得用无信息量命令凑调用次数。只有已核验任务验收条件并检查 diff 后，才可在仅包含无参数 `submit_task` 的回复中结束。
+const EVALUATION_ACN_MD_GUIDANCE: &str = r#"对于需要修改代码的任务，按“定位相关代码、构造最小复现、实施最小修复、复跑验证、检查边界或回归、检查 diff、提交”逐步推进。任何尚未准备结束的 assistant 回复，都必须通过至少一个工具调用取得新的可证伪证据或推进实际修改；不得只给出计划，也不得用无信息量命令凑调用次数。只有已核验任务验收条件并检查 diff 后，才可在仅包含无参数 `submit_task` 的回复中结束。仓库已有测试全部通过，不等于题面验收条件已经覆盖；题面写到但现有测试未覆盖的行为、边界和异常路径，仍须核验后再提交。不要为提交而 git config / git commit，除非题面明确要求。
 
 若当前任务可能与团队已有 claim 有关，先查看冻结 router 的 scope overview；存在相关 scope 时，用 `consult_router` 查询候选 claim。
 
@@ -58,6 +68,8 @@ pub struct EvaluationAttemptConfig {
     pub attempt_deadline_secs: u64,
     /// 冻结的模型出口模式；由宿主 runner 与 Formal Gate 共同消费。
     pub model_egress_mode: String,
+    #[serde(default)]
+    pub harness_mode: EvaluationHarnessMode,
     #[serde(default)]
     pub claim_bundle: Option<PathBuf>,
 }
@@ -136,6 +148,18 @@ pub struct EvaluationEvent {
     pub event_type: String,
     pub timestamp_utc: DateTime<Utc>,
     pub payload: Value,
+}
+
+enum BufferedEvaluationEvent {
+    Direct {
+        event_type: String,
+        payload: Value,
+        timestamp_utc: DateTime<Utc>,
+    },
+    Session {
+        event: SessionEvent,
+        timestamp_utc: DateTime<Utc>,
+    },
 }
 
 impl EvaluationEvent {
@@ -280,6 +304,9 @@ pub async fn run_attempt(config: EvaluationAttemptConfig) -> anyhow::Result<Eval
             config.workspace_root.display()
         )
     })?;
+    // 被测命令可能耗尽容器 PID，届时 Tokio 无法再创建 blocking worker。writer 必须在
+    // attempt 启动前预留自己的线程，保证内部 deadline 后仍能写出完整判定产物。
+    let artifact_writer = EvaluationArtifactWriter::start(paths.clone())?;
     let mut events = Vec::new();
     record_event(
         &mut events,
@@ -303,7 +330,7 @@ pub async fn run_attempt(config: EvaluationAttemptConfig) -> anyhow::Result<Eval
                 &mut events,
                 &config.attempt_id,
                 "attempt_failed",
-                json!({"error": anchored}),
+                json!({ "error": anchored }),
             );
             let mut result = EvaluationResult::empty(
                 config.attempt_id.clone(),
@@ -317,27 +344,40 @@ pub async fn run_attempt(config: EvaluationAttemptConfig) -> anyhow::Result<Eval
                 "attempt_finished",
                 json!({"exit_type": result.exit_type, "agent_steps": result.agent_steps}),
             );
-            write_events_new(&paths.event_ledger, &events).await?;
-            write_result_new(&paths.result, &result).await?;
+            artifact_writer.persist(&events, &result).await?;
             return Ok(result);
         }
     };
     let deadline = std::time::Duration::from_secs(config.attempt_deadline_secs);
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let mut compaction_report = SessionFinalizeReport::default();
-    let attempt_outcome = with_evaluation_usage_recording(
-        usage_recorder.clone(),
-        tokio::time::timeout(
-            deadline,
-            run_attempt_inner(&config, &mut events, &mut compaction_report, router.clone()),
-        ),
-    )
-    .await
-    .unwrap_or_else(|_| {
-        Err(anyhow::anyhow!(
-            "stage=deadline attempt 超过自有截止时间 {}s，已在 Pier 墙钟前收尾",
-            config.attempt_deadline_secs
-        ))
-    });
+    let task_config = config.clone();
+    let task_router = router.clone();
+    let task_usage_recorder = usage_recorder.clone();
+    let mut attempt_task = tokio::spawn(with_evaluation_usage_recording(
+        task_usage_recorder,
+        async move { run_attempt_inner(&task_config, event_tx, task_router).await },
+    ));
+    let attempt_outcome = match tokio::time::timeout(deadline, &mut attempt_task).await {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(error)) => Err(anyhow::anyhow!("stage=run attempt task 异常退出: {error}")),
+        Err(_) => {
+            attempt_task.abort();
+            // 给 runtime 一个有界机会处理 abort 并释放 sender；不让清理再次吃掉 Pier reserve。
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(1), &mut attempt_task).await;
+            Err(anyhow::anyhow!(
+                "stage=deadline attempt 超过自有截止时间 {}s，已在 Pier 墙钟前收尾",
+                config.attempt_deadline_secs
+            ))
+        }
+    };
+    drain_buffered_events(
+        &mut event_rx,
+        &mut events,
+        &config.attempt_id,
+        &mut compaction_report,
+    );
     let agent_steps = usage_recorder.response_count();
     let router_evidence = router.take_evidence();
     let usage = record_model_request_events(&mut events, &config.attempt_id, &usage_recorder);
@@ -380,7 +420,7 @@ pub async fn run_attempt(config: EvaluationAttemptConfig) -> anyhow::Result<Eval
                 &mut events,
                 &config.attempt_id,
                 "attempt_failed",
-                json!({"error": anchored}),
+                json!({ "error": anchored }),
             );
             let mut result = EvaluationResult::empty(
                 config.attempt_id.clone(),
@@ -403,15 +443,13 @@ pub async fn run_attempt(config: EvaluationAttemptConfig) -> anyhow::Result<Eval
         "attempt_finished",
         json!({"exit_type": result.exit_type, "agent_steps": result.agent_steps}),
     );
-    write_events_new(&paths.event_ledger, &events).await?;
-    write_result_new(&paths.result, &result).await?;
+    artifact_writer.persist(&events, &result).await?;
     Ok(result)
 }
 
 async fn run_attempt_inner(
     config: &EvaluationAttemptConfig,
-    events: &mut Vec<EvaluationEvent>,
-    compaction_report: &mut SessionFinalizeReport,
+    event_tx: mpsc::UnboundedSender<BufferedEvaluationEvent>,
     router: Arc<FrozenClaimBundleRouter>,
 ) -> anyhow::Result<SessionFinalizeReport> {
     let workspace_root = resolve_workspace_root(Some(&config.workspace_root))
@@ -450,19 +488,26 @@ async fn run_attempt_inner(
     }
     cfg.activate_evaluation_runtime(&config.runtime_root)
         .context("stage=runtime 激活独立 runtime_root 失败")?;
-    let acn_md_path = cfg.storage.acn_md_path();
-    write_evaluation_acn_md(&acn_md_path)
-        .await
-        .context("stage=runtime 写入 evaluation ACN.md 引导失败")?;
+    if config.harness_mode == EvaluationHarnessMode::Standard {
+        let acn_md_path = cfg.storage.acn_md_path();
+        write_evaluation_acn_md(&acn_md_path)
+            .await
+            .context("stage=runtime 写入 evaluation ACN.md 引导失败")?;
+    }
     let submission = EvaluationSubmission::new();
-    let engine =
-        build_evaluation_session_engine(&cfg, &upstream, router.clone(), submission.clone())
-            .context("stage=engine 构造 evaluation session engine 失败")?;
+    let engine = build_evaluation_session_engine(
+        &cfg,
+        &upstream,
+        router.clone(),
+        submission.clone(),
+        config.harness_mode,
+    )
+    .context("stage=engine 构造 evaluation session engine 失败")?;
     let start = engine
         .start_session_with_id_factory(
             SessionId::random,
             cfg.agent.session.id_mint_max_attempts(),
-            |event| record_session_event(events, &config.attempt_id, compaction_report, event),
+            |event| buffer_session_event(&event_tx, event),
         )
         .await
         .context("stage=session 创建单次 session 失败")?;
@@ -470,24 +515,21 @@ async fn run_attempt_inner(
     let (turn_prompt, forced_claim_ids) =
         task_prompt_with_forced_claims(config, router.as_ref()).await?;
     if !forced_claim_ids.is_empty() {
-        record_event(
-            events,
-            &config.attempt_id,
+        buffer_direct_event(
+            &event_tx,
             "forced_claim_context",
             json!({ "claim_ids": forced_claim_ids }),
         );
     }
     let turn_result = engine
         .run_turn(&mut session, turn_prompt, |event| {
-            record_session_event(events, &config.attempt_id, compaction_report, event)
+            buffer_session_event(&event_tx, event)
         })
         .await;
     turn_result.context("stage=turn 执行任务失败")?;
-    record_evaluation_completion(events, &config.attempt_id, &submission);
+    buffer_evaluation_completion(&event_tx, &submission);
     let report = engine
-        .finalize_session(&mut session, |event| {
-            record_session_event(events, &config.attempt_id, compaction_report, event)
-        })
+        .finalize_session(&mut session, |event| buffer_session_event(&event_tx, event))
         .await
         .context("stage=finalize 收尾 session 失败")?;
     Ok(report)
@@ -575,25 +617,67 @@ impl EvaluationCompletionMode {
     }
 }
 
-fn record_evaluation_completion(
-    events: &mut Vec<EvaluationEvent>,
-    attempt_id: &str,
+fn buffer_evaluation_completion(
+    event_tx: &mpsc::UnboundedSender<BufferedEvaluationEvent>,
     submission: &EvaluationSubmission,
 ) {
     let mode = EvaluationCompletionMode::from_submission(submission);
-    record_event(
-        events,
-        attempt_id,
+    buffer_direct_event(
+        event_tx,
         "evaluation_completion",
         json!({"mode": mode.as_str()}),
     );
     if mode == EvaluationCompletionMode::ExplicitSubmitTask {
-        record_event(
-            events,
-            attempt_id,
+        buffer_direct_event(
+            event_tx,
             "evaluation_submitted",
             json!({"tool": "submit_task"}),
         );
+    }
+}
+
+fn buffer_direct_event(
+    event_tx: &mpsc::UnboundedSender<BufferedEvaluationEvent>,
+    event_type: &str,
+    payload: Value,
+) {
+    let _ = event_tx.send(BufferedEvaluationEvent::Direct {
+        event_type: event_type.to_string(),
+        payload,
+        timestamp_utc: Utc::now(),
+    });
+}
+
+fn buffer_session_event(
+    event_tx: &mpsc::UnboundedSender<BufferedEvaluationEvent>,
+    event: SessionEvent,
+) {
+    let _ = event_tx.send(BufferedEvaluationEvent::Session {
+        event,
+        timestamp_utc: Utc::now(),
+    });
+}
+
+fn drain_buffered_events(
+    event_rx: &mut mpsc::UnboundedReceiver<BufferedEvaluationEvent>,
+    events: &mut Vec<EvaluationEvent>,
+    attempt_id: &str,
+    compaction_report: &mut SessionFinalizeReport,
+) {
+    while let Ok(buffered) = event_rx.try_recv() {
+        match buffered {
+            BufferedEvaluationEvent::Direct {
+                event_type,
+                payload,
+                timestamp_utc,
+            } => record_event_at(events, attempt_id, &event_type, payload, timestamp_utc),
+            BufferedEvaluationEvent::Session {
+                event,
+                timestamp_utc,
+            } => {
+                record_session_event_at(events, attempt_id, compaction_report, event, timestamp_utc)
+            }
+        }
     }
 }
 
@@ -655,7 +739,7 @@ fn append_claim_snapshot_events(
             events,
             attempt_id,
             "claim_snapshot",
-            json!({"claim": claim}),
+            json!({ "claim": claim }),
         );
     }
     Ok(())
@@ -806,11 +890,12 @@ fn apply_claim_attribution(result: &mut EvaluationResult, report: &SessionFinali
         .collect();
 }
 
-fn record_session_event(
+fn record_session_event_at(
     events: &mut Vec<EvaluationEvent>,
     attempt_id: &str,
     compaction_report: &mut SessionFinalizeReport,
     event: SessionEvent,
+    timestamp_utc: DateTime<Utc>,
 ) {
     let (kind, payload) = match event {
         SessionEvent::AssistantMessageCompleted { .. }
@@ -823,7 +908,7 @@ fn record_session_event(
             json!({"id": id, "outcome": format!("{outcome:?}")}),
         ),
         SessionEvent::TurnCommitted { message_count } => {
-            ("turn_committed", json!({"message_count": message_count}))
+            ("turn_committed", json!({ "message_count": message_count }))
         }
         SessionEvent::FinalizeCompleted {
             new_claim_ids,
@@ -855,11 +940,11 @@ fn record_session_event(
             )
         }
         SessionEvent::TurnFailed { error } | SessionEvent::FinalizeFailed { error } => {
-            ("session_error", json!({"error": error}))
+            ("session_error", json!({ "error": error }))
         }
         _ => return,
     };
-    record_event(events, attempt_id, kind, payload);
+    record_event_at(events, attempt_id, kind, payload, timestamp_utc);
 }
 
 /// 评测只汇总本 attempt 的 claim 归因字段，不携带 report 的 trace、warning 或 recap 状态。
@@ -949,33 +1034,80 @@ async fn prepare_output_dir(
     Ok(())
 }
 
-async fn write_events_new(path: &Path, events: &[EvaluationEvent]) -> anyhow::Result<()> {
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .await
-        .with_context(|| format!("stage=output 创建 event ledger 失败: {}", path.display()))?;
-    for event in events {
-        let encoded = serde_json::to_vec(event).context("stage=output 序列化 event 失败")?;
-        file.write_all(&encoded).await?;
-        file.write_all(b"\n").await?;
-    }
-    file.sync_data().await?;
-    Ok(())
+struct EvaluationArtifactWrite {
+    events: Vec<u8>,
+    result: Vec<u8>,
+    ack: oneshot::Sender<anyhow::Result<()>>,
 }
 
-async fn write_result_new(path: &Path, result: &EvaluationResult) -> anyhow::Result<()> {
-    let encoded = serde_json::to_vec_pretty(result).context("stage=output 序列化 result 失败")?;
-    let mut file = tokio::fs::OpenOptions::new()
+struct EvaluationArtifactWriter {
+    tx: std_mpsc::Sender<EvaluationArtifactWrite>,
+}
+
+impl EvaluationArtifactWriter {
+    fn start(paths: EvaluationRunPaths) -> anyhow::Result<Self> {
+        let (tx, rx) = std_mpsc::channel::<EvaluationArtifactWrite>();
+        std::thread::Builder::new()
+            .name("acn-eval-artifacts".into())
+            .spawn(move || {
+                if let Ok(write) = rx.recv() {
+                    let result =
+                        write_evaluation_artifacts_blocking(&paths, &write.events, &write.result);
+                    let _ = write.ack.send(result);
+                }
+            })
+            .map_err(|error| anyhow::anyhow!("stage=output 启动评测产物持久化线程失败: {error}"))?;
+        Ok(Self { tx })
+    }
+
+    async fn persist(
+        self,
+        events: &[EvaluationEvent],
+        result: &EvaluationResult,
+    ) -> anyhow::Result<()> {
+        let mut encoded_events = Vec::new();
+        for event in events {
+            serde_json::to_writer(&mut encoded_events, event)
+                .context("stage=output 序列化 event 失败")?;
+            encoded_events.push(b'\n');
+        }
+        let mut encoded_result =
+            serde_json::to_vec_pretty(result).context("stage=output 序列化 result 失败")?;
+        encoded_result.push(b'\n');
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.tx
+            .send(EvaluationArtifactWrite {
+                events: encoded_events,
+                result: encoded_result,
+                ack: ack_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("stage=output 评测产物持久化线程已停止"))?;
+        match ack_rx.await {
+            Ok(result) => result,
+            Err(_) => anyhow::bail!("stage=output 评测产物持久化线程未返回结果"),
+        }
+    }
+}
+
+fn write_evaluation_artifacts_blocking(
+    paths: &EvaluationRunPaths,
+    events: &[u8],
+    result: &[u8],
+) -> anyhow::Result<()> {
+    write_new_file_blocking(&paths.event_ledger, events, "event ledger")?;
+    write_new_file_blocking(&paths.result, result, "result")
+}
+
+fn write_new_file_blocking(path: &Path, content: &[u8], label: &str) -> anyhow::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
-        .await
-        .with_context(|| format!("stage=output 创建 result 失败: {}", path.display()))?;
-    file.write_all(&encoded).await?;
-    file.write_all(b"\n").await?;
-    file.sync_data().await?;
+        .with_context(|| format!("stage=output 创建 {label} 失败: {}", path.display()))?;
+    file.write_all(content)
+        .with_context(|| format!("stage=output 写入 {label} 失败: {}", path.display()))?;
+    file.sync_data()
+        .with_context(|| format!("stage=output 同步 {label} 失败: {}", path.display()))?;
     Ok(())
 }
 
@@ -1023,6 +1155,7 @@ model_egress_mode = "pier"
 
         assert!(EvaluationRunPaths::from_config(&config).is_ok());
         assert_eq!(config.model_egress_mode, "pier");
+        assert_eq!(config.harness_mode, EvaluationHarnessMode::Standard);
     }
 
     #[tokio::test]
@@ -1038,14 +1171,26 @@ model_egress_mode = "pier"
         );
         assert!(EVALUATION_ACN_MD_GUIDANCE.contains("至少一个工具调用"));
         assert!(EVALUATION_ACN_MD_GUIDANCE.contains("submit_task"));
+        assert!(EVALUATION_ACN_MD_GUIDANCE.contains("题面验收条件已经覆盖"));
+        assert!(EVALUATION_ACN_MD_GUIDANCE.contains("git commit"));
+        assert!(EVALUATION_ACN_MD_GUIDANCE.contains("consult_router"));
+        assert!(EVALUATION_ACN_MD_GUIDANCE.contains("候选 claim 只是此前探索的经验和线索"));
     }
 
     #[test]
     fn evaluation_completion_distinguishes_explicit_submission_from_normal_assistant_done() {
         let submission = EvaluationSubmission::new();
         let mut events = Vec::new();
+        let mut compaction_report = SessionFinalizeReport::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
-        record_evaluation_completion(&mut events, "attempt-001", &submission);
+        buffer_evaluation_completion(&event_tx, &submission);
+        drain_buffered_events(
+            &mut event_rx,
+            &mut events,
+            "attempt-001",
+            &mut compaction_report,
+        );
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "evaluation_completion");
         assert_eq!(
@@ -1054,12 +1199,91 @@ model_egress_mode = "pier"
         );
 
         submission.mark_submitted();
-        record_evaluation_completion(&mut events, "attempt-001", &submission);
+        buffer_evaluation_completion(&event_tx, &submission);
+        drain_buffered_events(
+            &mut event_rx,
+            &mut events,
+            "attempt-001",
+            &mut compaction_report,
+        );
         assert_eq!(events.len(), 3);
         assert_eq!(events[1].event_type, "evaluation_completion");
         assert_eq!(events[1].payload, json!({"mode": "explicit_submit_task"}));
         assert_eq!(events[2].event_type, "evaluation_submitted");
         assert_eq!(events[2].payload, json!({"tool": "submit_task"}));
+    }
+
+    #[test]
+    fn outer_ledger_assigns_one_strictly_increasing_sequence_to_buffered_events() {
+        let mut events = Vec::new();
+        let mut compaction_report = SessionFinalizeReport::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        record_event(&mut events, "attempt-001", "attempt_started", json!({}));
+        buffer_direct_event(&event_tx, "forced_claim_context", json!({"claim_ids": []}));
+        buffer_session_event(&event_tx, SessionEvent::TurnCommitted { message_count: 2 });
+
+        drain_buffered_events(
+            &mut event_rx,
+            &mut events,
+            "attempt-001",
+            &mut compaction_report,
+        );
+        record_event(&mut events, "attempt-001", "attempt_finished", json!({}));
+
+        assert_eq!(
+            events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(events[2].event_type, "turn_committed");
+    }
+
+    #[test]
+    fn artifact_persistence_does_not_depend_on_the_tokio_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("test runtime should build");
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().expect("tempdir should be created");
+            let paths = EvaluationRunPaths {
+                event_ledger: directory.path().join("events.jsonl"),
+                result: directory.path().join("result.json"),
+            };
+            let artifact_writer = EvaluationArtifactWriter::start(paths.clone())
+                .expect("artifact writer should start before PID exhaustion");
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (blocking_started_tx, blocking_started_rx) = oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = blocking_started_tx.send(());
+                let _ = release_rx.recv();
+            });
+            blocking_started_rx
+                .await
+                .expect("blocking worker should start");
+            let events = vec![EvaluationEvent::new(
+                "attempt-001",
+                1,
+                "attempt_finished",
+                json!({"exit_type": "failed"}),
+                Utc::now(),
+            )];
+            let result =
+                EvaluationResult::empty("attempt-001", "failed", paths.event_ledger.clone());
+
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                artifact_writer.persist(&events, &result),
+            )
+            .await
+            .expect("artifact persistence must not wait for Tokio blocking capacity")
+            .expect("artifact persistence should succeed");
+            assert!(paths.event_ledger.is_file());
+            assert!(paths.result.is_file());
+
+            let _ = release_tx.send(());
+            blocker.await.expect("blocking probe should finish");
+        });
     }
 
     #[test]
@@ -1100,6 +1324,7 @@ model_egress_mode = "pier"
             variant: "B_forced_claim".into(),
             attempt_deadline_secs: 1,
             model_egress_mode: "pier".into(),
+            harness_mode: EvaluationHarnessMode::Standard,
             claim_bundle: Some(PathBuf::from("/tmp/acn-eval/claims.json")),
         };
 
@@ -1137,6 +1362,7 @@ model_egress_mode = "pier"
             variant: "B_forced_claim".into(),
             attempt_deadline_secs: 1,
             model_egress_mode: "pier".into(),
+            harness_mode: EvaluationHarnessMode::Standard,
             claim_bundle: Some(PathBuf::from("/tmp/acn-eval/claims.json")),
         };
 
@@ -1172,6 +1398,7 @@ model_egress_mode = "pier"
             variant: "B_claim".into(),
             attempt_deadline_secs: 1,
             model_egress_mode: "pier".into(),
+            harness_mode: EvaluationHarnessMode::Standard,
             claim_bundle: Some(PathBuf::from("/tmp/acn-eval/claims.json")),
         };
 
@@ -1228,7 +1455,7 @@ model_egress_mode = "pier"
         let mut compaction_report = SessionFinalizeReport::default();
         let mut events = Vec::new();
 
-        record_session_event(
+        record_session_event_at(
             &mut events,
             "attempt-001",
             &mut compaction_report,
@@ -1240,6 +1467,7 @@ model_egress_mode = "pier"
                 used_claim_ids: vec![compaction_used.clone()],
                 new_dispute_ids: Vec::new(),
             },
+            Utc::now(),
         );
         let merged = merge_attempt_claim_reports(
             compaction_report,
@@ -1311,16 +1539,31 @@ model_egress_mode = "pier"
     #[tokio::test]
     async fn timeout_cancellation_leaves_outer_compaction_attribution_available() {
         let claim_id: ClaimId = "claim_11111111".parse().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let mut outer_report = SessionFinalizeReport::default();
-        let timeout = tokio::time::timeout(std::time::Duration::ZERO, async {
-            add_claim_attribution(&mut outer_report, &[claim_id.clone()], &[], &[]);
-            tokio::task::yield_now().await;
+        let buffered_claim_id = claim_id.clone();
+        let attempt_task = tokio::spawn(async move {
+            buffer_session_event(
+                &event_tx,
+                SessionEvent::CompactionCompleted {
+                    compacted_until: 1,
+                    recapped_until: 1,
+                    new_claim_ids: vec![buffered_claim_id],
+                    updated_claim_ids: Vec::new(),
+                    used_claim_ids: Vec::new(),
+                    new_dispute_ids: Vec::new(),
+                },
+            );
             std::future::pending::<()>().await;
-        })
-        .await;
+        });
+        tokio::task::yield_now().await;
+        attempt_task.abort();
+        let _ = attempt_task.await;
+        let mut events = Vec::new();
+        drain_buffered_events(&mut event_rx, &mut events, "attempt-001", &mut outer_report);
 
-        assert!(timeout.is_err());
         assert_eq!(outer_report.new_claim_ids, vec![claim_id]);
+        assert_eq!(events[0].event_type, "compaction_completed");
     }
 
     fn snapshot_claim(id: &str, name: &str) -> Claim {

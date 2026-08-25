@@ -18,6 +18,14 @@ const BUNDLED_TEMPLATES: &[(&str, &str)] = &[
         include_str!("../../prompts/agent_system.j2"),
     ),
     (
+        "evaluation_agent_system.j2",
+        include_str!("../../prompts/evaluation_agent_system.j2"),
+    ),
+    (
+        "evaluation_minimal_agent_system.j2",
+        include_str!("../../prompts/evaluation_minimal_agent_system.j2"),
+    ),
+    (
         "inbox_claim_attribute_update_internalize.j2",
         include_str!("../../prompts/inbox_claim_attribute_update_internalize.j2"),
     ),
@@ -164,20 +172,22 @@ impl PromptRegistry {
     pub fn validate_renderable(&self, names: &[&str]) -> Result<(), PromptError> {
         for name in names {
             match *name {
-                "agent_system" => self.render(
-                    name,
-                    minijinja::context! {
-                        agent_id => "agent-a",
-                        memory_enabled => true,
-                        memory_md => "agent memory",
-                        user_md => "user profile",
-                        local_claims_snapshot => "local claims",
-                        router_scopes_overview => "router overview",
-                        available_skills => Vec::<serde_json::Value>::new(),
-                        subagent_max_concurrent => 6usize,
-                        file_edit_authority_enabled => true,
-                    },
-                )?,
+                "agent_system" | "evaluation_agent_system" | "evaluation_minimal_agent_system" => {
+                    self.render(
+                        name,
+                        minijinja::context! {
+                            agent_id => "agent-a",
+                            memory_enabled => true,
+                            memory_md => "agent memory",
+                            user_md => "user profile",
+                            local_claims_snapshot => "local claims",
+                            router_scopes_overview => "router overview",
+                            available_skills => Vec::<serde_json::Value>::new(),
+                            subagent_max_concurrent => 6usize,
+                            file_edit_authority_enabled => true,
+                        },
+                    )?
+                }
                 "session_compaction" => self.render(
                     name,
                     minijinja::context! {
@@ -460,6 +470,60 @@ mod tests {
         assert!(out.contains("2000 个中文字符或 120 行以内"));
         assert!(out.contains("更长内容按章节分段 append"));
         assert!(out.contains("避免把大段正文一次性塞进 `file_write.content`"));
+    }
+
+    #[test]
+    fn repository_evaluation_agent_system_is_minimal_and_keeps_claim_boundary() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let source = fs::read_to_string(root.join("evaluation_agent_system.j2")).unwrap();
+        let reg = PromptRegistry::new(&root).unwrap();
+        let out = reg
+            .render("evaluation_agent_system", agent_system_test_context(false))
+            .unwrap();
+
+        assert!(source.contains("编程评测"));
+        assert!(out.contains("改代码并通过验收"));
+        assert!(out.contains("submit_task"));
+        assert!(out.contains("验收条件"));
+        assert!(out.contains("git commit"));
+        assert!(out.contains("file_read"));
+        assert!(out.contains("code_run"));
+        assert!(out.contains("consult_router"));
+        assert!(out.contains("不要在会话中创建、更新或删除 claim"));
+        assert!(out.contains("finalize"));
+        assert!(out.contains("候选 claim 只是此前探索的经验和线索"));
+        assert!(out.contains("self claims 快照"));
+        assert!(!out.contains("思考并**用自然语言**回答用户的问题"));
+        assert!(!out.contains("create_subagent"));
+        assert!(!out.contains("web_search"));
+        assert!(!out.contains("调用 `session_search`"));
+        assert!(out.contains("评测中没有 web、memory、subagent、ask_user、session_search"));
+        assert!(!out.contains("{% include \"what_is_claim.j2\" %}"));
+        assert!(!out.contains("{% include \"what_is_dispute.j2\" %}"));
+        assert!(!out.contains("{% include \"what_is_memory.j2\" %}"));
+        assert!(!out.contains("persistent memory"));
+    }
+
+    #[test]
+    fn repository_minimal_evaluation_prompt_matches_the_reduced_tool_surface() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let reg = PromptRegistry::new(&root).unwrap();
+        let out = reg
+            .render(
+                "evaluation_minimal_agent_system",
+                agent_system_test_context(false),
+            )
+            .unwrap();
+
+        assert!(out.contains("code_run"));
+        assert!(out.contains("write_stdin"));
+        assert!(out.contains("process_list"));
+        assert!(out.contains("consult_router"));
+        assert!(out.contains("candidate claims"));
+        assert!(!out.contains("file_read"));
+        assert!(!out.contains("working_note"));
+        assert!(!out.contains("available_skills"));
+        assert!(!out.contains("self claims"));
     }
 
     #[test]

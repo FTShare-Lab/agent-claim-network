@@ -16,6 +16,20 @@ python -m acn_deepswe.auto_run --config /absolute/path/to/automated-run.json run
 
 若宿主未设置模型 key，可将最后一条命令改为 `run --read-key-stdin`；自动化父进程只会在终端隐藏读取一次，并仅在自身内存中继承给所运行阶段，结束即清除。该值不会写入运行配置、manifest 或日志。若要跳过 Smoke，设置 `"smoke_size": 0`、`"full_size": 113`；`run` 会直接进入 `full` 阶段。
 
+需要先评估 A、满意后再补三条 B 臂时，使用两个独立 `run_root`。第一阶段设置
+`"run_a_only": true`、`"smoke_size": 0`；每题执行 A、写入 freeze barrier 和 claim bundle，三条 B
+臂以 `A_ONLY` 终态留档。第二阶段保持相同的任务 seed、plan seed、模型、effort、资源、超时、镜像、
+二进制与源码，设置 `"run_a_only": false`、`"run_all_variants_without_claims": true`，并增加：
+
+```json
+"b_only_from_a_output_dir": "/absolute/path/to/a-run/full/output"
+```
+
+第二阶段只调度 `B_empty`、`B_claim`、`B_forced_claim`，不会重跑 A。真实执行前会先校验全部 task 的
+A-only manifest、Gate、freeze barrier、claim bundle、task checksum 与公平性 provenance；任一 task
+缺失、被修改或配置漂移时，整批 B 在创建 attempt 目录前失败。B manifest 同时保留来源 A 的证据路径和
+source manifest hash。B-only 必须设置 `smoke_size=0`，且不能与 `run_a_only` 同时启用。
+
 `run` 会继承原有 key，但不打印、不写入配置、manifest 或命令行。同一 `run_root` 有跨进程锁，第二个
 自动编排器会被拒绝，不能并行覆盖 checkpoint。若进程中断，普通 `run` 只报告阶段需要人工确认，不会自动
 续跑。操作者确认是无终态的中断后，显式传 `run --resume-interrupted`，它才向阶段传递

@@ -8430,7 +8430,20 @@ async fn turn_journal_emitter_flushes_delta_by_timer_without_next_delta() {
         TurnJournalEventKind::AssistantDelta { text } => assert_eq!(text, "partial"),
         other => panic!("unexpected journal command: {other:?}"),
     }
-    emitter.finish(TurnJournalStatus::Failed).await;
+    let finish = tokio::spawn(emitter.finish(TurnJournalStatus::Failed));
+    let command = rx.recv().await.unwrap();
+    assert!(matches!(
+        command.kind,
+        TurnJournalEventKind::TurnFinished {
+            status: TurnJournalStatus::Failed
+        }
+    ));
+    command
+        .ack
+        .expect("TurnFinished must request a durable ack")
+        .send(Ok(()))
+        .expect("finish task still waits for ack");
+    finish.await.expect("finish task should join");
 }
 
 #[test]

@@ -302,6 +302,47 @@ class PresmokeRunnerTests(unittest.TestCase):
         self.assertEqual(started, list(TASK_IDS[1:]))
         self.assertEqual(results[0].status, "no_eligible_claim")
 
+    def test_a_only_checkpoint_is_a_reusable_passed_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            specs = build_specs(root)
+            write_a_only_task_artifacts(specs[0])
+            completion = root / "task-completions.json"
+            completion.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "task_results": [
+                            PresmokeTaskResult(
+                                specs[0].task_id,
+                                "passed",
+                                str(specs[0].manifest_path),
+                                None,
+                            ).to_dict()
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            terminal = load_terminal_task_results(specs, completion)
+            started: list[str] = []
+
+            def factory(spec: PresmokeTaskSpec) -> FakeTaskRunner:
+                return FakeTaskRunner(spec.task_id, started)
+
+            results = PresmokeHostRunner(
+                specs[1:],
+                root / "aggregate.json",
+                frozen_task_ids=TASK_IDS,
+                task_runner_factory=factory,
+                completed_task_results=terminal,
+                completion_manifest_path=completion,
+            ).run(execute=True)
+
+        self.assertEqual(terminal[0].status, "passed")
+        self.assertEqual(started, list(TASK_IDS[1:]))
+        self.assertEqual(results[0].status, "passed")
+
     def test_interrupted_retry_can_be_reserved_only_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             completion = (Path(directory) / "task-completions.json").resolve()
@@ -400,6 +441,48 @@ def build_specs(root: Path) -> tuple[PresmokeTaskSpec, ...]:
 def write_completed_task_artifacts(spec: PresmokeTaskSpec) -> None:
     records = []
     for attempt in spec.experiment.attempts:
+        output = Path(attempt.output_path)
+        output.mkdir(parents=True)
+        result_path = output / "attempt-result.json"
+        gate_path = output / "gate.json"
+        result_path.write_text(
+            json.dumps({"attempt_id": attempt.attempt_id, "variant": attempt.variant}),
+            encoding="utf-8",
+        )
+        gate_path.write_text(
+            json.dumps({"attempt_id": attempt.attempt_id, "decision": "pass"}),
+            encoding="utf-8",
+        )
+        records.append(
+            {
+                "attempt_id": attempt.attempt_id,
+                "variant": attempt.variant,
+                "status": "passed",
+                "result_path": str(result_path),
+                "gate_path": str(gate_path),
+            }
+        )
+    spec.manifest_path.parent.mkdir(parents=True)
+    spec.manifest_path.write_text(
+        json.dumps({"failure": None, "attempt_results": records}), encoding="utf-8"
+    )
+
+
+def write_a_only_task_artifacts(spec: PresmokeTaskSpec) -> None:
+    records = []
+    for attempt in spec.experiment.attempts:
+        if attempt.variant != "A":
+            records.append(
+                {
+                    "attempt_id": attempt.attempt_id,
+                    "variant": attempt.variant,
+                    "status": "not_run",
+                    "reason": "A_ONLY",
+                    "result_path": None,
+                    "gate_path": None,
+                }
+            )
+            continue
         output = Path(attempt.output_path)
         output.mkdir(parents=True)
         result_path = output / "attempt-result.json"

@@ -337,6 +337,51 @@ async fn evaluation_registry_limits_tools_and_keeps_router() {
 }
 
 #[tokio::test]
+async fn minimal_evaluation_registry_keeps_only_process_claim_and_submission_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = ToolRegistry::new(&test_tool_config(dir.path()))
+        .unwrap()
+        .with_router_client(Arc::new(TestRouter {
+            result: sample_router_result(),
+            overview: sample_scopes_overview(),
+        }))
+        .for_minimal_evaluation("ACN_TEST_EVALUATION_SECRET".into())
+        .with_evaluation_submission(EvaluationSubmission::new());
+
+    let names = registry
+        .definitions()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        names,
+        vec![
+            "code_run",
+            "write_stdin",
+            "process_list",
+            "consult_router",
+            "submit_task",
+        ]
+    );
+    assert!(!registry.background_process_context_enabled());
+    assert!(matches!(
+        registry
+            .dispatch("file_read", json!({"path": "README.md"}))
+            .await,
+        Err(ToolError::UnknownTool(_))
+    ));
+    assert_eq!(
+        registry
+            .dispatch("consult_router", json!({"mode": "overview"}))
+            .await
+            .unwrap()
+            .outcome,
+        ToolExecutionOutcome::Completed
+    );
+}
+
+#[tokio::test]
 async fn evaluation_code_run_removes_configured_secret_from_pipe_environment() {
     let _secret = EnvVarGuard::set("ACN_TEST_EVALUATION_SECRET", "secret-value");
     let _visible = EnvVarGuard::set("ACN_TEST_EVALUATION_VISIBLE", "visible-value");
