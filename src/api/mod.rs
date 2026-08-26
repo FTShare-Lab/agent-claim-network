@@ -172,13 +172,14 @@ pub use turn_loop::{
     AgentTurnLoop, SessionTurnContextAppender, SessionTurnEventRecorder, SessionTurnPreflight,
 };
 pub use types::{
-    AvailableSkill, ClaimAttributeUpdateInternalizeRequest, ClaimDraft,
-    CompletedSessionTurnMessage, DisputeDraft, InboxInternalizeKind, InternalizeOutcome,
-    InternalizeRequest, MemoryReviewRequest, ModelContextSource, ProviderReplayState, RecapOutcome,
-    SessionAttachment, SessionCompactionOutcome, SessionCompactionRequest, SessionRecapRequest,
-    SessionSearchSummaryOutcome, SessionSearchSummaryRequest, SessionTurn, SessionTurnContentBlock,
-    SessionTurnEvent, SessionTurnInterrupted, SessionTurnMessage, SessionTurnRequest,
-    ToolCallSkipReason, ToolExecutionOutcome, TurnMessage,
+    AvailableSkill, ClaimAttributeUpdateInternalizeItem, ClaimAttributeUpdateInternalizeRequest,
+    ClaimDraft, CompletedSessionTurnMessage, DisputeDraft, InboxInternalizeKind,
+    InternalizeOutcome, InternalizeRequest, MemoryReviewRequest, ModelContextSource,
+    ProviderReplayState, RecapOutcome, SessionAttachment, SessionCompactionOutcome,
+    SessionCompactionRequest, SessionRecapRequest, SessionSearchSummaryOutcome,
+    SessionSearchSummaryRequest, SessionTurn, SessionTurnContentBlock, SessionTurnEvent,
+    SessionTurnInterrupted, SessionTurnMessage, SessionTurnRequest, ToolCallSkipReason,
+    ToolExecutionOutcome, TurnMessage,
 };
 
 #[cfg(test)]

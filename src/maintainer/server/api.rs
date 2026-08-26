@@ -218,6 +218,7 @@ pub struct HolderAdoptionSummary {
     pub notified_holders: usize,
     pub delivered_holders: usize,
     pub updated_claims: usize,
+    pub additional_claims: usize,
     pub unchanged_claims: usize,
     pub unavailable_claims: usize,
 }
@@ -226,9 +227,13 @@ pub struct HolderAdoptionSummary {
 pub struct HolderClaimAdoptionView {
     pub claim_id: ClaimId,
     pub claim_name: String,
+    pub is_additional_claim: bool,
     pub snapshot_status: Option<ClaimStatus>,
     pub snapshot_scope: Option<String>,
     pub snapshot_statement: Option<String>,
+    pub adopted_status: Option<ClaimStatus>,
+    pub adopted_scope: Option<String>,
+    pub adopted_statement: Option<String>,
     pub recommended_status: Option<ClaimStatus>,
     pub current_status: Option<ClaimStatus>,
     pub recommended_scope: Option<String>,
@@ -255,6 +260,7 @@ pub struct HolderAdoptionItem {
     pub observation_state: ObservationState,
     pub claim_count: usize,
     pub updated_claim_count: usize,
+    pub additional_claim_count: usize,
     pub unchanged_claim_count: usize,
     pub unavailable_claim_count: usize,
     pub reasons: Vec<String>,
@@ -610,6 +616,7 @@ fn holder_adoption_view(
                 notified_holders: 0,
                 delivered_holders: 0,
                 updated_claims: 0,
+                additional_claims: 0,
                 unchanged_claims: 0,
                 unavailable_claims: 0,
             },
@@ -640,10 +647,21 @@ fn holder_adoption_view(
                 },
                 observation_state: holder.state,
                 claim_count: claims.len(),
-                updated_claim_count: claims.iter().filter(|claim| claim.update_observed).count(),
+                updated_claim_count: claims
+                    .iter()
+                    .filter(|claim| !claim.is_additional_claim && claim.update_observed)
+                    .count(),
+                additional_claim_count: claims
+                    .iter()
+                    .filter(|claim| claim.is_additional_claim && claim.update_observed)
+                    .count(),
                 unchanged_claim_count: claims
                     .iter()
-                    .filter(|claim| claim.current_status.is_some() && !claim.update_observed)
+                    .filter(|claim| {
+                        !claim.is_additional_claim
+                            && claim.current_status.is_some()
+                            && !claim.update_observed
+                    })
                     .count(),
                 unavailable_claim_count: claims
                     .iter()
@@ -673,6 +691,10 @@ fn holder_adoption_view(
                 .iter()
                 .map(|holder| holder.updated_claim_count)
                 .sum(),
+            additional_claims: holders
+                .iter()
+                .map(|holder| holder.additional_claim_count)
+                .sum(),
             unchanged_claims: holders
                 .iter()
                 .map(|holder| holder.unchanged_claim_count)
@@ -696,9 +718,19 @@ fn holder_claim_adoption_view(
     HolderClaimAdoptionView {
         claim_id: claim.claim_id.clone(),
         claim_name: claim.claim_name.clone(),
+        is_additional_claim: claim.is_additional_claim,
         snapshot_status: snapshot.map(|snapshot| snapshot.status),
         snapshot_scope: snapshot.map(|snapshot| snapshot.scope.clone()),
         snapshot_statement: snapshot.map(|snapshot| snapshot.statement.clone()),
+        adopted_status: claim.adoption_snapshot.as_ref().map(|claim| claim.status),
+        adopted_scope: claim
+            .adoption_snapshot
+            .as_ref()
+            .map(|claim| claim.scope.clone()),
+        adopted_statement: claim
+            .adoption_snapshot
+            .as_ref()
+            .map(|claim| claim.statement.clone()),
         recommended_status: claim.recommended_status,
         current_status: claim.current_status,
         recommended_scope: claim.recommended_scope.clone(),
@@ -1298,10 +1330,7 @@ pub async fn upload_claim(
         .await
         .map_err(internal_error)?;
     if let Some(events) = state.resolution_events.as_ref() {
-        events
-            .refresh_claim(&claim.id)
-            .await
-            .map_err(internal_error)?;
+        events.refresh_claim(&claim).await.map_err(internal_error)?;
     }
     log_history_error(
         state
@@ -2016,6 +2045,13 @@ mod tests {
         let observation = ClaimObservation {
             claim_id: snapshot.id.clone(),
             claim_name: snapshot.name.clone(),
+            is_additional_claim: false,
+            adoption_snapshot: Some(Claim {
+                status: ClaimStatus::Stale,
+                scope: "runtime / current".into(),
+                statement: "current production behavior".into(),
+                ..snapshot.clone()
+            }),
             recommended_status: Some(ClaimStatus::Deprecated),
             current_status: Some(ClaimStatus::Stale),
             recommended_scope: None,
@@ -2028,7 +2064,7 @@ mod tests {
             notes: Vec::new(),
         };
 
-        let view = holder_claim_adoption_view(&[snapshot], &observation);
+        let view = holder_claim_adoption_view(std::slice::from_ref(&snapshot), &observation);
 
         assert_eq!(view.snapshot_status, Some(ClaimStatus::Active));
         assert_eq!(view.snapshot_scope.as_deref(), Some("runtime / previous"));
@@ -2037,6 +2073,7 @@ mod tests {
             Some("previous production behavior")
         );
         assert_eq!(view.current_status, Some(ClaimStatus::Stale));
+        assert_eq!(view.adopted_status, Some(ClaimStatus::Stale));
         assert_eq!(view.current_scope.as_deref(), Some("runtime / current"));
         assert_eq!(
             view.current_statement.as_deref(),
@@ -2044,6 +2081,29 @@ mod tests {
         );
         assert!(view.update_observed);
         assert_eq!(view.changed_fields, ["status", "scope", "statement"]);
+
+        let additional_claim = sample_claim(&holder, ClaimStatus::Active, now_seconds());
+        let additional = ClaimObservation {
+            claim_id: additional_claim.id.clone(),
+            claim_name: additional_claim.name.clone(),
+            is_additional_claim: true,
+            adoption_snapshot: Some(additional_claim),
+            recommended_status: None,
+            current_status: Some(ClaimStatus::Active),
+            recommended_scope: None,
+            current_scope: Some("runtime / additional".into()),
+            recommended_statement: None,
+            current_statement: Some("additional knowledge".into()),
+            policy_provenance_present: true,
+            update_observed: true,
+            changed_fields: Vec::new(),
+            notes: Vec::new(),
+        };
+        let additional_view =
+            holder_claim_adoption_view(std::slice::from_ref(&snapshot), &additional);
+        assert!(additional_view.is_additional_claim);
+        assert!(additional_view.snapshot_status.is_none());
+        assert_eq!(additional_view.adopted_status, Some(ClaimStatus::Active));
     }
 
     #[tokio::test]

@@ -187,6 +187,7 @@ const resolvedDetail: DisputeDetail = {
       notified_holders: 5,
       delivered_holders: 4,
       updated_claims: 1,
+      additional_claims: 1,
       unchanged_claims: 1,
       unavailable_claims: 1,
     },
@@ -197,6 +198,7 @@ const resolvedDetail: DisputeDetail = {
         observation_state: 'no_update_observed',
         claim_count: 1,
         updated_claim_count: 0,
+        additional_claim_count: 0,
         unchanged_claim_count: 1,
         unavailable_claim_count: 0,
         reasons: [],
@@ -223,8 +225,9 @@ const resolvedDetail: DisputeDetail = {
         agent_id: 'agent-updated',
         delivery_state: 'delivered',
         observation_state: 'update_observed',
-        claim_count: 1,
+        claim_count: 2,
         updated_claim_count: 1,
+        additional_claim_count: 1,
         unchanged_claim_count: 0,
         unavailable_claim_count: 0,
         reasons: [],
@@ -236,15 +239,32 @@ const resolvedDetail: DisputeDetail = {
           snapshot_status: 'active',
           snapshot_scope: 'payments / previous',
           snapshot_statement: longSnapshotStatement,
+          adopted_status: 'active',
+          adopted_scope: 'payments / legacy',
+          adopted_statement: longCurrentStatement,
           recommended_status: 'deprecated',
           current_status: 'active',
           recommended_scope: 'payments / current',
           current_scope: 'payments / legacy',
           recommended_statement: longSnapshotStatement,
           current_statement: longCurrentStatement,
-          policy_provenance_present: false,
+          policy_provenance_present: true,
           update_observed: true,
           changed_fields: ['scope', 'statement'],
+          notes: [],
+        }, {
+          claim_id: 'claim_new_a',
+          claim_name: 'claim-new-name',
+          is_additional_claim: true,
+          adopted_status: 'active',
+          adopted_scope: 'payments / current',
+          adopted_statement: 'A newly derived operational boundary.',
+          current_status: 'active',
+          current_scope: 'payments / current',
+          current_statement: 'A newly derived operational boundary.',
+          policy_provenance_present: true,
+          update_observed: true,
+          changed_fields: [],
           notes: [],
         }],
         technical: {
@@ -259,6 +279,7 @@ const resolvedDetail: DisputeDetail = {
         observation_state: 'no_update_observed',
         claim_count: 0,
         updated_claim_count: 0,
+        additional_claim_count: 0,
         unchanged_claim_count: 0,
         unavailable_claim_count: 0,
         reasons: [],
@@ -271,6 +292,7 @@ const resolvedDetail: DisputeDetail = {
         observation_state: 'unknown',
         claim_count: 1,
         updated_claim_count: 0,
+        additional_claim_count: 0,
         unchanged_claim_count: 0,
         unavailable_claim_count: 1,
         reasons: ['The holder mirror is missing or duplicated.'],
@@ -283,6 +305,7 @@ const resolvedDetail: DisputeDetail = {
         observation_state: 'not_delivered',
         claim_count: 0,
         updated_claim_count: 0,
+        additional_claim_count: 0,
         unchanged_claim_count: 0,
         unavailable_claim_count: 0,
         reasons: ['The inbox has not been acknowledged.'],
@@ -615,6 +638,7 @@ describe('DisputesPage', () => {
     expect(panel).toHaveClass('border-amber-700', 'bg-amber-50/40')
     expect(panel).toHaveTextContent('Delivered holders4')
     expect(panel).toHaveTextContent('Updated Claims1')
+    expect(panel).toHaveTextContent('Additional Claims1')
     expect(panel).toHaveTextContent('Unchanged Claims1')
     expect(panel).toHaveTextContent('Unavailable Claims1')
     expect(panel).not.toHaveTextContent('Converged')
@@ -625,7 +649,7 @@ describe('DisputesPage', () => {
     expect(within(panel).getAllByText('Not delivered')).not.toHaveLength(0)
     expect(within(panel).getAllByText('No update observed')).not.toHaveLength(0)
     expect(within(panel).getByText('Update observed')).toBeInTheDocument()
-    expect(within(panel).getByText('Claim mirror unavailable')).toBeInTheDocument()
+    expect(within(panel).getByText('Mirror unavailable')).toBeInTheDocument()
   })
 
   it('renders Claim snapshots before and after Agent internalization', async () => {
@@ -636,9 +660,10 @@ describe('DisputesPage', () => {
     fireEvent.click(within(panel).getByRole('button', { name: 'Show holder adoption' }))
     const holder = within(panel).getByRole('article', { name: 'Holder adoption agent-updated' })
 
-    fireEvent.click(within(holder).getByText('Resolution snapshot / current mirror (1)'))
+    fireEvent.click(within(holder).getByText('Direct Claim adoption (1)'))
     const comparison = within(holder).getByRole('article', { name: 'Claim adoption claim_a' })
     expect(comparison).toHaveTextContent('At Resolution')
+    expect(comparison).toHaveTextContent('Agent Adoption')
     expect(comparison).toHaveTextContent('Current Mirror')
     expect(comparison).toHaveTextContent('payments / previous')
     expect(comparison).toHaveTextContent('payments / legacy')
@@ -655,6 +680,8 @@ describe('DisputesPage', () => {
     expect(holder).toHaveTextContent('Policy ID:')
     expect(holder).toHaveTextContent('policy_resolution')
     expect(holder).not.toHaveTextContent('"policy_id"')
+    expect(holder).toHaveTextContent('Additional Claims from this CAU (1)')
+    expect(within(holder).getByRole('article', { name: 'Additional Claim adoption claim_new_a' })).toHaveTextContent('A newly derived operational boundary.')
   })
 
   it('renders an empty holder-adoption state without raw JSON', async () => {

@@ -13,7 +13,7 @@ const observationLabels: Record<HolderAdoption['observation_state'], string> = {
   not_delivered: 'Not delivered',
   no_update_observed: 'No update observed',
   update_observed: 'Update observed',
-  unknown: 'Claim mirror unavailable',
+  unknown: 'Mirror unavailable',
 }
 
 const summaryCellClass = 'rounded border border-amber-900/15 bg-white/80 p-2'
@@ -25,9 +25,78 @@ function observationTone(state: HolderAdoption['observation_state']) {
   return 'neutral' as const
 }
 
+function ClaimFields({
+  label,
+  status,
+  scope,
+  statement,
+  tone = 'slate',
+}: {
+  label: string
+  status?: ClaimAdoptionComparison['current_status']
+  scope?: string | null
+  statement?: string | null
+  tone?: 'slate' | 'amber' | 'emerald'
+}) {
+  const styles = tone === 'amber'
+    ? 'border-amber-200 bg-amber-50/70 text-amber-800'
+    : tone === 'emerald'
+      ? 'border-emerald-200 bg-emerald-50/60 text-emerald-800'
+      : 'border-slate-200 bg-slate-50/80 text-slate-600'
+  return (
+    <div className={`rounded-lg border p-2.5 ${styles}`}>
+      <div className="text-[11px] font-bold uppercase tracking-wide">{label}</div>
+      <div className="mt-2">{status ? <StatusBadge>{status}</StatusBadge> : <span className="text-slate-500">Not recorded</span>}</div>
+      <div className="mt-2 text-[11px] font-medium">Scope</div>
+      <div className="mt-0.5 break-words leading-5 text-slate-900">{scope ?? 'Not recorded'}</div>
+      <div className="mt-2 text-[11px] font-medium">Statement</div>
+      <ExpandableText className="mt-0.5 block leading-5 text-slate-900" limit={130} emptyLabel="Not recorded">
+        {statement}
+      </ExpandableText>
+    </div>
+  )
+}
+
 function ClaimComparison({ claim }: { claim: ClaimAdoptionComparison }) {
   const changes = claim.changed_fields
-  const hasSnapshot = Boolean(claim.snapshot_status || claim.snapshot_scope || claim.snapshot_statement)
+  const currentDiffersFromAdoption = Boolean(claim.adopted_status) && (
+    claim.current_status !== claim.adopted_status
+    || claim.current_scope !== claim.adopted_scope
+    || claim.current_statement !== claim.adopted_statement
+  )
+
+  if (claim.is_additional_claim) {
+    return (
+      <article aria-label={`Additional Claim adoption ${claim.claim_id}`} className="rounded-lg border border-emerald-200 bg-white p-3">
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <div className="min-w-0">
+            <div className="break-words text-xs font-semibold text-slate-900">{claim.claim_name || 'Claim'}</div>
+            <div className="mt-0.5 break-all font-mono text-[11px] text-slate-500">{claim.claim_id}</div>
+          </div>
+          <StatusBadge tone="success">Additional Claim observed</StatusBadge>
+        </div>
+        <div className={`mt-3 grid gap-2.5 text-xs ${currentDiffersFromAdoption ? 'sm:grid-cols-2' : ''}`}>
+          <ClaimFields
+            label="Additional Claim from this CAU"
+            status={claim.adopted_status}
+            scope={claim.adopted_scope}
+            statement={claim.adopted_statement}
+            tone="emerald"
+          />
+          {currentDiffersFromAdoption ? (
+            <ClaimFields
+              label="Current Mirror"
+              status={claim.current_status}
+              scope={claim.current_scope}
+              statement={claim.current_statement}
+              tone="amber"
+            />
+          ) : null}
+        </div>
+      </article>
+    )
+  }
+
   return (
     <article aria-label={`Claim adoption ${claim.claim_id}`} className="rounded-lg border border-amber-200 bg-white p-3">
       <div className="flex flex-wrap items-start justify-between gap-2">
@@ -35,51 +104,38 @@ function ClaimComparison({ claim }: { claim: ClaimAdoptionComparison }) {
           <div className="break-words text-xs font-semibold text-slate-900">{claim.claim_name ?? 'Claim'}</div>
           <div className="mt-0.5 break-all font-mono text-[11px] text-slate-500">{claim.claim_id}</div>
         </div>
-        {!hasSnapshot ? (
-          <StatusBadge tone="warning">Snapshot unavailable</StatusBadge>
-        ) : claim.current_status ? (
+        {claim.current_status ? (
           <StatusBadge tone={claim.update_observed ? 'info' : 'neutral'}>
-            {claim.update_observed ? `Update observed · ${changes.join(', ')}` : 'No update observed'}
+            {claim.update_observed
+              ? `Attributed update${changes.length ? ` · ${changes.join(', ')}` : ''}`
+              : 'No attributed update'}
           </StatusBadge>
         ) : (
           <StatusBadge tone="warning">Mirror unavailable</StatusBadge>
         )}
       </div>
 
-      <div className="mt-3 grid gap-2.5 text-xs sm:grid-cols-2">
-        <div className="rounded-lg border border-slate-200 bg-slate-50/80 p-2.5">
-          <div className="text-[11px] font-bold uppercase tracking-wide text-slate-600">At Resolution</div>
-          <div className="mt-2">{claim.snapshot_status ? <StatusBadge>{claim.snapshot_status}</StatusBadge> : <span className="text-slate-500">Snapshot unavailable</span>}</div>
-          <div className="mt-2 text-[11px] font-medium text-slate-500">Scope</div>
-          <div className="mt-0.5 break-words leading-5 text-slate-800">{claim.snapshot_scope ?? 'Snapshot unavailable'}</div>
-          <div className="mt-2 text-[11px] font-medium text-slate-500">Statement</div>
-          <ExpandableText className="mt-0.5 block leading-5 text-slate-800" limit={130} emptyLabel="Snapshot unavailable">
-            {claim.snapshot_statement}
-          </ExpandableText>
-        </div>
-        <div className="rounded-lg border border-amber-200 bg-amber-50/70 p-2.5">
-          <div className="text-[11px] font-bold uppercase tracking-wide text-amber-800">Current Mirror</div>
-          <div className="mt-2">{claim.current_status ? <StatusBadge>{claim.current_status}</StatusBadge> : <span className="text-slate-500">Mirror unavailable</span>}</div>
-          <div className="mt-2 text-[11px] font-medium text-amber-700">Scope</div>
-          <div className="mt-0.5 break-words leading-5 text-slate-900">{claim.current_scope ?? 'Mirror unavailable'}</div>
-          <div className="mt-2 text-[11px] font-medium text-amber-700">Statement</div>
-          <ExpandableText className="mt-0.5 block leading-5 text-slate-900" limit={130} emptyLabel="Mirror unavailable">
-            {claim.current_statement}
-          </ExpandableText>
-        </div>
+      <div className={`mt-3 grid gap-2.5 text-xs ${claim.adopted_status ? 'sm:grid-cols-3' : 'sm:grid-cols-2'}`}>
+        <ClaimFields label="At Resolution" status={claim.snapshot_status} scope={claim.snapshot_scope} statement={claim.snapshot_statement} />
+        {claim.adopted_status ? (
+          <ClaimFields label="Agent Adoption" status={claim.adopted_status} scope={claim.adopted_scope} statement={claim.adopted_statement} tone="emerald" />
+        ) : null}
+        <ClaimFields label="Current Mirror" status={claim.current_status} scope={claim.current_scope} statement={claim.current_statement} tone="amber" />
       </div>
     </article>
   )
 }
 
 function HolderCard({ holder, observedAt }: { holder: HolderAdoption; observedAt?: string }) {
+  const directClaims = holder.claims.filter((claim) => !claim.is_additional_claim)
+  const additionalClaims = holder.claims.filter((claim) => claim.is_additional_claim)
   return (
     <article aria-label={`Holder adoption ${holder.agent_id}`} className="rounded-md border border-amber-200 bg-amber-50/40 p-3">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div>
           <div className="text-xs font-semibold text-slate-900">{holder.agent_id}</div>
           <div className="mt-1 text-[11px] text-slate-500">
-            {holder.claim_count} Claim{holder.claim_count === 1 ? '' : 's'} compared · {holder.updated_claim_count} updated · {holder.unchanged_claim_count} unchanged
+            {holder.claim_count} Claim{holder.claim_count === 1 ? '' : 's'} observed · {holder.updated_claim_count} updated · {holder.additional_claim_count ?? 0} additional · {holder.unchanged_claim_count} unchanged
           </div>
         </div>
         <div className="flex flex-wrap justify-end gap-1.5">
@@ -107,14 +163,25 @@ function HolderCard({ holder, observedAt }: { holder: HolderAdoption; observedAt
 
       <details className="mt-3 rounded-md border border-slate-200 bg-white p-2.5">
         <summary className="cursor-pointer text-xs font-medium text-amber-800">
-          Resolution snapshot / current mirror ({holder.claims.length})
+          Direct Claim adoption ({directClaims.length})
         </summary>
         <div className="mt-2 space-y-2">
-          {holder.claims.length
-            ? holder.claims.map((claim) => <ClaimComparison key={claim.claim_id} claim={claim} />)
-            : <div className="text-xs text-slate-500">No Claim snapshots are available.</div>}
+          {directClaims.length
+            ? directClaims.map((claim) => <ClaimComparison key={claim.claim_id} claim={claim} />)
+            : <div className="text-xs text-slate-500">No direct Claims are associated with this holder.</div>}
         </div>
       </details>
+
+      {additionalClaims.length ? (
+        <details open className="mt-2 rounded-md border border-emerald-200 bg-white p-2.5">
+          <summary className="cursor-pointer text-xs font-medium text-emerald-800">
+            Additional Claims from this CAU ({additionalClaims.length})
+          </summary>
+          <div className="mt-2 space-y-2">
+            {additionalClaims.map((claim) => <ClaimComparison key={claim.claim_id} claim={claim} />)}
+          </div>
+        </details>
+      ) : null}
 
       {holder.technical && Object.values(holder.technical).some(Boolean) ? (
         <details className="mt-2 rounded-md border border-slate-200 bg-white p-2.5 text-[11px]">
@@ -136,6 +203,7 @@ export function HolderAdoptionPanel({ adoption }: { adoption?: HolderAdoptionVie
     notified_holders: 0,
     delivered_holders: 0,
     updated_claims: 0,
+    additional_claims: 0,
     unchanged_claims: 0,
     unavailable_claims: 0,
   }
@@ -161,6 +229,7 @@ export function HolderAdoptionPanel({ adoption }: { adoption?: HolderAdoptionVie
         <div className={summaryCellClass}><dt className={summaryLabelClass}>Notified holders</dt><dd className={summaryValueClass}>{summary.notified_holders}</dd></div>
         <div className={summaryCellClass}><dt className={summaryLabelClass}>Delivered holders</dt><dd className={summaryValueClass}>{summary.delivered_holders}</dd></div>
         <div className={summaryCellClass}><dt className={summaryLabelClass}>Updated Claims</dt><dd className={summaryValueClass}>{summary.updated_claims}</dd></div>
+        <div className={summaryCellClass}><dt className={summaryLabelClass}>Additional Claims</dt><dd className={summaryValueClass}>{summary.additional_claims ?? 0}</dd></div>
         <div className={summaryCellClass}><dt className={summaryLabelClass}>Unchanged Claims</dt><dd className={summaryValueClass}>{summary.unchanged_claims}</dd></div>
         <div className={summaryCellClass}><dt className={summaryLabelClass}>Unavailable Claims</dt><dd className={summaryValueClass}>{summary.unavailable_claims}</dd></div>
         <div className={summaryCellClass}><dt className={summaryLabelClass}>Last observation change</dt><dd className="mt-1 font-mono text-[11px] text-amber-950">{formatDateTime(adoption?.observed_at)}</dd></div>

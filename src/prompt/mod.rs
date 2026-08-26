@@ -686,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_claim_attribute_update_prompt_defines_unified_single_call_context() {
+    fn repository_claim_attribute_update_prompt_defines_unified_batch_context() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
         let reg = PromptRegistry::new(&root).unwrap();
         let prompt = reg
@@ -694,7 +694,7 @@ mod tests {
             .unwrap();
 
         for field in [
-            "claim_attribute_update",
+            "claim_attribute_updates",
             "conclusion",
             "resolution",
             "dispute",
@@ -714,6 +714,9 @@ mod tests {
         assert!(prompt.contains("仅仅选择不采纳 CAU 或 Resolution"));
         assert!(prompt.contains("新的实质证据"));
         assert!(prompt.contains("语义输入完全相同，不要重复创建"));
+        assert!(prompt.contains("按 inbox 先后顺序"));
+        assert!(prompt.contains("真正导致该变更的本批 CAU Policy ID"));
+        assert!(prompt.contains("不要把本批所有 Policy 机械附加"));
     }
 
     #[test]

@@ -120,9 +120,13 @@ export type AnalysisListResponse = {
 export type ClaimAdoptionComparison = {
   claim_id: string
   claim_name: string
+  is_additional_claim?: boolean
   snapshot_status?: 'active' | 'stale' | 'deprecated' | null
   snapshot_scope?: string | null
   snapshot_statement?: string | null
+  adopted_status?: 'active' | 'stale' | 'deprecated' | null
+  adopted_scope?: string | null
+  adopted_statement?: string | null
   recommended_status?: 'active' | 'stale' | 'deprecated' | null
   current_status?: 'active' | 'stale' | 'deprecated' | null
   recommended_scope?: string | null
@@ -141,6 +145,7 @@ export type HolderAdoption = {
   observation_state: 'not_delivered' | 'no_update_observed' | 'update_observed' | 'unknown'
   claim_count: number
   updated_claim_count: number
+  additional_claim_count?: number
   unchanged_claim_count: number
   unavailable_claim_count: number
   reasons: string[]
@@ -158,6 +163,7 @@ export type HolderAdoptionSummary = {
   notified_holders: number
   delivered_holders: number
   updated_claims: number
+  additional_claims?: number
   unchanged_claims: number
   unavailable_claims: number
 }

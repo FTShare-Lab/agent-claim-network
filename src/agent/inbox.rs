@@ -21,9 +21,10 @@ use super::prepare::{
 use super::runner::{AgentRunner, InboxProcessReport, TeamServiceConnectionStatus};
 use super::traits::ClaimedInboxMessage;
 use crate::api::{
-    resolve_placeholders, BufferedProviderRuntime, ClaimAttributeUpdateInternalizeRequest,
-    InboxInternalizeKind, InternalizeOutcome, InternalizeRequest, ProviderRuntimeFallbackScope,
-    ProviderTransport, SessionTurnMessage, StructuredJsonAttemptRequest, StructuredJsonCaller,
+    resolve_placeholders, BufferedProviderRuntime, ClaimAttributeUpdateInternalizeItem,
+    ClaimAttributeUpdateInternalizeRequest, InboxInternalizeKind, InternalizeOutcome,
+    InternalizeRequest, ProviderRuntimeFallbackScope, ProviderTransport, SessionTurnMessage,
+    StructuredJsonAttemptRequest, StructuredJsonCaller,
 };
 use crate::claim::{
     ArbitrationResolutionContext, ArbitrationResolutionId, Claim, ClaimId, ClaimStatus, Dispute,
@@ -54,7 +55,7 @@ pub(crate) trait InboxJsonGenerator: Send + Sync {
         &self,
         _request: ClaimAttributeUpdateInternalizeRequest,
     ) -> anyhow::Result<serde_json::Value> {
-        anyhow::bail!("当前 inbox generator 未实现 ClaimAttributeUpdate 单消息内化输入")
+        anyhow::bail!("当前 inbox generator 未实现 ClaimAttributeUpdate 批量内化输入")
     }
 
     async fn generate_validated_claim_attribute_update_json(
@@ -193,6 +194,10 @@ struct InboxEffectPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resolution_id: Option<ArbitrationResolutionId>,
     message_hash: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    batch_members: Vec<InboxEffectMember>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    batch_hash: Option<String>,
     state: InboxEffectState,
     #[serde(with = "crate::time::serde_utc")]
     prepared_at: DateTime<Utc>,
@@ -206,12 +211,40 @@ struct InboxEffectPlan {
     warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct InboxEffectMember {
+    inbox_id: InboxId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolution_id: Option<ArbitrationResolutionId>,
+    message_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct InboxEffectRef {
+    schema_version: u32,
+    canonical_inbox_id: InboxId,
+    batch_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum InboxEffectRecord {
+    Plan(Box<InboxEffectPlan>),
+    Ref(InboxEffectRef),
+}
+
+struct LoadedInboxEffectBatch {
+    plan: InboxEffectPlan,
+    canonical_path: std::path::PathBuf,
+    members: FxHashMap<InboxId, InboxEffectMember>,
+}
+
 impl AgentRunner {
     /// 排空 inbox 中所有 pending 消息。
     ///
     /// 处理纪律：
-    /// - 连续 `PolicyUpdate` 收集成 batch 后交给 LLM；ClaimAttributeUpdate 为保证每条
-    ///   消息有独立 Effect Journal，统一按消息单独处理
+    /// - 连续同类型消息收集成 batch 后交给 LLM；ClaimAttributeUpdate 以批量 Effect
+    ///   Journal 保留逐消息幂等与恢复边界
     /// - 单次最多处理 1024 条，避免极端 inbox 堆积让一次 session 卡太久
     pub async fn process_inbox(&self) -> anyhow::Result<InboxProcessReport> {
         self.process_inbox_with(self.inbox_generator.as_ref()).await
@@ -421,23 +454,15 @@ impl AgentRunner {
                     .await?;
                 }
                 InboxMessageKind::ClaimAttributeUpdate { .. } => {
-                    self.flush_internalize_updates(generator, batch_kind, llm_msgs, report)
-                        .await?;
-                    let summary = self
-                        .internalize_claim_attribute_update_message(generator, &claimed_msg.message)
-                        .await?;
-                    self.inbox.ack_claimed(&claimed_msg).await?;
-                    report.claim_attribute_count += 1;
-                    if let Some(trace_id) = summary.trace_id {
-                        report.trace_ids.push(trace_id);
-                    }
-                    report.new_claim_ids.extend(summary.new_claim_ids);
-                    report.updated_claim_ids.extend(summary.updated_claim_ids);
-                    report
-                        .deprecated_claim_ids
-                        .extend(summary.deprecated_claim_ids);
-                    report.new_dispute_ids.extend(summary.new_dispute_ids);
-                    report.warnings.extend(summary.warnings);
+                    self.push_internalize_message(
+                        generator,
+                        InboxInternalizeKind::ClaimAttributeUpdate,
+                        claimed_msg,
+                        batch_kind,
+                        llm_msgs,
+                        report,
+                    )
+                    .await?;
                 }
             }
             report.total += 1;
@@ -486,9 +511,16 @@ impl AgentRunner {
             .iter()
             .map(|claimed| claimed.message.clone())
             .collect::<Vec<_>>();
-        let summary = self
-            .internalize_inbox_updates(generator, kind, inbox_messages)
-            .await?;
+        let summary = match kind {
+            InboxInternalizeKind::PolicyUpdate => {
+                self.internalize_inbox_updates(generator, kind, inbox_messages)
+                    .await?
+            }
+            InboxInternalizeKind::ClaimAttributeUpdate => {
+                self.internalize_claim_attribute_update_messages(generator, &inbox_messages)
+                    .await?
+            }
+        };
         // 内化产出全部落地后再 ack 这批消息
         for claimed in &batch {
             self.inbox.ack_claimed(claimed).await?;
@@ -572,82 +604,325 @@ impl AgentRunner {
         })
     }
 
+    #[cfg(test)]
     async fn internalize_claim_attribute_update_message(
         &self,
         generator: &dyn InboxJsonGenerator,
         message: &InboxMessage,
     ) -> anyhow::Result<InternalizeSummary> {
-        let (policy, resolution_context) = match &message.kind {
-            InboxMessageKind::ClaimAttributeUpdate {
-                policy,
-                arbitration_resolution,
-            } => (policy, arbitration_resolution.as_deref()),
-            _ => anyhow::bail!("期望 ClaimAttributeUpdate inbox 消息"),
-        };
-        if let Some(resolution_context) = resolution_context {
-            validate_arbitration_message(message, resolution_context)?;
+        self.internalize_claim_attribute_update_messages(generator, std::slice::from_ref(message))
+            .await
+    }
+
+    async fn internalize_claim_attribute_update_messages(
+        &self,
+        generator: &dyn InboxJsonGenerator,
+        messages: &[InboxMessage],
+    ) -> anyhow::Result<InternalizeSummary> {
+        if messages.is_empty() {
+            return Ok(InternalizeSummary::default());
         }
-        let effect_path = paths::agent_home_inbox_effect_path(
-            self.maintainer_upload_queue.agent_home(),
-            &message.id,
-        );
-        let lock_path = effect_path.with_extension("lock");
-        let _guard = FileLockGuard::lock_exclusive(&lock_path).await?;
-        let message_hash = inbox_effect_hash(message)?;
-        let existing = match read_yaml::<InboxEffectPlan>(&effect_path).await {
-            Ok(plan) => Some(plan),
-            Err(StorageError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                None
+        for message in messages {
+            let InboxMessageKind::ClaimAttributeUpdate {
+                arbitration_resolution,
+                ..
+            } = &message.kind
+            else {
+                anyhow::bail!("期望 ClaimAttributeUpdate inbox 消息");
+            };
+            if let Some(context) = arbitration_resolution.as_deref() {
+                validate_arbitration_message(message, context)?;
             }
-            Err(error) => return Err(error.into()),
-        };
-        let resolution_id =
-            resolution_context.map(|context| context.resolution.resolution_id.clone());
-        let mut plan = if let Some(plan) = existing {
-            if plan.schema_version != INBOX_EFFECT_SCHEMA_VERSION
-                || plan.inbox_id != message.id
-                || plan.resolution_id != resolution_id
-                || plan.message_hash != message_hash
+        }
+
+        // 先发现 ref 指向的完整 batch，再按路径排序统一加锁。若无锁发现期间记录变化，
+        // 释放后重新收集，避免跨进程恢复时违反固定锁顺序。
+        let _guards = loop {
+            let effect_paths = self
+                .discover_claim_attribute_update_effect_paths(messages)
+                .await?;
+            let mut guards = Vec::with_capacity(effect_paths.len());
+            for path in &effect_paths {
+                guards.push(FileLockGuard::lock_exclusive(path.with_extension("lock")).await?);
+            }
+            let stable_paths = self
+                .discover_claim_attribute_update_effect_paths(messages)
+                .await?;
+            if stable_paths
+                .iter()
+                .all(|path| effect_paths.binary_search(path).is_ok())
             {
-                anyhow::bail!(
-                    "inbox effect 冲突: inbox_id={} 已存在不同 CAU context 或 message payload",
-                    message.id
+                break guards;
+            }
+        };
+
+        let mut records = Vec::with_capacity(messages.len());
+        for message in messages {
+            records.push(read_inbox_effect_record(&self.inbox_effect_path(&message.id)).await?);
+        }
+
+        let mut batches = FxHashMap::<InboxId, LoadedInboxEffectBatch>::default();
+        // 在产生任何副作用前，先校验本轮已经存在的 journal。后续因恢复旧 plan
+        // 而补齐的 ref，会在顺序循环中按同一规则即时校验。
+        for (message, record) in messages.iter().zip(&records) {
+            if let Some(record) = record.as_ref() {
+                self.load_claim_attribute_update_effect_batch(message, record, &mut batches)
+                    .await?;
+            }
+        }
+
+        let mut summary = InternalizeSummary::default();
+        let mut applied_batches = FxHashSet::default();
+        let mut index = 0;
+        while index < messages.len() {
+            if records[index].is_none() {
+                // 前一个 Prepared plan 可能刚补齐本消息的 ref；重新读取后必须复用
+                // 已有联合 effect，不能把它当成新的 CAU 再次规划。
+                records[index] =
+                    read_inbox_effect_record(&self.inbox_effect_path(&messages[index].id)).await?;
+            }
+            if let Some(record) = records[index].as_ref() {
+                let canonical_id = self
+                    .load_claim_attribute_update_effect_batch(
+                        &messages[index],
+                        record,
+                        &mut batches,
+                    )
+                    .await?;
+                if applied_batches.insert(canonical_id.clone()) {
+                    let batch = batches
+                        .get_mut(&canonical_id)
+                        .ok_or_else(|| anyhow::anyhow!("canonical batch cache 缺失"))?;
+                    let canonical_path = batch.canonical_path.clone();
+                    summary.extend(
+                        self.apply_persisted_claim_attribute_update_plan(
+                            &mut batch.plan,
+                            &canonical_path,
+                        )
+                        .await?,
+                    );
+                }
+                index += 1;
+                continue;
+            }
+
+            // 只合并当前位置之后、尚无 journal 的连续消息。遇到既有 plan/ref 就先
+            // 应用它；下一段新 CAU 因而总能读取此前 effect 落地后的最新本地 Claim。
+            let mut end = index + 1;
+            while end < messages.len() {
+                if records[end].is_none() {
+                    records[end] =
+                        read_inbox_effect_record(&self.inbox_effect_path(&messages[end].id))
+                            .await?;
+                }
+                if records[end].is_some() {
+                    break;
+                }
+                end += 1;
+            }
+            let mut prepared = self
+                .prepare_claim_attribute_update_effect(generator, &messages[index..end])
+                .await?;
+            self.persist_prepared_claim_attribute_update_plan(&prepared)
+                .await?;
+            let canonical_path = self.inbox_effect_path(&prepared.inbox_id);
+            summary.extend(
+                self.apply_persisted_claim_attribute_update_plan(&mut prepared, &canonical_path)
+                    .await?,
+            );
+            index = end;
+        }
+        Ok(summary)
+    }
+
+    async fn load_claim_attribute_update_effect_batch(
+        &self,
+        message: &InboxMessage,
+        record: &InboxEffectRecord,
+        batches: &mut FxHashMap<InboxId, LoadedInboxEffectBatch>,
+    ) -> anyhow::Result<InboxId> {
+        let canonical_id = match record {
+            InboxEffectRecord::Plan(plan) => plan.inbox_id.clone(),
+            InboxEffectRecord::Ref(reference) => reference.canonical_inbox_id.clone(),
+        };
+        if !batches.contains_key(&canonical_id) {
+            let (plan, canonical_path) = match record {
+                InboxEffectRecord::Plan(plan) => (
+                    plan.as_ref().clone(),
+                    self.inbox_effect_path(&plan.inbox_id),
+                ),
+                InboxEffectRecord::Ref(reference) => {
+                    let path = self.inbox_effect_path(&reference.canonical_inbox_id);
+                    let Some(InboxEffectRecord::Plan(plan)) =
+                        read_inbox_effect_record(&path).await?
+                    else {
+                        anyhow::bail!(
+                            "inbox effect ref 缺少 canonical plan: inbox_id={} canonical_inbox_id={}",
+                            message.id,
+                            reference.canonical_inbox_id
+                        );
+                    };
+                    (*plan, path)
+                }
+            };
+            validate_effect_plan_integrity(&plan)?;
+            let members = effect_plan_members(&plan)
+                .into_iter()
+                .map(|member| (member.inbox_id.clone(), member))
+                .collect();
+            batches.insert(
+                canonical_id.clone(),
+                LoadedInboxEffectBatch {
+                    plan,
+                    canonical_path,
+                    members,
+                },
+            );
+        }
+
+        let batch = batches
+            .get(&canonical_id)
+            .ok_or_else(|| anyhow::anyhow!("canonical batch cache 缺失"))?;
+        match record {
+            InboxEffectRecord::Plan(plan) if **plan != batch.plan => anyhow::bail!(
+                "inbox effect 冲突: canonical inbox_id={} 存在不同 batch plan",
+                canonical_id
+            ),
+            InboxEffectRecord::Plan(_) => {}
+            InboxEffectRecord::Ref(reference) => {
+                validate_effect_ref(reference, &batch.plan, message)?;
+            }
+        }
+        validate_effect_plan_message_member(&batch.plan.inbox_id, &batch.members, message)?;
+        Ok(canonical_id)
+    }
+
+    async fn apply_persisted_claim_attribute_update_plan(
+        &self,
+        plan: &mut InboxEffectPlan,
+        canonical_path: &std::path::Path,
+    ) -> anyhow::Result<InternalizeSummary> {
+        self.repair_claim_attribute_update_refs(plan).await?;
+        if plan.state == InboxEffectState::Prepared {
+            self.apply_claim_attribute_update_effect(plan).await?;
+            plan.state = InboxEffectState::Applied;
+            write_yaml_atomic(
+                canonical_path,
+                &InboxEffectRecord::Plan(Box::new(plan.clone())),
+            )
+            .await?;
+        }
+        Ok(effect_summary(plan))
+    }
+
+    fn inbox_effect_path(&self, inbox_id: &InboxId) -> std::path::PathBuf {
+        paths::agent_home_inbox_effect_path(self.maintainer_upload_queue.agent_home(), inbox_id)
+    }
+
+    async fn discover_claim_attribute_update_effect_paths(
+        &self,
+        messages: &[InboxMessage],
+    ) -> anyhow::Result<Vec<std::path::PathBuf>> {
+        let mut paths = messages
+            .iter()
+            .map(|message| self.inbox_effect_path(&message.id))
+            .collect::<Vec<_>>();
+        let mut records = FxHashMap::default();
+        let mut canonical_paths = FxHashSet::default();
+        for message in messages {
+            let message_path = self.inbox_effect_path(&message.id);
+            if !records.contains_key(&message_path) {
+                records.insert(
+                    message_path.clone(),
+                    read_inbox_effect_record(&message_path).await?,
                 );
             }
-            if plan.state == InboxEffectState::Applied {
-                return Ok(effect_summary(&plan));
+            match records.get(&message_path).and_then(Option::as_ref) {
+                Some(InboxEffectRecord::Plan(_)) => {
+                    canonical_paths.insert(message_path);
+                }
+                Some(InboxEffectRecord::Ref(reference)) => {
+                    let canonical_path = self.inbox_effect_path(&reference.canonical_inbox_id);
+                    paths.push(canonical_path.clone());
+                    canonical_paths.insert(canonical_path);
+                }
+                None => {}
             }
-            plan
-        } else {
-            let prepared = self
-                .prepare_claim_attribute_update_effect(
-                    generator,
-                    message,
-                    policy,
-                    resolution_context,
-                )
-                .await?;
-            write_yaml_atomic(&effect_path, &prepared).await?;
-            prepared
+        }
+        for canonical_path in canonical_paths {
+            if !records.contains_key(&canonical_path) {
+                records.insert(
+                    canonical_path.clone(),
+                    read_inbox_effect_record(&canonical_path).await?,
+                );
+            }
+            if let Some(InboxEffectRecord::Plan(plan)) =
+                records.get(&canonical_path).and_then(Option::as_ref)
+            {
+                paths.extend(
+                    effect_plan_members(plan)
+                        .into_iter()
+                        .map(|member| self.inbox_effect_path(&member.inbox_id)),
+                );
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
+    async fn persist_prepared_claim_attribute_update_plan(
+        &self,
+        plan: &InboxEffectPlan,
+    ) -> anyhow::Result<()> {
+        let canonical_path = self.inbox_effect_path(&plan.inbox_id);
+        write_yaml_atomic(
+            &canonical_path,
+            &InboxEffectRecord::Plan(Box::new(plan.clone())),
+        )
+        .await?;
+        self.repair_claim_attribute_update_refs(plan).await
+    }
+
+    async fn repair_claim_attribute_update_refs(
+        &self,
+        plan: &InboxEffectPlan,
+    ) -> anyhow::Result<()> {
+        let Some(batch_hash) = plan.batch_hash.as_ref() else {
+            return Ok(());
         };
-        self.apply_claim_attribute_update_effect(&mut plan).await?;
-        plan.state = InboxEffectState::Applied;
-        write_yaml_atomic(&effect_path, &plan).await?;
-        Ok(effect_summary(&plan))
+        for member in effect_plan_members(plan).iter().skip(1) {
+            let path = self.inbox_effect_path(&member.inbox_id);
+            let expected = InboxEffectRecord::Ref(InboxEffectRef {
+                schema_version: INBOX_EFFECT_SCHEMA_VERSION,
+                canonical_inbox_id: plan.inbox_id.clone(),
+                batch_hash: batch_hash.clone(),
+            });
+            match read_inbox_effect_record(&path).await? {
+                Some(existing) if existing == expected => {}
+                Some(_) => anyhow::bail!(
+                    "inbox effect 冲突: inbox_id={} 已存在不同 batch plan",
+                    member.inbox_id
+                ),
+                None => write_yaml_atomic(&path, &expected).await?,
+            }
+        }
+        Ok(())
     }
 
     async fn prepare_claim_attribute_update_effect(
         &self,
         generator: &dyn InboxJsonGenerator,
-        message: &InboxMessage,
-        policy: &Policy,
-        resolution_context: Option<&ArbitrationResolutionContext>,
+        messages: &[InboxMessage],
     ) -> anyhow::Result<InboxEffectPlan> {
+        let members = effect_members_from_messages(messages)?;
+        let canonical = members
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("ClaimAttributeUpdate batch 不能为空"))?;
         let all_local = self.claim_store.list_local_claims().await?;
-        let direct_ids: FxHashSet<ClaimId> = resolution_context
-            .into_iter()
+        let direct_ids: FxHashSet<ClaimId> = messages
+            .iter()
+            .filter_map(cau_resolution_context)
             .flat_map(|context| &context.direct_claim_snapshots)
             .map(|claim| claim.id.clone())
             .collect();
@@ -670,52 +945,67 @@ impl AgentRunner {
             }
         }
         local_claims.sort_by(|left, right| left.id.cmp(&right.id));
-        let mut direct_claims = resolution_context
-            .map(|context| context.direct_claim_snapshots.clone())
-            .unwrap_or_default();
-        direct_claims.sort_by(|left, right| left.id.cmp(&right.id));
         let local_by_id: FxHashMap<ClaimId, Claim> = local_claims
             .iter()
             .map(|claim| (claim.id.clone(), claim.clone()))
             .collect();
+        let mut items = Vec::with_capacity(messages.len());
+        for message in messages {
+            let InboxMessageKind::ClaimAttributeUpdate {
+                policy,
+                arbitration_resolution,
+            } = &message.kind
+            else {
+                anyhow::bail!("期望 ClaimAttributeUpdate inbox 消息");
+            };
+            let mut direct_claims = arbitration_resolution
+                .as_deref()
+                .map(|context| context.direct_claim_snapshots.clone())
+                .unwrap_or_default();
+            direct_claims.sort_by(|left, right| left.id.cmp(&right.id));
+            items.push(ClaimAttributeUpdateInternalizeItem {
+                claim_attribute_update: message.clone(),
+                conclusion: arbitration_resolution
+                    .as_deref()
+                    .map(|context| context.resolution.conclusion.clone())
+                    .unwrap_or_else(|| policy.statement.clone()),
+                resolution: arbitration_resolution
+                    .as_deref()
+                    .map(|context| context.resolution.clone()),
+                dispute: arbitration_resolution
+                    .as_deref()
+                    .map(|context| context.dispute_snapshot.clone()),
+                direct_claims,
+            });
+        }
         let request = ClaimAttributeUpdateInternalizeRequest {
             agent_id: self.agent_id.clone(),
-            claim_attribute_update: message.clone(),
-            conclusion: resolution_context
-                .map(|context| context.resolution.conclusion.clone())
-                .unwrap_or_else(|| policy.statement.clone()),
-            resolution: resolution_context.map(|context| context.resolution.clone()),
-            dispute: resolution_context.map(|context| context.dispute_snapshot.clone()),
+            claim_attribute_updates: items,
             local_claims,
-            direct_claims,
         };
-        let (now, mut new_claims, mut updated_claims, mut new_disputes) = self
+        let (now, new_claims, updated_claims, mut new_disputes) = self
             .claim_attribute_update_internalize_and_prepare_once(generator, request, &local_by_id)
             .await?;
-        if let Some(resolution_context) = resolution_context {
-            let before_repeat_filter = new_disputes.len();
-            new_disputes.retain(|dispute| {
-                !repeats_resolved_arbitration_input(
-                    dispute,
-                    resolution_context,
-                    &local_by_id,
-                    &updated_claims,
-                )
-            });
-            if new_disputes.len() != before_repeat_filter {
-                log::info!(
-                    target: "agent",
-                    "agent {} 跳过与已 resolved dispute={} 语义输入相同的重复 dispute",
-                    self.agent_id,
-                    resolution_context.dispute_id
-                );
-            }
-        }
-        let provenance = SourceId::Policy(policy.id.clone());
-        for claim in new_claims.iter_mut().chain(updated_claims.iter_mut()) {
-            if !claim.source_claim_ids.contains(&provenance) {
-                claim.source_claim_ids.push(provenance.clone());
-            }
+        let before_repeat_filter = new_disputes.len();
+        new_disputes.retain(|dispute| {
+            !messages
+                .iter()
+                .filter_map(cau_resolution_context)
+                .any(|context| {
+                    repeats_resolved_arbitration_input(
+                        dispute,
+                        context,
+                        &local_by_id,
+                        &updated_claims,
+                    )
+                })
+        });
+        if new_disputes.len() != before_repeat_filter {
+            log::info!(
+                target: "agent",
+                "agent {} 跳过与本批已 resolved dispute 语义输入相同的重复 dispute",
+                self.agent_id
+            );
         }
         let mut deprecated_claim_ids = Vec::new();
         let updated_claims = updated_claims
@@ -746,7 +1036,7 @@ impl AgentRunner {
             None
         } else {
             let mut inputs = FxHashSet::default();
-            inputs.insert(provenance);
+            inputs.extend(inbox_policy_ids(messages).into_iter().map(SourceId::Policy));
             inputs.extend(direct_ids.iter().cloned().map(SourceId::Claim));
             inputs.extend(
                 new_claims
@@ -763,27 +1053,38 @@ impl AgentRunner {
             Some(Trace {
                 id: TraceId::from_trace_parts(now, &name, &input_claims, &output_claims),
                 name,
-                task: resolution_context.map_or_else(
-                    || "内化 ClaimAttributeUpdate".to_string(),
-                    |context| {
-                        format!(
-                            "内化 ClaimAttributeUpdate resolution {}",
-                            context.resolution.resolution_id
-                        )
-                    },
-                ),
+                task: if messages.len() == 1 {
+                    cau_resolution_context(&messages[0]).map_or_else(
+                        || "内化 ClaimAttributeUpdate".to_string(),
+                        |context| {
+                            format!(
+                                "内化 ClaimAttributeUpdate resolution {}",
+                                context.resolution.resolution_id
+                            )
+                        },
+                    )
+                } else {
+                    format!("批量内化 {} 条 ClaimAttributeUpdate", messages.len())
+                },
                 agent: self.agent_id.clone(),
                 input_claims,
                 output_claims,
                 created_at: crate::time::truncate_to_second(now),
             })
         };
+        let (batch_members, batch_hash) = if members.len() == 1 {
+            (Vec::new(), None)
+        } else {
+            let hash = inbox_effect_hash(&members)?;
+            (members.clone(), Some(hash))
+        };
         Ok(InboxEffectPlan {
             schema_version: INBOX_EFFECT_SCHEMA_VERSION,
-            inbox_id: message.id.clone(),
-            resolution_id: resolution_context
-                .map(|context| context.resolution.resolution_id.clone()),
-            message_hash: inbox_effect_hash(message)?,
+            inbox_id: canonical.inbox_id.clone(),
+            resolution_id: canonical.resolution_id.clone(),
+            message_hash: canonical.message_hash.clone(),
+            batch_members,
+            batch_hash,
             state: InboxEffectState::Prepared,
             prepared_at: now,
             new_claims,
@@ -803,8 +1104,9 @@ impl AgentRunner {
     ) -> anyhow::Result<(DateTime<Utc>, Vec<Claim>, Vec<Claim>, Vec<Dispute>)> {
         let agent_id = self.agent_id.clone();
         let mut visible_claims_by_id: FxHashMap<ClaimId, Claim> = request
-            .direct_claims
+            .claim_attribute_updates
             .iter()
+            .flat_map(|item| &item.direct_claims)
             .map(|claim| (claim.id.clone(), claim.clone()))
             .collect();
         // 当前 holder 的本地状态比 resolution 中的历史快照更新，应覆盖同 ID 快照。
@@ -814,14 +1116,23 @@ impl AgentRunner {
                 .iter()
                 .map(|claim| (claim.id.clone(), claim.clone())),
         );
-        let visible_claims = request.direct_claims.iter().chain(&request.local_claims);
-        let mut allowed_policy_ids =
-            inbox_policy_ids(std::slice::from_ref(&request.claim_attribute_update))
-                .into_iter()
-                .collect::<FxHashSet<_>>();
+        let inbox_messages = request
+            .claim_attribute_updates
+            .iter()
+            .map(|item| item.claim_attribute_update.clone())
+            .collect::<Vec<_>>();
+        let batch_policy_ids = inbox_policy_ids(&inbox_messages)
+            .into_iter()
+            .collect::<FxHashSet<_>>();
+        let mut allowed_policy_ids = batch_policy_ids.clone();
         let mut allowed_source_claim_ids = FxHashSet::default();
         let mut allowed_dispute_claim_ids = FxHashSet::default();
-        for claim in visible_claims {
+        for claim in request
+            .claim_attribute_updates
+            .iter()
+            .flat_map(|item| &item.direct_claims)
+            .chain(&request.local_claims)
+        {
             allowed_source_claim_ids.insert(claim.id.clone());
             allowed_dispute_claim_ids.insert(claim.id.clone());
             for source in &claim.source_claim_ids {
@@ -841,8 +1152,9 @@ impl AgentRunner {
             let mut attempt_dispute_claim_ids = allowed_dispute_claim_ids.clone();
             let now = Utc::now();
             let resolved = resolve_placeholders(raw, now)?;
-            let outcome: InternalizeOutcome = serde_json::from_value(resolved)
+            let mut outcome: InternalizeOutcome = serde_json::from_value(resolved)
                 .map_err(|error| anyhow::anyhow!("ClaimAttributeUpdate 输出无法解析: {error}"))?;
+            ensure_cau_policy_provenance(&mut outcome, &batch_policy_ids)?;
             validate_visible_policy_sources(
                 "new_claims",
                 &outcome.new_claims,
@@ -1473,6 +1785,173 @@ fn inbox_effect_hash(value: &impl Serialize) -> anyhow::Result<String> {
     ))
 }
 
+async fn read_inbox_effect_record(
+    path: &std::path::Path,
+) -> anyhow::Result<Option<InboxEffectRecord>> {
+    match read_yaml(path).await {
+        Ok(record) => Ok(Some(record)),
+        Err(StorageError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn cau_resolution_context(message: &InboxMessage) -> Option<&ArbitrationResolutionContext> {
+    match &message.kind {
+        InboxMessageKind::ClaimAttributeUpdate {
+            arbitration_resolution,
+            ..
+        } => arbitration_resolution.as_deref(),
+        InboxMessageKind::PolicyUpdate { .. } => None,
+    }
+}
+
+fn effect_members_from_messages(
+    messages: &[InboxMessage],
+) -> anyhow::Result<Vec<InboxEffectMember>> {
+    let mut seen = FxHashSet::default();
+    let mut members = Vec::with_capacity(messages.len());
+    for message in messages {
+        if !seen.insert(message.id.clone()) {
+            anyhow::bail!("ClaimAttributeUpdate batch 含重复 inbox_id={}", message.id);
+        }
+        members.push(InboxEffectMember {
+            inbox_id: message.id.clone(),
+            resolution_id: cau_resolution_context(message)
+                .map(|context| context.resolution.resolution_id.clone()),
+            message_hash: inbox_effect_hash(message)?,
+        });
+    }
+    Ok(members)
+}
+
+fn effect_plan_members(plan: &InboxEffectPlan) -> Vec<InboxEffectMember> {
+    if plan.batch_members.is_empty() {
+        vec![InboxEffectMember {
+            inbox_id: plan.inbox_id.clone(),
+            resolution_id: plan.resolution_id.clone(),
+            message_hash: plan.message_hash.clone(),
+        }]
+    } else {
+        plan.batch_members.clone()
+    }
+}
+
+fn validate_effect_plan_integrity(plan: &InboxEffectPlan) -> anyhow::Result<()> {
+    if plan.schema_version != INBOX_EFFECT_SCHEMA_VERSION {
+        anyhow::bail!(
+            "inbox effect schema 不兼容: inbox_id={} schema_version={}",
+            plan.inbox_id,
+            plan.schema_version
+        );
+    }
+    let members = effect_plan_members(plan);
+    let Some(canonical) = members.first() else {
+        anyhow::bail!("inbox effect batch 不能为空");
+    };
+    if canonical.inbox_id != plan.inbox_id
+        || canonical.resolution_id != plan.resolution_id
+        || canonical.message_hash != plan.message_hash
+    {
+        anyhow::bail!("inbox effect canonical member 与 plan 顶层字段不一致");
+    }
+    let mut seen = FxHashSet::default();
+    if members
+        .iter()
+        .any(|member| !seen.insert(member.inbox_id.clone()))
+    {
+        anyhow::bail!("inbox effect batch 含重复 inbox_id");
+    }
+    match (&plan.batch_hash, plan.batch_members.is_empty()) {
+        (None, true) => Ok(()),
+        (Some(expected), false) if inbox_effect_hash(&members)? == *expected => Ok(()),
+        _ => anyhow::bail!("inbox effect batch hash 缺失或不匹配"),
+    }
+}
+
+fn validate_effect_ref(
+    reference: &InboxEffectRef,
+    plan: &InboxEffectPlan,
+    message: &InboxMessage,
+) -> anyhow::Result<()> {
+    if reference.schema_version != INBOX_EFFECT_SCHEMA_VERSION {
+        anyhow::bail!(
+            "inbox effect ref schema 不兼容: inbox_id={} schema_version={}",
+            message.id,
+            reference.schema_version
+        );
+    }
+    if reference.canonical_inbox_id != plan.inbox_id
+        || plan.batch_hash.as_deref() != Some(reference.batch_hash.as_str())
+    {
+        anyhow::bail!(
+            "inbox effect ref 与 canonical plan 不一致: inbox_id={}",
+            message.id
+        );
+    }
+    Ok(())
+}
+
+fn validate_effect_plan_message_member(
+    canonical_inbox_id: &InboxId,
+    members: &FxHashMap<InboxId, InboxEffectMember>,
+    message: &InboxMessage,
+) -> anyhow::Result<()> {
+    let expected_resolution_id =
+        cau_resolution_context(message).map(|context| context.resolution.resolution_id.clone());
+    let message_hash = inbox_effect_hash(message)?;
+    let Some(member) = members.get(&message.id) else {
+        anyhow::bail!(
+            "inbox effect 冲突: inbox_id={} 不属于 canonical batch={}",
+            message.id,
+            canonical_inbox_id
+        );
+    };
+    if member.resolution_id != expected_resolution_id || member.message_hash != message_hash {
+        anyhow::bail!(
+            "inbox effect 冲突: inbox_id={} 已存在不同 CAU context 或 message payload",
+            message.id
+        );
+    }
+    Ok(())
+}
+
+fn ensure_cau_policy_provenance(
+    outcome: &mut InternalizeOutcome,
+    batch_policy_ids: &FxHashSet<PolicyId>,
+) -> anyhow::Result<()> {
+    let sole_policy = if batch_policy_ids.len() == 1 {
+        batch_policy_ids.iter().next().map(ToString::to_string)
+    } else {
+        None
+    };
+    for (field, drafts) in [
+        ("new_claims", &mut outcome.new_claims),
+        ("updated_claims", &mut outcome.updated_claims),
+    ] {
+        for (index, draft) in drafts.iter_mut().enumerate() {
+            let has_batch_policy = draft.source_claim_ids.iter().any(|source| {
+                batch_policy_ids
+                    .iter()
+                    .any(|policy_id| source == &policy_id.to_string())
+            });
+            if has_batch_policy {
+                continue;
+            }
+            if let Some(policy_id) = sole_policy.as_ref() {
+                // 单一可归因 Policy 时沿用旧单条 CAU 的自动 provenance 行为。
+                draft.source_claim_ids.push(policy_id.clone());
+            } else {
+                anyhow::bail!(
+                    "ClaimAttributeUpdate {field}[{index}] 必须引用至少一个真正相关的本批 CAU PolicyId"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn effect_summary(plan: &InboxEffectPlan) -> InternalizeSummary {
     InternalizeSummary {
         trace_id: plan.trace.as_ref().map(|trace| trace.id.clone()),
@@ -1553,6 +2032,7 @@ struct PolicyDeprecationSummary {
     warnings: Vec<String>,
 }
 
+#[derive(Default)]
 struct InternalizeSummary {
     trace_id: Option<TraceId>,
     new_claim_ids: Vec<ClaimId>,
@@ -1560,6 +2040,19 @@ struct InternalizeSummary {
     deprecated_claim_ids: Vec<ClaimId>,
     new_dispute_ids: Vec<DisputeId>,
     warnings: Vec<String>,
+}
+
+impl InternalizeSummary {
+    fn extend(&mut self, other: Self) {
+        if self.trace_id.is_none() {
+            self.trace_id = other.trace_id;
+        }
+        self.new_claim_ids.extend(other.new_claim_ids);
+        self.updated_claim_ids.extend(other.updated_claim_ids);
+        self.deprecated_claim_ids.extend(other.deprecated_claim_ids);
+        self.new_dispute_ids.extend(other.new_dispute_ids);
+        self.warnings.extend(other.warnings);
+    }
 }
 
 fn push_upload_warning(
@@ -2421,13 +2914,15 @@ mod tests {
             let requests = generator.requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
             let request = &requests[0];
-            assert_eq!(request.claim_attribute_update, message);
+            assert_eq!(request.claim_attribute_updates.len(), 1);
+            let item = &request.claim_attribute_updates[0];
+            assert_eq!(item.claim_attribute_update, message);
             assert_eq!(
-                request.conclusion,
+                item.conclusion,
                 "keep current local facts where evidence supports them"
             );
-            assert!(request.resolution.is_some());
-            assert!(request.dispute.is_some());
+            assert!(item.resolution.is_some());
+            assert!(item.dispute.is_some());
             assert_eq!(
                 request
                     .local_claims
@@ -2445,8 +2940,7 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].id < pair[1].id));
             assert_eq!(
-                request
-                    .direct_claims
+                item.direct_claims
                     .iter()
                     .map(|claim| claim.id.clone())
                     .collect::<FxHashSet<_>>(),
@@ -3154,39 +3648,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_claim_attribute_updates_are_individual_and_journaled() {
+    async fn large_consecutive_claim_attribute_updates_share_one_call_and_batch_journal() {
         let dir = tempfile::tempdir().unwrap();
         let agent_home = dir.path().to_path_buf();
         let agent_id = AgentId::new("agent-a").unwrap();
         let inbox = Arc::new(LocalFsInboxReader::new(agent_home.clone()));
-        let messages = ["first", "second"].map(|name| InboxMessage {
-            id: InboxId::random(),
-            kind: InboxMessageKind::ClaimAttributeUpdate {
-                policy: Policy {
-                    id: PolicyId::random(),
-                    message_type: PolicyMessageType::ClaimAttributeUpdate,
-                    name: format!("{name}_cau"),
-                    statement: format!("{name} conclusion"),
-                    scope: "tests / cau".into(),
-                    status: PolicyStatus::Active,
-                    created_at: Utc::now(),
-                    updated_at: None,
-                    target_agents: Some(vec![agent_id.clone()]),
+        let messages = (0..64)
+            .map(|index| InboxMessage {
+                id: InboxId::random(),
+                kind: InboxMessageKind::ClaimAttributeUpdate {
+                    policy: Policy {
+                        id: PolicyId::random(),
+                        message_type: PolicyMessageType::ClaimAttributeUpdate,
+                        name: format!("cau_{index}"),
+                        statement: format!("conclusion {index}"),
+                        scope: "tests / cau".into(),
+                        status: PolicyStatus::Active,
+                        created_at: Utc::now(),
+                        updated_at: None,
+                        target_agents: Some(vec![agent_id.clone()]),
+                    },
+                    arbitration_resolution: None,
                 },
-                arbitration_resolution: None,
-            },
-            handled_at: None,
-        });
+                handled_at: None,
+            })
+            .collect::<Vec<_>>();
         for message in &messages {
             inbox.accept_pulled(message).await.unwrap();
         }
-        let generator = Arc::new(CountingInboxGenerator {
+        let generator = Arc::new(RecordingClaimAttributeUpdateGenerator {
             response: json!({
                 "new_claims": [],
                 "updated_claims": [],
                 "new_disputes": []
             }),
-            calls: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
         });
         let runner = AgentRunner::new_local(
             agent_id,
@@ -3207,19 +3703,375 @@ mod tests {
 
         let report = runner.process_inbox_with(generator.as_ref()).await.unwrap();
 
-        assert_eq!(report.total, 2);
-        assert_eq!(report.claim_attribute_count, 2);
-        assert_eq!(generator.calls.load(Ordering::SeqCst), 2);
-        for message in &messages {
-            let plan: InboxEffectPlan = read_yaml(&paths::agent_home_inbox_effect_path(
-                &agent_home,
-                &message.id,
-            ))
+        assert_eq!(report.total, messages.len());
+        assert_eq!(report.claim_attribute_count, messages.len());
+        {
+            let requests = generator.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0]
+                    .claim_attribute_updates
+                    .iter()
+                    .map(|item| item.claim_attribute_update.id.clone())
+                    .collect::<Vec<_>>(),
+                messages
+                    .iter()
+                    .map(|message| message.id.clone())
+                    .collect::<Vec<_>>()
+            );
+        }
+        let canonical: InboxEffectPlan = read_yaml(&paths::agent_home_inbox_effect_path(
+            &agent_home,
+            &messages[0].id,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(canonical.state, InboxEffectState::Applied);
+        assert_eq!(canonical.batch_members.len(), messages.len());
+        assert!(canonical.batch_hash.is_some());
+        let reference: InboxEffectRef = read_yaml(&paths::agent_home_inbox_effect_path(
+            &agent_home,
+            &messages[1].id,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(reference.canonical_inbox_id, messages[0].id);
+        assert_eq!(Some(reference.batch_hash), canonical.batch_hash);
+    }
+
+    #[tokio::test]
+    async fn batch_effect_ref_replays_remaining_cau_without_second_model_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_home = dir.path().to_path_buf();
+        let agent_id = AgentId::new("agent-a").unwrap();
+        let messages = ["first", "second", "third"].map(|name| InboxMessage {
+            id: InboxId::random(),
+            kind: InboxMessageKind::ClaimAttributeUpdate {
+                policy: Policy {
+                    id: PolicyId::random(),
+                    message_type: PolicyMessageType::ClaimAttributeUpdate,
+                    name: format!("{name}_cau"),
+                    statement: format!("{name} conclusion"),
+                    scope: "tests / cau".into(),
+                    status: PolicyStatus::Active,
+                    created_at: Utc::now(),
+                    updated_at: None,
+                    target_agents: Some(vec![agent_id.clone()]),
+                },
+                arbitration_resolution: None,
+            },
+            handled_at: None,
+        });
+        let generator = Arc::new(CountingInboxGenerator {
+            response: json!({
+                "new_claims": [],
+                "updated_claims": [],
+                "new_disputes": []
+            }),
+            calls: AtomicUsize::new(0),
+        });
+        let runner = AgentRunner::new_local(
+            agent_id,
+            generator.clone(),
+            Arc::new(LocalFsClaimStore::new(agent_home.clone())),
+            Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home.clone())),
+            Arc::new(LocalFsInboxReader::new(agent_home.clone())),
+            Arc::new(LocalFsMemoryStore::new(
+                agent_home.clone(),
+                1600,
+                1000,
+                false,
+            )),
+            Arc::new(LocalFsMaintainerUploadQueue::new(agent_home.clone())),
+            0,
+            Vec::<SkillSummary>::new(),
+        );
+
+        runner
+            .internalize_claim_attribute_update_messages(generator.as_ref(), &messages)
             .await
             .unwrap();
-            assert_eq!(plan.state, InboxEffectState::Applied);
-            assert_eq!(plan.resolution_id, None);
+        let canonical_path = paths::agent_home_inbox_effect_path(&agent_home, &messages[0].id);
+        let mut interrupted: InboxEffectPlan = read_yaml(&canonical_path).await.unwrap();
+        interrupted.state = InboxEffectState::Prepared;
+        write_yaml_atomic(
+            &canonical_path,
+            &InboxEffectRecord::Plan(Box::new(interrupted)),
+        )
+        .await
+        .unwrap();
+
+        for remaining in &messages[1..] {
+            runner
+                .internalize_claim_attribute_update_messages(
+                    generator.as_ref(),
+                    std::slice::from_ref(remaining),
+                )
+                .await
+                .unwrap();
         }
+
+        assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
+        let recovered: InboxEffectPlan = read_yaml(&canonical_path).await.unwrap();
+        assert_eq!(recovered.state, InboxEffectState::Applied);
+    }
+
+    #[tokio::test]
+    async fn prepared_prefix_is_applied_before_planning_later_cau() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_home = dir.path().to_path_buf();
+        let agent_id = AgentId::new("agent-a").unwrap();
+        let first_policy = PolicyId::random();
+        let second_policy = PolicyId::random();
+        let messages = [
+            ("first", first_policy.clone()),
+            ("second", second_policy.clone()),
+        ]
+        .map(|(name, policy_id)| InboxMessage {
+            id: InboxId::random(),
+            kind: InboxMessageKind::ClaimAttributeUpdate {
+                policy: Policy {
+                    id: policy_id,
+                    message_type: PolicyMessageType::ClaimAttributeUpdate,
+                    name: format!("{name}_cau"),
+                    statement: format!("{name} conclusion"),
+                    scope: "tests / ordered-recovery".into(),
+                    status: PolicyStatus::Active,
+                    created_at: Utc::now(),
+                    updated_at: None,
+                    target_agents: Some(vec![agent_id.clone()]),
+                },
+                arbitration_resolution: None,
+            },
+            handled_at: None,
+        });
+        let mut local = arbitration_claim("agent-a", "shared", ClaimStatus::Active);
+        local.statement = "before recovery".into();
+        let claim_store = Arc::new(LocalFsClaimStore::new(agent_home.clone()));
+        claim_store.write_claim(&local).await.unwrap();
+        let first_generator = Arc::new(StaticInboxGenerator {
+            expected_kind: InboxInternalizeKind::ClaimAttributeUpdate,
+            response: json!({
+                "new_claims": [],
+                "updated_claims": [{
+                    "id": local.id.as_str(),
+                    "name": local.name,
+                    "statement": "after first CAU",
+                    "scope": local.scope,
+                    "confidence": "high",
+                    "status": "active",
+                    "evidence_summary": "first CAU applied",
+                    "source_claim_ids": [first_policy.as_str()]
+                }],
+                "new_disputes": []
+            }),
+        });
+        let runner = AgentRunner::new_local(
+            agent_id,
+            first_generator.clone(),
+            claim_store.clone(),
+            Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home.clone())),
+            Arc::new(LocalFsInboxReader::new(agent_home.clone())),
+            Arc::new(LocalFsMemoryStore::new(
+                agent_home.clone(),
+                1600,
+                1000,
+                false,
+            )),
+            Arc::new(LocalFsMaintainerUploadQueue::new(agent_home.clone())),
+            0,
+            Vec::<SkillSummary>::new(),
+        );
+
+        let first_plan = runner
+            .prepare_claim_attribute_update_effect(
+                first_generator.as_ref(),
+                std::slice::from_ref(&messages[0]),
+            )
+            .await
+            .unwrap();
+        write_yaml_atomic(
+            &paths::agent_home_inbox_effect_path(&agent_home, &messages[0].id),
+            &InboxEffectRecord::Plan(Box::new(first_plan)),
+        )
+        .await
+        .unwrap();
+
+        let second_generator = Arc::new(RecordingClaimAttributeUpdateGenerator {
+            response: json!({
+                "new_claims": [],
+                "updated_claims": [{
+                    "id": local.id.as_str(),
+                    "name": local.name,
+                    "statement": "after second CAU",
+                    "scope": local.scope,
+                    "confidence": "high",
+                    "status": "active",
+                    "evidence_summary": "second CAU applied after recovery",
+                    "source_claim_ids": [second_policy.as_str()]
+                }],
+                "new_disputes": []
+            }),
+            requests: Mutex::new(Vec::new()),
+        });
+
+        runner
+            .internalize_claim_attribute_update_messages(second_generator.as_ref(), &messages)
+            .await
+            .unwrap();
+
+        let requests = second_generator.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].claim_attribute_updates.len(), 1);
+        assert_eq!(
+            requests[0].claim_attribute_updates[0]
+                .claim_attribute_update
+                .id,
+            messages[1].id
+        );
+        assert_eq!(requests[0].local_claims[0].statement, "after first CAU");
+        drop(requests);
+
+        let final_claim = claim_store
+            .list_local_claims()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|claim| claim.id == local.id)
+            .unwrap();
+        assert_eq!(final_claim.statement, "after second CAU");
+        let second_plan: InboxEffectPlan = read_yaml(&paths::agent_home_inbox_effect_path(
+            &agent_home,
+            &messages[1].id,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(second_plan.state, InboxEffectState::Applied);
+        assert!(!second_plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("superseded")));
+    }
+
+    #[test]
+    fn cau_batch_requires_specific_policy_provenance_but_keeps_single_compatibility() {
+        let first = PolicyId::random();
+        let second = PolicyId::random();
+        let mut missing: InternalizeOutcome = serde_json::from_value(json!({
+            "new_claims": [{
+                "id": ClaimId::random().as_str(),
+                "name": "derived_fact",
+                "statement": "derived fact",
+                "scope": "tests / cau",
+                "confidence": "high",
+                "evidence_summary": "batch conclusion",
+                "source_claim_ids": []
+            }],
+            "updated_claims": [],
+            "new_disputes": []
+        }))
+        .unwrap();
+        let error = ensure_cau_policy_provenance(
+            &mut missing,
+            &FxHashSet::from_iter([first.clone(), second.clone()]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("真正相关的本批 CAU PolicyId"));
+
+        missing.new_claims[0].source_claim_ids = vec![second.to_string()];
+        ensure_cau_policy_provenance(
+            &mut missing,
+            &FxHashSet::from_iter([first.clone(), second.clone()]),
+        )
+        .unwrap();
+        assert_eq!(
+            missing.new_claims[0].source_claim_ids,
+            vec![second.to_string()]
+        );
+
+        missing.new_claims[0].source_claim_ids.clear();
+        ensure_cau_policy_provenance(&mut missing, &FxHashSet::from_iter([first.clone()])).unwrap();
+        assert_eq!(
+            missing.new_claims[0].source_claim_ids,
+            vec![first.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn cau_batch_persists_only_model_attributed_policy_on_changed_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_home = dir.path().to_path_buf();
+        let agent_id = AgentId::new("agent-a").unwrap();
+        let first_policy = PolicyId::random();
+        let second_policy = PolicyId::random();
+        let messages =
+            [first_policy.clone(), second_policy.clone()].map(|policy_id| InboxMessage {
+                id: InboxId::random(),
+                kind: InboxMessageKind::ClaimAttributeUpdate {
+                    policy: Policy {
+                        id: policy_id,
+                        message_type: PolicyMessageType::ClaimAttributeUpdate,
+                        name: "batch_cau".into(),
+                        statement: "batch conclusion".into(),
+                        scope: "tests / cau".into(),
+                        status: PolicyStatus::Active,
+                        created_at: Utc::now(),
+                        updated_at: None,
+                        target_agents: Some(vec![agent_id.clone()]),
+                    },
+                    arbitration_resolution: None,
+                },
+                handled_at: None,
+            });
+        let generator = Arc::new(RecordingClaimAttributeUpdateGenerator {
+            response: json!({
+                "new_claims": [{
+                    "id": "$new_claim_0$",
+                    "name": "second_policy_fact",
+                    "statement": "only the second CAU caused this knowledge",
+                    "scope": "tests / cau",
+                    "confidence": "high",
+                    "evidence_summary": "second conclusion",
+                    "source_claim_ids": [second_policy.as_str()]
+                }],
+                "updated_claims": [],
+                "new_disputes": []
+            }),
+            requests: Mutex::new(Vec::new()),
+        });
+        let claim_store = Arc::new(LocalFsClaimStore::new(agent_home.clone()));
+        let runner = AgentRunner::new_local(
+            agent_id,
+            generator.clone(),
+            claim_store.clone(),
+            Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home.clone())),
+            Arc::new(LocalFsInboxReader::new(agent_home.clone())),
+            Arc::new(LocalFsMemoryStore::new(
+                agent_home.clone(),
+                1600,
+                1000,
+                false,
+            )),
+            Arc::new(LocalFsMaintainerUploadQueue::new(agent_home.clone())),
+            0,
+            Vec::<SkillSummary>::new(),
+        );
+
+        runner
+            .internalize_claim_attribute_update_messages(generator.as_ref(), &messages)
+            .await
+            .unwrap();
+
+        assert_eq!(generator.requests.lock().unwrap().len(), 1);
+        let claims = claim_store.list_local_claims().await.unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(
+            claims[0].source_claim_ids,
+            vec![SourceId::Policy(second_policy)]
+        );
+        assert!(!claims[0]
+            .source_claim_ids
+            .contains(&SourceId::Policy(first_policy)));
     }
 
     #[tokio::test]
@@ -3312,6 +4164,9 @@ mod tests {
         assert_eq!(effect.state, InboxEffectState::Applied);
         assert_eq!(effect.deprecated_claim_ids, vec![local.id.clone()]);
         assert!(effect.new_disputes.is_empty());
+        let serialized = tokio::fs::read_to_string(&effect_path).await.unwrap();
+        assert!(!serialized.contains("batch_members"));
+        assert!(!serialized.contains("batch_hash"));
     }
 
     #[tokio::test]
@@ -4063,12 +4918,14 @@ mod tests {
         assert_eq!(summary.updated_claim_ids, vec![existing.id.clone()]);
         let request = generator.requests.lock().unwrap().pop().unwrap();
         assert_eq!(request.agent_id, agent_id);
-        assert_eq!(request.claim_attribute_update, message);
-        assert_eq!(request.conclusion, "建议将旧规则标记为 deprecated");
-        assert!(request.resolution.is_none());
-        assert!(request.dispute.is_none());
+        assert_eq!(request.claim_attribute_updates.len(), 1);
+        let item = &request.claim_attribute_updates[0];
+        assert_eq!(item.claim_attribute_update, message);
+        assert_eq!(item.conclusion, "建议将旧规则标记为 deprecated");
+        assert!(item.resolution.is_none());
+        assert!(item.dispute.is_none());
         assert_eq!(request.local_claims, vec![existing.clone()]);
-        assert!(request.direct_claims.is_empty());
+        assert!(item.direct_claims.is_empty());
 
         let updated = claim_store
             .list_local_claims()
@@ -4153,6 +5010,11 @@ mod tests {
             },
             handled_at: None,
         };
+        let third_message = InboxMessage {
+            id: InboxId::random(),
+            kind: second_message.kind.clone(),
+            handled_at: None,
+        };
         let first_generator = Arc::new(RecordingClaimAttributeUpdateGenerator {
             response: json!({
                 "new_claims": [],
@@ -4189,11 +5051,14 @@ mod tests {
         });
 
         let first = runner
-            .internalize_claim_attribute_update_message(first_generator.as_ref(), &first_message)
+            .internalize_claim_attribute_update_messages(
+                first_generator.as_ref(),
+                &[first_message.clone(), second_message.clone()],
+            )
             .await
             .unwrap();
         let second = runner
-            .internalize_claim_attribute_update_message(second_generator.as_ref(), &second_message)
+            .internalize_claim_attribute_update_message(second_generator.as_ref(), &third_message)
             .await
             .unwrap();
 
@@ -4204,9 +5069,16 @@ mod tests {
             assert_eq!(uploaded.len(), 1);
             assert_eq!(uploaded[0].id, first.new_dispute_ids[0]);
         }
-        let second_plan: InboxEffectPlan = read_yaml(&paths::agent_home_inbox_effect_path(
+        let batch_ref: InboxEffectRef = read_yaml(&paths::agent_home_inbox_effect_path(
             &agent_home,
             &second_message.id,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(batch_ref.canonical_inbox_id, first_message.id);
+        let second_plan: InboxEffectPlan = read_yaml(&paths::agent_home_inbox_effect_path(
+            &agent_home,
+            &third_message.id,
         ))
         .await
         .unwrap();

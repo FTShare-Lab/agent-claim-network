@@ -10,7 +10,8 @@ use serde::Serialize;
 use tokio::fs;
 
 use crate::claim::{
-    ArbitrationResolutionId, ClaimId, DisputeId, DisputeStatus, InboxId, ResolutionBasis,
+    ArbitrationResolutionId, Claim, ClaimId, DisputeId, DisputeStatus, InboxId, PolicyId,
+    ResolutionBasis, SourceId,
 };
 use crate::config::ArbitrationMode;
 use crate::storage::{paths, read_yaml, write_yaml_atomic, FileLockGuard, StorageError};
@@ -469,6 +470,14 @@ impl ArbitrationStore {
             resolution_id: record.resolution_id.clone(),
         };
         if let Some(intent) = record.delivery_intent.as_ref() {
+            write_yaml_atomic(
+                &paths::team_store_arbitration_event_policy_index_path(
+                    &self.team_root,
+                    &intent.policy.id,
+                ),
+                &target,
+            )
+            .await?;
             for delivery in &intent.targets {
                 write_yaml_atomic(
                     &paths::team_store_arbitration_event_inbox_index_path(
@@ -519,6 +528,122 @@ impl ArbitrationStore {
         targets.sort();
         targets.dedup();
         Ok(targets)
+    }
+
+    pub async fn event_targets_for_policies(
+        &self,
+        policy_ids: &[PolicyId],
+    ) -> anyhow::Result<Vec<ResolutionEventTarget>> {
+        let mut targets = Vec::new();
+        for policy_id in policy_ids {
+            if let Some(target) = read_optional_yaml(
+                &paths::team_store_arbitration_event_policy_index_path(&self.team_root, policy_id),
+            )
+            .await?
+            {
+                targets.push(target);
+            }
+        }
+        targets.sort();
+        targets.dedup();
+        Ok(targets)
+    }
+
+    /// 在 Claim 上传请求仍携带 CAU provenance 时冻结首次归因结果。
+    ///
+    /// mirror 随后可以被同一 Agent 的下一次上传覆盖，因此候选必须直接取自当前
+    /// 请求，并在对应 Dispute 锁内 create-once。只有当前 Resolution 可以新增候选；
+    /// 被替换 Resolution 的 Policy 索引即使仍存在，也不会继续接收观测数据。
+    pub async fn capture_claim_adoption_candidates(
+        &self,
+        claim: &Claim,
+    ) -> anyhow::Result<Vec<ResolutionEventTarget>> {
+        let mut policy_ids = claim
+            .source_claim_ids
+            .iter()
+            .filter_map(|source| match source {
+                SourceId::Policy(policy_id) => Some(policy_id.clone()),
+                SourceId::Claim(_) => None,
+            })
+            .collect::<Vec<_>>();
+        policy_ids.sort();
+        policy_ids.dedup();
+
+        let mut targets = Vec::new();
+        for policy_id in policy_ids {
+            let Some(target) = read_optional_yaml::<ResolutionEventTarget>(
+                &paths::team_store_arbitration_event_policy_index_path(&self.team_root, &policy_id),
+            )
+            .await?
+            else {
+                continue;
+            };
+            let _guard = self.lock_dispute(&target.dispute_id).await?;
+            let current = self.read_dispute(&target.dispute_id).await?;
+            if current
+                .resolution
+                .as_ref()
+                .map(|resolution| &resolution.resolution_id)
+                != Some(&target.resolution_id)
+            {
+                continue;
+            }
+            let record = self
+                .read_resolution_record(&target.dispute_id, &target.resolution_id)
+                .await?;
+            let is_intended_holder = record.delivery_intent.as_ref().is_some_and(|intent| {
+                intent.policy.id == policy_id
+                    && intent
+                        .targets
+                        .iter()
+                        .any(|delivery| delivery.target_agent == claim.holder)
+            });
+            if !is_intended_holder {
+                continue;
+            }
+
+            let candidate_path = paths::team_store_arbitration_adoption_candidate_path(
+                &self.team_root,
+                &target.dispute_id,
+                &target.resolution_id,
+                &policy_id,
+                &claim.id,
+            );
+            create_first_yaml(&candidate_path, claim, "Claim adoption candidate").await?;
+
+            // candidate 落盘后立即留下恢复 marker。即使进程在 enqueue 前退出，
+            // 启动恢复也会只刷新这个 Resolution，并由候选初始化归因快照。
+            self.write_pending_observation(&target).await?;
+
+            // Additional Claim 首次归因后也要拥有 ClaimId -> Resolution 索引，
+            // 后续上传即使已移除 Policy provenance，仍能定向刷新当前 Resolution。
+            let claim_index =
+                paths::team_store_arbitration_event_claim_index_dir(&self.team_root, &claim.id)
+                    .join(format!("{}.yaml", target.dispute_id));
+            write_yaml_atomic(&claim_index, &target).await?;
+            targets.push(target);
+        }
+        targets.sort();
+        targets.dedup();
+        Ok(targets)
+    }
+
+    pub async fn list_claim_adoption_candidates(
+        &self,
+        dispute_id: &DisputeId,
+        resolution_id: &ArbitrationResolutionId,
+        policy_id: &PolicyId,
+    ) -> anyhow::Result<Vec<Claim>> {
+        let mut claims: Vec<Claim> =
+            list_yaml(&paths::team_store_arbitration_adoption_candidates_dir(
+                &self.team_root,
+                dispute_id,
+                resolution_id,
+                policy_id,
+            ))
+            .await?;
+        claims.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(claims)
     }
 
     pub async fn read_observation(
@@ -716,6 +841,22 @@ where
     match read_yaml::<T>(path).await {
         Ok(existing) if existing == *value => return Ok(()),
         Ok(_) => anyhow::bail!("{label} 已存在但内容不同: {path:?}"),
+        Err(StorageError::Io { source, .. }) if source.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    write_yaml_atomic(path, value)
+        .await
+        .with_context(|| format!("创建 {label} 失败: {path:?}"))
+}
+
+/// 调用方必须持有覆盖该路径的业务锁。候选记录采用 first-write-wins：后续同一
+/// Claim 的上传用于更新 current mirror，不能改写首次归因快照。
+async fn create_first_yaml<T>(path: &Path, value: &T, label: &str) -> anyhow::Result<()>
+where
+    T: Serialize + DeserializeOwned,
+{
+    match read_yaml::<T>(path).await {
+        Ok(_) => return Ok(()),
         Err(StorageError::Io { source, .. }) if source.kind() == ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }

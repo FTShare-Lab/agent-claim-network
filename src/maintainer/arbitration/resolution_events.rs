@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::claim::{ClaimId, InboxId};
+use crate::claim::{Claim, InboxId, SourceId};
 
 use super::types::ARBITRATION_SCHEMA_VERSION;
 use super::{
@@ -98,8 +98,24 @@ impl ResolutionEventScheduler {
         Ok(())
     }
 
-    pub async fn refresh_claim(&self, claim_id: &ClaimId) -> anyhow::Result<()> {
-        for target in self.store.event_targets_for_claim(claim_id).await? {
+    pub async fn refresh_claim(&self, claim: &Claim) -> anyhow::Result<()> {
+        let policy_ids = claim
+            .source_claim_ids
+            .iter()
+            .filter_map(|source| match source {
+                SourceId::Policy(policy_id) => Some(policy_id.clone()),
+                SourceId::Claim(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let mut targets = self.store.event_targets_for_claim(&claim.id).await?;
+        targets.extend(self.store.event_targets_for_policies(&policy_ids).await?);
+        // 直接使用当前上传请求冻结首次携带 CAU provenance 的结果，避免异步
+        // Refresh 执行前 mirror 已被后续上传覆盖。该调用也为 Additional Claim
+        // 建立 ClaimId 索引。
+        targets.extend(self.store.capture_claim_adoption_candidates(claim).await?);
+        targets.sort();
+        targets.dedup();
+        for target in targets {
             let _ = self.enqueue(ResolutionEvent::Refresh(target)).await?;
         }
         Ok(())
@@ -1047,6 +1063,18 @@ mod tests {
             .register_resolution_event_targets(&first)
             .await
             .unwrap();
+        store.write_resolution_record(&first).await.unwrap();
+        store
+            .write_dispute(&MaintainerDisputeRecord {
+                dispute: Dispute {
+                    status: DisputeStatus::Resolved,
+                    resolved_at: Some(first.resolution.resolved_at),
+                    ..first.dispute_snapshot.clone()
+                },
+                resolution: Some(first.resolution.clone()),
+            })
+            .await
+            .unwrap();
         let first_inbox = &first.delivery_intent.as_ref().unwrap().targets[0].inbox_id;
         assert_eq!(
             store
@@ -1068,6 +1096,17 @@ mod tests {
                 resolution_id: second.resolution_id.clone(),
             }]
         );
+        let first_policy = &first.delivery_intent.as_ref().unwrap().policy.id;
+        assert_eq!(
+            store
+                .event_targets_for_policies(std::slice::from_ref(first_policy))
+                .await
+                .unwrap(),
+            vec![ResolutionEventTarget {
+                dispute_id: first.dispute_id.clone(),
+                resolution_id: first.resolution_id.clone(),
+            }]
+        );
 
         let (sender, mut receiver) = mpsc::channel(1);
         let scheduler = ResolutionEventScheduler {
@@ -1081,13 +1120,43 @@ mod tests {
             dispute_id: first.dispute_id.clone(),
             resolution_id: first.resolution_id.clone(),
         };
-        assert!(scheduler.refresh_resolution(target.clone()).await.unwrap());
+        let mut additional_claim = first.direct_claim_snapshots[0].clone();
+        additional_claim.id = crate::claim::ClaimId::random();
+        additional_claim.statement = "first attributed result".into();
+        additional_claim.source_claim_ids = vec![SourceId::Policy(first_policy.clone())];
+        scheduler.refresh_claim(&additional_claim).await.unwrap();
         assert!(!scheduler.refresh_resolution(target.clone()).await.unwrap());
         assert_eq!(
             receiver.recv().await,
             Some(ResolutionEvent::Refresh(target))
         );
         assert_eq!(store.list_pending_observations().await.unwrap().len(), 1);
+
+        let candidates = store
+            .list_claim_adoption_candidates(&first.dispute_id, &first.resolution_id, first_policy)
+            .await
+            .unwrap();
+        assert_eq!(candidates, vec![additional_claim.clone()]);
+        assert_eq!(
+            store
+                .event_targets_for_claim(&additional_claim.id)
+                .await
+                .unwrap(),
+            vec![ResolutionEventTarget {
+                dispute_id: first.dispute_id.clone(),
+                resolution_id: first.resolution_id.clone(),
+            }]
+        );
+
+        // 后续上传不再携带 provenance，仍由 ClaimId 索引定向刷新；首次候选不改写。
+        additional_claim.statement = "later unrelated edit".into();
+        additional_claim.source_claim_ids.clear();
+        scheduler.refresh_claim(&additional_claim).await.unwrap();
+        let candidates = store
+            .list_claim_adoption_candidates(&first.dispute_id, &first.resolution_id, first_policy)
+            .await
+            .unwrap();
+        assert_eq!(candidates[0].statement, "first attributed result");
     }
 
     #[tokio::test]
@@ -1143,6 +1212,11 @@ mod tests {
             .write_observation(&old_target.dispute_id, &old_observation)
             .await
             .unwrap();
+        fixture
+            .store
+            .register_resolution_event_targets(&fixture.record)
+            .await
+            .unwrap();
 
         let mut replacement = resolution_record("agent-a");
         replacement.dispute_id = old_target.dispute_id.clone();
@@ -1160,6 +1234,26 @@ mod tests {
         dispute.resolution = Some(replacement.resolution.clone());
         dispute.dispute.resolved_at = Some(replacement.resolution.resolved_at);
         fixture.store.write_dispute(&dispute).await.unwrap();
+
+        let old_policy = &fixture.record.delivery_intent.as_ref().unwrap().policy.id;
+        let mut late_old_claim = fixture.record.direct_claim_snapshots[0].clone();
+        late_old_claim.source_claim_ids = vec![SourceId::Policy(old_policy.clone())];
+        assert!(fixture
+            .store
+            .capture_claim_adoption_candidates(&late_old_claim)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(fixture
+            .store
+            .list_claim_adoption_candidates(
+                &old_target.dispute_id,
+                &old_target.resolution_id,
+                old_policy,
+            )
+            .await
+            .unwrap()
+            .is_empty());
 
         process_event(
             &fixture.store,

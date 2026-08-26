@@ -17,7 +17,7 @@
 //!
 //! ## InboxMessage 直接复用领域实体
 //! inbox 内化请求把完整 `InboxMessage` 交给 Agent 自己的模型，而不是改成
-//! PolicySummary。ClaimAttributeUpdate 在入模边界统一为单消息请求；普通建议只提供
+//! PolicySummary。连续 ClaimAttributeUpdate 在入模边界批量提供；普通建议只提供
 //! conclusion，带 Resolution 的建议再补充结构化裁决、Dispute 与 direct Claim 快照。
 
 use std::ops::Deref;
@@ -555,7 +555,6 @@ impl SessionTurnContentBlock {
 
 /// 批量 PolicyUpdate 内化请求：把同类型 inbox 消息和 agent 自己的本地 claim
 /// 一并喂给 LLM，由 LLM 决定要不要新增 / 更新 claim、是否产生 dispute。
-/// ClaimAttributeUpdate 使用下面的单消息请求和 Effect Journal。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InternalizeRequest {
     pub agent_id: AgentId,
@@ -565,13 +564,12 @@ pub struct InternalizeRequest {
     pub local_claims: Vec<Claim>,
 }
 
-/// ClaimAttributeUpdate 的统一单次内化输入。
+/// 单条 ClaimAttributeUpdate 的规范化上下文。
 ///
 /// `conclusion` 对所有 CAU 都存在：普通 CAU 取自 `policy.statement`，结构化裁决
 /// 取自 Resolution。其余裁决与 Dispute 字段按消息实际携带的上下文增量提供。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClaimAttributeUpdateInternalizeRequest {
-    pub agent_id: AgentId,
+pub struct ClaimAttributeUpdateInternalizeItem {
     pub claim_attribute_update: InboxMessage,
     pub conclusion: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -579,9 +577,20 @@ pub struct ClaimAttributeUpdateInternalizeRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispute: Option<Dispute>,
     #[serde(default)]
-    pub local_claims: Vec<Claim>,
-    #[serde(default)]
     pub direct_claims: Vec<Claim>,
+}
+
+/// 连续 ClaimAttributeUpdate 的批量内化输入。
+///
+/// `claim_attribute_updates` 保持 inbox 顺序；本地 Claim 只发送一次，由模型综合
+/// 本批建议后返回一份最终知识变更。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimAttributeUpdateInternalizeRequest {
+    pub agent_id: AgentId,
+    #[serde(default)]
+    pub claim_attribute_updates: Vec<ClaimAttributeUpdateInternalizeItem>,
+    #[serde(default)]
+    pub local_claims: Vec<Claim>,
 }
 
 /// session recap / finalize 请求：补充 agent 当前完整本地 claim。

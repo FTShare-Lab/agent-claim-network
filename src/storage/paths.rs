@@ -208,6 +208,39 @@ pub fn team_store_arbitration_event_claim_index_dir(
         .join(claim_id.as_str())
 }
 
+pub fn team_store_arbitration_event_policy_index_path(
+    team_root: &Path,
+    policy_id: &crate::claim::PolicyId,
+) -> PathBuf {
+    team_store_arbitrations_dir(team_root)
+        .join("event-index")
+        .join("policies")
+        .join(format!("{policy_id}.yaml"))
+}
+
+pub fn team_store_arbitration_adoption_candidates_dir(
+    team_root: &Path,
+    dispute_id: &crate::claim::DisputeId,
+    resolution_id: &crate::claim::ArbitrationResolutionId,
+    policy_id: &crate::claim::PolicyId,
+) -> PathBuf {
+    team_store_arbitration_dispute_dir(team_root, dispute_id)
+        .join("adoption-candidates")
+        .join(resolution_id.as_str())
+        .join(policy_id.as_str())
+}
+
+pub fn team_store_arbitration_adoption_candidate_path(
+    team_root: &Path,
+    dispute_id: &crate::claim::DisputeId,
+    resolution_id: &crate::claim::ArbitrationResolutionId,
+    policy_id: &crate::claim::PolicyId,
+    claim_id: &crate::claim::ClaimId,
+) -> PathBuf {
+    team_store_arbitration_adoption_candidates_dir(team_root, dispute_id, resolution_id, policy_id)
+        .join(format!("{claim_id}.yaml"))
+}
+
 pub fn team_store_arbitration_observations_dir(
     team_root: &Path,
     dispute_id: &crate::claim::DisputeId,

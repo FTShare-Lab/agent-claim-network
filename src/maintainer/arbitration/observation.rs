@@ -1,6 +1,6 @@
 //! 根据 outbox ACK 与 holder mirror 派生 Resolution 收敛观测。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 
@@ -62,7 +62,21 @@ impl ObservationService {
         }
         let mut holders = Vec::new();
         if let Some(intent) = record.delivery_intent.as_ref() {
+            let adoption_candidates = self
+                .store
+                .list_claim_adoption_candidates(
+                    &record.dispute_id,
+                    &record.resolution_id,
+                    &intent.policy.id,
+                )
+                .await?;
             for target in &intent.targets {
+                let previous_holder = previous.as_ref().and_then(|observation| {
+                    observation
+                        .holders
+                        .iter()
+                        .find(|holder| holder.agent_id == target.target_agent)
+                });
                 let delivered_at = outbox
                     .iter()
                     .find(|entry| entry.inbox_id == target.inbox_id)
@@ -77,10 +91,14 @@ impl ObservationService {
                     &target.target_agent,
                     delivered_at,
                     observed_at,
-                    &intent.policy.id,
-                    &assessments,
-                    &record.direct_claim_snapshots,
-                    &mirrors,
+                    HolderObservationContext {
+                        policy_id: &intent.policy.id,
+                        assessments: &assessments,
+                        snapshots: &record.direct_claim_snapshots,
+                        mirrors: &mirrors,
+                        adoption_candidates: &adoption_candidates,
+                    },
+                    previous_holder,
                 ));
             }
         }
@@ -156,32 +174,47 @@ impl ObservationService {
     }
 }
 
+#[derive(Clone, Copy)]
+struct HolderObservationContext<'a> {
+    policy_id: &'a crate::claim::PolicyId,
+    assessments: &'a BTreeMap<crate::claim::ClaimId, &'a ClaimAssessment>,
+    snapshots: &'a [Claim],
+    mirrors: &'a [(AgentId, Claim)],
+    adoption_candidates: &'a [Claim],
+}
+
 fn observe_holder(
     holder: &AgentId,
     delivered_at: Option<DateTime<Utc>>,
     observed_at: DateTime<Utc>,
-    policy_id: &crate::claim::PolicyId,
-    assessments: &BTreeMap<crate::claim::ClaimId, &ClaimAssessment>,
-    snapshots: &[Claim],
-    mirrors: &[(AgentId, Claim)],
+    context: HolderObservationContext<'_>,
+    previous: Option<&HolderObservation>,
 ) -> HolderObservation {
+    let claims = claim_observations(
+        holder,
+        context.policy_id,
+        context.assessments,
+        context.snapshots,
+        context.mirrors,
+        context.adoption_candidates,
+        previous,
+    );
     let Some(delivered_at) = delivered_at else {
         return HolderObservation {
             agent_id: holder.clone(),
             state: ObservationState::NotDelivered,
-            reasons: vec!["inbox 尚未 ACK".into()],
+            reasons: vec!["The inbox has not been acknowledged.".into()],
             delivery_observed: false,
             delivered_at: None,
             last_observed_at: Some(observed_at),
-            claims: claim_observations(holder, policy_id, assessments, snapshots, mirrors),
+            claims,
         };
     };
-    let claims = claim_observations(holder, policy_id, assessments, snapshots, mirrors);
     if claims.is_empty() {
         return HolderObservation {
             agent_id: holder.clone(),
             state: ObservationState::Unknown,
-            reasons: vec!["resolution 没有 holder direct Claim snapshot".into()],
+            reasons: vec!["No holder Claim is available for observation yet.".into()],
             delivery_observed: true,
             delivered_at: Some(delivered_at),
             last_observed_at: Some(observed_at),
@@ -220,13 +253,31 @@ fn claim_observations(
     assessments: &BTreeMap<crate::claim::ClaimId, &ClaimAssessment>,
     snapshots: &[Claim],
     mirrors: &[(AgentId, Claim)],
+    adoption_candidates: &[Claim],
+    previous: Option<&HolderObservation>,
 ) -> Vec<ClaimObservation> {
     let holder_snapshots = snapshots
         .iter()
         .filter(|claim| claim.holder == *holder)
         .collect::<Vec<_>>();
+    let direct_ids = holder_snapshots
+        .iter()
+        .map(|claim| claim.id.clone())
+        .collect::<BTreeSet<_>>();
+    let previous_by_id = previous
+        .map(|holder| {
+            holder
+                .claims
+                .iter()
+                .map(|claim| (claim.claim_id.clone(), claim))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
     let mut observations = Vec::with_capacity(holder_snapshots.len());
     for snapshot in holder_snapshots {
+        let candidate = adoption_candidates
+            .iter()
+            .find(|claim| claim.holder == *holder && claim.id == snapshot.id);
         let assessment = assessments.get(&snapshot.id).copied();
         let matches: Vec<&Claim> = mirrors
             .iter()
@@ -238,6 +289,11 @@ fn claim_observations(
         let mut observation = ClaimObservation {
             claim_id: snapshot.id.clone(),
             claim_name: snapshot.name.clone(),
+            is_additional_claim: false,
+            adoption_snapshot: previous_by_id
+                .get(&snapshot.id)
+                .and_then(|claim| claim.adoption_snapshot.clone())
+                .or_else(|| candidate.cloned()),
             recommended_status: assessment.map(|assessment| assessment.recommended_status),
             current_status: None,
             recommended_scope: assessment
@@ -246,40 +302,140 @@ fn claim_observations(
             recommended_statement: assessment
                 .and_then(|assessment| assessment.recommended_statement.clone()),
             current_statement: None,
-            policy_provenance_present: false,
+            policy_provenance_present: candidate.is_some(),
             update_observed: false,
             changed_fields: Vec::new(),
             notes: Vec::new(),
         };
         if matches.len() != 1 {
-            observation
-                .notes
-                .push(format!("claim={} 的 holder mirror 缺失或重复", snapshot.id));
+            observation.notes.push(format!(
+                "The holder mirror for Claim {} is missing or duplicated.",
+                snapshot.id
+            ));
+            observation.update_observed = observation.adoption_snapshot.is_some();
+            if let Some(adoption) = observation.adoption_snapshot.as_ref() {
+                observation.changed_fields = visible_changed_fields(snapshot, adoption);
+            }
             observations.push(observation);
             continue;
         }
         let claim = matches[0];
-        observation.claim_name = claim.name.clone();
         observation.current_status = Some(claim.status);
         observation.current_scope = Some(claim.scope.clone());
         observation.current_statement = Some(claim.statement.clone());
         observation.policy_provenance_present = claim
             .source_claim_ids
-            .contains(&SourceId::Policy(policy_id.clone()));
-        if claim.status != snapshot.status {
-            observation.changed_fields.push("status".into());
+            .contains(&SourceId::Policy(policy_id.clone()))
+            || candidate.is_some();
+        if observation.adoption_snapshot.is_none() && observation.policy_provenance_present {
+            observation.adoption_snapshot = Some(claim.clone());
         }
-        if claim.scope != snapshot.scope {
-            observation.changed_fields.push("scope".into());
+        if let Some(adoption) = observation.adoption_snapshot.as_ref() {
+            observation.changed_fields = visible_changed_fields(snapshot, adoption);
+            observation.update_observed = true;
+        } else if !visible_changed_fields(snapshot, claim).is_empty() {
+            observation.notes.push(
+                "The current mirror differs, but no matching CAU Policy provenance was observed."
+                    .into(),
+            );
         }
-        if claim.statement != snapshot.statement {
-            observation.changed_fields.push("statement".into());
+        observations.push(observation);
+    }
+
+    let mut additional_claim_ids = previous_by_id
+        .values()
+        .filter(|claim| claim.is_additional_claim)
+        .map(|claim| claim.claim_id.clone())
+        .collect::<BTreeSet<_>>();
+    additional_claim_ids.extend(
+        adoption_candidates
+            .iter()
+            .filter(|claim| claim.holder == *holder && !direct_ids.contains(&claim.id))
+            .map(|claim| claim.id.clone()),
+    );
+    for (path_holder, claim) in mirrors {
+        if path_holder == holder
+            && claim.holder == *holder
+            && !direct_ids.contains(&claim.id)
+            && claim
+                .source_claim_ids
+                .contains(&SourceId::Policy(policy_id.clone()))
+        {
+            additional_claim_ids.insert(claim.id.clone());
         }
-        observation.update_observed = !observation.changed_fields.is_empty();
+    }
+    for claim_id in additional_claim_ids {
+        let matches = mirrors
+            .iter()
+            .filter(|(path_holder, claim)| {
+                path_holder == holder && claim.holder == *holder && claim.id == claim_id
+            })
+            .map(|(_, claim)| claim)
+            .collect::<Vec<_>>();
+        let previous_claim = previous_by_id.get(&claim_id).copied();
+        let candidate = adoption_candidates
+            .iter()
+            .find(|claim| claim.holder == *holder && claim.id == claim_id);
+        let mut adoption_snapshot = previous_claim
+            .and_then(|claim| claim.adoption_snapshot.clone())
+            .or_else(|| candidate.cloned());
+        let mut observation = ClaimObservation {
+            claim_id: claim_id.clone(),
+            claim_name: adoption_snapshot
+                .as_ref()
+                .map(|claim| claim.name.clone())
+                .or_else(|| matches.first().map(|claim| claim.name.clone()))
+                .unwrap_or_else(|| "Claim".into()),
+            is_additional_claim: true,
+            adoption_snapshot: None,
+            recommended_status: None,
+            current_status: None,
+            recommended_scope: None,
+            current_scope: None,
+            recommended_statement: None,
+            current_statement: None,
+            policy_provenance_present: candidate.is_some(),
+            update_observed: false,
+            changed_fields: Vec::new(),
+            notes: Vec::new(),
+        };
+        if matches.len() != 1 {
+            observation.notes.push(format!(
+                "The holder mirror for additional Claim {claim_id} is missing or duplicated."
+            ));
+        } else {
+            let claim = matches[0];
+            observation.current_status = Some(claim.status);
+            observation.current_scope = Some(claim.scope.clone());
+            observation.current_statement = Some(claim.statement.clone());
+            observation.policy_provenance_present = claim
+                .source_claim_ids
+                .contains(&SourceId::Policy(policy_id.clone()))
+                || candidate.is_some();
+            if adoption_snapshot.is_none() && observation.policy_provenance_present {
+                adoption_snapshot = Some(claim.clone());
+            }
+        }
+        observation.update_observed = adoption_snapshot.is_some();
+        observation.adoption_snapshot = adoption_snapshot;
         observations.push(observation);
     }
     observations.sort_by(|left, right| left.claim_id.cmp(&right.claim_id));
     observations
+}
+
+fn visible_changed_fields(before: &Claim, after: &Claim) -> Vec<String> {
+    let mut fields = Vec::new();
+    if after.status != before.status {
+        fields.push("status".into());
+    }
+    if after.scope != before.scope {
+        fields.push("scope".into());
+    }
+    if after.statement != before.statement {
+        fields.push("statement".into());
+    }
+    fields
 }
 
 #[cfg(test)]
@@ -314,6 +470,37 @@ mod tests {
             .collect()
     }
 
+    fn observation_context<'a>(
+        policy_id: &'a PolicyId,
+        assessments: &'a BTreeMap<ClaimId, &'a ClaimAssessment>,
+        snapshots: &'a [Claim],
+        mirrors: &'a [(AgentId, Claim)],
+    ) -> HolderObservationContext<'a> {
+        HolderObservationContext {
+            policy_id,
+            assessments,
+            snapshots,
+            mirrors,
+            adoption_candidates: &[],
+        }
+    }
+
+    fn observation_context_with_candidates<'a>(
+        policy_id: &'a PolicyId,
+        assessments: &'a BTreeMap<ClaimId, &'a ClaimAssessment>,
+        snapshots: &'a [Claim],
+        mirrors: &'a [(AgentId, Claim)],
+        adoption_candidates: &'a [Claim],
+    ) -> HolderObservationContext<'a> {
+        HolderObservationContext {
+            policy_id,
+            assessments,
+            snapshots,
+            mirrors,
+            adoption_candidates,
+        }
+    }
+
     fn mirror(holder: &AgentId, claim_id: ClaimId, policy_id: &PolicyId) -> Claim {
         Claim {
             id: claim_id,
@@ -331,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_resolution_snapshots_are_unknown() {
+    fn holder_without_direct_snapshots_observes_additional_policy_claim() {
         let holder = AgentId::new("agent-a").unwrap();
         let policy_id = PolicyId::random();
         let present_id = ClaimId::random();
@@ -346,14 +533,18 @@ mod tests {
             &holder,
             Some("2026-08-02T00:00:00Z".parse().unwrap()),
             "2026-08-03T00:00:00Z".parse().unwrap(),
-            &policy_id,
-            &assessment_lookup(&assessments),
-            &[],
-            &[(holder.clone(), present)],
+            observation_context(
+                &policy_id,
+                &assessment_lookup(&assessments),
+                &[],
+                &[(holder.clone(), present)],
+            ),
+            None,
         );
 
-        assert_eq!(observed.state, ObservationState::Unknown);
-        assert_eq!(observed.reasons.len(), 1);
+        assert_eq!(observed.state, ObservationState::UpdateObserved);
+        assert_eq!(observed.claims.len(), 1);
+        assert!(observed.claims[0].is_additional_claim);
     }
 
     #[test]
@@ -363,10 +554,8 @@ mod tests {
             &holder,
             None,
             "2026-08-03T00:00:00Z".parse().unwrap(),
-            &PolicyId::random(),
-            &BTreeMap::new(),
-            &[],
-            &[],
+            observation_context(&PolicyId::random(), &BTreeMap::new(), &[], &[]),
+            None,
         );
         assert_eq!(observed.state, ObservationState::NotDelivered);
     }
@@ -376,7 +565,8 @@ mod tests {
         let holder = AgentId::new("agent-a").unwrap();
         let policy_id = PolicyId::random();
         let claim_id = ClaimId::random();
-        let snapshot = mirror(&holder, claim_id, &policy_id);
+        let mut snapshot = mirror(&holder, claim_id, &policy_id);
+        snapshot.source_claim_ids.clear();
         let delivered_at = "2026-08-02T00:00:00Z".parse().unwrap();
         let observed_at = "2026-08-03T00:00:00Z".parse().unwrap();
 
@@ -384,10 +574,13 @@ mod tests {
             &holder,
             Some(delivered_at),
             observed_at,
-            &policy_id,
-            &BTreeMap::new(),
-            std::slice::from_ref(&snapshot),
-            &[(holder.clone(), snapshot.clone())],
+            observation_context(
+                &policy_id,
+                &BTreeMap::new(),
+                std::slice::from_ref(&snapshot),
+                &[(holder.clone(), snapshot.clone())],
+            ),
+            None,
         );
         assert_eq!(unchanged.state, ObservationState::NoUpdateObserved);
         assert_eq!(unchanged.claims.len(), 1);
@@ -395,14 +588,20 @@ mod tests {
 
         let mut changed_mirror = snapshot.clone();
         changed_mirror.status = ClaimStatus::Deprecated;
+        changed_mirror
+            .source_claim_ids
+            .push(SourceId::Policy(policy_id.clone()));
         let changed = observe_holder(
             &holder,
             Some(delivered_at),
             observed_at,
-            &policy_id,
-            &BTreeMap::new(),
-            &[snapshot],
-            &[(holder.clone(), changed_mirror)],
+            observation_context(
+                &policy_id,
+                &BTreeMap::new(),
+                &[snapshot],
+                &[(holder.clone(), changed_mirror)],
+            ),
+            None,
         );
         assert_eq!(changed.state, ObservationState::UpdateObserved);
         assert_eq!(changed.claims.len(), 1);
@@ -410,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn delivered_holder_compares_snapshot_and_current_mirror_without_provenance_gate() {
+    fn visible_change_without_policy_provenance_is_not_attributed() {
         let holder = AgentId::new("agent-a").unwrap();
         let policy_id = PolicyId::random();
         let claim_id = ClaimId::random();
@@ -424,10 +623,13 @@ mod tests {
             &holder,
             Some(delivered_at),
             observed_at,
-            &policy_id,
-            &assessment_lookup(std::slice::from_ref(&assessment)),
-            std::slice::from_ref(&snapshot),
-            &[(holder.clone(), snapshot.clone())],
+            observation_context(
+                &policy_id,
+                &assessment_lookup(std::slice::from_ref(&assessment)),
+                std::slice::from_ref(&snapshot),
+                &[(holder.clone(), snapshot.clone())],
+            ),
+            None,
         );
         assert_eq!(unchanged.state, ObservationState::NoUpdateObserved);
         assert!(!unchanged.claims[0].update_observed);
@@ -441,15 +643,171 @@ mod tests {
             &holder,
             Some(delivered_at),
             observed_at,
-            &policy_id,
-            &assessment_lookup(std::slice::from_ref(&assessment)),
-            &[snapshot],
-            &[(holder.clone(), changed_mirror)],
+            observation_context(
+                &policy_id,
+                &assessment_lookup(std::slice::from_ref(&assessment)),
+                &[snapshot],
+                &[(holder.clone(), changed_mirror)],
+            ),
+            None,
         );
-        assert_eq!(changed.state, ObservationState::UpdateObserved);
-        assert!(changed.claims[0].update_observed);
-        assert_eq!(changed.claims[0].changed_fields, ["status", "statement"]);
+        assert_eq!(changed.state, ObservationState::NoUpdateObserved);
+        assert!(!changed.claims[0].update_observed);
+        assert!(changed.claims[0].changed_fields.is_empty());
         assert!(!changed.claims[0].policy_provenance_present);
+        assert_eq!(changed.claims[0].notes.len(), 1);
+    }
+
+    #[test]
+    fn policy_provenance_attributes_additional_claim_and_freezes_first_adoption() {
+        let holder = AgentId::new("agent-a").unwrap();
+        let policy_id = PolicyId::random();
+        let direct_id = ClaimId::random();
+        let mut direct = mirror(&holder, direct_id, &policy_id);
+        direct.source_claim_ids.clear();
+        direct.status = ClaimStatus::Active;
+        let mut new_claim = mirror(&holder, ClaimId::random(), &policy_id);
+        new_claim.name = "new-knowledge".into();
+        new_claim.statement = "first attributed result".into();
+        let delivered_at = "2026-08-02T00:00:00Z".parse().unwrap();
+        let first = observe_holder(
+            &holder,
+            Some(delivered_at),
+            "2026-08-03T00:00:00Z".parse().unwrap(),
+            observation_context(
+                &policy_id,
+                &BTreeMap::new(),
+                std::slice::from_ref(&direct),
+                &[
+                    (holder.clone(), direct.clone()),
+                    (holder.clone(), new_claim.clone()),
+                ],
+            ),
+            None,
+        );
+        assert_eq!(first.state, ObservationState::UpdateObserved);
+        let first_new = first
+            .claims
+            .iter()
+            .find(|claim| claim.is_additional_claim)
+            .unwrap();
+        assert!(first_new.update_observed);
+        assert_eq!(
+            first_new
+                .adoption_snapshot
+                .as_ref()
+                .map(|claim| claim.statement.as_str()),
+            Some("first attributed result")
+        );
+
+        new_claim.statement = "later unrelated edit".into();
+        let refreshed = observe_holder(
+            &holder,
+            Some(delivered_at),
+            "2026-08-04T00:00:00Z".parse().unwrap(),
+            observation_context(
+                &policy_id,
+                &BTreeMap::new(),
+                &[direct.clone()],
+                &[(holder.clone(), direct), (holder.clone(), new_claim)],
+            ),
+            Some(&first),
+        );
+        let refreshed_new = refreshed
+            .claims
+            .iter()
+            .find(|claim| claim.is_additional_claim)
+            .unwrap();
+        assert_eq!(
+            refreshed_new
+                .adoption_snapshot
+                .as_ref()
+                .map(|claim| claim.statement.as_str()),
+            Some("first attributed result")
+        );
+        assert_eq!(
+            refreshed_new.current_statement.as_deref(),
+            Some("later unrelated edit")
+        );
+    }
+
+    #[test]
+    fn persisted_candidate_survives_mirror_overwrite_before_first_refresh() {
+        let holder = AgentId::new("agent-a").unwrap();
+        let policy_id = PolicyId::random();
+        let mut direct = mirror(&holder, ClaimId::random(), &policy_id);
+        direct.status = ClaimStatus::Active;
+        direct.source_claim_ids.clear();
+
+        let mut direct_candidate = direct.clone();
+        direct_candidate.status = ClaimStatus::Deprecated;
+        direct_candidate.statement = "first attributed direct result".into();
+        direct_candidate
+            .source_claim_ids
+            .push(SourceId::Policy(policy_id.clone()));
+        let mut additional_candidate = mirror(&holder, ClaimId::random(), &policy_id);
+        additional_candidate.statement = "first attributed additional result".into();
+
+        let mut overwritten_direct = direct_candidate.clone();
+        overwritten_direct.statement = "later direct edit".into();
+        overwritten_direct.source_claim_ids.clear();
+        let mut overwritten_additional = additional_candidate.clone();
+        overwritten_additional.statement = "later additional edit".into();
+        overwritten_additional.source_claim_ids.clear();
+        let candidates = [direct_candidate.clone(), additional_candidate.clone()];
+        let mirrors = [
+            (holder.clone(), overwritten_direct),
+            (holder.clone(), overwritten_additional),
+        ];
+
+        let observed = observe_holder(
+            &holder,
+            Some("2026-08-02T00:00:00Z".parse().unwrap()),
+            "2026-08-03T00:00:00Z".parse().unwrap(),
+            observation_context_with_candidates(
+                &policy_id,
+                &BTreeMap::new(),
+                std::slice::from_ref(&direct),
+                &mirrors,
+                &candidates,
+            ),
+            None,
+        );
+
+        assert_eq!(observed.state, ObservationState::UpdateObserved);
+        let direct_observation = observed
+            .claims
+            .iter()
+            .find(|claim| claim.claim_id == direct.id)
+            .unwrap();
+        assert_eq!(
+            direct_observation
+                .adoption_snapshot
+                .as_ref()
+                .map(|claim| claim.statement.as_str()),
+            Some("first attributed direct result")
+        );
+        assert_eq!(
+            direct_observation.current_statement.as_deref(),
+            Some("later direct edit")
+        );
+        let additional_observation = observed
+            .claims
+            .iter()
+            .find(|claim| claim.claim_id == additional_candidate.id)
+            .unwrap();
+        assert!(additional_observation.is_additional_claim);
+        assert_eq!(
+            additional_observation
+                .adoption_snapshot
+                .as_ref()
+                .map(|claim| claim.statement.as_str()),
+            Some("first attributed additional result")
+        );
+        assert_eq!(
+            additional_observation.current_statement.as_deref(),
+            Some("later additional edit")
+        );
     }
 
     #[test]
@@ -470,6 +828,15 @@ holders:
         assert!(!holder.delivery_observed);
         assert!(holder.claims.is_empty());
         assert!(holder.delivered_at.is_none());
+
+        let legacy_claim_yaml = r#"
+claim_id: claim_1234abcd
+claim_name: legacy
+update_observed: true
+"#;
+        let claim: ClaimObservation = serde_yaml_ng::from_str(legacy_claim_yaml).unwrap();
+        assert!(!claim.is_additional_claim);
+        assert!(claim.adoption_snapshot.is_none());
     }
 
     #[tokio::test]
@@ -480,6 +847,7 @@ holders:
         let claim_id = ClaimId::random();
         let mut current = mirror(&holder, claim_id.clone(), &policy_id);
         current.status = ClaimStatus::Active;
+        current.source_claim_ids.clear();
         let mirror_path = paths::team_store_agent_claims_dir(root.path(), &holder)
             .join(format!("{}.yaml", current.id));
         write_yaml_atomic(&mirror_path, &current).await.unwrap();
@@ -505,7 +873,7 @@ holders:
             rejection_reason: None,
         };
         let policy = Policy {
-            id: policy_id,
+            id: policy_id.clone(),
             message_type: PolicyMessageType::ClaimAttributeUpdate,
             name: "dispute_arbitration".into(),
             statement: "statement".into(),
@@ -613,6 +981,9 @@ holders:
         );
 
         current.status = ClaimStatus::Deprecated;
+        current
+            .source_claim_ids
+            .push(SourceId::Policy(policy_id.clone()));
         current.updated_at = Some("2026-08-03T02:00:00Z".parse().unwrap());
         write_yaml_atomic(&mirror_path, &current).await.unwrap();
         let changed = service
@@ -654,6 +1025,26 @@ holders:
             2
         );
 
+        current.status = ClaimStatus::Stale;
+        current.statement = "later unrelated edit".into();
+        current.updated_at = Some("2026-08-03T03:30:00Z".parse().unwrap());
+        write_yaml_atomic(&mirror_path, &current).await.unwrap();
+        let later = service
+            .refresh(&record, "2026-08-03T03:45:00Z".parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            later.holders[0].claims[0]
+                .adoption_snapshot
+                .as_ref()
+                .map(|claim| claim.status),
+            Some(ClaimStatus::Deprecated)
+        );
+        assert_eq!(
+            later.holders[0].claims[0].current_status,
+            Some(ClaimStatus::Stale)
+        );
+
         // 已被替换的 Resolution cache 必须冻结；详情读取即使持有旧 record，
         // 也不能在替换后继续写旧 observation。
         let mut current_dispute = store.read_dispute(&record.dispute_id).await.unwrap();
@@ -668,7 +1059,7 @@ holders:
             .unwrap();
         assert_eq!(
             frozen.observed_at,
-            "2026-08-03T03:00:00Z".parse::<DateTime<Utc>>().unwrap()
+            "2026-08-03T03:45:00Z".parse::<DateTime<Utc>>().unwrap()
         );
         assert_eq!(frozen.holders[0].state, ObservationState::UpdateObserved);
         assert_eq!(

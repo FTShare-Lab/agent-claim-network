@@ -415,6 +415,14 @@ pub struct ClaimObservation {
     pub claim_id: ClaimId,
     #[serde(default)]
     pub claim_name: String,
+    /// 不在 Resolution direct Claim 快照中、但携带该 CAU Policy provenance 的 Claim。
+    /// 该 Claim 可能是本次新建，也可能是既有非 direct Claim 被修改，因此使用中性语义。
+    #[serde(default)]
+    pub is_additional_claim: bool,
+    /// 第一次在 holder mirror 中看到对应 CAU Policy provenance 时冻结的结果。
+    /// 后续无关修改只更新 current_*，不会改写这份归因快照。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adoption_snapshot: Option<Claim>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recommended_status: Option<ClaimStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

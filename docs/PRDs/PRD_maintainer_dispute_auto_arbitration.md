@@ -187,19 +187,21 @@ Resolution、Policy 和 outbox entry 都使用 create-or-verify 语义。相同 
 
 ## Agent Claim Attribute Update 内化
 
-普通建议、自动 Resolution、人工 Resolve 与 Reject & Replace 统一为 Claim Attribute Update。每条 CAU 单独处理，一次结构化模型调用输入：
+普通建议、自动 Resolution、人工 Resolve 与 Reject & Replace 统一为 Claim Attribute Update。连续 CAU 按 inbox 顺序组成一次结构化模型调用，输入：
 
 ```text
 agent_id
-claim_attribute_update
-conclusion
-resolution?
-dispute?
+claim_attribute_updates[] {
+  claim_attribute_update
+  conclusion
+  resolution?
+  dispute?
+  direct_claims
+}
 local_claims
-direct_claims
 ```
 
-- `claim_attribute_update` 保留完整 inbox 消息和 Policy。
+- `claim_attribute_updates` 保留每条完整 inbox 消息和 Policy，顺序与 inbox 一致。
 - `conclusion` 始终存在；普通 CAU 取自 `policy.statement`，结构化 CAU 取自 Resolution conclusion。
 - `resolution` 与 `dispute` 按消息是否包含结构化治理结果提供；Resolution 保留 type、basis、assessment 等信息。
 - `local_claims` 是唯一可编辑集合：当前 Agent 全部非 deprecated 本地 Claim，加上由它持有的任意 status direct Claim。
@@ -207,13 +209,13 @@ direct_claims
 
 该调用不读取 Memory、USER、session transcript 或工具上下文。模型可以保持不变、更新 `local_claims` 中的对象、创建新 Claim，或在发现新的实质冲突时报告新 Dispute。存在 Resolution 时，模型先判断当前 Claim 是否已经符合结论；已有等价、正确的本地 Claim 时不创建重复知识，同一知识单元优先原地更新，只有明确存在正确承载对象时才将错误 direct Claim deprecated。不能为了记录 Resolution 或提高可观察性而制造更新。
 
-后端重新按 holder、status 与 direct Claim 集合构造编辑白名单，不信任模型对权限的理解：更新目标必须属于当前 Agent，且必须是非 deprecated 本地 Claim或当前 Dispute 的本地 direct Claim。Claim source 只允许输入中可见 Claim、它们已有的 Claim 来源和本批新 Claim；Policy source 只允许当前 CAU 及可见 Claim 中出现的 Policy；Dispute 只允许引用实际可见 Claim和本批新 Claim。仅作为历史来源出现的 Claim不能升格为 Dispute 对象，其他 holder 的 direct Claim不能更新。
+后端重新按 holder、status 与 direct Claim 集合构造编辑白名单，不信任模型对权限的理解：更新目标必须属于当前 Agent，且必须是非 deprecated 本地 Claim或当前 Dispute 的本地 direct Claim。Claim source 只允许输入中可见 Claim、它们已有的 Claim 来源和本批新 Claim；Policy source 只允许本批 CAU 及可见 Claim 中出现的 Policy；每个 new/updated Claim 必须至少引用一个真正影响它的本批 CAU Policy。Dispute 只允许引用实际可见 Claim和本批新 Claim。仅作为历史来源出现的 Claim不能升格为 Dispute 对象，其他 holder 的 direct Claim不能更新。
 
-每条消息在 `<agent_home>/inbox/effects/<inbox_id>.yaml` 保存稳定 Effect Journal：
+每批连续 CAU 在 `<agent_home>/inbox/effects/` 保存稳定联合 Effect Journal，并为批内各 inbox 消息保存可恢复引用：
 
-- `Prepared` 保存已校验 effect、preimage hash 与固定 Claim/Dispute/Trace ID。
+- `Prepared` 保存有序消息身份与 hash、已校验 effect、preimage hash 与固定 Claim/Dispute/Trace ID。
 - `Applied` 表示 Claim、Trace 与 durable Maintainer upload 已进入幂等恢复边界。
-- 崩溃后优先重放 Prepared plan，不再次调用模型。
+- 崩溃或部分 ACK 后优先重放同一 Prepared plan，不再次调用模型。
 - 当前 Claim 等于 target 时视为已应用；等于 preimage 时应用；已被后续本地操作改变时记录 superseded warning，不覆盖新内容。
 
 ## Resolution 投递与 Holder Observation
@@ -227,16 +229,16 @@ Observation 由以下事件定向刷新当前 Resolution：
 - 当前 Resolution 切换；
 - Dispute 详情按需读取。
 
-索引把 inbox ID 和 direct Claim ID 映射到受影响的当前 Resolution。被替换 Resolution 的 observation cache 保留，后续事件只更新当前 Resolution。
+索引把 inbox ID、direct Claim ID 和通知 Policy ID 映射到受影响的当前 Resolution；Policy 索引使 CAU 新建 Claim 的首次 mirror 上传也能定向刷新。被替换 Resolution 的 observation cache 保留，后续事件只更新当前 Resolution。
 
-Observation 以 Resolution 中冻结的 direct Claim 快照为基线，逐 Claim 对比当前 holder mirror 的 status、scope 和 statement；assessment 只提供可选的建议元数据，不决定比较对象，因此不含 assessment 的人工 Resolution 仍能展示完整快照对比。receipt 独立表示是否送达；通知 Policy provenance 只作为技术事实保留，不作为识别更新的门槛。状态为：
+Observation 以 Resolution 中冻结的 direct Claim 快照为基线，逐 Claim 对比 holder mirror 的 status、scope 和 statement，并以通知 Policy provenance 归因 CAU 修改。具有对应 provenance、但不属于 direct 快照的 Claim 作为额外 Policy-linked Claim 纳入观察，其中包含本次真正新建的 Claim，也可能包含被 CAU 修改的既有非 direct Claim；仅凭 provenance 不伪造两者的区别。Maintainer 在首次收到携带对应 provenance 的 Claim 上传时，直接从该请求 create-once 冻结 adoption 快照；异步刷新和后续 mirror 版本不能改写它。assessment 只提供可选的建议元数据，不决定比较对象，因此不含 assessment 的人工 Resolution 仍能展示完整快照对比。receipt 独立表示是否送达。状态为：
 
 - `not_delivered`
 - `no_update_observed`
 - `update_observed`
 - `unknown`
 
-updated、unchanged 和 unavailable 以 Claim 为单位汇总，notified 与 delivered 以 holder 为单位汇总。Observation 不评价 holder 是否逐字段服从 assessment，只用于治理可见性，不触发 Analysis、Resolution、通知或 Claim 修改。
+updated、additional、unchanged 和 unavailable 以 Claim 为单位汇总，notified 与 delivered 以 holder 为单位汇总。Observation 不评价 holder 是否逐字段服从 assessment，只用于治理可见性，不触发 Analysis、Resolution、通知或 Claim 修改。
 
 ## Workbench
 
@@ -276,7 +278,7 @@ Proposal 与 Verification 使用同一份 Maintainer LLM 配置，但执行两�
 - Analyze 覆盖 Current Analysis，不产生 history/chain；Adopt 不重新调用模型。
 - Resolution 与投递 ID 在并发、请求取消、进程重启和部分 outbox 写入后保持幂等。
 - pending delivery 退避恢复；ACK、Claim upload 与 Resolution switch 只刷新相关当前 Resolution；旧 observation cache 保持冻结。
-- 所有 CAU 使用统一单消息输入与 Effect Journal，不读取 Memory；当前 Agent 可修改全部非 deprecated 本地 Claim和自己持有的任意状态 direct Claim，其他 holder 快照只读，崩溃恢复不重复调用模型。
+- 所有 CAU 使用统一的连续批量输入与联合 Effect Journal，不读取 Memory；当前 Agent 可修改全部非 deprecated 本地 Claim和自己持有的任意状态 direct Claim，其他 holder 快照只读，崩溃或部分 ACK 恢复不重复调用模型。
 - Policy 内化已消除的冲突不生成 Dispute；Agent 在本地落盘和上传前按整批最终 Claim 状态校验，Maintainer 再对含 deprecated direct Claim 的新上报返回确定性冲突，Agent 单次发送后不自动重试。
 - Workbench 在 Resolution 提交后立即刷新当前 Dispute、Analysis 与 Resolution 视图。
 - Rust 与 Workbench 的格式、静态检查、测试、构建及独立 code review 通过。
