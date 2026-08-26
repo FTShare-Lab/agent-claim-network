@@ -1,3 +1,4 @@
+import { QueryClient } from '@tanstack/react-query'
 import { createMemoryRouter } from 'react-router'
 import { RouterProvider } from 'react-router/dom'
 
@@ -14,12 +15,20 @@ type WorkbenchInitialEntry =
     }
 
 export function renderWorkbenchRoute(initialEntry: WorkbenchInitialEntry) {
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: {
+        retry: false,
+        staleTime: 0,
+      },
+    },
+  })
   const router = createMemoryRouter(routes, {
     initialEntries: [initialEntry],
   })
 
   return (
-    <AppProviders>
+    <AppProviders queryClient={queryClient}>
       <RouterProvider router={router} />
     </AppProviders>
   )

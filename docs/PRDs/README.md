@@ -40,3 +40,4 @@
 
 - [Upstream 鉴权与目录隔离](PRD_team_auth_design.md)
 - [Inbox Delivery](PRD_inbox_delivery_refactor.md)
+- [Maintainer Dispute 自动裁决](PRD_maintainer_dispute_auto_arbitration.md)

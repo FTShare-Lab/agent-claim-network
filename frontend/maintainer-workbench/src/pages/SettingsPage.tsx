@@ -176,14 +176,15 @@ const ENDPOINT_GROUPS: EndpointGroup[] = [
         method: 'GET',
         path: '/api/disputes',
         summary: '列出所有 dispute',
-        response: `Dispute[] 每项 {
+        response: `MaintainerDisputeRecord[] 每项 {
   id: string, name: string,
   reporter_agent_id: string,
-  claims: [ string ],          // 关联的 claim_id 列表
+  claims: [ string ],          // direct claim_id 列表
   summary: string,
   status: "open"|"resolved",
   created_at: ISO8601,
-  resolved_at?: ISO8601
+  resolved_at?: ISO8601,
+  resolution?: DisputeResolution
 }`,
         caller: 'workbench Disputes 页',
       },
@@ -191,13 +192,45 @@ const ENDPOINT_GROUPS: EndpointGroup[] = [
         method: 'GET',
         path: '/api/disputes/{id}',
         summary: '查询单个 dispute',
-        response: 'Dispute（结构同 /api/disputes 的单项）',
+        response: `DisputeDetail {
+  ...MaintainerDisputeRecord,
+  current_analysis?: ArbitrationAnalysisSummary,
+  holder_adoption?: HolderAdoptionView
+}`,
+        caller: 'workbench Disputes Drawer',
+      },
+      {
+        method: 'GET',
+        path: '/api/disputes/{id}/analyses',
+        summary: '查询当前 Analysis',
+        response: '{ current_analysis? }',
         caller: 'workbench Disputes Drawer',
       },
       {
         method: 'POST',
+        path: '/api/disputes/{id}/analyses',
+        summary: '显式运行 Analysis，并覆盖当前结果',
+        response: '202 Accepted + ArbitrationAnalysisSummary',
+        caller: 'workbench Disputes Analyze',
+      },
+      {
+        method: 'GET',
+        path: '/api/disputes/{id}/analyses/{analysis_id}',
+        summary: '查询冻结上下文、proposal 与 verification',
+        response: 'ArbitrationAnalysisDetail',
+        caller: 'workbench Analysis 卡片',
+      },
+      {
+        method: 'POST',
+        path: '/api/disputes/{id}/analyses/{analysis_id}/adopt',
+        summary: '显式采用 approved Analysis，不重新调用模型',
+        response: '201 Created + ArbitrationResolutionRecord；输入已变化或已关闭时 409',
+        caller: 'workbench Analysis Adopt',
+      },
+      {
+        method: 'POST',
         path: '/disputes/report',
-        summary: 'agent 上报一条 dispute',
+        summary: 'agent 上报 dispute；shadow/auto 建立 Current Analysis，manual 只保存 dispute',
         body: `{
   auth: { agent_id: string, acn_key: string },
   data: Dispute {
@@ -211,13 +244,31 @@ const ENDPOINT_GROUPS: EndpointGroup[] = [
       {
         method: 'POST',
         path: '/disputes/{id}/resolve',
-        summary: 'maintainer 关闭一条 dispute，可选通知受影响 agent',
+        summary: '人类直接关闭一条 dispute，可选通知 direct Claim holder',
         body: `{
-  resolve_note: string,                 // 必填，关闭说明
-  notify_affected_agents: boolean      // true 时向相关 claim holder 推送 CAU
+  resolve_note: string,
+  notify_affected_agents: boolean,
+  resolution_type?: ResolutionType,
+  resolution_basis?: ResolutionBasis,
+  claim_assessments?: ClaimAssessment[]
 }`,
         response: '204 No Content（成功无 body）',
         caller: 'workbench Disputes Resolve',
+      },
+      {
+        method: 'POST',
+        path: '/api/disputes/{id}/resolution/reject',
+        summary: '驳回并替换当前 automatic Resolution',
+        body: `{
+  expected_resolution_id: string,
+  rejection_reason: string,
+  conclusion: string,
+  resolution_type?: ResolutionType,
+  resolution_basis?: ResolutionBasis,
+  claim_assessments?: ClaimAssessment[]
+}`,
+        response: '201 Created + ArbitrationResolutionRecord；Resolution 已变化时 409',
+        caller: 'workbench Reject & Replace',
       },
     ],
   },

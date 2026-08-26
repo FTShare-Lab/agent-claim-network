@@ -120,6 +120,9 @@ const RESERVED_UPSTREAM_NAMES_RAW: &str = include_str!("../resources/upstream_re
 pub const DEFAULT_MAINTAINER_SWEEP_TICK_INTERVAL_SECS: u64 = 86_400;
 pub const DEFAULT_MAINTAINER_STALE_AFTER_DAYS: u32 = 30;
 pub const DEFAULT_MAINTAINER_DEPRECATED_AFTER_DAYS: u32 = 90;
+pub const DEFAULT_MAINTAINER_ARBITRATION_CONFIDENCE_THRESHOLD: f64 = 0.90;
+pub const DEFAULT_MAINTAINER_ARBITRATION_MAX_SOURCE_CLAIMS: usize = 20;
+pub const DEFAULT_MAINTAINER_LLM_RETRY_COUNT: u32 = 2;
 pub const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_LLM_TIMEOUT_SECS: u64 = 300;
 pub const DEFAULT_HTTP_RETRY_COUNT: u32 = 1;
@@ -524,6 +527,14 @@ fn default_maintainer_stale_after_days() -> u32 {
 
 fn default_maintainer_deprecated_after_days() -> u32 {
     DEFAULT_MAINTAINER_DEPRECATED_AFTER_DAYS
+}
+
+fn default_maintainer_arbitration_confidence_threshold() -> f64 {
+    DEFAULT_MAINTAINER_ARBITRATION_CONFIDENCE_THRESHOLD
+}
+
+fn default_maintainer_arbitration_max_source_claims() -> usize {
+    DEFAULT_MAINTAINER_ARBITRATION_MAX_SOURCE_CLAIMS
 }
 
 fn default_http_timeout_secs() -> u64 {
@@ -1699,6 +1710,43 @@ pub struct MaintainerIdConfig {
     pub mint_max_retries: u32,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArbitrationMode {
+    #[default]
+    Shadow,
+    Auto,
+    Manual,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintainerArbitrationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: ArbitrationMode,
+    // 旧配置曾公开该字段；事件驱动调度不再使用它，但反序列化时仍接受，避免升级即启动失败。
+    #[serde(default, rename = "poll_interval_secs", skip_serializing)]
+    pub(crate) _legacy_poll_interval_secs: Option<u64>,
+    #[serde(default = "default_maintainer_arbitration_confidence_threshold")]
+    pub confidence_threshold: f64,
+    #[serde(default = "default_maintainer_arbitration_max_source_claims")]
+    pub max_source_claims: usize,
+}
+
+impl Default for MaintainerArbitrationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: ArbitrationMode::Shadow,
+            _legacy_poll_interval_secs: None,
+            confidence_threshold: default_maintainer_arbitration_confidence_threshold(),
+            max_source_claims: default_maintainer_arbitration_max_source_claims(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaintainerConfig {
@@ -1714,6 +1762,30 @@ pub struct MaintainerConfig {
     pub id: MaintainerIdConfig,
     #[serde(default)]
     pub auth: MaintainerAuthConfig,
+    #[serde(default)]
+    pub arbitration: MaintainerArbitrationConfig,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_maintainer_llm",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub llm: Option<LlmChatConfig>,
+}
+
+fn deserialize_maintainer_llm<'de, D>(deserializer: D) -> Result<Option<LlmChatConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(mut value) = Option::<toml::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let table = value
+        .as_table_mut()
+        .ok_or_else(|| serde::de::Error::custom("[maintainer.llm] 必须是 TOML table"))?;
+    table
+        .entry("retry_count")
+        .or_insert_with(|| toml::Value::Integer(i64::from(DEFAULT_MAINTAINER_LLM_RETRY_COUNT)));
+    value.try_into().map(Some).map_err(serde::de::Error::custom)
 }
 
 impl Default for MaintainerSweepConfig {
@@ -1735,6 +1807,8 @@ impl Default for MaintainerConfig {
             ui: MaintainerUiConfig::default(),
             id: MaintainerIdConfig::default(),
             auth: MaintainerAuthConfig::default(),
+            arbitration: MaintainerArbitrationConfig::default(),
+            llm: None,
         }
     }
 }
@@ -1813,6 +1887,7 @@ impl Config {
             explicit_path,
             ConfigLoadOptions {
                 require_agent_llm_api_key: true,
+                require_maintainer_llm_api_key: false,
                 require_maintainer_admin_auth_password: true,
                 validate_upstreams: true,
                 ensure_storage_dirs: true,
@@ -1828,6 +1903,7 @@ impl Config {
             explicit_path,
             ConfigLoadOptions {
                 require_agent_llm_api_key: true,
+                require_maintainer_llm_api_key: false,
                 require_maintainer_admin_auth_password: false,
                 validate_upstreams: true,
                 ensure_storage_dirs: false,
@@ -1841,6 +1917,7 @@ impl Config {
     ) -> Result<(Self, PathBuf), ConfigError> {
         let options = ConfigLoadOptions {
             require_agent_llm_api_key: false,
+            require_maintainer_llm_api_key: false,
             require_maintainer_admin_auth_password: false,
             validate_upstreams: true,
             ensure_storage_dirs: false,
@@ -1872,6 +1949,7 @@ impl Config {
     ) -> Result<(Self, PathBuf), ConfigError> {
         let options = ConfigLoadOptions {
             require_agent_llm_api_key: false,
+            require_maintainer_llm_api_key: false,
             require_maintainer_admin_auth_password: false,
             validate_upstreams: false,
             ensure_storage_dirs: false,
@@ -1905,6 +1983,7 @@ impl Config {
             explicit_path,
             ConfigLoadOptions {
                 require_agent_llm_api_key: false,
+                require_maintainer_llm_api_key: false,
                 require_maintainer_admin_auth_password: false,
                 validate_upstreams: false,
                 ensure_storage_dirs: true,
@@ -1920,6 +1999,7 @@ impl Config {
             explicit_path,
             ConfigLoadOptions {
                 require_agent_llm_api_key: false,
+                require_maintainer_llm_api_key: true,
                 require_maintainer_admin_auth_password: true,
                 validate_upstreams: false,
                 ensure_storage_dirs: true,
@@ -1944,6 +2024,7 @@ impl Config {
                     &path,
                     ConfigLoadOptions {
                         require_agent_llm_api_key: false,
+                        require_maintainer_llm_api_key: false,
                         ensure_storage_dirs: options.ensure_storage_dirs,
                         ..options
                     },
@@ -1962,6 +2043,7 @@ impl Config {
             path,
             ConfigLoadOptions {
                 require_agent_llm_api_key: true,
+                require_maintainer_llm_api_key: false,
                 require_maintainer_admin_auth_password: true,
                 validate_upstreams: true,
                 ensure_storage_dirs: true,
@@ -1975,6 +2057,7 @@ impl Config {
             path,
             ConfigLoadOptions {
                 require_agent_llm_api_key: false,
+                require_maintainer_llm_api_key: false,
                 require_maintainer_admin_auth_password: false,
                 validate_upstreams: false,
                 ensure_storage_dirs: true,
@@ -2124,6 +2207,13 @@ impl Config {
         if !self.agent.llm.api_key_env.trim().is_empty() {
             if let Ok(v) = std::env::var(&self.agent.llm.api_key_env) {
                 self.agent.llm.api_key = Some(v);
+            }
+        }
+        if let Some(llm) = self.maintainer.llm.as_mut() {
+            if !llm.api_key_env.trim().is_empty() {
+                if let Ok(value) = std::env::var(&llm.api_key_env) {
+                    llm.api_key = Some(value);
+                }
             }
         }
         if let Ok(v) = std::env::var("LANGFUSE_PUBLIC_KEY") {
@@ -2317,6 +2407,7 @@ fn normalize_path(path: &Path) -> PathBuf {
 #[derive(Clone, Copy)]
 struct ConfigLoadOptions {
     require_agent_llm_api_key: bool,
+    require_maintainer_llm_api_key: bool,
     require_maintainer_admin_auth_password: bool,
     validate_upstreams: bool,
     ensure_storage_dirs: bool,
@@ -2411,6 +2502,94 @@ fn validate_config(
         return Err(ConfigError::Validation(
             "agent.llm.retry_max_delay_ms must be > 0".into(),
         ));
+    }
+    let arbitration = &cfg.maintainer.arbitration;
+    if !arbitration.confidence_threshold.is_finite()
+        || !(0.0..=1.0).contains(&arbitration.confidence_threshold)
+    {
+        return Err(ConfigError::Validation(
+            "maintainer.arbitration.confidence_threshold must be finite and within [0, 1]".into(),
+        ));
+    }
+    if arbitration.max_source_claims == 0 {
+        return Err(ConfigError::Validation(
+            "maintainer.arbitration.max_source_claims must be > 0".into(),
+        ));
+    }
+    let enabled_maintainer_llm = if arbitration.enabled {
+        let llm = cfg.maintainer.llm.as_ref().ok_or_else(|| {
+            ConfigError::Validation(
+                "maintainer.arbitration.enabled=true requires [maintainer.llm]".into(),
+            )
+        })?;
+        if llm.max_tokens == 0 {
+            return Err(ConfigError::Validation(
+                "maintainer.llm.max_tokens must be > 0".into(),
+            ));
+        }
+        if llm.supports_websockets && llm.provider != LlmProvider::OpenAiResponses {
+            return Err(ConfigError::Validation(
+                "maintainer.llm.supports_websockets 只能用于 provider = \"openai_responses\""
+                    .into(),
+            ));
+        }
+        if llm.context_window == 0 {
+            return Err(ConfigError::Validation(
+                "maintainer.llm.context_window must be > 0".into(),
+            ));
+        }
+        for (name, value) in [
+            ("maintainer.llm.temperature", llm.temperature),
+            ("maintainer.llm.top_p", llm.top_p),
+        ] {
+            if value.is_some_and(|value| !value.is_finite()) {
+                return Err(ConfigError::Validation(format!(
+                    "{name} must be a finite number"
+                )));
+            }
+        }
+        if llm.timeout_secs == 0 {
+            return Err(ConfigError::Validation(
+                "maintainer.llm.timeout_secs must be > 0".into(),
+            ));
+        }
+        if llm.retry_count > 0 && llm.retry_base_delay_ms == 0 {
+            return Err(ConfigError::Validation(
+                "maintainer.llm.retry_base_delay_ms must be > 0 when retry_count > 0".into(),
+            ));
+        }
+        if llm.retry_max_delay_ms == 0 {
+            return Err(ConfigError::Validation(
+                "maintainer.llm.retry_max_delay_ms must be > 0".into(),
+            ));
+        }
+        if llm.endpoint.trim().is_empty() || llm.model.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "[maintainer.llm].endpoint and model must not be empty when arbitration is enabled"
+                    .into(),
+            ));
+        }
+        if usize::try_from(llm.max_tokens).unwrap_or(usize::MAX) > llm.context_window {
+            return Err(ConfigError::Validation(
+                "maintainer.llm.max_tokens must not exceed context_window".into(),
+            ));
+        }
+        Some(llm)
+    } else {
+        None
+    };
+    if let Some(llm) = enabled_maintainer_llm.filter(|_| options.require_maintainer_llm_api_key) {
+        if llm.api_key_env.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "[maintainer.llm].api_key_env must not be empty when arbitration is enabled".into(),
+            ));
+        }
+        if llm.api_key.as_deref().is_none_or(str::is_empty) {
+            return Err(ConfigError::Validation(format!(
+                "[maintainer.llm].api_key_env 指定的环境变量 '{}' 未设置或为空",
+                llm.api_key_env
+            )));
+        }
     }
     if cfg.clients.http.timeout_secs == 0 {
         return Err(ConfigError::Validation(
@@ -3084,6 +3263,7 @@ mod tests {
             None,
             ConfigLoadOptions {
                 require_agent_llm_api_key: true,
+                require_maintainer_llm_api_key: false,
                 require_maintainer_admin_auth_password: true,
                 validate_upstreams: true,
                 ensure_storage_dirs: true,
@@ -4196,6 +4376,214 @@ router_endpoint = "http://router.example"
         assert!(acn_home.join("skills").is_dir());
         assert!(acn_home.join("data").join("team").is_dir());
         assert!(acn_home.join("data").join("agents").is_dir());
+    }
+
+    #[test]
+    fn maintainer_arbitration_defaults_disabled_in_shadow_mode() {
+        let cfg = parse_and_validate(minimal_config_without_optional_defaults()).unwrap();
+
+        assert!(!cfg.maintainer.arbitration.enabled);
+        assert_eq!(cfg.maintainer.arbitration.mode, ArbitrationMode::Shadow);
+        assert_eq!(cfg.maintainer.arbitration.confidence_threshold, 0.9);
+        assert_eq!(cfg.maintainer.arbitration.max_source_claims, 20);
+        assert!(cfg.maintainer.llm.is_none());
+    }
+
+    #[test]
+    fn maintainer_llm_retry_count_defaults_to_two_without_changing_agent_default() {
+        let maintainer_llm = r#"
+[maintainer.llm]
+provider = "anthropic"
+endpoint = "https://example.com"
+model = "example-model"
+"#;
+        let cfg = parse_and_validate(&format!(
+            "{}{}",
+            minimal_config_without_optional_defaults(),
+            maintainer_llm
+        ))
+        .unwrap();
+
+        assert_eq!(
+            cfg.maintainer.llm.as_ref().unwrap().retry_count,
+            DEFAULT_MAINTAINER_LLM_RETRY_COUNT
+        );
+        assert_eq!(
+            LlmChatConfig::default().retry_count,
+            DEFAULT_HTTP_RETRY_COUNT
+        );
+
+        let explicit = parse_and_validate(&format!(
+            "{}{}retry_count = 0\n",
+            minimal_config_without_optional_defaults(),
+            maintainer_llm
+        ))
+        .unwrap();
+        assert_eq!(explicit.maintainer.llm.as_ref().unwrap().retry_count, 0);
+    }
+
+    #[test]
+    fn maintainer_arbitration_parses_and_serializes_manual_mode() {
+        let raw = format!(
+            "{}\n[maintainer.arbitration]\nmode = \"manual\"\n",
+            minimal_config_without_optional_defaults()
+        );
+        let cfg = parse_and_validate(&raw).unwrap();
+
+        assert_eq!(cfg.maintainer.arbitration.mode, ArbitrationMode::Manual);
+        let encoded = toml::to_string(&cfg.maintainer.arbitration).unwrap();
+        assert!(encoded.contains("mode = \"manual\""));
+    }
+
+    #[test]
+    fn maintainer_arbitration_accepts_but_does_not_serialize_legacy_poll_interval() {
+        let raw = format!(
+            "{}\n[maintainer.arbitration]\npoll_interval_secs = 7\n",
+            minimal_config_without_optional_defaults()
+        );
+        let cfg = parse_and_validate(&raw).unwrap();
+
+        assert_eq!(
+            cfg.maintainer.arbitration._legacy_poll_interval_secs,
+            Some(7)
+        );
+        let encoded = toml::to_string(&cfg.maintainer.arbitration).unwrap();
+        assert!(!encoded.contains("poll_interval_secs"));
+    }
+
+    #[test]
+    fn disabled_maintainer_arbitration_does_not_validate_optional_llm_placeholder() {
+        let raw = format!(
+            r#"{}
+[maintainer.llm]
+provider = "anthropic"
+endpoint = ""
+model = ""
+max_tokens = 0
+context_window = 0
+timeout_secs = 0
+retry_count = 1
+retry_base_delay_ms = 0
+retry_max_delay_ms = 0
+"#,
+            minimal_config_without_optional_defaults()
+        );
+
+        let cfg = parse_and_validate(&raw).unwrap();
+        assert!(!cfg.maintainer.arbitration.enabled);
+        assert!(cfg.maintainer.llm.is_some());
+    }
+
+    #[test]
+    fn maintainer_arbitration_rejects_invalid_numeric_bounds() {
+        for (field, value, expected) in [
+            (
+                "confidence_threshold",
+                "1.1",
+                "confidence_threshold must be finite and within [0, 1]",
+            ),
+            ("max_source_claims", "0", "max_source_claims must be > 0"),
+        ] {
+            expect_parse_err_contains(
+                format!(
+                    "{}\n[maintainer.arbitration]\n{field} = {value}\n",
+                    minimal_config_without_optional_defaults()
+                ),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_maintainer_arbitration_modes_require_independent_llm() {
+        for mode in ["shadow", "auto", "manual"] {
+            let raw = format!(
+                "{}\n[maintainer.arbitration]\nenabled = true\nmode = \"{mode}\"\n",
+                minimal_daemon_config_without_upstreams()
+            );
+            let (_dir, path) = write_config(&raw);
+
+            let error = Config::load_or_init_for_maintainer_daemon(Some(&path))
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains("requires [maintainer.llm]"));
+        }
+    }
+
+    #[test]
+    fn maintainer_daemon_reads_only_its_configured_llm_key() {
+        let env = EnvGuard::clean(LLM_ENV_KEYS);
+        env.set("EXAMPLE_LLM_API_KEY", "maintainer-test-key");
+        let raw = format!(
+            r#"{}
+[maintainer.arbitration]
+enabled = true
+mode = "auto"
+
+[maintainer.llm]
+provider = "openai_chat"
+endpoint = "https://example.com/v1"
+model = "example-model"
+api_key_env = "EXAMPLE_LLM_API_KEY"
+max_tokens = 4096
+context_window = 32000
+timeout_secs = 30
+retry_count = 1
+retry_base_delay_ms = 10
+retry_max_delay_ms = 20
+"#,
+            minimal_daemon_config_without_upstreams()
+        );
+        let (_dir, path) = write_config(&raw);
+
+        let (cfg, _) = Config::load_or_init_for_maintainer_daemon(Some(&path)).unwrap();
+
+        assert_eq!(cfg.maintainer.arbitration.mode, ArbitrationMode::Auto);
+        assert_eq!(
+            cfg.maintainer
+                .llm
+                .as_ref()
+                .and_then(|llm| llm.api_key.as_deref()),
+            Some("maintainer-test-key")
+        );
+    }
+
+    #[test]
+    fn enabled_maintainer_llm_accepts_responses_websockets_and_rejects_chat_websockets() {
+        let config = |provider: &str| {
+            format!(
+                r#"{}
+[maintainer.arbitration]
+enabled = true
+mode = "auto"
+
+[maintainer.llm]
+provider = "{provider}"
+endpoint = "https://example.com/v1"
+model = "example-model"
+supports_websockets = true
+max_tokens = 4096
+context_window = 32000
+timeout_secs = 30
+retry_count = 1
+retry_base_delay_ms = 10
+retry_max_delay_ms = 20
+"#,
+                minimal_config_without_optional_defaults()
+            )
+        };
+
+        let responses = parse_and_validate(&config("openai_responses")).unwrap();
+        assert!(responses
+            .maintainer
+            .llm
+            .as_ref()
+            .is_some_and(|llm| llm.supports_websockets));
+        expect_parse_err_contains(
+            config("openai_chat"),
+            "maintainer.llm.supports_websockets 只能用于 provider = \"openai_responses\"",
+        );
     }
 
     #[test]

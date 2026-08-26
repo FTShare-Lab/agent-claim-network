@@ -38,7 +38,7 @@ import { isStaticDemo } from '../lib/runtime'
 import {
   orderActionsByCreatedAt,
   orderOutboxByCreatedAt,
-  orderPoliciesByStatusAndPublishedAt,
+  orderPoliciesByTypeAndRecentChange,
   orderSendLogBySentAt,
 } from '../lib/tableOrdering'
 
@@ -146,7 +146,7 @@ export function PoliciesPage() {
 
   const filteredPolicies = useMemo(() => {
     if (!data) return []
-    return orderPoliciesByStatusAndPublishedAt(
+    return orderPoliciesByTypeAndRecentChange(
       data.policies.filter((policy) => {
         const haystack = `${policy.id} ${policy.name} ${policy.scope} ${policy.statement}`.toLowerCase()
         if (policySearch && !haystack.includes(policySearch.toLowerCase())) return false

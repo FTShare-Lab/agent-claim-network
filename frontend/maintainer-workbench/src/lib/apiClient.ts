@@ -4,6 +4,22 @@ import { isStaticDemo } from './runtime'
 
 export type QueryValue = string | number | boolean | null | undefined
 
+export class ApiError extends Error {
+  readonly status: number
+  readonly statusText: string
+
+  constructor(
+    message: string,
+    status: number,
+    statusText: string,
+  ) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+    this.statusText = statusText
+  }
+}
+
 function buildQuery(params?: Record<string, QueryValue>) {
   const searchParams = new URLSearchParams()
   Object.entries(params ?? {}).forEach(([key, value]) => {
@@ -39,7 +55,11 @@ async function request<T>(
       clearAdminSession()
     }
     const text = await response.text()
-    throw new Error(text || `${response.status} ${response.statusText}`)
+    throw new ApiError(
+      text || `${response.status} ${response.statusText}`,
+      response.status,
+      response.statusText,
+    )
   }
 
   if (response.status === 204) {

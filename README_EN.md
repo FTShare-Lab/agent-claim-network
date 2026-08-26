@@ -305,7 +305,7 @@ cargo run --bin acn-maintainer -- --config /path/to/config.toml
 The commands above are sufficient for local evaluation. For long-running team deployments, add `--release` for slower compilation but lower runtime overhead and smaller binaries. Router and Maintainer may be deployed separately as long as every Agent can reach both endpoints.
 
 - **Router**: retrieves team Claims and related disputes by scope or semantic similarity. It helps discover information but does not decide what is correct.
-- **Maintainer**: receives Claim mirrors and disputes, publishes policies, scans for stale information, and delivers suggestions to each Agent's inbox.
+- **Maintainer**: receives Claim mirrors and disputes, publishes policies, manages stale knowledge, and can optionally use an independent LLM to analyze conflicts and resolve them.
 
 Maintainer also includes a web management console at `/app` by default, covering agents, claims, disputes, policies, sweeps, Router queries, audit records, and team keys. See the [Frontend Guide](frontend/README.md) for build instructions.
 

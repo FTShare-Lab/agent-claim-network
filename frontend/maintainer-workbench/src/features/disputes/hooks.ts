@@ -1,10 +1,256 @@
+import { useEffect, useRef } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import { listDisputes, resolveDispute } from './api'
-import type { ResolveDisputeRequest } from './types'
+import { ApiError } from '../../lib/apiClient'
+import {
+  adoptAnalysis,
+  createAnalysis,
+  getAnalysis,
+  getDispute,
+  listAnalyses,
+  listDisputes,
+  rejectResolution,
+  resolveDispute,
+} from './api'
+import type {
+  AnalysisState,
+  ArbitrationResolutionRecord,
+  ArbitrationAnalysisSummary,
+  Dispute,
+  DisputeDetail,
+  RejectResolutionRequest,
+  ResolveDisputeRequest,
+} from './types'
+
+const IN_PROGRESS_ANALYSIS_STATES = new Set<AnalysisState>([
+  'pending',
+  'waiting_context',
+  'waiting_reanalysis',
+  'proposing',
+  'verifying',
+  'adopting',
+])
+const RESOLUTION_FENCE_ANALYSIS_STATES = new Set<AnalysisState>([
+  'adopting',
+  'adopted',
+])
+const ACTIVE_POLL_INTERVAL_MS = 1_000
+
+function isAnalysisInProgress(state?: AnalysisState) {
+  return state ? IN_PROGRESS_ANALYSIS_STATES.has(state) : false
+}
+
+function shouldPollAnalysis(analysis?: ArbitrationAnalysisSummary | null) {
+  return Boolean(analysis && (
+    isAnalysisInProgress(analysis.state) || analysis.automatic_progress_pending
+  ))
+}
+
+function disputeNeedsResolutionRefresh(
+  dispute: Dispute | undefined,
+  analysis: ArbitrationAnalysisSummary,
+) {
+  if (!dispute) return false
+  if (dispute.status !== 'resolved') return true
+  return Boolean(
+    analysis.resolution_id
+    && dispute.resolution?.resolution_id !== analysis.resolution_id
+  )
+}
+
+function resolutionCachesNeedRefresh(
+  queryClient: ReturnType<typeof useQueryClient>,
+  id: string,
+  analysis: ArbitrationAnalysisSummary,
+) {
+  const listDispute = queryClient
+    .getQueryData<Dispute[]>(['disputes'])
+    ?.find((dispute) => dispute.id === id)
+  const detail = queryClient.getQueryData<DisputeDetail>(['disputes', id])
+  return (
+    disputeNeedsResolutionRefresh(listDispute, analysis)
+    || disputeNeedsResolutionRefresh(detail, analysis)
+  )
+}
+
+function applyResolutionToCache(
+  queryClient: ReturnType<typeof useQueryClient>,
+  id: string,
+  record: ArbitrationResolutionRecord,
+) {
+  const closeDispute = <T extends Dispute>(dispute: T): T => ({
+    ...dispute,
+    status: 'resolved',
+    resolved_at: record.resolution.resolved_at,
+    resolution: record.resolution,
+  })
+  queryClient.setQueryData<Dispute[]>(['disputes'], (current) => (
+    current?.map((dispute) => dispute.id === id ? closeDispute(dispute) : dispute)
+  ))
+  queryClient.setQueryData<DisputeDetail>(['disputes', id], (current) => (
+    current ? {
+      ...closeDispute(current),
+      holder_adoption: current.resolution?.resolution_id
+        === record.resolution.resolution_id
+        ? current.holder_adoption
+        : null,
+    } : current
+  ))
+}
+
+function allAnalyses(data?: {
+  current_analysis?: ArbitrationAnalysisSummary | null
+}) {
+  return data?.current_analysis ? [data.current_analysis] : []
+}
 
 export function useDisputesQuery() {
-  return useQuery({ queryKey: ['disputes'], queryFn: listDisputes })
+  const queryClient = useQueryClient()
+  const query = useQuery({
+    queryKey: ['disputes'],
+    queryFn: listDisputes,
+  })
+
+  useEffect(() => {
+    for (const dispute of query.data ?? []) {
+      const detailKey = ['disputes', dispute.id] as const
+      const current = queryClient.getQueryData<DisputeDetail>(detailKey)
+      if (!current || dispute.status !== 'resolved') continue
+
+      const resolutionChanged = (
+        current.status !== 'resolved'
+        || current.resolved_at !== dispute.resolved_at
+        || current.resolution?.resolution_id !== dispute.resolution?.resolution_id
+      )
+      if (!resolutionChanged) continue
+
+      const resolutionIdChanged = (
+        current.resolution?.resolution_id !== dispute.resolution?.resolution_id
+      )
+
+      queryClient.setQueryData<DisputeDetail>(detailKey, {
+        ...current,
+        status: 'resolved',
+        resolved_at: dispute.resolved_at,
+        resolution: dispute.resolution,
+        holder_adoption: resolutionIdChanged ? null : current.holder_adoption,
+      })
+      void Promise.all([
+        queryClient.invalidateQueries({ queryKey: detailKey, exact: true }),
+        queryClient.invalidateQueries({
+          queryKey: ['disputes', dispute.id, 'analyses'],
+        }),
+      ])
+    }
+  }, [query.data, queryClient])
+
+  return query
+}
+
+export function useDisputeDetailQuery(id?: string) {
+  return useQuery({
+    queryKey: ['disputes', id],
+    queryFn: () => getDispute(id!),
+    enabled: Boolean(id),
+    refetchInterval: false,
+  })
+}
+
+export function useAnalysesQuery(id?: string) {
+  const queryClient = useQueryClient()
+  const previousStates = useRef<{ disputeId?: string; states: Map<string, AnalysisState> }>({
+    states: new Map(),
+  })
+  const query = useQuery({
+    queryKey: ['disputes', id, 'analyses'],
+    queryFn: () => listAnalyses(id!),
+    enabled: Boolean(id),
+    refetchInterval: (currentQuery) => (
+      allAnalyses(currentQuery.state.data).some(shouldPollAnalysis)
+        ? ACTIVE_POLL_INTERVAL_MS
+        : false
+    ),
+  })
+
+  useEffect(() => {
+    if (!id || !query.data) return
+    const analyses = allAnalyses(query.data)
+    const previous = previousStates.current
+    const progressed = previous.disputeId === id && analyses.some((analysis) => {
+      const oldState = previous.states.get(analysis.analysis_id)
+      return oldState !== undefined && oldState !== analysis.state
+    })
+    previousStates.current = {
+      disputeId: id,
+      states: new Map(analyses.map((analysis) => [analysis.analysis_id, analysis.state])),
+    }
+    if (progressed) {
+      void Promise.all([
+        invalidateDisputeQueries(queryClient, id, false),
+        ...analyses.map((analysis) => queryClient.invalidateQueries({
+          queryKey: ['disputes', id, 'analyses', analysis.analysis_id],
+          exact: true,
+        })),
+      ])
+      return
+    }
+
+    const resolutionFence = analyses.find((analysis) => (
+      RESOLUTION_FENCE_ANALYSIS_STATES.has(analysis.state)
+      && resolutionCachesNeedRefresh(queryClient, id, analysis)
+    ))
+    if (resolutionFence) {
+      void Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['disputes'], exact: true }),
+        queryClient.invalidateQueries({ queryKey: ['disputes', id], exact: true }),
+      ])
+    }
+  }, [id, query.data, query.dataUpdatedAt, queryClient])
+
+  return query
+}
+
+export function useAnalysisDetailQuery(id?: string, analysisId?: string) {
+  return useQuery({
+    queryKey: ['disputes', id, 'analyses', analysisId],
+    queryFn: () => getAnalysis(id!, analysisId!),
+    enabled: Boolean(id && analysisId),
+    refetchInterval: (query) => (
+      shouldPollAnalysis(query.state.data) ? ACTIVE_POLL_INTERVAL_MS : false
+    ),
+  })
+}
+
+async function invalidateDisputeQueries(
+  queryClient: ReturnType<typeof useQueryClient>,
+  id: string,
+  includeAnalyses = true,
+) {
+  const invalidations = [
+    queryClient.invalidateQueries({ queryKey: ['disputes'], exact: true }),
+    queryClient.invalidateQueries({ queryKey: ['disputes', id], exact: true }),
+    queryClient.invalidateQueries({ queryKey: ['claims'] }),
+    queryClient.invalidateQueries({ queryKey: ['overview'] }),
+    queryClient.invalidateQueries({ queryKey: ['policies'] }),
+    queryClient.invalidateQueries({ queryKey: ['outbox'] }),
+  ]
+  if (includeAnalyses) {
+    invalidations.push(queryClient.invalidateQueries({ queryKey: ['disputes', id, 'analyses'] }))
+  }
+  await Promise.all(invalidations)
+}
+
+async function refreshResolutionFenceAfterConflict(
+  queryClient: ReturnType<typeof useQueryClient>,
+  id: string,
+  error: Error,
+) {
+  if (!(error instanceof ApiError) || error.status !== 409) return
+  await Promise.all([
+    queryClient.invalidateQueries({ queryKey: ['disputes'], exact: true }),
+    queryClient.invalidateQueries({ queryKey: ['disputes', id], exact: true }),
+    queryClient.invalidateQueries({ queryKey: ['disputes', id, 'analyses'] }),
+  ])
 }
 
 export function useResolveDisputeMutation() {
@@ -12,12 +258,48 @@ export function useResolveDisputeMutation() {
 
   return useMutation({
     mutationFn: ({ id, request }: { id: string; request: ResolveDisputeRequest }) => resolveDispute(id, request),
-    onSuccess: async () => {
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ['disputes'] }),
-        queryClient.invalidateQueries({ queryKey: ['claims'] }),
-        queryClient.invalidateQueries({ queryKey: ['overview'] }),
-      ])
+    onSettled: async (_data, _error, variables) => invalidateDisputeQueries(queryClient, variables.id),
+  })
+}
+
+export function useCreateAnalysisMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: createAnalysis,
+    onSettled: async (_data, _error, id) => invalidateDisputeQueries(queryClient, id),
+  })
+}
+
+export function useAdoptAnalysisMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, analysisId }: { id: string; analysisId: string }) => (
+      adoptAnalysis(id, analysisId)
+    ),
+    onSuccess: async (record, variables) => {
+      applyResolutionToCache(queryClient, variables.id, record)
     },
+    onError: async (error, variables) => refreshResolutionFenceAfterConflict(
+      queryClient,
+      variables.id,
+      error,
+    ),
+    onSettled: async (_data, _error, variables) => invalidateDisputeQueries(queryClient, variables.id),
+  })
+}
+
+export function useRejectResolutionMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, request }: { id: string; request: RejectResolutionRequest }) => rejectResolution(id, request),
+    onSuccess: async (record, variables) => {
+      applyResolutionToCache(queryClient, variables.id, record)
+    },
+    onError: async (error, variables) => refreshResolutionFenceAfterConflict(
+      queryClient,
+      variables.id,
+      error,
+    ),
+    onSettled: async (_data, _error, variables) => invalidateDisputeQueries(queryClient, variables.id),
   })
 }

@@ -138,6 +138,8 @@ pub use openai_compatible_responses::{
     OpenAiCompatibleResponsesError, OpenAiCompatibleResponsesProviderAdapter,
 };
 pub use placeholder::{resolve_placeholders, PlaceholderError};
+#[cfg(test)]
+pub(crate) use provider::ProviderStreamFailure;
 pub(crate) use provider::ProviderTransport;
 pub use provider::{
     assistant_text_from_message, context_usage_from_anthropic_committed_usage,
@@ -170,13 +172,13 @@ pub use turn_loop::{
     AgentTurnLoop, SessionTurnContextAppender, SessionTurnEventRecorder, SessionTurnPreflight,
 };
 pub use types::{
-    AvailableSkill, ClaimDraft, CompletedSessionTurnMessage, DisputeDraft, InboxInternalizeKind,
-    InternalizeOutcome, InternalizeRequest, MemoryReviewRequest, ModelContextSource,
-    ProviderReplayState, RecapOutcome, SessionAttachment, SessionCompactionOutcome,
-    SessionCompactionRequest, SessionRecapRequest, SessionSearchSummaryOutcome,
-    SessionSearchSummaryRequest, SessionTurn, SessionTurnContentBlock, SessionTurnEvent,
-    SessionTurnInterrupted, SessionTurnMessage, SessionTurnRequest, ToolCallSkipReason,
-    ToolExecutionOutcome, TurnMessage,
+    AvailableSkill, ClaimAttributeUpdateInternalizeRequest, ClaimDraft,
+    CompletedSessionTurnMessage, DisputeDraft, InboxInternalizeKind, InternalizeOutcome,
+    InternalizeRequest, MemoryReviewRequest, ModelContextSource, ProviderReplayState, RecapOutcome,
+    SessionAttachment, SessionCompactionOutcome, SessionCompactionRequest, SessionRecapRequest,
+    SessionSearchSummaryOutcome, SessionSearchSummaryRequest, SessionTurn, SessionTurnContentBlock,
+    SessionTurnEvent, SessionTurnInterrupted, SessionTurnMessage, SessionTurnRequest,
+    ToolCallSkipReason, ToolExecutionOutcome, TurnMessage,
 };
 
 #[cfg(test)]

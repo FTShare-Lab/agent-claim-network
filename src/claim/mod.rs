@@ -10,6 +10,7 @@
 //!
 //! 以及统一的 ID 生成（8 位 hex 随机 + 类型前缀），见 `id` 子模块。
 
+mod arbitration;
 #[allow(clippy::module_inception)]
 mod claim;
 mod dispute;
@@ -19,11 +20,15 @@ mod outbox;
 mod policy;
 mod trace;
 
+pub use arbitration::{
+    ArbitrationResolutionContext, ClaimAssessment, DisputeResolution, ResolutionBasis,
+    ResolutionType, ResolvedBy,
+};
 pub use claim::{Claim, ClaimStatus, Confidence};
 pub use dispute::{Dispute, DisputeReportValidationError, DisputeStatus};
 pub use id::{
-    AgentId, ClaimId, DisputeId, IdError, InboxId, MaintainerActionId, PolicyId, SessionId,
-    SourceId, TraceId,
+    AgentId, ArbitrationResolutionId, ClaimId, DisputeId, IdError, InboxId, MaintainerActionId,
+    PolicyId, SessionId, SourceId, TraceId,
 };
 pub use inbox::{InboxMessage, InboxMessageKind};
 pub use outbox::{DeliveredMark, InboxAckRequest, OfferedMark, OutboxEntry, OutboxTarget};

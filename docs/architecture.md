@@ -59,12 +59,14 @@ Maintainer 是团队治理与投递服务：
 
 - 接收 Agent 上传的 claim mirror 与 dispute
 - 发布或废弃 policy
-- 解决 dispute
+- 通过人工决策或可选的双阶段模型分析解决 dispute
 - 根据 claim 最近语义更新时间执行 stale sweep，并向 holder 发送属性调整建议
 - 维护 outbox、投递状态、send log、history 与团队 key
 - 提供管理 API 和 Workbench 页面
 
 Maintainer 不以 trace 引用次数直接修改 claim，也不删除已经解决的历史 dispute。
+
+自裁决提供 `manual`、`shadow`、`auto` 三种模式，并用独立的 Proposal 与 Verification 两阶段模型调用降低误判风险。Analysis 是可审阅的分析结果；管理者 Adopt、人工 Resolve，或 `auto` 模式自动采用后，才形成正式 Resolution。Resolution 仍只是发送给 holder 的治理建议，不会让 Maintainer 直接修改 Agent 的本地 Claim。
 
 ### Finalize Supervisor
 
@@ -80,7 +82,7 @@ TUI 退出非空 session 时，可将 finalize job 交给独立 supervisor。Sup
 - OpenAI-compatible Chat Completions
 - OpenAI-compatible Responses（HTTP SSE/JSON，`store = false`）
 
-普通 turn、compact、finalize recap、inbox 内化和 memory review 共享 provider-neutral DTO，但使用各自的 prompt 和工具权限。
+普通 turn、compact、finalize recap、inbox 内化、memory review 和 Maintainer 仲裁共享 provider-neutral DTO，但使用各自的 prompt 和工具权限。
 
 工具按职责组织在 `src/tool/`，包括文件、受管进程、Web、working note、Memory、session search、MCP、subagent 与团队 Router 查询。MCP server 连接由 session 共享的 connection manager 管理；subagent 只能获得其权限边界允许的工具。
 

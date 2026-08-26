@@ -49,6 +49,12 @@ password_env = "ACN_MAINTAINER_ADMIN_PASSWORD"
 [maintainer.auth.team]
 enabled = false
 
+[maintainer.arbitration]
+enabled = false
+mode = "shadow"
+confidence_threshold = 0.90
+max_source_claims = 20
+
 [agent.llm]
 provider = "openai_responses"
 endpoint = "https://api.openai.com/v1"

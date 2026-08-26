@@ -1,0 +1,30 @@
+//! Dispute 仲裁的持久状态、上下文、模型编排、Resolution 提交与恢复。
+
+mod context;
+mod evaluator;
+mod observation;
+mod resolution;
+mod resolution_events;
+mod service;
+mod store;
+mod types;
+mod worker;
+
+pub(crate) use context::{load_team_claims, ArbitrationContextBuilder};
+pub use evaluator::{lease_base_duration, ArbitrationEvaluator, LlmArbitrationEvaluator};
+pub use observation::ObservationService;
+pub use resolution::{HumanResolutionInput, RejectResolutionInput, ResolutionService};
+pub use resolution_events::{spawn_resolution_event_scheduler, ResolutionEventScheduler};
+pub use service::{
+    is_analysis_conflict, AnalysisConflict, ArbitrationService, ReportDisputeResult,
+    SystemArbitrationClock,
+};
+pub use store::ArbitrationStore;
+pub use types::{
+    AnalysisError, AnalysisJob, AnalysisLease, AnalysisPhase, AnalysisRound, AnalysisState,
+    ArbitrationAnalysis, ArbitrationAnalysisId, ArbitrationProposal, ArbitrationResolutionRecord,
+    ArbitrationVerification, ClaimAssessmentVerification, ClaimObservation, ContextWarning,
+    DeliveryIntent, FrozenArbitrationContext, HolderObservation, MaintainerDisputeRecord,
+    ObservationState, PendingResolutionDelivery, ResolutionEventTarget, ResolutionObservation,
+};
+pub use worker::{spawn_arbitration_scheduler, ArbitrationScheduler};

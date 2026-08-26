@@ -19,9 +19,14 @@ use std::sync::Arc;
 use axum::middleware;
 use axum::routing::{get, post};
 use axum::Router as AxumRouter;
+use tokio_util::sync::CancellationToken;
 
 use crate::auth::{AuthVerifier, TeamAuthStore};
 use crate::config::{Config, DEFAULT_MAINTAINER_FRONTEND_DIST_DIR};
+use crate::maintainer::arbitration::{
+    spawn_arbitration_scheduler, spawn_resolution_event_scheduler, ArbitrationStore,
+    ObservationService, ResolutionService,
+};
 use crate::maintainer::Maintainer;
 use crate::router::http_client::HttpRouterClient;
 use crate::storage::paths;
@@ -33,6 +38,7 @@ pub async fn serve(
     maintainer: Arc<Maintainer>,
     cfg: &Config,
     sweep_scheduler: SweepScheduler,
+    cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let frontend_dist_dir = resolve_frontend_dist_dir(&cfg.maintainer.ui.frontend_dist_dir).await;
     let auth_store = TeamAuthStore::new(paths::team_store_auth_keys_path(&cfg.storage.team_root));
@@ -42,18 +48,48 @@ pub async fn serve(
         ))
         .await?;
     let router_endpoint = router_endpoint_from_listen(&cfg.router.daemon.listen)?;
-    let router_client = Arc::new(HttpRouterClient::new_with_auth(
-        router_endpoint,
-        &cfg.clients.http,
-        router_service_key.agent_id,
-        Some(router_service_key.acn_key),
-    )?);
+    let router_client: Arc<dyn crate::router::RouterClient> =
+        Arc::new(HttpRouterClient::new_with_auth(
+            router_endpoint,
+            &cfg.clients.http,
+            router_service_key.agent_id,
+            Some(router_service_key.acn_key),
+        )?);
+    let arbitration = crate::bootstrap::build_maintainer_arbitration_service(
+        cfg,
+        maintainer.clone(),
+        router_client.clone(),
+    )?;
+    let (arbitration_scheduler, arbitration_worker) = if let Some(service) = arbitration.as_ref() {
+        let (scheduler, worker) =
+            spawn_arbitration_scheduler(service.clone(), 64, cancel.child_token());
+        (Some(scheduler), Some(worker))
+    } else {
+        (None, None)
+    };
+    let arbitration_store = ArbitrationStore::new(cfg.storage.team_root.clone());
+    let delivery_service = arbitration
+        .as_ref()
+        .map(|service| service.resolution_service().clone())
+        .unwrap_or_else(|| ResolutionService::new(maintainer.clone(), arbitration_store.clone()));
+    let observation_service =
+        ObservationService::new(arbitration_store, maintainer.history_store().clone());
+    let (resolution_events, delivery_worker) = spawn_resolution_event_scheduler(
+        delivery_service,
+        observation_service,
+        64,
+        arbitration.is_none(),
+        cancel.child_token(),
+    );
     let team_auth =
         AuthVerifier::from_key_store_path(auth_store.path(), cfg.maintainer.auth.team.enabled)
             .await?;
     let state = AppState {
         history_store: maintainer.history_store().clone(),
         maintainer,
+        arbitration,
+        arbitration_scheduler,
+        resolution_events: Some(resolution_events),
         router_client,
         auth: team_auth,
         auth_store,
@@ -80,12 +116,52 @@ pub async fn serve(
         "maintainer daemon 监听 {}",
         cfg.maintainer.daemon.listen
     );
-    axum::serve(
+    let serve_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .await?;
+    .with_graceful_shutdown(shutdown_signal(cancel.clone()))
+    .await;
+    cancel.cancel();
+    // 仲裁与 delivery worker 的长操作都把 cancel 设为 biased 分支；join 不等待模型阶段超时。
+    if let Some(worker) = arbitration_worker {
+        match worker.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => log::warn!(
+                target: "maintainer_arbitration",
+                "arbitration worker 退出: {error:#}"
+            ),
+            Err(error) => log::warn!(
+                target: "maintainer_arbitration",
+                "arbitration worker join 失败: {error}"
+            ),
+        }
+    }
+    match delivery_worker.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log::warn!(
+            target: "maintainer_arbitration",
+            "resolution event worker 退出: {error:#}"
+        ),
+        Err(error) => log::warn!(
+            target: "maintainer_arbitration",
+            "resolution event worker join 失败: {error}"
+        ),
+    }
+    serve_result?;
     Ok(())
+}
+
+async fn shutdown_signal(cancel: CancellationToken) {
+    tokio::select! {
+        _ = cancel.cancelled() => {}
+        result = tokio::signal::ctrl_c() => {
+            if let Err(error) = result {
+                log::warn!(target: "maintainer_http_server", "监听 Ctrl-C 失败: {error}");
+            }
+            cancel.cancel();
+        }
+    }
 }
 
 async fn resolve_frontend_dist_dir(configured: &Path) -> PathBuf {
@@ -168,6 +244,22 @@ pub(crate) fn build_app() -> AxumRouter<AppState> {
         .route("/api/overview", get(api::overview))
         .route("/api/disputes", get(api::list_disputes))
         .route("/api/disputes/{id}", get(api::get_dispute))
+        .route(
+            "/api/disputes/{id}/analyses",
+            get(api::list_dispute_analyses).post(api::create_analysis),
+        )
+        .route(
+            "/api/disputes/{id}/analyses/{analysis_id}",
+            get(api::get_dispute_analysis),
+        )
+        .route(
+            "/api/disputes/{id}/analyses/{analysis_id}/adopt",
+            post(api::adopt_analysis),
+        )
+        .route(
+            "/api/disputes/{id}/resolution/reject",
+            post(api::reject_dispute_resolution),
+        )
         .route("/api/claims", get(api::list_claims))
         .route("/api/claims/{id}", get(api::get_claim))
         .route("/api/policies", get(api::list_policies))
@@ -269,6 +361,9 @@ mod tests {
         let state = AppState {
             history_store: maintainer.history_store().clone(),
             maintainer: maintainer.clone(),
+            arbitration: None,
+            arbitration_scheduler: None,
+            resolution_events: None,
             router_client: Arc::new(Router::new(team.path().to_path_buf())),
             auth: AuthVerifier::disabled(),
             auth_store: TeamAuthStore::new(paths::team_store_auth_keys_path(team.path())),
@@ -321,6 +416,9 @@ mod tests {
         let state = AppState {
             history_store: maintainer.history_store().clone(),
             maintainer,
+            arbitration: None,
+            arbitration_scheduler: None,
+            resolution_events: None,
             router_client: Arc::new(Router::new(team.path().to_path_buf())),
             auth: AuthVerifier::disabled(),
             auth_store: TeamAuthStore::new(paths::team_store_auth_keys_path(team.path())),
@@ -420,6 +518,54 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn analysis_route_is_admin_guarded_and_reports_disabled() {
+        let team = tempfile::tempdir().unwrap();
+        let (state, _maintainer) = admin_auth_state(&team);
+        let app = build_app()
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                audit::audit_middleware,
+            ))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth::admin_auth_middleware,
+            ))
+            .with_state(state);
+        let path = format!(
+            "/api/disputes/{}/analyses",
+            crate::claim::DisputeId::random()
+        );
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&path)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let disabled = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(header::AUTHORIZATION, basic_auth("admin", "secret"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), axum::http::StatusCode::CONFLICT);
     }
 
     #[tokio::test]
@@ -661,6 +807,9 @@ mod tests {
         let state = AppState {
             history_store: maintainer.history_store().clone(),
             maintainer,
+            arbitration: None,
+            arbitration_scheduler: None,
+            resolution_events: None,
             router_client: Arc::new(Router::new(team.path().to_path_buf())),
             auth: AuthVerifier::disabled(),
             auth_store: TeamAuthStore::new(paths::team_store_auth_keys_path(team.path())),
@@ -740,6 +889,9 @@ mod tests {
         let state = AppState {
             history_store: maintainer.history_store().clone(),
             maintainer,
+            arbitration: None,
+            arbitration_scheduler: None,
+            resolution_events: None,
             router_client: Arc::new(Router::new(team.path().to_path_buf())),
             auth: AuthVerifier::disabled(),
             auth_store: TeamAuthStore::new(paths::team_store_auth_keys_path(team.path())),
@@ -823,6 +975,9 @@ mod tests {
         let state = AppState {
             history_store: maintainer.history_store().clone(),
             maintainer,
+            arbitration: None,
+            arbitration_scheduler: None,
+            resolution_events: None,
             router_client: Arc::new(Router::new(team.path().to_path_buf())),
             auth: AuthVerifier::disabled(),
             auth_store: TeamAuthStore::new(paths::team_store_auth_keys_path(team.path())),

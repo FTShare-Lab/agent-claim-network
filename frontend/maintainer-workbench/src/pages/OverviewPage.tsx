@@ -241,7 +241,7 @@ export function OverviewPage() {
   return (
     <PageContainer
       title="Network Operations Overview"
-      subtitle="Review what needs a Maintainer decision, then inspect network health and evidence."
+      subtitle="Review what needs a Maintainer resolution, then inspect network health and evidence."
     >
       <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,1.55fr)_minmax(320px,0.85fr)]">
         <Panel
@@ -258,7 +258,7 @@ export function OverviewPage() {
                 <CheckCircle2 aria-hidden="true" className="h-5 w-5" />
               </span>
               <div className="min-w-0 flex-1">
-                <div className="text-sm font-semibold text-slate-900">No network decisions are waiting.</div>
+                <div className="text-sm font-semibold text-slate-900">No network resolutions are waiting.</div>
                 <p className="mt-0.5 text-xs leading-5 text-slate-600">
                   Disputes, stale suggestions, agent risk, and recent HTTP errors are clear in this snapshot.
                 </p>

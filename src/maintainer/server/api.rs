@@ -12,12 +12,20 @@ use crate::auth::{
     PublicAuthKeyRecord, TeamAuthStoreError,
 };
 use crate::claim::{
-    AgentId, Claim, ClaimId, ClaimStatus, Dispute, DisputeId, InboxAckRequest, InboxMessage,
-    OutboxEntry, Policy, PolicyId,
+    AgentId, ArbitrationResolutionId, Claim, ClaimAssessment, ClaimId, ClaimStatus, Dispute,
+    DisputeId, InboxAckRequest, InboxId, InboxMessage, OutboxEntry, Policy, PolicyId,
+    ResolutionBasis, ResolutionType,
+};
+use crate::maintainer::arbitration::{
+    is_analysis_conflict, AnalysisError, AnalysisJob, AnalysisPhase, AnalysisState,
+    ArbitrationAnalysis, ArbitrationAnalysisId, ArbitrationProposal, ArbitrationResolutionRecord,
+    ArbitrationStore, ArbitrationVerification, ClaimObservation, FrozenArbitrationContext,
+    HumanResolutionInput, MaintainerDisputeRecord, ObservationService, ObservationState,
+    RejectResolutionInput, ResolutionObservation, ResolutionService,
 };
 use crate::maintainer::history::{
-    fresh_record_id, AgentActivityKind, AgentActivityRecord, DisputeResolutionEventRecord,
-    HttpAuditRecord, PolicyEventKind, PolicyEventRecord, RouterQueryAuditRecord, SweepRunRecord,
+    fresh_record_id, AgentActivityKind, AgentActivityRecord, HttpAuditRecord, PolicyEventKind,
+    PolicyEventRecord, RouterQueryAuditRecord, SweepRunRecord,
 };
 use crate::maintainer::{
     ClaimSweepReport, InboxAckError, MaintainerActionRow, MaintainerStatusSnapshot, SendLogRow,
@@ -70,6 +78,197 @@ pub struct ResolveDisputeRequest {
     pub resolve_note: String,
     #[serde(default)]
     pub notify_affected_agents: bool,
+    #[serde(default)]
+    pub resolution_type: Option<ResolutionType>,
+    #[serde(default)]
+    pub resolution_basis: Option<ResolutionBasis>,
+    #[serde(default)]
+    pub claim_assessments: Vec<ClaimAssessment>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RejectResolutionRequest {
+    pub expected_resolution_id: ArbitrationResolutionId,
+    pub rejection_reason: String,
+    pub conclusion: String,
+    #[serde(default)]
+    pub resolution_type: Option<ResolutionType>,
+    #[serde(default)]
+    pub resolution_basis: Option<ResolutionBasis>,
+    #[serde(default)]
+    pub claim_assessments: Vec<ClaimAssessment>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArbitrationAnalysisSummary {
+    pub analysis_id: ArbitrationAnalysisId,
+    pub state: AnalysisState,
+    pub phase: Option<AnalysisPhase>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub semantic_fingerprint: Option<String>,
+    pub proposal: Option<ArbitrationProposal>,
+    pub resolution_id: Option<ArbitrationResolutionId>,
+    pub error: Option<AnalysisError>,
+    pub adoptable: bool,
+    pub automatic_progress_pending: bool,
+    pub adoption_blocker: Option<String>,
+    pub analysis_round: u32,
+    pub context_change_count: u32,
+    pub next_retry_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub context_change_reason: Option<String>,
+}
+
+impl ArbitrationAnalysisSummary {
+    fn from_analysis(
+        analysis: &ArbitrationAnalysis,
+        dispute: &MaintainerDisputeRecord,
+        adoption_enabled: bool,
+        automatic_adoption_enabled: bool,
+    ) -> Self {
+        let resolved_proposal = analysis
+            .proposal
+            .as_ref()
+            .is_some_and(|proposal| proposal.resolution_type.is_resolved());
+        let adoptable = analysis.state == AnalysisState::Approved
+            && resolved_proposal
+            && dispute.dispute.status == crate::claim::DisputeStatus::Open
+            && dispute.resolution.is_none()
+            && analysis.adoption_blocked_reason.is_none()
+            && adoption_enabled;
+        let automatic_progress_pending = analysis.state == AnalysisState::Approved
+            && resolved_proposal
+            && dispute.dispute.status == crate::claim::DisputeStatus::Open
+            && dispute.resolution.is_none()
+            && analysis.adoption_blocked_reason.is_none()
+            && analysis.mode == crate::config::ArbitrationMode::Auto
+            && automatic_adoption_enabled;
+        let adoption_blocker = if dispute.dispute.status != crate::claim::DisputeStatus::Open
+            || dispute.resolution.is_some()
+        {
+            // Resolution 是治理终态；已消费的 Analysis 只保留来源审计，不能再向用户
+            // 暗示它仍可采用或已被其他 Resolution 抢占。
+            None
+        } else if adoptable {
+            None
+        } else if let Some(reason) = analysis.adoption_blocked_reason.as_ref() {
+            Some(reason.clone())
+        } else if !adoption_enabled {
+            Some("Maintainer 自裁决未启用".to_string())
+        } else if analysis.state != AnalysisState::Approved {
+            Some("只有 approved Analysis 可以采用".to_string())
+        } else if !resolved_proposal {
+            Some("unresolved Analysis 不能采用".to_string())
+        } else {
+            Some("当前 Analysis 不可采用".to_string())
+        };
+        Self {
+            analysis_id: analysis.analysis_id.clone(),
+            state: analysis.state,
+            phase: analysis.lease.as_ref().map(|lease| lease.phase),
+            created_at: analysis.created_at,
+            updated_at: analysis.updated_at,
+            semantic_fingerprint: analysis.semantic_fingerprint.clone(),
+            proposal: analysis.proposal.clone(),
+            resolution_id: analysis.resolution_id.clone(),
+            error: analysis.error.clone(),
+            adoptable,
+            automatic_progress_pending,
+            adoption_blocker,
+            analysis_round: analysis.analysis_round,
+            context_change_count: analysis.context_change_count,
+            next_retry_at: analysis.next_retry_at,
+            context_change_reason: analysis.context_change_reason.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DisputeListItem {
+    #[serde(flatten)]
+    pub record: MaintainerDisputeRecord,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DisputeDetail {
+    #[serde(flatten)]
+    pub record: MaintainerDisputeRecord,
+    pub current_analysis: Option<ArbitrationAnalysisSummary>,
+    pub holder_adoption: Option<HolderAdoptionView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArbitrationAnalysisDetail {
+    #[serde(flatten)]
+    pub summary: ArbitrationAnalysisSummary,
+    pub frozen_context: Option<FrozenArbitrationContext>,
+    pub verification: Option<ArbitrationVerification>,
+    pub warnings: Vec<crate::maintainer::arbitration::ContextWarning>,
+    pub validation_result: String,
+    pub rounds: Vec<crate::maintainer::arbitration::AnalysisRound>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArbitrationAnalysesResponse {
+    pub current_analysis: Option<ArbitrationAnalysisSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HolderAdoptionSummary {
+    pub notified_holders: usize,
+    pub delivered_holders: usize,
+    pub updated_claims: usize,
+    pub unchanged_claims: usize,
+    pub unavailable_claims: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HolderClaimAdoptionView {
+    pub claim_id: ClaimId,
+    pub claim_name: String,
+    pub snapshot_status: Option<ClaimStatus>,
+    pub snapshot_scope: Option<String>,
+    pub snapshot_statement: Option<String>,
+    pub recommended_status: Option<ClaimStatus>,
+    pub current_status: Option<ClaimStatus>,
+    pub recommended_scope: Option<String>,
+    pub current_scope: Option<String>,
+    pub recommended_statement: Option<String>,
+    pub current_statement: Option<String>,
+    pub policy_provenance_present: bool,
+    pub update_observed: bool,
+    pub changed_fields: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HolderAdoptionTechnicalView {
+    pub policy_id: PolicyId,
+    pub inbox_id: InboxId,
+    pub snapshot_source: Option<ArbitrationResolutionId>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HolderAdoptionItem {
+    pub agent_id: AgentId,
+    pub delivery_state: String,
+    pub observation_state: ObservationState,
+    pub claim_count: usize,
+    pub updated_claim_count: usize,
+    pub unchanged_claim_count: usize,
+    pub unavailable_claim_count: usize,
+    pub reasons: Vec<String>,
+    pub last_delivered_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_observed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub claims: Vec<HolderClaimAdoptionView>,
+    pub technical: HolderAdoptionTechnicalView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HolderAdoptionView {
+    pub observed_at: chrono::DateTime<chrono::Utc>,
+    pub summary: HolderAdoptionSummary,
+    pub holders: Vec<HolderAdoptionItem>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -241,39 +440,504 @@ pub async fn overview(
 pub async fn list_disputes(
     State(state): State<AppState>,
     Query(query): Query<DisputeListQuery>,
-) -> Result<Json<Vec<Dispute>>, (StatusCode, String)> {
-    let mut disputes = state
-        .maintainer
-        .list_disputes()
-        .await
-        .map_err(internal_error)?;
-    disputes.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    let disputes = disputes
+) -> Result<Json<Vec<DisputeListItem>>, (StatusCode, String)> {
+    let store = arbitration_store(&state);
+    let mut records = store.list_disputes().await.map_err(internal_error)?;
+    records.sort_by(|a, b| b.dispute.created_at.cmp(&a.dispute.created_at));
+    let mut result = Vec::new();
+    for record in records
         .into_iter()
-        .filter(|dispute| match query.status.as_deref() {
-            Some("open") => dispute.status == crate::claim::DisputeStatus::Open,
-            Some("resolved") => dispute.status == crate::claim::DisputeStatus::Resolved,
+        .filter(|record| match query.status.as_deref() {
+            Some("open") => record.dispute.status == crate::claim::DisputeStatus::Open,
+            Some("resolved") => record.dispute.status == crate::claim::DisputeStatus::Resolved,
             _ => true,
         })
-        .collect();
-    Ok(Json(disputes))
+    {
+        result.push(DisputeListItem { record });
+    }
+    Ok(Json(result))
 }
 
 pub async fn get_dispute(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<Dispute>, (StatusCode, String)> {
+) -> Result<Json<DisputeDetail>, (StatusCode, String)> {
     let dispute_id = DisputeId::from_str(&id)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("非法 dispute id: {e}")))?;
-    let dispute = state
-        .maintainer
-        .list_disputes()
+    let store = arbitration_store(&state);
+    let record = store
+        .read_dispute(&dispute_id)
+        .await
+        .map_err(|error| arbitration_read_error(error, &format!("未找到 dispute: {id}")))?;
+    let current_analysis = store
+        .read_current_analysis(&dispute_id)
+        .await
+        .map_err(internal_error)?;
+    let current_resolution = match record.resolution.as_ref() {
+        Some(resolution) => Some(
+            store
+                .read_resolution_record(&dispute_id, &resolution.resolution_id)
+                .await
+                .map_err(internal_error)?,
+        ),
+        None => None,
+    };
+    let holder_adoption = if let Some(resolution_record) = current_resolution
+        .as_ref()
+        .filter(|record| record.delivery_intent.is_some())
+    {
+        let observation = ObservationService::new(store.clone(), state.history_store.clone())
+            .refresh(resolution_record, now_seconds())
+            .await
+            .map_err(internal_error)?;
+        Some(holder_adoption_view(resolution_record, &observation))
+    } else {
+        None
+    };
+    Ok(Json(DisputeDetail {
+        current_analysis: current_analysis.as_ref().map(|analysis| {
+            ArbitrationAnalysisSummary::from_analysis(
+                analysis,
+                &record,
+                state.arbitration.is_some(),
+                state
+                    .arbitration
+                    .as_ref()
+                    .is_some_and(|service| service.automatic_adoption_enabled()),
+            )
+        }),
+        holder_adoption,
+        record,
+    }))
+}
+
+pub async fn list_dispute_analyses(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ArbitrationAnalysesResponse>, (StatusCode, String)> {
+    let dispute_id = parse_dispute_id(&id)?;
+    let store = arbitration_store(&state);
+    let dispute = store
+        .read_dispute(&dispute_id)
+        .await
+        .map_err(|error| arbitration_read_error(error, "未找到 dispute"))?;
+    let current_analysis = store
+        .read_current_analysis(&dispute_id)
         .await
         .map_err(internal_error)?
-        .into_iter()
-        .find(|item| item.id == dispute_id)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未找到 dispute: {id}")))?;
-    Ok(Json(dispute))
+        .as_ref()
+        .map(|analysis| {
+            ArbitrationAnalysisSummary::from_analysis(
+                analysis,
+                &dispute,
+                state.arbitration.is_some(),
+                state
+                    .arbitration
+                    .as_ref()
+                    .is_some_and(|service| service.automatic_adoption_enabled()),
+            )
+        });
+    Ok(Json(ArbitrationAnalysesResponse { current_analysis }))
+}
+
+pub async fn get_dispute_analysis(
+    State(state): State<AppState>,
+    Path((id, analysis_id)): Path<(String, String)>,
+) -> Result<Json<ArbitrationAnalysisDetail>, (StatusCode, String)> {
+    let dispute_id = parse_dispute_id(&id)?;
+    let analysis_id = ArbitrationAnalysisId::from_str(&analysis_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let store = arbitration_store(&state);
+    let dispute = store
+        .read_dispute(&dispute_id)
+        .await
+        .map_err(|error| arbitration_read_error(error, "未找到 dispute"))?;
+    let analysis = read_analysis_by_id(&store, &dispute_id, &analysis_id).await?;
+    let warnings = analysis
+        .context
+        .as_ref()
+        .map(|context| context.warnings.clone())
+        .unwrap_or_default();
+    Ok(Json(ArbitrationAnalysisDetail {
+        summary: ArbitrationAnalysisSummary::from_analysis(
+            &analysis,
+            &dispute,
+            state.arbitration.is_some(),
+            state
+                .arbitration
+                .as_ref()
+                .is_some_and(|service| service.automatic_adoption_enabled()),
+        ),
+        frozen_context: analysis.context.clone(),
+        verification: analysis.verification,
+        warnings,
+        validation_result: if analysis.error.is_some() {
+            "failed".into()
+        } else {
+            "valid".into()
+        },
+        rounds: analysis.rounds,
+    }))
+}
+
+async fn read_analysis_by_id(
+    store: &ArbitrationStore,
+    dispute_id: &DisputeId,
+    analysis_id: &ArbitrationAnalysisId,
+) -> Result<ArbitrationAnalysis, (StatusCode, String)> {
+    let current = store
+        .read_current_analysis(dispute_id)
+        .await
+        .map_err(internal_error)?;
+    current
+        .filter(|analysis| analysis.analysis_id == *analysis_id)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "未找到 arbitration analysis".to_string(),
+            )
+        })
+}
+
+fn holder_adoption_view(
+    resolution_record: &ArbitrationResolutionRecord,
+    observation: &ResolutionObservation,
+) -> HolderAdoptionView {
+    let Some(intent) = resolution_record.delivery_intent.as_ref() else {
+        return HolderAdoptionView {
+            observed_at: observation.observed_at,
+            summary: HolderAdoptionSummary {
+                notified_holders: 0,
+                delivered_holders: 0,
+                updated_claims: 0,
+                unchanged_claims: 0,
+                unavailable_claims: 0,
+            },
+            holders: Vec::new(),
+        };
+    };
+    let holders: Vec<HolderAdoptionItem> = observation
+        .holders
+        .iter()
+        .filter_map(|holder| {
+            let target = intent
+                .targets
+                .iter()
+                .find(|target| target.target_agent == holder.agent_id)?;
+            let claims: Vec<HolderClaimAdoptionView> = holder
+                .claims
+                .iter()
+                .map(|claim| {
+                    holder_claim_adoption_view(&resolution_record.direct_claim_snapshots, claim)
+                })
+                .collect();
+            Some(HolderAdoptionItem {
+                agent_id: holder.agent_id.clone(),
+                delivery_state: if holder.delivery_observed {
+                    "delivered".to_string()
+                } else {
+                    "not_delivered".to_string()
+                },
+                observation_state: holder.state,
+                claim_count: claims.len(),
+                updated_claim_count: claims.iter().filter(|claim| claim.update_observed).count(),
+                unchanged_claim_count: claims
+                    .iter()
+                    .filter(|claim| claim.current_status.is_some() && !claim.update_observed)
+                    .count(),
+                unavailable_claim_count: claims
+                    .iter()
+                    .filter(|claim| claim.current_status.is_none())
+                    .count(),
+                reasons: holder.reasons.clone(),
+                last_delivered_at: holder.delivered_at,
+                last_observed_at: holder.last_observed_at.or(Some(observation.observed_at)),
+                claims,
+                technical: HolderAdoptionTechnicalView {
+                    policy_id: intent.policy.id.clone(),
+                    inbox_id: target.inbox_id.clone(),
+                    snapshot_source: resolution_record.snapshot_source_resolution_id.clone(),
+                },
+            })
+        })
+        .collect();
+    HolderAdoptionView {
+        observed_at: observation.observed_at,
+        summary: HolderAdoptionSummary {
+            notified_holders: intent.targets.len(),
+            delivered_holders: holders
+                .iter()
+                .filter(|holder| holder.delivery_state == "delivered")
+                .count(),
+            updated_claims: holders
+                .iter()
+                .map(|holder| holder.updated_claim_count)
+                .sum(),
+            unchanged_claims: holders
+                .iter()
+                .map(|holder| holder.unchanged_claim_count)
+                .sum(),
+            unavailable_claims: holders
+                .iter()
+                .map(|holder| holder.unavailable_claim_count)
+                .sum(),
+        },
+        holders,
+    }
+}
+
+fn holder_claim_adoption_view(
+    snapshots: &[Claim],
+    claim: &ClaimObservation,
+) -> HolderClaimAdoptionView {
+    let snapshot = snapshots
+        .iter()
+        .find(|snapshot| snapshot.id == claim.claim_id);
+    HolderClaimAdoptionView {
+        claim_id: claim.claim_id.clone(),
+        claim_name: claim.claim_name.clone(),
+        snapshot_status: snapshot.map(|snapshot| snapshot.status),
+        snapshot_scope: snapshot.map(|snapshot| snapshot.scope.clone()),
+        snapshot_statement: snapshot.map(|snapshot| snapshot.statement.clone()),
+        recommended_status: claim.recommended_status,
+        current_status: claim.current_status,
+        recommended_scope: claim.recommended_scope.clone(),
+        current_scope: claim.current_scope.clone(),
+        recommended_statement: claim.recommended_statement.clone(),
+        current_statement: claim.current_statement.clone(),
+        policy_provenance_present: claim.policy_provenance_present,
+        update_observed: claim.update_observed,
+        changed_fields: claim.changed_fields.clone(),
+        notes: claim.notes.clone(),
+    }
+}
+
+pub async fn create_analysis(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<ArbitrationAnalysisSummary>), (StatusCode, String)> {
+    let dispute_id = parse_dispute_id(&id)?;
+    let service = state.arbitration.as_ref().ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            "maintainer arbitration is disabled".to_string(),
+        )
+    })?;
+    let scheduler = state.arbitration_scheduler.as_ref().ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            "maintainer arbitration scheduler is unavailable".to_string(),
+        )
+    })?;
+    // Current Analysis 先落盘、后入有界队列。请求若恰在两步之间被取消，Drop
+    // 只能同步唤醒持久恢复扫描，不能 await enqueue。
+    let mut recovery_wake = AnalysisRecoveryWakeGuard::new(Some(scheduler));
+    let analysis = service
+        .create_analysis(&dispute_id)
+        .await
+        .map_err(arbitration_mutation_error)?;
+    if let Err(error) = scheduler
+        .enqueue(AnalysisJob {
+            dispute_id: dispute_id.clone(),
+            analysis_id: analysis.analysis_id.clone(),
+        })
+        .await
+    {
+        // Current Analysis 已经持久化，是这次显式请求的稳定结果。调度器故障不能把
+        // 客户端诱导到重试并额外 mint 一条 Analysis；启动恢复会重新提交 pending job。
+        log::warn!(
+            target: "maintainer_arbitration",
+            "current analysis={} 唤醒失败，等待启动恢复: {error:#}",
+            analysis.analysis_id
+        );
+    }
+    recovery_wake.disarm();
+    let dispute = arbitration_store(&state)
+        .read_dispute(&dispute_id)
+        .await
+        .map_err(internal_error)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ArbitrationAnalysisSummary::from_analysis(
+            &analysis,
+            &dispute,
+            true,
+            service.automatic_adoption_enabled(),
+        )),
+    ))
+}
+
+pub async fn adopt_analysis(
+    State(state): State<AppState>,
+    Path((id, analysis_id)): Path<(String, String)>,
+) -> Result<(StatusCode, Json<ArbitrationResolutionRecord>), (StatusCode, String)> {
+    let dispute_id = parse_dispute_id(&id)?;
+    let analysis_id = ArbitrationAnalysisId::from_str(&analysis_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let service = state.arbitration.as_ref().ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            "maintainer arbitration is disabled".to_string(),
+        )
+    })?;
+    read_analysis_by_id(service.store(), &dispute_id, &analysis_id).await?;
+    let job = AnalysisJob {
+        dispute_id: dispute_id.clone(),
+        analysis_id,
+    };
+    // Adopt 会先固定 Resolution 与投递意图，再提交 Dispute/outbox。若客户端在这个
+    // 窗口断开，两条持久恢复队列都必须在当前进程被唤醒。
+    let mut recovery_wake = AdoptionRecoveryWakeGuard::new(
+        state.arbitration_scheduler.as_ref(),
+        state.resolution_events.as_ref(),
+    );
+    let resolution_record = service
+        .adopt_analysis(&job)
+        .await
+        .map_err(arbitration_mutation_error)?;
+    service.wake_preemption_checks();
+    resume_adopting_analysis(&state, service.store(), &job).await;
+    recovery_wake.disarm();
+    if let Some(events) = state.resolution_events.as_ref() {
+        let target = crate::maintainer::arbitration::ResolutionEventTarget {
+            dispute_id: dispute_id.clone(),
+            resolution_id: resolution_record.resolution_id.clone(),
+        };
+        let _ = events.enqueue_pending_delivery(target.clone()).await;
+        let _ = events.refresh_resolution(target).await;
+    }
+    Ok((StatusCode::CREATED, Json(resolution_record)))
+}
+
+struct AdoptionRecoveryWakeGuard {
+    scheduler: Option<crate::maintainer::arbitration::ArbitrationScheduler>,
+    resolution_events: Option<crate::maintainer::arbitration::ResolutionEventScheduler>,
+}
+
+struct AnalysisRecoveryWakeGuard {
+    scheduler: Option<crate::maintainer::arbitration::ArbitrationScheduler>,
+}
+
+impl AnalysisRecoveryWakeGuard {
+    fn new(scheduler: Option<&crate::maintainer::arbitration::ArbitrationScheduler>) -> Self {
+        Self {
+            scheduler: scheduler.cloned(),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.scheduler = None;
+    }
+}
+
+impl Drop for AnalysisRecoveryWakeGuard {
+    fn drop(&mut self) {
+        if let Some(scheduler) = &self.scheduler {
+            scheduler.wake_durable_recovery();
+        }
+    }
+}
+
+impl AdoptionRecoveryWakeGuard {
+    fn new(
+        scheduler: Option<&crate::maintainer::arbitration::ArbitrationScheduler>,
+        resolution_events: Option<&crate::maintainer::arbitration::ResolutionEventScheduler>,
+    ) -> Self {
+        Self {
+            scheduler: scheduler.cloned(),
+            resolution_events: resolution_events.cloned(),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.scheduler = None;
+        self.resolution_events = None;
+    }
+}
+
+impl Drop for AdoptionRecoveryWakeGuard {
+    fn drop(&mut self) {
+        if let Some(scheduler) = &self.scheduler {
+            scheduler.wake_durable_recovery();
+        }
+        if let Some(events) = &self.resolution_events {
+            events.wake_durable_recovery();
+        }
+    }
+}
+
+async fn resume_adopting_analysis(state: &AppState, store: &ArbitrationStore, job: &AnalysisJob) {
+    let analysis = match store.read_analysis(job).await {
+        Ok(analysis) => analysis,
+        Err(error) => {
+            // adopt 已成功返回 durable Resolution；补偿读取失败不能诱导客户端重试。
+            log::warn!(
+                target: "maintainer_arbitration",
+                "读取 dispute={} analysis={} 的 adoption 恢复状态失败，等待启动恢复: {error:#}",
+                job.dispute_id,
+                job.analysis_id
+            );
+            return;
+        }
+    };
+    if analysis.state != AnalysisState::Adopting {
+        return;
+    }
+    let Some(scheduler) = state.arbitration_scheduler.as_ref() else {
+        log::warn!(
+            target: "maintainer_arbitration",
+            "dispute={} analysis={} 投递待恢复，但 arbitration scheduler 不可用，等待启动恢复",
+            job.dispute_id,
+            job.analysis_id
+        );
+        return;
+    };
+    if let Err(error) = scheduler.enqueue(job.clone()).await {
+        // 与上面的读取一样，这里发生在 durable Resolution 之后，只能降级为恢复告警。
+        log::warn!(
+            target: "maintainer_arbitration",
+            "dispute={} analysis={} adoption 恢复唤醒失败，等待启动恢复: {error:#}",
+            job.dispute_id,
+            job.analysis_id
+        );
+    }
+}
+
+pub async fn reject_dispute_resolution(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<RejectResolutionRequest>,
+) -> Result<(StatusCode, Json<ArbitrationResolutionRecord>), (StatusCode, String)> {
+    let dispute_id = parse_dispute_id(&id)?;
+    let _recovery_wake = ResolutionEventRecoveryWakeGuard::new(state.resolution_events.as_ref());
+    let service = ResolutionService::new(state.maintainer.clone(), arbitration_store(&state));
+    let resolution_record = service
+        .reject_and_replace(
+            &dispute_id,
+            RejectResolutionInput {
+                expected_resolution_id: request.expected_resolution_id,
+                rejection_reason: request.rejection_reason,
+                conclusion: request.conclusion,
+                resolution_type: request.resolution_type,
+                resolution_basis: request.resolution_basis,
+                claim_assessments: request.claim_assessments,
+            },
+            now_seconds(),
+        )
+        .await
+        .map_err(arbitration_mutation_error)?;
+    if let Some(arbitration) = state.arbitration.as_ref() {
+        arbitration.wake_preemption_checks();
+    }
+    if let Some(events) = state.resolution_events.as_ref() {
+        let target = crate::maintainer::arbitration::ResolutionEventTarget {
+            dispute_id: dispute_id.clone(),
+            resolution_id: resolution_record.resolution_id.clone(),
+        };
+        let _ = events.enqueue_pending_delivery(target.clone()).await;
+        let _ = events.refresh_resolution(target).await;
+    }
+    Ok((StatusCode::CREATED, Json(resolution_record)))
 }
 
 pub async fn list_claims(
@@ -613,6 +1277,12 @@ pub async fn ack_inbox(
         .ack_inbox(&req.agent_id, &req.inbox_ids)
         .await
         .map_err(inbox_ack_error)?;
+    if let Some(events) = state.resolution_events.as_ref() {
+        events
+            .refresh_inboxes(&req.inbox_ids)
+            .await
+            .map_err(internal_error)?;
+    }
     Ok(StatusCode::OK)
 }
 
@@ -627,6 +1297,12 @@ pub async fn upload_claim(
         .upload_claim(&claim)
         .await
         .map_err(internal_error)?;
+    if let Some(events) = state.resolution_events.as_ref() {
+        events
+            .refresh_claim(&claim.id)
+            .await
+            .map_err(internal_error)?;
+    }
     log_history_error(
         state
             .history_store
@@ -655,11 +1331,45 @@ pub async fn report_dispute(
     dispute
         .validate_agent_report()
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-    state
-        .maintainer
-        .report_dispute(&dispute)
-        .await
-        .map_err(internal_error)?;
+    if let Some(service) = state.arbitration.as_ref() {
+        // Current Analysis 与 Dispute 的 create-once 状态先于 enqueue 持久化。
+        // 客户端取消不能让 pending 记录在当前进程中失去唤醒来源。
+        let mut recovery_wake =
+            AnalysisRecoveryWakeGuard::new(state.arbitration_scheduler.as_ref());
+        let result = service
+            .report_dispute(&dispute)
+            .await
+            .map_err(arbitration_mutation_error)?;
+        if result.should_enqueue {
+            if let (Some(scheduler), Some(analysis)) = (
+                state.arbitration_scheduler.as_ref(),
+                result.current_analysis.as_ref(),
+            ) {
+                if let Err(error) = scheduler
+                    .enqueue(AnalysisJob {
+                        dispute_id: dispute.id.clone(),
+                        analysis_id: analysis.analysis_id.clone(),
+                    })
+                    .await
+                {
+                    // Dispute 与 pending analysis 已经持久化；不能把安全重放窗口伪装成
+                    // report 失败。启动恢复会重新提交这条 job。
+                    log::warn!(
+                        target: "maintainer_arbitration",
+                        "dispute={} Analysis 唤醒失败，等待启动恢复: {error:#}",
+                        dispute.id
+                    );
+                }
+            }
+        }
+        recovery_wake.disarm();
+    } else {
+        state
+            .maintainer
+            .report_dispute(&dispute)
+            .await
+            .map_err(arbitration_mutation_error)?;
+    }
     log_history_error(
         state
             .history_store
@@ -780,105 +1490,60 @@ pub async fn resolve_dispute(
     Path(dispute_id): Path<String>,
     Json(req): Json<ResolveDisputeRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let dispute_id = DisputeId::from_str(&dispute_id)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("非法 dispute id: {e}")))?;
+    let dispute_id = parse_dispute_id(&dispute_id)?;
+    let _recovery_wake = ResolutionEventRecoveryWakeGuard::new(state.resolution_events.as_ref());
     let resolve_note = req.resolve_note.trim();
     if resolve_note.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Resolve Note 不能为空".to_string()));
     }
-
-    let dispute = state
-        .maintainer
-        .list_disputes()
-        .await
-        .map_err(internal_error)?
-        .into_iter()
-        .find(|item| item.id == dispute_id)
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("未找到 dispute: {dispute_id}"),
-            )
-        })?;
-    if dispute.status == crate::claim::DisputeStatus::Resolved {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("dispute 已 resolve: {dispute_id}"),
-        ));
-    }
-    let notification = if req.notify_affected_agents {
-        let all_claims = state
-            .maintainer
-            .list_all_claims()
-            .await
-            .map_err(internal_error)?;
-        let related_claims = related_claims_for_dispute(&dispute, &all_claims);
-        if related_claims.len() != dispute.claims.len() {
-            let missing: Vec<String> = dispute
-                .claims
-                .iter()
-                .filter(|claim_id| !related_claims.iter().any(|claim| &claim.id == *claim_id))
-                .map(ToString::to_string)
-                .collect();
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "无法通知 affected agents，缺少相关 claim mirror: {}",
-                    missing.join(", ")
-                ),
-            ));
-        }
-        let target_agents = affected_agents_from_claims(&related_claims);
-        if target_agents.is_empty() {
-            None
-        } else {
-            validate_target_agents(state.maintainer.team_root(), Some(&target_agents)).await?;
-            let statement =
-                build_dispute_resolve_cau_statement(&dispute, resolve_note, &related_claims);
-            Some((target_agents, statement))
-        }
-    } else {
-        None
-    };
-
     let occurred_at = now_seconds();
-    let resolved_summary = append_resolve_note_to_summary(&dispute.summary, resolve_note);
-    state
-        .maintainer
-        .resolve_dispute(&dispute_id, Some(resolved_summary), occurred_at)
-        .await
-        .map_err(internal_error)?;
-    if let Some((target_agents, statement)) = notification {
-        let (policy_id, _pushed) = state
-            .maintainer
-            .claim_update_suggestion(statement, occurred_at, Some(target_agents))
-            .await
-            .map_err(internal_error)?;
-        let policy = read_policy(&state, &policy_id).await?;
-        log_history_error(
-            state
-                .history_store
-                .write_policy_event(&build_policy_event_record(
-                    &policy,
-                    PolicyEventKind::ClaimAttributeUpdatePublished,
-                ))
-                .await,
-            "写 dispute resolve claim update suggestion history",
-        );
-    }
-    log_history_error(
-        state
-            .history_store
-            .write_dispute_resolution_event(&DisputeResolutionEventRecord {
-                event_id: fresh_record_id("dispute_resolution"),
-                dispute_id,
+    let resolution_record =
+        ResolutionService::new(state.maintainer.clone(), arbitration_store(&state))
+            .resolve_human(
+                &dispute_id,
+                HumanResolutionInput {
+                    conclusion: resolve_note.to_string(),
+                    notify_affected_agents: req.notify_affected_agents,
+                    resolution_type: req.resolution_type,
+                    resolution_basis: req.resolution_basis,
+                    claim_assessments: req.claim_assessments,
+                },
                 occurred_at,
-                summary: Some(resolve_note.to_string()),
-            })
-            .await,
-        "写 resolve dispute history",
-    );
+            )
+            .await
+            .map_err(arbitration_mutation_error)?;
+    if let Some(arbitration) = state.arbitration.as_ref() {
+        arbitration.wake_preemption_checks();
+    }
+    if let Some(events) = state.resolution_events.as_ref() {
+        let target = crate::maintainer::arbitration::ResolutionEventTarget {
+            dispute_id: dispute_id.clone(),
+            resolution_id: resolution_record.resolution_id.clone(),
+        };
+        let _ = events.enqueue_pending_delivery(target.clone()).await;
+        let _ = events.refresh_resolution(target).await;
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+struct ResolutionEventRecoveryWakeGuard {
+    scheduler: Option<crate::maintainer::arbitration::ResolutionEventScheduler>,
+}
+
+impl ResolutionEventRecoveryWakeGuard {
+    fn new(scheduler: Option<&crate::maintainer::arbitration::ResolutionEventScheduler>) -> Self {
+        Self {
+            scheduler: scheduler.cloned(),
+        }
+    }
+}
+
+impl Drop for ResolutionEventRecoveryWakeGuard {
+    fn drop(&mut self) {
+        if let Some(scheduler) = &self.scheduler {
+            scheduler.wake_durable_recovery();
+        }
+    }
 }
 
 pub async fn router_query(
@@ -959,69 +1624,6 @@ fn build_dispute_map(disputes: &[Dispute]) -> FxHashMap<ClaimId, (Vec<DisputeId>
         }
     }
     map
-}
-
-fn related_claims_for_dispute(dispute: &Dispute, all_claims: &[(AgentId, Claim)]) -> Vec<Claim> {
-    let mut out = Vec::with_capacity(dispute.claims.len());
-    for claim_id in &dispute.claims {
-        if let Some((_, claim)) = all_claims.iter().find(|(_, claim)| &claim.id == claim_id) {
-            out.push(claim.clone());
-        }
-    }
-    out
-}
-
-fn affected_agents_from_claims(claims: &[Claim]) -> Vec<AgentId> {
-    let mut agents: Vec<AgentId> = claims.iter().map(|claim| claim.holder.clone()).collect();
-    agents.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-    agents.dedup();
-    agents
-}
-
-fn append_resolve_note_to_summary(summary: &str, resolve_note: &str) -> String {
-    let summary = summary.trim_end();
-    if summary.is_empty() {
-        format!("**来自团队 Maintainer 的 resolve 结论：**{resolve_note}")
-    } else {
-        format!("{summary}\n\n**来自团队 Maintainer 的 resolve 结论：**{resolve_note}")
-    }
-}
-
-fn build_dispute_resolve_cau_statement(
-    dispute: &Dispute,
-    resolve_note: &str,
-    related_claims: &[Claim],
-) -> String {
-    let mut lines = vec![
-        format!("Maintainer 已 resolve dispute {}。", dispute.id),
-        String::new(),
-        "Resolve Note:".to_string(),
-        resolve_note.to_string(),
-        String::new(),
-        "该 dispute 涉及以下 claim:".to_string(),
-    ];
-    for claim in related_claims {
-        lines.push(format!(
-            "- {} holder={} name={} scope={} statement={}",
-            claim.id,
-            claim.holder,
-            one_line(&claim.name),
-            one_line(&claim.scope),
-            one_line(&claim.statement)
-        ));
-    }
-    lines.extend([
-        String::new(),
-        "原Dispute 内容:".to_string(),
-        dispute.summary.clone(),
-        String::new(),
-        "请检查你本地是否持有上述 claim。如果你认为本次 resolve 结论影响了你的本地 claim，请在 'updated_claims' 中更新该 claim 的相应字段，使其反映 maintainer 的结论；如果你的本地 claim 不受影响，请跳过。不要仅因为收到本消息就生成新 claim；只有当 resolve 结论形成了新的、可复用的团队知识时才生成新 claim。".to_string(),
-    ]);
-    lines.join("\n")
-}
-
-fn one_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn parse_claim_status(raw: Option<&str>) -> Result<Option<ClaimStatus>, (StatusCode, String)> {
@@ -1137,6 +1739,69 @@ fn internal_error(err: anyhow::Error) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}"))
 }
 
+fn arbitration_store(state: &AppState) -> ArbitrationStore {
+    ArbitrationStore::new(state.maintainer.team_root().to_path_buf())
+}
+
+fn parse_dispute_id(raw: &str) -> Result<DisputeId, (StatusCode, String)> {
+    DisputeId::from_str(raw)
+        .map_err(|error| (StatusCode::BAD_REQUEST, format!("非法 dispute id: {error}")))
+}
+
+fn arbitration_read_error(error: anyhow::Error, not_found: &str) -> (StatusCode, String) {
+    if arbitration_error_is_not_found(&error) {
+        (StatusCode::NOT_FOUND, not_found.to_string())
+    } else {
+        internal_error(error)
+    }
+}
+
+fn arbitration_error_is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        || cause
+            .downcast_ref::<crate::storage::StorageError>()
+            .is_some_and(|storage| {
+                matches!(storage, crate::storage::StorageError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound)
+            })
+    })
+}
+
+fn arbitration_mutation_error(error: anyhow::Error) -> (StatusCode, String) {
+    let not_found = arbitration_error_is_not_found(&error);
+    let conflict = is_analysis_conflict(&error);
+    let message = format!("{error:#}");
+    let lowered = message.to_ascii_lowercase();
+    let status = if not_found {
+        StatusCode::NOT_FOUND
+    } else if conflict {
+        StatusCode::CONFLICT
+    } else if lowered.contains("not found") || message.contains("未找到") {
+        StatusCode::NOT_FOUND
+    } else if message.contains("已 resolved")
+        || message.contains("不一致")
+        || message.contains("仅允许")
+        || message.contains("已被")
+        || message.contains("不再")
+        || message.contains("没有可替换")
+        || message.contains("分析输入已变化")
+        || lowered.contains("approved")
+    {
+        StatusCode::CONFLICT
+    } else if message.contains("不能")
+        || message.contains("必须")
+        || message.contains("缺少")
+        || message.contains("无法为 dispute")
+    {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (status, message)
+}
+
 fn inbox_ack_error(err: InboxAckError) -> (StatusCode, String) {
     let status = match err {
         // 客户端用 route-level 404/405 识别 legacy server，领域内未知 ID 不能复用 404。
@@ -1159,8 +1824,18 @@ mod tests {
     use chrono::Utc;
     use tempfile::TempDir;
 
+    use crate::claim::{
+        ArbitrationResolutionContext, DisputeResolution, InboxMessageKind, MaintainerActionId,
+        PolicyStatus, ResolvedBy,
+    };
     use crate::claim::{Confidence, PolicyMessageType};
-    use crate::config::MaintainerAdminAuthConfig;
+    use crate::config::{
+        ArbitrationMode, LlmChatConfig, MaintainerAdminAuthConfig, MaintainerArbitrationConfig,
+    };
+    use crate::maintainer::arbitration::{
+        ArbitrationAnalysis, ArbitrationContextBuilder, ArbitrationEvaluator, ArbitrationService,
+        DeliveryIntent, SystemArbitrationClock,
+    };
     use crate::maintainer::server::auth::AdminAuth;
     use crate::maintainer::Maintainer;
     use crate::router::Router;
@@ -1190,6 +1865,9 @@ mod tests {
             AppState {
                 history_store: maintainer.history_store().clone(),
                 maintainer,
+                arbitration: None,
+                arbitration_scheduler: None,
+                resolution_events: None,
                 router_client,
                 auth: crate::auth::AuthVerifier::disabled(),
                 auth_store: crate::auth::TeamAuthStore::new(paths::team_store_auth_keys_path(
@@ -1204,6 +1882,109 @@ mod tests {
             team,
             homes,
         )
+    }
+
+    struct UnusedEvaluator;
+
+    #[async_trait::async_trait]
+    impl ArbitrationEvaluator for UnusedEvaluator {
+        async fn propose(
+            &self,
+            _context: &FrozenArbitrationContext,
+        ) -> anyhow::Result<ArbitrationProposal> {
+            anyhow::bail!("test evaluator must not be called")
+        }
+
+        async fn verify(
+            &self,
+            _context: &FrozenArbitrationContext,
+            _proposal: &ArbitrationProposal,
+        ) -> anyhow::Result<ArbitrationVerification> {
+            anyhow::bail!("test evaluator must not be called")
+        }
+    }
+
+    fn test_arbitration_service_with_mode(
+        state: &AppState,
+        mode: ArbitrationMode,
+    ) -> Arc<ArbitrationService> {
+        let store = ArbitrationStore::new(state.maintainer.team_root().to_path_buf());
+        let config = MaintainerArbitrationConfig {
+            enabled: true,
+            mode,
+            ..MaintainerArbitrationConfig::default()
+        };
+        let service = ArbitrationService::new(
+            store.clone(),
+            ArbitrationContextBuilder::new(
+                store.clone(),
+                state.router_client.clone(),
+                config.clone(),
+                LlmChatConfig::default(),
+            ),
+            Arc::new(UnusedEvaluator),
+            ResolutionService::new(state.maintainer.clone(), store),
+            config,
+            "test-model".to_string(),
+            std::time::Duration::from_secs(1),
+            4,
+            Arc::new(SystemArbitrationClock),
+        );
+        Arc::new(service)
+    }
+
+    fn test_arbitration_service(state: &AppState) -> Arc<ArbitrationService> {
+        test_arbitration_service_with_mode(state, ArbitrationMode::Shadow)
+    }
+
+    fn enable_test_arbitration(state: &mut AppState) {
+        let service = test_arbitration_service(state);
+        let (scheduler, _worker) = crate::maintainer::arbitration::spawn_arbitration_scheduler(
+            service.clone(),
+            1,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        state.arbitration = Some(service);
+        state.arbitration_scheduler = Some(scheduler);
+    }
+
+    fn enable_test_arbitration_mode(state: &mut AppState, mode: ArbitrationMode) {
+        let service = test_arbitration_service_with_mode(state, mode);
+        let (scheduler, _worker) = crate::maintainer::arbitration::spawn_arbitration_scheduler(
+            service.clone(),
+            1,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        state.arbitration = Some(service);
+        state.arbitration_scheduler = Some(scheduler);
+    }
+
+    async fn persist_test_analysis(
+        service: &ArbitrationService,
+        dispute_id: &DisputeId,
+        state: AnalysisState,
+    ) -> ArbitrationAnalysis {
+        let mut analysis = service.create_analysis(dispute_id).await.unwrap();
+        analysis.state = state;
+        service.store().write_analysis(&analysis).await.unwrap();
+        analysis
+    }
+
+    async fn wait_until_scheduler_processed(
+        scheduler: &crate::maintainer::arbitration::ArbitrationScheduler,
+        job: &AnalysisJob,
+    ) {
+        assert!(scheduler.enqueue(job.clone()).await.unwrap());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                tokio::task::yield_now().await;
+                if scheduler.enqueue(job.clone()).await.unwrap() {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("scheduler 应处理完屏障 job");
     }
 
     fn sample_claim(
@@ -1224,6 +2005,92 @@ mod tests {
             source_claim_ids: vec![],
             evidence_summary: "summary".into(),
         }
+    }
+
+    #[test]
+    fn holder_adoption_projects_resolution_snapshot_and_current_mirror() {
+        let holder = AgentId::new("agent-a").unwrap();
+        let mut snapshot = sample_claim(&holder, ClaimStatus::Active, now_seconds());
+        snapshot.scope = "runtime / previous".into();
+        snapshot.statement = "previous production behavior".into();
+        let observation = ClaimObservation {
+            claim_id: snapshot.id.clone(),
+            claim_name: snapshot.name.clone(),
+            recommended_status: Some(ClaimStatus::Deprecated),
+            current_status: Some(ClaimStatus::Stale),
+            recommended_scope: None,
+            current_scope: Some("runtime / current".into()),
+            recommended_statement: None,
+            current_statement: Some("current production behavior".into()),
+            policy_provenance_present: true,
+            update_observed: true,
+            changed_fields: vec!["status".into(), "scope".into(), "statement".into()],
+            notes: Vec::new(),
+        };
+
+        let view = holder_claim_adoption_view(&[snapshot], &observation);
+
+        assert_eq!(view.snapshot_status, Some(ClaimStatus::Active));
+        assert_eq!(view.snapshot_scope.as_deref(), Some("runtime / previous"));
+        assert_eq!(
+            view.snapshot_statement.as_deref(),
+            Some("previous production behavior")
+        );
+        assert_eq!(view.current_status, Some(ClaimStatus::Stale));
+        assert_eq!(view.current_scope.as_deref(), Some("runtime / current"));
+        assert_eq!(
+            view.current_statement.as_deref(),
+            Some("current production behavior")
+        );
+        assert!(view.update_observed);
+        assert_eq!(view.changed_fields, ["status", "scope", "statement"]);
+    }
+
+    #[tokio::test]
+    async fn analysis_summary_only_marks_unblocked_auto_adoption_as_pending() {
+        let (state, ..) = build_state();
+        let service = test_arbitration_service_with_mode(&state, ArbitrationMode::Auto);
+        let dispute = Dispute {
+            id: DisputeId::random(),
+            name: "auto adoption handoff".into(),
+            reporter_agent_id: AgentId::new("agent-a").unwrap(),
+            claims: Vec::new(),
+            summary: "approved analysis is waiting for automatic adoption".into(),
+            status: crate::claim::DisputeStatus::Open,
+            created_at: now_seconds(),
+            resolved_at: None,
+        };
+        let record = MaintainerDisputeRecord::from(dispute.clone());
+        service.store().write_dispute(&record).await.unwrap();
+        let mut analysis = service.create_analysis(&dispute.id).await.unwrap();
+        analysis.state = AnalysisState::Approved;
+        analysis.proposal = Some(ArbitrationProposal {
+            resolution_type: ResolutionType::ConflictResolved,
+            resolution_basis: ResolutionBasis::Evidence,
+            conclusion: "use the supported claim".into(),
+            claim_assessments: Vec::new(),
+            confidence: 0.95,
+            evidence_refs: Vec::new(),
+            missing_evidence: Vec::new(),
+            human_review_reason: None,
+            reasoning: "direct evidence is sufficient".into(),
+        });
+
+        let summary = ArbitrationAnalysisSummary::from_analysis(&analysis, &record, true, true);
+        assert!(summary.automatic_progress_pending);
+
+        let auto_disabled =
+            ArbitrationAnalysisSummary::from_analysis(&analysis, &record, true, false);
+        assert!(!auto_disabled.automatic_progress_pending);
+
+        analysis.mode = ArbitrationMode::Manual;
+        let manual = ArbitrationAnalysisSummary::from_analysis(&analysis, &record, true, true);
+        assert!(!manual.automatic_progress_pending);
+
+        analysis.mode = ArbitrationMode::Auto;
+        analysis.adoption_blocked_reason = Some("waiting for human review".into());
+        let blocked = ArbitrationAnalysisSummary::from_analysis(&analysis, &record, true, true);
+        assert!(!blocked.automatic_progress_pending);
     }
 
     async fn seed_claim(team_root: &std::path::Path, claim: &Claim) {
@@ -1434,6 +2301,165 @@ mod tests {
             AgentActivityKind::DisputeReported
         );
         assert!(activities[0].summary.contains(dispute.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn report_dispute_with_deprecated_direct_claim_returns_conflict_without_analysis() {
+        let (mut state, ..) = build_state();
+        enable_test_arbitration(&mut state);
+        let reporter = AgentId::new("agent-a").unwrap();
+        let created_at = now_seconds();
+        let deprecated = sample_claim(&reporter, ClaimStatus::Deprecated, created_at);
+        let active = sample_claim(&reporter, ClaimStatus::Active, created_at);
+        seed_claim(state.maintainer.team_root(), &deprecated).await;
+        seed_claim(state.maintainer.team_root(), &active).await;
+        let dispute = Dispute {
+            id: DisputeId::random(),
+            name: "deprecated_direct_claim".into(),
+            reporter_agent_id: reporter.clone(),
+            claims: vec![deprecated.id, active.id],
+            summary: "the deprecated Claim must not open a new dispute".into(),
+            status: crate::claim::DisputeStatus::Open,
+            created_at,
+            resolved_at: None,
+        };
+
+        let error = report_dispute(
+            State(state.clone()),
+            Json(envelope(&reporter, "", dispute.clone())),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(error.1.contains("deprecated direct claim"));
+        assert!(
+            ArbitrationStore::new(state.maintainer.team_root().to_path_buf())
+                .read_current_analysis(&dispute.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(state
+            .history_store
+            .list_agent_activity_events()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_mode_report_exposes_no_current_analysis() {
+        let (mut state, ..) = build_state();
+        enable_test_arbitration_mode(&mut state, ArbitrationMode::Manual);
+        let reporter = AgentId::new("agent-a").unwrap();
+        let dispute = Dispute {
+            id: DisputeId::random(),
+            name: "manual-only".into(),
+            reporter_agent_id: reporter.clone(),
+            claims: vec![ClaimId::random(), ClaimId::random()],
+            summary: "wait for an administrator".into(),
+            status: crate::claim::DisputeStatus::Open,
+            created_at: now_seconds(),
+            resolved_at: None,
+        };
+
+        assert_eq!(
+            report_dispute(
+                State(state.clone()),
+                Json(envelope(&reporter, "", dispute.clone())),
+            )
+            .await
+            .unwrap(),
+            StatusCode::OK
+        );
+
+        let Json(analyses) =
+            list_dispute_analyses(State(state.clone()), Path(dispute.id.to_string()))
+                .await
+                .unwrap();
+        assert!(analyses.current_analysis.is_none());
+        let Json(detail) = get_dispute(State(state), Path(dispute.id.to_string()))
+            .await
+            .unwrap();
+        assert!(detail.current_analysis.is_none());
+        assert_eq!(
+            detail.record.dispute.status,
+            crate::claim::DisputeStatus::Open
+        );
+    }
+
+    #[tokio::test]
+    async fn report_dispute_replay_with_changed_payload_returns_conflict() {
+        let (mut state, ..) = build_state();
+        enable_test_arbitration(&mut state);
+        let reporter = AgentId::new("agent-a").unwrap();
+        let dispute = Dispute {
+            id: DisputeId::random(),
+            name: "reported".into(),
+            reporter_agent_id: reporter.clone(),
+            claims: vec![ClaimId::random(), ClaimId::random()],
+            summary: "original report".into(),
+            status: crate::claim::DisputeStatus::Open,
+            created_at: now_seconds(),
+            resolved_at: None,
+        };
+        assert_eq!(
+            report_dispute(
+                State(state.clone()),
+                Json(envelope(&reporter, "", dispute.clone())),
+            )
+            .await
+            .unwrap(),
+            StatusCode::OK
+        );
+
+        let mut changed = dispute;
+        changed.summary = "changed report with the same id".into();
+        let error = report_dispute(State(state), Json(envelope(&reporter, "", changed)))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn report_dispute_replay_with_changed_payload_returns_conflict_when_arbitration_disabled()
+    {
+        let (state, ..) = build_state();
+        let reporter = AgentId::new("agent-a").unwrap();
+        let dispute = Dispute {
+            id: DisputeId::random(),
+            name: "reported".into(),
+            reporter_agent_id: reporter.clone(),
+            claims: vec![ClaimId::random(), ClaimId::random()],
+            summary: "original report".into(),
+            status: crate::claim::DisputeStatus::Open,
+            created_at: now_seconds(),
+            resolved_at: None,
+        };
+        assert_eq!(
+            report_dispute(
+                State(state.clone()),
+                Json(envelope(&reporter, "", dispute.clone())),
+            )
+            .await
+            .unwrap(),
+            StatusCode::OK
+        );
+
+        let mut changed = dispute.clone();
+        changed.summary = "changed report with the same id".into();
+        let error = report_dispute(State(state.clone()), Json(envelope(&reporter, "", changed)))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        let stored = ArbitrationStore::new(state.maintainer.team_root().to_path_buf())
+            .read_dispute(&dispute.id)
+            .await
+            .unwrap();
+        assert_eq!(stored.dispute.summary, "original report");
     }
 
     #[tokio::test]
@@ -2150,6 +3176,9 @@ mod tests {
             Json(ResolveDisputeRequest {
                 resolve_note: "resolved".into(),
                 notify_affected_agents: false,
+                resolution_type: None,
+                resolution_basis: None,
+                claim_assessments: Vec::new(),
             }),
         )
         .await
@@ -2163,9 +3192,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(stored.status, crate::claim::DisputeStatus::Resolved);
-        assert!(stored
-            .summary
-            .contains("**来自团队 Maintainer 的 resolve 结论：**resolved"));
+        assert_eq!(stored.summary, "open");
 
         let events = state
             .history_store
@@ -2210,6 +3237,9 @@ mod tests {
             Json(ResolveDisputeRequest {
                 resolve_note: "scope differs".into(),
                 notify_affected_agents: true,
+                resolution_type: None,
+                resolution_basis: None,
+                claim_assessments: Vec::new(),
             }),
         )
         .await
@@ -2225,12 +3255,33 @@ mod tests {
             Some(vec![agent_a.clone(), agent_b.clone()])
         );
         assert!(policy.statement.contains(dispute.id.as_str()));
-        assert!(policy.statement.contains("Resolve Note:\nscope differs"));
+        assert!(policy.statement.contains("Conclusion: scope differs"));
         assert!(policy
             .statement
-            .contains("原Dispute 内容:\noriginal dispute"));
+            .contains("Original dispute: original dispute"));
         assert!(policy.statement.contains(claim_a.id.as_str()));
         assert!(policy.statement.contains(claim_b.id.as_str()));
+
+        let outbox = state
+            .maintainer
+            .list_outbox_entries(None, None)
+            .await
+            .unwrap();
+        assert_eq!(outbox.len(), 2);
+        for entry in outbox {
+            let InboxMessageKind::ClaimAttributeUpdate {
+                arbitration_resolution,
+                ..
+            } = entry.inbox_message.kind
+            else {
+                panic!("human Resolution 通知必须使用 ClaimAttributeUpdate");
+            };
+            let context = arbitration_resolution
+                .expect("即使 assessments 为空，通知也必须携带结构化 Resolution");
+            assert_eq!(context.dispute_id, dispute.id);
+            assert_eq!(context.resolution.conclusion, "scope differs");
+            assert!(context.resolution.claim_assessments.is_empty());
+        }
 
         let events = state.history_store.list_policy_events().await.unwrap();
         assert_eq!(events.len(), 1);
@@ -2267,6 +3318,9 @@ mod tests {
             Json(ResolveDisputeRequest {
                 resolve_note: "  ".into(),
                 notify_affected_agents: false,
+                resolution_type: None,
+                resolution_basis: None,
+                claim_assessments: Vec::new(),
             }),
         )
         .await
@@ -2279,6 +3333,9 @@ mod tests {
             Json(ResolveDisputeRequest {
                 resolve_note: "resolved".into(),
                 notify_affected_agents: false,
+                resolution_type: None,
+                resolution_basis: None,
+                claim_assessments: Vec::new(),
             }),
         )
         .await
@@ -2291,10 +3348,486 @@ mod tests {
             Json(ResolveDisputeRequest {
                 resolve_note: "again".into(),
                 notify_affected_agents: false,
+                resolution_type: None,
+                resolution_basis: None,
+                claim_assessments: Vec::new(),
             }),
         )
         .await
         .unwrap_err();
         assert_eq!(already_resolved.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn analysis_returns_conflict_when_arbitration_is_disabled() {
+        let (state, ..) = build_state();
+
+        let error = create_analysis(State(state), Path(DisputeId::random().to_string()))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(error.1.contains("disabled"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_analysis_request_wakes_the_persisted_job_without_restart() {
+        let (mut state, ..) = build_state();
+        let store = ArbitrationStore::new(state.maintainer.team_root().to_path_buf());
+        let service = test_arbitration_service_with_mode(&state, ArbitrationMode::Manual);
+        let (scheduler, _worker) = crate::maintainer::arbitration::spawn_arbitration_scheduler(
+            service.clone(),
+            1,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        state.arbitration = Some(service.clone());
+        state.arbitration_scheduler = Some(scheduler.clone());
+
+        // 先穿过一个 terminal job，保证 startup scan 已完成；随后落盘的 Pending
+        // Analysis 只能由请求取消 guard 的 durable wake 被发现。
+        let barrier_dispute = Dispute {
+            id: DisputeId::random(),
+            name: "scheduler barrier".into(),
+            reporter_agent_id: AgentId::new("agent-barrier").unwrap(),
+            claims: Vec::new(),
+            summary: "terminal analysis used as scheduler barrier".into(),
+            status: crate::claim::DisputeStatus::Open,
+            created_at: "2026-08-01T00:00:00Z".parse().unwrap(),
+            resolved_at: None,
+        };
+        store
+            .write_dispute(&MaintainerDisputeRecord::from(barrier_dispute.clone()))
+            .await
+            .unwrap();
+        let barrier = persist_test_analysis(
+            service.as_ref(),
+            &barrier_dispute.id,
+            AnalysisState::Approved,
+        )
+        .await;
+        wait_until_scheduler_processed(
+            &scheduler,
+            &AnalysisJob {
+                dispute_id: barrier_dispute.id,
+                analysis_id: barrier.analysis_id,
+            },
+        )
+        .await;
+
+        let holder = AgentId::new("agent-a").unwrap();
+        let claim_a = sample_claim(&holder, ClaimStatus::Active, now_seconds());
+        let claim_b = sample_claim(&holder, ClaimStatus::Active, now_seconds());
+        seed_claim(state.maintainer.team_root(), &claim_a).await;
+        seed_claim(state.maintainer.team_root(), &claim_b).await;
+        let dispute = Dispute {
+            id: DisputeId::random(),
+            name: "cancelled current analysis".into(),
+            reporter_agent_id: holder,
+            claims: vec![claim_a.id, claim_b.id],
+            summary: "the request is cancelled immediately after its durable write".into(),
+            status: crate::claim::DisputeStatus::Open,
+            created_at: "2026-08-02T00:00:00Z".parse().unwrap(),
+            resolved_at: None,
+        };
+        store
+            .write_dispute(&MaintainerDisputeRecord::from(dispute.clone()))
+            .await
+            .unwrap();
+        let analysis = service.create_analysis(&dispute.id).await.unwrap();
+        let job = AnalysisJob {
+            dispute_id: dispute.id,
+            analysis_id: analysis.analysis_id,
+        };
+
+        drop(AnalysisRecoveryWakeGuard::new(Some(&scheduler)));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if store.read_analysis(&job).await.unwrap().state != AnalysisState::Pending {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("同一进程应接管已经持久化的 Analysis");
+    }
+
+    #[tokio::test]
+    async fn cancelled_adopt_drop_guard_recovers_delivery_without_restart() {
+        let (mut state, ..) = build_state();
+        let store = ArbitrationStore::new(state.maintainer.team_root().to_path_buf());
+        let service = test_arbitration_service(&state);
+
+        // 先用一个 terminal job 穿过 scheduler，保证后面创建的 Adopting 记录不可能被
+        // startup recovery 扫到；其收敛只能来自显式 Adopt 的补偿入队。
+        let sentinel_dispute = Dispute {
+            id: DisputeId::random(),
+            name: "scheduler barrier".into(),
+            reporter_agent_id: AgentId::new("agent-sentinel").unwrap(),
+            claims: vec![ClaimId::random()],
+            summary: "terminal analysis used as scheduler barrier".into(),
+            status: crate::claim::DisputeStatus::Open,
+            created_at: "2026-08-01T00:00:00Z".parse().unwrap(),
+            resolved_at: None,
+        };
+        store
+            .write_dispute(&MaintainerDisputeRecord::from(sentinel_dispute.clone()))
+            .await
+            .unwrap();
+        let sentinel = persist_test_analysis(
+            service.as_ref(),
+            &sentinel_dispute.id,
+            AnalysisState::Approved,
+        )
+        .await;
+        let sentinel_job = AnalysisJob {
+            dispute_id: sentinel_dispute.id,
+            analysis_id: sentinel.analysis_id,
+        };
+        let (scheduler, _worker) = crate::maintainer::arbitration::spawn_arbitration_scheduler(
+            service.clone(),
+            1,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        state.arbitration = Some(service.clone());
+        state.arbitration_scheduler = Some(scheduler.clone());
+        wait_until_scheduler_processed(&scheduler, &sentinel_job).await;
+
+        let holder = AgentId::new("agent-a").unwrap();
+        let claim_a = sample_claim(&holder, ClaimStatus::Active, now_seconds());
+        let claim_b = sample_claim(&holder, ClaimStatus::Deprecated, now_seconds());
+        seed_claim(state.maintainer.team_root(), &claim_a).await;
+        seed_claim(state.maintainer.team_root(), &claim_b).await;
+        let original_dispute = Dispute {
+            id: DisputeId::random(),
+            name: "delivery recovery".into(),
+            reporter_agent_id: holder.clone(),
+            claims: vec![claim_a.id.clone(), claim_b.id.clone()],
+            summary: "resolution 已提交，但 holder 通知发生瞬时故障".into(),
+            status: crate::claim::DisputeStatus::Open,
+            created_at: "2026-08-02T00:00:00Z".parse().unwrap(),
+            resolved_at: None,
+        };
+        store
+            .write_dispute(&MaintainerDisputeRecord::from(original_dispute.clone()))
+            .await
+            .unwrap();
+        let mut analysis = service.create_analysis(&original_dispute.id).await.unwrap();
+        let resolution_id = ArbitrationResolutionId::random();
+        let resolved_at = "2026-08-03T00:00:00Z".parse().unwrap();
+        let assessments = vec![
+            ClaimAssessment {
+                claim_id: claim_a.id.clone(),
+                recommended_status: ClaimStatus::Active,
+                assessment: "保留当前知识".into(),
+                recommended_scope: None,
+                recommended_statement: None,
+                reason: "生产证据仍有效".into(),
+            },
+            ClaimAssessment {
+                claim_id: claim_b.id.clone(),
+                recommended_status: ClaimStatus::Deprecated,
+                assessment: "保留 deprecated".into(),
+                recommended_scope: None,
+                recommended_statement: None,
+                reason: "历史边界已失效".into(),
+            },
+        ];
+        let resolution = DisputeResolution {
+            resolution_id: resolution_id.clone(),
+            resolved_by: ResolvedBy::Human,
+            resolved_at,
+            resolution_type: Some(ResolutionType::ConflictResolved),
+            resolution_basis: Some(ResolutionBasis::Evidence),
+            conclusion: "采用有生产证据支持的知识".into(),
+            claim_assessments: assessments,
+            rejection_reason: None,
+        };
+        let policy = Policy {
+            id: PolicyId::random(),
+            message_type: PolicyMessageType::ClaimAttributeUpdate,
+            name: "dispute_arbitration_result".into(),
+            statement: "请 holder 内化已采用的裁决".into(),
+            scope: "maintainer / dispute arbitration".into(),
+            status: PolicyStatus::Active,
+            created_at: resolved_at,
+            updated_at: None,
+            target_agents: Some(vec![holder.clone()]),
+        };
+        let inbox_id = InboxId::random();
+        let inbox_message = InboxMessage {
+            id: inbox_id.clone(),
+            kind: InboxMessageKind::ClaimAttributeUpdate {
+                policy: policy.clone(),
+                arbitration_resolution: Some(Box::new(ArbitrationResolutionContext {
+                    dispute_id: original_dispute.id.clone(),
+                    resolution: resolution.clone(),
+                    context_snapshot_hash: None,
+                    dispute_snapshot: original_dispute.clone(),
+                    direct_claim_snapshots: vec![claim_a.clone(), claim_b.clone()],
+                    snapshot_source_resolution_id: None,
+                })),
+            },
+            handled_at: None,
+        };
+        // DeliveryTargetIntent 是 Maintainer 私有恢复细节；通过其稳定序列化协议构造
+        // 一份真实 delivery intent，避免测试越过模块可见性边界。
+        let delivery_intent: DeliveryIntent = serde_json::from_value(serde_json::json!({
+            "policy": policy,
+            "maintainer_action_id": MaintainerActionId::random(),
+            "targets": [{
+                "inbox_id": inbox_id,
+                "target_agent": holder,
+                "inbox_message": inbox_message,
+            }],
+        }))
+        .unwrap();
+        let resolution_record = ArbitrationResolutionRecord {
+            schema_version: analysis.schema_version,
+            resolution_id: resolution_id.clone(),
+            dispute_id: original_dispute.id.clone(),
+            created_at: resolved_at,
+            resolution: resolution.clone(),
+            dispute_snapshot: original_dispute.clone(),
+            direct_claim_snapshots: vec![claim_a, claim_b],
+            semantic_fingerprint: None,
+            context_snapshot_hash: None,
+            analysis_source_id: Some(analysis.analysis_id.clone()),
+            legacy_source_attempt_id: None,
+            delivery_intent: Some(delivery_intent),
+            snapshot_source_resolution_id: None,
+        };
+        store
+            .write_resolution_record(&resolution_record)
+            .await
+            .unwrap();
+        let mut resolved_dispute = original_dispute;
+        resolved_dispute.status = crate::claim::DisputeStatus::Resolved;
+        resolved_dispute.resolved_at = Some(resolved_at);
+        store
+            .write_dispute(&MaintainerDisputeRecord {
+                dispute: resolved_dispute,
+                resolution: Some(resolution),
+            })
+            .await
+            .unwrap();
+        analysis.state = AnalysisState::Adopting;
+        analysis.resolution_id = Some(resolution_id);
+        analysis.pending_resolution = Some(resolution_record);
+        analysis.delivery_error = Some("holder 通知投递待恢复；详见 Maintainer 日志".into());
+        store.write_analysis(&analysis).await.unwrap();
+        let job = AnalysisJob {
+            dispute_id: analysis.dispute_id.clone(),
+            analysis_id: analysis.analysis_id.clone(),
+        };
+
+        // 模拟 HTTP Adopt 在 fixed intent 落盘后被取消：future drop 只能执行同步
+        // guard，不能 await enqueue。durable wake 必须让同进程 scheduler 接管。
+        drop(AdoptionRecoveryWakeGuard::new(
+            state.arbitration_scheduler.as_ref(),
+            state.resolution_events.as_ref(),
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if store.read_analysis(&job).await.unwrap().state == AnalysisState::Adopted {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("同一进程内的 scheduler 应完成 delivery 恢复");
+        let outbox = state
+            .maintainer
+            .list_outbox_entries(None, None)
+            .await
+            .unwrap();
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(
+            outbox[0].target,
+            crate::claim::OutboxTarget::Targeted {
+                target_agent: AgentId::new("agent-a").unwrap(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn dispute_mutations_return_not_found_for_missing_dispute() {
+        let (mut state, ..) = build_state();
+        let dispute_id = DisputeId::random();
+
+        let resolve_error = resolve_dispute(
+            State(state.clone()),
+            Path(dispute_id.to_string()),
+            Json(ResolveDisputeRequest {
+                resolve_note: "human conclusion".into(),
+                notify_affected_agents: false,
+                resolution_type: None,
+                resolution_basis: None,
+                claim_assessments: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(resolve_error.0, StatusCode::NOT_FOUND);
+
+        let reject_error = reject_dispute_resolution(
+            State(state.clone()),
+            Path(dispute_id.to_string()),
+            Json(RejectResolutionRequest {
+                expected_resolution_id: ArbitrationResolutionId::random(),
+                rejection_reason: "new evidence".into(),
+                conclusion: "replacement conclusion".into(),
+                resolution_type: None,
+                resolution_basis: None,
+                claim_assessments: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(reject_error.0, StatusCode::NOT_FOUND);
+
+        enable_test_arbitration(&mut state);
+        let analyze_error = create_analysis(State(state), Path(dispute_id.to_string()))
+            .await
+            .unwrap_err();
+        assert_eq!(analyze_error.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn reject_returns_conflict_for_legacy_resolution_without_structured_record() {
+        let (state, ..) = build_state();
+        let agent = AgentId::new("agent-a").unwrap();
+        let dispute = Dispute {
+            id: DisputeId::random(),
+            name: "legacy resolution".into(),
+            reporter_agent_id: agent,
+            claims: vec![ClaimId::random(), ClaimId::random()],
+            summary: "historical resolved dispute without structured resolution".into(),
+            status: crate::claim::DisputeStatus::Resolved,
+            created_at: "2026-08-01T00:00:00Z".parse().unwrap(),
+            resolved_at: Some("2026-08-02T00:00:00Z".parse().unwrap()),
+        };
+        ArbitrationStore::new(state.maintainer.team_root().to_path_buf())
+            .write_dispute(&MaintainerDisputeRecord {
+                dispute: dispute.clone(),
+                resolution: None,
+            })
+            .await
+            .unwrap();
+
+        let error = reject_dispute_resolution(
+            State(state),
+            Path(dispute.id.to_string()),
+            Json(RejectResolutionRequest {
+                expected_resolution_id: ArbitrationResolutionId::random(),
+                rejection_reason: "human review".into(),
+                conclusion: "replacement".into(),
+                resolution_type: None,
+                resolution_basis: None,
+                claim_assessments: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn reject_replaces_automatic_resolution_and_fences_outdated_request() {
+        let (state, ..) = build_state();
+        let agent_a = AgentId::new("agent-a").unwrap();
+        let agent_b = AgentId::new("agent-b").unwrap();
+        let claim_a = sample_claim(&agent_a, ClaimStatus::Active, now_seconds());
+        let claim_b = sample_claim(&agent_b, ClaimStatus::Deprecated, now_seconds());
+        seed_claim(state.maintainer.team_root(), &claim_a).await;
+        seed_claim(state.maintainer.team_root(), &claim_b).await;
+        let dispute = Dispute {
+            id: DisputeId::random(),
+            name: "automatic resolution".into(),
+            reporter_agent_id: agent_a,
+            claims: vec![claim_a.id.clone(), claim_b.id.clone()],
+            summary: "original summary".into(),
+            status: crate::claim::DisputeStatus::Resolved,
+            created_at: "2026-08-01T00:00:00Z".parse().unwrap(),
+            resolved_at: Some("2026-08-02T00:00:00Z".parse().unwrap()),
+        };
+        let resolution_id = ArbitrationResolutionId::random();
+        let resolution = crate::claim::DisputeResolution {
+            resolution_id: resolution_id.clone(),
+            resolved_by: crate::claim::ResolvedBy::Automatic,
+            resolved_at: "2026-08-02T00:00:00Z".parse().unwrap(),
+            resolution_type: Some(ResolutionType::ConflictResolved),
+            resolution_basis: Some(ResolutionBasis::Evidence),
+            conclusion: "automatic conclusion".into(),
+            claim_assessments: Vec::new(),
+            rejection_reason: None,
+        };
+        let store = ArbitrationStore::new(state.maintainer.team_root().to_path_buf());
+        store
+            .write_dispute(&MaintainerDisputeRecord {
+                dispute: dispute.clone(),
+                resolution: Some(resolution.clone()),
+            })
+            .await
+            .unwrap();
+        store
+            .write_resolution_record(&ArbitrationResolutionRecord {
+                schema_version: 2,
+                resolution_id: resolution_id.clone(),
+                dispute_id: dispute.id.clone(),
+                created_at: resolution.resolved_at,
+                resolution,
+                dispute_snapshot: dispute.clone(),
+                direct_claim_snapshots: vec![claim_a, claim_b],
+                semantic_fingerprint: Some("sha256-v1:test".into()),
+                context_snapshot_hash: Some("sha256-v1:snapshot".into()),
+                analysis_source_id: None,
+                legacy_source_attempt_id: None,
+                delivery_intent: None,
+                snapshot_source_resolution_id: None,
+            })
+            .await
+            .unwrap();
+        let request = RejectResolutionRequest {
+            expected_resolution_id: resolution_id.clone(),
+            rejection_reason: "human evidence supersedes it".into(),
+            conclusion: "reviewed conclusion".into(),
+            resolution_type: Some(ResolutionType::Coexist),
+            resolution_basis: Some(ResolutionBasis::DirectAnalysis),
+            claim_assessments: Vec::new(),
+        };
+
+        let (status, Json(replacement)) = reject_dispute_resolution(
+            State(state.clone()),
+            Path(dispute.id.to_string()),
+            Json(request.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_ne!(replacement.resolution.resolution_id, resolution_id);
+        assert_eq!(
+            replacement.resolution.resolved_by,
+            crate::claim::ResolvedBy::Human
+        );
+        assert_eq!(
+            store
+                .read_dispute(&dispute.id)
+                .await
+                .unwrap()
+                .dispute
+                .summary,
+            "original summary"
+        );
+
+        let outdated_request =
+            reject_dispute_resolution(State(state), Path(dispute.id.to_string()), Json(request))
+                .await
+                .unwrap_err();
+        assert_eq!(outdated_request.0, StatusCode::CONFLICT);
     }
 }

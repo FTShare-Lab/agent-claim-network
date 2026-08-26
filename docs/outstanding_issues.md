@@ -19,3 +19,5 @@
 8. TUI running turn 期间 queued input 只按普通文本草稿恢复：ESC 会逐条取回最新 queued input 到 composer；Ctrl-C 中断 turn 后会把剩余 queued input 用换行合并回 composer。若 queued input 原本是 slash command（如 `/compact`），恢复后再次提交可能会被当作自然语言或多行普通输入处理。当前接受该语义；后续如果要保留 command 类型，需要把 queued input 从纯文本草稿升级为带 action/mode 的结构。
 
 9. @附件 功能目前支持 PNG/JPEG/GIF/WebP/PDF/任意UTF-8文件，但不支持 DOCX/XLSX/ZIP 等二进制，他们会被当成文本读取，随后因不是 UTF-8 而失败。这些内容目前上游 Anthropic 协议尚未支持，推荐引导模型采用 code_run 等方式读取解析。参考[Anthropic 附件支持文档](https://platform.claude.com/docs/en/build-with-claude/files)。
+
+10. Maintainer 的 holder adoption 目前通过 Resolution 快照与当前团队 Claim mirror 的差异来观察，因此不能严格证明某次变化由对应通知导致，也不会展示同次内化涉及的其他本地 Claim。后续如评估需要，可补充不含私有上下文的最小执行结果投影。

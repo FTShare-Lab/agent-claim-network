@@ -7,7 +7,11 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 
 use crate::auth::{AuthVerifier, TeamAuthStore};
-use crate::maintainer::{history::HistoryStore, Maintainer};
+use crate::maintainer::{
+    arbitration::{ArbitrationScheduler, ArbitrationService, ResolutionEventScheduler},
+    history::HistoryStore,
+    Maintainer,
+};
 use crate::router::RouterClient;
 use crate::time::{serde_utc_opt, truncate_to_second};
 
@@ -16,6 +20,9 @@ use super::auth::AdminAuth;
 #[derive(Clone)]
 pub struct AppState {
     pub maintainer: Arc<Maintainer>,
+    pub arbitration: Option<Arc<ArbitrationService>>,
+    pub arbitration_scheduler: Option<ArbitrationScheduler>,
+    pub resolution_events: Option<ResolutionEventScheduler>,
     pub history_store: HistoryStore,
     pub router_client: Arc<dyn RouterClient>,
     pub auth: AuthVerifier,

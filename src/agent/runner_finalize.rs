@@ -62,12 +62,16 @@ pub(super) fn prepare_recap_value(
 
     // —— 校验前置：先把 outcome 内所有可能 bail 的检查跑完，再做任何 I/O，
     // 避免出现"已经落了部分 claim 但 dispute 校验失败"的半成品状态。
-    let mut prepared_claims =
-        prepare_claims(outcome.new_claims, &allowed_source_claim_ids, agent_id, now)?;
+    let mut prepared_claims = prepare_claims(
+        outcome.new_claims,
+        Some(&allowed_source_claim_ids),
+        agent_id,
+        now,
+    )?;
     let prepared_updates = prepare_claim_updates(
         outcome.updated_claims,
         local_by_id,
-        &allowed_source_claim_ids,
+        Some(&allowed_source_claim_ids),
         now,
     )?;
     for claim in &prepared_updates {
@@ -78,7 +82,7 @@ pub(super) fn prepare_recap_value(
     prepared_claims.extend(prepared_updates);
     let prepared_disputes = prepare_disputes(
         outcome.new_disputes,
-        &allowed_dispute_claim_ids,
+        Some(&allowed_dispute_claim_ids),
         agent_id,
         now,
     )?;

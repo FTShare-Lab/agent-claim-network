@@ -358,6 +358,19 @@ background-shell 其余时序、容量和 PTY 参数是 `config.rs` 内部默认
 
 - `enabled`：maintainer 是否校验来自 agent 的团队鉴权信封。默认值：`false`。为 `false` 时仍要求请求体是 `{ auth, data }` 信封，但不校验 `auth.acn_key`。
 
+### `[maintainer.arbitration]`
+
+- `enabled`：是否启用针对 dispute 的模型分析服务。默认 `false`。
+- `mode`：`manual` 只保存新 Dispute，等待管理者 Analyze 或 Resolve；`shadow` 生成 Analysis 但不自动采用；`auto` 自动生成 Analysis，并在双阶段验证通过后采用。默认 `shadow`。
+- `confidence_threshold`：proposal 和 verification 都必须达到的置信度，范围 `[0, 1]`，默认 `0.90`。
+- `max_source_claims`：直接 Claim 的 source graph 广度优先加载上限，默认 `20`。
+
+`auto` 在采用前发现分析上下文变化时会延迟重分析，最多尝试三轮；仍无法获得稳定上下文时保持 Dispute open，等待人工处理。切换到其他模式会停止尚未确定的自动采用。
+
+### `[maintainer.llm]`
+
+该节使用与 `[agent.llm]` 相同的 provider-neutral 字段，但必须独立配置。只在 `maintainer.arbitration.enabled=true` 时要求提供，且 `api_key_env` 指向的环境变量必须存在。Maintainer 不会回退使用 `[agent.llm]`；字段含义与 `[agent.llm]` 一致，但 `retry_count` 默认 `2`，即每个 Proposal 或 Verification 阶段首次失败后最多额外重试两次、总共最多尝试三次。
+
 ### `[maintainer.id]`
 
 - `mint_max_retries`：Maintainer 生成需要查重的 ID 时，发生碰撞后的最大重抽次数。当前包括 policy、outbox inbox 和 action ID；总尝试次数为 `1 + mint_max_retries`。dispute id 由 agent 侧派生，不走该配置。

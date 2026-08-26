@@ -104,6 +104,10 @@ fn should_audit(method: &str, path: &str) -> bool {
             | "/api/router-query"
             | "/api/team-auth/keys"
     ) || (path.starts_with("/disputes/") && path.ends_with("/resolve"))
+        || (path.starts_with("/api/disputes/")
+            && (path.ends_with("/analyses")
+                || path.ends_with("/adopt")
+                || path.ends_with("/resolution/reject")))
         || (path.starts_with("/api/team-auth/keys/") && path.ends_with("/revoke"))
 }
 
@@ -113,6 +117,11 @@ fn infer_resource_id(path: &str, request_body: &str, response_body: &str) -> Opt
         .and_then(|rest| rest.strip_suffix("/resolve"))
     {
         return Some(id.to_string());
+    }
+    if let Some(rest) = path.strip_prefix("/api/disputes/") {
+        if let Some(dispute_id) = rest.split('/').next().filter(|value| !value.is_empty()) {
+            return Some(dispute_id.to_string());
+        }
     }
     extract_json_string(request_body, "policy_id")
         .or_else(|| extract_json_string(request_body, "id"))
@@ -265,6 +274,9 @@ mod tests {
             AppState {
                 history_store: maintainer.history_store().clone(),
                 maintainer,
+                arbitration: None,
+                arbitration_scheduler: None,
+                resolution_events: None,
                 router_client: Arc::new(Router::new(team.path().to_path_buf())),
                 auth: crate::auth::AuthVerifier::disabled(),
                 auth_store: crate::auth::TeamAuthStore::new(
@@ -315,6 +327,14 @@ mod tests {
             "/api/team-auth/keys/key_abcd1234/revoke"
         ));
         assert!(should_audit("POST", "/disputes/dispute_abcd1234/resolve"));
+        assert!(should_audit(
+            "POST",
+            "/api/disputes/dispute_abcd1234/analyses"
+        ));
+        assert!(should_audit(
+            "POST",
+            "/api/disputes/dispute_abcd1234/analyses/analysis_deadbeefdeadbeef/adopt"
+        ));
         assert!(!should_audit("GET", "/api/audits"));
         assert!(!should_audit("GET", "/assets/index.js"));
         assert!(!should_audit("GET", "/api/overview"));

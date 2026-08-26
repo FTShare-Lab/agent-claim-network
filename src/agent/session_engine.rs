@@ -17,7 +17,9 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use super::context::AgentContext;
-use super::inbox::InboxJsonGenerator;
+use super::inbox::{
+    ClaimAttributeUpdateJsonValidator, InboxJsonGenerator, PreparedClaimAttributeUpdate,
+};
 use super::runner::{AgentRunner, InboxProcessReport};
 use super::runner_trace::trace_name_from_task;
 use super::user_shell::{
@@ -27,12 +29,13 @@ use crate::api::{
     context_recovery_protected_tail_from_marker, ensure_compaction_request_within_context_window,
     estimate_session_turn_messages_tokens, project_compaction_input_media,
     project_turn_message_for_safe_transcript, trailing_model_context_segments, AgentTurnLoop,
-    CompletedSessionTurnMessage, ContextUsageSnapshot, ContextUsageSource, InboxInternalizeKind,
-    InternalizeRequest, MemoryReviewLoop, ModelContextSource, ProviderReplayIdentity,
-    SessionAttachment, SessionCompactionOutcome, SessionTurn, SessionTurnContentBlock,
-    SessionTurnContextAppender, SessionTurnEvent, SessionTurnEventRecorder, SessionTurnHooks,
-    SessionTurnInterrupted, SessionTurnMessage, SessionTurnPreflight, SessionTurnRequest,
-    StructuredJsonAttemptRequest, StructuredJsonCaller, ToolBoundaryControl, TurnMessage,
+    ClaimAttributeUpdateInternalizeRequest, CompletedSessionTurnMessage, ContextUsageSnapshot,
+    ContextUsageSource, InboxInternalizeKind, InternalizeRequest, MemoryReviewLoop,
+    ModelContextSource, ProviderReplayIdentity, SessionAttachment, SessionCompactionOutcome,
+    SessionTurn, SessionTurnContentBlock, SessionTurnContextAppender, SessionTurnEvent,
+    SessionTurnEventRecorder, SessionTurnHooks, SessionTurnInterrupted, SessionTurnMessage,
+    SessionTurnPreflight, SessionTurnRequest, StructuredJsonAttemptRequest, StructuredJsonCaller,
+    ToolBoundaryControl, TurnMessage,
 };
 use crate::claim::{AgentId, Claim, ClaimId, DisputeId, SessionId, SourceId, TraceId};
 use crate::config::{
@@ -1286,6 +1289,54 @@ impl InboxJsonGenerator for SessionInboxJsonGenerator<'_> {
                 vec![SessionTurnMessage::user_text(user_text)],
                 crate::api::BufferedProviderRuntime::new(self.fallback_scope.clone()),
                 preferred_transport,
+            )
+            .await
+    }
+
+    async fn generate_claim_attribute_update_json(
+        &self,
+        request: ClaimAttributeUpdateInternalizeRequest,
+    ) -> anyhow::Result<serde_json::Value> {
+        let system_prompt = self
+            .prompt_registry
+            .render(PROMPT_INBOX_CLAIM_ATTRIBUTE_UPDATE_INTERNALIZE, ())
+            .context("渲染 inbox_claim_attribute_update_internalize prompt 失败")?;
+        let user_text = serde_json::to_string_pretty(&request)?;
+        self.json_caller
+            .generate_json(
+                system_prompt,
+                vec![SessionTurnMessage::user_text(user_text)],
+            )
+            .await
+    }
+
+    async fn generate_validated_claim_attribute_update_json(
+        &self,
+        request: ClaimAttributeUpdateInternalizeRequest,
+        validator: &mut ClaimAttributeUpdateJsonValidator<'_>,
+    ) -> anyhow::Result<PreparedClaimAttributeUpdate> {
+        let agent_id = request.agent_id.clone();
+        let system_prompt = self
+            .prompt_registry
+            .render(PROMPT_INBOX_CLAIM_ATTRIBUTE_UPDATE_INTERNALIZE, ())
+            .context("渲染 inbox_claim_attribute_update_internalize prompt 失败")?;
+        let user_text = serde_json::to_string_pretty(&request)?;
+        self.json_caller
+            .generate_json_validated_with_guarded_attempts(
+                StructuredJsonAttemptRequest::claim_attribute_update(
+                    system_prompt,
+                    vec![SessionTurnMessage::user_text(user_text)],
+                ),
+                validator,
+                |retry, total, error| {
+                    log::warn!(
+                        target: "agent",
+                        "agent {} ClaimAttributeUpdate 输出校验失败，重试 ({retry}/{total}): {error:#}",
+                        agent_id
+                    );
+                },
+                |_| std::future::ready(()),
+                |_, _| Ok(()),
             )
             .await
     }

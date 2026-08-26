@@ -26,6 +26,14 @@ const BUNDLED_TEMPLATES: &[(&str, &str)] = &[
         include_str!("../../prompts/inbox_policy_update_internalize.j2"),
     ),
     (
+        "maintainer_arbitration_proposal.j2",
+        include_str!("../../prompts/maintainer_arbitration_proposal.j2"),
+    ),
+    (
+        "maintainer_arbitration_verification.j2",
+        include_str!("../../prompts/maintainer_arbitration_verification.j2"),
+    ),
+    (
         "memory_review_system.j2",
         include_str!("../../prompts/memory_review_system.j2"),
     ),
@@ -661,6 +669,220 @@ mod tests {
             assert!(out.contains("`updated_claims` 必须返回 `status`"));
             assert!(out.contains("后端也会忽略并把新 claim 初始化为 `active`"));
             assert!(out.contains("\"status\": \"active\" | \"stale\" | \"deprecated\""));
+        }
+    }
+
+    #[test]
+    fn repository_policy_inbox_prompt_rejects_resolved_or_deprecated_disputes() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let reg = PromptRegistry::new(&root).unwrap();
+        let prompt = reg.render("inbox_policy_update_internalize", ()).unwrap();
+
+        assert!(prompt.contains("推演最终 Claim 状态"));
+        assert!(prompt.contains("仍有至少两条非 deprecated Claim"));
+        assert!(prompt.contains("policy 本身不足以判断"));
+        assert!(prompt.contains("不得再为新旧表达创建 Dispute"));
+        assert!(prompt.contains("deprecated Claim 不能成为新 Dispute 的 direct Claim"));
+    }
+
+    #[test]
+    fn repository_claim_attribute_update_prompt_defines_unified_single_call_context() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let reg = PromptRegistry::new(&root).unwrap();
+        let prompt = reg
+            .render("inbox_claim_attribute_update_internalize", ())
+            .unwrap();
+
+        for field in [
+            "claim_attribute_update",
+            "conclusion",
+            "resolution",
+            "dispute",
+            "local_claims",
+            "direct_claims",
+        ] {
+            assert!(prompt.contains(field), "missing CAU field {field}");
+        }
+        assert!(prompt.contains("不读取 Memory、USER、session transcript 或工具上下文"));
+        assert!(prompt.contains("全部非 deprecated 本地 Claim"));
+        assert!(prompt.contains("即使其当前为 deprecated"));
+        assert!(prompt.contains("全部 direct Claim 冻结快照"));
+        assert!(prompt.contains("`updated_claims` 只能引用 `local_claims`"));
+        assert!(prompt.contains("非 direct 的非 deprecated 本地 Claim 同样可以在相关时原地更新"));
+        assert!(prompt.contains("仍可见、可修改并可恢复"));
+        assert!(prompt.contains("非直接 deprecated Claim 不可见"));
+        assert!(prompt.contains("仅仅选择不采纳 CAU 或 Resolution"));
+        assert!(prompt.contains("新的实质证据"));
+        assert!(prompt.contains("语义输入完全相同，不要重复创建"));
+    }
+
+    #[test]
+    fn repository_arbitration_prompts_prefer_minimal_knowledge_changes() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let reg = PromptRegistry::new(&root).unwrap();
+        let prompt_context = minijinja::context! { confidence_threshold => 0.90 };
+        let proposal = reg
+            .render("maintainer_arbitration_proposal", &prompt_context)
+            .unwrap();
+        let verification = reg
+            .render("maintainer_arbitration_verification", &prompt_context)
+            .unwrap();
+        let inbox = reg
+            .render("inbox_claim_attribute_update_internalize", ())
+            .unwrap();
+
+        for prompt in [&proposal, &verification] {
+            assert!(prompt.contains("最小知识变更"));
+            assert!(prompt.contains("`coexist`"));
+            assert!(prompt.contains("`lifecycle_update`"));
+            assert!(prompt.contains("`conflict_resolved`"));
+            assert!(prompt.contains("`unresolved`"));
+            assert!(prompt.contains("原地更新"));
+            assert!(prompt.contains("创建重复 Claim"));
+        }
+        assert!(proposal.contains("不指示创建新 Claim"));
+        assert!(verification.contains("不能假设 Maintainer 看到了 holder 的完整本地知识"));
+        assert!(inbox.contains("以下最小知识变更顺序"));
+        assert!(inbox.contains("已有另一条等价、正确且非 deprecated 的本地 Claim"));
+        assert!(inbox.contains("不要创建重复 Claim"));
+        assert!(inbox.contains("优先原地更新这个 direct Claim"));
+        assert!(inbox.contains("独立、可复用知识单元时，才创建新 Claim"));
+        assert!(inbox.contains("可以不产生任何 Claim 变更"));
+    }
+
+    #[test]
+    fn repository_arbitration_prompts_define_governance_and_confidence_boundary() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let reg = PromptRegistry::new(&root).unwrap();
+        let prompt_context = minijinja::context! { confidence_threshold => 0.91 };
+        let proposal = reg
+            .render("maintainer_arbitration_proposal", &prompt_context)
+            .unwrap();
+        let verification = reg
+            .render("maintainer_arbitration_verification", &prompt_context)
+            .unwrap();
+
+        for prompt in [&proposal, &verification] {
+            for input in [
+                "direct_claims",
+                "source_claims",
+                "router_candidate_claims",
+                "message_type=policy_update",
+            ] {
+                assert!(prompt.contains(input), "missing input boundary {input}");
+            }
+            for kind in [
+                "`coexist`",
+                "`lifecycle_update`",
+                "`conflict_resolved`",
+                "`unresolved`",
+            ] {
+                assert!(prompt.contains(kind), "missing resolution type {kind}");
+            }
+            for basis in [
+                "`direct_analysis`",
+                "`prior_resolution`",
+                "`policy`",
+                "`evidence`",
+                "`insufficient_evidence`",
+            ] {
+                assert!(prompt.contains(basis), "missing resolution basis {basis}");
+            }
+            for status in ["`active`", "`stale`", "`deprecated`"] {
+                assert!(prompt.contains(status), "missing claim status {status}");
+            }
+            assert!(prompt.contains("团队当前基线"));
+            assert!(prompt.contains("Node 18"));
+            assert!(prompt.contains("Node 22"));
+            assert!(prompt.contains("query v4"));
+            assert!(prompt.contains("硬编码"));
+            assert!(prompt.contains("0.91"));
+            assert!(prompt.contains("最弱环节原则"));
+            assert!(prompt.contains("0.00–0.49"));
+            assert!(prompt.contains("0.50–0.74"));
+            assert!(prompt.contains("0.75–门槛以下"));
+            assert!(prompt.contains("门槛–0.97"));
+            assert!(prompt.contains("0.98–1.00"));
+            assert!(prompt.contains("自动关闭"));
+            assert!(prompt.contains("missing evidence"));
+            assert!(prompt.contains("不得仅因输入出现风险相关关键词"));
+            assert!(prompt.contains("若补齐该证据"));
+            for core_field in [
+                "resolution_type",
+                "resolution_basis",
+                "conclusion",
+                "resolved assessment",
+            ] {
+                assert!(
+                    prompt.contains(core_field),
+                    "missing material-evidence field {core_field}"
+                );
+            }
+            for check in 1..=10 {
+                assert!(
+                    prompt.contains(&format!("{check}.")),
+                    "missing confidence check {check}"
+                );
+            }
+        }
+        assert!(proposal.contains("`human_review_reason` 只是可选的人工交接说明"));
+        assert!(proposal.contains("缺失不能让正确的 unresolved 变成技术失败"));
+        assert!(proposal.contains("`unresolved` 必须输出空的 `claim_assessments`"));
+        assert!(proposal.contains("不以 `stale` 或其他状态代替“等待人工”"));
+        assert!(proposal.contains("必须包含每个 direct Claim ID"));
+        assert!(proposal.contains("Policy 是主要依据时也不能省略 direct Claim"));
+        assert!(proposal.contains("unresolved 也必须引用承载证据缺口的 direct Claim"));
+        assert!(verification.contains("Proposal 是待审查对象，不是既定事实"));
+        assert!(verification.contains("不得照抄它的结论或 confidence"));
+        assert!(verification.contains("任一核心项目不同意"));
+        assert!(verification.contains("门槛+0.01"));
+        assert!(verification.contains("verdict 为 unresolved 时 `claim_assessments` 必须为 `[]`"));
+        assert!(verification.contains("evidence_refs 必须无重复并覆盖全部 direct Claim"));
+    }
+
+    #[test]
+    fn repository_arbitration_prompts_include_shared_domain_definitions() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let claim_doc = fs::read_to_string(root.join("what_is_claim.j2")).unwrap();
+        let dispute_doc = fs::read_to_string(root.join("what_is_dispute.j2")).unwrap();
+        let policy_doc = fs::read_to_string(root.join("what_is_policy.j2")).unwrap();
+        let reg = PromptRegistry::new(&root).unwrap();
+        let bundled = PromptRegistry::bundled().unwrap();
+        let prompt_context = minijinja::context! { confidence_threshold => 0.90 };
+
+        for name in [
+            "maintainer_arbitration_proposal",
+            "maintainer_arbitration_verification",
+        ] {
+            let source = fs::read_to_string(root.join(format!("{name}.j2"))).unwrap();
+            for include in [
+                "what_is_claim.j2",
+                "what_is_dispute.j2",
+                "what_is_policy.j2",
+            ] {
+                assert!(
+                    source.contains(&format!("{{% include \"{include}\" %}}")),
+                    "{name} 应显式 include {include}"
+                );
+            }
+
+            let rendered = reg.render(name, &prompt_context).unwrap();
+            for definition in [&claim_doc, &dispute_doc, &policy_doc] {
+                assert!(
+                    rendered.contains(definition.trim()),
+                    "{name} 应包含统一领域定义"
+                );
+            }
+            assert!(!rendered.contains("{% include"));
+
+            let bundled_rendered = bundled.render(name, &prompt_context).unwrap();
+            for definition in [&claim_doc, &dispute_doc, &policy_doc] {
+                assert!(
+                    bundled_rendered.contains(definition.trim()),
+                    "bundled {name} 应包含统一领域定义"
+                );
+            }
+            assert!(!bundled_rendered.contains("{% include"));
         }
     }
 
