@@ -4390,7 +4390,7 @@ router_endpoint = "http://router.example"
     }
 
     #[test]
-    fn maintainer_llm_retry_count_defaults_to_two_without_changing_agent_default() {
+    fn maintainer_llm_uses_llm_defaults_and_maintainer_retry_count() {
         let maintainer_llm = r#"
 [maintainer.llm]
 provider = "anthropic"
@@ -4404,10 +4404,11 @@ model = "example-model"
         ))
         .unwrap();
 
-        assert_eq!(
-            cfg.maintainer.llm.as_ref().unwrap().retry_count,
-            DEFAULT_MAINTAINER_LLM_RETRY_COUNT
-        );
+        let llm = cfg.maintainer.llm.as_ref().unwrap();
+        assert_eq!(llm.max_tokens, 65_536);
+        assert_eq!(llm.timeout_secs, 300);
+        assert_eq!(llm.context_window, 200_000);
+        assert_eq!(llm.retry_count, DEFAULT_MAINTAINER_LLM_RETRY_COUNT);
         assert_eq!(
             LlmChatConfig::default().retry_count,
             DEFAULT_HTTP_RETRY_COUNT
