@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { useSearchParams } from 'react-router'
+import { useNavigate, useSearchParams } from 'react-router'
 
 import { StatusBadge } from '../components/badges/StatusBadge'
 import { DataTable } from '../components/data-table/DataTable'
@@ -47,6 +47,7 @@ type DrawerState = {
 const chipLinkClass = "rounded border border-blue-200 bg-blue-50 px-1.5 py-0.5 font-mono text-[11px] font-medium text-blue-700 transition hover:bg-blue-100"
 
 export function ClaimsPage() {
+  const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
   const claimIdFromUrl = searchParams.get('claim_id')
   const { data = [], isLoading, error } = useClaimsQuery()
@@ -91,6 +92,24 @@ export function ClaimsPage() {
 
   function openClaim(claimId: string) {
     setDrawerState({ current: { type: 'claim', id: claimId } })
+  }
+
+  function openSource(sourceId: string) {
+    if (sourceId.startsWith('policy_')) {
+      navigate(`/policies?policy_id=${encodeURIComponent(sourceId)}`)
+      return
+    }
+
+    setDrawerState((current) => {
+      const currentState = current ?? effectiveDrawerState
+      if (currentState?.current.type === 'claim' && currentState.current.id === sourceId) {
+        return currentState
+      }
+      return {
+        current: { type: 'claim', id: sourceId },
+        previous: currentState?.current,
+      }
+    })
   }
 
   function openDispute(disputeId: string) {
@@ -237,7 +256,6 @@ export function ClaimsPage() {
 
       <DetailDrawer
         modal={false}
-        size="default"
         open={Boolean(effectiveDrawerState?.current && (selectedClaim.data || selectedDispute))}
         onClose={closeDrawer}
         onBack={effectiveDrawerState?.previous ? goBack : undefined}
@@ -296,9 +314,14 @@ export function ClaimsPage() {
               {selectedClaim.data.claim.source_claim_ids.length ? (
                 <div className="flex flex-wrap gap-1">
                   {selectedClaim.data.claim.source_claim_ids.map((sourceId) => (
-                    <span key={sourceId} className="rounded bg-white px-1.5 py-0.5 font-mono text-[11px] text-slate-700 ring-1 ring-blue-100">
+                    <button
+                      key={sourceId}
+                      type="button"
+                      className={chipLinkClass}
+                      onClick={() => openSource(sourceId)}
+                    >
                       {sourceId}
-                    </span>
+                    </button>
                   ))}
                 </div>
               ) : (

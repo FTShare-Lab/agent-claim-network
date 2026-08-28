@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { Link } from 'react-router'
 
 import { StatusBadge } from '../../components/badges/StatusBadge'
 import { formatDateTime } from '../../lib/format'
@@ -126,7 +127,15 @@ function ClaimComparison({ claim }: { claim: ClaimAdoptionComparison }) {
   )
 }
 
-function HolderCard({ holder, observedAt }: { holder: HolderAdoption; observedAt?: string }) {
+function HolderCard({
+  holder,
+  observedAt,
+  policyNames,
+}: {
+  holder: HolderAdoption
+  observedAt?: string
+  policyNames?: ReadonlyMap<string, string>
+}) {
   const directClaims = holder.claims.filter((claim) => !claim.is_additional_claim)
   const additionalClaims = holder.claims.filter((claim) => claim.is_additional_claim)
   return (
@@ -161,10 +170,15 @@ function HolderCard({ holder, observedAt }: { holder: HolderAdoption; observedAt
         </div>
       ) : null}
 
-      <details className="mt-3 rounded-md border border-slate-200 bg-white p-2.5">
+      <details open className="mt-3 rounded-md border border-slate-200 bg-white p-2.5">
         <summary className="cursor-pointer text-xs font-medium text-amber-800">
           Direct Claim adoption ({directClaims.length})
         </summary>
+        <div className="mt-2 rounded bg-slate-50 p-2 text-xs leading-5 text-slate-600">
+          <span className="font-medium text-slate-800">At Resolution</span> 是裁决时冻结的 Claim；
+          <span className="font-medium text-slate-800"> Agent Adoption</span> 是首次确认本次 CAU 被内化时冻结的结果；
+          <span className="font-medium text-slate-800"> Current Mirror</span> 是 Maintainer 当前看到的最新版本，后续修改可能使它与 Agent Adoption 不同。
+        </div>
         <div className="mt-2 space-y-2">
           {directClaims.length
             ? directClaims.map((claim) => <ClaimComparison key={claim.claim_id} claim={claim} />)
@@ -184,11 +198,37 @@ function HolderCard({ holder, observedAt }: { holder: HolderAdoption; observedAt
       ) : null}
 
       {holder.technical && Object.values(holder.technical).some(Boolean) ? (
-        <details className="mt-2 rounded-md border border-slate-200 bg-white p-2.5 text-[11px]">
+        <details open className="mt-2 rounded-md border border-slate-200 bg-white p-2.5 text-[11px]">
           <summary className="cursor-pointer font-medium text-slate-600">Technical details</summary>
           <dl className="mt-2 space-y-1.5">
-            {holder.technical.policy_id ? <div><dt className="inline text-slate-500">Policy ID: </dt><dd className="inline break-all font-mono">{holder.technical.policy_id}</dd></div> : null}
-            {holder.technical.inbox_id ? <div><dt className="inline text-slate-500">Inbox ID: </dt><dd className="inline break-all font-mono">{holder.technical.inbox_id}</dd></div> : null}
+            {holder.technical.policy_id ? (
+              <div>
+                <dt className="inline text-slate-500">Policy: </dt>
+                <dd className="inline break-all">
+                  <Link
+                    to={`/policies?policy_id=${encodeURIComponent(holder.technical.policy_id)}`}
+                    title={holder.technical.policy_id}
+                    className="font-medium text-blue-700 underline-offset-2 hover:text-blue-900 hover:underline"
+                  >
+                    {policyNames?.get(holder.technical.policy_id) ?? holder.technical.policy_id}
+                  </Link>
+                </dd>
+              </div>
+            ) : null}
+            {holder.technical.inbox_id ? (
+              <div>
+                <dt className="inline text-slate-500">Inbox ID: </dt>
+                <dd className="inline break-all font-mono">
+                  <Link
+                    to="/policies"
+                    state={{ outboxId: holder.technical.inbox_id }}
+                    className="font-medium text-blue-700 underline-offset-2 hover:text-blue-900 hover:underline"
+                  >
+                    {holder.technical.inbox_id}
+                  </Link>
+                </dd>
+              </div>
+            ) : null}
             {holder.technical.snapshot_source ? <div><dt className="inline text-slate-500">Snapshot source: </dt><dd className="inline break-all">{holder.technical.snapshot_source}</dd></div> : null}
           </dl>
         </details>
@@ -197,7 +237,13 @@ function HolderCard({ holder, observedAt }: { holder: HolderAdoption; observedAt
   )
 }
 
-export function HolderAdoptionPanel({ adoption }: { adoption?: HolderAdoptionView | null }) {
+export function HolderAdoptionPanel({
+  adoption,
+  policyNames,
+}: {
+  adoption?: HolderAdoptionView | null
+  policyNames?: ReadonlyMap<string, string>
+}) {
   const [expanded, setExpanded] = useState(false)
   const summary = adoption?.summary ?? {
     notified_holders: 0,
@@ -239,7 +285,12 @@ export function HolderAdoptionPanel({ adoption }: { adoption?: HolderAdoptionVie
         <div className="mt-3 space-y-2">
           {adoption?.holders.length
             ? adoption.holders.map((holder) => (
-              <HolderCard key={holder.agent_id} holder={holder} observedAt={adoption.observed_at} />
+              <HolderCard
+                key={holder.agent_id}
+                holder={holder}
+                observedAt={adoption.observed_at}
+                policyNames={policyNames}
+              />
             ))
             : <div className="rounded border border-amber-200 bg-white p-3 text-xs text-slate-500">No holder delivery or adoption data is available.</div>}
         </div>

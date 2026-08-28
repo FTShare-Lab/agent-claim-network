@@ -66,7 +66,7 @@ const proposal = {
     },
   ],
   confidence: 0.94,
-  evidence_refs: ['claim_a', 'claim_b'],
+  evidence_refs: ['claim_a', 'claim_b', 'claim_router_only'],
   missing_evidence: [],
   reasoning: 'The scopes and environments are directly comparable.',
 }
@@ -90,6 +90,16 @@ const approvedAnalysis: ArbitrationAnalysisSummary = {
   semantic_fingerprint: 'sha256-v1:manual',
   proposal,
   adoptable: true,
+}
+
+const terminalContextChurnAnalysis: ArbitrationAnalysisSummary = {
+  ...approvedAnalysis,
+  analysis_id: 'analysis_context_churn',
+  adoptable: false,
+  adoption_blocker: '分析输入连续变化，已停止自动处理，等待人工',
+  analysis_round: 3,
+  context_change_count: 3,
+  context_change_reason: 'Router candidate Claims',
 }
 
 function analysisDetail(analysis: ArbitrationAnalysisSummary): ArbitrationAnalysisDetail {
@@ -152,6 +162,17 @@ const resolution = {
   resolution_basis: 'evidence' as const,
   conclusion: 'automatic conclusion',
   claim_assessments: proposal.claim_assessments,
+}
+
+const arbitrationPolicy = {
+  id: 'policy_resolution',
+  message_type: 'claim_attribute_update',
+  name: 'dispute_arbitration',
+  statement: 'Maintainer arbitration result.',
+  scope: 'maintainer / dispute-arbitration',
+  status: 'active',
+  created_at: createdAt,
+  target_agents: ['agent-updated'],
 }
 
 const resolvedDispute = {
@@ -327,6 +348,12 @@ function buildFetch(overrides?: {
     const method = init?.method ?? 'GET'
     if (path === '/api/disputes') return new Response(JSON.stringify([resolvedDispute, openDispute]))
     if (path === '/api/claims') return new Response(JSON.stringify(claimsResponse))
+    if (path === '/api/policies') return new Response(JSON.stringify({
+      policies: [arbitrationPolicy],
+      outbox: [],
+      send_log: [],
+      events: [],
+    }))
     if (path === '/api/overview') return new Response(JSON.stringify({}))
     if (path === '/api/disputes/dispute_open' && method === 'GET') {
       return new Response(JSON.stringify({
@@ -367,8 +394,9 @@ function buildFetch(overrides?: {
       const analysis = [
         unresolvedAnalysis,
         approvedAnalysis,
+        overrides?.currentAnalysis ?? undefined,
         overrides?.resolvedDetail?.current_analysis ?? resolvedDetail.current_analysis!,
-      ].find((item) => item.analysis_id === analysisId)
+      ].find((item) => item?.analysis_id === analysisId)
       if (!analysis) return new Response('analysis not found', { status: 404 })
       return new Response(JSON.stringify(analysisDetail(analysis)))
     }
@@ -434,6 +462,18 @@ describe('DisputesPage', () => {
     expect(details).toHaveTextContent('claim b evidence')
     expect(details).not.toHaveTextContent('"holder":')
     expect(details).not.toHaveTextContent('"statement":')
+    expect(within(details).getByRole('button', { name: 'claim_a' })).toBeInTheDocument()
+  })
+
+  it('shows Evidence references by Claim name and makes them navigable', async () => {
+    render(renderWorkbenchRoute('/disputes'))
+    fireEvent.click(await screen.findByText('Scope mismatch'))
+    const analysis = await screen.findByRole('article', { name: 'Current analysis analysis_approved' })
+
+    expect(within(analysis).getByRole('button', { name: 'claim-a-name' })).toHaveAttribute('title', 'claim_a')
+    expect(within(analysis).getByRole('button', { name: 'claim-b-name' })).toHaveAttribute('title', 'claim_b')
+    expect(within(analysis).getByText('claim_router_only')).toBeInTheDocument()
+    expect(within(analysis).queryByRole('button', { name: 'claim_router_only' })).not.toBeInTheDocument()
   })
 
   it('shows exactly one current unresolved analysis without source categories', async () => {
@@ -629,6 +669,17 @@ describe('DisputesPage', () => {
     expect(analysis).not.toHaveTextContent('下次重试')
   })
 
+  it('explains the latest context-change source and the terminal manual options', async () => {
+    vi.stubGlobal('fetch', buildFetch({ currentAnalysis: terminalContextChurnAnalysis }))
+    render(renderWorkbenchRoute('/disputes'))
+    fireEvent.click(await screen.findByText('Scope mismatch'))
+    const analysis = await screen.findByRole('article', { name: 'Current analysis analysis_context_churn' })
+
+    expect(analysis).toHaveTextContent('最近一次分析输入变化来自：Router candidate Claims')
+    expect(analysis).toHaveTextContent('Cannot adopt: 分析输入多次变化，等待人工裁决或重新Analyze。')
+    expect(within(analysis).queryByRole('button', { name: '采用此分析' })).not.toBeInTheDocument()
+  })
+
   it('summarizes observed updates without scoring recommendation compliance', async () => {
     render(renderWorkbenchRoute('/disputes'))
     fireEvent.click(await screen.findByText('Already resolved'))
@@ -660,11 +711,13 @@ describe('DisputesPage', () => {
     fireEvent.click(within(panel).getByRole('button', { name: 'Show holder adoption' }))
     const holder = within(panel).getByRole('article', { name: 'Holder adoption agent-updated' })
 
-    fireEvent.click(within(holder).getByText('Direct Claim adoption (1)'))
+    expect(within(holder).getByText('Direct Claim adoption (1)').closest('details')).toHaveAttribute('open')
     const comparison = within(holder).getByRole('article', { name: 'Claim adoption claim_a' })
     expect(comparison).toHaveTextContent('At Resolution')
     expect(comparison).toHaveTextContent('Agent Adoption')
     expect(comparison).toHaveTextContent('Current Mirror')
+    expect(holder).toHaveTextContent('首次确认本次 CAU 被内化时冻结的结果')
+    expect(holder).toHaveTextContent('后续修改可能使它与 Agent Adoption 不同')
     expect(comparison).toHaveTextContent('payments / previous')
     expect(comparison).toHaveTextContent('payments / legacy')
     expect(comparison).not.toHaveTextContent('Recommended status')
@@ -676,11 +729,12 @@ describe('DisputesPage', () => {
     fireEvent.click(within(comparison).getByRole('button', { name: '收起全文' }))
     expect(comparison).not.toHaveTextContent(longSnapshotStatement)
 
-    fireEvent.click(within(holder).getByText('Technical details'))
-    expect(holder).toHaveTextContent('Policy ID:')
-    expect(holder).toHaveTextContent('policy_resolution')
+    expect(within(holder).getByText('Technical details').closest('details')).toHaveAttribute('open')
+    expect(within(holder).getByRole('link', { name: 'dispute_arbitration' })).toHaveAttribute('href', '/policies?policy_id=policy_resolution')
+    expect(within(holder).getByRole('link', { name: 'inbox_resolution' })).toHaveAttribute('href', '/policies')
     expect(holder).not.toHaveTextContent('"policy_id"')
     expect(holder).toHaveTextContent('Additional Claims from this CAU (1)')
+    expect(within(holder).getByText('Additional Claims from this CAU (1)').closest('details')).toHaveAttribute('open')
     expect(within(holder).getByRole('article', { name: 'Additional Claim adoption claim_new_a' })).toHaveTextContent('A newly derived operational boundary.')
   })
 
@@ -711,8 +765,13 @@ describe('DisputesPage', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Close' }))
     fireEvent.click(await screen.findByText('Already resolved'))
+    expect(screen.getByLabelText('Rejection Reason (Required)')).toBeInTheDocument()
+    expect(screen.getByLabelText('Replacement Conclusion (Required)')).toBeInTheDocument()
+    expect(screen.getByText('Resolution Metadata (Optional)').closest('details')).not.toHaveAttribute('open')
     fireEvent.change(await screen.findByPlaceholderText('Why is the automatic resolution rejected?'), { target: { value: 'Incomplete evidence.' } })
     fireEvent.change(screen.getByPlaceholderText('Replacement conclusion'), { target: { value: 'Reviewed conclusion.' } })
+    fireEvent.click(screen.getByText('Resolution Metadata (Optional)'))
+    expect(screen.getByLabelText('Replacement Resolution Type')).toBeInTheDocument()
     expect(screen.getByLabelText('Replacement Resolution Basis')).not.toHaveTextContent('Insufficient evidence')
     fireEvent.click(screen.getByRole('button', { name: 'Reject & Replace' }))
     await waitFor(() => expect(fetch).toHaveBeenCalledWith(

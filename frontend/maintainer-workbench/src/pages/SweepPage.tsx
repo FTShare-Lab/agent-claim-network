@@ -4,12 +4,40 @@ import { Link, useLocation, useNavigate } from 'react-router'
 import { StatusBadge } from '../components/badges/StatusBadge'
 import { DataTable } from '../components/data-table/DataTable'
 import { DetailDrawer } from '../components/drawer/DetailDrawer'
+import { FilterBar } from '../components/filters/FilterBar'
+import { PaginationBar } from '../components/pagination/PaginationBar'
 import { PageContainer } from '../layouts/PageContainer'
 import { useOverviewQuery } from '../features/overview/hooks'
 import { useSweepsQuery, useTriggerSweepMutation } from '../features/sweeps/hooks'
 import type { SweepRunRecord } from '../features/sweeps/types'
 import { formatDateTime, formatRelativeMinutes } from '../lib/format'
 import { isStaticDemo } from '../lib/runtime'
+
+type SweepTimeRange = 'all' | '24h' | '7d' | '30d'
+type SweepTriggerFilter = 'all' | SweepRunRecord['trigger']
+
+const SWEEP_TIME_RANGE_DAYS: Record<Exclude<SweepTimeRange, 'all'>, number> = {
+  '24h': 1,
+  '7d': 7,
+  '30d': 30,
+}
+
+function paginate<T>(items: T[], page: number, pageSize: number) {
+  const start = (page - 1) * pageSize
+  return items.slice(start, start + pageSize)
+}
+
+function isWithinTimeRange(run: SweepRunRecord, range: Exclude<SweepTimeRange, 'all'>, now: number) {
+  const triggeredAt = Date.parse(run.triggered_at)
+  if (!Number.isFinite(triggeredAt)) return false
+  return triggeredAt >= now - SWEEP_TIME_RANGE_DAYS[range] * 24 * 60 * 60 * 1000
+}
+
+function triggerLabel(trigger: SweepRunRecord['trigger']) {
+  if (trigger === 'manual') return 'Manual'
+  if (trigger === 'maintainer_startup') return 'Maintainer startup'
+  return 'Scheduled ticker'
+}
 
 function notificationsOf(run: SweepRunRecord | null) {
   return run?.report.notifications ?? []
@@ -178,17 +206,36 @@ export function SweepPage() {
   const { data: overviewData } = useOverviewQuery()
   const triggerSweep = useTriggerSweepMutation()
   const [selectedRunId, setSelectedRunId] = useState<string | null>(() => routeRunId)
+  const [timeRange, setTimeRange] = useState<SweepTimeRange>('all')
+  const [triggerFilter, setTriggerFilter] = useState<SweepTriggerFilter>('all')
+  const [filterNow, setFilterNow] = useState(Date.now)
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(10)
 
   useEffect(() => {
     if (!routeRunId) return
     navigate(location.pathname + location.search, { replace: true, state: null })
   }, [location.pathname, location.search, navigate, routeRunId])
 
+  useEffect(() => {
+    const interval = window.setInterval(() => setFilterNow(Date.now()), 60_000)
+    return () => window.clearInterval(interval)
+  }, [])
+
   const latest = data[0] ?? null
   const selectedRun = useMemo(
     () => data.find((run) => run.run_id === selectedRunId) ?? null,
     [data, selectedRunId],
   )
+  const filteredRuns = useMemo(
+    () => data.filter((run) => {
+      if (timeRange !== 'all' && !isWithinTimeRange(run, timeRange, filterNow)) return false
+      if (triggerFilter !== 'all' && run.trigger !== triggerFilter) return false
+      return true
+    }),
+    [data, filterNow, timeRange, triggerFilter],
+  )
+  const pagedRuns = paginate(filteredRuns, page, pageSize)
   const latestFindingCount = useMemo(() => findingCount(latest), [latest])
   const nextSweepAt = overviewData?.sweep_schedule?.next_sweep_at ?? null
 
@@ -232,15 +279,63 @@ export function SweepPage() {
         ))}
       </div>
 
+      <FilterBar>
+        <label className="space-y-1 text-xs text-slate-600">
+          <span className="font-medium text-slate-700">Time Range</span>
+          <select
+            className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none"
+            value={timeRange}
+            onChange={(event) => {
+              setFilterNow(Date.now())
+              setTimeRange(event.target.value as SweepTimeRange)
+              setPage(1)
+            }}
+          >
+            <option value="all">All Time</option>
+            <option value="24h">Last 24 hours</option>
+            <option value="7d">Last 7 days</option>
+            <option value="30d">Last 30 days</option>
+          </select>
+        </label>
+        <label className="space-y-1 text-xs text-slate-600">
+          <span className="font-medium text-slate-700">Triggered By</span>
+          <select
+            className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none"
+            value={triggerFilter}
+            onChange={(event) => {
+              setTriggerFilter(event.target.value as SweepTriggerFilter)
+              setPage(1)
+            }}
+          >
+            <option value="all">All Triggers</option>
+            <option value="manual">Manual</option>
+            <option value="maintainer_startup">Maintainer startup</option>
+            <option value="ticker">Scheduled ticker</option>
+          </select>
+        </label>
+        <button
+          type="button"
+          className="self-end rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
+          onClick={() => {
+            setFilterNow(Date.now())
+            setTimeRange('all')
+            setTriggerFilter('all')
+            setPage(1)
+          }}
+        >
+          Reset
+        </button>
+      </FilterBar>
+
       <section className="space-y-3">
         <div className="flex items-center gap-2">
           <h2 className="text-sm font-semibold tracking-tight text-slate-900">Sweep History</h2>
-          <StatusBadge tone="info">{data.length}</StatusBadge>
+          <StatusBadge tone="info">{filteredRuns.length}</StatusBadge>
         </div>
         <DataTable
           columns={[
             { key: 'triggeredAt', header: 'Triggered At', render: (row: SweepRunRecord) => <span className="font-mono text-xs">{formatDateTime(row.triggered_at)}</span> },
-            { key: 'trigger', header: 'Triggered By', render: (row: SweepRunRecord) => <span className="font-mono text-xs">{row.trigger}</span> },
+            { key: 'trigger', header: 'Triggered By', render: (row: SweepRunRecord) => <span className="text-xs font-medium text-slate-700">{triggerLabel(row.trigger)}</span> },
             {
               key: 'findings',
               header: 'Findings',
@@ -260,17 +355,26 @@ export function SweepPage() {
                 ),
             },
           ]}
-          rows={data}
+          rows={pagedRuns}
           getRowId={(row) => row.run_id}
           onRowClick={(row) => setSelectedRunId(row.run_id)}
-          emptyState="No sweep history has been recorded yet."
+          emptyState={data.length ? 'No sweep runs matched the current filters.' : 'No sweep history has been recorded yet.'}
+        />
+        <PaginationBar
+          page={page}
+          pageSize={pageSize}
+          total={filteredRuns.length}
+          onPageChange={setPage}
+          onPageSizeChange={(size) => {
+            setPageSize(size)
+            setPage(1)
+          }}
         />
       </section>
 
       <DetailDrawer
         modal={false}
         open={Boolean(selectedRun)}
-        size="default"
         onClose={() => setSelectedRunId(null)}
         label="Claim Sweep"
         title={selectedRun ? formatDateTime(selectedRun.triggered_at) : 'Sweep'}
@@ -280,12 +384,12 @@ export function SweepPage() {
           <>
             <DrawerSection title="Run Summary">
               <dl className="grid gap-2 text-sm md:grid-cols-2">
-                <div className="flex justify-between gap-3"><dt className="text-slate-500">Run ID</dt><dd className="font-mono text-[11px] text-slate-600">{selectedRun.run_id}</dd></div>
-                <div className="flex justify-between gap-3"><dt className="text-slate-500">Trigger</dt><dd className="font-mono text-xs text-slate-900">{selectedRun.trigger}</dd></div>
-                <div className="flex justify-between gap-3"><dt className="text-slate-500">Triggered At</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedRun.triggered_at)}</dd></div>
-                <div className="flex justify-between gap-3"><dt className="text-slate-500">Findings</dt><dd className="font-mono text-xs text-slate-900">{findingCount(selectedRun)}</dd></div>
-                <div className="flex justify-between gap-3"><dt className="text-slate-500">Notifications</dt><dd className="font-mono text-xs text-slate-900">{notificationsOf(selectedRun).length}</dd></div>
-                <div className="flex justify-between gap-3"><dt className="text-slate-500">Errors</dt><dd className="font-mono text-xs text-slate-900">{notificationErrorsOf(selectedRun).length}</dd></div>
+                <div className="min-w-0 rounded-lg bg-slate-50 px-2.5 py-2"><dt className="text-xs text-slate-500">Run ID</dt><dd className="mt-1 break-all font-mono text-[11px] leading-4 text-slate-700">{selectedRun.run_id}</dd></div>
+                <div className="min-w-0 rounded-lg bg-slate-50 px-2.5 py-2"><dt className="text-xs text-slate-500">Trigger</dt><dd className="mt-1 break-words text-xs font-medium leading-4 text-slate-900">{triggerLabel(selectedRun.trigger)}</dd></div>
+                <div className="min-w-0 rounded-lg bg-slate-50 px-2.5 py-2"><dt className="text-xs text-slate-500">Triggered At</dt><dd className="mt-1 break-words font-mono text-xs text-slate-900">{formatDateTime(selectedRun.triggered_at)}</dd></div>
+                <div className="min-w-0 rounded-lg bg-slate-50 px-2.5 py-2"><dt className="text-xs text-slate-500">Findings</dt><dd className="mt-1 font-mono text-xs text-slate-900">{findingCount(selectedRun)}</dd></div>
+                <div className="min-w-0 rounded-lg bg-slate-50 px-2.5 py-2"><dt className="text-xs text-slate-500">Notifications</dt><dd className="mt-1 font-mono text-xs text-slate-900">{notificationsOf(selectedRun).length}</dd></div>
+                <div className="min-w-0 rounded-lg bg-slate-50 px-2.5 py-2"><dt className="text-xs text-slate-500">Errors</dt><dd className="mt-1 font-mono text-xs text-slate-900">{notificationErrorsOf(selectedRun).length}</dd></div>
               </dl>
             </DrawerSection>
 

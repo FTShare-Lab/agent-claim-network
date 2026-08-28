@@ -56,6 +56,13 @@ const dispute = {
   created_at: '2026-05-15T10:00:00Z',
 }
 
+const holderOnlyDispute = {
+  ...dispute,
+  id: 'dispute-holder-only',
+  name: 'Holder-only mismatch',
+  reporter_agent_id: 'agent-b',
+}
+
 const audit = {
   audit_id: 'audit-a',
   occurred_at: '2026-05-15T10:02:00Z',
@@ -222,8 +229,60 @@ describe('route state shortcuts', () => {
 
     expect(await screen.findByText('Recent Activities')).toBeInTheDocument()
     expect(screen.getByText('Mirror Claims')).toBeInTheDocument()
-    expect(screen.getByText('claim_e1834b6f')).toBeInTheDocument()
+    expect(screen.getByText('Open Disputes')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /claim-a-name/ })).toHaveAttribute('href', '/claims?claim_id=claim-a')
+    expect(screen.getByRole('link', { name: /Scope mismatch/ })).toHaveAttribute('href', '/disputes')
+    expect(screen.getByRole('link', { name: /claim_e1834b6f/ })).toHaveAttribute('href', '/claims?claim_id=claim_e1834b6f')
     expect(screen.queryByText('claim_uploaded claim_e1834b6f')).not.toBeInTheDocument()
+  })
+
+  it('does not report zero Agent resources when Claims and Disputes are unavailable', async () => {
+    const successfulFetch = vi.mocked(fetch)
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = typeof input === 'string' ? input : input.toString()
+      if (path.endsWith('/api/claims') || path.endsWith('/api/disputes')) {
+        return new Response('temporarily unavailable', { status: 503 })
+      }
+      return successfulFetch(input, init)
+    }))
+
+    render(renderWorkbenchRoute({ pathname: '/agents', state: { agentId: 'agent-a' } }))
+
+    expect(await screen.findByText('Claim details are unavailable. Refresh the Workbench to try again.')).toBeInTheDocument()
+    expect(await screen.findByText('Dispute data is unavailable. Refresh the Workbench to try again.')).toBeInTheDocument()
+    expect(screen.getAllByText('Unavailable')).not.toHaveLength(0)
+    expect(screen.queryByText('No mirrored Claims are held by this Agent.')).not.toBeInTheDocument()
+    expect(screen.queryByText('No reported or Claim-related Disputes.')).not.toBeInTheDocument()
+  })
+
+  it('marks Claim-related Agent disputes unavailable while preserving reported disputes', async () => {
+    const successfulFetch = vi.mocked(fetch)
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = typeof input === 'string' ? input : input.toString()
+      if (path.endsWith('/api/claims')) {
+        return new Response('temporarily unavailable', { status: 503 })
+      }
+      if (path.endsWith('/api/disputes')) {
+        return new Response(JSON.stringify([holderOnlyDispute, dispute]))
+      }
+      return successfulFetch(input, init)
+    }))
+
+    render(renderWorkbenchRoute({ pathname: '/agents', state: { agentId: 'agent-a' } }))
+
+    expect(await screen.findByText('Disputes (Reported only)')).toBeInTheDocument()
+    expect(screen.getByText(/Claim-related Disputes are unavailable/)).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /Scope mismatch/ })).toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: /Holder-only mismatch/ })).not.toBeInTheDocument()
+    const openDisputes = screen.getByText('Open Disputes').parentElement
+    const involvedDisputes = screen.getByText('Involved Disputes').parentElement
+    const reportedDisputes = screen.getByText('Reported Disputes').parentElement
+    expect(openDisputes).not.toBeNull()
+    expect(involvedDisputes).not.toBeNull()
+    expect(reportedDisputes).not.toBeNull()
+    expect(within(openDisputes!).getByText('Unavailable')).toBeInTheDocument()
+    expect(within(involvedDisputes!).getByText('Unavailable')).toBeInTheDocument()
+    expect(within(reportedDisputes!).getByText('1')).toBeInTheDocument()
   })
 
   it('opens the dispute drawer from route state', async () => {

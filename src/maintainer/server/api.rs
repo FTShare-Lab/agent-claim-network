@@ -1267,7 +1267,7 @@ fn require_team_auth_admin_enabled(state: &AppState) -> Result<(), (StatusCode, 
     }
     Err((
         StatusCode::FORBIDDEN,
-        "maintainer admin auth must be enabled to manage team auth keys".to_string(),
+        "Maintainer admin auth must be enabled to manage team auth keys.".to_string(),
     ))
 }
 
@@ -2995,7 +2995,10 @@ mod tests {
 
         let err = list_team_auth_keys(State(state.clone())).await.unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
-        assert!(err.1.contains("admin auth"));
+        assert_eq!(
+            err.1,
+            "Maintainer admin auth must be enabled to manage team auth keys."
+        );
 
         let err = create_team_auth_key(
             State(state),
@@ -3315,10 +3318,12 @@ mod tests {
             Some(vec![agent_a.clone(), agent_b.clone()])
         );
         assert!(policy.statement.contains(dispute.id.as_str()));
-        assert!(policy.statement.contains("Conclusion: scope differs"));
         assert!(policy
             .statement
-            .contains("Original dispute: original dispute"));
+            .contains("\n\nConclusion: scope differs\n\n"));
+        assert!(policy
+            .statement
+            .contains("Original dispute: original dispute\n\nDirect claims:\n\n"));
         assert!(policy.statement.contains(claim_a.id.as_str()));
         assert!(policy.statement.contains(claim_b.id.as_str()));
 

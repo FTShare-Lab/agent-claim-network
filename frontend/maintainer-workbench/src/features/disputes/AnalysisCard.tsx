@@ -14,14 +14,21 @@ function confidence(value: number | undefined) {
   return value === undefined ? 'N/A' : `${Math.round(value * 100)}%`
 }
 
+const terminalContextChurnBlocker = '分析输入连续变化，已停止自动处理，等待人工'
+const terminalContextChurnMessage = '分析输入多次变化，等待人工裁决或重新Analyze。'
+
+function isTerminalContextChurn(analysis: ArbitrationAnalysisSummary | ArbitrationAnalysisDetail) {
+  return analysis.adoption_blocker === terminalContextChurnBlocker
+}
+
 function analysisStatus(analysis: ArbitrationAnalysisSummary | ArbitrationAnalysisDetail) {
   if (analysis.state === 'waiting_reanalysis') {
     return analysis.context_change_count === 1
       ? '等待 5 分钟后重新分析'
       : '等待 15 分钟后重新分析'
   }
-  if (analysis.adoption_blocker === '分析输入连续变化，已停止自动处理，等待人工') {
-    return analysis.adoption_blocker
+  if (isTerminalContextChurn(analysis)) {
+    return terminalContextChurnMessage
   }
   if (analysis.state === 'approved' && analysis.adoption_blocker) {
     return 'Approved，但采用被阻止'
@@ -36,9 +43,22 @@ type AnalysisCardProps = {
   adopting?: boolean
   compact?: boolean
   resolutionClosed?: boolean
+  referenceLabel?: (reference: string) => string
+  isReferenceNavigable?: (reference: string) => boolean
+  onOpenReference?: (reference: string) => void
 }
 
-export function AnalysisCard({ analysis, label, onAdopt, adopting = false, compact = false, resolutionClosed = false }: AnalysisCardProps) {
+export function AnalysisCard({
+  analysis,
+  label,
+  onAdopt,
+  adopting = false,
+  compact = false,
+  resolutionClosed = false,
+  referenceLabel,
+  isReferenceNavigable,
+  onOpenReference,
+}: AnalysisCardProps) {
   const detail = 'frozen_context' in analysis ? analysis : undefined
   const proposal = analysis.proposal
   const unresolved = analysis.state === 'unresolved'
@@ -75,7 +95,12 @@ export function AnalysisCard({ analysis, label, onAdopt, adopting = false, compa
           <div className="font-semibold">{status}</div>
           <div className="mt-1">当前第 {analysis.analysis_round ?? 1} 轮；已检测到 {analysis.context_change_count ?? 0} 次分析输入变化。</div>
           {analysis.next_retry_at ? <div>下次重试：{formatDateTime(analysis.next_retry_at)}</div> : null}
-          {analysis.context_change_reason ? <ExpandableText className="mt-1 block" limit={220}>{analysis.context_change_reason}</ExpandableText> : null}
+          {analysis.context_change_reason ? (
+            <div className="mt-1">
+              <span className="font-medium">最近一次分析输入变化来自：</span>
+              <ExpandableText limit={220}>{analysis.context_change_reason}</ExpandableText>
+            </div>
+          ) : null}
         </div>
       ) : null}
 
@@ -156,7 +181,21 @@ export function AnalysisCard({ analysis, label, onAdopt, adopting = false, compa
               <summary className="cursor-pointer text-xs font-medium text-blue-800">Evidence references ({proposal.evidence_refs.length})</summary>
               <div className="mt-2 flex flex-wrap gap-1">
                 {proposal.evidence_refs.map((reference) => (
-                  <span key={reference} className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-700">{reference}</span>
+                  onOpenReference && isReferenceNavigable?.(reference) ? (
+                    <button
+                      key={reference}
+                      type="button"
+                      title={reference}
+                      className="rounded border border-blue-200 bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium text-blue-700 transition hover:bg-blue-100"
+                      onClick={() => onOpenReference(reference)}
+                    >
+                      {referenceLabel?.(reference) ?? reference}
+                    </button>
+                  ) : (
+                    <span key={reference} className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-700">
+                      {referenceLabel?.(reference) ?? reference}
+                    </span>
+                  )
                 ))}
               </div>
             </details>
@@ -225,7 +264,12 @@ export function AnalysisCard({ analysis, label, onAdopt, adopting = false, compa
               <div key={`${round.round}:${round.semantic_fingerprint}`} className="rounded bg-white p-2">
                 <div className="font-semibold">Round {round.round} · {formatValue(round.proposal.resolution_type)} · {round.verification.verdict}</div>
                 <div className="mt-1 text-slate-500">{formatDateTime(round.started_at)} → {round.completed_at ? formatDateTime(round.completed_at) : 'In progress'}</div>
-                {round.context_change_reason ? <ExpandableText className="mt-1 block text-amber-800" limit={180}>{round.context_change_reason}</ExpandableText> : null}
+                {round.context_change_reason ? (
+                  <div className="mt-1 text-amber-800">
+                    <span className="font-medium">该轮结束后检测到的分析输入变化来自：</span>
+                    <ExpandableText limit={180}>{round.context_change_reason}</ExpandableText>
+                  </div>
+                ) : null}
                 <div className="mt-1 break-all font-mono text-[10px] text-slate-400">{round.semantic_fingerprint}</div>
               </div>
             ))}
@@ -234,7 +278,10 @@ export function AnalysisCard({ analysis, label, onAdopt, adopting = false, compa
       ) : null}
 
       {!resolutionClosed && analysis.adoption_blocker && !analysis.adoptable ? (
-        <div className="mt-3 text-xs leading-5 text-slate-500">Cannot adopt: {analysis.adoption_blocker}</div>
+        <div className="mt-3 text-xs leading-5 text-slate-500">
+          <span className="font-medium text-slate-700">Cannot adopt:</span>{' '}
+          {isTerminalContextChurn(analysis) ? terminalContextChurnMessage : analysis.adoption_blocker}
+        </div>
       ) : null}
       {!resolutionClosed && analysis.adoptable && analysis.state === 'approved' && onAdopt ? (
         <button

@@ -610,7 +610,7 @@ function EndpointToggle({ entry }: { entry: EndpointEntry }) {
         <span className={`inline-flex w-14 shrink-0 justify-center rounded border px-1.5 py-0.5 font-mono text-[11px] font-semibold ${methodTone(entry.method)}`}>
           {entry.method}
         </span>
-        <span className="min-w-0 flex-1 font-mono text-xs text-slate-900">{entry.path}</span>
+        <span className="min-w-0 flex-1 break-all font-mono text-xs text-slate-900">{entry.path}</span>
         <span className="hidden truncate text-xs text-slate-500 md:inline">{entry.summary}</span>
         <ChevronDown className={`h-3.5 w-3.5 shrink-0 text-slate-400 transition ${open ? 'rotate-180' : ''}`} />
       </button>

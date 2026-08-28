@@ -125,7 +125,6 @@ export function RouterQueryPage() {
 
       <DetailDrawer
         modal={false}
-        size="default"
         open={Boolean(selected && (candidateClaim || dispute))}
         onClose={() => setSelected(null)}
         label={selected?.kind === 'claim' ? 'Claim' : 'Dispute'}

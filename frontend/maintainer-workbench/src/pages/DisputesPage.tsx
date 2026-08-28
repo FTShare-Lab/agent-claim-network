@@ -12,6 +12,7 @@ import type { Claim, ClaimView } from '../features/claims/types'
 import { useClaimsQuery } from '../features/claims/hooks'
 import { AnalysisCard } from '../features/disputes/AnalysisCard'
 import { HolderAdoptionPanel } from '../features/disputes/HolderAdoptionPanel'
+import { usePoliciesQuery } from '../features/policies/hooks'
 import {
   useAdoptAnalysisMutation,
   useAnalysesQuery,
@@ -110,7 +111,15 @@ function arbitrationMutationError(error: unknown, conflictMessage: string) {
   return detail
 }
 
-function DirectClaimCard({ claim, onOpen }: { claim: Claim; onOpen: () => void }) {
+function DirectClaimCard({
+  claim,
+  onOpen,
+  onOpenSource,
+}: {
+  claim: Claim
+  onOpen: () => void
+  onOpenSource: (sourceId: string) => void
+}) {
   return (
     <article aria-label={claim.name} className="rounded-lg border border-blue-100 bg-white p-3 shadow-sm">
       <div className="flex flex-wrap items-start justify-between gap-2">
@@ -155,9 +164,14 @@ function DirectClaimCard({ claim, onOpen }: { claim: Claim; onOpen: () => void }
         {claim.source_claim_ids.length ? (
           <div className="mt-1.5 flex flex-wrap gap-1">
             {claim.source_claim_ids.map((sourceId) => (
-              <span key={sourceId} className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-700">
+              <button
+                key={sourceId}
+                type="button"
+                className={chipLinkClass}
+                onClick={() => onOpenSource(sourceId)}
+              >
                 {sourceId}
-              </span>
+              </button>
             ))}
           </div>
         ) : (
@@ -267,11 +281,16 @@ export function DisputesPage() {
   const routeDrawerResourceKey = drawerResourceKey(routeDrawerResource)
   const { data: disputes = [], isLoading, error } = useDisputesQuery()
   const { data: claims = [], isLoading: claimsLoading } = useClaimsQuery()
+  const { data: policyRecords } = usePoliciesQuery()
   const resolveMutation = useResolveDisputeMutation()
   const analyzeMutation = useCreateAnalysisMutation()
   const adoptMutation = useAdoptAnalysisMutation()
   const rejectMutation = useRejectResolutionMutation()
   const claimNameMap = useMemo(() => new Map(claims.map((claim) => [claim.claim.id, claim.claim.name])), [claims])
+  const policyNameMap = useMemo(
+    () => new Map((policyRecords?.policies ?? []).map((policy) => [policy.id, policy.name])),
+    [policyRecords?.policies],
+  )
   const [keyword, setKeyword] = useState('')
   const [status, setStatus] = useState('all')
   const [page, setPage] = useState(1)
@@ -391,6 +410,25 @@ export function DisputesPage() {
     })
   }
 
+  function openReference(reference: string) {
+    if (reference.startsWith('policy_')) {
+      navigate(`/policies?policy_id=${encodeURIComponent(reference)}`)
+      return
+    }
+    openClaim(reference)
+  }
+
+  function referenceLabel(reference: string) {
+    if (reference.startsWith('policy_')) return policyNameMap.get(reference) ?? reference
+    return claimNameMap.get(reference) ?? reference
+  }
+
+  function isReferenceNavigable(reference: string) {
+    if (reference.startsWith('policy_')) return policyNameMap.has(reference)
+    if (reference.startsWith('claim_')) return claimNameMap.has(reference)
+    return false
+  }
+
   function goBack() {
     setDrawerState((current) => {
       if (!current?.previous) {
@@ -499,6 +537,9 @@ export function DisputesPage() {
           onAdopt={selectedDispute?.status === 'open' ? adoptSelectedAnalysis : undefined}
           adopting={adoptMutation.isPending && adoptingAnalysisId === currentAnalysis.analysis_id}
           resolutionClosed={selectedDispute?.status === 'resolved'}
+          referenceLabel={referenceLabel}
+          isReferenceNavigable={isReferenceNavigable}
+          onOpenReference={openReference}
         />
       ) : (
         <div className="text-xs text-slate-500">No analysis is recorded for this dispute.</div>
@@ -524,14 +565,9 @@ export function DisputesPage() {
             <option value="resolved">Resolved</option>
           </select>
         </label>
-        <div className="flex gap-2 self-end">
-          <button type="button" className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50" onClick={() => { setKeyword(''); setStatus('all'); setPage(1) }}>
-            Reset
-          </button>
-          <button type="button" className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50" onClick={() => { setStatus('open'); setPage(1) }}>
-            Open only
-          </button>
-        </div>
+        <button type="button" className="self-end rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50" onClick={() => { setKeyword(''); setStatus('all'); setPage(1) }}>
+          Reset
+        </button>
       </FilterBar>
 
       <section className="space-y-3">
@@ -674,6 +710,7 @@ export function DisputesPage() {
                         key={claimId}
                         claim={directClaim}
                         onOpen={() => openClaim(claimId)}
+                        onOpenSource={openReference}
                       />
                     )
                   }
@@ -708,33 +745,41 @@ export function DisputesPage() {
                 ) : currentAnalysisContent}
               </DrawerSection>
             ) : null}
-            <HolderAdoptionPanel adoption={disputeDetail.data?.holder_adoption} />
+            <HolderAdoptionPanel
+              adoption={disputeDetail.data?.holder_adoption}
+              policyNames={policyNameMap}
+            />
             {selectedDispute.resolution?.resolved_by === 'automatic' ? (
               <div className="rounded-lg border border-amber-200 bg-amber-50 p-3">
                 <div className="text-xs font-semibold uppercase tracking-wide text-amber-800">Reject &amp; Replace Automatic Resolution</div>
-                <textarea className="mt-2 min-h-16 w-full rounded-md border border-amber-200 bg-white px-2.5 py-2 text-sm" placeholder="Why is the automatic resolution rejected?" value={rejectReason} onChange={(event) => setRejectReason(event.target.value)} />
-                <textarea className="mt-2 min-h-20 w-full rounded-md border border-amber-200 bg-white px-2.5 py-2 text-sm" placeholder="Replacement conclusion" value={replacementConclusion} onChange={(event) => setReplacementConclusion(event.target.value)} />
-                <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                  <label className="text-xs text-amber-900" htmlFor="replacement-resolution-type">
-                    <span className="font-medium">Replacement Resolution Type</span>
-                    <select id="replacement-resolution-type" className="mt-1 w-full rounded-md border border-amber-200 bg-white px-2.5 py-2 text-sm" value={replacementResolutionType} onChange={(event) => setReplacementResolutionType(event.target.value as Exclude<ResolutionType, 'unresolved'> | '')}>
-                      <option value="">Unspecified</option>
-                      <option value="coexist">Coexist</option>
-                      <option value="lifecycle_update">Lifecycle update</option>
-                      <option value="conflict_resolved">Conflict resolved</option>
-                    </select>
-                  </label>
-                  <label className="text-xs text-amber-900" htmlFor="replacement-resolution-basis">
-                    <span className="font-medium">Replacement Resolution Basis</span>
-                    <select id="replacement-resolution-basis" className="mt-1 w-full rounded-md border border-amber-200 bg-white px-2.5 py-2 text-sm" value={replacementResolutionBasis} onChange={(event) => setReplacementResolutionBasis(event.target.value as ResolvedResolutionBasis | '')}>
-                      <option value="">Unspecified</option>
-                      <option value="direct_analysis">Direct analysis</option>
-                      <option value="prior_resolution">Prior resolution</option>
-                      <option value="policy">Policy</option>
-                      <option value="evidence">Evidence</option>
-                    </select>
-                  </label>
-                </div>
+                <label className="mt-2 block text-xs font-medium text-amber-950" htmlFor="reject-resolution-reason">Rejection Reason (Required)</label>
+                <textarea id="reject-resolution-reason" className="mt-1 min-h-16 w-full rounded-md border border-amber-200 bg-white px-2.5 py-2 text-sm" placeholder="Why is the automatic resolution rejected?" value={rejectReason} onChange={(event) => setRejectReason(event.target.value)} />
+                <label className="mt-2 block text-xs font-medium text-amber-950" htmlFor="replacement-resolution-conclusion">Replacement Conclusion (Required)</label>
+                <textarea id="replacement-resolution-conclusion" className="mt-1 min-h-20 w-full rounded-md border border-amber-200 bg-white px-2.5 py-2 text-sm" placeholder="Replacement conclusion" value={replacementConclusion} onChange={(event) => setReplacementConclusion(event.target.value)} />
+                <details className="mt-2 rounded-md border border-amber-200 bg-white/70 p-2.5">
+                  <summary className="cursor-pointer text-xs font-medium text-amber-900">Resolution Metadata (Optional)</summary>
+                  <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                    <label className="text-xs text-amber-900" htmlFor="replacement-resolution-type">
+                      <span className="font-medium">Replacement Resolution Type</span>
+                      <select id="replacement-resolution-type" className="mt-1 w-full rounded-md border border-amber-200 bg-white px-2.5 py-2 text-sm" value={replacementResolutionType} onChange={(event) => setReplacementResolutionType(event.target.value as Exclude<ResolutionType, 'unresolved'> | '')}>
+                        <option value="">Unspecified</option>
+                        <option value="coexist">Coexist</option>
+                        <option value="lifecycle_update">Lifecycle update</option>
+                        <option value="conflict_resolved">Conflict resolved</option>
+                      </select>
+                    </label>
+                    <label className="text-xs text-amber-900" htmlFor="replacement-resolution-basis">
+                      <span className="font-medium">Replacement Resolution Basis</span>
+                      <select id="replacement-resolution-basis" className="mt-1 w-full rounded-md border border-amber-200 bg-white px-2.5 py-2 text-sm" value={replacementResolutionBasis} onChange={(event) => setReplacementResolutionBasis(event.target.value as ResolvedResolutionBasis | '')}>
+                        <option value="">Unspecified</option>
+                        <option value="direct_analysis">Direct analysis</option>
+                        <option value="prior_resolution">Prior resolution</option>
+                        <option value="policy">Policy</option>
+                        <option value="evidence">Evidence</option>
+                      </select>
+                    </label>
+                  </div>
+                </details>
                 <button type="button" className="mt-2 rounded-md bg-amber-700 px-3 py-1.5 text-sm font-semibold text-white disabled:bg-slate-300" disabled={isStaticDemo || rejectMutation.isPending} onClick={rejectSelectedResolution}>
                   {rejectMutation.isPending ? 'Replacing…' : 'Reject & Replace'}
                 </button>
@@ -826,9 +871,14 @@ export function DisputesPage() {
               {selectedClaim.claim.source_claim_ids.length ? (
                 <div className="flex flex-wrap gap-1">
                   {selectedClaim.claim.source_claim_ids.map((sourceId) => (
-                    <span key={sourceId} className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-700">
+                    <button
+                      key={sourceId}
+                      type="button"
+                      className={chipLinkClass}
+                      onClick={() => openReference(sourceId)}
+                    >
                       {sourceId}
-                    </span>
+                    </button>
                   ))}
                 </div>
               ) : (

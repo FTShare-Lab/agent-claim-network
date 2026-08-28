@@ -106,10 +106,10 @@ export function HttpAuditsPage() {
           ['Errors', errorCount, '4xx–5xx responses'],
           ['Latest Source', latestSource, filtered[0] ? `${filtered[0].method} ${filtered[0].path}` : 'No matching rows'],
         ].map(([label, value, detail]) => (
-          <div key={label as string} className="rounded-md border border-slate-200 bg-white px-3 py-2.5">
+          <div key={label as string} className="min-w-0 rounded-md border border-slate-200 bg-white px-3 py-2.5">
             <div className="text-[11px] text-slate-500">{label}</div>
-            <div className="mt-1 font-mono text-lg font-semibold tracking-tight text-slate-900">{value as string | number}</div>
-            <div className="mt-0.5 text-[11px] text-slate-500">{detail as string}</div>
+            <div className="mt-1 [overflow-wrap:anywhere] font-mono text-lg font-semibold tracking-tight text-slate-900">{value as string | number}</div>
+            <div className="mt-0.5 [overflow-wrap:anywhere] text-[11px] text-slate-500">{detail as string}</div>
           </div>
         ))}
       </div>
@@ -122,10 +122,10 @@ export function HttpAuditsPage() {
         <DataTable
           columns={[
             { key: 'time', header: 'Time', render: (row: HttpAuditRecord) => <span className="font-mono text-xs">{formatDateTime(row.occurred_at)}</span> },
-            { key: 'request', header: 'Request', render: (row: HttpAuditRecord) => <span className="font-mono text-xs font-medium text-slate-900">{row.method} {row.path}</span> },
+            { key: 'request', header: 'Request', render: (row: HttpAuditRecord) => <span className="[overflow-wrap:anywhere] font-mono text-xs font-medium text-slate-900">{row.method} {row.path}</span> },
             { key: 'status', header: 'Status', render: (row: HttpAuditRecord) => <StatusBadge tone={row.status_code < 400 ? 'success' : 'danger'}>{row.status_code}</StatusBadge> },
             { key: 'source', header: 'Source', render: (row: HttpAuditRecord) => <span className="font-mono text-[11px] text-slate-500">{row.source_ip ?? 'Unavailable'}</span> },
-            { key: 'resource', header: 'Resource', render: (row: HttpAuditRecord) => <span className="font-mono text-[11px] text-slate-500">{row.resource_id ?? '—'}</span> },
+            { key: 'resource', header: 'Resource', render: (row: HttpAuditRecord) => <span className="[overflow-wrap:anywhere] font-mono text-[11px] text-slate-500">{row.resource_id ?? '—'}</span> },
             { key: 'duration', header: 'Duration', render: (row: HttpAuditRecord) => <span className="font-mono text-xs">{row.duration_ms} ms</span> },
           ]}
           rows={pagedRows}
@@ -138,7 +138,6 @@ export function HttpAuditsPage() {
 
       <DetailDrawer
         modal={false}
-        size="default"
         open={Boolean(selected)}
         onClose={() => setSelectedAuditId(null)}
         label="HTTP Audit"
@@ -158,17 +157,17 @@ export function HttpAuditsPage() {
             </div>
             <div className="rounded-lg border border-slate-200 p-3">
               <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Summary</div>
-              <div className="mt-2 text-xs leading-5 text-slate-600">{selected.summary}</div>
+              <div className="mt-2 [overflow-wrap:anywhere] text-xs leading-5 text-slate-600">{selected.summary}</div>
             </div>
             <div className="rounded-lg border border-slate-200 p-3">
               <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Request Body</div>
-              <pre className="mt-2 overflow-x-auto rounded-md border border-slate-700 bg-slate-900 px-2.5 py-2 font-mono text-[11px] leading-5 text-slate-100">
+              <pre className="mt-2 max-w-full overflow-x-auto rounded-md border border-slate-700 bg-slate-900 px-2.5 py-2 font-mono text-[11px] leading-5 text-slate-100">
                 {formatJsonBody(selected.request_body)}
               </pre>
             </div>
             <div className="rounded-lg border border-slate-200 p-3">
               <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Response Body</div>
-              <pre className="mt-2 overflow-x-auto rounded-md border border-slate-700 bg-slate-900 px-2.5 py-2 font-mono text-[11px] leading-5 text-slate-100">
+              <pre className="mt-2 max-w-full overflow-x-auto rounded-md border border-slate-700 bg-slate-900 px-2.5 py-2 font-mono text-[11px] leading-5 text-slate-100">
                 {formatJsonBody(selected.response_body)}
               </pre>
             </div>

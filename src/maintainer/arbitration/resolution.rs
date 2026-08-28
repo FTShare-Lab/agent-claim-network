@@ -1255,9 +1255,13 @@ fn arbitration_policy_statement(
     let mut lines = vec![
         format!("Maintainer 已裁决 dispute {}。", dispute.id),
         format!("Resolution: {}", resolution.resolution_id),
+        String::new(),
         format!("Conclusion: {}", resolution.conclusion),
+        String::new(),
         format!("Original dispute: {}", dispute.summary),
+        String::new(),
         "Direct claims:".to_string(),
+        String::new(),
     ];
     for claim in snapshots {
         lines.push(format!(
@@ -1266,7 +1270,9 @@ fn arbitration_policy_statement(
         ));
     }
     if !resolution.claim_assessments.is_empty() {
+        lines.push(String::new());
         lines.push("Assessments:".to_string());
+        lines.push(String::new());
         for assessment in &resolution.claim_assessments {
             lines.push(format!(
                 "- {} recommended_status={:?} assessment={} reason={}",
@@ -1408,5 +1414,57 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("insufficient_evidence"));
+    }
+
+    #[test]
+    fn arbitration_policy_statement_separates_markdown_sections() {
+        let claim_id: crate::claim::ClaimId = "claim_aaaaaaaa".parse().unwrap();
+        let dispute = crate::claim::Dispute {
+            id: "dispute_bbbbbbbb".parse().unwrap(),
+            name: "checkout timeout".into(),
+            reporter_agent_id: AgentId::new("agent-a").unwrap(),
+            claims: vec![claim_id.clone()],
+            summary: "30 seconds conflicts with 60 seconds".into(),
+            status: DisputeStatus::Open,
+            created_at: "2026-08-28T00:00:00Z".parse().unwrap(),
+            resolved_at: None,
+        };
+        let claim = crate::claim::Claim {
+            id: claim_id.clone(),
+            name: "checkout_timeout".into(),
+            statement: "Checkout timeout is 30 seconds.".into(),
+            scope: "checkout / production".into(),
+            holder: AgentId::new("agent-a").unwrap(),
+            confidence: crate::claim::Confidence::High,
+            status: crate::claim::ClaimStatus::Active,
+            created_at: "2026-08-28T00:00:00Z".parse().unwrap(),
+            updated_at: None,
+            source_claim_ids: Vec::new(),
+            evidence_summary: "legacy deployment".into(),
+        };
+        let resolution = DisputeResolution {
+            resolution_id: "resolution_cccccccc".parse().unwrap(),
+            resolved_by: ResolvedBy::Automatic,
+            resolved_at: "2026-08-28T01:00:00Z".parse().unwrap(),
+            resolution_type: Some(ResolutionType::LifecycleUpdate),
+            resolution_basis: Some(ResolutionBasis::Policy),
+            conclusion: "Use the current 60 second timeout.".into(),
+            claim_assessments: vec![ClaimAssessment {
+                claim_id,
+                recommended_status: crate::claim::ClaimStatus::Deprecated,
+                assessment: "The 30 second default is historical.".into(),
+                recommended_scope: None,
+                recommended_statement: None,
+                reason: "Current configuration supersedes it.".into(),
+            }],
+            rejection_reason: None,
+        };
+
+        let statement = arbitration_policy_statement(&dispute, &[claim], &resolution);
+
+        assert!(statement.contains("Resolution: resolution_cccccccc\n\nConclusion:"));
+        assert!(statement.contains("\n\nOriginal dispute:"));
+        assert!(statement.contains("\n\nDirect claims:\n\n- claim_aaaaaaaa"));
+        assert!(statement.contains("\n\nAssessments:\n\n- claim_aaaaaaaa"));
     }
 }
