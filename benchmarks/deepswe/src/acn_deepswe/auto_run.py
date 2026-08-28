@@ -22,6 +22,7 @@ from .presmoke_cli import (
     ACN_REPOSITORY,
     FORMAL_ACN_MAIN_REVISION,
     FORMAL_ACN_VERSION,
+    FORMAL_DOCKER_DISK_ADMISSION_MB_PER_WORKER,
     FORMAL_PIER_EGRESS_PROXY_IMAGE,
 )
 from .run_lock import exclusive_run_lock
@@ -246,9 +247,13 @@ def load_config(path: Path) -> AutomatedRunConfig:
                 "正式运行必须锚定 "
                 f"acn_main_revision={FORMAL_ACN_MAIN_REVISION} 和 acn_version={FORMAL_ACN_VERSION}"
             )
-        if host_capacity["disk_admission_mb_per_worker"] < resources["storage_mb"]:
+        if (
+            host_capacity["disk_admission_mb_per_worker"]
+            < FORMAL_DOCKER_DISK_ADMISSION_MB_PER_WORKER
+        ):
             raise AutomatedRunError(
-                "正式运行的 disk_admission_mb_per_worker 不得小于 resources.storage_mb"
+                "正式运行的 disk_admission_mb_per_worker 不得小于 "
+                f"{FORMAL_DOCKER_DISK_ADMISSION_MB_PER_WORKER}"
             )
         if image_fingerprint is not None:
             raise AutomatedRunError("正式运行禁止复用本地 agent 镜像，必须使用冻结任务的官方镜像")

@@ -116,11 +116,26 @@ class AutomatedRunTests(unittest.TestCase):
             with self.assertRaisesRegex(AutomatedRunError, "file_edit_authority_enabled"):
                 load_config(path)
 
-    def test_formal_config_reserves_at_least_one_storage_budget_per_worker(self) -> None:
+    def test_formal_config_requires_transient_docker_budget_per_worker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = write_config(Path(directory), run_class="formal")
-            with self.assertRaisesRegex(AutomatedRunError, "resources.storage_mb"):
+            with self.assertRaisesRegex(AutomatedRunError, "8192"):
                 load_config(path)
+
+    def test_formal_config_does_not_preallocate_nominal_task_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_config(
+                Path(directory),
+                run_class="formal",
+                host_capacity={
+                    "memory_reserve_mb": 1024,
+                    "disk_reserve_mb": 1024,
+                    "disk_admission_mb_per_worker": 8192,
+                },
+            )
+            config = load_config(path)
+        self.assertEqual(config.resources["storage_mb"], 20480)
+        self.assertEqual(config.host_capacity["disk_admission_mb_per_worker"], 8192)
 
     def test_formal_config_rejects_a_different_product_anchor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -131,7 +146,7 @@ class AutomatedRunTests(unittest.TestCase):
                 host_capacity={
                     "memory_reserve_mb": 1024,
                     "disk_reserve_mb": 1024,
-                    "disk_admission_mb_per_worker": 20480,
+                    "disk_admission_mb_per_worker": 8192,
                 },
             )
             with self.assertRaisesRegex(AutomatedRunError, "9b818d70"):
@@ -146,7 +161,7 @@ class AutomatedRunTests(unittest.TestCase):
                 host_capacity={
                     "memory_reserve_mb": 1024,
                     "disk_reserve_mb": 1024,
-                    "disk_admission_mb_per_worker": 20480,
+                    "disk_admission_mb_per_worker": 8192,
                 },
             )
             with self.assertRaisesRegex(AutomatedRunError, "Pier egress proxy"):

@@ -66,6 +66,9 @@ ACN_SOURCE_ROOT = Path(__file__).resolve().parents[1]
 FORMAL_ACN_MAIN_REVISION = "9b818d70ddfad2f7d5e1972577dd294b19481c92"
 FORMAL_ACN_VERSION = "0.2.5"
 FORMAL_PIER_EGRESS_PROXY_IMAGE = "pier-egress-proxy:ubuntu-24.04"
+# Pier 的本地 Docker backend 只强制 CPU/内存，task.toml 的 storage_mb 不会预分配
+# overlay 空间。正式门禁为每个并发 trial 保留独立的瞬时构建/写层预算。
+FORMAL_DOCKER_DISK_ADMISSION_MB_PER_WORKER = 8192
 _PIER_INSTALL_EVIDENCE_SCRIPT = (
     "import importlib.metadata as metadata, json; "
     "distribution = metadata.distribution('datacurve-pier'); "
@@ -410,12 +413,12 @@ def load_config(path: Path) -> PresmokeConfig:
             "正式运行必须锚定 "
             f"acn_main_revision={FORMAL_ACN_MAIN_REVISION} 和 acn_version={FORMAL_ACN_VERSION}"
         )
-    if (
-        run_class == "formal"
-        and host_capacity["disk_admission_mb_per_worker"] < resources["storage_mb"]
+    if run_class == "formal" and (
+        host_capacity["disk_admission_mb_per_worker"] < FORMAL_DOCKER_DISK_ADMISSION_MB_PER_WORKER
     ):
         raise PresmokeCliError(
-            "正式运行的 disk_admission_mb_per_worker 不得小于 resources.storage_mb"
+            "正式运行的 disk_admission_mb_per_worker 不得小于 "
+            f"{FORMAL_DOCKER_DISK_ADMISSION_MB_PER_WORKER}"
         )
     if run_class == "formal" and pier_egress_proxy_image != FORMAL_PIER_EGRESS_PROXY_IMAGE:
         raise PresmokeCliError(

@@ -471,14 +471,25 @@ class PresmokeCliTests(unittest.TestCase):
             with self.assertRaisesRegex(PresmokeCliError, "file_edit_authority_enabled"):
                 load_config(config_path)
 
-    def test_formal_config_reserves_at_least_one_storage_budget_per_worker(self) -> None:
+    def test_formal_config_requires_transient_docker_budget_per_worker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = write_fixture(Path(directory))
             raw = json.loads(config_path.read_text(encoding="utf-8"))
             raw["run_class"] = "formal"
             config_path.write_text(json.dumps(raw), encoding="utf-8")
-            with self.assertRaisesRegex(PresmokeCliError, "resources.storage_mb"):
+            with self.assertRaisesRegex(PresmokeCliError, "8192"):
                 load_config(config_path)
+
+    def test_formal_config_does_not_preallocate_nominal_task_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw["run_class"] = "formal"
+            raw["host_capacity"]["disk_admission_mb_per_worker"] = 8192
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            config = load_config(config_path)
+        self.assertEqual(config.resources["storage_mb"], 1024)
+        self.assertEqual(config.host_capacity["disk_admission_mb_per_worker"], 8192)
 
     def test_formal_config_rejects_a_different_product_anchor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -486,7 +497,7 @@ class PresmokeCliTests(unittest.TestCase):
             raw = json.loads(config_path.read_text(encoding="utf-8"))
             raw["run_class"] = "formal"
             raw["acn_main_revision"] = "a" * 40
-            raw["host_capacity"]["disk_admission_mb_per_worker"] = raw["resources"]["storage_mb"]
+            raw["host_capacity"]["disk_admission_mb_per_worker"] = 8192
             config_path.write_text(json.dumps(raw), encoding="utf-8")
             with self.assertRaisesRegex(PresmokeCliError, "9b818d70"):
                 load_config(config_path)
@@ -497,7 +508,7 @@ class PresmokeCliTests(unittest.TestCase):
             raw = json.loads(config_path.read_text(encoding="utf-8"))
             raw["run_class"] = "formal"
             raw["pier_egress_proxy_image"] = "other/image:latest"
-            raw["host_capacity"]["disk_admission_mb_per_worker"] = raw["resources"]["storage_mb"]
+            raw["host_capacity"]["disk_admission_mb_per_worker"] = 8192
             config_path.write_text(json.dumps(raw), encoding="utf-8")
             with self.assertRaisesRegex(PresmokeCliError, "Pier egress proxy"):
                 load_config(config_path)
