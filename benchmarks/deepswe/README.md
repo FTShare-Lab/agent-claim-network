@@ -129,7 +129,7 @@ Docker daemon 可用且没有其他运行中容器、每个 task 的官方镜像
 `task_workers * disk_admission_mb_per_worker` 的高水位；正式运行要求每个 worker 的 admission
 至少覆盖 `resources.storage_mb`，并在每题启动前再次检查。资源不足直接失败，
 不静默降低并发。正式运行持有全机 Docker 锁；可选清理只处理带 Pier 所有权证据的已停止容器和
-明确的生成镜像，绝不使用全局 prune，也不删除官方 `public.ecr.*` 任务镜像。每个 trial 收尾时还会按
+明确的生成镜像，绝不使用全局 prune，也不删除 `hb__*`、官方 `public.ecr.*` 任务镜像或配置保护的共享 egress proxy 镜像。共享 proxy 的本地 image ID 必须匹配冻结配置中的 content digest，并进入 provenance。每个 trial 收尾时还会按
 Pier 的随机 trial name 精确回收该 trial 的 verifier/egress 派生镜像，阻断长跑期间的累计增长；清理失败
 会作为基础设施失败终止该题，保留既有 Gate 与 trial 证据。
 

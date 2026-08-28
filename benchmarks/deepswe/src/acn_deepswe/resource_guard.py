@@ -8,7 +8,7 @@ import re
 import shutil
 import stat
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -78,8 +78,7 @@ def verify_capacity(
         )
 
     required_free_mb = (
-        host_capacity["disk_reserve_mb"]
-        + workers * host_capacity["disk_admission_mb_per_worker"]
+        host_capacity["disk_reserve_mb"] + workers * host_capacity["disk_admission_mb_per_worker"]
     )
     verify_disk_headroom((output_path, docker_root), required_free_mb)
     return docker_root
@@ -118,7 +117,9 @@ def reject_running_containers() -> None:
         )
 
 
-def cleanup_stale_pier_resources() -> CleanupSummary:
+def cleanup_stale_pier_resources(
+    protected_image_references: Collection[str] = (),
+) -> CleanupSummary:
     """只删除已停止且有 Pier Compose 证据的容器及明确生成镜像。"""
     reject_running_containers()
     listed = _docker(["ps", "-aq", "--filter", "label=com.docker.compose.project"])
@@ -177,7 +178,12 @@ def cleanup_stale_pier_resources() -> CleanupSummary:
             isinstance(repository, str)
             and isinstance(tag, str)
             and tag != "<none>"
-            and _is_generated_image(repository, tag, owned_image_refs)
+            and _is_generated_image(
+                repository,
+                tag,
+                owned_image_refs,
+                protected_image_references,
+            )
         ):
             generated_refs.append(f"{repository}:{tag}")
     for batch in _batches(generated_refs, 100):
@@ -215,16 +221,19 @@ def cleanup_finished_trial_images(trial_name: str) -> int:
     return len(references)
 
 
-def _is_generated_image(repository: str, tag: str, owned_image_refs: set[str]) -> bool:
-    if repository.startswith("public.ecr."):
+def _is_generated_image(
+    repository: str,
+    tag: str,
+    owned_image_refs: set[str],
+    protected_image_references: Collection[str],
+) -> bool:
+    reference = f"{repository}:{tag}"
+    if reference in protected_image_references or repository.startswith("public.ecr."):
         return False
     return (
         "pier-egress-proxy" in repository
         or "__verifier__trial-main" in repository
-        or (
-            _GENERATED_MAIN_IMAGE.search(repository) is not None
-            and f"{repository}:{tag}" in owned_image_refs
-        )
+        or (_GENERATED_MAIN_IMAGE.search(repository) is not None and reference in owned_image_refs)
     )
 
 

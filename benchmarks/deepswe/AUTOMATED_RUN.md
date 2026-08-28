@@ -6,7 +6,7 @@
 
 正式模板锚定产品提交 `9b818d70ddfad2f7d5e1972577dd294b19481c92`（v0.2.5），只接受基于该提交的干净评测 HEAD；`acn_eval --build-info-json` 还必须与 HEAD 和 v0.2.5 一致。20 个 `task_workers` 配合每题 2 CPU / 16 GiB，另预留 64 GiB 宿主内存；真实执行前会要求至少 40 CPU 和 384 GiB 可用内存。磁盘门禁为 64 GiB 固定余量加每 worker 4 GiB admission，即至少 144 GiB 可用空间。资源不足会直接退出，不会降低并发或启动部分任务。
 
-正式运行持有全机 Docker 锁，拒绝与其他容器任务共享 daemon。模板开启的清理只删除已停止且带 Pier Compose 配置证据的容器，以及 `hb__`、Pier verifier/egress 和 Compose 生成镜像；官方 `public.ecr.*` 任务镜像与无关镜像不在删除集合。任务启动前及缺失镜像拉取后都会复查磁盘高水位。
+正式运行持有全机 Docker 锁，拒绝与其他容器任务共享 daemon。模板开启的清理只删除已停止且带 Pier Compose 配置证据的容器，以及 Pier trial verifier/egress 和有 Compose 所有权证据的生成镜像；`hb__*`、官方 `public.ecr.*` 任务镜像、配置明确保护的共享 egress proxy 镜像与无关镜像不在删除集合。共享 proxy 的 image ID 必须与配置中的 content digest 完全一致，并写入清理证据。任务启动前及缺失镜像拉取后都会复查磁盘高水位。
 
 外部启动器使用以下命令；先执行 `prepare` 只做冻结与配置生成，不请求模型，随后由调度器执行 `run`：
 

@@ -36,8 +36,10 @@ class EvaluationProvenance:
     normalized_task_tree_hash: str
     agent_image_reference_sha256: str
     verifier_image_reference_sha256: str
+    pier_egress_proxy_image_reference_sha256: str
     agent_image_content_digest: str | None
     verifier_image_content_digest: str | None
+    pier_egress_proxy_image_content_digest: str
     model: str
     reasoning_effort: str
     file_edit_authority_enabled: bool
@@ -66,8 +68,10 @@ class EvaluationProvenance:
             "normalized_task_tree_hash": self.normalized_task_tree_hash,
             "agent_image_reference_sha256": self.agent_image_reference_sha256,
             "verifier_image_reference_sha256": self.verifier_image_reference_sha256,
+            "pier_egress_proxy_image_reference_sha256": self.pier_egress_proxy_image_reference_sha256,
             "agent_image_content_digest": self.agent_image_content_digest,
             "verifier_image_content_digest": self.verifier_image_content_digest,
+            "pier_egress_proxy_image_content_digest": self.pier_egress_proxy_image_content_digest,
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
             "file_edit_authority_enabled": self.file_edit_authority_enabled,
@@ -96,6 +100,7 @@ class EvaluationProvenance:
             "normalized_task_tree_hash",
             "agent_image_reference_sha256",
             "verifier_image_reference_sha256",
+            "pier_egress_proxy_image_reference_sha256",
             "model",
             "reasoning_effort",
             "network_translation_warning",
@@ -144,7 +149,11 @@ class EvaluationProvenance:
         ):
             raise ValueError("provenance.resources/timeouts/llm_retry 的值必须是整数")
         image_digests: dict[str, str | None] = {}
-        for key in ("agent_image_content_digest", "verifier_image_content_digest"):
+        for key in (
+            "agent_image_content_digest",
+            "verifier_image_content_digest",
+            "pier_egress_proxy_image_content_digest",
+        ):
             value = data.get(key)
             if value is not None and (
                 not isinstance(value, str)
@@ -153,6 +162,8 @@ class EvaluationProvenance:
                 or any(character not in "0123456789abcdef" for character in value[7:])
             ):
                 raise ValueError(f"provenance.{key} 必须是 sha256 content digest 或 null")
+            if key == "pier_egress_proxy_image_content_digest" and value is None:
+                raise ValueError("provenance.pier_egress_proxy_image_content_digest 不得为 null")
             image_digests[key] = value
         return cls(
             dataset_seed=seed,

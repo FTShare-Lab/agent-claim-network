@@ -59,7 +59,10 @@ class ResourceGuardTests(unittest.TestCase):
                 "DockerRootDir": str(root),
             }
             with (
-                patch("acn_deepswe.resource_guard._host_available_memory_bytes", return_value=100 * MIB),
+                patch(
+                    "acn_deepswe.resource_guard._host_available_memory_bytes",
+                    return_value=100 * MIB,
+                ),
                 patch("acn_deepswe.resource_guard.verify_disk_headroom") as disk,
             ):
                 docker_root = verify_capacity(
@@ -77,7 +80,9 @@ class ResourceGuardTests(unittest.TestCase):
             disk.assert_called_once_with((root / "output", root), 70)
 
             with (
-                patch("acn_deepswe.resource_guard._host_available_memory_bytes", return_value=99 * MIB),
+                patch(
+                    "acn_deepswe.resource_guard._host_available_memory_bytes", return_value=99 * MIB
+                ),
                 self.assertRaisesRegex(ResourceGuardError, "拒绝静默降低 task_workers"),
             ):
                 verify_capacity(
@@ -101,7 +106,7 @@ class ResourceGuardTests(unittest.TestCase):
                     "Image": "task__abcdef0-main:latest",
                     "Labels": {
                         "com.docker.compose.project.config_files": "/tmp/frozen/pier/task.yaml"
-                    }
+                    },
                 },
             },
             {
@@ -109,21 +114,20 @@ class ResourceGuardTests(unittest.TestCase):
                 "State": {"Running": False},
                 "Config": {
                     "Image": "foreign__abcdef1-main:latest",
-                    "Labels": {
-                        "com.docker.compose.project.config_files": "/tmp/other/task.yaml"
-                    }
+                    "Labels": {"com.docker.compose.project.config_files": "/tmp/other/task.yaml"},
                 },
             },
         ]
         image_lines = "\n".join(
-            json.dumps({"Repository": repository, "Tag": "latest"})
-            for repository in (
-                "hb__task",
-                "task__verifier__trial-main",
-                "task__abcdef0-main",
-                "foreign__abcdef1-main",
-                "public.ecr.aws/example/task",
-                "unrelated/image",
+            json.dumps({"Repository": repository, "Tag": tag})
+            for repository, tag in (
+                ("hb__task", "latest"),
+                ("pier-egress-proxy", "ubuntu-24.04"),
+                ("task__verifier__trial-main", "latest"),
+                ("task__abcdef0-main", "latest"),
+                ("foreign__abcdef1-main", "latest"),
+                ("public.ecr.aws/example/task", "latest"),
+                ("unrelated/image", "latest"),
             )
         )
         with patch(
@@ -137,13 +141,14 @@ class ResourceGuardTests(unittest.TestCase):
                 completed(),
             ],
         ) as docker:
-            summary = cleanup_stale_pier_resources()
+            summary = cleanup_stale_pier_resources({"pier-egress-proxy:ubuntu-24.04"})
 
         self.assertEqual(summary.containers_removed, 1)
         self.assertEqual(summary.image_references_removed, 2)
         self.assertEqual(docker.call_args_list[3].args[0], ["rm", "owned"])
         removed_images = docker.call_args_list[5].args[0]
         self.assertNotIn("hb__task:latest", removed_images)
+        self.assertNotIn("pier-egress-proxy:ubuntu-24.04", removed_images)
         self.assertNotIn("public.ecr.aws/example/task:latest", removed_images)
         self.assertNotIn("unrelated/image:latest", removed_images)
         self.assertNotIn("foreign__abcdef1-main:latest", removed_images)

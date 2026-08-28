@@ -22,6 +22,7 @@ from .presmoke_cli import (
     ACN_REPOSITORY,
     FORMAL_ACN_MAIN_REVISION,
     FORMAL_ACN_VERSION,
+    FORMAL_PIER_EGRESS_PROXY_IMAGE,
 )
 from .run_lock import exclusive_run_lock
 
@@ -39,6 +40,8 @@ class AutomatedRunConfig:
     source_tasks_root: Path
     pier_checkout: Path
     pier_executable: Path
+    pier_egress_proxy_image: str
+    pier_egress_proxy_content_digest: str
     acn_eval: Path
     frozen_skill: Path
     model: str
@@ -92,6 +95,8 @@ _ALLOWED_CONFIG_FIELDS = frozenset(
         "model",
         "response_model",
         "reasoning_effort",
+        "pier_egress_proxy_image",
+        "pier_egress_proxy_content_digest",
         "run_class",
         "acn_main_revision",
         "acn_version",
@@ -124,7 +129,9 @@ def main(argv: list[str] | None = None) -> int:
         prog="acn-deepswe-auto",
         description="可选先跑 Smoke；也可直接冻结并运行全量 DeepSWE 任务。",
     )
-    parser.add_argument("--config", type=Path, required=True, help="绝对路径 JSON 配置（不含 credential）")
+    parser.add_argument(
+        "--config", type=Path, required=True, help="绝对路径 JSON 配置（不含 credential）"
+    )
     parser.add_argument(
         "--read-key-stdin",
         action="store_true",
@@ -207,13 +214,9 @@ def load_config(path: Path) -> AutomatedRunConfig:
     if smoke_size >= full_size:
         raise AutomatedRunError("smoke_size 必须小于 full_size，才能避免全量重复执行 Smoke")
     run_a_only = _boolean(raw.get("run_a_only", False), "run_a_only")
-    b_only_from_a_output_dir = _optional_absolute_path(
-        raw, "b_only_from_a_output_dir"
-    )
+    b_only_from_a_output_dir = _optional_absolute_path(raw, "b_only_from_a_output_dir")
     if run_a_only and b_only_from_a_output_dir is not None:
-        raise AutomatedRunError(
-            "run_a_only 与 b_only_from_a_output_dir 不能同时启用"
-        )
+        raise AutomatedRunError("run_a_only 与 b_only_from_a_output_dir 不能同时启用")
     if b_only_from_a_output_dir is not None and smoke_size != 0:
         raise AutomatedRunError("B-only 接续必须设置 smoke_size=0，保持 A/B task 集合完全一致")
     if b_only_from_a_output_dir is not None and _paths_overlap(
@@ -228,16 +231,17 @@ def load_config(path: Path) -> AutomatedRunConfig:
     file_edit_authority_enabled = _boolean(
         raw.get("file_edit_authority_enabled"), "file_edit_authority_enabled"
     )
+    pier_egress_proxy_image = _nonempty_string(raw, "pier_egress_proxy_image")
+    pier_egress_proxy_content_digest = _content_digest(raw, "pier_egress_proxy_content_digest")
     image_fingerprint = _optional_fingerprint(raw.get("reuse_local_agent_image_fingerprint"))
     if run_class == "formal":
         if harness_mode != "standard" or model_egress_mode != "pier":
-            raise AutomatedRunError("正式运行必须使用 harness_mode=standard 和 model_egress_mode=pier")
+            raise AutomatedRunError(
+                "正式运行必须使用 harness_mode=standard 和 model_egress_mode=pier"
+            )
         if not file_edit_authority_enabled:
             raise AutomatedRunError("正式运行必须启用 file_edit_authority_enabled")
-        if (
-            acn_main_revision != FORMAL_ACN_MAIN_REVISION
-            or acn_version != FORMAL_ACN_VERSION
-        ):
+        if acn_main_revision != FORMAL_ACN_MAIN_REVISION or acn_version != FORMAL_ACN_VERSION:
             raise AutomatedRunError(
                 "正式运行必须锚定 "
                 f"acn_main_revision={FORMAL_ACN_MAIN_REVISION} 和 acn_version={FORMAL_ACN_VERSION}"
@@ -248,11 +252,17 @@ def load_config(path: Path) -> AutomatedRunConfig:
             )
         if image_fingerprint is not None:
             raise AutomatedRunError("正式运行禁止复用本地 agent 镜像，必须使用冻结任务的官方镜像")
+        if pier_egress_proxy_image != FORMAL_PIER_EGRESS_PROXY_IMAGE:
+            raise AutomatedRunError(
+                f"正式运行的 Pier egress proxy 镜像必须为 {FORMAL_PIER_EGRESS_PROXY_IMAGE}"
+            )
     return AutomatedRunConfig(
         **paths,
         model=_nonempty_string(raw, "model"),
         response_model=_nonempty_string(raw, "response_model"),
         reasoning_effort=_nonempty_string(raw, "reasoning_effort"),
+        pier_egress_proxy_image=pier_egress_proxy_image,
+        pier_egress_proxy_content_digest=pier_egress_proxy_content_digest,
         run_class=run_class,
         acn_main_revision=acn_main_revision,
         acn_version=acn_version,
@@ -358,6 +368,8 @@ def prepare_run(config: AutomatedRunConfig) -> dict[str, object]:
             "model_egress_mode": config.model_egress_mode,
             "harness_mode": config.harness_mode,
             "file_edit_authority_enabled": config.file_edit_authority_enabled,
+            "pier_egress_proxy_image": config.pier_egress_proxy_image,
+            "pier_egress_proxy_content_digest": config.pier_egress_proxy_content_digest,
             "task_workers": config.task_workers,
             "host_capacity": config.host_capacity,
             "phase_mode": (
@@ -539,9 +551,7 @@ def _progress_observed_at(raw: Mapping[str, object]) -> datetime | None:
     return observed.astimezone(UTC) if observed.tzinfo is not None else None
 
 
-def _is_stale_progress(
-    raw: Mapping[str, object], observed: datetime | None, now: datetime
-) -> bool:
+def _is_stale_progress(raw: Mapping[str, object], observed: datetime | None, now: datetime) -> bool:
     if observed is None:
         return True
     poll_secs = raw.get("progress_poll_secs")
@@ -593,6 +603,8 @@ def _prepare_phase(
         "source_tasks_root": str(config.source_tasks_root),
         "pier_checkout": str(config.pier_checkout),
         "pier_executable": str(config.pier_executable),
+        "pier_egress_proxy_image": config.pier_egress_proxy_image,
+        "pier_egress_proxy_content_digest": config.pier_egress_proxy_content_digest,
         "acn_eval": str(config.acn_eval),
         "frozen_skill": str(config.frozen_skill),
         "normalized_root": str(config.run_root / normalized_root.name),
@@ -638,8 +650,10 @@ def _subset_manifest(
     source_ids = full.get("task_ids")
     hashes = full.get("task_toml_hashes")
     directory_hashes = full.get("task_directory_hashes")
-    if not isinstance(source_ids, list) or not isinstance(hashes, Mapping) or not isinstance(
-        directory_hashes, Mapping
+    if (
+        not isinstance(source_ids, list)
+        or not isinstance(hashes, Mapping)
+        or not isinstance(directory_hashes, Mapping)
     ):
         raise AutomatedRunError("全量冻结 manifest 缺少可分割的 task 字段")
     if any(
@@ -651,9 +665,7 @@ def _subset_manifest(
     copied["seed"] = seed
     copied["task_ids"] = list(task_ids)
     copied["task_toml_hashes"] = {task_id: hashes[task_id] for task_id in task_ids}
-    copied["task_directory_hashes"] = {
-        task_id: directory_hashes[task_id] for task_id in task_ids
-    }
+    copied["task_directory_hashes"] = {task_id: directory_hashes[task_id] for task_id in task_ids}
     return copied
 
 
@@ -795,9 +807,7 @@ def _optional_fingerprint(value: object) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{16}", value):
-        raise AutomatedRunError(
-            "reuse_local_agent_image_fingerprint 必须是 16 位小写十六进制"
-        )
+        raise AutomatedRunError("reuse_local_agent_image_fingerprint 必须是 16 位小写十六进制")
     return value
 
 
@@ -805,6 +815,17 @@ def _git_revision(raw: Mapping[str, object], field: str) -> str:
     value = _nonempty_string(raw, field)
     if not re.fullmatch(r"[0-9a-f]{40}", value):
         raise AutomatedRunError(f"{field} 必须是完整的 40 位小写 Git commit")
+    return value
+
+
+def _content_digest(raw: Mapping[str, object], field: str) -> str:
+    value = _nonempty_string(raw, field)
+    if (
+        len(value) != 71
+        or not value.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in value[7:])
+    ):
+        raise AutomatedRunError(f"{field} 必须是 sha256 content digest")
     return value
 
 

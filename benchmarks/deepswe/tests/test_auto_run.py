@@ -137,6 +137,21 @@ class AutomatedRunTests(unittest.TestCase):
             with self.assertRaisesRegex(AutomatedRunError, "9b818d70"):
                 load_config(path)
 
+    def test_formal_config_requires_the_frozen_pier_proxy_image(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_config(
+                Path(directory),
+                run_class="formal",
+                pier_egress_proxy_image="other/image:latest",
+                host_capacity={
+                    "memory_reserve_mb": 1024,
+                    "disk_reserve_mb": 1024,
+                    "disk_admission_mb_per_worker": 20480,
+                },
+            )
+            with self.assertRaisesRegex(AutomatedRunError, "Pier egress proxy"):
+                load_config(path)
+
     def test_prepare_splits_smoke_from_remaining_full_without_repeating_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -382,6 +397,8 @@ def write_config(root: Path, **overrides: object) -> Path:
         "source_tasks_root": str((root / "deep-swe" / "tasks").resolve()),
         "pier_checkout": str((root / "pier").resolve()),
         "pier_executable": str((root / "pier" / ".venv" / "bin" / "pier").resolve()),
+        "pier_egress_proxy_image": "pier-egress-proxy:ubuntu-24.04",
+        "pier_egress_proxy_content_digest": "sha256:" + "1" * 64,
         "acn_eval": str((root / "acn_eval").resolve()),
         "frozen_skill": str((root / "skill").resolve()),
         "model": "deepseek-v4-flash-local-exp",

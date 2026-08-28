@@ -286,9 +286,7 @@ class IsolationTests(unittest.TestCase):
             task_toml = Path(directory) / "task.toml"
             task_toml.write_text(TASK_TOML, encoding="utf-8")
 
-            self.assertTrue(
-                _pier_task_matches_attempt(task_toml, "task-1", "datacurve/task-1")
-            )
+            self.assertTrue(_pier_task_matches_attempt(task_toml, "task-1", "datacurve/task-1"))
             self.assertFalse(_pier_task_matches_attempt(task_toml, "task-1", "task-1"))
             self.assertFalse(
                 _pier_task_matches_attempt(task_toml, "another-task", "datacurve/task-1")
@@ -344,7 +342,10 @@ class RealExecutionTests(unittest.TestCase):
         )
         self.assertTrue(all(env["PYTHONDONTWRITEBYTECODE"] == "1" for env in pier_envs))
         self.assertTrue(
-            all(item["progress_path"].endswith("/progress.json") for item in manifest["attempt_results"])
+            all(
+                item["progress_path"].endswith("/progress.json")
+                for item in manifest["attempt_results"]
+            )
         )
 
     def test_operator_interruption_preserves_progress_evidence(self) -> None:
@@ -566,7 +567,9 @@ class ProvenanceTests(unittest.TestCase):
             def run(command: list[str], **_kwargs: object) -> FakeCompleted:
                 job = json.loads(Path(command[-1]).read_text())
                 attempt = next(item for item in plan.attempts if item.attempt_id == job["job_name"])
-                _write_fake_trial(Path(job["jobs_dir"]), attempt, bundle_path=artifacts.claim_bundle)
+                _write_fake_trial(
+                    Path(job["jobs_dir"]), attempt, bundle_path=artifacts.claim_bundle
+                )
                 return FakeCompleted(0)
 
             with (
@@ -630,9 +633,7 @@ class ProvenanceTests(unittest.TestCase):
             plan = build_attempt_plan(DATASET, root / "run", seed=2)
             experiment = build_experiment_manifest("experiment-1", plan, "b" * 64, provenance())
             artifacts = _artifacts(root, claim_bundle=root / "claims.json")
-            execution = replace(
-                _execution(root, artifacts), run_all_variants_without_claims=True
-            )
+            execution = replace(_execution(root, artifacts), run_all_variants_without_claims=True)
             variants: list[str] = []
 
             def run(command: list[str], **_kwargs: object) -> FakeCompleted:
@@ -654,18 +655,16 @@ class ProvenanceTests(unittest.TestCase):
             manifest = json.loads(execution.manifest_path.read_text())
 
         self.assertEqual(variants, [item.variant for item in plan.attempts])
-        self.assertEqual(
-            [item["status"] for item in manifest["attempt_results"]], ["passed"] * 4
-        )
+        self.assertEqual([item["status"] for item in manifest["attempt_results"]], ["passed"] * 4)
         claim_records = [
-            item for item in manifest["attempt_results"] if item["variant"] in {"B_claim", "B_forced_claim"}
+            item
+            for item in manifest["attempt_results"]
+            if item["variant"] in {"B_claim", "B_forced_claim"}
         ]
         self.assertTrue(
             all(item["claim_observation"]["bundle_available"] is False for item in claim_records)
         )
-        self.assertTrue(
-            all("EMPTY_CLAIM_BUNDLE" in item["reason"] for item in claim_records)
-        )
+        self.assertTrue(all("EMPTY_CLAIM_BUNDLE" in item["reason"] for item in claim_records))
         self.assertTrue(manifest["execution"]["run_all_variants_without_claims"])
 
     def test_run_a_only_freezes_claims_and_skips_b_arms(self) -> None:
@@ -734,9 +733,7 @@ class ProvenanceTests(unittest.TestCase):
                 )
                 return FakeCompleted(0)
 
-            with patch.dict(
-                "os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True
-            ):
+            with patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True):
                 Task1HostRunner(
                     b_experiment, root / "followup" / "jobs", b_execution, run=run
                 ).run_task1(execute=True)
@@ -767,9 +764,7 @@ class ProvenanceTests(unittest.TestCase):
             )
 
             with (
-                patch.dict(
-                    "os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True
-                ),
+                patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True),
                 self.assertRaisesRegex(TaskExecutionError, "claim bundle 内容已漂移"),
             ):
                 Task1HostRunner(
@@ -786,9 +781,7 @@ class ProvenanceTests(unittest.TestCase):
             )
 
             with (
-                patch.dict(
-                    "os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True
-                ),
+                patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True),
                 self.assertRaisesRegex(TaskExecutionError, "provenance 漂移: reasoning_effort"),
             ):
                 Task1HostRunner(
@@ -818,9 +811,7 @@ class ProvenanceTests(unittest.TestCase):
                 )
                 return FakeCompleted(0)
 
-            with patch.dict(
-                "os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True
-            ):
+            with patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True):
                 result = Task1HostRunner(
                     b_experiment, root / "followup" / "jobs", b_execution, run=run
                 ).run_task1(execute=True)
@@ -990,9 +981,9 @@ class ProvenanceTests(unittest.TestCase):
                 return FakeCompleted(0)
 
             with patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True):
-                result = Task1HostRunner(
-                    experiment, root / "jobs", execution, run=run
-                ).run_task1(execute=True)
+                result = Task1HostRunner(experiment, root / "jobs", execution, run=run).run_task1(
+                    execute=True
+                )
 
             manifest = json.loads(execution.manifest_path.read_text(encoding="utf-8"))
             attempt_result = json.loads(
@@ -1001,9 +992,7 @@ class ProvenanceTests(unittest.TestCase):
 
         self.assertEqual(result.status, "passed")
         self.assertEqual(len(agent_imports), 2)
-        cleaned_trials = [
-            item.args[0] for item in _cleanup_trial_images_mock.call_args_list
-        ]
+        cleaned_trials = [item.args[0] for item in _cleanup_trial_images_mock.call_args_list]
         self.assertEqual(len(cleaned_trials), 2)
         self.assertEqual(len(set(cleaned_trials)), 2)
         self.assertTrue(agent_imports[0].endswith(":AcnEvalPierAgent"))
@@ -1278,8 +1267,10 @@ def provenance() -> EvaluationProvenance:
         normalized_task_tree_hash=_fixture_task_tree_hash(),
         agent_image_reference_sha256="5" * 64,
         verifier_image_reference_sha256="6" * 64,
+        pier_egress_proxy_image_reference_sha256="8" * 64,
         agent_image_content_digest="sha256:" + "7" * 64,
         verifier_image_content_digest="sha256:" + "7" * 64,
+        pier_egress_proxy_image_content_digest="sha256:" + "9" * 64,
         model="fixture-model",
         reasoning_effort="max",
         file_edit_authority_enabled=True,

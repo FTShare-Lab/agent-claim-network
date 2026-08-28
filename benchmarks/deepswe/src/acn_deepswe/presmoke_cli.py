@@ -65,6 +65,7 @@ ACN_REPOSITORY = Path(__file__).resolve().parents[4]
 ACN_SOURCE_ROOT = Path(__file__).resolve().parents[1]
 FORMAL_ACN_MAIN_REVISION = "9b818d70ddfad2f7d5e1972577dd294b19481c92"
 FORMAL_ACN_VERSION = "0.2.5"
+FORMAL_PIER_EGRESS_PROXY_IMAGE = "pier-egress-proxy:ubuntu-24.04"
 _PIER_INSTALL_EVIDENCE_SCRIPT = (
     "import importlib.metadata as metadata, json; "
     "distribution = metadata.distribution('datacurve-pier'); "
@@ -88,6 +89,8 @@ _ALLOWED_CONFIG_FIELDS = frozenset(
         "source_tasks_root",
         "pier_checkout",
         "pier_executable",
+        "pier_egress_proxy_image",
+        "pier_egress_proxy_content_digest",
         "acn_eval",
         "frozen_skill",
         "normalized_root",
@@ -124,6 +127,8 @@ class PresmokeConfig:
     source_tasks_root: Path
     pier_checkout: Path
     pier_executable: Path
+    pier_egress_proxy_image: str
+    pier_egress_proxy_content_digest: str
     acn_eval: Path
     frozen_skill: Path
     normalized_root: Path
@@ -221,7 +226,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(
                 json.dumps(
-                    dry_run_summary(config, all_specs, frozen_task_ids), ensure_ascii=False, indent=2
+                    dry_run_summary(config, all_specs, frozen_task_ids),
+                    ensure_ascii=False,
+                    indent=2,
                 )
             )
             return 0
@@ -246,8 +253,7 @@ def main(argv: list[str] | None = None) -> int:
                 failed = [result.task_id for result in completed if result.status == "failed"]
                 if failed:
                     raise PresmokeCliError(
-                        "续跑拒绝覆盖已有失败终态（包括 Gate/协议失败）: "
-                        + ",".join(failed)
+                        "续跑拒绝覆盖已有失败终态（包括 Gate/协议失败）: " + ",".join(failed)
                     )
                 completed_ids = {result.task_id for result in completed}
                 pending_ids = tuple(
@@ -371,20 +377,14 @@ def load_config(path: Path) -> PresmokeConfig:
         raise PresmokeCliError("resources 不再支持字段: max_tool_loop_turns")
     progress = {
         "poll_secs": progress.get("poll_secs", DEFAULT_PROGRESS_POLL_SECS),
-        "stall_after_secs": progress.get(
-            "stall_after_secs", DEFAULT_PROGRESS_STALL_AFTER_SECS
-        ),
+        "stall_after_secs": progress.get("stall_after_secs", DEFAULT_PROGRESS_STALL_AFTER_SECS),
     }
     if progress["stall_after_secs"] < progress["poll_secs"]:
         raise PresmokeCliError("config.progress.stall_after_secs 不得小于 poll_secs")
     run_a_only = _boolean(raw.get("run_a_only", False), "run_a_only")
-    b_only_from_a_output_dir = _optional_absolute_path(
-        raw, "b_only_from_a_output_dir"
-    )
+    b_only_from_a_output_dir = _optional_absolute_path(raw, "b_only_from_a_output_dir")
     if run_a_only and b_only_from_a_output_dir is not None:
-        raise PresmokeCliError(
-            "run_a_only 与 b_only_from_a_output_dir 不能同时启用"
-        )
+        raise PresmokeCliError("run_a_only 与 b_only_from_a_output_dir 不能同时启用")
     if b_only_from_a_output_dir is not None and _paths_overlap(
         paths["output_dir"], b_only_from_a_output_dir
     ):
@@ -397,17 +397,14 @@ def load_config(path: Path) -> PresmokeConfig:
     file_edit_authority_enabled = _boolean(
         raw.get("file_edit_authority_enabled"), "file_edit_authority_enabled"
     )
-    if run_class == "formal" and (
-        harness_mode != "standard" or model_egress_mode != "pier"
-    ):
-        raise PresmokeCliError(
-            "正式运行必须使用 harness_mode=standard 和 model_egress_mode=pier"
-        )
+    pier_egress_proxy_image = _nonempty_string(raw, "pier_egress_proxy_image")
+    pier_egress_proxy_content_digest = _content_digest(raw, "pier_egress_proxy_content_digest")
+    if run_class == "formal" and (harness_mode != "standard" or model_egress_mode != "pier"):
+        raise PresmokeCliError("正式运行必须使用 harness_mode=standard 和 model_egress_mode=pier")
     if run_class == "formal" and not file_edit_authority_enabled:
         raise PresmokeCliError("正式运行必须启用 file_edit_authority_enabled")
     if run_class == "formal" and (
-        acn_main_revision != FORMAL_ACN_MAIN_REVISION
-        or acn_version != FORMAL_ACN_VERSION
+        acn_main_revision != FORMAL_ACN_MAIN_REVISION or acn_version != FORMAL_ACN_VERSION
     ):
         raise PresmokeCliError(
             "正式运行必须锚定 "
@@ -420,11 +417,17 @@ def load_config(path: Path) -> PresmokeConfig:
         raise PresmokeCliError(
             "正式运行的 disk_admission_mb_per_worker 不得小于 resources.storage_mb"
         )
+    if run_class == "formal" and pier_egress_proxy_image != FORMAL_PIER_EGRESS_PROXY_IMAGE:
+        raise PresmokeCliError(
+            f"正式运行的 Pier egress proxy 镜像必须为 {FORMAL_PIER_EGRESS_PROXY_IMAGE}"
+        )
     return PresmokeConfig(
         **paths,
         model=_nonempty_string(raw, "model"),
         response_model=_nonempty_string(raw, "response_model"),
         reasoning_effort=_nonempty_string(raw, "reasoning_effort"),
+        pier_egress_proxy_image=pier_egress_proxy_image,
+        pier_egress_proxy_content_digest=pier_egress_proxy_content_digest,
         run_class=run_class,
         acn_main_revision=acn_main_revision,
         acn_version=acn_version,
@@ -526,9 +529,7 @@ def build_task_specs(
     by_task = _attempts_by_task(plan, frozen_task_ids)
     skill_hash = sha256_directory_tree(frozen_skill)
     acn_binary_hash = (
-        frozen_runtime.acn_binary_hash
-        if frozen_runtime is not None
-        else _sha256_file(acn_eval)
+        frozen_runtime.acn_binary_hash if frozen_runtime is not None else _sha256_file(acn_eval)
     )
     verified_acn_eval = frozen_runtime.acn_eval if frozen_runtime is not None else acn_eval
     _verify_acn_eval_build_info(
@@ -591,8 +592,10 @@ def build_task_specs(
             normalized_task_tree_hash=normalized_tree_hash,
             agent_image_reference_sha256=_sha256_text(agent_image),
             verifier_image_reference_sha256=_sha256_text(agent_image),
+            pier_egress_proxy_image_reference_sha256=_sha256_text(config.pier_egress_proxy_image),
             agent_image_content_digest=image_content_digest,
             verifier_image_content_digest=image_content_digest,
+            pier_egress_proxy_image_content_digest=(config.pier_egress_proxy_content_digest),
             model=config.model,
             reasoning_effort=config.reasoning_effort,
             file_edit_authority_enabled=config.file_edit_authority_enabled,
@@ -609,12 +612,7 @@ def build_task_specs(
                     attempt.attempt_id,
                     attempt.task_id,
                     attempt.variant,
-                    str(
-                        attempt_output_root
-                        / "attempts"
-                        / attempt.attempt_id
-                        / "output"
-                    ),
+                    str(attempt_output_root / "attempts" / attempt.attempt_id / "output"),
                 )
                 for attempt in attempts
             )
@@ -642,7 +640,9 @@ def build_task_specs(
             None,
             provenance,
         )
-        task_output_root = attempt_output_root if attempt_output_root is not None else config.output_dir
+        task_output_root = (
+            attempt_output_root if attempt_output_root is not None else config.output_dir
+        )
         task_output = task_output_root / "tasks" / task_id
         a_only_source_manifest = (
             config.b_only_from_a_output_dir / "tasks" / task_id / "manifest.json"
@@ -683,9 +683,7 @@ def build_task_specs(
                     progress_stall_after_secs=config.progress["stall_after_secs"],
                     docker_root=docker_root,
                     disk_reserve_mb=config.host_capacity["disk_reserve_mb"],
-                    disk_admission_mb=config.host_capacity[
-                        "disk_admission_mb_per_worker"
-                    ],
+                    disk_admission_mb=config.host_capacity["disk_admission_mb_per_worker"],
                 ),
                 jobs_directory=task_output / "jobs",
                 manifest_path=task_output / "manifest.json",
@@ -737,9 +735,7 @@ def verify_acn_revision(
     if status.stdout.strip():
         raise PresmokeCliError(f"ACN 工作树不干净，正式运行拒绝启动: {checkout}")
     if expected_revision != head:
-        raise PresmokeCliError(
-            f"ACN revision 不匹配: expected={expected_revision}, actual={head}"
-        )
+        raise PresmokeCliError(f"ACN revision 不匹配: expected={expected_revision}, actual={head}")
     ancestor = _run_checkout_git(
         checkout,
         ["merge-base", "--is-ancestor", expected_main_revision, head],
@@ -747,8 +743,7 @@ def verify_acn_revision(
     )
     if ancestor.returncode != 0:
         raise PresmokeCliError(
-            "ACN 评测提交不是指定产品基线的后代: "
-            f"base={expected_main_revision}, head={head}"
+            f"ACN 评测提交不是指定产品基线的后代: base={expected_main_revision}, head={head}"
         )
     cargo = _run_checkout_git(
         checkout,
@@ -788,17 +783,33 @@ def preflight_execution(config: PresmokeConfig) -> Path:
         raise PresmokeCliError(f"pier --help 失败: executable={config.pier_executable}")
 
     if config.cleanup_stale_pier_resources:
-        cleanup = cleanup_stale_pier_resources()
+        cleanup = cleanup_stale_pier_resources({config.pier_egress_proxy_image})
+        proxy_digest = _docker_image_content_digest(config.pier_egress_proxy_image)
+        if proxy_digest != config.pier_egress_proxy_content_digest:
+            raise PresmokeCliError(
+                "Pier egress proxy 镜像 content digest 不匹配: "
+                f"image={config.pier_egress_proxy_image}, "
+                f"expected={config.pier_egress_proxy_content_digest}, actual={proxy_digest}"
+            )
         _atomic_write_json(
             config.output_dir / "docker-cleanup.json",
             {
                 "schema_version": 1,
                 "containers_removed": cleanup.containers_removed,
                 "image_references_removed": cleanup.image_references_removed,
+                "pier_egress_proxy_image": config.pier_egress_proxy_image,
+                "pier_egress_proxy_content_digest": proxy_digest,
             },
         )
     else:
         reject_running_containers()
+        proxy_digest = _docker_image_content_digest(config.pier_egress_proxy_image)
+        if proxy_digest != config.pier_egress_proxy_content_digest:
+            raise PresmokeCliError(
+                "Pier egress proxy 镜像 content digest 不匹配: "
+                f"image={config.pier_egress_proxy_image}, "
+                f"expected={config.pier_egress_proxy_content_digest}, actual={proxy_digest}"
+            )
     docker_info = _run_preflight_command(
         ["docker", "info", "--format", "{{json .}}"], "docker daemon"
     )
@@ -835,8 +846,7 @@ def _ensure_frozen_task_images_available(config: PresmokeConfig, docker_root: Pa
         verify_disk_headroom(
             (config.output_dir, docker_root),
             config.host_capacity["disk_reserve_mb"]
-            + config.task_workers
-            * config.host_capacity["disk_admission_mb_per_worker"],
+            + config.task_workers * config.host_capacity["disk_admission_mb_per_worker"],
         )
 
 
@@ -886,9 +896,7 @@ def stage_python_runtime(
         shutil.copy2(config.acn_eval, staged_acn_eval, follow_symlinks=False)
         _make_files_read_only(temporary)
         staged_source_hashes = {
-            "ACN evaluation package": sha256_directory_tree(
-                acn_source_root / "acn_deepswe"
-            ),
+            "ACN evaluation package": sha256_directory_tree(acn_source_root / "acn_deepswe"),
             "Pier package": sha256_directory_tree(pier_source_root / "pier"),
             "frozen skill": sha256_directory_tree(frozen_skill),
         }
@@ -959,9 +967,7 @@ def _next_resume_root(output_dir: Path) -> Path:
 
 def _task_has_partial_artifacts(spec: PresmokeTaskSpec) -> bool:
     """原 task 目录或任一 arm 输出已出现，即视为中断而非尚未调度。"""
-    source_manifest = (
-        spec.execution.a_only_source_manifest if spec.execution is not None else None
-    )
+    source_manifest = spec.execution.a_only_source_manifest if spec.execution is not None else None
     return spec.manifest_path.exists() or any(
         Path(attempt.output_path).exists()
         for attempt in spec.experiment.attempts
@@ -984,9 +990,7 @@ def _write_resume_descriptor(
             "completed_task_ids": [result.task_id for result in completed],
             "rerun_task_ids": [spec.task_id for spec in specs],
             "attempts": [
-                attempt.to_dict()
-                for spec in specs
-                for attempt in spec.experiment.attempts
+                attempt.to_dict() for spec in specs for attempt in spec.experiment.attempts
             ],
         },
     )
@@ -1124,6 +1128,8 @@ def dry_run_summary(
         "model": config.model,
         "response_model": config.response_model,
         "reasoning_effort": config.reasoning_effort,
+        "pier_egress_proxy_image": config.pier_egress_proxy_image,
+        "pier_egress_proxy_content_digest": config.pier_egress_proxy_content_digest,
         "run_class": config.run_class,
         "acn_main_revision": config.acn_main_revision,
         "acn_version": config.acn_version,
@@ -1200,6 +1206,17 @@ def _absolute_path(raw: Mapping[str, object], field: str) -> Path:
     if not path.is_absolute():
         raise PresmokeCliError(f"config.{field} 必须为绝对路径: {value}")
     return path
+
+
+def _content_digest(raw: Mapping[str, object], field: str) -> str:
+    value = _nonempty_string(raw, field)
+    if (
+        len(value) != 71
+        or not value.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in value[7:])
+    ):
+        raise PresmokeCliError(f"config.{field} 必须是 sha256 content digest")
+    return value
 
 
 def _optional_absolute_path(raw: Mapping[str, object], field: str) -> Path | None:
@@ -1279,10 +1296,7 @@ def _positive_int_mapping(
         raise PresmokeCliError(f"config.{field} 缺少字段: " + ",".join(missing))
     if unknown:
         raise PresmokeCliError(f"config.{field} 包含未知字段: " + ",".join(unknown))
-    return {
-        str(key): _positive_int(item, f"config.{field}.{key}")
-        for key, item in value.items()
-    }
+    return {str(key): _positive_int(item, f"config.{field}.{key}") for key, item in value.items()}
 
 
 def _positive_int(value: object, field: str) -> int:
@@ -1366,6 +1380,8 @@ def _effective_config_hash(config: PresmokeConfig) -> str:
         "model": config.model,
         "response_model": config.response_model,
         "reasoning_effort": config.reasoning_effort,
+        "pier_egress_proxy_image": config.pier_egress_proxy_image,
+        "pier_egress_proxy_content_digest": config.pier_egress_proxy_content_digest,
         "run_class": config.run_class,
         "acn_main_revision": config.acn_main_revision,
         "acn_version": config.acn_version,

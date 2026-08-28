@@ -33,4 +33,4 @@ python -m acn_deepswe.auto_run --config /absolute/path/to/automated-run.json mon
 
 除已确认的无终态中断外，不通过普通 `--resume` 重跑 task；需要恢复时使用既有的 `--resume-interrupted` 受限路径，以保留原始 attempt 和归档证据。
 
-正式运行只使用冻结任务声明的官方镜像，不接受 `hb__` 本地重定向。trial 结束拆掉 Compose 容器但保留官方镜像供后续臂复用；运行前定向清除遗留 Pier 容器和生成镜像，并以固定余量加每 worker admission 的方式检查输出盘和 Docker 数据盘。
+正式运行只使用冻结任务声明的官方镜像，不接受 `hb__` 本地重定向。trial 结束拆掉 Compose 容器但保留官方镜像供后续臂复用；运行前定向清除遗留 Pier 容器和生成镜像，但保留并按 content digest 校验共享 egress proxy 镜像，再以固定余量加每 worker admission 的方式检查输出盘和 Docker 数据盘。

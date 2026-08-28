@@ -222,13 +222,13 @@ class PresmokeRunnerTests(unittest.TestCase):
                 ),
             )
 
-            completed = load_completed_task_results(
-                (changed,), root / "task-completions.json"
-            )
+            completed = load_completed_task_results((changed,), root / "task-completions.json")
 
         self.assertEqual(completed, ())
 
-    def test_failure_is_checkpointed_as_a_terminal_state_and_not_reclassified_as_pending(self) -> None:
+    def test_failure_is_checkpointed_as_a_terminal_state_and_not_reclassified_as_pending(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             specs = build_specs(root)
@@ -423,8 +423,10 @@ def build_specs(root: Path) -> tuple[PresmokeTaskSpec, ...]:
         normalized_task_tree_hash="5" * 64,
         agent_image_reference_sha256="6" * 64,
         verifier_image_reference_sha256="7" * 64,
+        pier_egress_proxy_image_reference_sha256="8" * 64,
         agent_image_content_digest=None,
         verifier_image_content_digest=None,
+        pier_egress_proxy_image_content_digest="sha256:" + "9" * 64,
         model="fixture-model",
         reasoning_effort="max",
         file_edit_authority_enabled=True,
