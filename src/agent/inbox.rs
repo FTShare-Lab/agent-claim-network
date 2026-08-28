@@ -42,6 +42,16 @@ pub(crate) type ClaimAttributeUpdateJsonValidator<'a> =
     dyn FnMut(serde_json::Value) -> anyhow::Result<PreparedClaimAttributeUpdate> + Send + 'a;
 type PreparedInternalization = (DateTime<Utc>, Vec<Claim>, Vec<Claim>, Vec<Dispute>);
 
+#[derive(Default)]
+struct PendingInboxUpload {
+    claims: Vec<Claim>,
+    disputes: Vec<Dispute>,
+}
+
+struct AppliedInboxEffect {
+    summary: InternalizeSummary,
+}
+
 #[async_trait]
 pub(crate) trait InboxJsonGenerator: Send + Sync {
     async fn generate_json(
@@ -548,6 +558,10 @@ impl AgentRunner {
         &self,
         policy: &Policy,
     ) -> anyhow::Result<PolicyDeprecationSummary> {
+        let knowledge_guard = FileLockGuard::lock_exclusive(
+            paths::agent_home_knowledge_apply_lock_path(self.maintainer_upload_queue.agent_home()),
+        )
+        .await?;
         let now = Utc::now();
         let updated_at = crate::time::truncate_to_second(now);
         let policy_source = SourceId::Policy(policy.id.clone());
@@ -566,9 +580,25 @@ impl AgentRunner {
             self.claim_store.write_claim(&claim).await?;
             claims_to_upload.push(claim);
         }
-        let upload_report = self
-            .upload_maintainer_batch(claims_to_upload, Vec::new())
+        let trace_id = if deprecated_claim_ids.is_empty() {
+            None
+        } else {
+            deprecated_claim_ids.sort();
+            Some(
+                self.write_trace(
+                    "policy_deprecation_internalization".into(),
+                    format!("policy {} deprecated", policy.id),
+                    vec![policy_source],
+                    deprecated_claim_ids.clone(),
+                    now,
+                )
+                .await?,
+            )
+        };
+        self.stage_maintainer_batch(claims_to_upload, Vec::new())
             .await?;
+        drop(knowledge_guard);
+        let upload_report = self.upload_maintainer_batch(Vec::new(), Vec::new()).await?;
         let mut warnings = Vec::new();
         push_upload_warning(&mut warnings, upload_report);
 
@@ -579,16 +609,6 @@ impl AgentRunner {
             });
         }
 
-        deprecated_claim_ids.sort();
-        let trace_id = self
-            .write_trace(
-                "policy_deprecation_internalization".into(),
-                format!("policy {} deprecated", policy.id),
-                vec![policy_source],
-                deprecated_claim_ids.clone(),
-                now,
-            )
-            .await?;
         log::info!(
             target: "agent",
             "agent {} 处理 deprecated policy id={} → deprecated claims={:?}",
@@ -598,7 +618,7 @@ impl AgentRunner {
         );
 
         Ok(PolicyDeprecationSummary {
-            trace_id: Some(trace_id),
+            trace_id,
             deprecated_claim_ids,
             warnings,
         })
@@ -655,6 +675,10 @@ impl AgentRunner {
                 break guards;
             }
         };
+        let knowledge_guard = FileLockGuard::lock_exclusive(
+            paths::agent_home_knowledge_apply_lock_path(self.maintainer_upload_queue.agent_home()),
+        )
+        .await?;
 
         let mut records = Vec::with_capacity(messages.len());
         for message in messages {
@@ -694,13 +718,13 @@ impl AgentRunner {
                         .get_mut(&canonical_id)
                         .ok_or_else(|| anyhow::anyhow!("canonical batch cache 缺失"))?;
                     let canonical_path = batch.canonical_path.clone();
-                    summary.extend(
-                        self.apply_persisted_claim_attribute_update_plan(
+                    let applied = self
+                        .apply_persisted_claim_attribute_update_plan(
                             &mut batch.plan,
                             &canonical_path,
                         )
-                        .await?,
-                    );
+                        .await?;
+                    summary.extend(applied.summary);
                 }
                 index += 1;
                 continue;
@@ -726,12 +750,17 @@ impl AgentRunner {
             self.persist_prepared_claim_attribute_update_plan(&prepared)
                 .await?;
             let canonical_path = self.inbox_effect_path(&prepared.inbox_id);
-            summary.extend(
-                self.apply_persisted_claim_attribute_update_plan(&mut prepared, &canonical_path)
-                    .await?,
-            );
+            let applied = self
+                .apply_persisted_claim_attribute_update_plan(&mut prepared, &canonical_path)
+                .await?;
+            summary.extend(applied.summary);
             index = end;
         }
+        drop(knowledge_guard);
+        let upload = self
+            .upload_maintainer_batch_with_durable_claims(Vec::new(), Vec::new())
+            .await?;
+        push_upload_warning(&mut summary.warnings, upload);
         Ok(summary)
     }
 
@@ -801,10 +830,20 @@ impl AgentRunner {
         &self,
         plan: &mut InboxEffectPlan,
         canonical_path: &std::path::Path,
-    ) -> anyhow::Result<InternalizeSummary> {
+    ) -> anyhow::Result<AppliedInboxEffect> {
         self.repair_claim_attribute_update_refs(plan).await?;
         if plan.state == InboxEffectState::Prepared {
-            self.apply_claim_attribute_update_effect(plan).await?;
+            let pending_upload = self.apply_claim_attribute_update_effect(plan).await?;
+            self.stage_maintainer_batch_with_durable_claims(
+                pending_upload.claims,
+                pending_upload.disputes.clone(),
+            )
+            .await?;
+            if self.team_services_configured() {
+                for dispute in &pending_upload.disputes {
+                    self.record_dispute_if_new(dispute).await?;
+                }
+            }
             plan.state = InboxEffectState::Applied;
             write_yaml_atomic(
                 canonical_path,
@@ -812,7 +851,9 @@ impl AgentRunner {
             )
             .await?;
         }
-        Ok(effect_summary(plan))
+        Ok(AppliedInboxEffect {
+            summary: effect_summary(plan),
+        })
     }
 
     fn inbox_effect_path(&self, inbox_id: &InboxId) -> std::path::PathBuf {
@@ -1211,7 +1252,7 @@ impl AgentRunner {
     async fn apply_claim_attribute_update_effect(
         &self,
         plan: &mut InboxEffectPlan,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<PendingInboxUpload> {
         if self.team_services_configured() {
             let mut unreported = Vec::with_capacity(plan.new_disputes.len());
             let mut accepted_claim_sets = FxHashSet::default();
@@ -1294,21 +1335,12 @@ impl AgentRunner {
                 Err(error) => return Err(error.into()),
             }
         }
-        let upload = self
-            .upload_maintainer_batch_with_durable_claims(
-                claims_to_upload,
-                plan.new_disputes.clone(),
-            )
-            .await?;
-        push_upload_warning(&mut plan.warnings, upload);
-        if self.team_services_configured() {
-            for dispute in &plan.new_disputes {
-                self.record_dispute_if_new(dispute).await?;
-            }
-        }
         plan.warnings.sort();
         plan.warnings.dedup();
-        Ok(())
+        Ok(PendingInboxUpload {
+            claims: claims_to_upload,
+            disputes: plan.new_disputes.clone(),
+        })
     }
 
     /// 把一批同类型 inbox 更新消息交给 LLM 内化。
@@ -1332,6 +1364,10 @@ impl AgentRunner {
             i64::try_from(inbox_messages.len()).unwrap_or(i64::MAX),
         ));
 
+        let knowledge_guard = FileLockGuard::lock_exclusive(
+            paths::agent_home_knowledge_apply_lock_path(self.maintainer_upload_queue.agent_home()),
+        )
+        .await?;
         let local = llm_visible_claims(self.claim_store.list_local_claims().await?);
         let source_policy_ids = inbox_policy_ids(&inbox_messages);
         let request = InternalizeRequest {
@@ -1511,14 +1547,15 @@ impl AgentRunner {
                 disputes_to_upload.push(dispute);
             }
         }
-        let upload_report = self
-            .upload_maintainer_batch(claims_to_upload, disputes_to_upload.clone())
+        self.stage_maintainer_batch(claims_to_upload, disputes_to_upload.clone())
             .await?;
-        for dispute in disputes_to_upload {
-            if self.record_dispute_if_new(&dispute).await? {
+        for dispute in &disputes_to_upload {
+            if self.record_dispute_if_new(dispute).await? {
                 written_dispute_ids.push(dispute.id.clone());
             }
         }
+        drop(knowledge_guard);
+        let upload_report = self.upload_maintainer_batch(Vec::new(), Vec::new()).await?;
         let mut warnings = Vec::new();
         push_upload_warning(&mut warnings, upload_report);
 
@@ -2082,7 +2119,9 @@ mod tests {
         LocalFsReportedDisputeClaimSetStore,
     };
     use crate::agent::maintainer_upload::{LocalFsMaintainerUploadQueue, PendingMaintainerUploads};
-    use crate::agent::traits::{InboxReader, LocalClaimStore, MemoryStore};
+    use crate::agent::traits::{
+        InboxReader, LocalClaimStore, MemoryStore, ReportedDisputeClaimSetStore,
+    };
     use crate::api::{
         ProviderAdapter, ProviderEvent, ProviderRequest, ProviderResponse, ProviderStop,
     };
@@ -2117,6 +2156,46 @@ mod tests {
         response: Value,
     }
 
+    struct PendingBeforeLedgerReportedDisputeStore {
+        pending_path: std::path::PathBuf,
+        inner: LocalFsReportedDisputeClaimSetStore,
+    }
+
+    impl PendingBeforeLedgerReportedDisputeStore {
+        fn new(agent_home: std::path::PathBuf) -> Self {
+            Self {
+                pending_path: paths::agent_home_pending_maintainer_uploads_path(&agent_home),
+                inner: LocalFsReportedDisputeClaimSetStore::new(agent_home),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ReportedDisputeClaimSetStore for PendingBeforeLedgerReportedDisputeStore {
+        async fn contains_claim_set(&self, claims: &[ClaimId]) -> anyhow::Result<bool> {
+            self.inner.contains_claim_set(claims).await
+        }
+
+        async fn record_claim_set(
+            &self,
+            claims: &[ClaimId],
+            dispute_id: &DisputeId,
+            reported_at: DateTime<Utc>,
+        ) -> anyhow::Result<()> {
+            let pending: PendingMaintainerUploads = read_yaml(&self.pending_path).await?;
+            anyhow::ensure!(
+                pending
+                    .disputes
+                    .iter()
+                    .any(|dispute| dispute.id == *dispute_id),
+                "dispute ledger must be recorded only after durable pending staging"
+            );
+            self.inner
+                .record_claim_set(claims, dispute_id, reported_at)
+                .await
+        }
+    }
+
     #[async_trait]
     impl InboxJsonGenerator for StaticInboxGenerator {
         async fn generate_json(
@@ -2144,6 +2223,28 @@ mod tests {
     struct CountingInboxGenerator {
         response: Value,
         calls: AtomicUsize,
+    }
+
+    struct LockObservingInboxGenerator {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl InboxJsonGenerator for LockObservingInboxGenerator {
+        async fn generate_json(
+            &self,
+            kind: InboxInternalizeKind,
+            _request: InternalizeRequest,
+            _preferred_transport: Option<ProviderTransport>,
+        ) -> anyhow::Result<Value> {
+            assert_eq!(kind, InboxInternalizeKind::PolicyUpdate);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({
+                "new_claims": [],
+                "updated_claims": [],
+                "new_disputes": [],
+            }))
+        }
     }
 
     struct CountingArbitrationProvider {
@@ -2566,6 +2667,245 @@ mod tests {
                 "new_disputes": [],
             }),
         })
+    }
+
+    #[tokio::test]
+    async fn inbox_internalization_waits_for_agent_knowledge_apply_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let generator = Arc::new(LockObservingInboxGenerator {
+            calls: AtomicUsize::new(0),
+        });
+        let runner = Arc::new(receipt_test_runner(
+            &dir,
+            Arc::new(LocalFsInboxReader::new(dir.path().to_path_buf())),
+            Arc::new(NoopMaintainerClient),
+            generator.clone(),
+        ));
+        let guard =
+            FileLockGuard::lock_exclusive(paths::agent_home_knowledge_apply_lock_path(dir.path()))
+                .await
+                .unwrap();
+        let task_runner = runner.clone();
+        let task_generator = generator.clone();
+        let messages = vec![receipt_test_message(PolicyStatus::Active)];
+        let task = tokio::spawn(async move {
+            task_runner
+                .internalize_inbox_updates(
+                    task_generator.as_ref(),
+                    InboxInternalizeKind::PolicyUpdate,
+                    messages,
+                )
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(generator.calls.load(Ordering::SeqCst), 0);
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn policy_deprecation_stages_upload_before_releasing_knowledge_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_home = dir.path().to_path_buf();
+        let policy = Policy {
+            id: PolicyId::random(),
+            message_type: PolicyMessageType::PolicyUpdate,
+            name: "deprecated-policy".into(),
+            statement: "deprecated policy".into(),
+            scope: "tests / inbox".into(),
+            status: PolicyStatus::Deprecated,
+            created_at: Utc::now(),
+            updated_at: None,
+            target_agents: None,
+        };
+        let claim_store = Arc::new(LocalFsClaimStore::new(agent_home.clone()));
+        let claim = Claim {
+            id: ClaimId::random(),
+            name: "policy-backed-claim".into(),
+            statement: "policy-backed claim".into(),
+            scope: "tests / inbox".into(),
+            holder: AgentId::new("agent-a").unwrap(),
+            confidence: Confidence::High,
+            status: ClaimStatus::Active,
+            created_at: crate::time::now_seconds(),
+            updated_at: None,
+            source_claim_ids: vec![SourceId::Policy(policy.id.clone())],
+            evidence_summary: "policy source".into(),
+        };
+        claim_store.write_claim(&claim).await.unwrap();
+        let runner = Arc::new(AgentRunner::new(
+            AgentId::new("agent-a").unwrap(),
+            empty_receipt_generator(),
+            claim_store.clone(),
+            Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home.clone())),
+            Arc::new(LocalFsInboxReader::new(agent_home.clone())),
+            Arc::new(LocalFsMemoryStore::new(
+                agent_home.clone(),
+                1600,
+                1000,
+                false,
+            )),
+            Arc::new(EmptyRouterClient),
+            Arc::new(NoopMaintainerClient),
+            Arc::new(LocalFsMaintainerUploadQueue::new(agent_home.clone())),
+            0,
+            Vec::<SkillSummary>::new(),
+        ));
+        let pending_guard = FileLockGuard::lock_exclusive(
+            paths::agent_home_pending_maintainer_uploads_lock_path(&agent_home),
+        )
+        .await
+        .unwrap();
+
+        let task_runner = runner.clone();
+        let task_policy = policy.clone();
+        let task =
+            tokio::spawn(async move { task_runner.apply_policy_deprecation(&task_policy).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let stored = claim_store.list_local_claims().await.unwrap();
+                if stored
+                    .iter()
+                    .any(|stored| stored.id == claim.id && stored.status == ClaimStatus::Deprecated)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            FileLockGuard::try_lock_exclusive(paths::agent_home_knowledge_apply_lock_path(
+                &agent_home
+            ))
+            .await
+            .unwrap()
+            .is_none(),
+            "knowledge lock must cover local apply and durable upload staging"
+        );
+
+        drop(pending_guard);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn policy_update_stages_upload_before_releasing_knowledge_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_home = dir.path().to_path_buf();
+        let policy = Policy {
+            id: PolicyId::random(),
+            message_type: PolicyMessageType::PolicyUpdate,
+            name: "active-policy".into(),
+            statement: "active policy".into(),
+            scope: "tests / inbox".into(),
+            status: PolicyStatus::Active,
+            created_at: Utc::now(),
+            updated_at: None,
+            target_agents: None,
+        };
+        let generator = Arc::new(StaticInboxGenerator {
+            expected_kind: InboxInternalizeKind::PolicyUpdate,
+            response: json!({
+                "new_claims": [{
+                    "id": "$new_claim_0$",
+                    "name": "generated-policy-claim",
+                    "statement": "generated policy claim",
+                    "scope": "tests / inbox",
+                    "confidence": "high",
+                    "evidence_summary": "active policy source",
+                    "source_claim_ids": [policy.id.as_str()],
+                }],
+                "updated_claims": [],
+                "new_disputes": [],
+            }),
+        });
+        let claim_store = Arc::new(LocalFsClaimStore::new(agent_home.clone()));
+        let runner = Arc::new(AgentRunner::new(
+            AgentId::new("agent-a").unwrap(),
+            generator.clone(),
+            claim_store.clone(),
+            Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home.clone())),
+            Arc::new(LocalFsInboxReader::new(agent_home.clone())),
+            Arc::new(LocalFsMemoryStore::new(
+                agent_home.clone(),
+                1600,
+                1000,
+                false,
+            )),
+            Arc::new(EmptyRouterClient),
+            Arc::new(NoopMaintainerClient),
+            Arc::new(LocalFsMaintainerUploadQueue::new(agent_home.clone())),
+            0,
+            Vec::<SkillSummary>::new(),
+        ));
+        let pending_guard = FileLockGuard::lock_exclusive(
+            paths::agent_home_pending_maintainer_uploads_lock_path(&agent_home),
+        )
+        .await
+        .unwrap();
+        let message = InboxMessage {
+            id: InboxId::random(),
+            kind: InboxMessageKind::PolicyUpdate { policy },
+            handled_at: None,
+        };
+
+        let task_runner = runner.clone();
+        let task_generator = generator.clone();
+        let task = tokio::spawn(async move {
+            task_runner
+                .internalize_inbox_updates(
+                    task_generator.as_ref(),
+                    InboxInternalizeKind::PolicyUpdate,
+                    vec![message],
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if claim_store
+                    .list_local_claims()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|claim| claim.name == "generated-policy-claim")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            FileLockGuard::try_lock_exclusive(paths::agent_home_knowledge_apply_lock_path(
+                &agent_home
+            ))
+            .await
+            .unwrap()
+            .is_none(),
+            "knowledge lock must cover local apply and durable upload staging"
+        );
+
+        drop(pending_guard);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     fn arbitration_message(local: &Claim, remote: &Claim, policy: Policy) -> InboxMessage {
@@ -3920,17 +4260,18 @@ mod tests {
             .await
             .unwrap();
 
-        let requests = second_generator.requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].claim_attribute_updates.len(), 1);
-        assert_eq!(
-            requests[0].claim_attribute_updates[0]
-                .claim_attribute_update
-                .id,
-            messages[1].id
-        );
-        assert_eq!(requests[0].local_claims[0].statement, "after first CAU");
-        drop(requests);
+        {
+            let requests = second_generator.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].claim_attribute_updates.len(), 1);
+            assert_eq!(
+                requests[0].claim_attribute_updates[0]
+                    .claim_attribute_update
+                    .id,
+                messages[1].id
+            );
+            assert_eq!(requests[0].local_claims[0].statement, "after first CAU");
+        }
 
         let final_claim = claim_store
             .list_local_claims()
@@ -4969,7 +5310,9 @@ mod tests {
             agent_id.clone(),
             empty_receipt_generator(),
             claim_store,
-            Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home.clone())),
+            Arc::new(PendingBeforeLedgerReportedDisputeStore::new(
+                agent_home.clone(),
+            )),
             Arc::new(LocalFsInboxReader::new(agent_home.clone())),
             Arc::new(LocalFsMemoryStore::new(
                 agent_home.clone(),
@@ -5087,6 +5430,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn solo_cau_does_not_record_unstaged_dispute_as_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_home = dir.path().to_path_buf();
+        let agent_id = AgentId::new("agent-a").unwrap();
+        let first_claim = arbitration_claim("agent-a", "first", ClaimStatus::Active);
+        let second_claim = arbitration_claim("agent-a", "second", ClaimStatus::Active);
+        let claim_store = Arc::new(LocalFsClaimStore::new(agent_home.clone()));
+        claim_store.write_claim(&first_claim).await.unwrap();
+        claim_store.write_claim(&second_claim).await.unwrap();
+        let reported_store = Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home.clone()));
+        let generator = Arc::new(RecordingClaimAttributeUpdateGenerator {
+            response: json!({
+                "new_claims": [],
+                "updated_claims": [],
+                "new_disputes": [{
+                    "id": "$new_dispute_0$",
+                    "name": "solo_conflict",
+                    "claims": [first_claim.id.as_str(), second_claim.id.as_str()],
+                    "summary": "the local claims conflict"
+                }]
+            }),
+            requests: Mutex::new(Vec::new()),
+        });
+        let runner = AgentRunner::new_local(
+            agent_id.clone(),
+            generator.clone(),
+            claim_store,
+            reported_store.clone(),
+            Arc::new(LocalFsInboxReader::new(agent_home.clone())),
+            Arc::new(LocalFsMemoryStore::new(
+                agent_home.clone(),
+                1600,
+                1000,
+                false,
+            )),
+            Arc::new(LocalFsMaintainerUploadQueue::new(agent_home.clone())),
+            0,
+            Vec::<SkillSummary>::new(),
+        );
+        let message = InboxMessage {
+            id: InboxId::random(),
+            kind: InboxMessageKind::ClaimAttributeUpdate {
+                policy: Policy {
+                    id: PolicyId::random(),
+                    message_type: PolicyMessageType::ClaimAttributeUpdate,
+                    name: "review_claim_conflict".into(),
+                    statement: "review the conflicting local knowledge".into(),
+                    scope: "knowledge / shared".into(),
+                    status: PolicyStatus::Active,
+                    created_at: "2026-08-02T00:00:00Z".parse().unwrap(),
+                    updated_at: None,
+                    target_agents: Some(vec![agent_id]),
+                },
+                arbitration_resolution: None,
+            },
+            handled_at: None,
+        };
+
+        runner
+            .internalize_claim_attribute_update_message(generator.as_ref(), &message)
+            .await
+            .unwrap();
+
+        assert!(!reported_store
+            .contains_claim_set(&[first_claim.id, second_claim.id])
+            .await
+            .unwrap());
+        assert!(
+            !tokio::fs::try_exists(paths::agent_home_pending_maintainer_uploads_path(
+                &agent_home
+            ))
+            .await
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn policy_update_filters_duplicate_claim_sets_before_upload() {
         let dir = tempfile::tempdir().unwrap();
         let agent_home = dir.path().to_path_buf();
@@ -5122,7 +5542,9 @@ mod tests {
             agent_id.clone(),
             generator.clone(),
             claim_store,
-            Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home.clone())),
+            Arc::new(PendingBeforeLedgerReportedDisputeStore::new(
+                agent_home.clone(),
+            )),
             Arc::new(LocalFsInboxReader::new(agent_home.clone())),
             Arc::new(LocalFsMemoryStore::new(
                 agent_home.clone(),

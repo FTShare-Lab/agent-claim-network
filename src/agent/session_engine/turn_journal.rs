@@ -99,6 +99,7 @@ impl SessionTurnEventRecorder for TurnJournalDurableEventRecorder {
             SessionTurnEvent::Warning { .. }
             | SessionTurnEvent::CompactionStarted { .. }
             | SessionTurnEvent::CompactionCompleted { .. }
+            | SessionTurnEvent::RecapRequested { .. }
             | SessionTurnEvent::CompactionSkipped { .. }
             | SessionTurnEvent::CompactionFailed { .. } => Ok(()),
             SessionTurnEvent::NonStreamingFallbackAttemptStarted {

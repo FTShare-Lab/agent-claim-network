@@ -59,6 +59,8 @@ claim/dispute 的生成应基于 transcript、`background_process_completions` �
 # 输出要求（必须严格遵守）
 返回 **一个 JSON 对象**，**不要**包裹 markdown 代码块、不要附加解释文字，结构如下：
 
+所有 JSON 字符串值必须使用 JSON 转义：英文双引号写成 `\"`，反斜杠写成 `\\`，换行写成 `\n`，回车写成 `\r`，制表符写成 `\t`。禁止在 JSON 字符串中直接输出 U+0000–U+001F 控制字符。
+
 ```
 {
   "new_claims": [

@@ -105,11 +105,11 @@ acn
 
 ### 单人模式
 
-保持 `maintainer_endpoint` 与 `router_endpoint` 为空即可。单人模式不发起团队请求，仍可使用完整 TUI、工具、Memory、Session、本地 Claim、Trace 和后台 Finalize Supervisor。
+保持 `maintainer_endpoint` 与 `router_endpoint` 为空即可。单人模式不发起团队请求，仍可使用完整 TUI、工具、Memory、Session、本地 Claim、Trace 和后台 Recap/Finalize Supervisor。
 
 ### 团队模式
 
-同时配置 `maintainer_endpoint` 与 `router_endpoint` 后，ACN 会在 Session 启动、恢复或执行 `/inbox` 时同步团队消息，也会在任务中按需查询 Router，并在 compact 或 finalize 后上传新的 Claim mirror。只配置其中一项会被拒绝。
+同时配置 `maintainer_endpoint` 与 `router_endpoint` 后，ACN 会在 Session 启动、恢复或执行 `/inbox` 时同步团队消息，也会在任务中按需查询 Router，并在后台 recap 或 finalize 形成本地知识后上传新的 Claim mirror。只配置其中一项会被拒绝。
 
 `acn_key_env` 是团队服务鉴权 key 的环境变量名，与主 LLM 和 Web Search 的 key 无关。团队启用鉴权时，使用管理员提供的 key；未启用时可以留空或省略。配置了变量名但没有设置值不会阻止启动，但开启鉴权的团队服务会拒绝请求。
 
@@ -170,7 +170,7 @@ acn --resume
 常用命令：
 
 - `/help`：显示内置帮助
-- `/compact`：手动压缩上下文
+- `/compact`：手动压缩上下文；有未 recap 的 committed history 时会静默投递后台 Recap
 - `/copy`：复制最近一条 assistant 回复
 - `/exit`：结束当前 session，并把 finalize 交给后台 supervisor
 - `/inbox`：同步团队消息；单人模式会明确提示团队服务未配置
@@ -287,9 +287,11 @@ acn mcp logout my-server
 
 进程属于创建它的 root session 或 subagent。turn 结束不会自动杀死仍在运行的受管进程；session finalize 会收束相应生命周期。
 
-## 退出与 Finalize Supervisor
+## 后台 Recap 与 Finalize Supervisor
 
-退出非空 session 时，ACN 通常将 recap、claim 和 trace 的 finalize 工作交给后台 supervisor；团队模式还会报告符合条件的 dispute，然后尽快归还终端。
+自动或手动 compact 只同步生成上下文 summary；有未 recap 的 committed history 时，会把冻结消息 target 静默投递为后台 Recap job。Recap 失败不影响已经成功的 compact，也不发送系统通知；后续 compact 或 Finalize 会继续覆盖剩余区间。
+
+退出非空 session 时，ACN 通常把最终 recap、claim 和 trace 工作交给同一个 supervisor；团队模式还会报告符合条件的 dispute，然后尽快归还终端。Finalize 比排队中的 Recap 优先，但不会打断已经开始的模型请求。
 
 查看任务：
 
@@ -307,7 +309,7 @@ acn supervisor stop
 
 使用自定义 `--config` 或 `--upstream` 启动时，管理 supervisor 也应传相同参数。
 
-失败的 finalize 可按 session ID 重试，也可使用 `jobs` 显示的 job ID；若 session 已进入 `Finalizing` 但尚未创建 job，也可用 session ID 恢复。配置、相关凭据或 ACN 版本变化后，下次启动对应 upstream 时会自动接管旧 supervisor 并继续未完成任务。supervisor 连续空闲 5 分钟后会自行退出。
+`jobs` 会显示任务 kind；Recap 还会显示冻结 target。失败的 finalize 可按 session ID 重试，也可使用 `jobs` 显示的 job ID；`retry` 不用于 Recap。若 session 已进入 `Finalizing` 但尚未创建 job，也可用 session ID 恢复。配置、相关凭据或 ACN 版本变化后，下次启动对应 upstream 时会自动接管旧 supervisor 并继续未完成任务。supervisor 连续空闲 5 分钟后会自行退出。
 
 ## 会话维护与更新
 

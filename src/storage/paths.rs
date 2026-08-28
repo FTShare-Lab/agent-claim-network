@@ -336,8 +336,17 @@ pub fn agent_home_pending_maintainer_uploads_lock_path(agent_home: &Path) -> Pat
     agent_home_maintainer_uploads_dir(agent_home).join("pending.lock")
 }
 
+pub fn agent_home_maintainer_upload_delivery_lock_path(agent_home: &Path) -> PathBuf {
+    agent_home_maintainer_uploads_dir(agent_home).join("delivery.lock")
+}
+
 pub fn agent_home_runtime_dir(agent_home: &Path) -> PathBuf {
     agent_home.join("runtime")
+}
+
+/// `<agent_home>/knowledge_apply.lock`：inbox 与 recap/finalize 共用的知识应用锁。
+pub fn agent_home_knowledge_apply_lock_path(agent_home: &Path) -> PathBuf {
+    agent_home.join("knowledge_apply.lock")
 }
 
 pub fn agent_home_supervisor_dir(agent_home: &Path) -> PathBuf {
@@ -512,6 +521,14 @@ mod tests {
         assert_eq!(
             agent_home_pending_maintainer_uploads_lock_path(&home),
             PathBuf::from("/tmp/agents/agent-a/maintainer_uploads/pending.lock")
+        );
+        assert_eq!(
+            agent_home_maintainer_upload_delivery_lock_path(&home),
+            PathBuf::from("/tmp/agents/agent-a/maintainer_uploads/delivery.lock")
+        );
+        assert_eq!(
+            agent_home_knowledge_apply_lock_path(&home),
+            PathBuf::from("/tmp/agents/agent-a/knowledge_apply.lock")
         );
         assert_eq!(
             agent_home_supervisor_jobs_dir(&home),

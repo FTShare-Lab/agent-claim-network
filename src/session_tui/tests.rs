@@ -613,6 +613,13 @@ fn live_region_shows_local_claims_and_last_router_lookup() {
 #[test]
 fn live_region_tracks_recent_acn_contribution() {
     let mut state = super::TuiState::new();
+    state.apply_event(SessionEvent::LocalClaimsUpdated { total: 7 });
+    state.apply_event(SessionEvent::ToolCallCompleted {
+        id: "toolu_router".into(),
+        summary: "tool consult_router ok claims=3 disputes=1".into(),
+        file_change: None,
+        outcome: ToolExecutionOutcome::Completed,
+    });
     state.apply_event(SessionEvent::InboxCompleted {
         processed: 2,
         new_claim_ids: vec!["claim_00000001".parse().unwrap()],
@@ -643,12 +650,11 @@ fn live_region_tracks_recent_acn_contribution() {
         .join("\n");
     assert!(finalize_text.contains("finalize · claims +1 / ~1 / -0 · disputes +0"));
 
-    state.apply_event(SessionEvent::CompactionCompleted {
-        compacted_until: 8,
-        recapped_until: 18,
-        new_claim_ids: vec!["claim_00000004".parse().unwrap()],
-        updated_claim_ids: vec!["claim_00000006".parse().unwrap()],
-        new_dispute_ids: vec!["dispute_00000002".parse().unwrap()],
+    state.apply_event(SessionEvent::CompactionStarted {
+        compact_start_index: 0,
+        compact_end_index: 8,
+        recap_start_index: 0,
+        recap_end_index: 18,
     });
 
     let compact_text = super::inline_live_lines_with_width(&state, 96)
@@ -656,7 +662,11 @@ fn live_region_tracks_recent_acn_contribution() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(compact_text.contains("compact · claims +1 / ~1 / -0 · disputes +1"));
+    assert!(!compact_text.contains("finalize · claims"));
+    assert!(!compact_text.contains("compact · claims"));
+    assert!(!compact_text.contains("inbox 2 · claims"));
+    assert!(compact_text.contains("local claims 7"));
+    assert!(compact_text.contains("last router consult claims 3 · disputes 1"));
 }
 
 #[test]
@@ -2936,6 +2946,15 @@ fn multiline_compact_like_input_is_submitted_as_plain_input() {
 }
 
 #[test]
+fn recap_enqueue_is_silent_on_success_and_uses_fixed_warning_on_failure() {
+    assert_eq!(super::app::recap_enqueue_warning(&Ok(())), None);
+    assert_eq!(
+        super::app::recap_enqueue_warning(&Err(anyhow::anyhow!("unavailable"))),
+        Some("Background recap could not be queued and will retry later.")
+    );
+}
+
+#[test]
 fn slash_like_source_code_is_submitted_as_plain_input() {
     let code = "//! Provider adapter 实现：通过统一协议调用模型。\n\
 //! 用途：\n\
@@ -2977,13 +2996,7 @@ fn compaction_progress_is_visible() {
     assert!(!compacting_text.contains("compacting session"));
     assert!(!state.transcript_text().contains("compaction started"));
 
-    state.apply_event(SessionEvent::CompactionCompleted {
-        compacted_until: 2,
-        recapped_until: 4,
-        new_claim_ids: vec!["claim_00000001".parse().unwrap()],
-        updated_claim_ids: vec![],
-        new_dispute_ids: vec![],
-    });
+    state.apply_event(SessionEvent::CompactionCompleted { compacted_until: 2 });
     assert_eq!(state.status, SessionRuntimeStatus::Compacting);
     assert!(!state.transcript_text().contains("compaction completed"));
 

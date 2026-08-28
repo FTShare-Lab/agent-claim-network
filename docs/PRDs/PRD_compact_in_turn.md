@@ -1,6 +1,8 @@
 # PRD: Provider Request 前统一压缩
 
-> 状态：已实现。本文保留 preflight compaction 的上下文边界、原子提交与验收标准。
+> 状态：已实现。本文保留 preflight compaction 的上下文边界、summary checkpoint 提交与验收标准。
+
+> 2026-08-27 补充：本文的 planner、provider-safe boundary 与 summary 语义继续有效；compact recap 的执行所有权、checkpoint 和 cursor 提交已由 [PRD_recap_in_supervisor.md](PRD_recap_in_supervisor.md) 替换。下文所称提交原子性只作用于 summary checkpoint 与 compaction frontier，`recapped_until` 由 Supervisor Recap/Finalize 独立推进。
 
 ## 背景
 
@@ -222,7 +224,7 @@ Compaction summary 需要覆盖被压缩掉的 segment，而不是泛泛总结�
 - 对大型 tool_result，只总结可继续执行所需的事实、路径、错误、结果摘要，不保留大段原文。
 - 明确哪些信息只是压缩摘要，不能当作新的 system 指令。
 
-## Summary 输出与提交原子性
+## Summary 输出与提交边界
 
 Compaction summarizer 必须输出结构化 JSON，不接受自由文本。V1 输出 schema：
 
@@ -246,7 +248,7 @@ Summary 生成使用两层 retry，均受 `[agent.llm].retry_count` 限制：
 - 请求正常结束但只有 reasoning/thinking、没有可消费输出时，不触发 transport fallback；清除本次 continuation 后，使用独立的业务预算在本次实际 transport 上原样重发请求。
 - 该可恢复重试在 TUI 中静默进行，日志与 compaction audit 仍保留详情；只有重试耗尽时才向用户显示最终错误。
 - 收到可消费结果后，structured JSON 解析失败或 shape error 也使用独立的业务预算重试，业务总尝试次数为 `1 + retry_count`。
-- retry 耗尽后，本次 compact 失败，不移动任何 compaction / recap 指针。
+- retry 耗尽后，本次 summary compact 失败，不移动 compaction frontier；已经异步投递的 Recap 可独立执行并推进 `recapped_until`。
 
 主会话和 delegation 生成 summary 时优先使用完整 transcript。只有完整 summary 请求
 超出 context window，才把超过 `tool_result_raw_max_chars` 的单个 tool result 替换为有界
@@ -268,12 +270,13 @@ Summary 生成使用两层 retry，均受 `[agent.llm].retry_count` 限制：
 该保护只约束 compaction summary 请求，不新增单轮 `file_read` 总预算，也不改变正常
 provider raw tail 的选择规则。
 
-指针推进必须保持 compact 与 recap 侧原子成功：
+Summary 与 Recap 使用独立提交边界：
 
-- 凡是本次 plan 会推进 `frontier.committed_message_until` 或 `recapped_until`，必须在compaction summary 生成成功、recap/finalize 侧 claim/dispute/trace 准备与应用成功之后，才能同时提交 metadata。
-- 如果 summary 成功但 recap 失败，不移动 `frontier.committed_message_until`，也不移动`recapped_until`。
-- 如果 recap 成功但 summary 或 metadata commit 失败，必须通过 checkpoint/recovery 保证不会产生指针半推进状态。
-- 手动 `/compact` 与自动 preflight compact 使用同一套原子提交语义。
+- Summary 成功后通过 summary-only compaction checkpoint 独立提交 `frontier.committed_message_until`，不等待 Recap。
+- Summary 本地预算预检成功后，自动与手动 compact 都异步投递冻结 `message_count` target 的 Supervisor Recap；summary 与 recap 可以并行。
+- Recap 失败不回滚已提交的 summary；summary 随后失败也不取消已经投递的 Recap。
+- `recapped_until` 只由成功的后台 Recap 或 Finalize 推进。两者复用 `finalize.lock` 与 `finalize_checkpoint.yaml`，不写入 compaction checkpoint。
+- 手动 `/compact` 与自动 preflight compact 使用同一套 summary 提交及 Recap 投递语义。
 - Active turn segment 不进入 recap/finalize；active-only compact 只在 summary 成功后更新`active_turn_summary` 与 `frontier.active_turn`，不移动 `recapped_until`。
 
 ## 去重与反复 compact
@@ -339,7 +342,7 @@ Compact 进行中时，TUI 只用 live box 顶部状态表达进度：
 - 自动 compact 统一移动到 provider request preflight。
 - 移除 turn commit 后的自动 compact 检查；不保留过渡期的双触发。
 - 手动 `/compact` 也复用同一个 planner，只是不检查 `auto_compact_ctx_ratio`。
-- 现有 `compact_session_checkpoint` 的 summary 生成、checkpoint hash、recap/finalize 衔接思路可以复用，但需要升级为新 schema；旧 `compaction_checkpoint.yaml` 文件不迁移。tail selection 需要从“返回一个message index”重构为“返回 provider context projection”。
+- `compact_session_checkpoint` 保留 summary 生成与 checkpoint hash，checkpoint 升级为 summary-only schema；旧 `compaction_checkpoint.yaml` 文件不迁移。Recap/Finalize 使用独立共享 checkpoint。tail selection 需要从“返回一个message index”重构为“返回 provider context projection”。
 - 旧 `compacted_until` 兼容读取为 `frontier.committed_message_until`。
 
 ## 验收标准
@@ -361,8 +364,8 @@ Compact 进行中时，TUI 只用 live box 顶部状态表达进度：
 - compaction summary 使用结构化 JSON 输出；整轮没有可消费输出、JSON parse 或 shape error 均按 `[agent.llm].retry_count` 限制业务重试。
 - 主会话和 delegation 的 compaction summary 请求优先携带完整工具结果；完整请求超限后依次降级为“大型结果省略”和“全部结果省略”，canonical transcript 始终保留原文。
 - 全部 tool result 省略后仍超限则不调用 provider，也不推进 compaction frontier。每次 JSON retry 同样按最终请求重新执行保守预算检查。
-- 对同时包含 committed summary 与 recap 的 compact，先只构造并完成 summary 的本地预算预检；预检失败时两类 provider 请求均不启动。预检通过后 summary 与 recap 可以并发执行；任一实际调用失败时都不提交 checkpoint 或推进指针。
-- 推进 committed compact frontier / `recapped_until` 时，summary 与 recap/finalize 侧必须同时成功；手动 `/compact` 与自动 preflight compact 遵循同一原子提交语义。
+- 对包含 committed summary 的 compact，先完成 summary 的本地预算预检；预检失败时不调用 summary provider，也不投递 Recap。预检通过后异步投递 Recap，summary 与后台 recap 可以并发执行并独立提交各自 cursor。
+- Summary 成功独立推进 committed compact frontier；后台 Recap/Finalize 成功独立推进 `recapped_until`。手动 `/compact` 与自动 preflight compact 遵循相同语义。
 - 自动 compact 只在 provider request preflight 触发，不再依赖 turn commit 后的单独检查。
 - 旧 `session.yaml.compaction` 可迁移；旧 `compaction_checkpoint.yaml` 不兼容、不恢复。
 - current user anchor 超过 hard budget 时，TUI 显示明确错误提示，不截断用户请求。
@@ -432,7 +435,7 @@ Todo:
 - 单元测试覆盖 provider-safe segment 不切开 tool_use/tool_result。
 - 单元测试覆盖 no-op：无新 `summary_inputs` 时返回 no-op。
 
-### Phase 3: Summary 生成、Retry 与原子提交
+### Phase 3: Summary 生成、Retry 与独立提交
 
 进入本阶段前重新读取本 PRD。
 
@@ -440,17 +443,17 @@ Todo:
 
 - 升级 compaction summarizer 输出结构化 JSON：`committed_summary` 与 `active_turn_summary` 两个 key 必须存在。
 - 整轮没有可消费输出、JSON parse 或 shape error 使用独立的业务 retry budget，并受 `[agent.llm].retry_count` 限制。
-- retry 耗尽时 compact 失败，不移动 compaction / recap 指针。
-- compact summary 与 recap/finalize 侧原子提交：二者同时成功后才移动`frontier.committed_message_until` 与 `recapped_until`。
-- 手动 `/compact` 和自动 preflight compact 共用同一原子提交语义。
+- retry 耗尽时 summary compact 失败，不移动 compaction frontier；已经投递的 Recap 保持独立。
+- compact summary 通过 summary-only checkpoint 提交 `frontier.committed_message_until`；Recap/Finalize 通过共享 checkpoint 独立推进 `recapped_until`。
+- 手动 `/compact` 和自动 preflight compact 共用同一 summary 提交及 Recap 投递语义。
 - Active-only compact 不进入 recap/finalize，只更新 `active_turn_summary` 与 `frontier.active_turn`。
 - turn 成功 commit 后清空 `active_turn` 与 `active_turn_summary`，不归一化到 committed frontier。
 
 验收:
 
 - summary JSON 字段缺失、类型错误、非法 JSON 均触发 retry；超过 retry 后失败。
-- summary 成功但 recap 失败时，不移动任何相关指针。
-- recap 成功但 metadata commit 失败时，可通过 checkpoint/recovery 避免半推进。
+- summary 成功但 recap 失败时，保留已推进的 compaction frontier，`recapped_until` 留待后续 Recap/Finalize。
+- recap 成功但 summary 失败时，允许独立推进 `recapped_until`；summary frontier 保持不变。
 - active-only compact 不移动 `recapped_until`。
 - turn commit 后 active cursor / summary 被清空，`messages.jsonl` 保持完整 turn。
 
@@ -504,7 +507,7 @@ Todo:
 
 Todo:
 
-- 为新 schema、迁移、planner、summary retry、原子提交、preflight hook、TUI 文案补测试。
+- 为新 schema、迁移、planner、summary retry、summary-only 提交、preflight hook、TUI 文案补测试。
 - 运行 `cargo fmt`。
 - 运行完整 verify skill 流程：`cargo clippy -- -D warnings && cargo test && cargo check`。
 - 运行 TUI smoke test with tmux。
@@ -525,7 +528,7 @@ Todo:
 - 使用 code-review skill 检查：
   - schema / metadata / cleanup compatibility。
   - planner / tail selector / provider context。
-  - summary retry / checkpoint / recap 原子提交。
+  - summary retry / summary-only checkpoint / Recap 独立提交。
   - TUI / CLI 行为。
 
 验收:

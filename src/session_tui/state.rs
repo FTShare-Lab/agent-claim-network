@@ -121,7 +121,6 @@ pub(super) struct ContributionSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ContributionKind {
     Inbox,
-    Compact,
     Finalize,
 }
 
@@ -524,28 +523,16 @@ impl SessionTuiState {
                 }
                 self.status = SessionRuntimeStatus::Compacting;
                 self.transcript.set_activity(None);
+                self.network.clear_last_contribution();
             }
-            SessionEvent::CompactionCompleted {
-                compacted_until: _,
-                recapped_until: _,
-                new_claim_ids,
-                updated_claim_ids,
-                new_dispute_ids,
-            } => {
+            SessionEvent::CompactionCompleted { compacted_until: _ } => {
                 if self.turn_in_flight {
                     self.status = SessionRuntimeStatus::Running;
                     self.foreground_task_started_at = Some(Instant::now());
                 }
                 self.transcript.set_activity(None);
-                self.network.last_contribution = Some(ContributionSnapshot {
-                    kind: ContributionKind::Compact,
-                    processed: None,
-                    new_claims: new_claim_ids.len(),
-                    updated_claims: updated_claim_ids.len(),
-                    deprecated_claims: 0,
-                    new_disputes: new_dispute_ids.len(),
-                });
             }
+            SessionEvent::RecapRequested { .. } => {}
             SessionEvent::CompactionFailed { error } => {
                 self.status = SessionRuntimeStatus::Error;
                 self.foreground_task_started_at = None;

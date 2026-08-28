@@ -2020,6 +2020,7 @@ impl AgentTurnLoop {
             runtime_chain_id: Some(runtime_chain_id),
             runtime_fallback_scope: Some(runtime_fallback_scope.clone()),
             recovery_interrupt: provider_recovery_interrupt.cloned(),
+            allow_continuation: true,
             retry_count_override: None,
         };
         let streaming_result = self
@@ -2113,6 +2114,7 @@ impl AgentTurnLoop {
                         runtime_chain_id: None,
                         runtime_fallback_scope: None,
                         recovery_interrupt: provider_recovery_interrupt.cloned(),
+                        allow_continuation: true,
                         // TUI 的 N/5 必须严格对应一次 provider-call attempt，禁止 adapter 再嵌套 retry。
                         retry_count_override: Some(0),
                     };

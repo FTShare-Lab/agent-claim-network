@@ -25,18 +25,15 @@ pub(super) fn preflight_session_event_to_turn_event(
             recap_start_index,
             recap_end_index,
         }),
-        SessionEvent::CompactionCompleted {
-            compacted_until,
-            recapped_until,
-            new_claim_ids,
-            updated_claim_ids,
-            new_dispute_ids,
-        } => Some(SessionTurnEvent::CompactionCompleted {
-            compacted_until,
-            recapped_until,
-            new_claim_ids,
-            updated_claim_ids,
-            new_dispute_ids,
+        SessionEvent::CompactionCompleted { compacted_until } => {
+            Some(SessionTurnEvent::CompactionCompleted { compacted_until })
+        }
+        SessionEvent::RecapRequested {
+            session_id,
+            recap_end_index,
+        } => Some(SessionTurnEvent::RecapRequested {
+            session_id,
+            recap_end_index,
         }),
         SessionEvent::CompactionFailed { error } => {
             Some(SessionTurnEvent::CompactionFailed { error })
@@ -199,10 +196,11 @@ pub enum SessionEvent {
     },
     CompactionCompleted {
         compacted_until: usize,
-        recapped_until: usize,
-        new_claim_ids: Vec<ClaimId>,
-        updated_claim_ids: Vec<ClaimId>,
-        new_dispute_ids: Vec<DisputeId>,
+    },
+    /// 请求 TUI 将冻结 target 的 recap 异步投递给 supervisor。
+    RecapRequested {
+        session_id: SessionId,
+        recap_end_index: usize,
     },
     CompactionFailed {
         error: String,

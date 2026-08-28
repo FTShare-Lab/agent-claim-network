@@ -1198,12 +1198,8 @@ fn network_status_lines(state: &SessionTuiState, width: u16) -> Vec<Line<'static
                     Span::raw(contribution.new_disputes.to_string()),
                 ])
             }
-            ContributionKind::Compact | ContributionKind::Finalize => {
-                let label = match contribution.kind {
-                    ContributionKind::Compact => "compact",
-                    ContributionKind::Finalize => "finalize",
-                    ContributionKind::Inbox => unreachable!("Inbox contribution handled above"),
-                };
+            ContributionKind::Finalize => {
+                let label = "finalize";
                 Line::from(vec![
                     Span::styled(
                         format!("{label} · claims +"),

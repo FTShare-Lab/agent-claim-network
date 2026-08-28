@@ -314,6 +314,8 @@ pub struct ProviderRequest {
     pub runtime_fallback_scope: Option<ProviderRuntimeFallbackScope>,
     /// 只阻止尚未开始的 retry、continuation 与 fallback；不能取消当前正常 request。
     pub recovery_interrupt: Option<ProviderRecoveryInterrupt>,
+    /// 是否允许 adapter 在 max-token partial 后自动发起 continuation 请求。
+    pub allow_continuation: bool,
     /// 覆盖 adapter 内部的额外 HTTP retry 次数；`None` 使用 provider 配置。
     pub retry_count_override: Option<u32>,
 }

@@ -171,6 +171,7 @@ impl MemoryReviewLoop {
             runtime_chain_id: Some(runtime.chain_id),
             runtime_fallback_scope: Some(runtime.fallback_scope.clone()),
             recovery_interrupt: None,
+            allow_continuation: true,
             retry_count_override: None,
         };
         let mut attempt = 0;

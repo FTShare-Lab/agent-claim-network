@@ -2,6 +2,8 @@
 
 > 状态：阶段 0–15 已完成（2026-08-07）。本文定义 Anthropic Messages thinking/reasoning 的请求、解析、私有落盘、resume、工具回环、compaction 与原样回传边界，并同时把 OpenAI Responses replay 从“仅协议”收紧为“协议 + model + 连续 replay 世代”。Reasoning 的 TUI 展示与 OpenAI Chat reasoning 不在本期范围内。
 
+> 2026-08-27 补充：本文的 Reasoning/replay 与 provider-triggered compaction 边界继续有效；compact recap 已由 [PRD_recap_in_supervisor.md](PRD_recap_in_supervisor.md) 改为异步 Supervisor job。Summary 失败仍阻断当前 context recovery，Recap 失败不再阻断或回滚 summary。
+
 ## 1. 背景与现状
 
 ACN 的主对话 provider 当前支持：
@@ -254,9 +256,9 @@ Anthropic 将 `model_context_window_exceeded` 定义为成功响应中的有效�
 4. partial canonical text、完整 Anthropic replay、内部 continuation 与恢复计数只存在于当前 turn 的 in-flight 状态；最终成功前不写入 canonical `messages.jsonl`。
 5. 下一次 provider request 必须以显式 `ContextWindowExceeded` preflight 原因进入现有 active-turn compactor，绕过普通 ratio 触发判断，但继续使用既有 `tail_target_ctx_ratio`、`tail_hard_ctx_ratio`、安全投影、Reasoning 排除和 checkpoint 机制。
 6. 最近一次被截断的 assistant raw blocks 及紧随其后的内部 continuation 必须作为未 compact tail 原样保留；不能把需要回传的 thinking/signature/redacted data 改写进 summary，也不能生成伪造 reasoning。
-7. forced preflight 没有可压缩范围、压缩后请求没有实际缩小、投影仍超 hard budget、summary/recap 失败或恢复次数耗尽时，本轮返回清晰错误，不以原请求继续碰撞上游。
+7. forced preflight 没有可压缩范围、压缩后请求没有实际缩小、投影仍超 hard budget、summary 失败或恢复次数耗尽时，本轮返回清晰错误，不以原请求继续碰撞上游；异步 Recap 失败不阻断 context recovery。
 8. 最终获得 `Done` 后才合并 canonical assistant text、完整 provider replay 与本轮工具历史，并通过既有 commit gate 一次性提交；恢复失败、取消或进程退出后，resume 仍只恢复此前 committed 历史。
-9. forced compaction 若覆盖此前 committed history，沿用现有原子 `summary + recap`；recap 只读取已经落盘的 committed `session_messages`。若只压缩当前 active turn，则只生成 active-turn summary，不执行 recap。
+9. forced compaction 若覆盖此前 committed history，summary 独立提交并异步投递 Supervisor Recap；recap 只读取已经落盘的 committed `session_messages`。若只压缩当前 active turn，则只生成 active-turn summary，不投递 recap。
 10. 当前 user、partial assistant、内部 continuation 与 Reasoning 均不进入 recap。即使后续恢复失败，已经成功完成的 committed-history compaction/recap 可以保留；失败 turn 的 active compaction 必须按现有收束逻辑清理。
 11. 不新增 Reasoning TUI 展示、不把 partial thinking 作为 text delta；用户可见 text、工具和既有 compaction 状态事件继续复用当前 TUI 管线。
 
@@ -634,13 +636,13 @@ review 必须包含本地多轮审查和独立只读 reviewer。对真实存在�
 1. 为 turn-loop preflight 增加显式 provider context recovery 原因；普通自动 compact 继续按 ratio，恢复模式按 P4 最终拍板处理。
 2. 建立独立 in-flight accumulator，保存 partial canonical text、Anthropic replay messages、内部 continuation、工具回环和 P5 恢复计数。
 3. 复用 active-turn compactor，从第一次 context-stop assistant 建立稳定边界，持续保护其后的完整 partial/continuation/tool raw tail；无进展、超预算、重复耗尽和 compaction 失败均停止恢复。
-4. 按已确认边界处理 committed `summary + recap` 与 active-only summary；Reasoning 和未提交 turn 不进入 recap。
+4. 按已确认边界处理 committed summary 与异步 Recap、active-only summary；Reasoning 和未提交 turn 不进入 recap。
 5. 按 P6 最终拍板处理完整 tool use；最终成功才把合并 canonical/replay 原子提交。
 
 阶段验收：
 
 - context stop → forced compact → continuation → Done 的完整路径只提交一轮 canonical user/assistant，replay 顺序完整。
-- compaction 禁用、无可压缩历史、summary/recap 失败、重复耗尽、取消和进程退出均不提交 partial turn。
+- compaction 禁用、无可压缩历史、summary 失败、重复耗尽、取消和进程退出均不提交 partial turn；后台 Recap 失败不影响 summary 或 partial-turn gate。
 - committed-history compaction/recap 可在后续 turn 失败时保留；active compaction 被清理，resume 只恢复旧 committed 历史。
 - max-token continuation、普通工具循环和正常 preflight auto compact 不回归。
 
@@ -653,7 +655,7 @@ review 必须包含本地多轮审查和独立只读 reviewer。对真实存在�
 
 阶段 13 实施证据：
 
-- deterministic 覆盖 JSON/SSE context partial、thinking-only、完整工具、两次独立恢复上限、fallback attempt 中途转 recovery、`auto_compact_ctx_ratio = 0.0`、active-only summary、committed `summary + recap`、最近 raw replay 尾段保护、无安全范围和最终可见文本合并。
+- deterministic 覆盖 JSON/SSE context partial、thinking-only、完整工具、两次独立恢复上限、fallback attempt 中途转 recovery、`auto_compact_ctx_ratio = 0.0`、active-only summary、committed summary 与 recap 输入边界、最近 raw replay 尾段保护、无安全范围和最终可见文本合并。
 - 完整验证通过：fmt check、all-targets/all-features Clippy `-D warnings`、2068 个 lib tests、全部 bin/integration/example tests 与 all-targets/all-features check；按约定未执行版本一致性脚本。
 - 真实 LLM TUI 使用 Anthropic `claude-haiku-4-5` 与全新 `session_81bd9a92`，连续覆盖计算型 streaming、同会话 replay、真实 `file_read` 工具回环、工具后下一轮、关闭后 resume。结果为 5 个 committed turn、6 个 streaming delta、1 次完整工具调用、0 次 fallback；6 条 assistant replay 都有 Anthropic thinking block 与非空 signature，两份 stderr 均为空。只统计 block 类型和 signature 存在性，不输出 reasoning 原文。
 - 真实模型没有稳定产生 `model_context_window_exceeded`，因此该确定性终态不冒充真实覆盖，继续由上述本地 JSON/SSE 与 SessionEngine fixture 验收。
@@ -713,7 +715,7 @@ review 必须包含本地多轮审查和独立只读 reviewer。对真实存在�
 | Responses 回归 | 原有 reasoning/item、附件、tool、resume 行为不退化；旧 unbound replay 安全降级 |
 | 历史媒体（阶段 15） | 三个主对话 adapter 的未 compact Image/Document 在下一轮与 resume 中真实发送；compacted prefix 只发送摘要 |
 | Compaction | raw reasoning 不进 summary/Memory/search；当前世代 tail 可 replay；预算不漏算/双算 |
-| Provider-triggered compaction（阶段 11–14） | committed history 正常 summary + recap；active-only 不 recap；最近 partial replay tail 不被 compact；无进展立即失败 |
+| Provider-triggered compaction（阶段 11–14） | committed history 独立 summary 并异步投递 Recap；active-only 不 recap；最近 partial replay tail 不被 compact；无进展立即失败 |
 | 隐私 | TUI/log/journal/error/review 输出不含 raw reasoning、signature、data、key、base64 |
 | TUI | 无新 Reasoning 展示；最终 text/tool/fallback/cancel 行为保持现状 |
 | Router/Chat | Router 仍无 Reasoning；Chat 只补文档、不实现 reasoning_content |

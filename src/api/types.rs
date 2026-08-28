@@ -31,8 +31,7 @@ use serde_json::Value;
 
 use crate::api::ContextUsageSnapshot;
 use crate::claim::{
-    AgentId, Claim, ClaimId, Confidence, Dispute, DisputeId, DisputeResolution, InboxMessage,
-    SessionId,
+    AgentId, Claim, ClaimId, Confidence, Dispute, DisputeResolution, InboxMessage, SessionId,
 };
 use crate::skill::SkillInstructions;
 use crate::tool::diff::FileChange;
@@ -256,10 +255,10 @@ pub enum SessionTurnEvent {
     },
     CompactionCompleted {
         compacted_until: usize,
-        recapped_until: usize,
-        new_claim_ids: Vec<ClaimId>,
-        updated_claim_ids: Vec<ClaimId>,
-        new_dispute_ids: Vec<DisputeId>,
+    },
+    RecapRequested {
+        session_id: SessionId,
+        recap_end_index: usize,
     },
     CompactionSkipped {
         warning: String,

@@ -25,6 +25,7 @@ pub(crate) use inbox::PromptInboxJsonGenerator;
 pub use runner::{
     AgentRunner, InboxProcessReport, TeamServiceConnectionStatus, TeamServicesConnectionStatus,
 };
+pub(crate) use session_engine::SessionRecapPreemptionControl;
 pub use session_engine::{
     SessionCompactionNoopReason, SessionCompactionResult, SessionEngine, SessionEngineOptions,
     SessionEvent, SessionFinalizeReport, SessionRuntimeStatus, SessionStartReport,

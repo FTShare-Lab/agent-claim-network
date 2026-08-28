@@ -41,8 +41,9 @@ use super::input_queue::QueuedInput;
 use super::mcp_panel::McpPanelRequest;
 use super::process_panel::{ProcessPanelKeyAction, ProcessTerminationTarget};
 use super::runtime::{
-    spawn_resume_list_worker, spawn_resume_open_worker, spawn_start_worker, CompactWorkerOutcome,
-    FinalizeEnqueueOutcome, McpOperationOutcome, PendingSteerInput, SessionTaskState, WorkerEvent,
+    spawn_recap_enqueue_worker, spawn_resume_list_worker, spawn_resume_open_worker,
+    spawn_start_worker, CompactWorkerOutcome, FinalizeEnqueueOutcome, McpOperationOutcome,
+    PendingSteerInput, SessionTaskState, WorkerEvent,
 };
 use super::session_picker::SessionPickerState;
 use super::slash_command::SlashCommandCatalog;
@@ -62,6 +63,11 @@ const FIRST_DELEGATION_NOTICE_GRACE_SECS: i64 = 60;
 const DELEGATION_NOTICE_PREFIX: &str = "Subagent ";
 const SKILLS_NAME_COL_WIDTH: usize = 28;
 const SKILLS_DESC_COL_WIDTH: usize = 77;
+const RECAP_ENQUEUE_WARNING: &str = "Background recap could not be queued and will retry later.";
+
+pub(super) fn recap_enqueue_warning(result: &anyhow::Result<()>) -> Option<&'static str> {
+    result.as_ref().err().map(|_| RECAP_ENQUEUE_WARNING)
+}
 
 fn is_ctrl_c_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
@@ -561,6 +567,19 @@ impl SessionTuiApp {
                 if !self.session_task.current_task_matches(task_id) {
                     return Ok(false);
                 }
+                if let SessionEvent::RecapRequested {
+                    session_id,
+                    recap_end_index,
+                } = &event
+                {
+                    spawn_recap_enqueue_worker(
+                        self.supervisor.clone(),
+                        session_id.clone(),
+                        *recap_end_index,
+                        self.worker_tx.clone(),
+                    );
+                    return Ok(false);
+                }
                 if let Some(turn_id) = task_id {
                     if let SessionEvent::TurnCommitted { .. } = &event {
                         self.session_task.mark_turn_committed(turn_id);
@@ -807,6 +826,15 @@ impl SessionTuiApp {
                             self.worker_tx.clone(),
                         );
                     }
+                }
+            }
+            WorkerEvent::RecapEnqueueFinished { result } => {
+                if let Some(message) = recap_enqueue_warning(&result) {
+                    self.chat_widget
+                        .handle_session_event(SessionEvent::Warning {
+                            message: message.to_string(),
+                        });
+                    self.tui.render_requester().schedule_render();
                 }
             }
             WorkerEvent::CompactFinished { task_id, result } => {

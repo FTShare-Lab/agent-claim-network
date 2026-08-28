@@ -60,6 +60,7 @@ impl AnthropicMessagesClient {
             tools,
             max_tokens,
             retry_count,
+            true,
             emit,
             false,
             false,
@@ -80,6 +81,7 @@ impl AnthropicMessagesClient {
         tools: Option<Vec<super::protocol::ApiToolDefinition>>,
         max_tokens: u32,
         retry_count: u32,
+        allow_continuation: bool,
         retry_after_partial: bool,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
         observer: &mut super::AnthropicContinuationRequestObserver<'_>,
@@ -91,6 +93,7 @@ impl AnthropicMessagesClient {
             tools,
             max_tokens,
             retry_count,
+            allow_continuation,
             emit,
             false,
             retry_after_partial,
@@ -111,6 +114,7 @@ impl AnthropicMessagesClient {
         tools: Option<Vec<super::protocol::ApiToolDefinition>>,
         max_tokens: u32,
         retry_count: u32,
+        allow_continuation: bool,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
         error_on_unresolved_max_tokens: bool,
         retry_after_partial: bool,
@@ -122,8 +126,13 @@ impl AnthropicMessagesClient {
         let mut last_blocks = Vec::new();
         let mut last_stop_reason = String::from("end_turn");
         let mut replay_messages = Vec::new();
+        let max_continuation_turns = if allow_continuation {
+            MAX_CONTINUATION_TURNS
+        } else {
+            0
+        };
 
-        for round in 0..=MAX_CONTINUATION_TURNS {
+        for round in 0..=max_continuation_turns {
             if recovery_interrupt.is_some_and(ProviderRecoveryInterrupt::is_cancelled) {
                 if last_stop_reason == "max_tokens"
                     && last_response.is_some()
@@ -243,16 +252,16 @@ impl AnthropicMessagesClient {
                 last_stop_reason = "end_turn".into();
                 break;
             }
-            if round == MAX_CONTINUATION_TURNS && error_on_unresolved_max_tokens {
+            if round == max_continuation_turns && error_on_unresolved_max_tokens {
                 return Err(AnthropicError::OutputShape {
                     reason: format!(
                         "assistant max_tokens continuation 超过上限: {}",
-                        MAX_CONTINUATION_TURNS + 1
+                        max_continuation_turns + 1
                     ),
                     raw: merged_text,
                 });
             }
-            if round == MAX_CONTINUATION_TURNS {
+            if round == max_continuation_turns {
                 break;
             }
             let continuation = json!({"role": "user", "content": CONTINUATION_TRIGGER});
@@ -1421,6 +1430,7 @@ mod tests {
                 None,
                 128,
                 0,
+                true,
                 false,
                 &mut |_| {},
                 &mut request_observer,
@@ -1521,6 +1531,7 @@ mod tests {
                 None,
                 32,
                 0,
+                true,
                 false,
                 &mut |_| {},
                 &mut request_observer,

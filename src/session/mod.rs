@@ -22,7 +22,7 @@ use crate::api::{
     ProviderRuntimeChainId, ProviderRuntimeFallbackScope, SessionTurnContentBlock,
     SessionTurnMessage,
 };
-use crate::claim::{AgentId, Claim, ClaimId, Dispute, DisputeId, SessionId, TraceId};
+use crate::claim::{AgentId, Claim, ClaimId, Dispute, SessionId, TraceId};
 use crate::skill::SkillInstructions;
 use crate::storage::{
     paths, read_yaml, write_text_atomic, write_yaml_atomic, FileLockGuard, StorageError,
@@ -182,51 +182,24 @@ pub struct CompactionCheckpoint {
     pub summary_start_index: usize,
     pub summary_end_index: usize,
     pub summary_segment_hash: String,
-    pub recap_start_index: usize,
-    pub recap_end_index: usize,
-    pub recap_segment_hash: String,
     pub summary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn: Option<ActiveTurnCompactionCursor>,
-    #[serde(default)]
-    pub prepared_claims: Vec<Claim>,
-    #[serde(default)]
-    pub prepared_disputes: Vec<Dispute>,
-    #[serde(default)]
-    pub used_claim_ids: Vec<ClaimId>,
-    pub trace_text: String,
-    pub trace_created_at: DateTime<Utc>,
-    pub trace_id: Option<TraceId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub applied_report: Option<CompactionAppliedReport>,
     pub status: CompactionCheckpointStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompactionAppliedReport {
-    pub trace_id: Option<TraceId>,
-    #[serde(default)]
-    pub new_claim_ids: Vec<ClaimId>,
-    #[serde(default)]
-    pub updated_claim_ids: Vec<ClaimId>,
-    #[serde(default)]
-    pub used_claim_ids: Vec<ClaimId>,
-    #[serde(default)]
-    pub new_dispute_ids: Vec<DisputeId>,
-    #[serde(default)]
-    pub warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Open-session Recap 与 Finalize 共用 checkpoint 的落地状态。
 pub enum FinalizeCheckpointStatus {
     Prepared,
     Applied,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Recap/Finalize 共用的单代 checkpoint；物理文件名保留为 `finalize_checkpoint.yaml`。
 pub struct FinalizeCheckpoint {
     pub recap_start_index: usize,
     pub recap_end_index: usize,
@@ -437,7 +410,9 @@ pub struct SessionPaths {
     pub turn_events_jsonl: PathBuf,
     pub compaction_events_jsonl: PathBuf,
     pub compaction_checkpoint_yaml: PathBuf,
+    /// Recap/Finalize 共用 checkpoint 的既有物理路径。
     pub finalize_checkpoint_yaml: PathBuf,
+    /// Recap/Finalize 共用的 session 级执行锁。
     pub finalize_lock: PathBuf,
     pub session_lock: PathBuf,
     pub session_events_log: PathBuf,
@@ -2062,24 +2037,6 @@ impl SessionHandle {
         Ok(())
     }
 
-    pub async fn update_compaction_and_recapped_until(
-        &mut self,
-        compaction: SessionCompactionState,
-        recapped_until: usize,
-    ) -> Result<(), SessionStoreError> {
-        let _guard = self.lock_session().await?;
-        let mut compaction = compaction;
-        compaction.normalize_active_turn();
-        self.write_provider_history_file(compaction.provider_history.as_deref())
-            .await?;
-        self.metadata = self.read_metadata_light().await?;
-        self.metadata.compaction = Some(compaction);
-        self.metadata.recapped_until = self.metadata.recapped_until.max(recapped_until);
-        self.metadata.updated_at = Utc::now();
-        write_yaml_atomic(&self.paths.session_yaml, &self.metadata).await?;
-        Ok(())
-    }
-
     pub async fn advance_recapped_until(
         &mut self,
         recapped_until: usize,
@@ -3152,12 +3109,14 @@ frontier:
         )
         .await;
         handle
-            .update_compaction_and_recapped_until(
-                SessionCompactionState::from_committed_summary(1, "summary".into(), Utc::now()),
-                2,
-            )
+            .update_compaction(SessionCompactionState::from_committed_summary(
+                1,
+                "summary".into(),
+                Utc::now(),
+            ))
             .await
             .unwrap();
+        handle.advance_recapped_until(2).await.unwrap();
         handle.mark_finalized(Utc::now()).await.unwrap();
 
         handle.mark_open(Utc::now()).await.unwrap();
@@ -3693,12 +3652,14 @@ frontier:
         )
         .await;
         handle
-            .update_compaction_and_recapped_until(
-                SessionCompactionState::from_committed_summary(1, "summary".into(), Utc::now()),
-                2,
-            )
+            .update_compaction(SessionCompactionState::from_committed_summary(
+                1,
+                "summary".into(),
+                Utc::now(),
+            ))
             .await
             .unwrap();
+        handle.advance_recapped_until(2).await.unwrap();
         handle.mark_closed(Utc::now()).await.unwrap();
 
         let reopened = store.reopen_existing_session(&agent, &id).await.unwrap();
@@ -3737,12 +3698,14 @@ frontier:
         )
         .await;
         handle
-            .update_compaction_and_recapped_until(
-                SessionCompactionState::from_committed_summary(1, "summary".into(), Utc::now()),
-                2,
-            )
+            .update_compaction(SessionCompactionState::from_committed_summary(
+                1,
+                "summary".into(),
+                Utc::now(),
+            ))
             .await
             .unwrap();
+        handle.advance_recapped_until(2).await.unwrap();
         let checkpoint = FinalizeCheckpoint {
             recap_start_index: 0,
             recap_end_index: 2,

@@ -44,6 +44,8 @@ pub(crate) struct LocalFsMaintainerUploadQueue {
     path: PathBuf,
     lock_path: PathBuf,
     lock: Mutex<()>,
+    delivery_lock_path: PathBuf,
+    delivery_lock: Mutex<()>,
 }
 
 impl LocalFsMaintainerUploadQueue {
@@ -53,6 +55,8 @@ impl LocalFsMaintainerUploadQueue {
             path: paths::agent_home_pending_maintainer_uploads_path(&agent_home),
             lock_path: paths::agent_home_pending_maintainer_uploads_lock_path(&agent_home),
             lock: Mutex::new(()),
+            delivery_lock_path: paths::agent_home_maintainer_upload_delivery_lock_path(&agent_home),
+            delivery_lock: Mutex::new(()),
         }
     }
 
@@ -102,6 +106,44 @@ impl LocalFsMaintainerUploadQueue {
 }
 
 impl AgentRunner {
+    pub(super) async fn stage_maintainer_batch(
+        &self,
+        claims: Vec<Claim>,
+        disputes: Vec<Dispute>,
+    ) -> anyhow::Result<()> {
+        self.stage_maintainer_batch_inner(claims, disputes, false)
+            .await
+    }
+
+    pub(super) async fn stage_maintainer_batch_with_durable_claims(
+        &self,
+        claims: Vec<Claim>,
+        disputes: Vec<Dispute>,
+    ) -> anyhow::Result<()> {
+        self.stage_maintainer_batch_inner(claims, disputes, true)
+            .await
+    }
+
+    async fn stage_maintainer_batch_inner(
+        &self,
+        claims: Vec<Claim>,
+        disputes: Vec<Dispute>,
+        durable_claims: bool,
+    ) -> anyhow::Result<()> {
+        if self.maintainer_client.is_none() {
+            return Ok(());
+        }
+        let _guard = self.maintainer_upload_queue.lock.lock().await;
+        let _file_guard =
+            crate::storage::FileLockGuard::lock_exclusive(&self.maintainer_upload_queue.lock_path)
+                .await?;
+        let merged = self
+            .maintainer_upload_queue
+            .merged_with(claims, disputes, durable_claims)
+            .await?;
+        self.maintainer_upload_queue.write_or_clear(&merged).await
+    }
+
     pub(super) async fn upload_maintainer_batch(
         &self,
         claims: Vec<Claim>,
@@ -129,21 +171,26 @@ impl AgentRunner {
         let Some(maintainer_client) = self.maintainer_client.clone() else {
             return Ok(MaintainerUploadReport::default());
         };
+        // 新批次先进入 durable pending；网络交付再按 agent 单飞。这样后到的新版本可在
+        // 旧请求进行时继续落盘，但不会先于旧请求写入 Maintainer mirror。
+        self.stage_maintainer_batch_inner(claims, disputes, durable_claims)
+            .await?;
+        let _delivery_guard = self.maintainer_upload_queue.delivery_lock.lock().await;
+        let _delivery_file_guard = crate::storage::FileLockGuard::lock_exclusive(
+            &self.maintainer_upload_queue.delivery_lock_path,
+        )
+        .await?;
         let attempted = {
             let _guard = self.maintainer_upload_queue.lock.lock().await;
             let _file_guard = crate::storage::FileLockGuard::lock_exclusive(
                 &self.maintainer_upload_queue.lock_path,
             )
             .await?;
-            let merged = self
-                .maintainer_upload_queue
-                .merged_with(claims, disputes, durable_claims)
-                .await?;
-            if merged.claims.is_empty() && merged.disputes.is_empty() {
+            let pending = self.maintainer_upload_queue.read().await?;
+            if pending.claims.is_empty() && pending.disputes.is_empty() {
                 return Ok(MaintainerUploadReport::default());
             }
-            self.maintainer_upload_queue.write_or_clear(&merged).await?;
-            merged
+            pending
         };
 
         if attempted.claims.is_empty() && attempted.disputes.is_empty() {
@@ -522,6 +569,7 @@ mod tests {
         client_error_claims: Mutex<BTreeSet<String>>,
         unknown_error_claims: Mutex<BTreeSet<String>>,
         uploaded_claims: Mutex<Vec<String>>,
+        uploaded_claim_statements: Mutex<Vec<String>>,
         uploaded_disputes: Mutex<Vec<String>>,
         reported_dispute_attempts: Mutex<Vec<String>>,
         pending_path_to_observe: Mutex<Option<PathBuf>>,
@@ -529,6 +577,9 @@ mod tests {
         pull_retryable: Mutex<bool>,
         pull_auth: Mutex<bool>,
         pull_forbidden: Mutex<bool>,
+        blocked_claim_statement: Mutex<Option<String>>,
+        blocked_upload_started: tokio::sync::Notify,
+        release_blocked_upload: tokio::sync::Notify,
     }
 
     #[async_trait]
@@ -574,6 +625,12 @@ mod tests {
 
         async fn upload_claim(&self, claim: &Claim) -> anyhow::Result<()> {
             let id = claim.id.to_string();
+            let should_block = self.blocked_claim_statement.lock().unwrap().as_deref()
+                == Some(claim.statement.as_str());
+            if should_block {
+                self.blocked_upload_started.notify_one();
+                self.release_blocked_upload.notified().await;
+            }
             let pending_path = self.pending_path_to_observe.lock().unwrap().clone();
             if let Some(path) = pending_path {
                 if fs::try_exists(path).await.unwrap_or(false) {
@@ -616,6 +673,10 @@ mod tests {
                 return Err(anyhow::anyhow!("unknown upload failure"));
             }
             self.uploaded_claims.lock().unwrap().push(id);
+            self.uploaded_claim_statements
+                .lock()
+                .unwrap()
+                .push(claim.statement.clone());
             Ok(())
         }
 
@@ -896,6 +957,74 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["dispute_22222222"]
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_uploads_deliver_same_claim_versions_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let maintainer = Arc::new(TestMaintainerClient::default());
+        *maintainer.blocked_claim_statement.lock().unwrap() = Some("old".into());
+        let old_runner = build_runner(&dir, maintainer.clone());
+        let new_runner = build_runner(&dir, maintainer.clone());
+        let mut old = claim(
+            "claim_11111111",
+            ClaimStatus::Active,
+            "2026-06-22T00:00:00Z",
+        );
+        old.statement = "old".into();
+        let mut new = old.clone();
+        new.statement = "new".into();
+        new.updated_at = Some("2026-06-23T00:00:00Z".parse().unwrap());
+
+        let old_task = tokio::spawn(async move {
+            old_runner
+                .upload_maintainer_batch(vec![old], Vec::new())
+                .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            maintainer.blocked_upload_started.notified(),
+        )
+        .await
+        .expect("old upload should reach the network");
+
+        let new_task = tokio::spawn(async move {
+            new_runner
+                .upload_maintainer_batch(vec![new], Vec::new())
+                .await
+        });
+        let pending_path = paths::agent_home_pending_maintainer_uploads_path(dir.path());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(pending) = read_yaml::<PendingMaintainerUploads>(&pending_path).await {
+                    if pending.claims.iter().any(|claim| claim.statement == "new") {
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("new version should be staged while old upload is in flight");
+        assert!(maintainer
+            .uploaded_claim_statements
+            .lock()
+            .unwrap()
+            .is_empty());
+
+        maintainer.release_blocked_upload.notify_one();
+        old_task.await.unwrap().unwrap();
+        new_task.await.unwrap().unwrap();
+
+        assert_eq!(
+            maintainer
+                .uploaded_claim_statements
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &["old".to_string(), "new".to_string()]
+        );
+        assert!(!fs::try_exists(pending_path).await.unwrap());
     }
 
     #[tokio::test]

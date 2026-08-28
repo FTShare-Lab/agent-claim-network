@@ -5,12 +5,12 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
@@ -18,7 +18,7 @@ use super::super::fs::{
     LocalFsClaimStore, LocalFsInboxReader, LocalFsMemoryStore, LocalFsReportedDisputeClaimSetStore,
 };
 use super::super::inbox::InboxJsonGenerator;
-use super::super::maintainer_upload::LocalFsMaintainerUploadQueue;
+use super::super::maintainer_upload::{LocalFsMaintainerUploadQueue, PendingMaintainerUploads};
 use super::super::runner::AgentRunner;
 use super::{
     active_provider_safe_segments, active_segments_hash, append_acn_md,
@@ -42,9 +42,10 @@ use super::{
     DelegationProjectionBaseline, MainModelContextAppender, ManualCompactionOutcome,
     PreflightCompactionRequest, PreflightCompactor, ProviderContextUsageAnchor,
     ProviderProjectionBudget, SessionCompactionNoopReason, SessionCompactionResult, SessionEngine,
-    SessionEvent, SessionRecapBackgroundProcessProjection, SessionTurnCommittedPostCommitError,
-    TurnJournalEmitter, TurnJournalSink, COMPACTION_CHECKPOINT_SCHEMA_VERSION,
-    DELEGATION_PROJECTION_MAX_CHARS, DELEGATION_PROJECTION_MAX_ITEMS, MEDIA_BLOCK_ESTIMATED_TOKENS,
+    SessionEvent, SessionRecapBackgroundProcessProjection, SessionRecapPreemptionControl,
+    SessionTurnCommittedPostCommitError, TurnJournalEmitter, TurnJournalSink,
+    COMPACTION_CHECKPOINT_SCHEMA_VERSION, DELEGATION_PROJECTION_MAX_CHARS,
+    DELEGATION_PROJECTION_MAX_ITEMS, MEDIA_BLOCK_ESTIMATED_TOKENS,
 };
 use crate::agent::{
     InboxReader, LocalClaimStore, MemoryStore, ReportedDisputeClaimSetStore, SessionRuntimeStatus,
@@ -77,15 +78,15 @@ use crate::prompt::PromptRegistry;
 use crate::router::{AgentQuery, RouterClient, RouterQueryResult, ScopesOverviewSnapshot};
 use crate::session::{
     canonical_user_content_hash, replay_turn_journal, ActiveTurnCompactionCursor,
-    CompactedProviderHistory, CompactionAppliedReport, CompactionCheckpoint,
-    CompactionCheckpointStatus, FinalizeCheckpoint, FinalizeCheckpointStatus, NewSessionMessage,
-    PendingProviderHistoryTurn, SessionCompactionState, SessionContentBlock, SessionMessage,
-    SessionMessageRole, SessionMetadata, SessionStatus, SessionStore, TurnJournalEventKind,
-    TurnJournalFlush, TurnJournalModelContext, TurnJournalNonStreamingFallbackState,
-    TurnJournalProjection, TurnJournalStatus, TurnJournalTurn,
+    CompactedProviderHistory, CompactionCheckpoint, CompactionCheckpointStatus, FinalizeCheckpoint,
+    FinalizeCheckpointStatus, NewSessionMessage, PendingProviderHistoryTurn,
+    SessionCompactionState, SessionContentBlock, SessionMessage, SessionMessageRole,
+    SessionMetadata, SessionStatus, SessionStore, TurnJournalEventKind, TurnJournalFlush,
+    TurnJournalModelContext, TurnJournalNonStreamingFallbackState, TurnJournalProjection,
+    TurnJournalStatus, TurnJournalTurn,
 };
 use crate::skill::{SkillInstructions, SkillSummary};
-use crate::storage::write_yaml_atomic;
+use crate::storage::{paths, write_yaml_atomic, FileLockGuard};
 use crate::tool::{ProcessCompletion, ToolDispatchContext, ToolRegistry};
 use serde_json::json;
 
@@ -505,6 +506,62 @@ struct BlockingAfterFileReadProvider {
     second_call_started: Notify,
 }
 
+struct PreemptibleRecapProvider {
+    calls: AtomicUsize,
+    first_call_started: Notify,
+    first_call_dropped: Arc<AtomicBool>,
+    requests: Mutex<Vec<ProviderRequest>>,
+}
+
+struct FirstRecapCallGuard(Arc<AtomicBool>);
+
+impl Drop for FirstRecapCallGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+impl PreemptibleRecapProvider {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            first_call_started: Notify::new(),
+            first_call_dropped: Arc::new(AtomicBool::new(false)),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    async fn requests(&self) -> Vec<ProviderRequest> {
+        self.requests.lock().await.clone()
+    }
+}
+
+#[async_trait]
+impl ProviderAdapter for PreemptibleRecapProvider {
+    fn emit_preflight_context_estimate(&self) -> bool {
+        false
+    }
+
+    async fn send(
+        &self,
+        request: ProviderRequest,
+        _emit: &mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> anyhow::Result<ProviderResponse> {
+        self.requests.lock().await.push(request);
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                let _guard = FirstRecapCallGuard(Arc::clone(&self.first_call_dropped));
+                self.first_call_started.notify_one();
+                std::future::pending::<anyhow::Result<ProviderResponse>>().await
+            }
+            1 => Ok(provider_response(
+                r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
+            )),
+            call => anyhow::bail!("unexpected preemptible recap provider call {call}"),
+        }
+    }
+}
+
 impl BlockingAfterFileReadProvider {
     fn new() -> Self {
         Self {
@@ -544,58 +601,6 @@ impl ProviderAdapter for BlockingAfterFileReadProvider {
             }
             call => anyhow::bail!("unexpected provider call {call}"),
         }
-    }
-}
-
-/// 用于验证 compact 与 recap 在预算预检通过后会同时开始。
-/// 摘要请求必须等到 recap 请求已进入 provider；若实现退回串行，该请求会超时。
-struct ConcurrentCompactionRecapProvider {
-    recap_started: Notify,
-    calls: AtomicUsize,
-}
-
-impl ConcurrentCompactionRecapProvider {
-    fn new() -> Self {
-        Self {
-            recap_started: Notify::new(),
-            calls: AtomicUsize::new(0),
-        }
-    }
-}
-
-#[async_trait]
-impl ProviderAdapter for ConcurrentCompactionRecapProvider {
-    fn emit_preflight_context_estimate(&self) -> bool {
-        false
-    }
-
-    async fn send(
-        &self,
-        request: ProviderRequest,
-        _emit: &mut (dyn FnMut(ProviderEvent) + Send),
-    ) -> anyhow::Result<ProviderResponse> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        if request.system_prompt.contains("session 历史压缩")
-            || request.system_prompt.contains("committed_summary")
-        {
-            tokio::time::timeout(Duration::from_secs(5), self.recap_started.notified())
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!("recap provider request did not start concurrently")
-                })?;
-            return Ok(provider_response(
-                r#"{"committed_summary":"old turn summarized","active_turn_summary":null}"#,
-            ));
-        }
-        if request.system_prompt.contains("复盘阶段")
-            || request.system_prompt.contains("new_claims")
-        {
-            self.recap_started.notify_one();
-            return Ok(provider_response(
-                r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
-            ));
-        }
-        anyhow::bail!("unexpected provider request in compaction concurrency test")
     }
 }
 
@@ -718,6 +723,47 @@ impl MaintainerClient for NoopMaintainerClient {
     }
 }
 
+struct PendingBeforeLedgerReportedDisputeStore {
+    pending_path: PathBuf,
+    inner: LocalFsReportedDisputeClaimSetStore,
+}
+
+impl PendingBeforeLedgerReportedDisputeStore {
+    fn new(agent_home: PathBuf) -> Self {
+        Self {
+            pending_path: paths::agent_home_pending_maintainer_uploads_path(&agent_home),
+            inner: LocalFsReportedDisputeClaimSetStore::new(agent_home),
+        }
+    }
+}
+
+#[async_trait]
+impl ReportedDisputeClaimSetStore for PendingBeforeLedgerReportedDisputeStore {
+    async fn contains_claim_set(&self, claims: &[ClaimId]) -> anyhow::Result<bool> {
+        self.inner.contains_claim_set(claims).await
+    }
+
+    async fn record_claim_set(
+        &self,
+        claims: &[ClaimId],
+        dispute_id: &DisputeId,
+        reported_at: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let pending: PendingMaintainerUploads =
+            crate::storage::read_yaml(&self.pending_path).await?;
+        anyhow::ensure!(
+            pending
+                .disputes
+                .iter()
+                .any(|dispute| dispute.id == *dispute_id),
+            "dispute ledger must be recorded only after durable pending staging"
+        );
+        self.inner
+            .record_claim_set(claims, dispute_id, reported_at)
+            .await
+    }
+}
+
 struct NoopDelegationExecutor;
 
 #[async_trait]
@@ -746,6 +792,25 @@ fn response_step(text: &str, events: Vec<ProviderEvent>) -> ProviderStep {
     ProviderStep::Response {
         response: provider_response(text),
         events,
+    }
+}
+
+fn prepared_empty_finalize_checkpoint(
+    recap_start_index: usize,
+    recap_end_index: usize,
+    recap_segment_hash: String,
+) -> FinalizeCheckpoint {
+    FinalizeCheckpoint {
+        recap_start_index,
+        recap_end_index,
+        recap_segment_hash,
+        prepared_claims: Vec::new(),
+        prepared_disputes: Vec::new(),
+        used_claim_ids: Vec::new(),
+        trace_text: "prepared recap trace".into(),
+        trace_created_at: Utc::now(),
+        trace_id: None,
+        status: FinalizeCheckpointStatus::Prepared,
     }
 }
 
@@ -791,10 +856,6 @@ fn tool_use_step(id: &str, name: &str, input: serde_json::Value) -> ProviderStep
         },
         events: Vec::new(),
     }
-}
-
-fn json_by_request_kind_step(compaction_text: &str, recap_text: &str) -> ProviderStep {
-    json_by_request_kind_responses(&[compaction_text], &[recap_text])
 }
 
 fn json_by_request_kind_responses(compaction_texts: &[&str], recap_texts: &[&str]) -> ProviderStep {
@@ -1238,10 +1299,31 @@ fn build_test_engine_with_team_mode(
     let agent = AgentId::new("agent-a").unwrap();
     let agents_root = dir.path().join("agents");
     let agent_home = agents_root.join(agent.as_str());
+    let reported_store: Arc<dyn ReportedDisputeClaimSetStore> =
+        Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home));
+    build_test_engine_with_team_mode_and_reported_store(
+        dir,
+        provider,
+        tools,
+        available_skills,
+        team_services_configured,
+        reported_store,
+    )
+}
+
+fn build_test_engine_with_team_mode_and_reported_store(
+    dir: &tempfile::TempDir,
+    provider: Arc<dyn ProviderAdapter>,
+    tools: Arc<ToolRegistry>,
+    available_skills: Vec<SkillSummary>,
+    team_services_configured: bool,
+    reported_store: Arc<dyn ReportedDisputeClaimSetStore>,
+) -> (SessionEngine, SessionStore) {
+    let agent = AgentId::new("agent-a").unwrap();
+    let agents_root = dir.path().join("agents");
+    let agent_home = agents_root.join(agent.as_str());
     let claim_store: Arc<dyn LocalClaimStore> =
         Arc::new(LocalFsClaimStore::new(agent_home.clone()));
-    let reported_store: Arc<dyn ReportedDisputeClaimSetStore> =
-        Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home.clone()));
     let inbox: Arc<dyn InboxReader> = Arc::new(LocalFsInboxReader::new(agent_home.clone()));
     let memory_store: Arc<dyn MemoryStore> = Arc::new(LocalFsMemoryStore::new(
         agent_home.clone(),
@@ -1326,6 +1408,26 @@ fn build_test_engine_with_team_mode(
     )
     .with_session_metadata("test", "test-model");
     (engine, store)
+}
+
+fn build_test_engine_with_reported_store(
+    dir: &tempfile::TempDir,
+    provider: Arc<dyn ProviderAdapter>,
+    reported_store: Arc<dyn ReportedDisputeClaimSetStore>,
+) -> (SessionEngine, SessionStore) {
+    let tool_config = ToolConfig {
+        workspace_root: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let tools = Arc::new(ToolRegistry::new(&tool_config).unwrap());
+    build_test_engine_with_team_mode_and_reported_store(
+        dir,
+        provider,
+        tools,
+        Vec::new(),
+        true,
+        reported_store,
+    )
 }
 
 async fn create_test_session(store: &SessionStore, id: &str) -> crate::session::SessionHandle {
@@ -3077,7 +3179,7 @@ async fn context_window_recovery_respects_disabled_auto_compaction_without_commi
 }
 
 #[tokio::test]
-async fn context_window_recovery_compacts_and_recaps_only_committed_history() {
+async fn context_window_recovery_compacts_and_requests_recap_only_for_committed_history() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(vec![
         ProviderStep::Response {
@@ -3088,9 +3190,11 @@ async fn context_window_recovery_compacts_and_recaps_only_committed_history() {
             ),
             events: Vec::new(),
         },
-        json_by_request_kind_step(
-            r#"{"committed_summary":"Older committed work was summarized.","active_turn_summary":null}"#,
-            r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
+        json_by_request_kind_responses(
+            &[
+                r#"{"committed_summary":"Older committed work was summarized.","active_turn_summary":null}"#,
+            ],
+            &[],
         ),
         ProviderStep::Response {
             response: anthropic_response("DONE", ProviderStop::Done, "committed-history-final"),
@@ -3117,13 +3221,16 @@ async fn context_window_recovery_compacts_and_recaps_only_committed_history() {
         .await
         .unwrap();
 
+    let mut events = Vec::new();
     engine
-        .run_turn(&mut session, "finish after committed compaction", |_| {})
+        .run_turn(&mut session, "finish after committed compaction", |event| {
+            events.push(event)
+        })
         .await
         .unwrap();
 
     let requests = provider.requests().await;
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 3);
     let compaction_request = requests
         .iter()
         .find(|request| request.system_prompt.contains("committed_summary"))
@@ -3131,21 +3238,23 @@ async fn context_window_recovery_compacts_and_recaps_only_committed_history() {
     assert!(serde_json::to_string(&compaction_request.messages)
         .unwrap()
         .contains("OLDER_COMMITTED_USER_ONE"));
-    let recap_request = requests
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::RecapRequested {
+            recap_end_index: 4,
+            ..
+        }
+    )));
+    assert!(requests
         .iter()
-        .find(|request| request.system_prompt.contains("new_claims"))
-        .expect("recap request");
-    let recap_request = serde_json::to_string(&recap_request.messages).unwrap();
-    assert!(recap_request.contains("OLDER_COMMITTED_USER_ONE"));
-    assert!(!recap_request.contains("CURRENT-PARTIAL"));
-    assert!(!recap_request.contains("private-committed-history-context"));
-    let final_request = serde_json::to_string(&requests[3].messages).unwrap();
+        .all(|request| !request.system_prompt.contains("new_claims")));
+    let final_request = serde_json::to_string(&requests[2].messages).unwrap();
     assert!(final_request.contains("Older committed work was summarized."));
     assert!(final_request.contains("CURRENT-PARTIAL"));
     assert!(final_request.contains("private-committed-history-context"));
 
     let metadata = session.read_metadata().await.unwrap();
-    assert_eq!(metadata.recapped_until, 4);
+    assert_eq!(metadata.recapped_until, 0);
     let compaction = metadata.compaction.unwrap();
     assert_eq!(compaction.committed_message_until(), 4);
     assert!(compaction.active_turn_summary.is_none());
@@ -3835,10 +3944,14 @@ async fn cancelled_uncompacted_turn_replays_write_ahead_provider_window_after_re
 #[tokio::test]
 async fn preflight_compaction_summarizes_oversized_previous_turn_instead_of_failing() {
     let dir = tempfile::tempdir().unwrap();
-    let provider = Arc::new(RecordingProvider::new(vec![json_by_request_kind_step(
-        r#"{"committed_summary": "older committed context summarized", "active_turn_summary": null}"#,
-        r#"{"new_claims": [], "used_claim_ids": [], "new_disputes": []}"#,
-    )]));
+    let provider = Arc::new(RecordingProvider::new(vec![
+        json_by_request_kind_responses(
+            &[
+                r#"{"committed_summary": "older committed context summarized", "active_turn_summary": null}"#,
+            ],
+            &[],
+        ),
+    ]));
     let (mut engine, store) = build_test_engine(&dir, provider);
     engine.context_window = 10_000;
     engine.compaction.tail_target_ctx_ratio = 0.001;
@@ -3879,13 +3992,20 @@ async fn preflight_compaction_summarizes_oversized_previous_turn_instead_of_fail
     let metadata = session.read_metadata().await.unwrap();
     let compaction = metadata.compaction.unwrap();
     assert_eq!(compaction.committed_message_until(), 4);
-    assert_eq!(metadata.recapped_until, 4);
+    assert_eq!(metadata.recapped_until, 0);
     assert!(events
         .iter()
         .any(|event| matches!(event, SessionTurnEvent::CompactionStarted { .. })));
     assert!(events
         .iter()
         .any(|event| matches!(event, SessionTurnEvent::CompactionCompleted { .. })));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionTurnEvent::RecapRequested {
+            recap_end_index: 4,
+            ..
+        }
+    )));
 }
 
 fn oversized_active_suffix(
@@ -4174,10 +4294,7 @@ async fn auto_compaction_failure_continues_with_raw_history_when_request_still_f
         summary = serde_json::to_string(&overlong).unwrap()
     );
     let provider = Arc::new(RecordingProvider::new(vec![
-        json_by_request_kind_responses(
-            &[&response, &response],
-            &[r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#],
-        ),
+        json_by_request_kind_responses(&[&response, &response], &[]),
         response_step("continued with full history", Vec::new()),
     ]));
     let (mut engine, store) = build_test_engine(&dir, provider.clone());
@@ -4212,8 +4329,8 @@ async fn auto_compaction_failure_continues_with_raw_history_when_request_still_f
         .expect("raw request still fits and should continue");
 
     let requests = provider.requests().await;
-    assert_eq!(requests.len(), 4);
-    let final_request = serde_json::to_string(&requests[3].messages).unwrap();
+    assert_eq!(requests.len(), 3);
+    let final_request = serde_json::to_string(&requests[2].messages).unwrap();
     assert!(final_request.contains("old request"));
     assert!(final_request.contains("continue safely"));
     assert!(events.iter().any(|event| matches!(
@@ -4234,7 +4351,7 @@ async fn auto_compaction_failure_continues_with_raw_history_when_request_still_f
     let history = compaction.provider_history.as_ref().unwrap();
     assert!(history.pending_turn.is_none());
     assert_eq!(history.canonical_message_until, metadata.message_count);
-    assert!(history.messages.starts_with(&requests[3].messages));
+    assert!(history.messages.starts_with(&requests[2].messages));
     assert!(session
         .read_compaction_checkpoint()
         .await
@@ -4272,7 +4389,7 @@ async fn auto_compaction_provider_failure_continues_with_raw_history_when_reques
         .expect("a recoverable compaction provider failure should not abort a safe raw request");
 
     let requests = provider.requests().await;
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 2);
     assert!(events.iter().any(|event| matches!(
         event,
         SessionEvent::Warning { message }
@@ -4292,7 +4409,7 @@ async fn auto_compaction_provider_failure_continues_with_raw_history_when_reques
     let history = compaction.provider_history.as_ref().unwrap();
     assert!(history.pending_turn.is_none());
     assert_eq!(history.canonical_message_until, metadata.message_count);
-    assert!(history.messages.starts_with(&requests[2].messages));
+    assert!(history.messages.starts_with(&requests[1].messages));
 }
 
 #[tokio::test]
@@ -4304,7 +4421,7 @@ async fn auto_compaction_projection_failure_continues_raw_when_full_request_stil
                 r#"{"committed_summary":"short summary","active_turn_summary":null}"#,
                 r#"{"committed_summary":"tiny","active_turn_summary":null}"#,
             ],
-            &[r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#],
+            &[],
         ),
         response_step("continued after hard-tail failure", Vec::new()),
     ]));
@@ -4335,8 +4452,8 @@ async fn auto_compaction_projection_failure_continues_raw_when_full_request_stil
         .expect("the full raw request fits even though the compact hard-tail projection does not");
 
     let requests = provider.requests().await;
-    assert_eq!(requests.len(), 4);
-    let final_request = serde_json::to_string(&requests[3].messages).unwrap();
+    assert_eq!(requests.len(), 3);
+    let final_request = serde_json::to_string(&requests[2].messages).unwrap();
     assert!(final_request.contains("old request"));
     assert!(final_request.contains(&current_request));
     assert!(events.iter().any(|event| matches!(
@@ -4358,7 +4475,7 @@ async fn auto_compaction_projection_failure_continues_raw_when_full_request_stil
     let history = compaction.provider_history.as_ref().unwrap();
     assert!(history.pending_turn.is_none());
     assert_eq!(history.canonical_message_until, metadata.message_count);
-    assert!(history.messages.starts_with(&requests[3].messages));
+    assert!(history.messages.starts_with(&requests[2].messages));
     assert!(session
         .read_compaction_checkpoint()
         .await
@@ -4375,10 +4492,7 @@ async fn auto_compaction_failure_blocks_when_raw_request_with_output_reserve_doe
         summary = serde_json::to_string(&overlong).unwrap()
     );
     let provider = Arc::new(RecordingProvider::new(vec![
-        json_by_request_kind_responses(
-            &[&response, &response],
-            &[r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#],
-        ),
+        json_by_request_kind_responses(&[&response, &response], &[]),
     ]));
     let (mut engine, store) = build_test_engine(&dir, provider.clone());
     engine.context_window = 6_000;
@@ -4434,7 +4548,7 @@ async fn auto_compaction_failure_blocks_when_raw_request_with_output_reserve_doe
         error.to_string(),
         "Context compaction failed: the generated summary exceeded 10 characters after 2 attempts. Run /compact to retry."
     );
-    assert_eq!(provider.requests().await.len(), 3);
+    assert_eq!(provider.requests().await.len(), 2);
     assert!(events.iter().any(|event| matches!(
         event,
         SessionEvent::TurnFailed { error }
@@ -6104,9 +6218,12 @@ async fn finalize_failure_keeps_unclosed_session_finalizing() {
 }
 
 #[tokio::test]
-async fn finalize_recovered_compaction_checkpoint_requests_success_notification() {
+async fn finalize_recovered_summary_checkpoint_still_runs_recap() {
     let dir = tempfile::tempdir().unwrap();
-    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        r#"{"new_claims": [], "used_claim_ids": [], "new_disputes": []}"#,
+        Vec::new(),
+    )]));
     let (engine, store) = build_test_engine(&dir, provider.clone());
     let mut session = create_test_session(&store, "session_face0003").await;
     let now = Utc::now();
@@ -6132,12 +6249,9 @@ async fn finalize_recovered_compaction_checkpoint_requests_success_notification(
         schema_version: Some(COMPACTION_CHECKPOINT_SCHEMA_VERSION),
         audit_ids: Vec::new(),
         summary_start_index: 0,
-        summary_end_index: 0,
-        summary_segment_hash: super::hash_session_segment(&messages[0..0]).unwrap(),
-        recap_start_index: 0,
-        recap_end_index: messages.len(),
-        recap_segment_hash: super::hash_session_segment(&messages).unwrap(),
-        summary: String::new(),
+        summary_end_index: messages.len(),
+        summary_segment_hash: super::hash_session_segment(&messages).unwrap(),
+        summary: "checkpointed summary".into(),
         active_turn_summary: Some("stale active summary".into()),
         active_turn: Some(ActiveTurnCompactionCursor {
             turn_id: "turn_1".into(),
@@ -6146,13 +6260,6 @@ async fn finalize_recovered_compaction_checkpoint_requests_success_notification(
             safe_until_event_seq: 10,
             source_hash: "stale_hash".into(),
         }),
-        prepared_claims: Vec::new(),
-        prepared_disputes: Vec::new(),
-        used_claim_ids: Vec::new(),
-        trace_text: "checkpointed request".into(),
-        trace_created_at: Utc::now(),
-        trace_id: None,
-        applied_report: None,
         status: CompactionCheckpointStatus::Applied,
     };
     session
@@ -6164,7 +6271,7 @@ async fn finalize_recovered_compaction_checkpoint_requests_success_notification(
 
     assert!(report.advanced_recapped_until);
     assert!(report.finalized_unrecapped_messages);
-    assert!(provider.requests().await.is_empty());
+    assert_eq!(provider.requests().await.len(), 1);
     let metadata = session.read_metadata().await.unwrap();
     assert_eq!(metadata.recapped_until, metadata.message_count);
     assert!(metadata.finalized_at.is_some());
@@ -6202,7 +6309,7 @@ fn no_consumable_compaction_retry_is_hidden_from_tui_but_other_retry_warnings_re
 }
 
 #[tokio::test]
-async fn manual_compact_noop_reports_raw_tail_budget_when_new_history_is_preserved() {
+async fn manual_compact_with_only_recap_backlog_requests_background_recap() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(Vec::new()));
     let (engine, store) = build_test_engine(&dir, provider);
@@ -6215,19 +6322,24 @@ async fn manual_compact_noop_reports_raw_tail_budget_when_new_history_is_preserv
         .await
         .unwrap();
 
+    let mut events = Vec::new();
     let outcome = engine
-        .compact_session_checkpoint(&mut session, |_| {})
+        .compact_session_checkpoint(&mut session, |event| events.push(event))
         .await
         .unwrap();
 
-    assert!(matches!(
-        outcome,
-        SessionCompactionResult::Noop(SessionCompactionNoopReason::RawTailWithinBudget)
-    ));
+    assert!(matches!(outcome, SessionCompactionResult::Compacted(_)));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::RecapRequested {
+            recap_end_index: 2,
+            ..
+        }
+    )));
 }
 
 #[tokio::test]
-async fn manual_compact_noops_when_selected_prefix_contains_only_model_context() {
+async fn manual_compact_context_only_summary_range_still_requests_recap_for_canonical_messages() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(Vec::new()));
     let (engine, store) = build_test_engine(&dir, provider.clone());
@@ -6258,19 +6370,24 @@ async fn manual_compact_noops_when_selected_prefix_contains_only_model_context()
         .await
         .unwrap();
 
+    let mut events = Vec::new();
     let outcome = engine
-        .compact_session_checkpoint(&mut session, |_| {})
+        .compact_session_checkpoint(&mut session, |event| events.push(event))
         .await
         .unwrap();
 
-    assert!(matches!(
-        outcome,
-        SessionCompactionResult::Noop(SessionCompactionNoopReason::RawTailWithinBudget)
-    ));
+    assert!(matches!(outcome, SessionCompactionResult::Compacted(_)));
     assert!(provider.requests().await.is_empty());
     let metadata = session.read_metadata().await.unwrap();
     assert!(metadata.compaction.is_none());
     assert_eq!(metadata.recapped_until, 0);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::RecapRequested {
+            recap_end_index: 5,
+            ..
+        }
+    )));
 }
 
 #[tokio::test]
@@ -6495,7 +6612,459 @@ async fn finalize_context_only_segment_skips_recap_provider_and_advances_cursor(
 }
 
 #[tokio::test]
-async fn manual_compact_applied_checkpoint_preserves_report_and_clears_file_read_state() {
+async fn background_recap_jobs_process_only_the_remaining_message_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        response_step(
+            r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
+            Vec::new(),
+        ),
+        response_step(
+            r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
+            Vec::new(),
+        ),
+    ]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_face0015").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "first request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "first answer"),
+            NewSessionMessage::text(SessionMessageRole::User, "second request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "second answer"),
+        ])
+        .await
+        .unwrap();
+
+    let first = engine
+        .recap_existing_session_until(&session.metadata.id, 2)
+        .await
+        .unwrap();
+    let second = engine
+        .recap_existing_session_until(&session.metadata.id, 4)
+        .await
+        .unwrap();
+    let noop = engine
+        .recap_existing_session_until(&session.metadata.id, 4)
+        .await
+        .unwrap();
+
+    assert!(first.advanced_recapped_until);
+    assert!(second.advanced_recapped_until);
+    assert!(!noop.advanced_recapped_until);
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 2);
+    let second_payload = last_user_text(&requests[1]);
+    assert!(!second_payload.contains("first request"));
+    assert!(second_payload.contains("second request"));
+    let metadata = session.read_metadata().await.unwrap();
+    assert_eq!(metadata.status, SessionStatus::Open);
+    assert_eq!(metadata.recapped_until, 4);
+    assert!(metadata.finalized_at.is_none());
+}
+
+#[tokio::test]
+async fn background_recap_stages_dispute_before_recording_reported_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        r#"{
+            "new_claims":[
+                {
+                    "id":"$new_claim_0$",
+                    "name":"first recap fact",
+                    "statement":"first recap fact",
+                    "scope":"tests / recap",
+                    "confidence":"high",
+                    "evidence_summary":"session evidence",
+                    "source_claim_ids":[]
+                },
+                {
+                    "id":"$new_claim_1$",
+                    "name":"conflicting recap fact",
+                    "statement":"conflicting recap fact",
+                    "scope":"tests / recap",
+                    "confidence":"high",
+                    "evidence_summary":"session evidence",
+                    "source_claim_ids":[]
+                }
+            ],
+            "used_claim_ids":[],
+            "new_disputes":[{
+                "id":"$new_dispute_0$",
+                "name":"recap conflict",
+                "claims":["$new_claim_0$","$new_claim_1$"],
+                "summary":"the recap facts conflict"
+            }]
+        }"#,
+        Vec::new(),
+    )]));
+    let agent_home = dir.path().join("agents").join("agent-a");
+    let reported_store = Arc::new(PendingBeforeLedgerReportedDisputeStore::new(agent_home));
+    let (engine, store) = build_test_engine_with_reported_store(&dir, provider, reported_store);
+    let mut session = create_test_session(&store, "session_face0023").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "answer"),
+        ])
+        .await
+        .unwrap();
+
+    let report = engine
+        .recap_existing_session_until(&session.metadata.id, 2)
+        .await
+        .unwrap();
+
+    assert_eq!(report.new_dispute_ids.len(), 1);
+    assert!(report.advanced_recapped_until);
+}
+
+#[tokio::test]
+async fn background_recap_waits_for_agent_knowledge_apply_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
+        Vec::new(),
+    )]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_face0018").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "answer"),
+        ])
+        .await
+        .unwrap();
+    let lock_path =
+        paths::agent_home_knowledge_apply_lock_path(&dir.path().join("agents").join("agent-a"));
+    let guard = FileLockGuard::lock_exclusive(&lock_path).await.unwrap();
+    let session_id = session.metadata.id.clone();
+    let task =
+        tokio::spawn(async move { engine.recap_existing_session_until(&session_id, 2).await });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(provider.requests().await.is_empty());
+
+    drop(guard);
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(provider.requests().await.len(), 1);
+}
+
+#[tokio::test]
+async fn same_session_finalize_preempts_recap_before_prepared_and_takes_full_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(PreemptibleRecapProvider::new());
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_face0019").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "first request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "first answer"),
+            NewSessionMessage::text(SessionMessageRole::User, "final request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "final answer"),
+        ])
+        .await
+        .unwrap();
+    let control = Arc::new(SessionRecapPreemptionControl::new());
+    let recap_engine = engine.clone();
+    let recap_session_id = session.metadata.id.clone();
+    let recap_control = Arc::clone(&control);
+    let recap = tokio::spawn(async move {
+        recap_engine
+            .recap_existing_session_until_with_preemption(&recap_session_id, 2, recap_control)
+            .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        provider.first_call_started.notified(),
+    )
+    .await
+    .unwrap();
+
+    session.mark_finalizing(Utc::now()).await.unwrap();
+    assert!(control.request_before_prepared().await);
+    let recap_report = tokio::time::timeout(Duration::from_secs(2), recap)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    assert!(!recap_report.advanced_recapped_until);
+    assert!(provider.first_call_dropped.load(Ordering::SeqCst));
+    assert!(session.read_finalize_checkpoint().await.unwrap().is_none());
+    let metadata = session.read_metadata().await.unwrap();
+    assert_eq!(metadata.status, SessionStatus::Finalizing);
+    assert_eq!(metadata.recapped_until, 0);
+
+    engine
+        .finalize_existing_session_once(&session.metadata.id, |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 2);
+    let finalize_payload = last_user_text(&requests[1]);
+    assert!(finalize_payload.contains("first request"));
+    assert!(finalize_payload.contains("final request"));
+    let metadata = session.read_metadata().await.unwrap();
+    assert_eq!(metadata.status, SessionStatus::Closed);
+    assert_eq!(metadata.recapped_until, metadata.message_count);
+}
+
+#[tokio::test]
+async fn finalize_recovers_prepared_recap_prefix_before_processing_remaining_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
+        Vec::new(),
+    )]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_face0020").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "prepared request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "prepared answer"),
+            NewSessionMessage::text(SessionMessageRole::User, "remaining request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "remaining answer"),
+        ])
+        .await
+        .unwrap();
+    let messages = session.read_messages().await.unwrap();
+    let recap_hash = hash_session_segment(&messages[..2]).unwrap();
+    session
+        .write_finalize_checkpoint(&prepared_empty_finalize_checkpoint(0, 2, recap_hash))
+        .await
+        .unwrap();
+    session.mark_finalizing(Utc::now()).await.unwrap();
+
+    engine
+        .finalize_existing_session_once(&session.metadata.id, |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 1);
+    let payload = last_user_text(&requests[0]);
+    assert!(!payload.contains("prepared request"));
+    assert!(payload.contains("remaining request"));
+    let metadata = session.read_metadata().await.unwrap();
+    assert_eq!(metadata.status, SessionStatus::Closed);
+    assert_eq!(metadata.recapped_until, 4);
+    let checkpoint = session.read_finalize_checkpoint().await.unwrap().unwrap();
+    assert_eq!(checkpoint.recap_start_index, 2);
+    assert_eq!(checkpoint.recap_end_index, 4);
+    assert_eq!(checkpoint.status, FinalizeCheckpointStatus::Applied);
+}
+
+#[tokio::test]
+async fn finalize_applied_checkpoint_recovery_flushes_durable_pending_uploads() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_face0022").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "applied request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "applied answer"),
+        ])
+        .await
+        .unwrap();
+    let messages = session.read_messages().await.unwrap();
+    let recap_hash = hash_session_segment(&messages).unwrap();
+    let mut checkpoint = prepared_empty_finalize_checkpoint(0, 2, recap_hash);
+    checkpoint.status = FinalizeCheckpointStatus::Applied;
+    session
+        .write_finalize_checkpoint(&checkpoint)
+        .await
+        .unwrap();
+    let agent_home = dir.path().join("agents").join("agent-a");
+    let pending_path = paths::agent_home_pending_maintainer_uploads_path(&agent_home);
+    write_yaml_atomic(
+        &pending_path,
+        &PendingMaintainerUploads {
+            claims: vec![Claim {
+                id: "claim_11111111".parse().unwrap(),
+                name: "pending recap claim".into(),
+                statement: "pending recap claim statement".into(),
+                scope: "test".into(),
+                holder: AgentId::new("agent-a").unwrap(),
+                confidence: Confidence::High,
+                status: ClaimStatus::Active,
+                created_at: Utc::now(),
+                updated_at: None,
+                source_claim_ids: Vec::new(),
+                evidence_summary: "test".into(),
+            }],
+            durable_claim_ids: Default::default(),
+            disputes: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    session.mark_finalizing(Utc::now()).await.unwrap();
+
+    engine
+        .finalize_existing_session_once(&session.metadata.id, |_| {})
+        .await
+        .unwrap();
+
+    assert!(!tokio::fs::try_exists(pending_path).await.unwrap());
+    assert!(provider.requests().await.is_empty());
+    let metadata = session.read_metadata().await.unwrap();
+    assert_eq!(metadata.status, SessionStatus::Closed);
+    assert_eq!(metadata.recapped_until, 2);
+}
+
+#[tokio::test]
+async fn finalize_recovers_prepared_recap_before_adding_background_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
+        Vec::new(),
+    )]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_face0021").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "prepared request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "prepared answer"),
+        ])
+        .await
+        .unwrap();
+    let messages = session.read_messages().await.unwrap();
+    let recap_hash = hash_session_segment(&messages).unwrap();
+    session
+        .write_finalize_checkpoint(&prepared_empty_finalize_checkpoint(0, 2, recap_hash))
+        .await
+        .unwrap();
+    let mut writer = session.open_turn_journal_writer().await.unwrap();
+    writer
+        .append(
+            "turn_background",
+            Utc::now(),
+            TurnJournalEventKind::BackgroundProcessCompleted {
+                tool_use_id: "toolu_after_prepared".into(),
+                process_id: "process_after_prepared".into(),
+                instance_id: 21,
+                status: "finished".into(),
+                exit_code: Some(0),
+                signal: None,
+                success: true,
+            },
+            TurnJournalFlush::Immediate,
+        )
+        .await
+        .unwrap();
+    drop(writer);
+    session.mark_finalizing(Utc::now()).await.unwrap();
+
+    engine
+        .finalize_existing_session_once(&session.metadata.id, |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 1);
+    let payload = last_user_text(&requests[0]);
+    assert!(!payload.contains("prepared request"));
+    assert!(payload.contains("process_after_prepared"));
+    let metadata = session.read_metadata().await.unwrap();
+    assert_eq!(metadata.status, SessionStatus::Closed);
+    assert_eq!(metadata.recapped_until, 2);
+    assert!(metadata
+        .recap_background_completion_until_seq
+        .is_some_and(|cursor| cursor > 0));
+}
+
+#[tokio::test]
+async fn finalize_continues_from_background_recap_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        response_step(
+            r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
+            Vec::new(),
+        ),
+        response_step(
+            r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
+            Vec::new(),
+        ),
+    ]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_face0016").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "first request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "first answer"),
+            NewSessionMessage::text(SessionMessageRole::User, "final request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "final answer"),
+        ])
+        .await
+        .unwrap();
+
+    engine
+        .recap_existing_session_until(&session.metadata.id, 2)
+        .await
+        .unwrap();
+    engine.finalize_session(&mut session, |_| {}).await.unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 2);
+    let finalize_payload = last_user_text(&requests[1]);
+    assert!(!finalize_payload.contains("first request"));
+    assert!(finalize_payload.contains("final request"));
+    let metadata = session.read_metadata().await.unwrap();
+    assert_eq!(metadata.status, SessionStatus::Closed);
+    assert_eq!(metadata.recapped_until, metadata.message_count);
+}
+
+#[tokio::test]
+async fn supervisor_finalize_attempt_uses_one_model_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        response_step("{not json", Vec::new()),
+        response_step(
+            r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
+            Vec::new(),
+        ),
+    ]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.json_caller = Arc::new(StructuredJsonCaller::new(
+        provider.clone(),
+        1024,
+        4,
+        Duration::ZERO,
+        Duration::ZERO,
+    ));
+    let mut session = create_test_session(&store, "session_face0017").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "answer"),
+        ])
+        .await
+        .unwrap();
+
+    engine
+        .finalize_existing_session_once(&session.metadata.id, |_| {})
+        .await
+        .expect_err("first supervisor attempt should expose invalid JSON to the job retry");
+    assert_eq!(provider.requests().await.len(), 1);
+
+    engine
+        .finalize_existing_session_once(&session.metadata.id, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(provider.requests().await.len(), 2);
+    let metadata = session.read_metadata().await.unwrap();
+    assert_eq!(metadata.status, SessionStatus::Closed);
+}
+
+#[tokio::test]
+async fn manual_compact_applied_summary_checkpoint_clears_file_read_state() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(Vec::new()));
     let tool_config = ToolConfig {
@@ -6539,49 +7108,16 @@ async fn manual_compact_applied_checkpoint_preserves_report_and_clears_file_read
         .await
         .unwrap();
     let messages = session.read_messages().await.unwrap();
-    let summary_hash = super::hash_session_segment(&messages[0..0]).unwrap();
-    let recap_hash = super::hash_session_segment(&messages).unwrap();
-    let claim_id = ClaimId::random();
-    let applied_claim_id = ClaimId::random();
-    let applied_dispute_id = DisputeId::random();
+    let summary_hash = super::hash_session_segment(&messages).unwrap();
     let checkpoint = CompactionCheckpoint {
         schema_version: Some(COMPACTION_CHECKPOINT_SCHEMA_VERSION),
         audit_ids: vec!["compact_report".into()],
         summary_start_index: 0,
-        summary_end_index: 0,
+        summary_end_index: messages.len(),
         summary_segment_hash: summary_hash,
-        recap_start_index: 0,
-        recap_end_index: messages.len(),
-        recap_segment_hash: recap_hash,
-        summary: String::new(),
+        summary: "checkpointed summary".into(),
         active_turn_summary: None,
         active_turn: None,
-        prepared_claims: vec![Claim {
-            id: claim_id.clone(),
-            name: "checkpoint_claim".into(),
-            statement: "checkpoint claim statement".into(),
-            scope: "test".into(),
-            holder: AgentId::new("agent-a").unwrap(),
-            confidence: Confidence::High,
-            status: ClaimStatus::Active,
-            created_at: now,
-            updated_at: None,
-            source_claim_ids: Vec::new(),
-            evidence_summary: "checkpoint evidence".into(),
-        }],
-        prepared_disputes: Vec::new(),
-        used_claim_ids: Vec::new(),
-        trace_text: "checkpointed request".into(),
-        trace_created_at: now,
-        trace_id: None,
-        applied_report: Some(CompactionAppliedReport {
-            trace_id: None,
-            new_claim_ids: vec![applied_claim_id.clone()],
-            updated_claim_ids: Vec::new(),
-            used_claim_ids: vec![claim_id.clone()],
-            new_dispute_ids: vec![applied_dispute_id.clone()],
-            warnings: vec!["upload warning kept".into()],
-        }),
         status: CompactionCheckpointStatus::Applied,
     };
     session
@@ -6598,10 +7134,6 @@ async fn manual_compact_applied_checkpoint_preserves_report_and_clears_file_read
     };
     let outcome = *outcome;
 
-    assert_eq!(outcome.report.new_claim_ids, vec![applied_claim_id]);
-    assert_eq!(outcome.report.used_claim_ids, vec![claim_id]);
-    assert_eq!(outcome.report.new_dispute_ids, vec![applied_dispute_id]);
-    assert_eq!(outcome.report.warnings, vec!["upload warning kept"]);
     assert_eq!(outcome.audit_ids, vec!["compact_report"]);
     let write = tools
         .dispatch_with_context(
@@ -6626,12 +7158,14 @@ async fn manual_compact_applied_checkpoint_preserves_report_and_clears_file_read
 }
 
 #[tokio::test]
-async fn manual_compact_post_summary_failure_writes_failed_audit() {
+async fn manual_compact_does_not_call_recap_provider_after_summary() {
     let dir = tempfile::tempdir().unwrap();
-    let provider = Arc::new(RecordingProvider::new(vec![json_by_request_kind_step(
-        r#"{"committed_summary":"old turn summarized","active_turn_summary":null}"#,
-        "not json",
-    )]));
+    let provider = Arc::new(RecordingProvider::new(vec![
+        json_by_request_kind_responses(
+            &[r#"{"committed_summary":"old turn summarized","active_turn_summary":null}"#],
+            &[],
+        ),
+    ]));
     let (mut engine, store) = build_test_engine(&dir, provider.clone());
     engine.context_window = 20_000;
     engine.compaction.tail_target_ctx_ratio = 0.015;
@@ -6648,20 +7182,27 @@ async fn manual_compact_post_summary_failure_writes_failed_audit() {
         .await
         .unwrap();
 
-    let err = engine
-        .compact_session_checkpoint_with_events(&mut session, &mut |_| {})
+    let mut events = Vec::new();
+    engine
+        .compact_session_checkpoint_with_events(&mut session, &mut |event| events.push(event))
         .await
-        .unwrap_err();
+        .unwrap();
 
-    assert!(err.to_string().contains("解析结构化 JSON 响应失败"));
-    assert_eq!(provider.requests().await.len(), 2);
+    assert_eq!(provider.requests().await.len(), 1);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::RecapRequested {
+            recap_end_index: 4,
+            ..
+        }
+    )));
     let audit_log = tokio::fs::read_to_string(&session.paths.compaction_events_jsonl)
         .await
         .unwrap();
     assert!(audit_log.contains(r#""kind":"started""#));
     assert!(audit_log.contains(r#""kind":"model_attempt""#));
-    assert!(audit_log.contains(r#""kind":"failed""#));
-    assert!(!audit_log.contains(r#""kind":"completed""#));
+    assert!(!audit_log.contains(r#""kind":"failed""#));
+    assert!(audit_log.contains(r#""kind":"completed""#));
 }
 
 #[tokio::test]
@@ -6673,10 +7214,7 @@ async fn manual_compact_exhausts_overlong_summary_repairs_without_advancing_stat
         summary = serde_json::to_string(&overlong).unwrap()
     );
     let provider = Arc::new(RecordingProvider::new(vec![
-        json_by_request_kind_responses(
-            &[&response, &response],
-            &[r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#],
-        ),
+        json_by_request_kind_responses(&[&response, &response], &[]),
     ]));
     let (mut engine, store) = build_test_engine(&dir, provider.clone());
     engine.context_window = 20_000;
@@ -6709,7 +7247,7 @@ async fn manual_compact_exhausts_overlong_summary_repairs_without_advancing_stat
         .await
         .expect_err("two overlong summaries must fail manual compaction");
 
-    assert_eq!(provider.requests().await.len(), 3);
+    assert_eq!(provider.requests().await.len(), 2);
     let metadata = session.read_metadata().await.unwrap();
     assert_eq!(metadata.message_count, original_message_count);
     assert_eq!(metadata.recapped_until, 0);
@@ -6771,9 +7309,12 @@ async fn manual_compact_over_budget_summary_does_not_start_recap_provider() {
 }
 
 #[tokio::test]
-async fn manual_compact_starts_summary_and_recap_concurrently_after_budget_preflight() {
+async fn manual_compact_requests_background_recap_after_budget_preflight() {
     let dir = tempfile::tempdir().unwrap();
-    let provider = Arc::new(ConcurrentCompactionRecapProvider::new());
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        r#"{"committed_summary":"old turn summarized","active_turn_summary":null}"#,
+        Vec::new(),
+    )]));
     let (mut engine, store) = build_test_engine(&dir, provider.clone());
     engine.context_window = 20_000;
     engine.compaction.tail_target_ctx_ratio = 0.015;
@@ -6790,19 +7331,24 @@ async fn manual_compact_starts_summary_and_recap_concurrently_after_budget_prefl
         .await
         .unwrap();
 
-    let outcome = tokio::time::timeout(
-        Duration::from_secs(1),
-        engine.compact_session_checkpoint_with_events(&mut session, &mut |_| {}),
-    )
-    .await
-    .expect("compaction should not wait for recap before starting the summary request")
-    .expect("concurrent compact and recap should succeed");
+    let mut events = Vec::new();
+    let outcome = engine
+        .compact_session_checkpoint_with_events(&mut session, &mut |event| events.push(event))
+        .await
+        .expect("summary compact should not wait for background recap");
 
     assert!(matches!(outcome, ManualCompactionOutcome::Compacted(_)));
-    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(provider.requests().await.len(), 1);
     let metadata = session.read_metadata().await.unwrap();
-    assert_eq!(metadata.recapped_until, metadata.message_count);
+    assert_eq!(metadata.recapped_until, 0);
     assert!(metadata.compaction.is_some());
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::RecapRequested {
+            session_id,
+            recap_end_index,
+        } if session_id == &metadata.id && *recap_end_index == metadata.message_count
+    )));
 }
 
 #[tokio::test]
@@ -6825,19 +7371,9 @@ async fn manual_compact_bad_checkpoint_range_writes_failed_audit() {
         summary_start_index: 0,
         summary_end_index: messages.len() + 10,
         summary_segment_hash: "unused".into(),
-        recap_start_index: 0,
-        recap_end_index: messages.len(),
-        recap_segment_hash: hash_session_segment(&messages).unwrap(),
         summary: "bad range summary".into(),
         active_turn_summary: None,
         active_turn: None,
-        prepared_claims: Vec::new(),
-        prepared_disputes: Vec::new(),
-        used_claim_ids: Vec::new(),
-        trace_text: String::new(),
-        trace_created_at: Utc::now(),
-        trace_id: None,
-        applied_report: None,
         status: CompactionCheckpointStatus::Applied,
     };
     session
@@ -6859,7 +7395,7 @@ async fn manual_compact_bad_checkpoint_range_writes_failed_audit() {
 }
 
 #[tokio::test]
-async fn finalize_ignores_legacy_compaction_checkpoint_without_schema_version() {
+async fn finalize_ignores_legacy_v2_compaction_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(vec![response_step(
         r#"{"new_claims": [], "used_claim_ids": [], "new_disputes": []}"#,
@@ -6887,24 +7423,14 @@ async fn finalize_ignores_legacy_compaction_checkpoint_without_schema_version() 
         .unwrap();
     let messages = session.read_messages().await.unwrap();
     let checkpoint = CompactionCheckpoint {
-        schema_version: None,
+        schema_version: Some(2),
         audit_ids: Vec::new(),
         summary_start_index: 0,
         summary_end_index: 0,
         summary_segment_hash: super::hash_session_segment(&messages[0..0]).unwrap(),
-        recap_start_index: 0,
-        recap_end_index: messages.len(),
-        recap_segment_hash: super::hash_session_segment(&messages).unwrap(),
         summary: String::new(),
         active_turn_summary: None,
         active_turn: None,
-        prepared_claims: Vec::new(),
-        prepared_disputes: Vec::new(),
-        used_claim_ids: Vec::new(),
-        trace_text: "legacy checkpoint request".into(),
-        trace_created_at: Utc::now(),
-        trace_id: None,
-        applied_report: None,
         status: CompactionCheckpointStatus::Applied,
     };
     session
@@ -10459,19 +10985,9 @@ async fn preflight_recovers_matching_compaction_checkpoint_before_replanning() {
         summary_start_index: 0,
         summary_end_index: messages.len(),
         summary_segment_hash: segment_hash.clone(),
-        recap_start_index: 0,
-        recap_end_index: messages.len(),
-        recap_segment_hash: segment_hash,
         summary: "recovered committed summary".into(),
         active_turn_summary: None,
         active_turn: None,
-        prepared_claims: Vec::new(),
-        prepared_disputes: Vec::new(),
-        used_claim_ids: Vec::new(),
-        trace_text: String::new(),
-        trace_created_at: Utc::now(),
-        trace_id: None,
-        applied_report: None,
         status: CompactionCheckpointStatus::Applied,
     };
     session
@@ -10503,7 +11019,7 @@ async fn preflight_recovers_matching_compaction_checkpoint_before_replanning() {
     assert!(rendered.contains("recovered committed summary"));
     assert!(rendered.contains("compacted_session_context"));
     let metadata = session.read_metadata().await.unwrap();
-    assert_eq!(metadata.recapped_until, messages.len());
+    assert_eq!(metadata.recapped_until, 0);
     let compaction = metadata.compaction.unwrap();
     assert_eq!(compaction.committed_message_until(), messages.len());
     assert_eq!(
@@ -10534,26 +11050,15 @@ async fn preflight_checkpoint_recovery_validation_failure_writes_failed_audit() 
         .await
         .unwrap();
     let messages = session.read_messages().await.unwrap();
-    let segment_hash = hash_session_segment(&messages).unwrap();
     let checkpoint = CompactionCheckpoint {
         schema_version: Some(COMPACTION_CHECKPOINT_SCHEMA_VERSION),
         audit_ids: vec!["compact_bad_hash".into()],
         summary_start_index: 0,
         summary_end_index: messages.len(),
         summary_segment_hash: "wrong_hash".into(),
-        recap_start_index: 0,
-        recap_end_index: messages.len(),
-        recap_segment_hash: segment_hash,
         summary: "recovered committed summary".into(),
         active_turn_summary: None,
         active_turn: None,
-        prepared_claims: Vec::new(),
-        prepared_disputes: Vec::new(),
-        used_claim_ids: Vec::new(),
-        trace_text: String::new(),
-        trace_created_at: Utc::now(),
-        trace_id: None,
-        applied_report: None,
         status: CompactionCheckpointStatus::Applied,
     };
     session

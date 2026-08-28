@@ -75,6 +75,7 @@ pub(crate) struct StructuredJsonAttemptRequest {
     system_prompt: String,
     messages: Vec<SessionTurnMessage>,
     provider_retry_count_override: Option<u32>,
+    allow_continuation: bool,
     buffered_runtime: Option<BufferedProviderRuntime>,
     enforce_request_timeout: bool,
 }
@@ -85,6 +86,7 @@ impl StructuredJsonAttemptRequest {
             system_prompt,
             messages,
             provider_retry_count_override: None,
+            allow_continuation: true,
             buffered_runtime: None,
             enforce_request_timeout: false,
         }
@@ -96,6 +98,7 @@ impl StructuredJsonAttemptRequest {
             system_prompt,
             messages,
             provider_retry_count_override: Some(0),
+            allow_continuation: true,
             buffered_runtime: None,
             enforce_request_timeout: false,
         }
@@ -110,6 +113,7 @@ impl StructuredJsonAttemptRequest {
             system_prompt,
             messages,
             provider_retry_count_override: None,
+            allow_continuation: true,
             buffered_runtime: Some(runtime),
             enforce_request_timeout: false,
         }
@@ -124,7 +128,19 @@ impl StructuredJsonAttemptRequest {
             system_prompt,
             messages,
             provider_retry_count_override: None,
+            allow_continuation: true,
             buffered_runtime: Some(runtime),
+            enforce_request_timeout: false,
+        }
+    }
+
+    fn single_attempt(system_prompt: String, messages: Vec<SessionTurnMessage>) -> Self {
+        Self {
+            system_prompt,
+            messages,
+            provider_retry_count_override: Some(0),
+            allow_continuation: false,
+            buffered_runtime: None,
             enforce_request_timeout: false,
         }
     }
@@ -137,6 +153,7 @@ impl StructuredJsonAttemptRequest {
             system_prompt,
             messages,
             provider_retry_count_override: Some(0),
+            allow_continuation: true,
             buffered_runtime: None,
             enforce_request_timeout: true,
         }
@@ -210,6 +227,7 @@ impl StructuredJsonCaller {
                 system_prompt,
                 messages,
                 None,
+                true,
                 Some(&runtime),
                 preferred_transport,
                 false,
@@ -260,6 +278,34 @@ impl StructuredJsonCaller {
             |_, _| Ok(()),
         )
         .await
+    }
+
+    /// 只执行一次结构化业务 attempt，并同时关闭 provider adapter 内层重试。
+    pub(crate) async fn generate_json_validated_once<T, V>(
+        &self,
+        system_prompt: String,
+        messages: Vec<SessionTurnMessage>,
+        validate: V,
+    ) -> anyhow::Result<T>
+    where
+        V: FnMut(Value) -> anyhow::Result<T>,
+    {
+        let caller = Self {
+            provider: Arc::clone(&self.provider),
+            max_tokens: self.max_tokens,
+            retry_count: 0,
+            retry_base_delay: self.retry_base_delay,
+            retry_max_delay: self.retry_max_delay,
+        };
+        caller
+            .generate_json_validated_with_guarded_attempts(
+                StructuredJsonAttemptRequest::single_attempt(system_prompt, messages),
+                validate,
+                |_, _, _| {},
+                |_| std::future::ready(()),
+                |_, _| Ok(()),
+            )
+            .await
     }
 
     /// 缓冲式流式生成 JSON，并在每次结构化重试前检查最终请求。
@@ -409,6 +455,7 @@ impl StructuredJsonCaller {
             system_prompt,
             messages,
             provider_retry_count_override,
+            allow_continuation,
             buffered_runtime,
             enforce_request_timeout,
         } = request;
@@ -423,6 +470,7 @@ impl StructuredJsonCaller {
                     system_prompt.clone(),
                     attempt_messages.clone(),
                     provider_retry_count_override,
+                    allow_continuation,
                     buffered_runtime.as_ref(),
                     preferred_transport,
                     enforce_request_timeout,
@@ -563,6 +611,7 @@ impl StructuredJsonCaller {
             runtime_chain_id: None,
             runtime_fallback_scope: None,
             recovery_interrupt: None,
+            allow_continuation: true,
             retry_count_override: None,
         };
 
@@ -578,11 +627,16 @@ impl StructuredJsonCaller {
         parse_structured_response(response)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "结构化请求需显式携带 retry、continuation、transport 与 timeout 策略"
+    )]
     async fn generate_json_once_observed(
         &self,
         system_prompt: String,
         messages: Vec<SessionTurnMessage>,
         retry_count_override: Option<u32>,
+        allow_continuation: bool,
         buffered_runtime: Option<&BufferedProviderRuntime>,
         preferred_transport: Option<ProviderTransport>,
         enforce_request_timeout: bool,
@@ -609,6 +663,7 @@ impl StructuredJsonCaller {
                 .map(|runtime| runtime.chain_id),
             runtime_fallback_scope,
             recovery_interrupt: None,
+            allow_continuation,
             retry_count_override,
         };
 
@@ -1378,6 +1433,31 @@ mod tests {
         assert!(retry_text.contains("Previous response preview"));
         assert!(retry_text.contains(r#"quoted "bad" text"#));
         assert!(retry_text.contains("Escape every double quote"));
+    }
+
+    #[tokio::test]
+    async fn validated_once_disables_business_and_provider_retries() {
+        let provider = Arc::new(FakeProvider::new(vec![
+            text_response("{not json"),
+            text_response(r#"{"ok":true}"#),
+        ]));
+        let caller =
+            StructuredJsonCaller::new(provider.clone(), 512, 3, Duration::ZERO, Duration::ZERO);
+
+        caller
+            .generate_json_validated_once(
+                "system".into(),
+                vec![SessionTurnMessage::user_text("payload")],
+                Ok,
+            )
+            .await
+            .expect_err("single attempt must not consume the configured retry budget");
+
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].retry_count_override, Some(0));
+        assert!(!requests[0].allow_continuation);
+        assert!(!requests[0].stream);
     }
 
     #[tokio::test]

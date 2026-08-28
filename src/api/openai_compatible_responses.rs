@@ -166,6 +166,7 @@ impl OpenAiCompatibleResponsesProviderAdapter {
         max_tokens: u32,
         stream: bool,
         retry_count: u32,
+        allow_continuation: bool,
         runtime_chain_id: Option<ProviderRuntimeChainId>,
         runtime_fallback_scope: Option<&crate::api::ProviderRuntimeFallbackScope>,
         retry_after_partial: bool,
@@ -183,8 +184,13 @@ impl OpenAiCompatibleResponsesProviderAdapter {
             ProviderTransport::ResponsesNonStreaming
         };
         let mut provider_messages = base_messages.to_vec();
+        let max_continuation_turns = if allow_continuation {
+            MAX_CONTINUATION_TURNS
+        } else {
+            0
+        };
 
-        for round in 0..=MAX_CONTINUATION_TURNS {
+        for round in 0..=max_continuation_turns {
             if recovery_interrupt.is_some_and(ProviderRecoveryInterrupt::is_cancelled) {
                 if last_terminal == ResponsesTerminal::MaxOutputTokens
                     && last_function_calls.is_empty()
@@ -340,7 +346,7 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                 last_terminal = ResponsesTerminal::Completed;
                 break;
             }
-            if round == MAX_CONTINUATION_TURNS {
+            if round == max_continuation_turns {
                 break;
             }
             let continuation = user_text_item(CONTINUATION_TRIGGER);
@@ -454,6 +460,7 @@ impl OpenAiCompatibleResponsesProviderAdapter {
             .unwrap_or(self.client.retry_count());
         let retry_after_partial =
             request.stream_output_mode == crate::api::ProviderStreamOutputMode::Buffered;
+        let allow_continuation = request.allow_continuation;
         let base_messages = request.messages;
         let input = session_turn_messages_to_responses(base_messages.clone(), &self.model)?;
         let recovery_interrupt = request.recovery_interrupt.clone();
@@ -467,6 +474,7 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                 request.max_tokens,
                 request.stream,
                 retry_count,
+                allow_continuation,
                 request.runtime_chain_id,
                 request.runtime_fallback_scope.as_ref(),
                 retry_after_partial,
@@ -1486,6 +1494,7 @@ mod tests {
                     runtime_chain_id: None,
                     runtime_fallback_scope: None,
                     recovery_interrupt: None,
+                    allow_continuation: true,
                     retry_count_override: None,
                 },
                 &mut |event| events.push(event),
@@ -1553,6 +1562,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn max_token_response_does_not_continue_when_request_disables_it() {
+        let (endpoint, requests) = spawn_json_sequence(vec![json!({
+            "status":"incomplete",
+            "incomplete_details":{"reason":"max_output_tokens"},
+            "output":[{
+                "type":"message","id":"msg_1","role":"assistant","status":"incomplete",
+                "content":[{"type":"output_text","text":"partial"}]
+            }]
+        })])
+        .await;
+        let adapter = OpenAiCompatibleResponsesProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            Duration::from_secs(5),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        let response = adapter
+            .send(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 32,
+                    stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: None,
+                    allow_continuation: false,
+                    retry_count_override: Some(0),
+                },
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.stop, ProviderStop::MaxTokens);
+        assert_eq!(requests.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn safe_steer_after_send_keeps_successful_incomplete_response_without_continuation() {
         let output = json!({
             "type":"message","id":"msg_1","role":"assistant","status":"incomplete",
@@ -1593,6 +1648,7 @@ mod tests {
                     runtime_chain_id: None,
                     runtime_fallback_scope: None,
                     recovery_interrupt: Some(interrupt),
+                    allow_continuation: true,
                     retry_count_override: None,
                 },
                 &mut |_| {},
@@ -1654,6 +1710,7 @@ mod tests {
                     runtime_chain_id: None,
                     runtime_fallback_scope: None,
                     recovery_interrupt: Some(interrupt.clone()),
+                    allow_continuation: true,
                     retry_count_override: None,
                 },
                 &mut |_| {},

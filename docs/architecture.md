@@ -11,7 +11,7 @@
 - 多轮 TUI session、resume、compact 与 finalize
 - LLM、文件、进程、Web、MCP、Skill、Memory、session search
 - 本地 claim、trace、inbox 与 session 存储
-- session subagents 与后台 finalize supervisor
+- session subagents 与后台 Recap/Finalize Supervisor
 
 单人模式是明确的产品模式，不是连接故障后的临时降级。它不会为未来的团队连接预先积累上传队列。
 
@@ -33,7 +33,7 @@
 
 Agent 是用户直接运行的 `acn` TUI：
 
-- 维护 session、turn journal、compact checkpoint 与 finalize checkpoint
+- 维护 session、turn journal、summary-only compact checkpoint 与 Recap/Finalize 共用 checkpoint
 - 运行 provider-neutral LLM tool loop
 - 管理用户工作区内的文件、命令、后台进程与附件
 - 维护私有 Memory、用户资料、本地 claim、trace、inbox 和 dispute 上报幂等台账
@@ -68,11 +68,13 @@ Maintainer 不以 trace 引用次数直接修改 claim，也不删除已经解�
 
 自裁决提供 `manual`、`shadow`、`auto` 三种模式，并用独立的 Proposal 与 Verification 两阶段模型调用降低误判风险。Analysis 是可审阅的分析结果；管理者 Adopt、人工 Resolve，或 `auto` 模式自动采用后，才形成正式 Resolution。Resolution 仍只是发送给 holder 的治理建议，不会让 Maintainer 直接修改 Agent 的本地 Claim。
 
-### Finalize Supervisor
+### Recap/Finalize Supervisor
 
-TUI 退出非空 session 时，可将 finalize job 交给独立 supervisor。Supervisor 串行恢复 session checkpoint，完成 recap、claim/dispute/trace 本地落盘，并在团队模式下上传 claim mirror 与 dispute，使终端无需等待完整收尾。
+Provider request preflight 或手动 `/compact` 完成 summary 本地预检后，会把冻结消息 target 的 Recap job 异步交给独立 supervisor；TUI 退出非空 session 时则提交 Finalize job。Supervisor 单 worker 串行执行，使用全局 `Finalize > Recap` 优先级，同优先级保持 FIFO。Recap 与 Finalize 复用 session 级 `finalize.lock` 和 `finalize_checkpoint.yaml`；Recap 只推进 `recapped_until`，Finalize 从最新 cursor 收尾并关闭 session。
 
-它与 `code_run` 的进程管理器职责不同：前者管理 ACN 后台 finalize job，后者管理工具启动的 shell process。
+每个 supervisor job attempt 的 recap 只发起一次模型请求，失败由 job 外层最多重试五次。Recap 不发系统通知；Finalize 仍按配置决定通知。知识应用还与 inbox 共用 agent 级 `knowledge_apply.lock`，但 Maintainer 上传在释放该锁后进行。
+
+它与 `code_run` 的进程管理器职责不同：前者管理 ACN 后台 Recap/Finalize job，后者管理工具启动的 shell process。
 
 ## Provider 与工具边界
 
@@ -112,6 +114,7 @@ TUI 退出非空 session 时，可将 finalize job 交给独立 supervisor。Sup
           disputes/
           inbox/
           maintainer_uploads/
+          knowledge_apply.lock
           memories/
             MEMORY.md
             USER.md
@@ -130,8 +133,8 @@ Agent 进程使用 `<acn_home>/<upstream>/data/agents/<agent_id>/`。Router 和 
 2. 读取当时的 Memory、用户资料、本地 claim、Skill 摘要和 `ACN.md`，渲染并持久化 system prompt。
 3. 每个用户 turn 经 provider tool loop 执行；canonical message 与增量 turn journal 分别承担稳定历史和中断恢复。
    最近一次真实 Provider 窗口另存为 session 内独立原子 WAL，不内嵌进 `session.yaml`；WAL 缺失或损坏时从 canonical history 重建。
-4. 上下文接近预算时在 provider request 前压缩已覆盖历史；手动 `/compact` 复用同一边界。
-5. 退出后 finalize 生成 recap，形成或更新 claim 与 trace；canonical message 或后台终态任一仍未 recap 时都交给 supervisor，团队模式下再持久上传 claim mirror，并报告符合条件的 dispute。
+4. 上下文接近预算时在 provider request 前生成并独立提交 summary；手动 `/compact` 复用同一边界。Committed history 同时异步投递 Recap job，Recap 的成败不影响 summary frontier。
+5. 后台 Recap 从 canonical `messages.jsonl` 的最新 `recapped_until` 处理到 job 的冻结 target。退出后的 Finalize 从最新 cursor 继续到最终 `message_count`，并额外消费未处理的后台进程终态；团队模式下在本地知识应用后上传 claim mirror，并报告符合条件的 dispute。
 6. 已 finalize 的 session 关闭；空 session 可以直接清理。
 
 已创建 session 的 system prompt 是冻结快照。修改 `ACN.md`、Memory、Skill 或本地 claim 只影响后续新 session。

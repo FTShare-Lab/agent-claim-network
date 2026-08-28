@@ -119,16 +119,18 @@ Provider 私有 replay 不属于用户可见 transcript，不进入 TUI、sessio
 
 `openai_chat` 当前没有 provider 私有 Reasoning replay；厂商扩展的 Reasoning 字段会被丢弃。
 
-## Finalize 与知识形成
+## Recap、Finalize 与知识形成
 
-Session finalize 对尚未 recap 的消息段做结构化复盘：
+Compact 的 summary 只负责 provider context，并独立推进 compaction frontier。对于已提交且尚未 recap 的 canonical messages，compact 会异步投递 Supervisor Recap job；Recap 从最新 `recapped_until` 处理到冻结 target，不影响前台 summary 的成功结果。Session Finalize 则从最新 cursor 覆盖到最终 `message_count`，并处理 Finalize 专属的后台进程终态。
+
+Recap/Finalize 对目标消息段做结构化复盘：
 
 - 识别本次使用的来源
 - 形成新 claim 或更新已有本地 claim
 - 在团队模式下识别需要报告的 dispute
 - 为有知识输入或产出的任务写 trace
 
-Finalize 只处理可验证的 session 内容，不把 system prompt、Memory 更新本身或未出现的 Router claim 当作证据。Checkpoint 使中断后的重试不会重复提交已完成段。
+Recap/Finalize 只处理可验证的 session 内容，不把 system prompt、Memory 更新本身或未出现的 Router claim 当作证据。两者共用 session 级锁与 `finalize_checkpoint.yaml`；Recap 只推进 cursor，Finalize 负责关闭 session。Inbox 与 Recap/Finalize 的本地知识应用还通过 agent 级锁串行，团队上传在释放知识锁后进行。
 
 ## Stale Sweep
 

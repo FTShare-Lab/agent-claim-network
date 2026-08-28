@@ -339,6 +339,7 @@ impl AnthropicMessagesClient {
             tools,
             max_tokens,
             retry_count,
+            true,
             false,
             None,
             None,
@@ -357,6 +358,7 @@ impl AnthropicMessagesClient {
         tools: Option<Vec<ApiToolDefinition>>,
         max_tokens: u32,
         retry_count: u32,
+        allow_continuation: bool,
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         observer: &mut AnthropicContinuationRequestObserver<'_>,
     ) -> Result<ContinuedAssistantTurn, AnthropicError> {
@@ -366,6 +368,7 @@ impl AnthropicMessagesClient {
             tools,
             max_tokens,
             retry_count,
+            allow_continuation,
             false,
             Some(observer),
             recovery_interrupt,
@@ -384,6 +387,7 @@ impl AnthropicMessagesClient {
         tools: Option<Vec<ApiToolDefinition>>,
         max_tokens: u32,
         retry_count: u32,
+        allow_continuation: bool,
         error_on_unresolved_max_tokens: bool,
         mut request_observer: Option<&mut AnthropicContinuationRequestObserver<'_>>,
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
@@ -393,8 +397,13 @@ impl AnthropicMessagesClient {
         let mut last_blocks = Vec::new();
         let mut last_stop_reason = String::from("end_turn");
         let mut replay_messages = Vec::new();
+        let max_continuation_turns = if allow_continuation {
+            MAX_CONTINUATION_TURNS
+        } else {
+            0
+        };
 
-        for round in 0..=MAX_CONTINUATION_TURNS {
+        for round in 0..=max_continuation_turns {
             if recovery_interrupt.is_some_and(ProviderRecoveryInterrupt::is_cancelled) {
                 if last_stop_reason == "max_tokens"
                     && last_response.is_some()
@@ -514,16 +523,16 @@ impl AnthropicMessagesClient {
                 last_stop_reason = "end_turn".into();
                 break;
             }
-            if round == MAX_CONTINUATION_TURNS && error_on_unresolved_max_tokens {
+            if round == max_continuation_turns && error_on_unresolved_max_tokens {
                 return Err(AnthropicError::OutputShape {
                     reason: format!(
                         "assistant max_tokens continuation 超过上限: {}",
-                        MAX_CONTINUATION_TURNS + 1
+                        max_continuation_turns + 1
                     ),
                     raw: merged_text,
                 });
             }
-            if round == MAX_CONTINUATION_TURNS {
+            if round == max_continuation_turns {
                 break;
             }
             let continuation = json!({"role": "user", "content": CONTINUATION_TRIGGER});
@@ -661,6 +670,7 @@ impl AnthropicProviderAdapter {
                 | SessionTurnEvent::Warning { .. }
                 | SessionTurnEvent::CompactionStarted { .. }
                 | SessionTurnEvent::CompactionCompleted { .. }
+                | SessionTurnEvent::RecapRequested { .. }
                 | SessionTurnEvent::CompactionSkipped { .. }
                 | SessionTurnEvent::CompactionFailed { .. }
                 | SessionTurnEvent::ToolCallStarted { .. }
@@ -676,6 +686,7 @@ impl AnthropicProviderAdapter {
                     api_tools,
                     request.max_tokens,
                     retry_count,
+                    request.allow_continuation,
                     retry_after_partial,
                     &mut provider_emit,
                     &mut request_observer,
@@ -690,6 +701,7 @@ impl AnthropicProviderAdapter {
                     api_tools,
                     request.max_tokens,
                     retry_count,
+                    request.allow_continuation,
                     recovery_interrupt.as_ref(),
                     &mut request_observer,
                 )
@@ -2005,6 +2017,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn max_token_response_does_not_continue_when_request_disables_it() {
+        let (endpoint, requests) = spawn_json_server(vec![json!({
+            "content":[{"type":"text", "text":"partial"}],
+            "stop_reason":"max_tokens",
+            "usage":{"input_tokens":1,"output_tokens":2}
+        })])
+        .await;
+        let adapter = AnthropicProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            32,
+            Duration::from_secs(5),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        let response = adapter
+            .send(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 32,
+                    stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: None,
+                    allow_continuation: false,
+                    retry_count_override: Some(0),
+                },
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.stop, ProviderStop::MaxTokens);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn safe_steer_after_send_keeps_successful_max_tokens_response_without_continuation() {
         let (endpoint, requests) = spawn_json_server(vec![json!({
             "content":[{"type":"text", "text":"partial-answer"}],
@@ -2042,6 +2098,7 @@ mod tests {
                     runtime_chain_id: None,
                     runtime_fallback_scope: None,
                     recovery_interrupt: Some(interrupt),
+                    allow_continuation: true,
                     retry_count_override: None,
                 },
                 &mut |_| {},
@@ -2099,6 +2156,7 @@ mod tests {
                     runtime_chain_id: None,
                     runtime_fallback_scope: None,
                     recovery_interrupt: Some(interrupt.clone()),
+                    allow_continuation: true,
                     retry_count_override: None,
                 },
                 &mut |_| {},
@@ -2162,6 +2220,7 @@ mod tests {
                     runtime_chain_id: None,
                     runtime_fallback_scope: None,
                     recovery_interrupt: None,
+                    allow_continuation: true,
                     retry_count_override: None,
                 },
                 &mut |_| {},

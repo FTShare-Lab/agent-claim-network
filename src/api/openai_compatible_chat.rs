@@ -151,6 +151,7 @@ impl OpenAiCompatibleChatProviderAdapter {
         max_tokens: u32,
         stream: bool,
         retry_count: u32,
+        allow_continuation: bool,
         retry_after_partial: bool,
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         emit: &mut (dyn FnMut(ProviderEvent) + Send),
@@ -162,8 +163,13 @@ impl OpenAiCompatibleChatProviderAdapter {
         let mut last_finish_reason = Some(ChatFinishReason::Stop);
         let mut continuation_requests_started = 0usize;
         let mut provider_messages = base_messages.to_vec();
+        let max_continuation_turns = if allow_continuation {
+            MAX_CONTINUATION_TURNS
+        } else {
+            0
+        };
 
-        for round in 0..=MAX_CONTINUATION_TURNS {
+        for round in 0..=max_continuation_turns {
             if let Some(interrupt) = recovery_interrupt.filter(|interrupt| interrupt.is_cancelled())
             {
                 if last_finish_reason == Some(ChatFinishReason::Length) && last_message.is_some() {
@@ -306,7 +312,7 @@ impl OpenAiCompatibleChatProviderAdapter {
                 last_finish_reason = Some(ChatFinishReason::Stop);
                 break;
             }
-            if round == MAX_CONTINUATION_TURNS {
+            if round == max_continuation_turns {
                 break;
             }
             let continuation = ChatMessage::user(CONTINUATION_TRIGGER.to_string());
@@ -436,6 +442,7 @@ impl OpenAiCompatibleChatProviderAdapter {
             .unwrap_or(self.client.retry_count());
         let retry_after_partial =
             request.stream_output_mode == crate::api::ProviderStreamOutputMode::Buffered;
+        let allow_continuation = request.allow_continuation;
         let recovery_interrupt = request.recovery_interrupt.clone();
         let base_messages = request.messages;
         let mut messages = session_turn_messages_to_chat(base_messages.clone(), &self.model)?;
@@ -450,6 +457,7 @@ impl OpenAiCompatibleChatProviderAdapter {
                 request.max_tokens,
                 request.stream,
                 retry_count,
+                allow_continuation,
                 retry_after_partial,
                 recovery_interrupt.as_ref(),
                 emit,
@@ -1227,6 +1235,7 @@ mod tests {
                     runtime_chain_id: None,
                     runtime_fallback_scope: None,
                     recovery_interrupt: None,
+                    allow_continuation: true,
                     retry_count_override: None,
                 },
                 &mut |_| {},
@@ -1256,6 +1265,7 @@ mod tests {
                     runtime_chain_id: None,
                     runtime_fallback_scope: None,
                     recovery_interrupt: None,
+                    allow_continuation: true,
                     retry_count_override: None,
                 },
                 &mut |_| {},
@@ -1281,6 +1291,50 @@ mod tests {
             &second[1..],
             "observer 上报的 neutral history 必须映射为同一份 Chat messages（除 system）"
         );
+    }
+
+    #[tokio::test]
+    async fn max_token_response_does_not_continue_when_request_disables_it() {
+        let (endpoint, captured) = spawn_chat_json_sequence(vec![json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "partial"},
+                "finish_reason": "length"
+            }]
+        })])
+        .await;
+        let adapter = OpenAiCompatibleChatProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            Duration::from_secs(5),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        let response = adapter
+            .send(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 32,
+                    stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: None,
+                    allow_continuation: false,
+                    retry_count_override: Some(0),
+                },
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.stop, ProviderStop::MaxTokens);
+        assert_eq!(captured.await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1321,6 +1375,7 @@ mod tests {
                     runtime_chain_id: None,
                     runtime_fallback_scope: None,
                     recovery_interrupt: Some(interrupt),
+                    allow_continuation: true,
                     retry_count_override: None,
                 },
                 &mut |_| {},
@@ -1378,6 +1433,7 @@ mod tests {
                     runtime_chain_id: None,
                     runtime_fallback_scope: None,
                     recovery_interrupt: Some(interrupt.clone()),
+                    allow_continuation: true,
                     retry_count_override: None,
                 },
                 &mut |_| {},

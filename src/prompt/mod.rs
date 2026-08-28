@@ -651,6 +651,9 @@ mod tests {
         assert!(out.contains("不要把这些要素单独摘成缺少判断含义的碎片"));
         assert!(out.contains("已显著消耗探索成本"));
         assert!(out.contains("不要为了覆盖清单而为每一类凑 claim"));
+        assert!(out.contains("反斜杠写成 `\\\\`"));
+        assert!(out.contains("换行写成 `\\n`"));
+        assert!(out.contains("U+0000–U+001F"));
         assert!(!out.contains("`router_context`："));
         assert!(!out.contains("router_context.candidate_claims"));
         assert!(!out.contains("transcript、router_context 或 local_claims"));
@@ -909,6 +912,9 @@ mod tests {
 
         assert!(out.contains("不超过 1234 个字符"));
         assert!(out.contains("选择性保留"));
+        assert!(out.contains("反斜杠写成 `\\\\`"));
+        assert!(out.contains("换行写成 `\\n`"));
+        assert!(out.contains("U+0000–U+001F"));
         assert!(out.contains("运行期修改许可"));
         assert!(out.contains("required_read"));
         assert!(!out.contains("summary_max_chars"));

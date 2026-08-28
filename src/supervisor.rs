@@ -1,7 +1,7 @@
 //! 轻量后台 supervisor。
 //!
-//! v1 只承载 session finalize job：TUI enqueue 后立即退出，supervisor 串行执行
-//! finalize。它是按需启动、空闲退出的普通子进程，不注册 OS service。
+//! 承载 session recap / finalize job：TUI enqueue 后不等待后台模型执行，supervisor
+//! 按优先级串行处理。它是按需启动、空闲退出的普通子进程，不注册 OS service。
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -21,7 +21,9 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{SessionEngine, SessionEvent};
+use crate::agent::{
+    SessionEngine, SessionEvent, SessionFinalizeReport, SessionRecapPreemptionControl,
+};
 use crate::build_info::BuildIdentity;
 use crate::claim::{AgentId, SessionId};
 #[cfg(target_os = "macos")]
@@ -40,7 +42,7 @@ use crate::storage::write_text_atomic;
 use crate::storage::{mint_unique_id_in_dir, paths, read_yaml, write_yaml_atomic, FileLockGuard};
 
 const SUPERVISOR_RUNTIME_FINGERPRINT_SCHEMA: u32 = 1;
-const SUPERVISOR_STOPPING_MESSAGE: &str = "supervisor 正在停止，拒绝新 finalize job";
+const SUPERVISOR_STOPPING_MESSAGE: &str = "supervisor 正在停止，拒绝新 job";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupervisorRuntimeFingerprint {
@@ -54,7 +56,7 @@ impl SupervisorRuntimeFingerprint {
     }
 }
 
-/// 对 finalize supervisor 实际使用的配置快照生成不含明文凭据的稳定身份。
+/// 对 recap/finalize supervisor 实际使用的配置快照生成不含明文凭据的稳定身份。
 pub fn runtime_fingerprint(
     cfg: &Config,
     upstream: &ResolvedUpstream,
@@ -204,7 +206,9 @@ pub struct SupervisorQueueSummary {
 pub struct SupervisorJobView {
     pub id: String,
     pub agent_id: Option<AgentId>,
+    pub kind: String,
     pub session_id: SessionId,
+    pub recap_end_index: Option<usize>,
     pub status: String,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
@@ -279,6 +283,14 @@ struct SupervisorSharedState {
     runtime_fingerprint: SupervisorRuntimeFingerprint,
     stopping: Arc<AtomicBool>,
     lifecycle_gate: Arc<Mutex<()>>,
+    running_recap: Arc<Mutex<Option<RunningRecap>>>,
+}
+
+#[derive(Clone)]
+struct RunningRecap {
+    job_id: String,
+    session_id: SessionId,
+    preemption: Arc<SessionRecapPreemptionControl>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -294,6 +306,10 @@ enum SupervisorRequest {
             skip_serializing_if = "is_true"
         )]
         notify_on_completion: bool,
+    },
+    EnqueueRecap {
+        session_id: SessionId,
+        recap_end_index: usize,
     },
     RetryFinalize {
         target: SupervisorRetryTarget,
@@ -355,7 +371,13 @@ impl SupervisorJobStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum SupervisorJobKind {
-    Finalize { session_id: SessionId },
+    Finalize {
+        session_id: SessionId,
+    },
+    Recap {
+        session_id: SessionId,
+        recap_end_index: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -502,6 +524,34 @@ pub async fn enqueue_finalize(
         SupervisorResponse::Enqueued { job_id } => Ok(job_id),
         SupervisorResponse::Error { message } => anyhow::bail!(message),
         other => anyhow::bail!("supervisor 返回了非 enqueue 响应: {other:?}"),
+    }
+}
+
+pub async fn enqueue_recap(
+    config: &SupervisorLaunchConfig,
+    session_id: SessionId,
+    recap_end_index: usize,
+) -> anyhow::Result<String> {
+    let request = SupervisorRequest::EnqueueRecap {
+        session_id,
+        recap_end_index,
+    };
+    match send_request(&config.paths(), request.clone()).await {
+        Ok(SupervisorResponse::Enqueued { job_id }) => return Ok(job_id),
+        Ok(SupervisorResponse::Error { message }) if message == SUPERVISOR_STOPPING_MESSAGE => {
+            let _ = wait_for_supervisor_shutdown(&config.paths()).await;
+        }
+        Ok(SupervisorResponse::Error { message }) => anyhow::bail!(message),
+        Ok(other) => anyhow::bail!("supervisor 返回了非 recap enqueue 响应: {other:?}"),
+        Err(error) if ipc_error_indicates_unavailable(&error) => {}
+        Err(error) => return Err(error.context("请求 supervisor recap enqueue 失败")),
+    }
+
+    ensure_supervisor_running(config).await?;
+    match send_request(&config.paths(), request).await? {
+        SupervisorResponse::Enqueued { job_id } => Ok(job_id),
+        SupervisorResponse::Error { message } => anyhow::bail!(message),
+        other => anyhow::bail!("supervisor 返回了非 recap enqueue 响应: {other:?}"),
     }
 }
 
@@ -870,6 +920,7 @@ pub async fn run_supervisor(
     let running_job = Arc::new(AtomicBool::new(false));
     let stopping = Arc::new(AtomicBool::new(false));
     let lifecycle_gate = Arc::new(Mutex::new(()));
+    let running_recap = Arc::new(Mutex::new(None));
     let shared_state = SupervisorSharedState {
         agent_id,
         notify_tx,
@@ -879,6 +930,7 @@ pub async fn run_supervisor(
         runtime_fingerprint,
         stopping: stopping.clone(),
         lifecycle_gate,
+        running_recap,
     };
 
     let accept_handle = tokio::spawn(accept_loop(
@@ -1017,6 +1069,30 @@ async fn handle_client(
                     .await
                     {
                         Ok(job) => {
+                            request_same_session_recap_preemption(paths, shared, &job).await;
+                            let _ = shared.notify_tx.send(());
+                            SupervisorResponse::Enqueued { job_id: job.id }
+                        }
+                        Err(error) => SupervisorResponse::Error {
+                            message: format!("{error:#}"),
+                        },
+                    }
+                }
+            }
+            Ok(SupervisorRequest::EnqueueRecap {
+                session_id,
+                recap_end_index,
+            }) => {
+                let _guard = shared.lifecycle_gate.lock().await;
+                if shared.stopping.load(Ordering::Acquire) || shared.stop_requested.is_cancelled() {
+                    SupervisorResponse::Error {
+                        message: SUPERVISOR_STOPPING_MESSAGE.into(),
+                    }
+                } else {
+                    match create_recap_job(paths, &shared.agent_id, session_id, recap_end_index)
+                        .await
+                    {
+                        Ok(job) => {
                             let _ = shared.notify_tx.send(());
                             SupervisorResponse::Enqueued { job_id: job.id }
                         }
@@ -1072,6 +1148,30 @@ async fn handle_client(
     Ok(())
 }
 
+async fn request_same_session_recap_preemption(
+    paths: &SupervisorPaths,
+    shared: &SupervisorSharedState,
+    finalize_job: &SupervisorJob,
+) {
+    let SupervisorJobKind::Finalize { session_id } = &finalize_job.kind else {
+        return;
+    };
+    let running = shared.running_recap.lock().await.clone();
+    let Some(running) = running.filter(|running| &running.session_id == session_id) else {
+        return;
+    };
+    if running.preemption.request_before_prepared().await {
+        append_supervisor_log(
+            paths,
+            format!(
+                "recap job {} preemption requested by same-session finalize job {} session={} before Prepared",
+                running.job_id, finalize_job.id, session_id
+            ),
+        )
+        .await;
+    }
+}
+
 async fn worker_loop(
     engine: SessionEngine,
     paths: SupervisorPaths,
@@ -1092,6 +1192,10 @@ async fn worker_loop(
             if shared.stop_requested.is_cancelled() || shared.stopping.load(Ordering::Acquire) {
                 break;
             }
+            let _guard = shared.lifecycle_gate.lock().await;
+            if shared.stop_requested.is_cancelled() || shared.stopping.load(Ordering::Acquire) {
+                break;
+            }
             let job = match next_queued_job(&paths).await {
                 Ok(Some(job)) => job,
                 Ok(None) => break,
@@ -1100,20 +1204,40 @@ async fn worker_loop(
                     break;
                 }
             };
-            let _guard = shared.lifecycle_gate.lock().await;
-            if shared.stop_requested.is_cancelled() || shared.stopping.load(Ordering::Acquire) {
-                break;
+            let job_id = job.id.clone();
+            let recap_preemption = matches!(&job.kind, SupervisorJobKind::Recap { .. })
+                .then(|| Arc::new(SessionRecapPreemptionControl::new()));
+            if let (SupervisorJobKind::Recap { session_id, .. }, Some(preemption)) =
+                (&job.kind, recap_preemption.as_ref())
+            {
+                *shared.running_recap.lock().await = Some(RunningRecap {
+                    job_id: job_id.clone(),
+                    session_id: session_id.clone(),
+                    preemption: Arc::clone(preemption),
+                });
             }
             running_job.store(true, Ordering::Relaxed);
             drop(_guard);
             shared.last_activity.store(now_millis(), Ordering::Relaxed);
-            let requeued = if let Err(err) = run_job(&engine, &paths, job).await {
-                append_supervisor_log(&paths, format!("job runner error: {err:#}")).await;
-                false
-            } else {
-                has_queued_jobs(&paths).await.unwrap_or(false)
-            };
+            let requeued =
+                if let Err(err) = run_job(&engine, &paths, job, recap_preemption.clone()).await {
+                    append_supervisor_log(&paths, format!("job runner error: {err:#}")).await;
+                    false
+                } else {
+                    has_queued_jobs(&paths).await.unwrap_or(false)
+                };
+            let _guard = shared.lifecycle_gate.lock().await;
+            if recap_preemption.is_some() {
+                let mut running_recap = shared.running_recap.lock().await;
+                if running_recap
+                    .as_ref()
+                    .is_some_and(|running| running.job_id == job_id)
+                {
+                    *running_recap = None;
+                }
+            }
             running_job.store(false, Ordering::Relaxed);
+            drop(_guard);
             shared.last_activity.store(now_millis(), Ordering::Relaxed);
             if requeued {
                 tokio::select! {
@@ -1129,6 +1253,7 @@ async fn run_job(
     engine: &SessionEngine,
     paths: &SupervisorPaths,
     mut job: SupervisorJob,
+    recap_preemption: Option<Arc<SessionRecapPreemptionControl>>,
 ) -> anyhow::Result<()> {
     job.status = SupervisorJobStatus::Running;
     job.attempts = job.attempts.saturating_add(1);
@@ -1137,15 +1262,49 @@ async fn run_job(
     job.last_error = None;
     write_job(paths, &job).await?;
 
-    let result = match &job.kind {
+    let kind = job.kind.clone();
+    let result = match &kind {
         SupervisorJobKind::Finalize { session_id } => {
             append_supervisor_log(paths, format!("finalize job {} started", job.id)).await;
             engine
-                .finalize_existing_session(session_id, |event| {
+                .finalize_existing_session_once(session_id, |event| {
                     log_supervisor_session_event(&job.id, &event);
                 })
                 .await
         }
+        SupervisorJobKind::Recap {
+            session_id,
+            recap_end_index,
+        } => {
+            append_supervisor_log(
+                paths,
+                format!(
+                    "recap job {} started session={} target={} attempt={}",
+                    job.id, session_id, recap_end_index, job.attempts
+                ),
+            )
+            .await;
+            let preemption = recap_preemption
+                .as_ref()
+                .context("Recap job 缺少 Prepared 前抢占控制器")?;
+            engine
+                .recap_existing_session_until_with_preemption(
+                    session_id,
+                    *recap_end_index,
+                    Arc::clone(preemption),
+                )
+                .await
+        }
+    };
+
+    let recap_was_preempted = match recap_preemption.as_ref() {
+        Some(preemption) => preemption.finish().await,
+        None => false,
+    };
+    let result = if recap_was_preempted {
+        Ok(SessionFinalizeReport::default())
+    } else {
+        result
     };
 
     match result {
@@ -1154,49 +1313,100 @@ async fn run_job(
             job.finished_at = Some(Utc::now());
             job.updated_at = Utc::now();
             write_job(paths, &job).await?;
-            if job.notify_on_completion && finalize_report_should_notify_success(&report) {
-                notify_finalize_success(paths, &job, &report).await;
+            match &kind {
+                SupervisorJobKind::Finalize { .. } => {
+                    if job.notify_on_completion && finalize_report_should_notify_success(&report) {
+                        notify_finalize_success(paths, &job, &report).await;
+                    }
+                    append_supervisor_log(
+                        paths,
+                        format!(
+                            "finalize job {} succeeded trace={} claims={} disputes={}",
+                            job.id,
+                            report
+                                .trace_id
+                                .as_ref()
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| "None".into()),
+                            report.new_claim_ids.len() + report.updated_claim_ids.len(),
+                            report.new_dispute_ids.len()
+                        ),
+                    )
+                    .await;
+                }
+                SupervisorJobKind::Recap {
+                    session_id,
+                    recap_end_index,
+                } => {
+                    let metadata = read_yaml::<SessionMetadata>(
+                        &SessionPaths::new(&paths.agent_home, session_id).session_yaml,
+                    )
+                    .await
+                    .ok();
+                    let subsumed =
+                        recap_report_was_subsumed_by_finalize(&report, metadata.as_ref());
+                    if recap_was_preempted {
+                        append_supervisor_log(
+                            paths,
+                            format!(
+                                "recap job {} succeeded no-op: preempted before Prepared and subsumed by finalize session={} target={}",
+                                job.id, session_id, recap_end_index
+                            ),
+                        )
+                        .await;
+                    } else if subsumed {
+                        append_supervisor_log(
+                            paths,
+                            format!(
+                                "recap job {} succeeded no-op: subsumed by finalize session={} target={}",
+                                job.id, session_id, recap_end_index
+                            ),
+                        )
+                        .await;
+                    } else {
+                        let cursor = metadata
+                            .as_ref()
+                            .map(|metadata| metadata.recapped_until)
+                            .unwrap_or(*recap_end_index);
+                        append_supervisor_log(
+                            paths,
+                            format!(
+                                "recap job {} succeeded session={} target={} recapped_until={} claims={} disputes={}",
+                                job.id,
+                                session_id,
+                                recap_end_index,
+                                cursor,
+                                report.new_claim_ids.len() + report.updated_claim_ids.len(),
+                                report.new_dispute_ids.len()
+                            ),
+                        )
+                        .await;
+                    }
+                }
             }
-            append_supervisor_log(
-                paths,
-                format!(
-                    "finalize job {} succeeded trace={} claims={} disputes={}",
-                    job.id,
-                    report
-                        .trace_id
-                        .as_ref()
-                        .map(ToString::to_string)
-                        .unwrap_or_else(|| "None".into()),
-                    report.new_claim_ids.len(),
-                    report.new_dispute_ids.len()
-                ),
-            )
-            .await;
         }
         Err(err) => {
             let message = err.to_string();
-            if job.attempts < DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS {
-                job.status = SupervisorJobStatus::Queued;
-                job.finished_at = None;
-            } else {
-                job.status = SupervisorJobStatus::Failed;
-                job.finished_at = Some(Utc::now());
-            }
-            job.updated_at = Utc::now();
-            job.last_error = Some(message.clone());
+            apply_job_attempt_failure(&mut job, message.clone());
             write_job(paths, &job).await?;
             if job.status == SupervisorJobStatus::Failed {
-                if job.notify_on_completion {
+                if matches!(&kind, SupervisorJobKind::Finalize { .. }) && job.notify_on_completion {
                     notify_finalize_failure(paths, &job, &message).await;
                 }
-                append_supervisor_log(paths, format!("finalize job {} failed: {message}", job.id))
-                    .await;
+                append_supervisor_log(
+                    paths,
+                    format!("{} job {} failed: {message}", job_kind_label(&kind), job.id),
+                )
+                .await;
             } else {
                 append_supervisor_log(
                     paths,
                     format!(
-                        "finalize job {} failed attempt {}/{} and was requeued: {message}",
-                        job.id, job.attempts, DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS
+                        "{} job {} failed attempt {}/{} and was requeued: {message}",
+                        job_kind_label(&kind),
+                        job.id,
+                        job.attempts,
+                        DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS
                     ),
                 )
                 .await;
@@ -1204,6 +1414,38 @@ async fn run_job(
         }
     }
     Ok(())
+}
+
+fn apply_job_attempt_failure(job: &mut SupervisorJob, message: String) {
+    let now = Utc::now();
+    if job.attempts < DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS {
+        job.status = SupervisorJobStatus::Queued;
+        job.finished_at = None;
+    } else {
+        job.status = SupervisorJobStatus::Failed;
+        job.finished_at = Some(now);
+    }
+    job.updated_at = now;
+    job.last_error = Some(message);
+}
+
+fn recap_report_was_subsumed_by_finalize(
+    report: &SessionFinalizeReport,
+    metadata: Option<&SessionMetadata>,
+) -> bool {
+    !report.advanced_recapped_until
+        && metadata.is_some_and(|metadata| {
+            metadata.status != SessionStatus::Open
+                || metadata.finalized_at.is_some()
+                || metadata.closed_at.is_some()
+        })
+}
+
+fn job_kind_label(kind: &SupervisorJobKind) -> &'static str {
+    match kind {
+        SupervisorJobKind::Finalize { .. } => "finalize",
+        SupervisorJobKind::Recap { .. } => "recap",
+    }
 }
 
 async fn enqueue_finalize_job(
@@ -1253,7 +1495,9 @@ async fn retry_finalize_job(
                 .iter()
                 .find(|job| job.id == job_id)
                 .with_context(|| format!("未找到 supervisor job {job_id}"))?;
-            let session_id = finalize_job_session_id(job).clone();
+            let session_id = finalize_job_session_id(job)
+                .with_context(|| format!("supervisor job {job_id} 不是 finalize job"))?
+                .clone();
             let matching = unresolved_finalize_jobs(&jobs, &session_id);
             ensure_unique_unresolved_job(&session_id, &matching)?;
             (session_id, Some(job.clone()))
@@ -1396,7 +1640,7 @@ fn unresolved_finalize_jobs<'a>(
 ) -> Vec<&'a SupervisorJob> {
     jobs.iter()
         .filter(|job| {
-            finalize_job_session_id(job) == session_id
+            finalize_job_session_id(job) == Some(session_id)
                 && job.status != SupervisorJobStatus::Succeeded
         })
         .collect()
@@ -1421,9 +1665,17 @@ fn unresolved_job_invariant_error(session_id: &SessionId, jobs: &[&SupervisorJob
     )
 }
 
-fn finalize_job_session_id(job: &SupervisorJob) -> &SessionId {
+fn finalize_job_session_id(job: &SupervisorJob) -> Option<&SessionId> {
     match &job.kind {
-        SupervisorJobKind::Finalize { session_id } => session_id,
+        SupervisorJobKind::Finalize { session_id } => Some(session_id),
+        SupervisorJobKind::Recap { .. } => None,
+    }
+}
+
+fn job_session_id_ref(job: &SupervisorJob) -> &SessionId {
+    match &job.kind {
+        SupervisorJobKind::Finalize { session_id }
+        | SupervisorJobKind::Recap { session_id, .. } => session_id,
     }
 }
 
@@ -1446,6 +1698,61 @@ async fn create_finalize_job(
         default_id_mint_max_attempts(),
     )
     .await
+}
+
+async fn create_recap_job(
+    paths: &SupervisorPaths,
+    agent_id: &AgentId,
+    session_id: SessionId,
+    recap_end_index: usize,
+) -> anyhow::Result<SupervisorJob> {
+    let session_paths = SessionPaths::new(&paths.agent_home, &session_id);
+    let metadata = read_yaml::<SessionMetadata>(&session_paths.session_yaml)
+        .await
+        .with_context(|| format!("读取 recap session {session_id} metadata 失败"))?;
+    if metadata.id != session_id {
+        anyhow::bail!(
+            "session metadata id {} 与 recap 请求的 {session_id} 不一致",
+            metadata.id
+        );
+    }
+    if metadata.agent_id != *agent_id {
+        anyhow::bail!(
+            "session {session_id} 属于 agent {}，不是当前 agent {agent_id}",
+            metadata.agent_id
+        );
+    }
+    if recap_end_index > metadata.message_count {
+        anyhow::bail!(
+            "session {session_id} recap target {recap_end_index} 超过 message_count {}",
+            metadata.message_count
+        );
+    }
+
+    fs::create_dir_all(&paths.jobs_dir).await?;
+    let id = mint_unique_id_in_dir(&paths.jobs_dir, next_job_id, default_id_mint_max_attempts())
+        .await
+        .context("原子申领 recap supervisor job id 失败")?;
+    let now = Utc::now();
+    let job = SupervisorJob {
+        id,
+        agent_id: Some(agent_id.clone()),
+        kind: SupervisorJobKind::Recap {
+            session_id,
+            recap_end_index,
+        },
+        status: SupervisorJobStatus::Queued,
+        attempts: 0,
+        manual_retries: 0,
+        created_at: now,
+        updated_at: now,
+        started_at: None,
+        finished_at: None,
+        last_error: None,
+        notify_on_completion: false,
+    };
+    write_reserved_job(paths, &job).await?;
+    Ok(job)
 }
 
 async fn create_recovery_finalize_job(
@@ -1545,11 +1852,22 @@ async fn next_queued_job(paths: &SupervisorPaths) -> anyhow::Result<Option<Super
     let mut jobs = read_jobs(paths).await?;
     jobs.retain(|job| job.status == SupervisorJobStatus::Queued);
     jobs.sort_by(|a, b| {
-        a.created_at
-            .cmp(&b.created_at)
-            .then_with(|| a.id.cmp(&b.id))
+        supervisor_job_priority(&a.kind)
+            .cmp(&supervisor_job_priority(&b.kind))
+            .then_with(|| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            })
     });
     Ok(jobs.into_iter().next())
+}
+
+fn supervisor_job_priority(kind: &SupervisorJobKind) -> u8 {
+    match kind {
+        SupervisorJobKind::Finalize { .. } => 0,
+        SupervisorJobKind::Recap { .. } => 1,
+    }
 }
 
 async fn has_queued_jobs(paths: &SupervisorPaths) -> anyhow::Result<bool> {
@@ -1563,8 +1881,8 @@ async fn reconcile_stale_running_jobs(paths: &SupervisorPaths) -> anyhow::Result
             continue;
         }
 
-        let session_id = finalize_job_session_id(job);
-        let session_paths = SessionPaths::new(&paths.agent_home, session_id);
+        let session_id = job_session_id_ref(job).clone();
+        let session_paths = SessionPaths::new(&paths.agent_home, &session_id);
         let session_status = read_yaml::<SessionMetadata>(&session_paths.session_yaml)
             .await
             .with_context(|| {
@@ -1575,22 +1893,58 @@ async fn reconcile_stale_running_jobs(paths: &SupervisorPaths) -> anyhow::Result
             })?
             .status;
         let now = Utc::now();
-        match session_status {
-            SessionStatus::Closed | SessionStatus::Open => {
+        let recap_subsumed = matches!(
+            (&job.kind, &session_status),
+            (
+                SupervisorJobKind::Recap { .. },
+                SessionStatus::Finalizing | SessionStatus::Closed
+            )
+        );
+        match (&job.kind, session_status) {
+            (SupervisorJobKind::Finalize { .. }, SessionStatus::Closed | SessionStatus::Open) => {
                 // finalize 先提交 session，再提交 job。若进程在两次原子写之间退出，或
                 // session 已经被 resume，旧 Running job 不能再次关闭新的会话周期。
                 job.status = SupervisorJobStatus::Succeeded;
                 job.finished_at = Some(now);
                 job.last_error = None;
             }
-            SessionStatus::Finalizing => {
-                job.status = SupervisorJobStatus::Queued;
-                job.finished_at = None;
-                job.last_error = Some("recovered stale running job after supervisor start".into());
+            (SupervisorJobKind::Finalize { .. }, SessionStatus::Finalizing)
+            | (SupervisorJobKind::Recap { .. }, SessionStatus::Open) => {
+                if job.attempts >= DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS {
+                    job.status = SupervisorJobStatus::Failed;
+                    job.finished_at = Some(now);
+                    job.last_error = Some(
+                        "stale running job exhausted supervisor retry budget before recovery"
+                            .into(),
+                    );
+                } else {
+                    job.status = SupervisorJobStatus::Queued;
+                    job.finished_at = None;
+                    job.last_error =
+                        Some("recovered stale running job after supervisor start".into());
+                }
+            }
+            (
+                SupervisorJobKind::Recap { .. },
+                SessionStatus::Finalizing | SessionStatus::Closed,
+            ) => {
+                job.status = SupervisorJobStatus::Succeeded;
+                job.finished_at = Some(now);
+                job.last_error = None;
             }
         }
         job.updated_at = now;
         write_job(paths, job).await?;
+        if recap_subsumed {
+            append_supervisor_log(
+                paths,
+                format!(
+                    "recap job {} succeeded no-op during stale recovery: subsumed by finalize session={}",
+                    job.id, session_id
+                ),
+            )
+            .await;
+        }
     }
     Ok(())
 }
@@ -1660,13 +2014,25 @@ fn sort_jobs_by_created_at(jobs: &mut [SupervisorJob]) {
 }
 
 fn job_to_view(job: &SupervisorJob) -> SupervisorJobView {
-    let session_id = match &job.kind {
-        SupervisorJobKind::Finalize { session_id } => session_id.clone(),
+    let (kind, session_id, recap_end_index) = match &job.kind {
+        SupervisorJobKind::Finalize { session_id } => {
+            ("finalize".to_string(), session_id.clone(), None)
+        }
+        SupervisorJobKind::Recap {
+            session_id,
+            recap_end_index,
+        } => (
+            "recap".to_string(),
+            session_id.clone(),
+            Some(*recap_end_index),
+        ),
     };
     SupervisorJobView {
         id: job.id.clone(),
         agent_id: job.agent_id.clone(),
+        kind,
         session_id,
+        recap_end_index,
         status: job.status.as_str().to_string(),
         created_at: job.created_at,
         started_at: job.started_at,
@@ -2551,7 +2917,7 @@ fn truncate_notification(value: &str) -> String {
 }
 
 fn job_session_id(job: &SupervisorJob) -> String {
-    finalize_job_session_id(job).to_string()
+    job_session_id_ref(job).to_string()
 }
 
 fn now_millis() -> u64 {
@@ -2668,6 +3034,86 @@ mod tests {
             last_error: None,
             notify_on_completion: true,
         }
+    }
+
+    fn queued_recap_job(id: &str, session_id: SessionId, recap_end_index: usize) -> SupervisorJob {
+        let now = Utc::now();
+        SupervisorJob {
+            id: id.to_owned(),
+            agent_id: Some(AgentId::new("agent-a").unwrap()),
+            kind: SupervisorJobKind::Recap {
+                session_id,
+                recap_end_index,
+            },
+            status: SupervisorJobStatus::Queued,
+            attempts: 0,
+            manual_retries: 0,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            finished_at: None,
+            last_error: None,
+            notify_on_completion: false,
+        }
+    }
+
+    #[test]
+    fn recap_job_fails_on_the_fifth_outer_attempt() {
+        let mut job = queued_recap_job("job_recap", "session_11111111".parse().unwrap(), 4);
+
+        for attempt in 1..DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS {
+            job.attempts = attempt;
+            apply_job_attempt_failure(&mut job, format!("attempt {attempt}"));
+            assert_eq!(job.status, SupervisorJobStatus::Queued);
+            assert!(job.finished_at.is_none());
+        }
+
+        job.attempts = DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS;
+        apply_job_attempt_failure(&mut job, "attempt 5".into());
+        assert_eq!(job.status, SupervisorJobStatus::Failed);
+        assert!(job.finished_at.is_some());
+        assert_eq!(job.last_error.as_deref(), Some("attempt 5"));
+    }
+
+    #[test]
+    fn recap_result_is_subsumed_only_when_finalize_won_without_cursor_progress() {
+        let now = Utc::now();
+        let mut metadata = SessionMetadata {
+            id: "session_11111111".parse().unwrap(),
+            agent_id: AgentId::new("agent-a").unwrap(),
+            status: SessionStatus::Finalizing,
+            created_at: now,
+            updated_at: now,
+            closed_at: None,
+            source: "tui".into(),
+            model: "test-model".into(),
+            system_prompt_path: "system_prompt.md".into(),
+            message_count: 4,
+            finalized_at: None,
+            recapped_until: 4,
+            provider_background_completion_until_seq: None,
+            recap_background_completion_until_seq: None,
+            compaction: None,
+        };
+        let mut report = SessionFinalizeReport::default();
+
+        assert!(recap_report_was_subsumed_by_finalize(
+            &report,
+            Some(&metadata)
+        ));
+
+        report.advanced_recapped_until = true;
+        assert!(!recap_report_was_subsumed_by_finalize(
+            &report,
+            Some(&metadata)
+        ));
+
+        report.advanced_recapped_until = false;
+        metadata.status = SessionStatus::Open;
+        assert!(!recap_report_was_subsumed_by_finalize(
+            &report,
+            Some(&metadata)
+        ));
     }
 
     async fn write_test_session(
@@ -2806,6 +3252,24 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<SupervisorRequest>(&quiet_json).unwrap(),
             quiet
+        );
+    }
+
+    #[test]
+    fn supervisor_request_round_trips_enqueue_recap() {
+        let request = SupervisorRequest::EnqueueRecap {
+            session_id: "session_1234abcd".parse().unwrap(),
+            recap_end_index: 42,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+
+        assert_eq!(
+            json,
+            r#"{"type":"enqueue_recap","session_id":"session_1234abcd","recap_end_index":42}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SupervisorRequest>(&json).unwrap(),
+            request
         );
     }
 
@@ -3486,6 +3950,7 @@ mod tests {
             runtime_fingerprint: test_runtime_fingerprint("current"),
             stopping: Arc::new(AtomicBool::new(true)),
             lifecycle_gate: Arc::new(Mutex::new(())),
+            running_recap: Arc::new(Mutex::new(None)),
         };
         let (client, server) = UnixStream::pair()?;
 
@@ -3514,7 +3979,7 @@ mod tests {
         assert_eq!(
             response,
             SupervisorResponse::Error {
-                message: "supervisor 正在停止，拒绝新 finalize job".into()
+                message: "supervisor 正在停止，拒绝新 job".into()
             }
         );
         assert!(!paths.jobs_dir.exists());
@@ -3538,6 +4003,7 @@ mod tests {
             runtime_fingerprint: test_runtime_fingerprint("current"),
             stopping: Arc::new(AtomicBool::new(false)),
             lifecycle_gate: Arc::new(Mutex::new(())),
+            running_recap: Arc::new(Mutex::new(None)),
         };
         let running_job = Arc::new(AtomicBool::new(false));
         let enqueue_guard = shared.lifecycle_gate.lock().await;
@@ -3579,6 +4045,112 @@ mod tests {
         assert_eq!(first.id, second.id);
         assert!(second.notify_on_completion);
         assert_eq!(read_jobs(&paths).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enqueue_recap_keeps_overlapping_jobs_and_disables_notifications() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Open).await?;
+
+        let first = create_recap_job(&paths, &agent_id, session_id.clone(), 0).await?;
+        let second = create_recap_job(&paths, &agent_id, session_id.clone(), 0).await?;
+
+        assert_ne!(first.id, second.id);
+        assert!(!first.notify_on_completion);
+        assert!(!second.notify_on_completion);
+        let jobs = read_jobs(&paths).await?;
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().all(|job| matches!(
+            &job.kind,
+            SupervisorJobKind::Recap {
+                session_id: stored_session_id,
+                recap_end_index: 0,
+            } if stored_session_id == &session_id
+        )));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalize_preemption_only_targets_running_recap_from_same_session() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let recap_session: SessionId = "session_11111111".parse()?;
+        let other_session: SessionId = "session_22222222".parse()?;
+        let preemption = Arc::new(SessionRecapPreemptionControl::new());
+        let (notify_tx, _notify_rx) = mpsc::unbounded_channel();
+        let shared = SupervisorSharedState {
+            agent_id: AgentId::new("agent-a")?,
+            notify_tx,
+            stop_requested: CancellationToken::new(),
+            last_activity: Arc::new(AtomicU64::new(now_millis())),
+            started_at: Utc::now(),
+            runtime_fingerprint: test_runtime_fingerprint("current"),
+            stopping: Arc::new(AtomicBool::new(false)),
+            lifecycle_gate: Arc::new(Mutex::new(())),
+            running_recap: Arc::new(Mutex::new(Some(RunningRecap {
+                job_id: "job_recap".into(),
+                session_id: recap_session.clone(),
+                preemption: Arc::clone(&preemption),
+            }))),
+        };
+
+        let other_finalize = queued_finalize_job("job_finalize_b", other_session);
+        request_same_session_recap_preemption(&paths, &shared, &other_finalize).await;
+        assert!(!preemption.was_preempted_before_prepared().await);
+
+        let same_finalize = queued_finalize_job("job_finalize_a", recap_session);
+        request_same_session_recap_preemption(&paths, &shared, &same_finalize).await;
+        assert!(preemption.was_preempted_before_prepared().await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalize_jobs_have_global_priority_over_older_recap_jobs() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        fs::create_dir_all(&paths.jobs_dir).await?;
+        let recap_session = "session_11111111".parse()?;
+        let finalize_session = "session_22222222".parse()?;
+        let mut recap = queued_recap_job("job_recap", recap_session, 10);
+        let mut finalize = queued_finalize_job("job_finalize", finalize_session);
+        recap.created_at = Utc::now() - chrono::Duration::seconds(10);
+        finalize.created_at = Utc::now();
+        write_yaml_atomic(&job_path(&paths, &recap.id), &recap).await?;
+        write_yaml_atomic(&job_path(&paths, &finalize.id), &finalize).await?;
+
+        let selected = next_queued_job(&paths).await?.context("queued job")?;
+
+        assert_eq!(selected.id, finalize.id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preempting_finalize_does_not_jump_an_older_finalize() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        fs::create_dir_all(&paths.jobs_dir).await?;
+        let session_a: SessionId = "session_11111111".parse()?;
+        let session_b: SessionId = "session_22222222".parse()?;
+        let now = Utc::now();
+        let mut recap_a = queued_recap_job("job_recap_a", session_a.clone(), 10);
+        let mut finalize_b = queued_finalize_job("job_finalize_b", session_b);
+        let mut finalize_a = queued_finalize_job("job_finalize_a", session_a);
+        recap_a.created_at = now - chrono::Duration::seconds(3);
+        finalize_b.created_at = now - chrono::Duration::seconds(2);
+        finalize_a.created_at = now - chrono::Duration::seconds(1);
+        write_yaml_atomic(&job_path(&paths, &recap_a.id), &recap_a).await?;
+        write_yaml_atomic(&job_path(&paths, &finalize_b.id), &finalize_b).await?;
+        write_yaml_atomic(&job_path(&paths, &finalize_a.id), &finalize_a).await?;
+
+        let selected = next_queued_job(&paths).await?.context("queued job")?;
+
+        assert_eq!(selected.id, finalize_b.id);
         Ok(())
     }
 
@@ -4059,8 +4631,15 @@ mod tests {
         failed.status = SupervisorJobStatus::Failed;
         failed.attempts = DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS;
         failed.finished_at = Some(Utc::now());
+        let exhausted_session: SessionId = "session_33333333".parse()?;
+        write_test_session(&paths, &agent_id, &exhausted_session, SessionStatus::Open).await?;
+        let mut exhausted = queued_recap_job("job_exhausted", exhausted_session, 0);
+        exhausted.status = SupervisorJobStatus::Running;
+        exhausted.attempts = DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS;
+        exhausted.started_at = Some(Utc::now());
         write_yaml_atomic(&job_path(&paths, &running.id), &running).await?;
         write_yaml_atomic(&job_path(&paths, &failed.id), &failed).await?;
+        write_yaml_atomic(&job_path(&paths, &exhausted.id), &exhausted).await?;
 
         reconcile_stale_running_jobs(&paths).await?;
 
@@ -4073,6 +4652,59 @@ mod tests {
         );
         let terminal = read_yaml::<SupervisorJob>(&job_path(&paths, &failed.id)).await?;
         assert_eq!(terminal, failed);
+        let exhausted = read_yaml::<SupervisorJob>(&job_path(&paths, "job_exhausted")).await?;
+        assert_eq!(exhausted.status, SupervisorJobStatus::Failed);
+        assert_eq!(exhausted.attempts, DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS);
+        assert!(exhausted.finished_at.is_some());
+        assert_eq!(
+            exhausted.last_error.as_deref(),
+            Some("stale running job exhausted supervisor retry budget before recovery")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_recap_requeues_open_but_is_subsumed_by_finalize_states() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let cases = [
+            (
+                "session_11111111",
+                SessionStatus::Open,
+                SupervisorJobStatus::Queued,
+            ),
+            (
+                "session_22222222",
+                SessionStatus::Finalizing,
+                SupervisorJobStatus::Succeeded,
+            ),
+            (
+                "session_33333333",
+                SessionStatus::Closed,
+                SupervisorJobStatus::Succeeded,
+            ),
+        ];
+        for (index, (session_id, status, _)) in cases.iter().enumerate() {
+            let session_id: SessionId = session_id.parse()?;
+            write_test_session(&paths, &agent_id, &session_id, *status).await?;
+            let mut job = queued_recap_job(&format!("job_recap_{index}"), session_id, 0);
+            job.status = SupervisorJobStatus::Running;
+            job.attempts = 2;
+            job.started_at = Some(Utc::now());
+            write_yaml_atomic(&job_path(&paths, &job.id), &job).await?;
+        }
+
+        reconcile_stale_running_jobs(&paths).await?;
+
+        for (index, (_, _, expected)) in cases.iter().enumerate() {
+            let job = read_yaml::<SupervisorJob>(&job_path(&paths, &format!("job_recap_{index}")))
+                .await?;
+            assert_eq!(&job.status, expected);
+            assert_eq!(job.attempts, 2);
+        }
+        let log = fs::read_to_string(&paths.log_path).await?;
+        assert_eq!(log.matches("subsumed by finalize").count(), 2);
         Ok(())
     }
 

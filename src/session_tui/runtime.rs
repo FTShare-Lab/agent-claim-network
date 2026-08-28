@@ -59,6 +59,9 @@ pub(super) enum WorkerEvent {
         task_id: u64,
         result: FinalizeEnqueueOutcome,
     },
+    RecapEnqueueFinished {
+        result: anyhow::Result<()>,
+    },
     McpOperationFinished {
         server_name: String,
         operation_id: u64,
@@ -912,6 +915,7 @@ fn spawn_turn_worker(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let event_tx = worker_tx.clone();
+        let completion_event_tx = worker_tx.clone();
         let text = input.text().to_string();
         let skill_source_text = input.command_text().to_string();
         let attachments = input.attachments().to_vec();
@@ -931,8 +935,38 @@ fn spawn_turn_worker(
             )
             .await
             .map(|_| session);
+        match engine.local_claim_count().await {
+            Ok(total) => {
+                let _ = completion_event_tx.send(WorkerEvent::Session {
+                    task_id: Some(turn_id),
+                    event: SessionEvent::LocalClaimsUpdated { total },
+                });
+            }
+            Err(error) => {
+                log::warn!(target: "agent", "turn 收束时刷新 local claim 计数失败: {error:#}");
+            }
+        }
         let _ = worker_tx.send(WorkerEvent::TurnFinished { turn_id, result });
     })
+}
+
+pub(super) fn spawn_recap_enqueue_worker(
+    supervisor: Option<crate::supervisor::SupervisorLaunchConfig>,
+    session_id: SessionId,
+    recap_end_index: usize,
+    worker_tx: mpsc::UnboundedSender<WorkerEvent>,
+) {
+    tokio::spawn(async move {
+        let result = match supervisor {
+            Some(supervisor) => {
+                crate::supervisor::enqueue_recap(&supervisor, session_id, recap_end_index)
+                    .await
+                    .map(|_| ())
+            }
+            None => Err(anyhow::anyhow!("supervisor is not configured")),
+        };
+        let _ = worker_tx.send(WorkerEvent::RecapEnqueueFinished { result });
+    });
 }
 
 fn spawn_user_shell_worker(
