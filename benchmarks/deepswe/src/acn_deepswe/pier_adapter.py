@@ -392,7 +392,7 @@ class AcnPatchReplayPierAgent(BaseAgent):
         return f"{cls.__module__}:{cls.__name__}"
 
     def version(self) -> str:
-        return "1.0.0"
+        return "1.0.1"
 
     async def setup(self, environment: BaseEnvironment) -> None:
         created = await environment.exec(
@@ -410,7 +410,10 @@ class AcnPatchReplayPierAgent(BaseAgent):
             "set -eu; cd /app; "
             f"if [ -s {CONTAINER_ROOT}/model.patch ]; then "
             f"git apply --check {CONTAINER_ROOT}/model.patch; "
-            f"git apply --index {CONTAINER_ROOT}/model.patch; "
+            # 部分官方镜像的 index 元数据会让 `git apply --index` 在 worktree 完全
+            # 匹配时仍误报 does not match index；先校验 worktree，再显式 stage。
+            f"git apply {CONTAINER_ROOT}/model.patch; "
+            "git add -A; "
             "git -c user.name=acn-eval -c user.email=eval@invalid "
             "commit -m 'replay frozen evaluation patch'; "
             "fi"

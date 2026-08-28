@@ -365,5 +365,10 @@ class AcnEvalPierAgentTests(unittest.IsolatedAsyncioTestCase):
         environment.upload_file.assert_awaited_once_with(
             frozen_patch, "/opt/acn-eval/model.patch"
         )
+        replay_command = environment.exec.await_args_list[-1].args[0]
+        self.assertIn("git apply --check /opt/acn-eval/model.patch", replay_command)
+        self.assertIn("git apply /opt/acn-eval/model.patch", replay_command)
+        self.assertIn("git add -A", replay_command)
+        self.assertNotIn("git apply --index", replay_command)
         self.assertEqual(context.metadata["patch_sha256"], digest)
-        self.assertEqual(agent.version(), "1.0.0")
+        self.assertEqual(agent.version(), "1.0.1")
