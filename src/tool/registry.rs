@@ -193,6 +193,10 @@ impl ToolRegistry {
         self.limits.file_edit_authority_enabled
     }
 
+    pub(crate) fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
     pub(crate) fn memory_enabled(&self) -> bool {
         self.memory_enabled
     }

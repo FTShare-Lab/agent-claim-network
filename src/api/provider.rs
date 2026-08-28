@@ -358,6 +358,18 @@ pub(crate) struct ProviderTerminalFailure {
     message: String,
 }
 
+/// Provider 明确拒绝了过大的 HTTP 请求体。Adapter 只负责统一分类，是否能通过
+/// 剥离媒体恢复由持有完整 provider-neutral history 的 turn loop 决定。
+#[derive(Debug, thiserror::Error)]
+#[error("LLM provider request is too large (HTTP 413)")]
+pub(crate) struct ProviderRequestTooLarge;
+
+impl ProviderRequestTooLarge {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+}
+
 /// Provider request 尚未发送时，其 write-ahead 准备已失败。
 ///
 /// 该错误不能进入 streaming fallback，否则会绕过同一条 WAL 不变量。

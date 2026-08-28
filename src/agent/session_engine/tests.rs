@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
@@ -124,6 +126,7 @@ enum ProviderStep {
         message: &'static str,
         events: Vec<ProviderEvent>,
     },
+    RequestTooLarge,
 }
 
 struct RecordingProvider {
@@ -266,6 +269,9 @@ impl ProviderAdapter for RecordingProvider {
                     emit(event);
                 }
                 anyhow::bail!(message)
+            }
+            Some(ProviderStep::RequestTooLarge) => {
+                Err(crate::api::ProviderRequestTooLarge::new().into())
             }
             None => anyhow::bail!("recording provider response exhausted"),
         }
@@ -873,6 +879,10 @@ fn json_by_request_kind_responses(compaction_texts: &[&str], recap_texts: &[&str
 
 fn error_step(message: &'static str, events: Vec<ProviderEvent>) -> ProviderStep {
     ProviderStep::Error { message, events }
+}
+
+fn request_too_large_step() -> ProviderStep {
+    ProviderStep::RequestTooLarge
 }
 
 fn exhausted_stream_failure_steps(
@@ -2527,6 +2537,80 @@ async fn run_turn_success_writes_committed_journal_and_canonical_messages() {
 }
 
 #[tokio::test]
+async fn resumed_session_appends_runtime_context_only_after_workspace_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let first_workspace = dir.path().join("workspace-a");
+    let second_workspace = dir.path().join("workspace-b");
+    tokio::fs::create_dir_all(&first_workspace).await.unwrap();
+    tokio::fs::create_dir_all(&second_workspace).await.unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        response_step("first", Vec::new()),
+        response_step("changed", Vec::new()),
+        response_step("same", Vec::new()),
+    ]));
+    let first_tools = Arc::new(
+        ToolRegistry::new(&ToolConfig {
+            workspace_root: first_workspace.clone(),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let (first_engine, store) = build_test_engine_with_tools(&dir, provider.clone(), first_tools);
+    let mut session = create_test_session(&store, "session_c0d0feed").await;
+
+    first_engine
+        .run_turn(&mut session, "first workspace", |_| {})
+        .await
+        .unwrap();
+    let agent_id = session.metadata.agent_id.clone();
+    let session_id = session.metadata.id.clone();
+    drop(session);
+
+    let second_tools = Arc::new(
+        ToolRegistry::new(&ToolConfig {
+            workspace_root: second_workspace.clone(),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let (second_engine, second_store) =
+        build_test_engine_with_tools(&dir, provider.clone(), second_tools);
+    let mut resumed = second_store
+        .load_existing_session(&agent_id, &session_id)
+        .await
+        .unwrap();
+    second_engine
+        .run_turn(&mut resumed, "changed workspace", |_| {})
+        .await
+        .unwrap();
+    second_engine
+        .run_turn(&mut resumed, "same workspace again", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 3);
+    let runtime_texts = |request: &ProviderRequest| {
+        request
+            .messages
+            .iter()
+            .filter_map(SessionTurnMessage::model_context_snapshot)
+            .filter(|(source, _, _)| **source == ModelContextSource::Runtime)
+            .map(|(_, _, text)| text.to_string())
+            .collect::<Vec<_>>()
+    };
+    let first_runtime = runtime_texts(&requests[0]);
+    let changed_runtime = runtime_texts(&requests[1]);
+    let same_runtime = runtime_texts(&requests[2]);
+    assert_eq!(first_runtime.len(), 1);
+    assert_eq!(changed_runtime.len(), 2);
+    assert_eq!(same_runtime.len(), 2);
+    assert!(first_runtime[0].contains(&format!("cwd: {}", first_workspace.display())));
+    assert!(changed_runtime[1].contains(&format!("cwd: {}", second_workspace.display())));
+    assert_eq!(changed_runtime, same_runtime);
+}
+
+#[tokio::test]
 async fn text_attachment_keeps_journal_input_aligned_with_canonical_user_message() {
     let dir = tempfile::tempdir().unwrap();
     let attachment_path = dir.path().join("large.rs");
@@ -2580,6 +2664,175 @@ async fn text_attachment_keeps_journal_input_aligned_with_canonical_user_message
         Some(expected_hash.as_str())
     );
     assert_eq!(projection.turns[0].canonical_user_first_text, None);
+}
+
+#[tokio::test]
+async fn request_too_large_media_cleanup_persists_provider_history_for_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let image_path = dir.path().join("oversized-request.png");
+    let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2));
+    let mut image_bytes = Vec::new();
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut image_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    tokio::fs::write(&image_path, image_bytes).await.unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        request_too_large_step(),
+        response_step("recovered without media", Vec::new()),
+        response_step("resume stayed clean", Vec::new()),
+    ]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_4130feed").await;
+    let mut warnings = Vec::new();
+
+    engine
+        .run_turn_with_attachments(
+            &mut session,
+            "inspect the image",
+            vec![SessionAttachment::LocalImage { path: image_path }],
+            |event| {
+                if let SessionEvent::Warning { message } = event {
+                    warnings.push(message);
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(warnings.len(), 1);
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].messages.iter().any(|message| message
+        .content
+        .iter()
+        .any(|block| matches!(block, SessionTurnContentBlock::Image { .. }))));
+    assert!(!requests[1].messages.iter().any(|message| message
+        .content
+        .iter()
+        .any(|block| matches!(block, SessionTurnContentBlock::Image { .. }))));
+    let canonical_messages = session.read_messages().await.unwrap();
+    assert!(canonical_messages.iter().any(|message| message
+        .content
+        .iter()
+        .any(|block| matches!(block, SessionContentBlock::Image { .. }))));
+    let metadata = session.read_metadata().await.unwrap();
+    let stable_history = metadata
+        .compaction
+        .as_ref()
+        .and_then(|compaction| compaction.provider_history.as_ref())
+        .expect("successful media recovery must persist provider history");
+    assert!(stable_history.pending_turn.is_none());
+    let stable_wire = serde_json::to_string(&stable_history.messages).unwrap();
+    assert!(stable_wire.contains("image attachment removed after HTTP 413"));
+    assert!(!stable_history.messages.iter().any(|message| message
+        .content
+        .iter()
+        .any(|block| matches!(block, SessionTurnContentBlock::Image { .. }))));
+
+    let agent_id = session.metadata.agent_id.clone();
+    let session_id = session.metadata.id.clone();
+    drop(session);
+    let mut resumed = store
+        .load_existing_session(&agent_id, &session_id)
+        .await
+        .unwrap();
+    engine
+        .run_turn(&mut resumed, "continue after restart", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 3);
+    assert!(requests[2].messages.starts_with(&stable_history.messages));
+    assert!(!requests[2].messages.iter().any(|message| message
+        .content
+        .iter()
+        .any(|block| matches!(block, SessionTurnContentBlock::Image { .. }))));
+}
+
+#[tokio::test]
+async fn failed_inline_media_cleanup_resumes_from_clean_provider_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2));
+    let mut image_bytes = Vec::new();
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut image_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    let inline_data = BASE64_STANDARD.encode(image_bytes);
+    let provider = Arc::new(RecordingProvider::new(vec![
+        request_too_large_step(),
+        request_too_large_step(),
+        response_step("continued after failed cleanup", Vec::new()),
+    ]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_4130fade").await;
+    let mut warnings = Vec::new();
+
+    let error = engine
+        .run_turn_with_attachments(
+            &mut session,
+            "inspect clipboard image",
+            vec![SessionAttachment::InlineImage {
+                media_type: "image/png".into(),
+                data: inline_data.clone(),
+            }],
+            |event| {
+                if let SessionEvent::Warning { message } = event {
+                    warnings.push(message);
+                }
+            },
+        )
+        .await
+        .expect_err("the second 413 must fail the active turn");
+
+    assert!(error
+        .downcast_ref::<crate::api::ProviderRequestTooLarge>()
+        .is_some());
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("重新附加较小文件"));
+    assert!(!warnings[0].contains("保留在本地"));
+    assert!(session.read_messages().await.unwrap().is_empty());
+    let failed_requests = provider.requests().await;
+    assert_eq!(failed_requests.len(), 2);
+    let metadata = session.read_metadata().await.unwrap();
+    let pending_history = metadata
+        .compaction
+        .as_ref()
+        .and_then(|compaction| compaction.provider_history.as_ref())
+        .expect("the cleaned retry must remain as the failed turn WAL");
+    assert!(pending_history.pending_turn.is_some());
+    assert_eq!(pending_history.messages, failed_requests[1].messages);
+    let pending_wire = serde_json::to_string(&pending_history.messages).unwrap();
+    assert!(pending_wire.contains("image attachment removed after HTTP 413"));
+    assert!(!pending_wire.contains(&inline_data));
+
+    let agent_id = session.metadata.agent_id.clone();
+    let session_id = session.metadata.id.clone();
+    drop(session);
+    let mut resumed = store
+        .load_existing_session(&agent_id, &session_id)
+        .await
+        .unwrap();
+    engine
+        .run_turn(&mut resumed, "continue without the image", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 3);
+    assert!(requests[2]
+        .messages
+        .starts_with(&failed_requests[1].messages));
+    assert!(!requests[2].messages.iter().any(|message| message
+        .content
+        .iter()
+        .any(|block| matches!(block, SessionTurnContentBlock::Image { .. }))));
 }
 
 #[tokio::test]

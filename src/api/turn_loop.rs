@@ -25,7 +25,7 @@ use tokio::time::Instant;
 use super::continuation::{append_with_overlap_dedupe, CONTINUATION_TRIGGER};
 use super::provider::{
     ProviderNoConsumableOutput, ProviderRequestObserver, ProviderRequestPreparationFailure,
-    ProviderStreamFailure, ProviderTerminalFailure,
+    ProviderRequestTooLarge, ProviderStreamFailure, ProviderTerminalFailure,
 };
 use crate::api::{
     estimate_provider_request_context_tokens, CompletedSessionTurnMessage, ContextUsageSnapshot,
@@ -53,6 +53,10 @@ const NON_STREAMING_FALLBACK_ERROR_MAX_CHARS: usize = 4096;
 const NON_STREAMING_FALLBACK_BASE_DELAY: Duration = Duration::from_millis(250);
 const NON_STREAMING_FALLBACK_MAX_DELAY: Duration = Duration::from_secs(4);
 const MAX_CONTEXT_WINDOW_RECOVERIES: usize = 2;
+const OVERSIZED_IMAGE_PLACEHOLDER: &str =
+    "[image attachment removed after HTTP 413 request_too_large]";
+const OVERSIZED_DOCUMENT_PLACEHOLDER: &str =
+    "[document attachment removed after HTTP 413 request_too_large]";
 // Provider WAL 是发起网络 I/O 前的内部保护边界，不与用户可配置的
 // LLM 请求超时共用几分钟的等待时间。
 const PROVIDER_WAL_PREPARATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -500,6 +504,7 @@ impl AgentTurnLoop {
         tools: Arc<ToolRegistry>,
         max_tokens: u32,
     ) -> Self {
+        let workspace_root = tools.workspace_root().to_path_buf();
         Self {
             provider,
             tools,
@@ -510,7 +515,7 @@ impl AgentTurnLoop {
             tool_input_journal_preview_chars: DEFAULT_TOOL_INPUT_JOURNAL_PREVIEW_CHARS,
             tool_output_journal_preview_chars: DEFAULT_TOOL_OUTPUT_JOURNAL_PREVIEW_CHARS,
             now: Arc::new(Utc::now),
-            runtime_context: Arc::new(runtime_context_text),
+            runtime_context: Arc::new(move |now| runtime_context_text(now, &workspace_root)),
             #[cfg(test)]
             before_tool_dispatch_reservation: None,
         }
@@ -1500,6 +1505,7 @@ impl AgentTurnLoop {
         let mut pending_process_deliveries = Vec::<PendingProcessDelivery>::new();
         let mut context_continuation = ContextWindowContinuation::default();
         let mut context_window_recoveries = 0usize;
+        let mut oversized_media_recovery_attempted = false;
 
         let mut turn_idx = 0usize;
         let mut provider_request_idx = 0usize;
@@ -1695,7 +1701,26 @@ impl AgentTurnLoop {
                     )
                     .await;
                 preflight = request_progress.take_preflight();
-                result?
+                result
+            };
+            let provider_call = match provider_call {
+                Ok(provider_call) => provider_call,
+                Err(error)
+                    if !oversized_media_recovery_attempted
+                        && error.downcast_ref::<ProviderRequestTooLarge>().is_some()
+                        && replace_oversized_provider_media(&mut provider_messages) > 0 =>
+                {
+                    oversized_media_recovery_attempted = true;
+                    frozen_provider_prefix.clear();
+                    self.provider.discard_runtime_chain(runtime_chain_id).await;
+                    let warning = SessionTurnEvent::Warning {
+                        message: "上游拒绝了过大的请求；已从模型上下文中移除图片 / PDF，并自动重试一次。如仍需模型查看，请在后续消息重新附加较小文件。".into(),
+                    };
+                    record_durable_event(&mut durable_recorder, warning.clone()).await?;
+                    emit(warning);
+                    continue;
+                }
+                Err(error) => return Err(error),
             };
             let ProviderCallOutcome {
                 response: provider_response,
@@ -2055,6 +2080,7 @@ impl AgentTurnLoop {
             Err(error)
                 if error.downcast_ref::<ProviderTerminalFailure>().is_some()
                     || error.downcast_ref::<SessionTurnInterrupted>().is_some()
+                    || error.downcast_ref::<ProviderRequestTooLarge>().is_some()
                     || error
                         .downcast_ref::<ProviderRequestPreparationFailure>()
                         .is_some() =>
@@ -2177,7 +2203,10 @@ impl AgentTurnLoop {
                         {
                             return Err(error);
                         }
-                        Err(error) if error.downcast_ref::<ProviderTerminalFailure>().is_some() => {
+                        Err(error)
+                            if error.downcast_ref::<ProviderTerminalFailure>().is_some()
+                                || error.downcast_ref::<ProviderRequestTooLarge>().is_some() =>
+                        {
                             let (error_text, _) = truncate_chars(
                                 &format!("{error:#}"),
                                 NON_STREAMING_FALLBACK_ERROR_MAX_CHARS,
@@ -2621,14 +2650,45 @@ fn assistant_message_text(message: &SessionTurnMessage) -> String {
         .join("\n")
 }
 
-fn runtime_context_text(now: DateTime<Utc>) -> String {
+fn runtime_context_text(now: DateTime<Utc>, workspace_root: &Path) -> String {
     // 这里需要模型看到用户本地日历语义，不能只用 UTC 日期。
     let local_now = now.with_timezone(&Local);
     let current_date = local_now.format("%Y-%m-%d %A");
     let timezone = local_timezone_name(&local_now);
     format!(
-        "<runtime_context>\ncurrent_date: {current_date}\ntimezone: {timezone}\n</runtime_context>"
+        "<runtime_context>\ncurrent_date: {current_date}\ntimezone: {timezone}\ncwd: {}\n</runtime_context>",
+        workspace_root.display()
     )
+}
+
+/// 413 恢复只改写 provider-neutral 窗口，不改写待提交的 canonical user message；
+/// 若本轮最终失败，则沿用现有 failed-turn 不提交 canonical 的语义。清除 replay 可避免
+/// 相同 provider 的私有历史绕过本次剥离。
+fn replace_oversized_provider_media(messages: &mut [SessionTurnMessage]) -> usize {
+    let mut replaced = 0usize;
+    for message in messages.iter_mut() {
+        for block in &mut message.content {
+            let placeholder = match block {
+                SessionTurnContentBlock::Image { .. } => Some(OVERSIZED_IMAGE_PLACEHOLDER),
+                SessionTurnContentBlock::Document { .. } => Some(OVERSIZED_DOCUMENT_PLACEHOLDER),
+                SessionTurnContentBlock::Text { .. }
+                | SessionTurnContentBlock::ModelContext { .. }
+                | SessionTurnContentBlock::SkillInstructions { .. }
+                | SessionTurnContentBlock::ToolUse { .. }
+                | SessionTurnContentBlock::ToolResult { .. } => None,
+            };
+            if let Some(placeholder) = placeholder {
+                *block = SessionTurnContentBlock::text(placeholder);
+                replaced = replaced.saturating_add(1);
+            }
+        }
+    }
+    if replaced > 0 {
+        for message in messages {
+            message.provider_replay = None;
+        }
+    }
+    replaced
 }
 
 fn latest_model_context(
@@ -3582,8 +3642,9 @@ mod tests {
     use super::{
         assistant_message_text, provider_assistant_suffix_for_latest_request, read_text_file_block,
         tool_dispatch_failure_payload, ProviderNoConsumableOutput,
-        ProviderRequestPreparationFailure, ProviderRequestProgress, ProviderStreamFailure,
-        ProviderTerminalFailure, CONTINUATION_TRIGGER,
+        ProviderRequestPreparationFailure, ProviderRequestProgress, ProviderRequestTooLarge,
+        ProviderStreamFailure, ProviderTerminalFailure, CONTINUATION_TRIGGER,
+        OVERSIZED_DOCUMENT_PLACEHOLDER, OVERSIZED_IMAGE_PLACEHOLDER,
     };
     use crate::agent::fs::LocalFsMemoryStore;
     use crate::api::{
@@ -3643,6 +3704,17 @@ mod tests {
     }
 
     struct FallbackTerminalFailureProvider {
+        requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    struct OversizedRequestProvider {
+        failures_remaining: AtomicUsize,
+        requests: Mutex<Vec<ProviderRequest>>,
+        discarded_chains: AtomicUsize,
+    }
+
+    struct OversizedFallbackProvider {
+        calls: AtomicUsize,
         requests: Mutex<Vec<ProviderRequest>>,
     }
 
@@ -3864,6 +3936,69 @@ mod tests {
                 return Err(anyhow::anyhow!("stream transport failed"));
             }
             Err(ProviderTerminalFailure::new("provider refused request").into())
+        }
+    }
+
+    impl OversizedRequestProvider {
+        fn new(failures: usize) -> Self {
+            Self {
+                failures_remaining: AtomicUsize::new(failures),
+                requests: Mutex::new(Vec::new()),
+                discarded_chains: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for OversizedRequestProvider {
+        async fn send(
+            &self,
+            request: ProviderRequest,
+            _emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        ) -> anyhow::Result<ProviderResponse> {
+            self.requests.lock().await.push(request);
+            if self
+                .failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(ProviderRequestTooLarge::new().into());
+            }
+            Ok(response(
+                vec![SessionTurnContentBlock::text("recovered")],
+                ProviderStop::Done,
+            ))
+        }
+
+        async fn discard_runtime_chain(&self, _chain_id: ProviderRuntimeChainId) {
+            self.discarded_chains.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for OversizedFallbackProvider {
+        async fn send(
+            &self,
+            request: ProviderRequest,
+            emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        ) -> anyhow::Result<ProviderResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requests.lock().await.push(request);
+            match call {
+                0 => {
+                    emit(ProviderEvent::AssistantTextDelta {
+                        text: "partial".into(),
+                    });
+                    Err(ProviderStreamFailure::new("stream failed").into())
+                }
+                1 => Err(ProviderRequestTooLarge::new().into()),
+                _ => Ok(response(
+                    vec![SessionTurnContentBlock::text("recovered")],
+                    ProviderStop::Done,
+                )),
+            }
         }
     }
 
@@ -6877,6 +7012,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_too_large_strips_all_provider_media_and_retries_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shot.png");
+        tokio::fs::write(&path, tiny_png_bytes()).await.unwrap();
+        let provider = Arc::new(OversizedRequestProvider::new(1));
+        let turn_loop = tool_loop(provider.clone()).with_now_fn(fixed_now);
+        let mut with_media = request();
+        with_media.history = vec![SessionTurnMessage {
+            role: "user".into(),
+            content: vec![SessionTurnContentBlock::Document {
+                media_type: "application/pdf".into(),
+                data: "historical-pdf-base64".into(),
+                filename: Some("brief.pdf".into()),
+            }],
+            provider_replay: Some(ProviderReplayState::OpenAiResponses {
+                model: Some("test-model".into()),
+                items: vec![json!({"type":"reasoning", "encrypted_content":"opaque"})],
+            }),
+        }];
+        with_media.user_attachments = vec![crate::api::SessionAttachment::LocalImage { path }];
+        let mut events = Vec::new();
+
+        let turn = turn_loop
+            .run_session_turn(with_media, &mut |event| events.push(event))
+            .await
+            .unwrap();
+
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    SessionTurnContentBlock::Image { .. }
+                        | SessionTurnContentBlock::Document { .. }
+                )
+            })
+        }));
+        assert!(requests[1]
+            .messages
+            .iter()
+            .all(|message| message.provider_replay.is_none()));
+        let cleaned_wire = serde_json::to_string(&requests[1].messages).unwrap();
+        assert!(cleaned_wire.contains(OVERSIZED_IMAGE_PLACEHOLDER));
+        assert!(cleaned_wire.contains(OVERSIZED_DOCUMENT_PLACEHOLDER));
+        assert!(!cleaned_wire.contains("historical-pdf-base64"));
+        assert!(!cleaned_wire.contains("opaque"));
+        assert!(!requests[1].messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    SessionTurnContentBlock::Image { .. }
+                        | SessionTurnContentBlock::Document { .. }
+                )
+            })
+        }));
+        assert!(matches!(
+            &non_context_messages(&turn)[0].content[1],
+            SessionTurnContentBlock::Image { .. }
+        ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, SessionTurnEvent::Warning { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(provider.discarded_chains.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn request_too_large_without_media_is_not_retried() {
+        let provider = Arc::new(OversizedRequestProvider::new(1));
+        let turn_loop = tool_loop(provider.clone());
+
+        let error = turn_loop
+            .run_session_turn(request(), &mut |_| {})
+            .await
+            .expect_err("text-only 413 must remain an error");
+
+        assert!(error.downcast_ref::<ProviderRequestTooLarge>().is_some());
+        assert_eq!(provider.requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn second_request_too_large_after_media_cleanup_is_not_retried_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shot.png");
+        tokio::fs::write(&path, tiny_png_bytes()).await.unwrap();
+        let provider = Arc::new(OversizedRequestProvider::new(2));
+        let turn_loop = tool_loop(provider.clone());
+        let mut with_image = request();
+        with_image.user_attachments = vec![crate::api::SessionAttachment::LocalImage { path }];
+        let mut events = Vec::new();
+
+        let error = turn_loop
+            .run_session_turn(with_image, &mut |event| events.push(event))
+            .await
+            .expect_err("the one media recovery attempt must not loop");
+
+        assert!(error.downcast_ref::<ProviderRequestTooLarge>().is_some());
+        assert_eq!(provider.requests.lock().await.len(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, SessionTurnEvent::Warning { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_request_too_large_exits_fallback_loop_and_uses_media_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shot.png");
+        tokio::fs::write(&path, tiny_png_bytes()).await.unwrap();
+        let provider = Arc::new(OversizedFallbackProvider {
+            calls: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+        });
+        let turn_loop = tool_loop(provider.clone());
+        let mut with_image = request();
+        with_image.user_attachments = vec![crate::api::SessionAttachment::LocalImage { path }];
+        let mut events = Vec::new();
+
+        turn_loop
+            .run_session_turn(with_image, &mut |event| events.push(event))
+            .await
+            .unwrap();
+
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].stream);
+        assert!(!requests[1].stream);
+        assert!(requests[2].stream);
+        assert!(!requests[2].messages.iter().any(|message| message
+            .content
+            .iter()
+            .any(|block| matches!(block, SessionTurnContentBlock::Image { .. }))));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, SessionTurnEvent::Warning { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn turn_loop_done_without_tools() {
         let provider = Arc::new(
             FakeProvider::new(vec![response(
@@ -6911,7 +7205,7 @@ mod tests {
             SessionTurnMessage::assistant_text("prior"),
             SessionTurnMessage::model_context(
                 ModelContextSource::Runtime,
-                super::runtime_context_text(fixed_now()),
+                super::runtime_context_text(fixed_now(), turn_loop.tools.workspace_root()),
             ),
             SessionTurnMessage::user_text("hello"),
         ];
@@ -7190,7 +7484,7 @@ mod tests {
                 SessionTurnMessage::user_text("<user_shell_command>...</user_shell_command>"),
                 SessionTurnMessage::model_context(
                     ModelContextSource::Runtime,
-                    super::runtime_context_text(fixed_now()),
+                    super::runtime_context_text(fixed_now(), turn_loop.tools.workspace_root()),
                 ),
                 SessionTurnMessage::user_text("hello"),
             ]
@@ -7221,6 +7515,10 @@ mod tests {
         assert!(user_text.starts_with("<runtime_context>"));
         assert!(user_text.contains(&format!("current_date: {expected_date}")));
         assert!(user_text.contains("timezone: "));
+        assert!(user_text.contains(&format!(
+            "cwd: {}",
+            turn_loop.tools.workspace_root().display()
+        )));
         assert!(!user_text.contains("current_datetime"));
         assert!(!user_text.contains("not a user request"));
         assert!(user_text.ends_with("</runtime_context>"));
@@ -7229,6 +7527,96 @@ mod tests {
             non_context_messages(&turn)[0],
             &SessionTurnMessage::user_text("hello")
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_context_appends_only_when_workspace_root_changes() {
+        let first_workspace = tempfile::tempdir().unwrap();
+        let second_workspace = tempfile::tempdir().unwrap();
+        let provider = Arc::new(FakeProvider::new(vec![
+            response(
+                vec![SessionTurnContentBlock::text("first")],
+                ProviderStop::Done,
+            ),
+            response(
+                vec![SessionTurnContentBlock::text("same")],
+                ProviderStop::Done,
+            ),
+            response(
+                vec![SessionTurnContentBlock::text("changed")],
+                ProviderStop::Done,
+            ),
+        ]));
+        let first_tools = Arc::new(
+            ToolRegistry::new(&ToolConfig {
+                workspace_root: first_workspace.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let second_tools = Arc::new(
+            ToolRegistry::new(&ToolConfig {
+                workspace_root: second_workspace.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+
+        let first_loop =
+            tool_loop_with_tools(provider.clone(), first_tools.clone()).with_now_fn(fixed_now);
+        let first_turn = first_loop
+            .run_session_turn(request(), &mut |_| {})
+            .await
+            .unwrap();
+        let mut history = first_turn
+            .messages
+            .into_iter()
+            .map(|message| message.message)
+            .collect::<Vec<_>>();
+
+        let same_loop = tool_loop_with_tools(provider.clone(), first_tools).with_now_fn(fixed_now);
+        let mut same_request = request();
+        same_request.history = history.clone();
+        same_request.user_text = "same workspace".into();
+        let same_turn = same_loop
+            .run_session_turn(same_request, &mut |_| {})
+            .await
+            .unwrap();
+        history.extend(
+            same_turn
+                .messages
+                .into_iter()
+                .map(|message| message.message),
+        );
+
+        let changed_loop =
+            tool_loop_with_tools(provider.clone(), second_tools).with_now_fn(fixed_now);
+        let mut changed_request = request();
+        changed_request.history = history;
+        changed_request.user_text = "changed workspace".into();
+        changed_loop
+            .run_session_turn(changed_request, &mut |_| {})
+            .await
+            .unwrap();
+
+        let requests = provider.requests.lock().await;
+        let same_runtime = requests[1]
+            .messages
+            .iter()
+            .filter_map(SessionTurnMessage::model_context_snapshot)
+            .filter(|(source, _, _)| **source == ModelContextSource::Runtime)
+            .collect::<Vec<_>>();
+        assert_eq!(same_runtime.len(), 1);
+        let changed_runtime = requests[2]
+            .messages
+            .iter()
+            .filter_map(SessionTurnMessage::model_context_snapshot)
+            .filter(|(source, _, _)| **source == ModelContextSource::Runtime)
+            .map(|(_, _, text)| text)
+            .collect::<Vec<_>>();
+        assert_eq!(changed_runtime.len(), 2);
+        assert!(changed_runtime[0].contains(&format!("cwd: {}", first_workspace.path().display())));
+        assert!(changed_runtime[1].contains(&format!("cwd: {}", second_workspace.path().display())));
     }
 
     #[tokio::test]
@@ -7275,7 +7663,7 @@ mod tests {
             vec![
                 SessionTurnMessage::model_context(
                     ModelContextSource::Runtime,
-                    super::runtime_context_text(fixed_now()),
+                    super::runtime_context_text(fixed_now(), turn_loop.tools.workspace_root()),
                 ),
                 background,
                 delegation,

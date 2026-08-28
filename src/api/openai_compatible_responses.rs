@@ -16,8 +16,9 @@ use super::provider::{
     NoopProviderRequestObserver, ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy,
     ProviderNoConsumableOutput, ProviderRecoveryInterrupt, ProviderReplayIdentity,
     ProviderReplayProtocol, ProviderRequest, ProviderRequestObserver,
-    ProviderRequestPreparationFailure, ProviderResponse, ProviderRuntimeChainId, ProviderStop,
-    ProviderStreamFailure, ProviderTerminalFailure, ProviderTransport, ToolSpec,
+    ProviderRequestPreparationFailure, ProviderRequestTooLarge, ProviderResponse,
+    ProviderRuntimeChainId, ProviderStop, ProviderStreamFailure, ProviderTerminalFailure,
+    ProviderTransport, ToolSpec,
 };
 use super::redact_media_error_body;
 use super::responses::{
@@ -495,6 +496,9 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                 ) {
                     return Err(SessionTurnInterrupted.into());
                 }
+                if let Some(error) = classify_request_too_large(&error) {
+                    return Err(error.into());
+                }
                 if request.stream && responses_adapter_stream_failure(&error) {
                     return Err(ProviderStreamFailure::new(error.to_string()).into());
                 }
@@ -851,6 +855,16 @@ fn wrap_media_rejection(
         }
         other => other,
     }
+}
+
+fn classify_request_too_large(
+    error: &OpenAiCompatibleResponsesError,
+) -> Option<ProviderRequestTooLarge> {
+    let OpenAiCompatibleResponsesError::Client(ResponsesError::Status { status: 413, .. }) = error
+    else {
+        return None;
+    };
+    Some(ProviderRequestTooLarge::new())
 }
 
 fn output_shape(reason: impl Into<String>) -> OpenAiCompatibleResponsesError {
@@ -1388,6 +1402,28 @@ mod tests {
 
         assert!(error.to_string().contains("可能不支持图片 / PDF 附件"));
         assert!(error.to_string().contains("bad input"));
+    }
+
+    #[test]
+    fn http_413_is_classified_as_request_too_large() {
+        let error = OpenAiCompatibleResponsesError::Client(ResponsesError::Status {
+            status: 413,
+            body: "request body exceeds gateway limit".into(),
+        });
+
+        let classified = classify_request_too_large(&error).expect("HTTP 413 classification");
+
+        assert!(classified.to_string().contains("HTTP 413"));
+        assert!(!classified.to_string().contains("gateway limit"));
+        assert!(
+            classify_request_too_large(&OpenAiCompatibleResponsesError::Client(
+                ResponsesError::Status {
+                    status: 429,
+                    body: "rate limited".into(),
+                }
+            ))
+            .is_none()
+        );
     }
 
     #[test]

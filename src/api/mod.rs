@@ -138,8 +138,6 @@ pub use openai_compatible_responses::{
     OpenAiCompatibleResponsesError, OpenAiCompatibleResponsesProviderAdapter,
 };
 pub use placeholder::{resolve_placeholders, PlaceholderError};
-#[cfg(test)]
-pub(crate) use provider::ProviderStreamFailure;
 pub(crate) use provider::ProviderTransport;
 pub use provider::{
     assistant_text_from_message, context_usage_from_anthropic_committed_usage,
@@ -150,6 +148,8 @@ pub use provider::{
     ProviderRuntimeChainId, ProviderRuntimeFallbackScope, ProviderStop, ProviderStreamOutputMode,
     ToolSpec,
 };
+#[cfg(test)]
+pub(crate) use provider::{ProviderRequestTooLarge, ProviderStreamFailure};
 pub use responses::{
     ReducedResponses, ResponsesClient, ResponsesError, ResponsesFunctionCall, ResponsesReasoning,
     ResponsesRequest, ResponsesStreamEvent, ResponsesTerminal, ResponsesTool,

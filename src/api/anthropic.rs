@@ -28,8 +28,9 @@ use super::llm_http::{read_llm_error_body, LlmHttpError, LlmHttpPhase};
 use super::provider::{
     NoopProviderRequestObserver, ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy,
     ProviderNoConsumableOutput, ProviderReplayIdentity, ProviderReplayProtocol, ProviderRequest,
-    ProviderRequestObserver, ProviderRequestPreparationFailure, ProviderResponse, ProviderStop,
-    ProviderStreamFailure, ProviderTerminalFailure, ProviderTransport, ToolSpec,
+    ProviderRequestObserver, ProviderRequestPreparationFailure, ProviderRequestTooLarge,
+    ProviderResponse, ProviderStop, ProviderStreamFailure, ProviderTerminalFailure,
+    ProviderTransport, ToolSpec,
 };
 use super::redact_media_error_body;
 use super::types::{SessionTurnContentBlock, SessionTurnEvent, SessionTurnMessage};
@@ -716,6 +717,9 @@ impl AnthropicProviderAdapter {
                 if matches!(&error, AnthropicError::RecoveryInterrupted) {
                     return Err(SessionTurnInterrupted.into());
                 }
+                if let Some(error) = classify_request_too_large(&error) {
+                    return Err(error.into());
+                }
                 if request.stream && anthropic_adapter_stream_failure(&error) {
                     return Err(ProviderStreamFailure::new(error.to_string()).into());
                 }
@@ -1141,6 +1145,13 @@ fn wrap_media_rejection(error: AnthropicError, request_has_media: bool) -> Anthr
         }
         other => other,
     }
+}
+
+fn classify_request_too_large(error: &AnthropicError) -> Option<ProviderRequestTooLarge> {
+    let AnthropicError::Status { status: 413, .. } = error else {
+        return None;
+    };
+    Some(ProviderRequestTooLarge::new())
 }
 
 const REDACTED_ANTHROPIC_PAYLOAD: &str = "[redacted Anthropic request/replay payload]";
@@ -2472,6 +2483,24 @@ mod tests {
         assert!(text.contains("可能不支持图片 / PDF 附件"));
         assert!(text.contains("unsupported content type"));
         assert!(!is_retryable(&error));
+    }
+
+    #[test]
+    fn http_413_is_classified_as_request_too_large() {
+        let error = AnthropicError::Status {
+            status: 413,
+            body: "request body exceeds provider limit".into(),
+        };
+
+        let classified = classify_request_too_large(&error).expect("HTTP 413 classification");
+
+        assert!(classified.to_string().contains("HTTP 413"));
+        assert!(!classified.to_string().contains("provider limit"));
+        assert!(classify_request_too_large(&AnthropicError::Status {
+            status: 400,
+            body: "bad request".into(),
+        })
+        .is_none());
     }
 
     #[test]

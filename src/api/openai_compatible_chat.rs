@@ -23,8 +23,8 @@ use super::provider::{
     NoopProviderRequestObserver, ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy,
     ProviderNoConsumableOutput, ProviderRecoveryInterrupt, ProviderReplayIdentity,
     ProviderReplayProtocol, ProviderRequest, ProviderRequestObserver,
-    ProviderRequestPreparationFailure, ProviderResponse, ProviderStop, ProviderStreamFailure,
-    ProviderTerminalFailure, ProviderTransport, ToolSpec,
+    ProviderRequestPreparationFailure, ProviderRequestTooLarge, ProviderResponse, ProviderStop,
+    ProviderStreamFailure, ProviderTerminalFailure, ProviderTransport, ToolSpec,
 };
 use super::redact_media_error_body;
 use super::types::{ProviderReplayState, SessionTurnContentBlock, SessionTurnMessage};
@@ -476,6 +476,9 @@ impl OpenAiCompatibleChatProviderAdapter {
                 ) {
                     return Err(SessionTurnInterrupted.into());
                 }
+                if let Some(error) = classify_request_too_large(&error) {
+                    return Err(error.into());
+                }
                 if request.stream && chat_adapter_stream_failure(&error) {
                     return Err(ProviderStreamFailure::new(error.to_string()).into());
                 }
@@ -714,6 +717,16 @@ fn wrap_media_rejection(
         }
         other => other,
     }
+}
+
+fn classify_request_too_large(
+    error: &OpenAiCompatibleChatError,
+) -> Option<ProviderRequestTooLarge> {
+    let OpenAiCompatibleChatError::Client(ChatCompletionsError::Status { status: 413, .. }) = error
+    else {
+        return None;
+    };
+    Some(ProviderRequestTooLarge::new())
 }
 
 fn first_choice(
@@ -1658,6 +1671,46 @@ mod tests {
         // 上游核心错误信息必须保留
         assert!(text.contains("1210: 文件格式不正确"));
         assert!(text.contains("HTTP 400"));
+    }
+
+    #[test]
+    fn http_413_is_classified_as_request_too_large_before_media_hinting() {
+        let echoed_system = "private system prompt";
+        let echoed_user = "private user request";
+        let echoed_tool = "private tool arguments";
+        let error = OpenAiCompatibleChatError::Client(ChatCompletionsError::Status {
+            status: 413,
+            body: json!({
+                "error": "request too large",
+                "request": {
+                    "messages": [
+                        {"role": "system", "content": echoed_system},
+                        {"role": "user", "content": echoed_user}
+                    ],
+                    "tools": [{"arguments": echoed_tool}],
+                    "image": format!("data:image/png;base64,{}", "A".repeat(300))
+                }
+            })
+            .to_string(),
+        });
+
+        let classified = classify_request_too_large(&error).expect("HTTP 413 classification");
+        let classified = classified.to_string();
+
+        assert!(classified.contains("HTTP 413"));
+        assert!(!classified.contains(echoed_system));
+        assert!(!classified.contains(echoed_user));
+        assert!(!classified.contains(echoed_tool));
+        assert!(!classified.contains(&"A".repeat(300)));
+        assert!(
+            classify_request_too_large(&OpenAiCompatibleChatError::Client(
+                ChatCompletionsError::Status {
+                    status: 400,
+                    body: "bad request".into(),
+                }
+            ))
+            .is_none()
+        );
     }
 
     #[test]
