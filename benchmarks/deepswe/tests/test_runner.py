@@ -54,6 +54,22 @@ allow_internet = false
 allow_internet = false
 """
 
+_cleanup_trial_images_patcher: object | None = None
+_cleanup_trial_images_mock: object | None = None
+
+
+def setUpModule() -> None:
+    global _cleanup_trial_images_patcher, _cleanup_trial_images_mock
+    _cleanup_trial_images_patcher = patch(
+        "acn_deepswe.host_runner.cleanup_finished_trial_images", return_value=0
+    )
+    _cleanup_trial_images_mock = _cleanup_trial_images_patcher.start()
+
+
+def tearDownModule() -> None:
+    assert _cleanup_trial_images_patcher is not None
+    _cleanup_trial_images_patcher.stop()
+
 
 class ConfigGenerationTests(unittest.TestCase):
     def test_claim_variants_attempt_toml_declare_a_claim_bundle(self) -> None:
@@ -135,7 +151,7 @@ class ConfigGenerationTests(unittest.TestCase):
             parsed["agent"]["tool"]["max_parallel_tool_calls"],
             EVALUATION_MAX_PARALLEL_TOOL_CALLS,
         )
-        self.assertFalse(parsed["agent"]["tool"]["file_edit_authority_enabled"])
+        self.assertTrue(parsed["agent"]["tool"]["file_edit_authority_enabled"])
         self.assertFalse(parsed["agent"]["memory"]["enabled"])
         self.assertFalse(parsed["agent"]["session"]["memory_review"]["enabled"])
         self.assertEqual(
@@ -940,6 +956,61 @@ class ProvenanceTests(unittest.TestCase):
         self.assertEqual(record["reason"], "UPSTREAM_CONCURRENCY_EXHAUSTED")
         self.assertIsNone(record["gate_path"])
 
+    def test_verifier_timeout_replays_frozen_patch_once_without_model_agent(self) -> None:
+        assert _cleanup_trial_images_mock is not None
+        _cleanup_trial_images_mock.reset_mock()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = build_attempt_plan(DATASET, root / "run", seed=2)
+            experiment = build_experiment_manifest("experiment-1", plan, "b" * 64, provenance())
+            artifacts = _artifacts(root, claim_bundle=root / "claims.json")
+            execution = replace(_execution(root, artifacts), run_a_only=True)
+            agent_imports: list[str] = []
+
+            def run(command: list[str], **_kwargs: object) -> FakeCompleted:
+                job = json.loads(Path(command[-1]).read_text())
+                agent_imports.append(job["agents"][0]["import_path"])
+                attempt = plan.attempts[0]
+                is_regrade = job["job_name"].endswith("-verifier-regrade-1")
+                _write_fake_trial(
+                    Path(job["jobs_dir"]),
+                    attempt,
+                    bundle_path=artifacts.claim_bundle,
+                    verifier_ran=is_regrade,
+                    job_name=job["job_name"],
+                    exception_info=(
+                        None
+                        if is_regrade
+                        else {
+                            "exception_type": "VerifierTimeoutError",
+                            "exception_message": "Verifier execution timed out",
+                        }
+                    ),
+                )
+                return FakeCompleted(0)
+
+            with patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True):
+                result = Task1HostRunner(
+                    experiment, root / "jobs", execution, run=run
+                ).run_task1(execute=True)
+
+            manifest = json.loads(execution.manifest_path.read_text(encoding="utf-8"))
+            attempt_result = json.loads(
+                Path(manifest["attempt_results"][0]["result_path"]).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(result.status, "passed")
+        self.assertEqual(len(agent_imports), 2)
+        cleaned_trials = [
+            item.args[0] for item in _cleanup_trial_images_mock.call_args_list
+        ]
+        self.assertEqual(len(cleaned_trials), 2)
+        self.assertEqual(len(set(cleaned_trials)), 2)
+        self.assertTrue(agent_imports[0].endswith(":AcnEvalPierAgent"))
+        self.assertTrue(agent_imports[1].endswith(":AcnPatchReplayPierAgent"))
+        self.assertEqual(attempt_result["verifier_regrade"]["trigger"], "VERIFIER_TIMEOUT")
+        self.assertTrue(attempt_result["verifier_passed"])
+
 
 class SentinelTests(unittest.TestCase):
     def test_sentinel_scan_blocks_leaked_string(self) -> None:
@@ -1006,10 +1077,12 @@ def _write_fake_trial(
     verifier_ran: bool = True,
     emit_claim: bool = True,
     verifier_passed: bool = True,
+    job_name: str | None = None,
+    exception_info: dict[str, str] | None = None,
 ) -> None:
     attempt_id = attempt.attempt_id
     variant = attempt.variant
-    trial = jobs_dir / attempt_id / "trial-1"
+    trial = jobs_dir / (job_name or attempt_id) / "trial-1"
     evaluation = trial / "agent" / "evaluation"
     evaluation.mkdir(parents=True)
     (trial / "artifacts").mkdir()
@@ -1111,7 +1184,11 @@ def _write_fake_trial(
         json.dumps(
             {
                 "task_name": f"datacurve/{attempt.task_id}",
-                "trial_name": attempt.attempt_id,
+                "trial_name": (
+                    f"{attempt.task_id}__def5678"
+                    if job_name is not None and job_name.endswith("-verifier-regrade-1")
+                    else f"{attempt.task_id}__abc1234"
+                ),
                 "trial_uri": trial.resolve().as_uri(),
                 "task_checksum": "checksum",
                 "config": {},
@@ -1119,6 +1196,7 @@ def _write_fake_trial(
                 "verifier_result": {"rewards": {"reward": 1 if verifier_passed else 0}}
                 if verifier_ran
                 else None,
+                "exception_info": exception_info,
             }
         )
     )
@@ -1185,6 +1263,9 @@ def provenance() -> EvaluationProvenance:
         deepswe_revision="deepswe@abc",
         pier_revision="datacurve-pier==0.3.0",
         acn_revision="acn@def",
+        acn_main_revision="9b818d70ddfad2f7d5e1972577dd294b19481c92",
+        acn_version="0.2.5",
+        run_class="diagnostic",
         acn_binary_hash=hashlib.sha256(b"fixture").hexdigest(),
         acn_config_hash="2" * 64,
         dataset_candidates_hash="a" * 64,
@@ -1201,6 +1282,7 @@ def provenance() -> EvaluationProvenance:
         verifier_image_content_digest="sha256:" + "7" * 64,
         model="fixture-model",
         reasoning_effort="max",
+        file_edit_authority_enabled=True,
         resources={
             "cpus": 2,
             "memory_mb": 4096,
@@ -1208,7 +1290,11 @@ def provenance() -> EvaluationProvenance:
             "max_tokens": 1024,
             "context_window": 8192,
         },
-        timeouts={"agent_seconds": 300, "deadline_reserve_seconds": 60},
+        timeouts={
+            "agent_seconds": 300,
+            "deadline_reserve_seconds": 60,
+            "verifier_seconds": 300,
+        },
         llm_retry={"retry_count": 3, "retry_base_delay_ms": 1000, "retry_max_delay_ms": 30000},
         network_translation_warning="translated",
     )

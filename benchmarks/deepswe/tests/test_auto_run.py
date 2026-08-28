@@ -106,6 +106,37 @@ class AutomatedRunTests(unittest.TestCase):
             with self.assertRaisesRegex(AutomatedRunError, "credential"):
                 load_config(path)
 
+    def test_formal_config_requires_file_edit_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_config(
+                Path(directory),
+                run_class="formal",
+                file_edit_authority_enabled=False,
+            )
+            with self.assertRaisesRegex(AutomatedRunError, "file_edit_authority_enabled"):
+                load_config(path)
+
+    def test_formal_config_reserves_at_least_one_storage_budget_per_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_config(Path(directory), run_class="formal")
+            with self.assertRaisesRegex(AutomatedRunError, "resources.storage_mb"):
+                load_config(path)
+
+    def test_formal_config_rejects_a_different_product_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_config(
+                Path(directory),
+                run_class="formal",
+                acn_main_revision="a" * 40,
+                host_capacity={
+                    "memory_reserve_mb": 1024,
+                    "disk_reserve_mb": 1024,
+                    "disk_admission_mb_per_worker": 20480,
+                },
+            )
+            with self.assertRaisesRegex(AutomatedRunError, "9b818d70"):
+                load_config(path)
+
     def test_prepare_splits_smoke_from_remaining_full_without_repeating_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -356,6 +387,10 @@ def write_config(root: Path, **overrides: object) -> Path:
         "model": "deepseek-v4-flash-local-exp",
         "response_model": "deepseek-v4-flash-local-exp",
         "reasoning_effort": "max",
+        "run_class": "diagnostic",
+        "acn_main_revision": "9b818d70ddfad2f7d5e1972577dd294b19481c92",
+        "acn_version": "0.2.5",
+        "file_edit_authority_enabled": True,
         "task_workers": 30,
         "smoke_size": 2,
         "full_size": len(TASK_IDS),
@@ -370,8 +405,17 @@ def write_config(root: Path, **overrides: object) -> Path:
             "max_tokens": 65536,
             "context_window": 1000000,
         },
-        "timeouts": {"agent_seconds": 5400, "deadline_reserve_seconds": 120},
+        "timeouts": {
+            "agent_seconds": 5400,
+            "deadline_reserve_seconds": 120,
+            "verifier_seconds": 2700,
+        },
         "llm_retry": {"retry_count": 2, "retry_base_delay_ms": 1000, "retry_max_delay_ms": 30000},
+        "host_capacity": {
+            "memory_reserve_mb": 1024,
+            "disk_reserve_mb": 1024,
+            "disk_admission_mb_per_worker": 1024,
+        },
     }
     config.update(overrides)
     path = root / "auto-run.json"

@@ -123,14 +123,21 @@ solve。输出 aggregate manifest 在
 真实执行在创建任何 attempt 目录前硬性检查：`pier` 必须是其 venv 的 `bin/pier`，且
 该 venv 的 PEP 610 `direct_url` 必须以 editable 方式明确指向 frozen Pier checkout；两份
 checkout 均须是冻结 revision 且工作树干净。随后 `pier --help` 必须成功、
-Docker daemon 可用、每个 task 的镜像引用能解析为本地 content digest，且 Docker 的 `NCPU`
-与 `MemTotal` 足以容纳 `task_workers * cpus` 与 `task_workers * memory_mb`。资源不足直接
-失败，不静默降低并发。
+Docker daemon 可用且没有其他运行中容器、每个 task 的官方镜像引用能解析为本地 content digest，
+且 Docker 的 `NCPU`、`MemTotal` 和宿主 `MemAvailable` 足以容纳 `task_workers * cpus`、
+`task_workers * memory_mb` 与显式宿主余量。输出盘和 Docker 数据盘还必须满足固定余量加
+`task_workers * disk_admission_mb_per_worker` 的高水位；正式运行要求每个 worker 的 admission
+至少覆盖 `resources.storage_mb`，并在每题启动前再次检查。资源不足直接失败，
+不静默降低并发。正式运行持有全机 Docker 锁；可选清理只处理带 Pier 所有权证据的已停止容器和
+明确的生成镜像，绝不使用全局 prune，也不删除官方 `public.ecr.*` 任务镜像。每个 trial 收尾时还会按
+Pier 的随机 trial name 精确回收该 trial 的 verifier/egress 派生镜像，阻断长跑期间的累计增长；清理失败
+会作为基础设施失败终止该题，保留既有 Gate 与 trial 证据。
 
-preflight 通过后，runner 会把 `acn_deepswe`、Pier package、console script 与 coding skill
-一次性复制到 `output_dir/frozen-python/`，四臂只从该目录 import，并在每臂前复核二进制、
-skill、task 与两份 Python source tree hash。`acn_revision` 必须等于当前 ACN `HEAD`；工作树
-有改动时必须写成 `<HEAD>+evaluation-worktree`，具体内容仍由 staged tree hash 唯一标识。
+preflight 通过后，runner 会把 `acn_deepswe`、Pier package、console script、`acn_eval` 与 coding skill
+一次性复制到 `output_dir/frozen-python/`，四臂只使用该只读目录，并在每臂前复核二进制、
+skill、task 与两份 Python source tree hash。`acn_revision` 必须精确等于当前 ACN `HEAD`，工作树有
+任何 tracked 或 untracked 变更都会拒绝正式启动；该 HEAD 必须是 `acn_main_revision` 的后代，产品基线
+`Cargo.toml` 版本必须等于 `acn_version`，二进制上报的 commit/version 也必须一致。
 
 16 GiB Mac 的 Docker VM 约 7.65 GiB，本机 pre-smoke 用 `task_workers=1`、`memory_mb=6144`、
 `cpus=2`；该降配结果不能与官方 8 GiB 资源口径直接横向比较。
@@ -154,6 +161,11 @@ skill、task 与两份 Python source tree hash。`acn_revision` 必须等于当�
 和 `progress.json`，但不执行 Gate、freeze 或后续 B 臂。它不计入 agent、claim 或 verifier 的
 得分；一般 429 若没有这个精确标记，仍按原始 agent 结果处理，避免把普通限流误归因。
 
+若 Pier 明确记录 `VerifierTimeoutError` 或已知 Docker 基础设施异常，宿主不会把它当成 verifier 0 分，
+也不会重新调用模型。已有 `model.patch` 会按 SHA-256 冻结，在全新官方任务环境中由无网络 replay agent
+重放并只运行一次 verifier；重判 task checksum、patch hash、原 trial 和重判 trial 会同时写入证据。
+重判仍无结果时终态为 `infrastructure_failed`，不会进入 Gate 或计为模型失败。
+
 Pier 固定 `force_build=false`，使用冻结 `task.toml` 指向的官方预构建镜像，避免本机联网重建
 和架构漂移；同时固定 `delete=false`，使每个 trial 结束时拆掉 Compose 容器，但保留已在本地的
 官方题面镜像。Pier 的 `delete=true` 会执行 `down --rmi all`，把这些镜像删掉后再次拉取，
@@ -166,7 +178,7 @@ Pier 固定 `force_build=false`，使用冻结 `task.toml` 指向的官方预构
 推理强度配置，官方可比的 Flash 组使用 `max`（`high` 或扩展预算均须在 provenance 中明确标为
 非官方对齐配置）。`resources` 必须记录 `cpus`、
 `memory_mb`、`storage_mb`、`max_tokens`、`context_window`；`timeouts` 必须记录
-`agent_seconds`、`deadline_reserve_seconds`，`llm_retry` 必须记录三项重试参数。
+`agent_seconds`、`deadline_reserve_seconds`、`verifier_seconds`，`llm_retry` 必须记录三项重试参数。
 官方 task 的 agent timeout 为 5400 秒，示例为 verifier、事件和 result 写入预留 120 秒，故 ACN
 工作 deadline 为 5280 秒。任何更长的 `agent_seconds` 都必须标记为扩展预算，不能与官方 90 分钟
 口径直接比较。该值会同时覆盖 Pier 墙钟、ACN 请求 timeout 与 attempt deadline（扣除
@@ -223,7 +235,7 @@ Gate 只验证基础设施、claim 归因与隔离：artifact hash、verifier �
 `EMPTY_CLAIM_BUNDLE`，不可与成功注入 claim 的结果混同。`presmoke-aggregate.json` 会单列 `claim_funnel`：每臂的
 bundle 可用、router 检索、内容注入、模型报告使用及对应 claim 数，不能用“挂载成功”代替这些证据。
 
-**verifier 判 0 分与 agent 自身失败都是有效实验结果，不是 Gate 失败**，按未通过计分，不得
+**verifier 正常运行后判 0 分与 agent 自身失败都是有效实验结果，不是 Gate 失败**，按未通过计分，不得
 重跑刷分。checkpoint 会持久化所有 task 终态（含 Gate、协议与基础设施失败）；普通 `--resume` 遇到任何
 失败终态即拒绝。只有无终态且已有半成品的中断 task，才可由操作者显式传
 `--resume --retry-interrupted` 重跑一次；此前的产物和 retry 计数都会保留。

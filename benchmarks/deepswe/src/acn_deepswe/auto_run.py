@@ -18,7 +18,11 @@ from pathlib import Path
 
 from .dataset import FrozenDatasetManifest, freeze_execution_dataset
 from .plan import build_attempt_plan
-from .presmoke_cli import ACN_REPOSITORY
+from .presmoke_cli import (
+    ACN_REPOSITORY,
+    FORMAL_ACN_MAIN_REVISION,
+    FORMAL_ACN_VERSION,
+)
 from .run_lock import exclusive_run_lock
 
 
@@ -40,8 +44,12 @@ class AutomatedRunConfig:
     model: str
     response_model: str
     reasoning_effort: str
+    run_class: str
+    acn_main_revision: str
+    acn_version: str
     model_egress_mode: str
     harness_mode: str
+    file_edit_authority_enabled: bool
     task_workers: int
     smoke_size: int
     full_size: int
@@ -52,6 +60,8 @@ class AutomatedRunConfig:
     timeouts: dict[str, int]
     llm_retry: dict[str, int]
     progress: dict[str, int]
+    host_capacity: dict[str, int]
+    cleanup_stale_pier_resources: bool
     run_all_variants_without_claims: bool = False
     run_a_only: bool = False
     b_only_from_a_output_dir: Path | None = None
@@ -68,9 +78,44 @@ _REQUIRED_PATHS = (
     "frozen_skill",
 )
 _REQUIRED_RESOURCES = ("cpus", "memory_mb", "storage_mb", "max_tokens", "context_window")
-_REQUIRED_TIMEOUTS = ("agent_seconds", "deadline_reserve_seconds")
+_REQUIRED_TIMEOUTS = ("agent_seconds", "deadline_reserve_seconds", "verifier_seconds")
 _REQUIRED_RETRY = ("retry_count", "retry_base_delay_ms", "retry_max_delay_ms")
+_REQUIRED_HOST_CAPACITY = (
+    "memory_reserve_mb",
+    "disk_reserve_mb",
+    "disk_admission_mb_per_worker",
+)
 _COMPLETED_PHASE_STATUSES = frozenset({"passed", "completed_with_no_eligible_claim"})
+_ALLOWED_CONFIG_FIELDS = frozenset(
+    {
+        *_REQUIRED_PATHS,
+        "model",
+        "response_model",
+        "reasoning_effort",
+        "run_class",
+        "acn_main_revision",
+        "acn_version",
+        "model_egress_mode",
+        "harness_mode",
+        "file_edit_authority_enabled",
+        "task_workers",
+        "smoke_size",
+        "full_size",
+        "dataset_seed",
+        "smoke_plan_seed",
+        "full_plan_seed",
+        "resources",
+        "timeouts",
+        "llm_retry",
+        "progress",
+        "host_capacity",
+        "cleanup_stale_pier_resources",
+        "run_all_variants_without_claims",
+        "run_a_only",
+        "b_only_from_a_output_dir",
+        "reuse_local_agent_image_fingerprint",
+    }
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -146,11 +191,15 @@ def load_config(path: Path) -> AutomatedRunConfig:
     forbidden = {"ACN_EVAL_UPSTREAM_KEY", "upstream_key", "api_key", "key"}
     if forbidden & set(raw):
         raise AutomatedRunError("自动化运行配置不得包含 upstream credential")
+    unknown = sorted(set(raw) - _ALLOWED_CONFIG_FIELDS)
+    if unknown:
+        raise AutomatedRunError("自动化运行配置包含未知字段: " + ",".join(unknown))
     paths = {name: _absolute_path(raw, name) for name in _REQUIRED_PATHS}
     resources = _positive_int_mapping(raw, "resources", _REQUIRED_RESOURCES)
     timeouts = _positive_int_mapping(raw, "timeouts", _REQUIRED_TIMEOUTS)
     llm_retry = _positive_int_mapping(raw, "llm_retry", _REQUIRED_RETRY)
     progress = _positive_int_mapping(raw, "progress", ("poll_secs", "stall_after_secs"))
+    host_capacity = _positive_int_mapping(raw, "host_capacity", _REQUIRED_HOST_CAPACITY)
     if progress["stall_after_secs"] < progress["poll_secs"]:
         raise AutomatedRunError("progress.stall_after_secs 不得小于 poll_secs")
     smoke_size = _nonnegative_int(raw.get("smoke_size"), "smoke_size")
@@ -171,13 +220,45 @@ def load_config(path: Path) -> AutomatedRunConfig:
         paths["run_root"] / "full" / "output", b_only_from_a_output_dir
     ):
         raise AutomatedRunError("B-only run_root 与 A-only source output 必须完全隔离")
+    run_class = _run_class(raw)
+    model_egress_mode = _model_egress_mode(raw)
+    harness_mode = _harness_mode(raw)
+    acn_main_revision = _git_revision(raw, "acn_main_revision")
+    acn_version = _version(raw, "acn_version")
+    file_edit_authority_enabled = _boolean(
+        raw.get("file_edit_authority_enabled"), "file_edit_authority_enabled"
+    )
+    image_fingerprint = _optional_fingerprint(raw.get("reuse_local_agent_image_fingerprint"))
+    if run_class == "formal":
+        if harness_mode != "standard" or model_egress_mode != "pier":
+            raise AutomatedRunError("正式运行必须使用 harness_mode=standard 和 model_egress_mode=pier")
+        if not file_edit_authority_enabled:
+            raise AutomatedRunError("正式运行必须启用 file_edit_authority_enabled")
+        if (
+            acn_main_revision != FORMAL_ACN_MAIN_REVISION
+            or acn_version != FORMAL_ACN_VERSION
+        ):
+            raise AutomatedRunError(
+                "正式运行必须锚定 "
+                f"acn_main_revision={FORMAL_ACN_MAIN_REVISION} 和 acn_version={FORMAL_ACN_VERSION}"
+            )
+        if host_capacity["disk_admission_mb_per_worker"] < resources["storage_mb"]:
+            raise AutomatedRunError(
+                "正式运行的 disk_admission_mb_per_worker 不得小于 resources.storage_mb"
+            )
+        if image_fingerprint is not None:
+            raise AutomatedRunError("正式运行禁止复用本地 agent 镜像，必须使用冻结任务的官方镜像")
     return AutomatedRunConfig(
         **paths,
         model=_nonempty_string(raw, "model"),
         response_model=_nonempty_string(raw, "response_model"),
         reasoning_effort=_nonempty_string(raw, "reasoning_effort"),
-        model_egress_mode=_model_egress_mode(raw),
-        harness_mode=_harness_mode(raw),
+        run_class=run_class,
+        acn_main_revision=acn_main_revision,
+        acn_version=acn_version,
+        model_egress_mode=model_egress_mode,
+        harness_mode=harness_mode,
+        file_edit_authority_enabled=file_edit_authority_enabled,
         task_workers=_positive_int(raw.get("task_workers"), "task_workers"),
         smoke_size=smoke_size,
         full_size=full_size,
@@ -188,15 +269,18 @@ def load_config(path: Path) -> AutomatedRunConfig:
         timeouts=timeouts,
         llm_retry=llm_retry,
         progress=progress,
+        host_capacity=host_capacity,
+        cleanup_stale_pier_resources=_boolean(
+            raw.get("cleanup_stale_pier_resources", False),
+            "cleanup_stale_pier_resources",
+        ),
         run_all_variants_without_claims=_boolean(
             raw.get("run_all_variants_without_claims", False),
             "run_all_variants_without_claims",
         ),
         run_a_only=run_a_only,
         b_only_from_a_output_dir=b_only_from_a_output_dir,
-        reuse_local_agent_image_fingerprint=_optional_fingerprint(
-            raw.get("reuse_local_agent_image_fingerprint")
-        ),
+        reuse_local_agent_image_fingerprint=image_fingerprint,
     )
 
 
@@ -268,9 +352,14 @@ def prepare_run(config: AutomatedRunConfig) -> dict[str, object]:
             "status": "prepared",
             "model": config.model,
             "response_model": config.response_model,
+            "run_class": config.run_class,
+            "acn_main_revision": config.acn_main_revision,
+            "acn_version": config.acn_version,
             "model_egress_mode": config.model_egress_mode,
             "harness_mode": config.harness_mode,
+            "file_edit_authority_enabled": config.file_edit_authority_enabled,
             "task_workers": config.task_workers,
+            "host_capacity": config.host_capacity,
             "phase_mode": (
                 "b_only_from_a"
                 if config.b_only_from_a_output_dir is not None
@@ -511,8 +600,12 @@ def _prepare_phase(
         "model": config.model,
         "response_model": config.response_model,
         "reasoning_effort": config.reasoning_effort,
+        "run_class": config.run_class,
+        "acn_main_revision": config.acn_main_revision,
+        "acn_version": config.acn_version,
         "model_egress_mode": config.model_egress_mode,
         "harness_mode": config.harness_mode,
+        "file_edit_authority_enabled": config.file_edit_authority_enabled,
         "acn_revision": acn_revision,
         "task_workers": config.task_workers,
         "run_all_variants_without_claims": config.run_all_variants_without_claims,
@@ -523,6 +616,8 @@ def _prepare_phase(
             else None
         ),
         "progress": config.progress,
+        "host_capacity": config.host_capacity,
+        "cleanup_stale_pier_resources": config.cleanup_stale_pier_resources,
         "resources": config.resources,
         "timeouts": config.timeouts,
         "llm_retry": config.llm_retry,
@@ -636,7 +731,7 @@ def _completed_phase_or_run(
 
 
 def _current_acn_revision() -> str:
-    """沿用 presmoke 的 revision 标签语义，工作树有改动时显式标明。"""
+    """正式冻结只接受可由单一 commit 完整还原的干净工作树。"""
     revision = subprocess.run(
         ["git", "-C", str(ACN_REPOSITORY), "rev-parse", "HEAD"],
         check=False,
@@ -652,7 +747,9 @@ def _current_acn_revision() -> str:
     head = revision.stdout.strip() if revision.returncode == 0 else ""
     if not head or status.returncode != 0:
         raise AutomatedRunError("无法读取当前 ACN revision")
-    return f"{head}+evaluation-worktree" if status.stdout.strip() else head
+    if status.stdout.strip():
+        raise AutomatedRunError("ACN 工作树不干净，正式运行拒绝冻结")
+    return head
 
 
 def _absolute_path(raw: Mapping[str, object], field: str) -> Path:
@@ -704,6 +801,27 @@ def _optional_fingerprint(value: object) -> str | None:
     return value
 
 
+def _git_revision(raw: Mapping[str, object], field: str) -> str:
+    value = _nonempty_string(raw, field)
+    if not re.fullmatch(r"[0-9a-f]{40}", value):
+        raise AutomatedRunError(f"{field} 必须是完整的 40 位小写 Git commit")
+    return value
+
+
+def _version(raw: Mapping[str, object], field: str) -> str:
+    value = _nonempty_string(raw, field)
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", value):
+        raise AutomatedRunError(f"{field} 必须是 x.y.z 版本")
+    return value
+
+
+def _run_class(raw: Mapping[str, object]) -> str:
+    value = raw.get("run_class")
+    if value not in {"formal", "diagnostic"}:
+        raise AutomatedRunError("run_class 仅支持 formal 或 diagnostic")
+    return value
+
+
 def _model_egress_mode(raw: Mapping[str, object]) -> str:
     """默认继续走 Pier allowlist；direct 必须显式写入冻结运行配置。"""
     value = raw.get("model_egress_mode", "pier")
@@ -725,6 +843,9 @@ def _positive_int_mapping(
     value = raw.get(field)
     if not isinstance(value, Mapping):
         raise AutomatedRunError(f"配置字段必须是整数对象: {field}")
+    unknown = sorted(set(value) - set(required))
+    if unknown:
+        raise AutomatedRunError(f"{field} 包含未知字段: " + ",".join(unknown))
     result = {str(key): _positive_int(item, f"{field}.{key}") for key, item in value.items()}
     for key in required:
         if key not in result:

@@ -209,6 +209,25 @@ class PresmokeRunnerTests(unittest.TestCase):
             [item["task_id"] for item in checkpoint["completed_tasks"]], list(TASK_IDS)
         )
 
+    def test_resume_rejects_completed_task_from_different_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = build_specs(root)[0]
+            write_completed_task_artifacts(spec)
+            changed = replace(
+                spec,
+                experiment=replace(
+                    spec.experiment,
+                    provenance=replace(spec.experiment.provenance, model="different-model"),
+                ),
+            )
+
+            completed = load_completed_task_results(
+                (changed,), root / "task-completions.json"
+            )
+
+        self.assertEqual(completed, ())
+
     def test_failure_is_checkpointed_as_a_terminal_state_and_not_reclassified_as_pending(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -389,6 +408,9 @@ def build_specs(root: Path) -> tuple[PresmokeTaskSpec, ...]:
         deepswe_revision="deepswe@abc",
         pier_revision="pier@abc",
         acn_revision="acn@abc",
+        acn_main_revision="9b818d70ddfad2f7d5e1972577dd294b19481c92",
+        acn_version="0.2.5",
+        run_class="diagnostic",
         acn_binary_hash="1" * 64,
         acn_config_hash="2" * 64,
         dataset_candidates_hash="a" * 64,
@@ -405,6 +427,7 @@ def build_specs(root: Path) -> tuple[PresmokeTaskSpec, ...]:
         verifier_image_content_digest=None,
         model="fixture-model",
         reasoning_effort="max",
+        file_edit_authority_enabled=True,
         resources={
             "cpus": 2,
             "memory_mb": 4096,
@@ -415,7 +438,11 @@ def build_specs(root: Path) -> tuple[PresmokeTaskSpec, ...]:
             "max_input_tokens": 20,
             "max_output_tokens": 20,
         },
-        timeouts={"agent_seconds": 2, "deadline_reserve_seconds": 1},
+        timeouts={
+            "agent_seconds": 2,
+            "deadline_reserve_seconds": 1,
+            "verifier_seconds": 2,
+        },
         llm_retry={"retry_count": 1, "retry_base_delay_ms": 1, "retry_max_delay_ms": 2},
         network_translation_warning="translated",
     )
@@ -464,7 +491,14 @@ def write_completed_task_artifacts(spec: PresmokeTaskSpec) -> None:
         )
     spec.manifest_path.parent.mkdir(parents=True)
     spec.manifest_path.write_text(
-        json.dumps({"failure": None, "attempt_results": records}), encoding="utf-8"
+        json.dumps(
+            {
+                "failure": None,
+                "experiment": spec.experiment.to_dict(),
+                "attempt_results": records,
+            }
+        ),
+        encoding="utf-8",
     )
 
 
@@ -506,7 +540,14 @@ def write_a_only_task_artifacts(spec: PresmokeTaskSpec) -> None:
         )
     spec.manifest_path.parent.mkdir(parents=True)
     spec.manifest_path.write_text(
-        json.dumps({"failure": None, "attempt_results": records}), encoding="utf-8"
+        json.dumps(
+            {
+                "failure": None,
+                "experiment": spec.experiment.to_dict(),
+                "attempt_results": records,
+            }
+        ),
+        encoding="utf-8",
     )
 
 
@@ -548,5 +589,12 @@ def write_no_eligible_claim_task_artifacts(spec: PresmokeTaskSpec) -> None:
         )
     spec.manifest_path.parent.mkdir(parents=True)
     spec.manifest_path.write_text(
-        json.dumps({"failure": None, "attempt_results": records}), encoding="utf-8"
+        json.dumps(
+            {
+                "failure": None,
+                "experiment": spec.experiment.to_dict(),
+                "attempt_results": records,
+            }
+        ),
+        encoding="utf-8",
     )

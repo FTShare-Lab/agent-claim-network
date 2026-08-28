@@ -127,6 +127,7 @@ impl ToolError {
             Self::RuntimeResourceExhausted(_) => Some("runtime_resource_exhausted"),
             Self::CodeRunInternalTimeout { .. } => Some("code_run_internal_timeout"),
             _ => None,
+        }
     }
 }
 

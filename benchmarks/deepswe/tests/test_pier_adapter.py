@@ -1,3 +1,4 @@
+import hashlib
 import os
 import stat
 import tempfile
@@ -9,6 +10,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from acn_deepswe.assets import frozen_coding_benchmark_skill
 from acn_deepswe.pier_adapter import (
     AcnEvalPierAgent,
+    AcnPatchReplayPierAgent,
     AcnPierAdapter,
     CONTAINER_MODEL_EGRESS_ENV,
     CONTAINER_MODEL_KEY_FILE,
@@ -313,6 +315,7 @@ class AcnEvalPierAgentTests(unittest.IsolatedAsyncioTestCase):
                 upstream_base_url=UPSTREAM,
                 host_model_key_env=HOST_KEY_ENV,
                 container_model_key_env=CONTAINER_KEY_ENV,
+                acn_version="0.2.5",
             )
             environment = SimpleNamespace(
                 exec=AsyncMock(return_value=SimpleNamespace(return_code=0)),
@@ -338,3 +341,29 @@ class AcnEvalPierAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             AcnEvalPierAgent.import_path(), "acn_deepswe.pier_adapter:AcnEvalPierAgent"
         )
+
+    async def test_patch_replay_agent_uploads_and_applies_only_the_frozen_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frozen_patch = root / "model.patch"
+            frozen_patch.write_text("diff --git a/a b/a\n", encoding="utf-8")
+            digest = hashlib.sha256(frozen_patch.read_bytes()).hexdigest()
+            agent = AcnPatchReplayPierAgent(
+                logs_dir=root / "logs",
+                patch_path=str(frozen_patch),
+                patch_sha256=digest,
+            )
+            environment = SimpleNamespace(
+                exec=AsyncMock(return_value=SimpleNamespace(return_code=0)),
+                upload_file=AsyncMock(),
+            )
+            context = SimpleNamespace(metadata=None)
+
+            await agent.setup(environment)
+            await agent.run("ignored", environment, context)
+
+        environment.upload_file.assert_awaited_once_with(
+            frozen_patch, "/opt/acn-eval/model.patch"
+        )
+        self.assertEqual(context.metadata["patch_sha256"], digest)
+        self.assertEqual(agent.version(), "1.0.0")

@@ -274,6 +274,7 @@ class AcnEvalPierAgent(BaseAgent):
         upstream_base_url: str,
         host_model_key_env: str,
         container_model_key_env: str,
+        acn_version: str,
         **kwargs: object,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -282,6 +283,9 @@ class AcnEvalPierAgent(BaseAgent):
         self.acn_config = Path(acn_config)
         self.frozen_skill = Path(frozen_skill)
         self.claim_bundle = Path(claim_bundle)
+        if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", acn_version):
+            raise ValueError("acn_version 必须是 x.y.z 版本")
+        self.acn_version = acn_version
         self.adapter = AcnPierAdapter(
             upstream_base_url,
             host_model_key_env,
@@ -297,7 +301,7 @@ class AcnEvalPierAgent(BaseAgent):
         return f"{cls.__module__}:{cls.__name__}"
 
     def version(self) -> str:
-        return "0.2.0"
+        return self.acn_version
 
     def network_allowlist(self) -> object:
         domains = list(self.adapter.network_allowlist())
@@ -359,6 +363,65 @@ class AcnEvalPierAgent(BaseAgent):
             ),
         )
         context.metadata = {"acn_eval_exit_code": result.return_code}
+
+
+class AcnPatchReplayPierAgent(BaseAgent):
+    """只重放既有 patch，供已知 verifier 基础设施故障进行一次隔离重判。"""
+
+    def __init__(
+        self,
+        *args: object,
+        patch_path: str,
+        patch_sha256: str,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.patch_path = Path(patch_path)
+        if not self.patch_path.is_absolute() or not self.patch_path.is_file():
+            raise ValueError("patch_path 必须是存在的绝对文件路径")
+        if not re.fullmatch(r"[0-9a-f]{64}", patch_sha256):
+            raise ValueError("patch_sha256 必须是小写 SHA-256")
+        self.patch_sha256 = patch_sha256
+
+    @staticmethod
+    def name() -> str:
+        return "acn_patch_replay"
+
+    @classmethod
+    def import_path(cls) -> str:
+        return f"{cls.__module__}:{cls.__name__}"
+
+    def version(self) -> str:
+        return "1.0.0"
+
+    async def setup(self, environment: BaseEnvironment) -> None:
+        created = await environment.exec(
+            f"mkdir -p {CONTAINER_ROOT}", user="root", timeout_sec=30
+        )
+        if created.return_code != 0:
+            raise RuntimeError("Pier verifier 重判无法创建上传目录")
+        await environment.upload_file(self.patch_path, f"{CONTAINER_ROOT}/model.patch")
+
+    async def run(
+        self, instruction: str, environment: BaseEnvironment, context: AgentContext
+    ) -> None:
+        del instruction
+        command = (
+            "set -eu; cd /app; "
+            f"if [ -s {CONTAINER_ROOT}/model.patch ]; then "
+            f"git apply --check {CONTAINER_ROOT}/model.patch; "
+            f"git apply --index {CONTAINER_ROOT}/model.patch; "
+            "git -c user.name=acn-eval -c user.email=eval@invalid "
+            "commit -m 'replay frozen evaluation patch'; "
+            "fi"
+        )
+        result = await environment.exec(command, cwd="/app", timeout_sec=300)
+        if result.return_code != 0:
+            raise RuntimeError("冻结 patch 无法在全新任务环境中重放")
+        context.metadata = {
+            "patch_sha256": self.patch_sha256,
+            "replay_exit_code": result.return_code,
+        }
 
 
 def _write_ephemeral_model_key(key: str) -> Path:

@@ -21,9 +21,14 @@ from pathlib import Path
 
 from .claim_freeze import append_freeze_barrier, freeze_claim_bundle
 from .gate import AttemptGateInput, GateValidator
-from .pier_adapter import AcnEvalPierAgent, upstream_host
+from .pier_adapter import AcnEvalPierAgent, AcnPatchReplayPierAgent, upstream_host
 from .pier_result import PierResultError, PierTrialEvidence, read_single_trial_evidence
 from .provenance import EvaluationProvenance, sha256_directory_tree
+from .resource_guard import (
+    ResourceGuardError,
+    cleanup_finished_trial_images,
+    verify_disk_headroom,
+)
 from .runner import ExperimentManifest
 from .rust_contract import read_rust_event_ledger, read_rust_result
 from .schemas import AttemptManifest, RouterEvidence
@@ -118,6 +123,9 @@ class Task1ExecutionConfig:
     a_only_source_manifest: Path | None = None
     progress_poll_secs: int = DEFAULT_PROGRESS_POLL_SECS
     progress_stall_after_secs: int = DEFAULT_PROGRESS_STALL_AFTER_SECS
+    docker_root: Path | None = None
+    disk_reserve_mb: int = 1
+    disk_admission_mb: int = 1
 
 
 @dataclass(frozen=True)
@@ -394,7 +402,7 @@ def build_acn_config(provenance: EvaluationProvenance, upstream_base_url: str) -
         "agent.tool": {
             "file_read_max_chars": EVALUATION_FILE_READ_MAX_CHARS,
             "file_diff_max_changed_lines": EVALUATION_FILE_DIFF_MAX_CHANGED_LINES,
-            "file_edit_authority_enabled": False,
+            "file_edit_authority_enabled": provenance.file_edit_authority_enabled,
             "max_parallel_tool_calls": EVALUATION_MAX_PARALLEL_TOOL_CALLS,
             "code_run_max_output_chars": EVALUATION_CODE_RUN_MAX_OUTPUT_CHARS,
         },
@@ -491,7 +499,13 @@ def build_pier_job_config(
             "override_storage_mb": resources.get("storage_mb"),
             "env": {},
         },
-        "verifier": {"env": {}, "disable": False},
+        "verifier": {
+            "env": {},
+            "disable": False,
+            "override_timeout_sec": _positive_int(
+                provenance.timeouts, "verifier_seconds"
+            ),
+        },
         "agents": [
             {
                 "import_path": AcnEvalPierAgent.import_path(),
@@ -508,6 +522,65 @@ def build_pier_job_config(
                     "upstream_base_url": upstream_base_url,
                     "host_model_key_env": HOST_MODEL_KEY_ENV,
                     "container_model_key_env": CONTAINER_MODEL_KEY_ENV,
+                    "acn_version": provenance.acn_version,
+                },
+                "env": {},
+            }
+        ],
+        "datasets": [],
+        "tasks": [{"path": str(task_dir)}],
+        "artifacts": [],
+        "metrics": [],
+    }
+
+
+def build_verifier_regrade_job_config(
+    attempt: AttemptManifest,
+    provenance: EvaluationProvenance,
+    artifacts: HostArtifacts,
+    patch: Path,
+    patch_sha256: str,
+    jobs_dir: Path,
+) -> dict[str, object]:
+    """在全新任务环境中只重放冻结 patch，不再次调用模型。"""
+    if not patch.is_absolute() or not patch.is_file():
+        raise ValueError("verifier 重判 patch 必须是存在的绝对文件")
+    if _sha256_file(patch) != patch_sha256:
+        raise ValueError("verifier 重判 patch 在配置生成前已变化")
+    if not jobs_dir.is_absolute():
+        raise ValueError("verifier 重判 jobs_dir 必须是绝对路径")
+    task_dir = artifacts.normalized_task_dir
+    if not task_dir.is_absolute() or not task_dir.is_dir():
+        raise ValueError("verifier 重判任务目录必须是存在的绝对路径")
+    resources = provenance.resources
+    return {
+        "job_name": f"{attempt.attempt_id}-verifier-regrade-1",
+        "jobs_dir": str(jobs_dir),
+        "n_attempts": 1,
+        "n_concurrent_trials": 1,
+        "retry": {"max_retries": 0},
+        "environment": {
+            "force_build": False,
+            "delete": False,
+            "override_cpus": resources.get("cpus"),
+            "override_memory_mb": resources.get("memory_mb"),
+            "override_storage_mb": resources.get("storage_mb"),
+            "env": {},
+        },
+        "verifier": {
+            "env": {},
+            "disable": False,
+            "override_timeout_sec": _positive_int(
+                provenance.timeouts, "verifier_seconds"
+            ),
+        },
+        "agents": [
+            {
+                "import_path": AcnPatchReplayPierAgent.import_path(),
+                "override_timeout_sec": 300,
+                "kwargs": {
+                    "patch_path": str(patch),
+                    "patch_sha256": patch_sha256,
                 },
                 "env": {},
             }
@@ -529,11 +602,13 @@ class Task1HostRunner:
         execution: Task1ExecutionConfig | None = None,
         *,
         run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        cleanup_trial_images: Callable[[str], int] | None = None,
     ) -> None:
         self.experiment = experiment
         self.jobs_directory = jobs_directory.resolve()
         self.execution = execution
         self._run = run
+        self._cleanup_trial_images = cleanup_trial_images or cleanup_finished_trial_images
         self._frozen_claim_bundle_hash: str | None = None
         self._frozen_claim_ids: tuple[str, ...] = ()
         self._pier_trial_uris: set[str] = set()
@@ -674,6 +749,14 @@ class Task1HostRunner:
         self._assert_a_only_source_still_bound(execution)
         self._validate_frozen_inputs(execution)
         attempt_dir = Path(attempt.output_path).resolve()
+        disk_paths = [attempt_dir]
+        if execution.docker_root is not None:
+            disk_paths.append(execution.docker_root)
+        verify_disk_headroom(
+            disk_paths,
+            execution.disk_reserve_mb
+            + execution.task_workers * execution.disk_admission_mb,
+        )
         attempt_dir.mkdir(parents=True, exist_ok=False)
         files = write_attempt_files(
             attempt,
@@ -703,21 +786,11 @@ class Task1HostRunner:
             job_path = self.jobs_directory / f"{attempt.attempt_id}.json"
             _write_json(job_path, job)
             # Pier 子进程继承宿主环境以取得模型 key；PATH 用于定位 pinned `pier`。
-            completed = self._run(
-                [str(execution.pier_executable), "run", "-c", str(job_path)],
-                check=False,
-                capture_output=True,
-                text=True,
-                env={
-                    **os.environ,
-                    "PYTHONPATH": os.pathsep.join(
-                        (
-                            str(execution.frozen_acn_source_root),
-                            str(execution.frozen_pier_source_root),
-                        )
-                    ),
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                },
+            completed = self._run_pier_process(
+                execution,
+                job_path,
+                stdout_path=attempt_dir / "pier.stdout.log",
+                stderr_path=attempt_dir / "pier.stderr.log",
             )
             if completed.returncode != 0:
                 reason = "PIER_INFRASTRUCTURE_FAILURE"
@@ -732,7 +805,7 @@ class Task1HostRunner:
             progress.finish("interrupted", reason=reason)
             return self._write_failed_attempt(attempt, attempt_dir, reason, progress.progress_path)
         try:
-            record = self._collect_and_gate(
+            record, trial_names = self._collect_and_gate(
                 attempt, execution, attempt_dir, progress.progress_path
             )
         except KeyboardInterrupt:
@@ -743,9 +816,67 @@ class Task1HostRunner:
             reason = f"EVIDENCE_PARSE_FAILURE:{error}"
             progress.finish("evidence_parse_failed", reason=reason)
             return self._write_failed_attempt(attempt, attempt_dir, reason, progress.progress_path)
+        try:
+            cleanup = {
+                trial_name: self._cleanup_trial_images(trial_name)
+                for trial_name in trial_names
+            }
+        except ResourceGuardError as error:
+            reason = f"DOCKER_TRIAL_IMAGE_CLEANUP_FAILED:{error}"
+            _write_json(
+                attempt_dir / "docker-image-cleanup.json",
+                {"schema_version": 1, "status": "failed", "reason": reason},
+            )
+            progress.finish("docker_cleanup_failed", reason=reason)
+            return replace(
+                record,
+                status="infrastructure_failed",
+                reason=reason,
+                progress_path=str(progress.progress_path.resolve()),
+            )
+        _write_json(
+            attempt_dir / "docker-image-cleanup.json",
+            {
+                "schema_version": 1,
+                "status": "completed",
+                "removed_image_references_by_trial": cleanup,
+            },
+        )
         progress.finish("pier_completed", pier_return_code=completed.returncode)
         self._assert_a_only_source_still_bound(execution)
         return replace(record, progress_path=str(progress.progress_path.resolve()))
+
+    def _run_pier_process(
+        self,
+        execution: Task1ExecutionConfig,
+        job_path: Path,
+        *,
+        stdout_path: Path,
+        stderr_path: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        """把 Pier 输出流式落盘，避免长任务的 stdout/stderr 常驻宿主内存。"""
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        with (
+            stdout_path.open("w", encoding="utf-8") as stdout,
+            stderr_path.open("w", encoding="utf-8") as stderr,
+        ):
+            return self._run(
+                [str(execution.pier_executable), "run", "-c", str(job_path)],
+                check=False,
+                stdout=stdout,
+                stderr=stderr,
+                text=True,
+                env={
+                    **os.environ,
+                    "PYTHONPATH": os.pathsep.join(
+                        (
+                            str(execution.frozen_acn_source_root),
+                            str(execution.frozen_pier_source_root),
+                        )
+                    ),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+            )
 
     def _collect_and_gate(
         self,
@@ -753,8 +884,9 @@ class Task1HostRunner:
         execution: Task1ExecutionConfig,
         attempt_dir: Path,
         progress_path: Path,
-    ) -> AttemptExecutionRecord:
+    ) -> tuple[AttemptExecutionRecord, tuple[str, ...]]:
         trial_dir, pier = read_single_trial_evidence(self._pier_job_directory(attempt))
+        trial_names = [pier.trial_name]
         evaluation_dir = trial_dir / "agent" / "evaluation"
         rust_result = read_rust_result(evaluation_dir / "result.json")
         events_path = evaluation_dir / "events.jsonl"
@@ -788,9 +920,57 @@ class Task1HostRunner:
                 str(attempt_dir / "attempt-result.json"),
                 None,
                 progress_path=str(progress_path.resolve()),
-            )
+            ), tuple(trial_names)
         patch = trial_dir / "artifacts" / "model.patch"
         artifact_hash = _sha256_file(patch)
+        verifier_evidence = pier
+        verifier_regrade: dict[str, object] | None = None
+        infrastructure_reason = pier.infrastructure_failure_reason()
+        if infrastructure_reason is not None:
+            try:
+                regrade_dir, regrade = self._run_verifier_regrade(
+                    attempt,
+                    execution,
+                    attempt_dir,
+                    patch,
+                    artifact_hash,
+                    pier,
+                )
+            except (OSError, ValueError, PierResultError) as error:
+                reason = f"{infrastructure_reason}:VERIFIER_REGRADE_FAILED:{error}"
+                result_path = attempt_dir / "attempt-result.json"
+                _write_json(
+                    result_path,
+                    {
+                        "schema_version": 1,
+                        "attempt_id": attempt.attempt_id,
+                        "variant": attempt.variant,
+                        "failure": reason,
+                        "pier_trial": pier.to_dict(),
+                        "rust_result": str((evaluation_dir / "result.json").resolve()),
+                        "rust_events": str(events_path.resolve()),
+                        "artifact_patch": str(patch.resolve()),
+                        "artifact_hash": artifact_hash,
+                        "progress_path": str(progress_path.resolve()),
+                    },
+                )
+                return AttemptExecutionRecord(
+                    attempt.attempt_id,
+                    attempt.variant,
+                    "infrastructure_failed",
+                    reason,
+                    str(result_path),
+                    None,
+                    progress_path=str(progress_path.resolve()),
+                ), tuple(trial_names)
+            verifier_evidence = regrade
+            trial_names.append(regrade.trial_name)
+            verifier_regrade = {
+                "trigger": infrastructure_reason,
+                "source_patch_sha256": artifact_hash,
+                "trial_directory": str(regrade_dir.resolve()),
+                "pier_trial": regrade.to_dict(),
+            }
         if attempt.variant in CLAIM_BUNDLE_VARIANTS:
             frozen_bundle_sha256, frozen_claim_content_hashes = _frozen_bundle_evidence(
                 execution.artifacts.claim_bundle
@@ -798,7 +978,7 @@ class Task1HostRunner:
         else:
             frozen_bundle_sha256, frozen_claim_content_hashes = None, {}
         isolation_checks = self._isolation_checks(attempt, execution, trial_dir, pier)
-        verifier = pier.verifier_for(attempt.attempt_id)
+        verifier = verifier_evidence.verifier_for(attempt.attempt_id)
         gate = GateValidator().validate(
             AttemptGateInput.from_rust_result(
                 rust_result,
@@ -834,6 +1014,7 @@ class Task1HostRunner:
                 "attempt_id": attempt.attempt_id,
                 "variant": attempt.variant,
                 "pier_trial": pier.to_dict(),
+                "verifier_regrade": verifier_regrade,
                 "rust_result": str((evaluation_dir / "result.json").resolve()),
                 "rust_events": str(events_path.resolve()),
                 "artifact_patch": str(patch.resolve()),
@@ -889,7 +1070,58 @@ class Task1HostRunner:
                 frozen_claim_content_hashes,
             ),
             str(progress_path.resolve()),
+        ), tuple(trial_names)
+
+    def _run_verifier_regrade(
+        self,
+        attempt: AttemptManifest,
+        execution: Task1ExecutionConfig,
+        attempt_dir: Path,
+        patch: Path,
+        patch_sha256: str,
+        original: PierTrialEvidence,
+    ) -> tuple[Path, PierTrialEvidence]:
+        """对已知基础设施故障最多重判一次，且不执行 ACN 或模型请求。"""
+        disk_paths = [attempt_dir]
+        if execution.docker_root is not None:
+            disk_paths.append(execution.docker_root)
+        verify_disk_headroom(
+            disk_paths,
+            execution.disk_reserve_mb
+            + execution.task_workers * execution.disk_admission_mb,
         )
+        regrade_root = (attempt_dir / "verifier-regrade").resolve()
+        jobs_dir = regrade_root / "pier-jobs"
+        job = build_verifier_regrade_job_config(
+            attempt,
+            self.experiment.provenance,
+            execution.artifacts,
+            patch.resolve(),
+            patch_sha256,
+            jobs_dir,
+        )
+        regrade_root.mkdir(parents=True, exist_ok=False)
+        job_path = regrade_root / "job.json"
+        _write_json(job_path, job)
+        completed = self._run_pier_process(
+            execution,
+            job_path,
+            stdout_path=regrade_root / "pier.stdout.log",
+            stderr_path=regrade_root / "pier.stderr.log",
+        )
+        if completed.returncode != 0:
+            raise ValueError(f"Pier verifier 重判退出码为 {completed.returncode}")
+        job_directory = jobs_dir / str(job["job_name"])
+        trial_dir, evidence = read_single_trial_evidence(job_directory)
+        if evidence.task_checksum != original.task_checksum:
+            raise ValueError("verifier 重判 task checksum 与原 trial 不一致")
+        replay_patch = trial_dir / "artifacts" / "model.patch"
+        if _sha256_file(replay_patch) != patch_sha256:
+            raise ValueError("verifier 重判产出的 patch 与冻结源 patch 不一致")
+        if evidence.verifier_rewards is None:
+            reason = evidence.infrastructure_failure_reason() or "VERIFIER_DID_NOT_RUN"
+            raise ValueError(f"verifier 重判仍无结果: {reason}")
+        return trial_dir, evidence
 
     def _freeze_after_a(self, attempt: AttemptManifest, execution: Task1ExecutionConfig) -> None:
         evaluation_dir = self._find_evaluation_dir(attempt)
@@ -1016,6 +1248,11 @@ class Task1HostRunner:
                     "task_workers": execution.task_workers,
                     "progress_poll_secs": execution.progress_poll_secs,
                     "progress_stall_after_secs": execution.progress_stall_after_secs,
+                    "docker_root": (
+                        str(execution.docker_root) if execution.docker_root is not None else None
+                    ),
+                    "disk_reserve_mb": execution.disk_reserve_mb,
+                    "disk_admission_mb": execution.disk_admission_mb,
                     "pier_executable": str(execution.pier_executable),
                     "task_prompt_hash": hashlib.sha256(
                         execution.task_prompt.encode("utf-8")
@@ -1198,6 +1435,8 @@ class Task1HostRunner:
             raise TaskExecutionError("progress_poll_secs 与 progress_stall_after_secs 必须为正整数")
         if execution.task_workers <= 0:
             raise TaskExecutionError("task_workers 必须为正整数")
+        if execution.disk_reserve_mb <= 0 or execution.disk_admission_mb <= 0:
+            raise TaskExecutionError("disk_reserve_mb 与 disk_admission_mb 必须为正整数")
         if execution.progress_stall_after_secs < execution.progress_poll_secs:
             raise TaskExecutionError("progress_stall_after_secs 不得小于 progress_poll_secs")
         if execution.require_eligible_claim and execution.run_all_variants_without_claims:
@@ -1231,6 +1470,8 @@ class Task1HostRunner:
             raise TaskExecutionError(
                 f"A-only source manifest 必须是绝对路径: {execution.a_only_source_manifest}"
             )
+        if execution.docker_root is not None and not execution.docker_root.is_absolute():
+            raise TaskExecutionError("docker_root 必须是绝对路径")
         if not execution.pier_executable.is_file():
             raise TaskExecutionError(
                 f"pier_executable 必须是存在的可执行文件: {execution.pier_executable}"

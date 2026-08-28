@@ -388,7 +388,11 @@ def _is_completed_task_manifest(spec: PresmokeTaskSpec, path: Path) -> bool:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    if not isinstance(raw, Mapping) or raw.get("failure") is not None:
+    if (
+        not isinstance(raw, Mapping)
+        or raw.get("failure") is not None
+        or not _task_manifest_matches_provenance(spec, raw)
+    ):
         return False
     records = raw.get("attempt_results")
     if not isinstance(records, list) or len(records) != 4:
@@ -446,7 +450,11 @@ def _is_a_only_task_manifest(spec: PresmokeTaskSpec, path: Path) -> bool:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    if not isinstance(raw, Mapping) or raw.get("failure") is not None:
+    if (
+        not isinstance(raw, Mapping)
+        or raw.get("failure") is not None
+        or not _task_manifest_matches_provenance(spec, raw)
+    ):
         return False
     records = raw.get("attempt_results")
     if not isinstance(records, list) or len(records) != 4:
@@ -491,7 +499,11 @@ def _is_no_eligible_claim_task_manifest(spec: PresmokeTaskSpec, path: Path) -> b
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    if not isinstance(raw, Mapping) or raw.get("failure") is not None:
+    if (
+        not isinstance(raw, Mapping)
+        or raw.get("failure") is not None
+        or not _task_manifest_matches_provenance(spec, raw)
+    ):
         return False
     records = raw.get("attempt_results")
     if not isinstance(records, list) or len(records) != 4:
@@ -527,6 +539,15 @@ def _is_no_eligible_claim_task_manifest(spec: PresmokeTaskSpec, path: Path) -> b
         ):
             return False
     return True
+
+
+def _task_manifest_matches_provenance(
+    spec: PresmokeTaskSpec, raw: Mapping[str, object]
+) -> bool:
+    """resume 只能复用与当前 spec 完整 provenance 一致的旧 task。"""
+    experiment = raw.get("experiment")
+    provenance = experiment.get("provenance") if isinstance(experiment, Mapping) else None
+    return provenance == spec.experiment.provenance.to_dict()
 
 
 def _has_valid_gated_attempt_evidence(

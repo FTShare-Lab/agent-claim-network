@@ -12,9 +12,15 @@
   "model": "deepseek-v4-flash-local-exp",
   "response_model": "deepseek-v4-flash",
   "reasoning_effort": "max",
+  "run_class": "formal",
+  "acn_main_revision": "9b818d70ddfad2f7d5e1972577dd294b19481c92",
+  "acn_version": "0.2.5",
   "model_egress_mode": "pier",
-  "acn_revision": "replace-with-HEAD-or-HEAD+evaluation-worktree",
-  "task_workers": 30,
+  "harness_mode": "standard",
+  "file_edit_authority_enabled": true,
+  "acn_revision": "0123456789abcdef0123456789abcdef01234567",
+  "task_workers": 20,
+  "cleanup_stale_pier_resources": true,
   "run_all_variants_without_claims": true,
   "progress": {
     "poll_secs": 30,
@@ -22,18 +28,24 @@
   },
   "resources": {
     "cpus": 2,
-    "memory_mb": 8192,
+    "memory_mb": 16384,
     "storage_mb": 20480,
     "max_tokens": 65536,
     "context_window": 1000000
   },
   "timeouts": {
     "agent_seconds": 5400,
-    "deadline_reserve_seconds": 120
+    "deadline_reserve_seconds": 120,
+    "verifier_seconds": 2700
   },
   "llm_retry": {
     "retry_count": 2,
     "retry_base_delay_ms": 1000,
     "retry_max_delay_ms": 30000
+  },
+  "host_capacity": {
+    "memory_reserve_mb": 65536,
+    "disk_reserve_mb": 65536,
+    "disk_admission_mb_per_worker": 20480
   }
 }

@@ -12,6 +12,7 @@ from acn_deepswe.presmoke_cli import (
     _ensure_frozen_task_images_available,
     _effective_config_hash,
     _task_has_partial_artifacts,
+    _verify_acn_eval_build_info,
     build_task_specs,
     load_config,
     main,
@@ -255,22 +256,31 @@ class PresmokeCliTests(unittest.TestCase):
             ):
                 verify_checkout_revision(checkout, "frozen-revision")
 
-    def test_acn_revision_binds_head_and_dirty_label(self) -> None:
+    def test_acn_revision_rejects_dirty_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             checkout = Path(directory)
-            with patch(
-                "acn_deepswe.presmoke_cli._run_checkout_git",
-                side_effect=[
-                    completed(["git"], stdout="abc123\n"),
-                    completed(["git"], stdout=" M file.py\n"),
-                ],
+            with (
+                patch(
+                    "acn_deepswe.presmoke_cli._run_checkout_git",
+                    side_effect=[
+                        completed(["git"], stdout="abc123\n"),
+                        completed(["git"], stdout=" M file.py\n"),
+                    ],
+                ),
+                self.assertRaisesRegex(PresmokeCliError, "工作树不干净"),
             ):
-                verify_acn_revision("abc123+evaluation-worktree", checkout)
+                verify_acn_revision(
+                    "abc123",
+                    "9b818d70ddfad2f7d5e1972577dd294b19481c92",
+                    "0.2.5",
+                    checkout,
+                )
 
     def test_staged_python_runtime_is_immutable_after_sources_change(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = load_config(write_fixture(Path(directory)))
-            runtime = stage_python_runtime(config)
+            with patch("acn_deepswe.presmoke_cli.verify_acn_revision"):
+                runtime = stage_python_runtime(config)
             staged_pier = runtime.pier_source_root / "pier" / "__init__.py"
             before = staged_pier.read_text(encoding="utf-8")
 
@@ -284,8 +294,9 @@ class PresmokeCliTests(unittest.TestCase):
     def test_resume_reuses_frozen_runtime_and_relocates_pending_attempts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = load_config(write_fixture(Path(directory)))
-            original_runtime = stage_python_runtime(config)
-            resumed_runtime = stage_python_runtime(config, allow_existing=True)
+            with patch("acn_deepswe.presmoke_cli.verify_acn_revision"):
+                original_runtime = stage_python_runtime(config)
+                resumed_runtime = stage_python_runtime(config, allow_existing=True)
             resume_root = config.output_dir / "resumes" / "resume-001"
             with patch("acn_deepswe.presmoke_cli.verify_checkout_revision"):
                 specs, _ = build_task_specs(
@@ -305,6 +316,31 @@ class PresmokeCliTests(unittest.TestCase):
             )
         )
         self.assertTrue(specs[0].manifest_path.is_relative_to(resume_root / "tasks"))
+
+    def test_build_info_probe_receives_no_upstream_credential(self) -> None:
+        response = completed(
+            ["acn_eval", "--build-info-json"],
+            stdout=json.dumps(
+                {
+                    "version": "0.2.5",
+                    "commit": "a" * 40,
+                    "commit_timestamp": "2026-08-28 00:00:00",
+                }
+            ),
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"PATH": "/usr/bin", "ACN_EVAL_UPSTREAM_KEY": "must-not-leak"},
+                clear=True,
+            ),
+            patch("acn_deepswe.presmoke_cli.subprocess.run", return_value=response) as run,
+        ):
+            _verify_acn_eval_build_info(
+                Path("/tmp/acn_eval"), expected_revision="a" * 40, expected_version="0.2.5"
+            )
+
+        self.assertEqual(run.call_args.kwargs["env"], {"PATH": "/usr/bin"})
 
     def test_pier_executable_binding_requires_checkout_source_install(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -394,12 +430,10 @@ class PresmokeCliTests(unittest.TestCase):
                 patch("sys.stdout") as stdout,
                 patch("acn_deepswe.presmoke_cli.verify_acn_revision"),
                 patch("acn_deepswe.presmoke_cli.verify_checkout_revision"),
-                patch("acn_deepswe.presmoke_cli.subprocess.run") as commands,
             ):
                 result = main(["--config", str(config), "--dry-run"])
         self.assertEqual(result, 0)
         runner.assert_not_called()
-        commands.assert_not_called()
         rendered = "".join(str(call.args[0]) for call in stdout.write.call_args_list)
         self.assertNotIn(secret, rendered)
         self.assertIn("B_claim", rendered)
@@ -423,6 +457,38 @@ class PresmokeCliTests(unittest.TestCase):
             raw.pop("reasoning_effort")
             config_path.write_text(json.dumps(raw), encoding="utf-8")
             with self.assertRaisesRegex(PresmokeCliError, "reasoning_effort"):
+                load_config(config_path)
+
+    def test_formal_config_requires_file_edit_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw["run_class"] = "formal"
+            raw["file_edit_authority_enabled"] = False
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(PresmokeCliError, "file_edit_authority_enabled"):
+                load_config(config_path)
+
+    def test_formal_config_reserves_at_least_one_storage_budget_per_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw["run_class"] = "formal"
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(PresmokeCliError, "resources.storage_mb"):
+                load_config(config_path)
+
+    def test_formal_config_rejects_a_different_product_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw["run_class"] = "formal"
+            raw["acn_main_revision"] = "a" * 40
+            raw["host_capacity"]["disk_admission_mb_per_worker"] = raw["resources"][
+                "storage_mb"
+            ]
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(PresmokeCliError, "9b818d70"):
                 load_config(config_path)
 
     def test_effective_config_hash_locks_response_model_mapping(self) -> None:
@@ -492,6 +558,7 @@ class PresmokeCliTests(unittest.TestCase):
                 ) as runner,
                 patch("acn_deepswe.presmoke_cli.verify_acn_revision"),
                 patch("acn_deepswe.presmoke_cli.verify_checkout_revision"),
+                patch("acn_deepswe.presmoke_cli._verify_acn_eval_build_info"),
                 patch("acn_deepswe.presmoke_cli.os.access", return_value=True),
                 patch(
                     "acn_deepswe.presmoke_cli.subprocess.run",
@@ -526,6 +593,7 @@ class PresmokeCliTests(unittest.TestCase):
                 patch("acn_deepswe.presmoke_cli.PresmokeHostRunner") as runner,
                 patch("acn_deepswe.presmoke_cli.verify_acn_revision"),
                 patch("acn_deepswe.presmoke_cli.verify_checkout_revision"),
+                patch("acn_deepswe.presmoke_cli._verify_acn_eval_build_info"),
                 patch("acn_deepswe.presmoke_cli.os.access", return_value=True),
                 patch(
                     "acn_deepswe.presmoke_cli.subprocess.run",
@@ -556,6 +624,7 @@ class PresmokeCliTests(unittest.TestCase):
                 patch("acn_deepswe.presmoke_cli.PresmokeHostRunner", return_value=fake_runner),
                 patch("acn_deepswe.presmoke_cli.verify_acn_revision"),
                 patch("acn_deepswe.presmoke_cli.verify_checkout_revision"),
+                patch("acn_deepswe.presmoke_cli._verify_acn_eval_build_info"),
                 patch("acn_deepswe.presmoke_cli.os.access", return_value=True),
                 patch(
                     "acn_deepswe.presmoke_cli.subprocess.run",
@@ -582,6 +651,7 @@ class PresmokeCliTests(unittest.TestCase):
                 patch("acn_deepswe.presmoke_cli.PresmokeHostRunner", return_value=fake_runner),
                 patch("acn_deepswe.presmoke_cli.verify_acn_revision"),
                 patch("acn_deepswe.presmoke_cli.verify_checkout_revision"),
+                patch("acn_deepswe.presmoke_cli._verify_acn_eval_build_info"),
                 patch("acn_deepswe.presmoke_cli.os.access", return_value=True),
                 patch(
                     "acn_deepswe.presmoke_cli.subprocess.run",
@@ -635,7 +705,6 @@ class PresmokeCliTests(unittest.TestCase):
                 patch("acn_deepswe.presmoke_cli.getpass.getpass") as read_key,
                 patch("acn_deepswe.presmoke_cli.verify_acn_revision"),
                 patch("acn_deepswe.presmoke_cli.verify_checkout_revision"),
-                patch("acn_deepswe.presmoke_cli.subprocess.run"),
             ):
                 result = main(["--config", str(config), "--dry-run", "--read-key-stdin"])
         self.assertEqual(result, 0)
@@ -676,7 +745,7 @@ class PresmokeCliTests(unittest.TestCase):
             with patch(
                 "acn_deepswe.presmoke_cli.subprocess.run", side_effect=[missing, pulled, digest]
             ) as run:
-                _ensure_frozen_task_images_available(config)
+                _ensure_frozen_task_images_available(config, config.output_dir.parent)
 
         self.assertEqual(run.call_count, 3)
         self.assertEqual(
@@ -707,7 +776,18 @@ def write_fixture(root: Path, *, output_dir: str | None = None) -> Path:
             )
         (normalized / task_id / "instruction.md").write_text(task_id, encoding="utf-8")
     acn_eval = root / "acn_eval"
-    acn_eval.write_text("binary", encoding="utf-8")
+    acn_eval.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"--build-info-json\" ]; then\n"
+        "  printf '%s\\n' "
+        "'{\"version\":\"0.2.5\",\"commit\":\"acn-rev\","
+        "\"commit_timestamp\":\"2026-08-28T00:00:00Z\"}'\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    acn_eval.chmod(0o755)
     pier_checkout, pier = write_pier_venv(root)
     skill = root / "coding-benchmark"
     skill.mkdir()
@@ -776,6 +856,10 @@ def write_fixture(root: Path, *, output_dir: str | None = None) -> Path:
         "model": "fixture-model",
         "response_model": "fixture-checkpoint",
         "reasoning_effort": "max",
+        "run_class": "diagnostic",
+        "acn_main_revision": "9b818d70ddfad2f7d5e1972577dd294b19481c92",
+        "acn_version": "0.2.5",
+        "file_edit_authority_enabled": True,
         "acn_revision": "acn-rev",
         "resources": {
             "cpus": 2,
@@ -784,9 +868,18 @@ def write_fixture(root: Path, *, output_dir: str | None = None) -> Path:
             "max_tokens": 128,
             "context_window": 256,
         },
-        "timeouts": {"agent_seconds": 60, "deadline_reserve_seconds": 30},
+        "timeouts": {
+            "agent_seconds": 60,
+            "deadline_reserve_seconds": 30,
+            "verifier_seconds": 60,
+        },
         "llm_retry": {"retry_count": 3, "retry_base_delay_ms": 1000, "retry_max_delay_ms": 30000},
         "progress": {"poll_secs": 30, "stall_after_secs": 600},
+        "host_capacity": {
+            "memory_reserve_mb": 1,
+            "disk_reserve_mb": 1,
+            "disk_admission_mb_per_worker": 1,
+        },
     }
     path = root / "config.json"
     path.write_text(json.dumps(config), encoding="utf-8")
@@ -827,12 +920,14 @@ def successful_preflight_commands(root: Path) -> list[object]:
     return [
         completed(["python"], stdout=json.dumps(pier_install_evidence(root / "pier-checkout"))),
         completed(["pier", "--help"]),
+        completed(["docker", "ps", "-q"]),
         completed(
             ["docker", "info", "--format", "{{json .}}"],
             stdout=json.dumps(
                 {
                     "NCPU": 8,
                     "MemTotal": 4 * 4096 * 1024 * 1024,
+                    "DockerRootDir": str(root),
                 }
             ),
         ),
@@ -857,12 +952,14 @@ def insufficient_resource_commands(root: Path) -> list[object]:
     return [
         completed(["python"], stdout=json.dumps(pier_install_evidence(root / "pier-checkout"))),
         completed(["pier", "--help"]),
+        completed(["docker", "ps", "-q"]),
         completed(
             ["docker", "info", "--format", "{{json .}}"],
             stdout=json.dumps(
                 {
                     "NCPU": 1,
                     "MemTotal": 2048 * 1024 * 1024,
+                    "DockerRootDir": str(root),
                 }
             ),
         ),

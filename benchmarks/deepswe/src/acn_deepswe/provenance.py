@@ -21,6 +21,9 @@ class EvaluationProvenance:
     deepswe_revision: str
     pier_revision: str
     acn_revision: str
+    acn_main_revision: str
+    acn_version: str
+    run_class: str
     acn_binary_hash: str
     acn_config_hash: str
     dataset_candidates_hash: str
@@ -37,6 +40,7 @@ class EvaluationProvenance:
     verifier_image_content_digest: str | None
     model: str
     reasoning_effort: str
+    file_edit_authority_enabled: bool
     resources: Mapping[str, int]
     timeouts: Mapping[str, int]
     llm_retry: Mapping[str, int]
@@ -47,6 +51,9 @@ class EvaluationProvenance:
             "deepswe_revision": self.deepswe_revision,
             "pier_revision": self.pier_revision,
             "acn_revision": self.acn_revision,
+            "acn_main_revision": self.acn_main_revision,
+            "acn_version": self.acn_version,
+            "run_class": self.run_class,
             "acn_binary_hash": self.acn_binary_hash,
             "acn_config_hash": self.acn_config_hash,
             "dataset_candidates_hash": self.dataset_candidates_hash,
@@ -63,6 +70,7 @@ class EvaluationProvenance:
             "verifier_image_content_digest": self.verifier_image_content_digest,
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
+            "file_edit_authority_enabled": self.file_edit_authority_enabled,
             "resources": dict(self.resources),
             "timeouts": dict(self.timeouts),
             "llm_retry": dict(self.llm_retry),
@@ -75,6 +83,9 @@ class EvaluationProvenance:
             "deepswe_revision",
             "pier_revision",
             "acn_revision",
+            "acn_main_revision",
+            "acn_version",
+            "run_class",
             "acn_binary_hash",
             "acn_config_hash",
             "dataset_candidates_hash",
@@ -100,12 +111,17 @@ class EvaluationProvenance:
         resources = data.get("resources")
         timeouts = data.get("timeouts")
         llm_retry = data.get("llm_retry")
+        file_edit_authority_enabled = data.get("file_edit_authority_enabled")
         if not isinstance(task_ids, list) or not all(isinstance(item, str) for item in task_ids):
             raise ValueError("provenance.dataset_task_ids 必须是字符串数组")
         if isinstance(seed, bool) or not isinstance(seed, int):
             raise ValueError("provenance.dataset_seed 必须是整数")
         if not all(isinstance(item, Mapping) for item in (resources, timeouts, llm_retry)):
             raise ValueError("provenance.resources/timeouts/llm_retry 必须是对象")
+        if not isinstance(file_edit_authority_enabled, bool):
+            raise ValueError("provenance.file_edit_authority_enabled 必须是布尔值")
+        if values["run_class"] not in {"formal", "diagnostic"}:
+            raise ValueError("provenance.run_class 仅支持 formal 或 diagnostic")
         typed_resources = {
             str(key): value
             for key, value in resources.items()
@@ -144,6 +160,7 @@ class EvaluationProvenance:
             resources=typed_resources,
             timeouts=typed_timeouts,
             llm_retry=typed_retry,
+            file_edit_authority_enabled=file_edit_authority_enabled,
             **image_digests,
             **values,
         )

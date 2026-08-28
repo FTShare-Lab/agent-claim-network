@@ -494,7 +494,7 @@ async fn long_code_run_yields_process_id_without_timeout_kill() {
     acknowledge_process_output(&registry, &running).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     let completed = registry
-        .dispatch("write_stdin", json!({"process_id": process_id}))
+        .dispatch("write_stdin", json!({ "process_id": process_id }))
         .await
         .unwrap();
     assert_eq!(completed.output["success"], true);
@@ -1297,7 +1297,7 @@ async fn configured_small_output_limit_pages_across_retained_head_tail_gap() {
             registry
                 .dispatch_with_context(
                     "write_stdin",
-                    json!({"process_id": process_id}),
+                    json!({ "process_id": process_id }),
                     context.clone(),
                 )
                 .await
