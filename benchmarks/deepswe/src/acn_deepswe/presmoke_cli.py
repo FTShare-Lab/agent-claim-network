@@ -870,7 +870,7 @@ def stage_python_runtime(
     source_hashes: dict[str, str] = {}
     for source, label in sources:
         _require_directory(source, label)
-        source_hashes[label] = sha256_directory_tree(source)
+        source_hashes[label] = _runtime_tree_hash(source)
     _verify_acn_eval_build_info(
         config.acn_eval,
         expected_revision=config.acn_revision,
@@ -1018,14 +1018,20 @@ def _atomic_write_json(path: Path, payload: object) -> None:
             temporary_path.unlink()
 
 
-def _copy_runtime_tree(source: Path, target: Path) -> None:
+def _runtime_tree_hash(source: Path) -> str:
+    """按实际冻结规则计算源码 hash，忽略不会复制的解释器缓存。"""
+    with tempfile.TemporaryDirectory(prefix="acn-runtime-hash-") as directory:
+        return _copy_runtime_tree(source, Path(directory) / "tree")
+
+
+def _copy_runtime_tree(source: Path, target: Path) -> str:
     shutil.copytree(
         source,
         target,
         symlinks=True,
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
     )
-    sha256_directory_tree(target)
+    return sha256_directory_tree(target)
 
 
 def _make_files_read_only(root: Path) -> None:

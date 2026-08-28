@@ -291,6 +291,19 @@ class PresmokeCliTests(unittest.TestCase):
             self.assertEqual(staged_pier.read_text(encoding="utf-8"), before)
             self.assertFalse(staged_pier.stat().st_mode & 0o222)
 
+    def test_staged_python_runtime_ignores_interpreter_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(write_fixture(Path(directory)))
+            cache = config.pier_checkout / "src" / "pier" / "__pycache__"
+            cache.mkdir()
+            (cache / "module.cpython-312.pyc").write_bytes(b"generated")
+
+            with patch("acn_deepswe.presmoke_cli.verify_acn_revision"):
+                runtime = stage_python_runtime(config)
+            staged_pier = runtime.pier_source_root / "pier"
+            self.assertTrue((staged_pier / "__init__.py").is_file())
+            self.assertFalse((staged_pier / "__pycache__").exists())
+
     def test_resume_reuses_frozen_runtime_and_relocates_pending_attempts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = load_config(write_fixture(Path(directory)))
