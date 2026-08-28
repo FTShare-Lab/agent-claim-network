@@ -5,6 +5,20 @@
 use super::*;
 
 impl ToolRegistry {
+    pub(crate) async fn bind_delegation_runtime_lease_for_session(
+        &self,
+        session_id: &SessionId,
+        runtime_lease: crate::session::SessionRuntimeLease,
+    ) -> Result<(), ToolError> {
+        let Some(host) = &self.delegation_host else {
+            return Ok(());
+        };
+        host.runner_for(session_id)?
+            .bind_runtime_lease(runtime_lease)
+            .await;
+        Ok(())
+    }
+
     pub(crate) async fn bind_delegation_fallback_root_for_session(
         &self,
         session_id: &SessionId,

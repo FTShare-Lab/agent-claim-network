@@ -10,6 +10,7 @@ use std::future::Future;
 use std::io::{ErrorKind, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -91,6 +92,16 @@ pub enum SessionStoreError {
     NotClosed {
         session_id: String,
         status: SessionStatus,
+    },
+    #[error("session {session_id} 已被其他进程打开，不能 resume")]
+    RuntimeLocked { session_id: String },
+    #[error("session {session_id} 没有真实用户输入，不能 resume")]
+    NoRealUserInput { session_id: String },
+    #[error("session runtime lock 失败 ({path:?}): {source}")]
+    RuntimeLock {
+        path: PathBuf,
+        #[source]
+        source: anyhow::Error,
     },
     #[error("session {session_id} message_count={message_count} 与 messages.jsonl 行数 {actual_count} 不一致")]
     MessageCountMismatch {
@@ -414,6 +425,8 @@ pub struct SessionPaths {
     pub finalize_checkpoint_yaml: PathBuf,
     /// Recap/Finalize 共用的 session 级执行锁。
     pub finalize_lock: PathBuf,
+    /// 交互运行期独占锁；进程异常退出时由操作系统自动释放。
+    pub runtime_lock: PathBuf,
     pub session_lock: PathBuf,
     pub session_events_log: PathBuf,
 }
@@ -432,6 +445,7 @@ impl SessionPaths {
             compaction_checkpoint_yaml: dir.join("compaction_checkpoint.yaml"),
             finalize_checkpoint_yaml: dir.join("finalize_checkpoint.yaml"),
             finalize_lock: dir.join("finalize.lock"),
+            runtime_lock: dir.join("runtime.lock"),
             session_lock: dir.join("session.lock"),
             session_events_log: dir.join("session_events.log"),
             dir,
@@ -647,6 +661,66 @@ pub struct ResumedSessionSummary {
     pub last_user_text: Option<String>,
 }
 
+/// 持有 session 的交互运行期所有权；drop 时自动释放跨进程锁。
+pub struct SessionRuntimeLease {
+    _guard: Arc<FileLockGuard>,
+}
+
+impl fmt::Debug for SessionRuntimeLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("SessionRuntimeLease").finish()
+    }
+}
+
+impl SessionRuntimeLease {
+    /// 让当前 session 的后台 worker 延长同一把运行期锁，但不对外暴露任意 Clone。
+    pub(crate) fn clone_for_worker(&self) -> Self {
+        Self {
+            _guard: Arc::clone(&self._guard),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn acquire_for_test(path: &Path) -> anyhow::Result<Self> {
+        Ok(Self {
+            _guard: Arc::new(FileLockGuard::lock_exclusive(path).await?),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionResumeKind {
+    Closed,
+    Interrupted,
+}
+
+#[derive(Debug)]
+pub struct RuntimeSession {
+    pub session: SessionHandle,
+    pub runtime_lease: SessionRuntimeLease,
+}
+
+#[derive(Debug)]
+pub struct ResumedRuntimeSession {
+    pub session: SessionHandle,
+    pub runtime_lease: SessionRuntimeLease,
+    pub kind: SessionResumeKind,
+}
+
+impl std::ops::Deref for ResumedRuntimeSession {
+    type Target = SessionHandle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
+impl std::ops::DerefMut for ResumedRuntimeSession {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.session
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ResumableSessionMetadata {
     id: SessionId,
@@ -654,6 +728,7 @@ struct ResumableSessionMetadata {
     status: SessionStatus,
     updated_at: DateTime<Utc>,
     closed_at: Option<DateTime<Utc>>,
+    finalized_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -818,9 +893,70 @@ impl SessionStore {
         system_prompt: &str,
         source: impl Into<String>,
         model: impl Into<String>,
-        mut id_factory: F,
+        id_factory: F,
         max_attempts: usize,
     ) -> Result<SessionHandle, SessionStoreError>
+    where
+        F: FnMut() -> SessionId,
+    {
+        let (session, _) = self
+            .create_with_metadata_id_factory_inner(
+                agent_id,
+                system_prompt,
+                source.into(),
+                model.into(),
+                id_factory,
+                max_attempts,
+                false,
+            )
+            .await?;
+        Ok(session)
+    }
+
+    pub(crate) async fn create_runtime_with_metadata_id_factory<F>(
+        &self,
+        agent_id: &AgentId,
+        system_prompt: &str,
+        source: impl Into<String>,
+        model: impl Into<String>,
+        id_factory: F,
+        max_attempts: usize,
+    ) -> Result<RuntimeSession, SessionStoreError>
+    where
+        F: FnMut() -> SessionId,
+    {
+        let (session, runtime_lease) = self
+            .create_with_metadata_id_factory_inner(
+                agent_id,
+                system_prompt,
+                source.into(),
+                model.into(),
+                id_factory,
+                max_attempts,
+                true,
+            )
+            .await?;
+        let runtime_lease = runtime_lease.ok_or_else(|| SessionStoreError::RuntimeLock {
+            path: session.paths.runtime_lock.clone(),
+            source: anyhow::anyhow!("新 session 未取得 runtime lock"),
+        })?;
+        Ok(RuntimeSession {
+            session,
+            runtime_lease,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_with_metadata_id_factory_inner<F>(
+        &self,
+        agent_id: &AgentId,
+        system_prompt: &str,
+        source: String,
+        model: String,
+        mut id_factory: F,
+        max_attempts: usize,
+        acquire_runtime_lease: bool,
+    ) -> Result<(SessionHandle, Option<SessionRuntimeLease>), SessionStoreError>
     where
         F: FnMut() -> SessionId,
     {
@@ -835,13 +971,21 @@ impl SessionStore {
             .map_err(|e| SessionStoreError::io(&sessions_dir, e))?;
 
         let mut last_id = None;
-        let source = source.into();
-        let model = model.into();
         for _ in 0..max_attempts {
             let session_id = id_factory();
             let paths = SessionPaths::new(&agent_home, &session_id);
             match fs::create_dir(&paths.dir).await {
                 Ok(()) => {
+                    let runtime_lease =
+                        if acquire_runtime_lease {
+                            Some(self.try_acquire_runtime_lease(&paths).await?.ok_or_else(
+                                || SessionStoreError::RuntimeLocked {
+                                    session_id: session_id.to_string(),
+                                },
+                            )?)
+                        } else {
+                            None
+                        };
                     let now = Utc::now();
                     let metadata = SessionMetadata {
                         id: session_id,
@@ -865,7 +1009,7 @@ impl SessionStore {
                     write_text_atomic(&paths.messages_jsonl, b"").await?;
                     write_text_atomic(&paths.turn_events_jsonl, b"").await?;
                     write_text_atomic(&paths.compaction_events_jsonl, b"").await?;
-                    return Ok(SessionHandle::new(metadata, paths));
+                    return Ok((SessionHandle::new(metadata, paths), runtime_lease));
                 }
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => {
                     last_id = Some(session_id.into_string());
@@ -880,6 +1024,23 @@ impl SessionStore {
             last_id: last_id.unwrap_or_else(|| "?".to_string()),
             sessions_dir,
         })
+    }
+
+    async fn try_acquire_runtime_lease(
+        &self,
+        paths: &SessionPaths,
+    ) -> Result<Option<SessionRuntimeLease>, SessionStoreError> {
+        FileLockGuard::try_lock_exclusive(&paths.runtime_lock)
+            .await
+            .map(|guard| {
+                guard.map(|guard| SessionRuntimeLease {
+                    _guard: Arc::new(guard),
+                })
+            })
+            .map_err(|source| SessionStoreError::RuntimeLock {
+                path: paths.runtime_lock.clone(),
+                source,
+            })
     }
 
     pub async fn list_resumable_sessions(
@@ -920,6 +1081,9 @@ impl SessionStore {
                 continue;
             };
             let paths = SessionPaths::new(&agent_home, &session_id);
+            let Some(_runtime_lease) = self.try_acquire_runtime_lease(&paths).await? else {
+                continue;
+            };
             let metadata: ResumableSessionMetadata = match read_yaml(&paths.session_yaml).await {
                 Ok(metadata) => metadata,
                 Err(StorageError::Io { source, .. }) if source.kind() == ErrorKind::NotFound => {
@@ -932,18 +1096,21 @@ impl SessionStore {
                 }
                 Err(error) => return Err(error.into()),
             };
-            if metadata.status != SessionStatus::Closed || metadata.agent_id != *agent_id {
+            let resumable_status = match metadata.status {
+                SessionStatus::Open => {
+                    metadata.closed_at.is_none() && metadata.finalized_at.is_none()
+                }
+                SessionStatus::Closed => true,
+                SessionStatus::Finalizing => false,
+            };
+            if !resumable_status || metadata.agent_id != *agent_id {
                 continue;
             }
             let id = metadata.id;
             let status = metadata.status;
             let updated_at = metadata.updated_at;
             let closed_at = metadata.closed_at;
-            let messages = read_messages_file(&paths.messages_jsonl).await?;
-            let last_user_text = match extract_last_user_text(&messages) {
-                Some(text) => Some(text),
-                None => resumable_journal_last_user_text(&paths).await,
-            };
+            let last_user_text = resumable_last_user_text(&paths).await?;
             let Some(last_user_text) = last_user_text else {
                 continue;
             };
@@ -957,8 +1124,8 @@ impl SessionStore {
         }
         sessions.sort_by(|a, b| {
             b.closed_at
-                .cmp(&a.closed_at)
-                .then_with(|| b.updated_at.cmp(&a.updated_at))
+                .unwrap_or(b.updated_at)
+                .cmp(&a.closed_at.unwrap_or(a.updated_at))
                 .then_with(|| b.id.as_str().cmp(a.id.as_str()))
         });
         Ok(sessions)
@@ -1046,6 +1213,54 @@ impl SessionStore {
             let mut handle = self.open_existing_session(agent_id, session_id).await?;
             handle.mark_open(Utc::now()).await?;
             Ok(handle)
+        })
+        .await
+    }
+
+    /// 抢占并持续持有交互运行期锁，然后在锁内重读 metadata 决定恢复路径。
+    pub async fn resume_runtime_session(
+        &self,
+        agent_id: &AgentId,
+        session_id: &SessionId,
+    ) -> Result<ResumedRuntimeSession, SessionStoreError> {
+        self.with_session_cleanup_lock(agent_id, || async {
+            let agent_home = self.agents_root.join(agent_id.as_str());
+            let paths = SessionPaths::new(&agent_home, session_id);
+            let runtime_lease = self
+                .try_acquire_runtime_lease(&paths)
+                .await?
+                .ok_or_else(|| SessionStoreError::RuntimeLocked {
+                    session_id: session_id.to_string(),
+                })?;
+            let mut session = self.load_existing_session(agent_id, session_id).await?;
+            if resumable_last_user_text(&session.paths).await?.is_none() {
+                return Err(SessionStoreError::NoRealUserInput {
+                    session_id: session_id.to_string(),
+                });
+            }
+            let kind = match session.metadata.status {
+                SessionStatus::Closed => {
+                    session.mark_open(Utc::now()).await?;
+                    SessionResumeKind::Closed
+                }
+                SessionStatus::Open
+                    if session.metadata.closed_at.is_none()
+                        && session.metadata.finalized_at.is_none() =>
+                {
+                    SessionResumeKind::Interrupted
+                }
+                status => {
+                    return Err(SessionStoreError::NotClosed {
+                        session_id: session_id.to_string(),
+                        status,
+                    });
+                }
+            };
+            Ok(ResumedRuntimeSession {
+                session,
+                runtime_lease,
+                kind,
+            })
         })
         .await
     }
@@ -1205,6 +1420,16 @@ pub fn count_real_user_turns(messages: &[SessionMessage]) -> usize {
         .iter()
         .filter(|message| is_real_user_message(message))
         .count()
+}
+
+async fn resumable_last_user_text(
+    paths: &SessionPaths,
+) -> Result<Option<String>, SessionStoreError> {
+    let messages = read_messages_file(&paths.messages_jsonl).await?;
+    Ok(match extract_last_user_text(&messages) {
+        Some(text) => Some(text),
+        None => resumable_journal_last_user_text(paths).await,
+    })
 }
 
 async fn resumable_journal_last_user_text(paths: &SessionPaths) -> Option<String> {
@@ -3156,7 +3381,7 @@ frontier:
     }
 
     #[tokio::test]
-    async fn list_resumable_sessions_includes_finalized_closed_and_filters_open_empty_finalizing_other_agent(
+    async fn list_resumable_sessions_includes_closed_and_interrupted_but_filters_empty_finalizing_other_agent(
     ) {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path().to_path_buf());
@@ -3261,17 +3486,17 @@ frontier:
             session_ids,
             vec![
                 session_id("session_ffffffff"),
+                session_id("session_bbbbbbbb"),
                 session_id("session_aaaaaaaa")
             ]
         );
         assert_eq!(sessions[0].last_user_text.as_deref(), Some("finalized a"));
-        assert_eq!(sessions[1].last_user_text.as_deref(), Some("closed a"));
+        assert_eq!(sessions[1].last_user_text.as_deref(), Some("open a"));
+        assert_eq!(sessions[1].status, SessionStatus::Open);
+        assert_eq!(sessions[2].last_user_text.as_deref(), Some("closed a"));
         assert!(!session_ids
             .iter()
             .any(|id| id == &session_id("session_99999999")));
-        assert!(!session_ids
-            .iter()
-            .any(|id| id == &session_id("session_bbbbbbbb")));
     }
 
     #[tokio::test]
@@ -3422,7 +3647,7 @@ frontier:
     }
 
     #[tokio::test]
-    async fn list_resumable_sessions_filters_open_journal_only_session_and_direct_open_rejects() {
+    async fn list_resumable_sessions_includes_unlocked_open_journal_session_but_skips_locked() {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path().to_path_buf());
         let agent = agent_id("agent-a");
@@ -3450,19 +3675,22 @@ frontier:
             .unwrap();
 
         let sessions = store.list_resumable_sessions(&agent).await.unwrap();
-        let err = store
-            .open_existing_session(&agent, &session_id("session_aaaaaaaa"))
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, SessionStatus::Open);
+        assert_eq!(
+            sessions[0].last_user_text.as_deref(),
+            Some("open session request")
+        );
+
+        let runtime_lease = FileLockGuard::try_lock_exclusive(&session.paths.runtime_lock)
             .await
-            .unwrap_err();
+            .unwrap()
+            .unwrap();
+        let sessions = store.list_resumable_sessions(&agent).await.unwrap();
+        drop(runtime_lease);
 
         assert!(sessions.is_empty());
-        assert!(matches!(
-            err,
-            SessionStoreError::NotClosed {
-                status: SessionStatus::Open,
-                ..
-            }
-        ));
     }
 
     #[tokio::test]
@@ -3512,6 +3740,236 @@ frontier:
         let err = store.open_existing_session(&agent, &id).await.unwrap_err();
 
         assert!(matches!(err, SessionStoreError::NotClosed { .. }));
+    }
+
+    #[tokio::test]
+    async fn resume_runtime_session_recovers_unlocked_open_without_clearing_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let agent = agent_id("agent-a");
+        let id = session_id("session_aaaaaaaa");
+        let session = create_session(
+            &store,
+            &agent,
+            id.clone(),
+            Utc::now(),
+            &[NewSessionMessage::text(
+                SessionMessageRole::User,
+                "interrupted request",
+            )],
+            false,
+        )
+        .await;
+        write_text_atomic(
+            &session.paths.finalize_checkpoint_yaml,
+            b"checkpoint: keep\n",
+        )
+        .await
+        .unwrap();
+
+        let resumed = store.resume_runtime_session(&agent, &id).await.unwrap();
+
+        assert_eq!(resumed.kind, SessionResumeKind::Interrupted);
+        assert_eq!(resumed.session.metadata.status, SessionStatus::Open);
+        assert_eq!(
+            fs::read_to_string(&resumed.session.paths.finalize_checkpoint_yaml)
+                .await
+                .unwrap(),
+            "checkpoint: keep\n"
+        );
+        assert!(store
+            .list_resumable_sessions(&agent)
+            .await
+            .unwrap()
+            .is_empty());
+        let error = store.resume_runtime_session(&agent, &id).await.unwrap_err();
+        assert!(matches!(error, SessionStoreError::RuntimeLocked { .. }));
+
+        drop(resumed);
+        assert_eq!(
+            store.list_resumable_sessions(&agent).await.unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_runtime_session_reopens_closed_and_clears_old_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let agent = agent_id("agent-a");
+        let id = session_id("session_aaaaaaaa");
+        let session = create_session(
+            &store,
+            &agent,
+            id.clone(),
+            Utc::now(),
+            &[NewSessionMessage::text(SessionMessageRole::User, "closed")],
+            true,
+        )
+        .await;
+        write_text_atomic(
+            &session.paths.finalize_checkpoint_yaml,
+            b"checkpoint: old\n",
+        )
+        .await
+        .unwrap();
+
+        let resumed = store.resume_runtime_session(&agent, &id).await.unwrap();
+
+        assert_eq!(resumed.kind, SessionResumeKind::Closed);
+        assert_eq!(resumed.session.metadata.status, SessionStatus::Open);
+        assert!(matches!(
+            fs::metadata(&resumed.session.paths.finalize_checkpoint_yaml).await,
+            Err(error) if error.kind() == ErrorKind::NotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn resume_runtime_session_rejects_finalizing_without_holding_runtime_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let agent = agent_id("agent-a");
+        let id = session_id("session_aaaaaaaa");
+        let mut session = create_session(
+            &store,
+            &agent,
+            id.clone(),
+            Utc::now(),
+            &[NewSessionMessage::text(
+                SessionMessageRole::User,
+                "finalizing",
+            )],
+            false,
+        )
+        .await;
+        session.mark_finalizing(Utc::now()).await.unwrap();
+
+        let error = store.resume_runtime_session(&agent, &id).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionStoreError::NotClosed {
+                status: SessionStatus::Finalizing,
+                ..
+            }
+        ));
+        assert!(
+            FileLockGuard::try_lock_exclusive(&session.paths.runtime_lock)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_runtime_session_rejects_empty_open_and_closed_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let agent = agent_id("agent-a");
+        let open_id = session_id("session_aaaaaaaa");
+        let closed_id = session_id("session_bbbbbbbb");
+        let open = create_session(&store, &agent, open_id.clone(), Utc::now(), &[], false).await;
+        let closed = create_session(&store, &agent, closed_id.clone(), Utc::now(), &[], true).await;
+
+        for id in [&open_id, &closed_id] {
+            let error = store.resume_runtime_session(&agent, id).await.unwrap_err();
+            assert!(matches!(error, SessionStoreError::NoRealUserInput { .. }));
+        }
+
+        assert_eq!(
+            open.read_metadata().await.unwrap().status,
+            SessionStatus::Open
+        );
+        assert_eq!(
+            closed.read_metadata().await.unwrap().status,
+            SessionStatus::Closed
+        );
+        assert!(FileLockGuard::try_lock_exclusive(&open.paths.runtime_lock)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            FileLockGuard::try_lock_exclusive(&closed.paths.runtime_lock)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_session_creation_holds_lock_until_lease_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let agent = agent_id("agent-a");
+        let id = session_id("session_aaaaaaaa");
+        let mut runtime = store
+            .create_runtime_with_metadata_id_factory(
+                &agent,
+                "system",
+                "tui",
+                "test-model",
+                || id.clone(),
+                1,
+            )
+            .await
+            .unwrap();
+        runtime
+            .session
+            .append_messages(&[NewSessionMessage::text(
+                SessionMessageRole::User,
+                "active request",
+            )])
+            .await
+            .unwrap();
+
+        assert!(store
+            .list_resumable_sessions(&agent)
+            .await
+            .unwrap()
+            .is_empty());
+        drop(runtime);
+        assert_eq!(
+            store.list_resumable_sessions(&agent).await.unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_lease_keeps_runtime_lock_after_app_owner_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let agent = agent_id("agent-a");
+        let id = session_id("session_aaaaaaaa");
+        let session = create_session(
+            &store,
+            &agent,
+            id.clone(),
+            Utc::now(),
+            &[NewSessionMessage::text(
+                SessionMessageRole::User,
+                "interrupted request",
+            )],
+            false,
+        )
+        .await;
+        let resumed = store.resume_runtime_session(&agent, &id).await.unwrap();
+        let worker_lease = resumed.runtime_lease.clone_for_worker();
+
+        drop(resumed);
+        assert!(
+            FileLockGuard::try_lock_exclusive(&session.paths.runtime_lock)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        drop(worker_lease);
+        assert!(
+            FileLockGuard::try_lock_exclusive(&session.paths.runtime_lock)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

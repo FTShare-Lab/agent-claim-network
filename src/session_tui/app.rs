@@ -183,6 +183,8 @@ struct SessionTuiApp {
     start_handle: Option<JoinHandle<()>>,
     resume_handle: Option<JoinHandle<()>>,
     session: Option<crate::session::SessionHandle>,
+    _runtime_lease: Option<crate::session::SessionRuntimeLease>,
+    current_session_has_real_user_input: bool,
     session_task: SessionTaskState,
     session_picker: Option<SessionPickerState>,
     mcp_manager: Option<Arc<McpConnectionManager>>,
@@ -292,6 +294,8 @@ impl SessionTuiApp {
             start_handle: None,
             resume_handle: None,
             session: None,
+            _runtime_lease: None,
+            current_session_has_real_user_input: false,
             session_task: SessionTaskState::default(),
             session_picker: None,
             mcp_manager,
@@ -585,6 +589,9 @@ impl SessionTuiApp {
                         self.session_task.mark_turn_committed(turn_id);
                     }
                 }
+                if matches!(&event, SessionEvent::UserMessageAccepted { .. }) {
+                    self.current_session_has_real_user_input = true;
+                }
                 let should_restore_late_async_inputs = matches!(
                     &event,
                     SessionEvent::TurnCancelled { .. } | SessionEvent::TurnFailed { .. }
@@ -623,7 +630,9 @@ impl SessionTuiApp {
                             status: report.inbox_report.team_services,
                         },
                     );
+                    self._runtime_lease = Some(report.runtime_lease);
                     self.session = Some(report.session);
+                    self.current_session_has_real_user_input = false;
                     self.start_handle = None;
                     self.chat_widget
                         .handle_session_event(SessionEvent::StatusChanged {
@@ -696,7 +705,25 @@ impl SessionTuiApp {
                             "Session {} resumed.",
                             outcome.session.metadata.id
                         ));
+                        self._runtime_lease = Some(outcome.runtime_lease);
                         self.session = Some(outcome.session);
+                        self.current_session_has_real_user_input = true;
+                        if let Some(temporary_session_id) = outcome.temporary_session_id {
+                            let engine = self.engine.clone();
+                            tokio::spawn(async move {
+                                match engine.delete_empty_session(&temporary_session_id).await {
+                                    Ok(true) => {}
+                                    Ok(false) => log::warn!(
+                                        target: "session_tui",
+                                        "Resume 后临时空 session 未被删除: {temporary_session_id}"
+                                    ),
+                                    Err(e) => log::warn!(
+                                        target: "session_tui",
+                                        "Resume 后删除临时空 session 失败 ({temporary_session_id}): {e:#}"
+                                    ),
+                                }
+                            });
+                        }
                         self.maybe_dispatch_next_queued_input()?;
                         self.tui.draw_after_state_reload(
                             &mut self.chat_widget,
@@ -705,9 +732,11 @@ impl SessionTuiApp {
                         return Ok(false);
                     }
                     Err(e) => {
-                        self.chat_widget
-                            .state_mut()
-                            .push_error(format!("Resume failed: {e:#}"));
+                        let state = self.chat_widget.state_mut();
+                        if self.session.is_none() {
+                            state.status = SessionRuntimeStatus::Error;
+                        }
+                        state.push_error(format!("Resume failed: {e:#}"));
                         self.restore_queued_inputs_after_resume_interrupted();
                         self.mark_pending_async_inputs_for_restore();
                     }
@@ -820,9 +849,11 @@ impl SessionTuiApp {
                             "Background finalize unavailable, finalizing here: {error:#}"
                         ));
                         self.tui.render_requester().schedule_render();
+                        let runtime_lease = self.runtime_lease_for_worker()?;
                         self.session_task.spawn_tracked_finalize(
                             self.engine.clone(),
                             *session,
+                            runtime_lease,
                             self.worker_tx.clone(),
                         );
                     }
@@ -1706,6 +1737,13 @@ impl SessionTuiApp {
             && self.chat_widget.state().input_accepts_text()
     }
 
+    fn runtime_lease_for_worker(&self) -> anyhow::Result<crate::session::SessionRuntimeLease> {
+        self._runtime_lease
+            .as_ref()
+            .map(crate::session::SessionRuntimeLease::clone_for_worker)
+            .ok_or_else(|| anyhow::anyhow!("session runtime lease is unavailable"))
+    }
+
     fn maybe_dispatch_next_queued_input(&mut self) -> anyhow::Result<()> {
         while self.session_can_dispatch_input() {
             let Some(next_input) = self.chat_widget.state_mut().pop_queued_turn() else {
@@ -1737,6 +1775,7 @@ impl SessionTuiApp {
         let Some(session) = self.session.clone() else {
             return Ok(());
         };
+        let runtime_lease = self.runtime_lease_for_worker()?;
         let visible_text = input.command_text().to_string();
         self.chat_widget
             .state_mut()
@@ -1746,6 +1785,7 @@ impl SessionTuiApp {
         self.session_task.spawn_tracked_turn(
             self.engine.clone(),
             session,
+            runtime_lease,
             input,
             self.worker_tx.clone(),
         );
@@ -1756,11 +1796,13 @@ impl SessionTuiApp {
         let Some(session) = self.session.clone() else {
             return Ok(());
         };
+        let runtime_lease = self.runtime_lease_for_worker()?;
         self.tui
             .draw(&mut self.chat_widget, self.session_picker.as_ref())?;
         self.session_task.spawn_tracked_user_shell_command(
             self.engine.clone(),
             session,
+            runtime_lease,
             command,
             self.worker_tx.clone(),
         );
@@ -1812,9 +1854,11 @@ impl SessionTuiApp {
         let Some(session) = self.session.clone() else {
             return Ok(());
         };
+        let runtime_lease = self.runtime_lease_for_worker()?;
         self.session_task.spawn_tracked_compact(
             self.engine.clone(),
             session,
+            runtime_lease,
             self.worker_tx.clone(),
         );
         self.tui.render_requester().schedule_render();
@@ -1825,8 +1869,13 @@ impl SessionTuiApp {
         let Some(session) = self.session.clone() else {
             return Ok(());
         };
-        self.session_task
-            .spawn_tracked_inbox(self.engine.clone(), session, self.worker_tx.clone());
+        let runtime_lease = self.runtime_lease_for_worker()?;
+        self.session_task.spawn_tracked_inbox(
+            self.engine.clone(),
+            session,
+            runtime_lease,
+            self.worker_tx.clone(),
+        );
         self.tui.render_requester().schedule_render();
         Ok(())
     }
@@ -1846,11 +1895,12 @@ impl SessionTuiApp {
             self.tui.render_requester().schedule_render();
             return Ok(());
         }
-        if self
-            .session
-            .as_ref()
-            .is_some_and(|session| session.metadata.message_count != 0)
-        {
+        if current_session_blocks_resume(
+            self.session
+                .as_ref()
+                .map(|session| session.metadata.message_count),
+            self.current_session_has_real_user_input,
+        ) {
             self.chat_widget
                 .state_mut()
                 .push_system("Please /exit the current session before resuming.");
@@ -1871,11 +1921,12 @@ impl SessionTuiApp {
             self.tui.render_requester().schedule_render();
             return Ok(());
         }
-        if self
-            .session
-            .as_ref()
-            .is_some_and(|session| session.metadata.message_count != 0)
-        {
+        if current_session_blocks_resume(
+            self.session
+                .as_ref()
+                .map(|session| session.metadata.message_count),
+            self.current_session_has_real_user_input,
+        ) {
             self.chat_widget
                 .state_mut()
                 .push_system("Please /exit the current session before resuming.");
@@ -1885,7 +1936,12 @@ impl SessionTuiApp {
         let temporary_session_id = self
             .session
             .as_ref()
-            .filter(|session| session.metadata.message_count == 0)
+            .filter(|session| {
+                !current_session_blocks_resume(
+                    Some(session.metadata.message_count),
+                    self.current_session_has_real_user_input,
+                )
+            })
             .map(|session| session.metadata.id.clone());
         self.resume_handle = Some(spawn_resume_open_worker(
             self.engine.clone(),
@@ -2005,10 +2061,12 @@ impl SessionTuiApp {
             });
         self.tui
             .draw(&mut self.chat_widget, self.session_picker.as_ref())?;
+        let runtime_lease = self.runtime_lease_for_worker()?;
         if let Some(supervisor) = self.supervisor.clone() {
             self.session_task.spawn_tracked_finalize_enqueue(
                 self.engine.clone(),
                 session,
+                runtime_lease,
                 supervisor,
                 self.worker_tx.clone(),
             );
@@ -2016,6 +2074,7 @@ impl SessionTuiApp {
             self.session_task.spawn_tracked_finalize(
                 self.engine.clone(),
                 session,
+                runtime_lease,
                 self.worker_tx.clone(),
             );
         }
@@ -2308,6 +2367,13 @@ fn pending_submission_should_restore(
     restore_before: u64,
 ) -> bool {
     explicit_restore || async_input_sequence_should_restore(sequence, restore_before)
+}
+
+fn current_session_blocks_resume(
+    current_message_count: Option<usize>,
+    has_real_user_input: bool,
+) -> bool {
+    current_message_count.is_some_and(|message_count| message_count != 0 || has_real_user_input)
 }
 
 fn pending_restore_should_wait_for_turn(
@@ -3057,6 +3123,14 @@ done
         assert!(!resume_interruption_can_restore_queued_inputs(
             false, false, true
         ));
+    }
+
+    #[test]
+    fn resume_rejects_journal_only_current_session() {
+        assert!(current_session_blocks_resume(Some(0), true));
+        assert!(current_session_blocks_resume(Some(1), false));
+        assert!(!current_session_blocks_resume(Some(0), false));
+        assert!(!current_session_blocks_resume(None, true));
     }
 
     #[test]

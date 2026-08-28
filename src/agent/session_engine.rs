@@ -51,9 +51,10 @@ use crate::session::{
     canonical_user_content_hash, read_session_turn_journal, replay_turn_journal,
     turn_journal_recovery_context_for_chain, ActiveTurnCompactionCursor, CompactedProviderHistory,
     CompactionCheckpoint, CompactionCheckpointStatus, FinalizeCheckpoint, NewSessionMessage,
-    PendingProviderHistoryTurn, RecoveryContextLimits, SessionCompactionState, SessionContentBlock,
-    SessionHandle, SessionMessage, SessionMessageRole, SessionStatus, SessionStore,
-    SessionStoreError, TurnJournalEventKind, TurnJournalFlush, TurnJournalStatus, TurnJournalTurn,
+    PendingProviderHistoryTurn, RecoveryContextLimits, ResumedRuntimeSession,
+    SessionCompactionState, SessionContentBlock, SessionHandle, SessionMessage, SessionMessageRole,
+    SessionResumeKind, SessionRuntimeLease, SessionStatus, SessionStore, SessionStoreError,
+    TurnJournalEventKind, TurnJournalFlush, TurnJournalStatus, TurnJournalTurn,
 };
 use crate::skill::{resolve_explicit_skill_instructions, SkillInjectionLimits, SkillInstructions};
 use crate::storage::FileLockGuard;
@@ -219,9 +220,10 @@ pub struct SessionEngineOptions {
     pub subagent_max_concurrent: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SessionStartReport {
     pub session: SessionHandle,
+    pub runtime_lease: SessionRuntimeLease,
     pub inbox_report: InboxProcessReport,
 }
 
@@ -1484,6 +1486,18 @@ impl SessionEngine {
         self.mcp_manager.clone()
     }
 
+    pub(crate) async fn bind_delegation_runtime_lease(
+        &self,
+        session_id: &SessionId,
+        runtime_lease: SessionRuntimeLease,
+    ) -> anyhow::Result<()> {
+        self.turn_loop
+            .tool_registry()
+            .bind_delegation_runtime_lease_for_session(session_id, runtime_lease)
+            .await
+            .context("绑定 subagent session runtime lease 失败")
+    }
+
     pub(crate) async fn process_snapshots_for_session(
         &self,
         session_id: &SessionId,
@@ -2364,28 +2378,25 @@ impl SessionEngine {
     pub async fn reopen_existing_session(
         &self,
         session_id: &SessionId,
-    ) -> anyhow::Result<SessionHandle> {
+    ) -> anyhow::Result<ResumedRuntimeSession> {
         // read state 是单次运行期安全状态；resume 后必须重新建立所需读取许可。
         self.turn_loop.clear_file_read_state(session_id).await;
-        let session = self
+        let resumed = self
             .session_store
-            .with_session_cleanup_lock(&self.agent.agent_id, || async {
-                let mut session = self
-                    .session_store
-                    .open_existing_session(&self.agent.agent_id, session_id)
-                    .await?;
-                self.abandon_session_delegations_best_effort(
-                    &session,
-                    "session restored after runtime exit",
-                )
-                .await;
-                session.mark_open(Utc::now()).await?;
-                Ok::<SessionHandle, anyhow::Error>(session)
-            })
+            .resume_runtime_session(&self.agent.agent_id, session_id)
             .await?;
-        self.append_session_event_log(&session, "INFO", "Session resumed")
+        self.abandon_session_delegations_best_effort(
+            &resumed.session,
+            "session restored after runtime exit",
+        )
+        .await;
+        let event = match resumed.kind {
+            SessionResumeKind::Closed => "Session resumed",
+            SessionResumeKind::Interrupted => "Interrupted session resumed",
+        };
+        self.append_session_event_log(&resumed.session, "INFO", event)
             .await;
-        Ok(session)
+        Ok(resumed)
     }
 
     /// resume 时刷新 inbox；单人模式只处理本地 pending，不发起团队网络请求。
@@ -2468,9 +2479,9 @@ impl SessionEngine {
         emit(SessionEvent::StartupProgress {
             label: "creating session...".into(),
         });
-        let mut session = self
+        let runtime_session = self
             .session_store
-            .create_with_metadata_id_factory(
+            .create_runtime_with_metadata_id_factory(
                 &self.runner.agent_id,
                 &system_prompt,
                 self.session_source.clone(),
@@ -2479,6 +2490,7 @@ impl SessionEngine {
                 max_attempts,
             )
             .await?;
+        let mut session = runtime_session.session;
         session.replace_runtime_fallback_root(inbox_fallback_scope);
         emit(SessionEvent::SessionStarted {
             session_id: session.metadata.id.clone(),
@@ -2493,6 +2505,7 @@ impl SessionEngine {
         });
         Ok(SessionStartReport {
             session,
+            runtime_lease: runtime_session.runtime_lease,
             inbox_report,
         })
     }

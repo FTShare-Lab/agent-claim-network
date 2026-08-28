@@ -76,6 +76,8 @@ pub(super) struct McpOperationOutcome {
 
 pub(super) struct ResumeSessionOutcome {
     pub(super) session: crate::session::SessionHandle,
+    pub(super) runtime_lease: crate::session::SessionRuntimeLease,
+    pub(super) temporary_session_id: Option<SessionId>,
     pub(super) inbox_report: crate::agent::InboxProcessReport,
     pub(super) last_turns: Vec<crate::session::HistoricalTimelineTurn>,
     pub(super) turn_count: usize,
@@ -457,12 +459,21 @@ impl SessionTaskState {
         &mut self,
         engine: SessionEngine,
         session: crate::session::SessionHandle,
+        runtime_lease: crate::session::SessionRuntimeLease,
         input: QueuedInput,
         worker_tx: mpsc::UnboundedSender<WorkerEvent>,
     ) {
         let turn_id = self.allocate_task_id();
         let (control, control_rx) = SessionTurnControl::channel();
-        let handle = spawn_turn_worker(engine, session, input, worker_tx, turn_id, control_rx);
+        let handle = spawn_turn_worker(
+            engine,
+            session,
+            runtime_lease,
+            input,
+            worker_tx,
+            turn_id,
+            control_rx,
+        );
         self.current = Some(ActiveSessionTask::Turn(Box::new(ActiveTurn::new(
             turn_id, handle, control,
         ))));
@@ -472,12 +483,21 @@ impl SessionTaskState {
         &mut self,
         engine: SessionEngine,
         session: crate::session::SessionHandle,
+        runtime_lease: crate::session::SessionRuntimeLease,
         command: String,
         worker_tx: mpsc::UnboundedSender<WorkerEvent>,
     ) {
         let task_id = self.allocate_task_id();
         let cancel = CancellationToken::new();
-        spawn_user_shell_worker(engine, session, command, worker_tx, task_id, cancel.clone());
+        spawn_user_shell_worker(
+            engine,
+            session,
+            runtime_lease,
+            command,
+            worker_tx,
+            task_id,
+            cancel.clone(),
+        );
         self.current = Some(ActiveSessionTask::UserShellCommand(ActiveShell::new(
             task_id, cancel,
         )));
@@ -487,45 +507,56 @@ impl SessionTaskState {
         &mut self,
         engine: SessionEngine,
         session: crate::session::SessionHandle,
+        runtime_lease: crate::session::SessionRuntimeLease,
         worker_tx: mpsc::UnboundedSender<WorkerEvent>,
     ) {
         let task_id = self.allocate_task_id();
         self.current = Some(ActiveSessionTask::Compact(task_id));
-        spawn_compact_worker(engine, session, worker_tx, task_id);
+        spawn_compact_worker(engine, session, runtime_lease, worker_tx, task_id);
     }
 
     pub(super) fn spawn_tracked_inbox(
         &mut self,
         engine: SessionEngine,
         session: crate::session::SessionHandle,
+        runtime_lease: crate::session::SessionRuntimeLease,
         worker_tx: mpsc::UnboundedSender<WorkerEvent>,
     ) {
         let task_id = self.allocate_task_id();
         self.current = Some(ActiveSessionTask::Inbox(task_id));
-        spawn_inbox_worker(engine, session, worker_tx, task_id);
+        spawn_inbox_worker(engine, session, runtime_lease, worker_tx, task_id);
     }
 
     pub(super) fn spawn_tracked_finalize(
         &mut self,
         engine: SessionEngine,
         session: crate::session::SessionHandle,
+        runtime_lease: crate::session::SessionRuntimeLease,
         worker_tx: mpsc::UnboundedSender<WorkerEvent>,
     ) {
         let task_id = self.allocate_task_id();
         self.current = Some(ActiveSessionTask::Finalize(task_id));
-        spawn_finalize_worker(engine, session, worker_tx, task_id);
+        spawn_finalize_worker(engine, session, runtime_lease, worker_tx, task_id);
     }
 
     pub(super) fn spawn_tracked_finalize_enqueue(
         &mut self,
         engine: SessionEngine,
         session: crate::session::SessionHandle,
+        runtime_lease: crate::session::SessionRuntimeLease,
         supervisor: crate::supervisor::SupervisorLaunchConfig,
         worker_tx: mpsc::UnboundedSender<WorkerEvent>,
     ) {
         let task_id = self.allocate_task_id();
         self.current = Some(ActiveSessionTask::Finalize(task_id));
-        spawn_finalize_enqueue_worker(engine, session, supervisor, worker_tx, task_id);
+        spawn_finalize_enqueue_worker(
+            engine,
+            session,
+            runtime_lease,
+            supervisor,
+            worker_tx,
+            task_id,
+        );
     }
 }
 
@@ -592,7 +623,9 @@ pub(super) fn spawn_resume_open_worker(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let result = async {
-            let session = engine.reopen_existing_session(&session_id).await?;
+            let resumed = engine.reopen_existing_session(&session_id).await?;
+            let session = resumed.session;
+            let runtime_lease = resumed.runtime_lease;
             let inbox_report = engine.process_inbox_for_resume(&session).await?;
             let messages = session.read_messages().await?;
             let journal_read = session.read_turn_journal().await;
@@ -619,21 +652,10 @@ pub(super) fn spawn_resume_open_worker(
                     None
                 }
             };
-            if let Some(temporary_session_id) = temporary_session_id {
-                match engine.delete_empty_session(&temporary_session_id).await {
-                    Ok(true) => {}
-                    Ok(false) => log::warn!(
-                        target: "session_tui",
-                        "Resume 后临时空 session 未被删除: {temporary_session_id}"
-                    ),
-                    Err(e) => log::warn!(
-                        target: "session_tui",
-                        "Resume 后删除临时空 session 失败 ({temporary_session_id}): {e:#}"
-                    ),
-                }
-            }
             anyhow::Ok(ResumeSessionOutcome {
                 session,
+                runtime_lease,
+                temporary_session_id,
                 inbox_report,
                 last_turns,
                 turn_count,
@@ -908,33 +930,42 @@ fn resume_fallback_journal_warning(
 fn spawn_turn_worker(
     engine: SessionEngine,
     mut session: crate::session::SessionHandle,
+    runtime_lease: crate::session::SessionRuntimeLease,
     input: QueuedInput,
     worker_tx: mpsc::UnboundedSender<WorkerEvent>,
     turn_id: u64,
     control_rx: SessionTurnControlReceiver,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let delegation_runtime_lease = runtime_lease.clone_for_worker();
+        let _runtime_lease = runtime_lease;
         let event_tx = worker_tx.clone();
         let completion_event_tx = worker_tx.clone();
         let text = input.text().to_string();
         let skill_source_text = input.command_text().to_string();
         let attachments = input.attachments().to_vec();
-        let result = engine
-            .run_turn_with_attachments_and_skill_source_controlled(
-                &mut session,
-                text,
-                attachments,
-                Some(skill_source_text),
-                Some(control_rx),
-                move |event| {
-                    let _ = event_tx.send(WorkerEvent::Session {
-                        task_id: Some(turn_id),
-                        event,
-                    });
-                },
-            )
-            .await
-            .map(|_| session);
+        let result = async {
+            engine
+                .bind_delegation_runtime_lease(&session.metadata.id, delegation_runtime_lease)
+                .await?;
+            engine
+                .run_turn_with_attachments_and_skill_source_controlled(
+                    &mut session,
+                    text,
+                    attachments,
+                    Some(skill_source_text),
+                    Some(control_rx),
+                    move |event| {
+                        let _ = event_tx.send(WorkerEvent::Session {
+                            task_id: Some(turn_id),
+                            event,
+                        });
+                    },
+                )
+                .await?;
+            anyhow::Ok(session)
+        }
+        .await;
         match engine.local_claim_count().await {
             Ok(total) => {
                 let _ = completion_event_tx.send(WorkerEvent::Session {
@@ -972,12 +1003,14 @@ pub(super) fn spawn_recap_enqueue_worker(
 fn spawn_user_shell_worker(
     engine: SessionEngine,
     mut session: crate::session::SessionHandle,
+    runtime_lease: crate::session::SessionRuntimeLease,
     command: String,
     worker_tx: mpsc::UnboundedSender<WorkerEvent>,
     task_id: u64,
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
+        let _runtime_lease = runtime_lease;
         let event_tx = worker_tx.clone();
         let result = engine
             .run_user_shell_command(&mut session, command, cancel, move |event| {
@@ -995,10 +1028,12 @@ fn spawn_user_shell_worker(
 fn spawn_compact_worker(
     engine: SessionEngine,
     mut session: crate::session::SessionHandle,
+    runtime_lease: crate::session::SessionRuntimeLease,
     worker_tx: mpsc::UnboundedSender<WorkerEvent>,
     task_id: u64,
 ) {
     tokio::spawn(async move {
+        let _runtime_lease = runtime_lease;
         let event_tx = worker_tx.clone();
         let result = engine
             .compact_session_checkpoint(&mut session, move |event| {
@@ -1021,10 +1056,12 @@ fn spawn_compact_worker(
 fn spawn_inbox_worker(
     engine: SessionEngine,
     session: crate::session::SessionHandle,
+    runtime_lease: crate::session::SessionRuntimeLease,
     worker_tx: mpsc::UnboundedSender<WorkerEvent>,
     task_id: u64,
 ) {
     tokio::spawn(async move {
+        let _runtime_lease = runtime_lease;
         let event_tx = worker_tx.clone();
         let result = engine
             .process_inbox_during_session(&session, move |event| {
@@ -1042,10 +1079,12 @@ fn spawn_inbox_worker(
 fn spawn_finalize_worker(
     engine: SessionEngine,
     mut session: crate::session::SessionHandle,
+    runtime_lease: crate::session::SessionRuntimeLease,
     worker_tx: mpsc::UnboundedSender<WorkerEvent>,
     task_id: u64,
 ) {
     tokio::spawn(async move {
+        let _runtime_lease = runtime_lease;
         let event_tx = worker_tx.clone();
         let result = engine
             .finalize_session(&mut session, move |event| {
@@ -1063,11 +1102,13 @@ fn spawn_finalize_worker(
 fn spawn_finalize_enqueue_worker(
     engine: SessionEngine,
     mut session: crate::session::SessionHandle,
+    runtime_lease: crate::session::SessionRuntimeLease,
     supervisor: crate::supervisor::SupervisorLaunchConfig,
     worker_tx: mpsc::UnboundedSender<WorkerEvent>,
     task_id: u64,
 ) {
     tokio::spawn(async move {
+        let _runtime_lease = runtime_lease;
         match async {
             let event_tx = worker_tx.clone();
             let mut emit = move |event| {

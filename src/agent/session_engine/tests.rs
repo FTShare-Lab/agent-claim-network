@@ -2368,6 +2368,13 @@ async fn resume_keeps_frozen_system_prompt_when_file_edit_authority_changes() {
         .create_with_id_factory(&agent, frozen_prompt, || session_id.clone(), 1)
         .await
         .unwrap();
+    session
+        .append_messages(&[NewSessionMessage::text(
+            SessionMessageRole::User,
+            "previous request",
+        )])
+        .await
+        .unwrap();
     session.mark_closed(Utc::now()).await.unwrap();
     drop(session);
 
@@ -2420,6 +2427,13 @@ async fn disabled_memory_omits_new_prompt_and_tools_but_resume_keeps_frozen_syst
     let frozen_prompt = "frozen system prompt with old memory instructions";
     let mut session = store
         .create_with_id_factory(&agent, frozen_prompt, || session_id.clone(), 1)
+        .await
+        .unwrap();
+    session
+        .append_messages(&[NewSessionMessage::text(
+            SessionMessageRole::User,
+            "previous request",
+        )])
         .await
         .unwrap();
     session.mark_closed(Utc::now()).await.unwrap();
@@ -11317,6 +11331,13 @@ async fn reopen_existing_session_clears_runtime_file_read_state() {
             json!({"path": "note.txt", "show_linenos": false}),
             context.clone(),
         )
+        .await
+        .unwrap();
+    session
+        .append_messages(&[NewSessionMessage::text(
+            SessionMessageRole::User,
+            "previous request",
+        )])
         .await
         .unwrap();
     session.mark_closed(Utc::now()).await.unwrap();

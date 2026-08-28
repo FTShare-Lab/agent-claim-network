@@ -12,6 +12,13 @@ use crate::session::ResumedSessionSummary;
 
 use super::app_event::{AppEvent, AppEventSender};
 
+const ID_COLUMN_WIDTH: usize = 18;
+const CLOSED_AT_COLUMN_WIDTH: usize = 20;
+const STATUS_COLUMN_WIDTH: usize = 11;
+const COLUMN_GAP: &str = "  ";
+const TABLE_FIXED_WIDTH: usize =
+    2 + ID_COLUMN_WIDTH + CLOSED_AT_COLUMN_WIDTH + STATUS_COLUMN_WIDTH + 3 * COLUMN_GAP.len();
+
 pub(super) struct SessionPickerState {
     sessions: Vec<ResumedSessionSummary>,
     selected: usize,
@@ -56,22 +63,30 @@ impl SessionPickerState {
             return lines;
         }
 
-        lines.push(Line::from(
-            "id                 closed_at            status  last_message",
-        ));
+        lines.push(Line::from(format_table_row(
+            " ",
+            "id",
+            "closed_at",
+            "status",
+            "last_message",
+        )));
         for (index, session) in self.sessions.iter().enumerate() {
             let id = session.id.as_str();
             let closed_at = session
                 .closed_at
                 .map(|time| time.format("%Y-%m-%dT%H:%M:%SZ").to_string())
                 .unwrap_or_else(|| "-".into());
-            let status = format!("{:?}", session.status).to_lowercase();
+            let status = match session.status {
+                crate::session::SessionStatus::Open => "Interrupted",
+                crate::session::SessionStatus::Closed => "Closed",
+                crate::session::SessionStatus::Finalizing => "Finalizing",
+            };
             let last_user = truncate_to_width(
                 session.last_user_text.as_deref().unwrap_or(""),
-                table_width.saturating_sub(48),
+                table_width.saturating_sub(TABLE_FIXED_WIDTH),
             );
             let marker = if index == self.selected { "›" } else { " " };
-            let line = format!("{marker} {id:<18} {closed_at:<20} {status:<7} {last_user}");
+            let line = format_table_row(marker, id, &closed_at, status, &last_user);
             let style = if index == self.selected {
                 Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
             } else {
@@ -88,6 +103,22 @@ impl SessionPickerState {
     fn selected(&self) -> usize {
         self.selected
     }
+}
+
+fn format_table_row(
+    marker: &str,
+    id: &str,
+    closed_at: &str,
+    status: &str,
+    last_message: &str,
+) -> String {
+    format!(
+        "{marker} {id:<id_width$}{gap}{closed_at:<closed_at_width$}{gap}{status:<status_width$}{gap}{last_message}",
+        gap = COLUMN_GAP,
+        id_width = ID_COLUMN_WIDTH,
+        closed_at_width = CLOSED_AT_COLUMN_WIDTH,
+        status_width = STATUS_COLUMN_WIDTH,
+    )
 }
 
 fn padded_line(text: String, width: usize, style: Style) -> Line<'static> {
@@ -180,6 +211,53 @@ mod tests {
         assert!(rendered.contains("last_message"));
         assert!(!rendered.contains("last message"));
         assert!(!rendered.contains("+00:00"));
+    }
+
+    #[test]
+    fn picker_header_and_rows_share_column_boundaries() {
+        let header = format_table_row(" ", "id", "closed_at", "status", "last_message");
+        let row = format_table_row("›", "session_aaaaaaaa", "-", "Interrupted", "hello");
+        let display_column = |line: &str, needle: &str| {
+            let byte_index = line.find(needle).unwrap();
+            line[..byte_index].width()
+        };
+
+        assert_eq!(
+            display_column(&header, "id"),
+            display_column(&row, "session_aaaaaaaa")
+        );
+        assert_eq!(
+            display_column(&header, "closed_at"),
+            display_column(&row, "-")
+        );
+        assert_eq!(
+            display_column(&header, "status"),
+            display_column(&row, "Interrupted")
+        );
+        assert_eq!(
+            display_column(&header, "last_message"),
+            display_column(&row, "hello")
+        );
+        assert!(row.contains("Interrupted  hello"));
+    }
+
+    #[test]
+    fn picker_derives_interrupted_label_from_open_status() {
+        let (event_tx, _event_rx) = AppEventSender::channel();
+        let mut interrupted = summary("session_aaaaaaaa");
+        interrupted.status = SessionStatus::Open;
+        interrupted.closed_at = None;
+        let picker = SessionPickerState::new(vec![interrupted], event_tx);
+
+        let rendered = picker
+            .render_inline_lines(100)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Interrupted"));
+        assert!(!rendered.contains("Finalizing"));
     }
 
     #[test]

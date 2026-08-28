@@ -893,7 +893,7 @@ Todo：
 
 选择：AF1。
 
-理由：AO 已拍板只有 `Closed` session 可以 resume，因此失败时回滚 `Open` 会把用户已经退出的session 重新打开，也会重新允许输入和 delegation 创建，不符合 finalize 的收束语义。AF3 会在delegation 未收束时关闭 session，破坏 finalize 的硬收束契约。AF1 让失败可见且状态诚实：这个 session 还没有完成关闭，不能 resume；用户通过 supervisor jobs 和 session event log定位失败。当前版本不提供显式 retry / rescue 入口，后续单独拍板。
+理由：`Finalizing` session 不能 resume，因此失败时回滚 `Open` 会把用户已经退出的session 重新打开，也会重新允许输入和 delegation 创建，不符合 finalize 的收束语义。AF3 会在delegation 未收束时关闭 session，破坏 finalize 的硬收束契约。AF1 让失败可见且状态诚实：这个 session 还没有完成关闭，不能 resume；用户通过 supervisor jobs 和 session event log定位失败，并可用 `acn supervisor retry <session_id>` 重试。
 
 ### AG. 空 session 删除与 delegation 目录
 
@@ -999,12 +999,12 @@ Todo：
 选项：
 
 - AO1：`acn --resume <session_id>` 只允许 `Closed` session，`Open` session 一律早拒绝；picker 与 direct resume 使用同一条可恢复边界。
-- AO2：direct resume 早期 preflight 只拒绝 wrong-agent 和 `Finalizing`；允许 `Closed` 与 crash-open `Open` session 进入 `SessionEngine::reopen_existing_session`，由 engine 统一执行 delegation restore best-effort abandon。
+- AO2：direct resume 早期 preflight 只拒绝 wrong-agent、无效 metadata 和 `Finalizing`；允许 `Closed` 与 crash-open `Open` session 进入 `SessionEngine::reopen_existing_session`。picker 与 engine 通过长生命周期 `runtime.lock` 排除仍被其他进程占用的 session，并由 engine 统一执行 delegation restore best-effort abandon。
 - AO3：把 delegation restore cleanup 挪到 CLI preflight，在构建 engine 前直接操作 store。
 
-选择：AO1。
+选择：AO2。
 
-理由：当前 ACN 没有长生命周期 owner lease / heartbeat / stale 判定。允许 direct `--resume <session_id>` 打开 `Open` session，会留下绕过 picker 的并发占用口子：用户可以在另一个进程中显式恢复一个正在运行的 session，导致 transcript、metadata、delegation restore cleanup 产生竞态。delegation restore cleanup 仍保留在 engine 的 closed resume 路径里，确保正常恢复时 queued/running delegation 会被 best-effort 标成 `abandoned`。crash-open 恢复不在当前拍板内；如果以后要支持，需要先引入 active owner 记录、心跳、stale 判定与显式救援语义。按 T1 修订，finalized `Closed` session 也可以 resume；resume 会清掉 `finalized_at` / `closed_at`，但保留 `recapped_until` 和既有 claim/trace 结果。
+理由：session 运行期持有独立的 OS 文件锁；正常退出或崩溃都会由 drop/操作系统释放，因此不需要 heartbeat 或 stale timeout。列表只把可非阻塞取得 `runtime.lock` 的 `Open` / `Closed` session 作为候选，选择后重新抢锁并在持锁状态下重读 metadata，关闭列表快照到实际打开之间的竞态。`Open` 直接续接，不经过 finalize，也不调用 `mark_open`；`Closed` 仍按既有路径清理上一代 finalize checkpoint 后重新打开。delegation restore cleanup 对两类 resume 都做 best-effort abandon。`Finalizing` 继续交给 supervisor，不能 resume。按 T1 修订，finalized `Closed` session 也可以 resume；resume 会清掉 `finalized_at` / `closed_at`，但保留 `recapped_until` 和既有 claim/trace 结果。
 
 ### AP. append/prepend 读取既有文件失败时的语义
 
@@ -1281,7 +1281,7 @@ Todo：
 
 选择：BK2。
 
-理由：BK1 会在磁盘损坏、权限错误、坏 metadata 等不可自愈问题上无限循环，静默消耗模型和后台资源；BK3 会破坏 `Closed` 的产品契约。BK2 保持状态诚实：queued / stale running 这类可恢复后台任务由 supervisor 自动接续；真正失败且耗尽 attempts 后不再悄悄重试，而是让用户看到明确的 Finalizing 卡点和错误原因。当前实现范围只要求失败可见与状态诚实，不提供自动无限重试，也不提供用户级 retry/re-enqueue 命令。后续若要解卡，需要单独设计 retry / rescue / force-close 等运维入口；只有 finalize 真正成功后，session 才能从 `Finalizing` 进入 `Closed`，随后出现在 resume 边界内。
+理由：BK1 会在磁盘损坏、权限错误、坏 metadata 等不可自愈问题上无限循环，静默消耗模型和后台资源；BK3 会破坏 `Closed` 的产品契约。BK2 保持状态诚实：queued / stale running 这类可恢复后台任务由 supervisor 自动接续；真正失败且耗尽 attempts 后不再悄悄重试，而是让用户看到明确的 Finalizing 卡点和错误原因。当前实现不提供自动无限重试或 force-close；用户可用 `acn supervisor retry <session_id>` 显式重试。只有 finalize 真正成功后，session 才能从 `Finalizing` 进入 `Closed`，随后出现在 resume 边界内。
 
 ### BL. 公开层统一使用 subagent 命名
 

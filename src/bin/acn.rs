@@ -438,7 +438,14 @@ fn direct_resume_metadata_failure(
             metadata.agent_id, expected_agent_id
         ));
     }
-    if metadata.status != SessionStatus::Closed {
+    if metadata.status == SessionStatus::Open
+        && (metadata.closed_at.is_some() || metadata.finalized_at.is_some())
+    {
+        return Some(format!(
+            "Resume failed: Session {session_id} has inconsistent Open metadata.\n"
+        ));
+    }
+    if !matches!(metadata.status, SessionStatus::Open | SessionStatus::Closed) {
         return Some(direct_resume_not_closed_message(
             session_id,
             metadata.status,
@@ -449,7 +456,7 @@ fn direct_resume_metadata_failure(
 
 fn direct_resume_not_closed_message(session_id: &SessionId, status: SessionStatus) -> String {
     format!(
-        "Resume failed: You can only resume Closed sessions.\nSession {session_id} current status: {}.\n",
+        "Resume failed: You can only resume Open or Closed sessions.\nSession {session_id} current status: {}.\n",
         session_status_label(status)
     )
 }
@@ -2676,12 +2683,12 @@ api_key_env = "UNUSED_TEST_LLM_KEY"
     }
 
     #[test]
-    fn direct_resume_rejects_non_closed_session_with_terminal_message() {
+    fn direct_resume_rejects_finalizing_session_with_terminal_message() {
         let session_id = SessionId::from_str("session_1234abcd").unwrap();
 
         assert_eq!(
             super::direct_resume_not_closed_message(&session_id, SessionStatus::Finalizing),
-            "Resume failed: You can only resume Closed sessions.\nSession session_1234abcd current status: Finalizing.\n"
+            "Resume failed: You can only resume Open or Closed sessions.\nSession session_1234abcd current status: Finalizing.\n"
         );
     }
 
@@ -2717,15 +2724,13 @@ api_key_env = "UNUSED_TEST_LLM_KEY"
     }
 
     #[test]
-    fn direct_resume_metadata_failure_allows_only_closed_sessions() {
+    fn direct_resume_metadata_failure_allows_consistent_open_and_closed_sessions() {
         let agent = AgentId::new("agent-a").unwrap();
         let session_id = SessionId::from_str("session_1234abcd").unwrap();
         let metadata =
             test_session_metadata(agent.clone(), session_id.clone(), SessionStatus::Open);
 
-        let failure = super::direct_resume_metadata_failure(&agent, &session_id, &metadata)
-            .expect("open direct resume should be rejected");
-        assert!(failure.contains("You can only resume Closed sessions"));
+        assert!(super::direct_resume_metadata_failure(&agent, &session_id, &metadata).is_none());
 
         let metadata =
             test_session_metadata(agent.clone(), session_id.clone(), SessionStatus::Closed);
@@ -2735,7 +2740,7 @@ api_key_env = "UNUSED_TEST_LLM_KEY"
             test_session_metadata(agent.clone(), session_id.clone(), SessionStatus::Finalizing);
         let failure = super::direct_resume_metadata_failure(&agent, &session_id, &metadata)
             .expect("finalizing direct resume should be rejected");
-        assert!(failure.contains("You can only resume Closed sessions"));
+        assert!(failure.contains("You can only resume Open or Closed sessions"));
         let mut metadata =
             test_session_metadata(agent.clone(), session_id.clone(), SessionStatus::Closed);
         metadata.finalized_at = Some(metadata.updated_at);
@@ -2747,7 +2752,7 @@ api_key_env = "UNUSED_TEST_LLM_KEY"
         metadata.finalized_at = Some(metadata.updated_at);
         let failure = super::direct_resume_metadata_failure(&agent, &session_id, &metadata)
             .expect("open finalized metadata should be rejected");
-        assert!(failure.contains("You can only resume Closed sessions"));
+        assert!(failure.contains("inconsistent Open metadata"));
     }
 
     #[test]

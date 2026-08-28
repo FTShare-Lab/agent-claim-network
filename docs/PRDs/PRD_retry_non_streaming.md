@@ -2,6 +2,8 @@
 
 > 状态：已实现。本文保留 provider request 级 fallback、journal 与 TUI 语义。
 
+> 后续变更：本文实施时记录的 “Closed-only resume” 边界已由 `PRD_interrupted_session_resume.md` 取代。未占用的 crash-open `Open` session 现在可以恢复；本文拍板的“不自动续跑 fallback、不补工具结果、只恢复 journal 现场”语义保持不变。
+
 ## 1. 背景与目标
 
 ACN 的交互式 session 默认通过流式请求展示 assistant 文本。当前 provider 在尚未产生可见输出时可以按既有策略重试，但一旦已经向 TUI 发出 assistant delta，流式连接中途失败就会直接令整个 turn 失败。
@@ -81,7 +83,7 @@ ACN 的交互式 session 默认通过流式请求展示 assistant 文本。当�
 
 ### 3.5 Resume
 
-Resume 只恢复历史现场，不自动重新发起 LLM 请求。以下“正常 TUI resume”均指 session 已经按既有流程成为 `Closed`（例如失败后用户 `/exit`）；本需求不改变项目既有的 Closed-only resume 准入策略。
+Resume 只恢复历史现场，不自动重新发起 LLM 请求。本文实施时通过已经按既有流程成为 `Closed` 的 session 验收；后续异常退出恢复能力也允许未占用的 crash-open `Open` session 进入同一套静态恢复语义。
 
 #### 非流式 5 次全部失败
 
@@ -105,7 +107,7 @@ turn interrupted during non-streaming fallback (attempt N/5)
 
 若最后落盘的是 attempt failed、但还未开始下一次尝试，则显示该次失败已发生，并仍将整个 turn 视为中断现场，而不是“5 次已经耗尽”。恢复上下文将该 turn 标记为 `interrupted`；不自动续跑剩余次数。
 
-进程硬退出会遗留 `Open` session，受当前全局 Closed-only resume 策略限制，以上中断投影暂不能通过正常 resume picker 或 `--resume <id>` 进入。本需求保证 journal 的状态和投影正确，但不实现 stale/Open session takeover 或恢复入口。
+进程硬退出会遗留 `Open` session。后续 `runtime.lock` 恢复入口允许它在原进程不再占用时通过 resume picker 或 `--resume <id>` 进入；仍只静态恢复以上中断投影，不自动续跑剩余 fallback 次数。
 
 #### Fallback 已成功、但 turn 后续失败
 
@@ -120,7 +122,7 @@ turn interrupted during non-streaming fallback (attempt N/5)
 - 不清除最终失败 turn 的 partial。
 - 不重试用户 cancel/steer。
 - 不为旧版 `turn_events.jsonl` 产物增加迁移或兼容分支；旧文件没有新事件时继续走既有泛化恢复语义即可。
-- 不改变正常 TUI 仅恢复 `Closed` session 的全局策略，也不实现硬退出后 `Open` session 的 stale recovery / takeover。
+- 本 provider fallback 需求本身不实现 session owner 判定；后续由独立的 `runtime.lock` 恢复能力承接 crash-open `Open` session。
 
 ## 5. 分阶段实现
 
@@ -167,4 +169,4 @@ turn interrupted during non-streaming fallback (attempt N/5)
 
 ## 7. 完成状态
 
-阶段 A–D 已完成，实现与第 3 节的产品语义一致。单元测试、集成测试、真实 LLM TUI smoke test以及 `cargo fmt --check`、`cargo clippy -- -D warnings`、`cargo test`、`cargo check` 均已通过。进程硬退出时的 fallback 中断状态可由 journal/recovery projection 正确表达；受既有Closed-only resume 策略限制，Open session 的正常 TUI takeover 不在本需求范围内。
+阶段 A–D 已完成，实现与第 3 节的 provider fallback 产品语义一致。单元测试、集成测试、真实 LLM TUI smoke test以及 `cargo fmt --check`、`cargo clippy -- -D warnings`、`cargo test`、`cargo check` 均已通过。进程硬退出时的 fallback 中断状态可由 journal/recovery projection 正确表达；后续异常退出恢复入口使未占用的 Open session 也能进入该投影，但仍不会自动重试。

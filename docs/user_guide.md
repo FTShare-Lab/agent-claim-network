@@ -163,6 +163,8 @@ acn --config /path/to/config.toml --upstream team --cd /path/to/workspace
 acn --resume
 ```
 
+仍被其他 ACN 进程占用的 session 不会出现在 resume 列表中，`Finalizing` session 需等待 supervisor 完成后 resume，finalize 失败时使用 `acn supervisor retry <session_id>` 重试。
+
 ## TUI 交互
 
 直接输入任务并按 `Enter`。`Shift+Enter` 插入换行；流式生成或工具执行期间，`Ctrl+Enter` 会把不带附件、不会被识别为命令的普通文本作为 steer，在安全边界交给当前 turn。带附件的输入会进入普通队列。

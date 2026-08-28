@@ -8,6 +8,7 @@
 - [Prompt Cache 前缀稳定性修复](PRD_fix_cache_hit.md)
 - [Provider Request 前统一压缩](PRD_compact_in_turn.md)
 - [Turn Journal 与 Mid-Turn 恢复](PRD_turn2message.md)
+- [异常退出 Session 恢复](PRD_interrupted_session_resume.md)
 - [流式失败回退非流式重试](PRD_retry_non_streaming.md)
 - [Finalize Supervisor](PRD_finalize_supervisor.md)
 - [Session Auto Cleanup](PRD_auto_cleanup.md)
