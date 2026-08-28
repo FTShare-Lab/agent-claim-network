@@ -240,8 +240,6 @@ def load_config(path: Path) -> AutomatedRunConfig:
             raise AutomatedRunError(
                 "正式运行必须使用 harness_mode=standard 和 model_egress_mode=pier"
             )
-        if not file_edit_authority_enabled:
-            raise AutomatedRunError("正式运行必须启用 file_edit_authority_enabled")
         if acn_main_revision != FORMAL_ACN_MAIN_REVISION or acn_version != FORMAL_ACN_VERSION:
             raise AutomatedRunError(
                 "正式运行必须锚定 "

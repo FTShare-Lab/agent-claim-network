@@ -106,15 +106,21 @@ class AutomatedRunTests(unittest.TestCase):
             with self.assertRaisesRegex(AutomatedRunError, "credential"):
                 load_config(path)
 
-    def test_formal_config_requires_file_edit_authority(self) -> None:
+    def test_formal_config_accepts_disabled_file_edit_authority(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = write_config(
                 Path(directory),
                 run_class="formal",
                 file_edit_authority_enabled=False,
+                host_capacity={
+                    "memory_reserve_mb": 1024,
+                    "disk_reserve_mb": 1024,
+                    "disk_admission_mb_per_worker": 8192,
+                },
             )
-            with self.assertRaisesRegex(AutomatedRunError, "file_edit_authority_enabled"):
-                load_config(path)
+            config = load_config(path)
+
+        self.assertFalse(config.file_edit_authority_enabled)
 
     def test_formal_config_requires_transient_docker_budget_per_worker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

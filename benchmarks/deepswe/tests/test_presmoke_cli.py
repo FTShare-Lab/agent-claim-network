@@ -474,15 +474,17 @@ class PresmokeCliTests(unittest.TestCase):
             with self.assertRaisesRegex(PresmokeCliError, "reasoning_effort"):
                 load_config(config_path)
 
-    def test_formal_config_requires_file_edit_authority(self) -> None:
+    def test_formal_config_accepts_disabled_file_edit_authority(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = write_fixture(Path(directory))
             raw = json.loads(config_path.read_text(encoding="utf-8"))
             raw["run_class"] = "formal"
             raw["file_edit_authority_enabled"] = False
+            raw["host_capacity"]["disk_admission_mb_per_worker"] = 8192
             config_path.write_text(json.dumps(raw), encoding="utf-8")
-            with self.assertRaisesRegex(PresmokeCliError, "file_edit_authority_enabled"):
-                load_config(config_path)
+            config = load_config(config_path)
+
+        self.assertFalse(config.file_edit_authority_enabled)
 
     def test_formal_config_requires_transient_docker_budget_per_worker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
