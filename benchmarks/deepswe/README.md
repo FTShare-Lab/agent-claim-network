@@ -32,8 +32,12 @@ token 计量由 `acn_eval` 自己从上游响应的 `usage` 累计，写进 `res
 模型在发出 tool call 前被截断，attempt 直接失败。
 官方 `mini-swe-agent` 不设 output cap，本 runner 默认给 65536。
 
-四臂注入同一份冻结 `assets/coding-benchmark/SKILL.md`（hash 写入 manifest），路径为
-`/logs/agent/runtime/skills/coding-benchmark`。评测生成的 `acn.toml` 将
+`harness_mode` 会随运行配置与每个 attempt 一起冻结。`standard` 四臂注入同一份
+`assets/coding-benchmark/SKILL.md`（hash 写入 manifest），路径为
+`/logs/agent/runtime/skills/coding-benchmark`；`minimal` 四臂改用精简 system/task prompt，只保留
+`code_run`、托管进程、claim/router 与提交工具，不加载 skill、文件工具、working note 或 `ACN.md`。
+两种 harness 都可用于正式对照，但正式运行仍强制 `model_egress_mode="pier"`，不能用 direct egress。
+评测生成的 `acn.toml` 将
 `max_parallel_tool_calls` 设为 `5`、`file_diff_max_changed_lines` 设为 `200`；
 `code_run` 观察窗口仍用产品内部护栏，不开放 TOML。A-only 短评测 prompt 与提交纪律的决策记录见
 [reports/a-only-minimal-harness-adjustments-20260820.md](reports/a-only-minimal-harness-adjustments-20260820.md)。

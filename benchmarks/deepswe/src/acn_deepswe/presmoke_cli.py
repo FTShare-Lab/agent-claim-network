@@ -402,8 +402,8 @@ def load_config(path: Path) -> PresmokeConfig:
     )
     pier_egress_proxy_image = _nonempty_string(raw, "pier_egress_proxy_image")
     pier_egress_proxy_content_digest = _content_digest(raw, "pier_egress_proxy_content_digest")
-    if run_class == "formal" and (harness_mode != "standard" or model_egress_mode != "pier"):
-        raise PresmokeCliError("正式运行必须使用 harness_mode=standard 和 model_egress_mode=pier")
+    if run_class == "formal" and model_egress_mode != "pier":
+        raise PresmokeCliError("正式运行必须使用 model_egress_mode=pier")
     if run_class == "formal" and (
         acn_main_revision != FORMAL_ACN_MAIN_REVISION or acn_version != FORMAL_ACN_VERSION
     ):

@@ -236,10 +236,8 @@ def load_config(path: Path) -> AutomatedRunConfig:
     pier_egress_proxy_content_digest = _content_digest(raw, "pier_egress_proxy_content_digest")
     image_fingerprint = _optional_fingerprint(raw.get("reuse_local_agent_image_fingerprint"))
     if run_class == "formal":
-        if harness_mode != "standard" or model_egress_mode != "pier":
-            raise AutomatedRunError(
-                "正式运行必须使用 harness_mode=standard 和 model_egress_mode=pier"
-            )
+        if model_egress_mode != "pier":
+            raise AutomatedRunError("正式运行必须使用 model_egress_mode=pier")
         if acn_main_revision != FORMAL_ACN_MAIN_REVISION or acn_version != FORMAL_ACN_VERSION:
             raise AutomatedRunError(
                 "正式运行必须锚定 "

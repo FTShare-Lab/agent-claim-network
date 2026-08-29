@@ -486,6 +486,40 @@ class PresmokeCliTests(unittest.TestCase):
 
         self.assertFalse(config.file_edit_authority_enabled)
 
+    def test_formal_config_accepts_minimal_harness_with_pier_egress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw.update(
+                {
+                    "run_class": "formal",
+                    "harness_mode": "minimal",
+                    "model_egress_mode": "pier",
+                }
+            )
+            raw["host_capacity"]["disk_admission_mb_per_worker"] = 8192
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            config = load_config(config_path)
+
+        self.assertEqual(config.harness_mode, "minimal")
+        self.assertEqual(config.model_egress_mode, "pier")
+
+    def test_formal_minimal_config_rejects_direct_model_egress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw.update(
+                {
+                    "run_class": "formal",
+                    "harness_mode": "minimal",
+                    "model_egress_mode": "direct",
+                }
+            )
+            raw["host_capacity"]["disk_admission_mb_per_worker"] = 8192
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(PresmokeCliError, "model_egress_mode=pier"):
+                load_config(config_path)
+
     def test_formal_config_requires_transient_docker_budget_per_worker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = write_fixture(Path(directory))

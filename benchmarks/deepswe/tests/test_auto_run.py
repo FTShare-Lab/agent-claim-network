@@ -122,6 +122,40 @@ class AutomatedRunTests(unittest.TestCase):
 
         self.assertFalse(config.file_edit_authority_enabled)
 
+    def test_formal_config_accepts_minimal_harness_with_pier_egress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_config(
+                Path(directory),
+                run_class="formal",
+                harness_mode="minimal",
+                model_egress_mode="pier",
+                host_capacity={
+                    "memory_reserve_mb": 1024,
+                    "disk_reserve_mb": 1024,
+                    "disk_admission_mb_per_worker": 8192,
+                },
+            )
+            config = load_config(path)
+
+        self.assertEqual(config.harness_mode, "minimal")
+        self.assertEqual(config.model_egress_mode, "pier")
+
+    def test_formal_minimal_config_rejects_direct_model_egress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_config(
+                Path(directory),
+                run_class="formal",
+                harness_mode="minimal",
+                model_egress_mode="direct",
+                host_capacity={
+                    "memory_reserve_mb": 1024,
+                    "disk_reserve_mb": 1024,
+                    "disk_admission_mb_per_worker": 8192,
+                },
+            )
+            with self.assertRaisesRegex(AutomatedRunError, "model_egress_mode=pier"):
+                load_config(path)
+
     def test_formal_config_requires_transient_docker_budget_per_worker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = write_config(Path(directory), run_class="formal")
