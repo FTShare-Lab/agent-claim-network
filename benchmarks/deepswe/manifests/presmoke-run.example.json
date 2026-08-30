@@ -24,6 +24,7 @@
   "task_workers": 20,
   "cleanup_stale_pier_resources": true,
   "run_all_variants_without_claims": true,
+  "claim_producer_variant": "A",
   "progress": {
     "poll_secs": 30,
     "stall_after_secs": 600

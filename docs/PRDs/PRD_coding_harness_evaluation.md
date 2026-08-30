@@ -137,30 +137,38 @@ provenance。
 | --- | --- | --- | --- |
 | 历史 Memory / Session | 空 | 空 | 空 | 空 |
 | 初始本地 Claim | 空 | 空 | 空 | 空 |
-| Router | 进程内空 bundle | 进程内空 bundle | 进程内只读 bundle，仅含 A 本题 freeze barrier 前的 claim | 同 `B_claim` |
+| Router | 进程内空 bundle | 进程内空 bundle | 进程内只读 bundle，仅含配置选定的 A 或 B_empty 本题 freeze barrier 前 claim | 同 `B_claim` |
 | 首轮任务上下文 | 无 claim | 无 claim | 无 claim（模型自主调用 `consult_router`） | 同一冻结 router 查询所得完整 claim；明确标为需独立验证的前序信息 |
-| A 的 workspace / patch / log / trace | 自身运行可见 | 不可见 | 不可见 | 不可见 |
+| 另一个 producer 的 workspace / patch / log / trace | 不可见 | 不可见 | 不可见 | 不可见 |
 | 运行中团队数据变化 | 不读取历史 claim | 禁止 | 禁止；开始前生成只读快照 | 禁止；开始前生成只读快照 |
 
-A 完成并退出后，由宿主写入不可变 freeze barrier；claim 资格检查只采信 barrier 前的宿主事件
-账本，不采信 claim 文件自报的时间或 attempt id。只要快照非空，两个带 claim 的 B 臂就使用通过检查的只读
-快照；A 是否通过 verifier 不影响 claim 是否可被注入。B 运行期间不得继续接收 A 的新 claim、policy
-或 dispute 更新。
+A 与 B_empty 从 pristine workspace 并行完成后，宿主分别写入不可变 freeze barrier；claim 资格检查只采信
+各自 barrier 前的宿主事件账本，不采信 claim 文件自报的时间或 attempt id。冻结配置通过
+`claim_producer_variant=A|B_empty` 预先绑定两个带 claim B 臂的唯一来源。只要选定快照非空，两个 consumer
+就使用通过检查的只读快照；producer 是否通过 verifier 不影响 claim 是否可被注入。consumer 运行期间不得
+继续接收 producer 的新 claim、policy 或 dispute 更新。
+
+自动化全量可选用自适应两阶段。此时物理 A / B_empty 仅作为对称候选 S1 / S2；两者在同一
+冻结 task 集合上全部结束后，按预注册的全量 verifier 通过数、F2P micro、完全平局选 S1
+依次排序。胜者整体重标为逻辑 A，败者整体重标为逻辑 B_empty，再让两个 claim consumer
+读取胜者的逐题 bundle。禁止逐题挑选、按 claim 是否非空挑选或让 consumer 结果反向影响选择。
+该模式的逻辑 A 是两次 producer 的最大值，因此报告必须保留物理臂与选择分数，且不能把它
+替代固定 producer 实验来宣称无选择偏差的因果效果。
 
 ### 3.3.1 成功效率与失败恢复的分层
 
-每题先运行 A，再从 pristine workspace 启动 B。A 的 verifier 结果只决定统计分层，不决定
-两个带 claim 的 B 臂是否启动：
+每题先并行运行 A 与 B_empty，再从 pristine workspace 并行启动两个 claim consumer。配置选定 producer
+的 verifier 结果只决定统计分层，不决定两个带 claim 的 B 臂是否启动：
 
 | 分层 | 入组条件 | B 臂 | 主要问题 |
 | --- | --- | --- | --- |
-| `success_efficiency` | A verifier 通过，且 freeze snapshot 非空 | `B_empty`、`B_claim`、`B_forced_claim` | 分别测量自主检索与强制交付的 claim 能否减少 agent step、成功响应观测 token 和耗时，同时维持完成质量？ |
-| `failure_recovery` | A verifier 未通过，且 freeze snapshot 非空 | `B_empty`、`B_claim`、`B_forced_claim` | 失败中的观察、已排除路径和测试结果能否让两个 claim 臂比干净重试更常通过 verifier？ |
-| `unpaired_no_claim` | freeze snapshot 为空 | 仅 `B_empty` | 记录 claim 产出覆盖率，不进入 claim 对照统计。 |
+| `success_efficiency` | 选定 producer verifier 通过，且 freeze snapshot 非空 | `B_claim`、`B_forced_claim` | 自主检索与强制交付的 claim 能否维持质量并降低 agent step、请求、观测 token 或耗时？ |
+| `failure_recovery` | 选定 producer verifier 未通过，且 freeze snapshot 非空 | `B_claim`、`B_forced_claim` | 失败中的观察、已排除路径和测试结果能否让 claim consumer 比 producer 更常通过 verifier？ |
+| `unpaired_no_claim` | 选定 producer freeze snapshot 为空 | 无 claim consumer（除非显式开启空 bundle 对照） | 记录 claim 产出覆盖率，不进入 claim 对照统计。 |
 
-失败 claim 不被当作已验证事实：它们只能作为带 provenance 的冻结观察供 B 自主判断。B 不得获得
-A 的 patch、workspace、session、trace 或日志，因此失败恢复衡量的是 ACN 外化 claim 的价值，而非
-续跑 A 的工作区。
+失败 claim 不被当作已验证事实：它们只能作为带 provenance 的冻结观察供 consumer 自主判断。consumer
+不得获得 producer 的 patch、workspace、session、trace 或日志，因此失败恢复衡量的是 ACN 外化 claim
+的价值，而非续跑 producer 的工作区。
 
 ### 3.4 每次运行必须落盘
 

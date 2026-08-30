@@ -4,7 +4,11 @@
 
 复制 [automated-run.example.json](manifests/automated-run.example.json) 到仓库外的绝对路径，并填写本机 checkout、`acn_eval` 和 run root。配置中禁止 key；外部启动器必须沿用已有的 `ACN_EVAL_UPSTREAM_KEY`，同时提供 `ACN_EVAL_UPSTREAM_BASE_URL`。`model` 是路由别名，`response_model` 必须填写上游实际回显的 checkpoint；当前模板分别为 `deepseek-v4-flash-local-exp` 和 `deepseek-v4-flash`。
 
-正式模板锚定产品提交 `9b818d70ddfad2f7d5e1972577dd294b19481c92`（v0.2.5），只接受基于该提交的干净评测 HEAD；`acn_eval --build-info-json` 还必须与 HEAD 和 v0.2.5 一致。20 个 `task_workers` 配合每题 2 CPU / 16 GiB，另预留 64 GiB 宿主内存；真实执行前会要求至少 40 CPU 和 384 GiB 可用内存。磁盘门禁为 64 GiB 固定余量加每 worker 4 GiB admission，即至少 144 GiB 可用空间。资源不足会直接退出，不会降低并发或启动部分任务。
+正式模板锚定产品提交 `9b818d70ddfad2f7d5e1972577dd294b19481c92`（v0.2.5），只接受基于该提交的干净评测 HEAD；`acn_eval --build-info-json` 还必须与 HEAD 和 v0.2.5 一致。每题按 `A + B_empty` producer wave、`B_claim + B_forced_claim` consumer wave 执行；共享 semaphore 保证 20 个 `task_workers` 表示全机最多 20 个活跃 Pier/Docker attempt，而不是题内并行后变成 40。配合每 attempt 2 CPU / 16 GiB，另预留 64 GiB 宿主内存；真实执行前会要求至少 40 CPU 和 384 GiB 可用内存。磁盘门禁为 64 GiB 固定余量加每 worker 8 GiB admission，即至少 224 GiB 可用空间。资源不足会直接退出，不会降低并发或启动部分任务。
+
+固定四臂仍可用 `"claim_producer_variant": "A"` 或 `"B_empty"` 预先指定 claim 来源。自适应全量模式则设置 `"adaptive_producer_selection": true`、`"claim_producer_variant": "adaptive"` 和 `"smoke_size": 0`：第一阶段在同一 113 题上运行两个对称候选 `S1=A`、`S2=B_empty`，二者都完成后才按预注册的“全量 verifier 通过数、F2P micro、完全平局选 S1”规则产生 `producer-selection.json`；高者重标为逻辑 A，低者重标为逻辑 B_empty。第二阶段只挂载胜者的逐题不可变 bundle，并行运行 `B_claim` 与 `B_forced_claim`。选择是全局一次性的，禁止逐题挑臂或只筛成功题。
+
+自适应模式回答“把同配置两次独立 producer 中表现更好的整臂作为知识来源后，claim consumer 的表现如何”，不替代预先固定 producer 的因果对照。由于逻辑 A 是两次运行的最大值，这一基线本身带有 winner-selection 优势；报告必须同时保留 `S1` / `S2` 物理标签、选择分数与逻辑四臂标签。
 
 正式运行持有全机 Docker 锁，拒绝与其他容器任务共享 daemon。模板开启的清理只删除已停止且带 Pier Compose 配置证据的容器，以及 Pier trial verifier/egress 和有 Compose 所有权证据的生成镜像；`hb__*`、官方 `public.ecr.*` 任务镜像、配置明确保护的共享 egress proxy 镜像与无关镜像不在删除集合。共享 proxy 的 image ID 必须与配置中的 content digest 完全一致，并写入清理证据。任务启动前及缺失镜像拉取后都会复查磁盘高水位。
 

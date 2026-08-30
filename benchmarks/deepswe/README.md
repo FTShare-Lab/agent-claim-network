@@ -1,8 +1,14 @@
 # ACN DeepSWE runner
 
-在冻结的 DeepSWE / Pier revision 上跑 ACN 的 DeepSWE 四臂实验：每题 `A`（产 claim）→ freeze barrier →
-`B_empty` / `B_claim` / `B_forced_claim`。`B_claim` 评估模型自主检索 claim 的真实端到端路径，
+在冻结的 DeepSWE / Pier revision 上跑 ACN 的 DeepSWE 四臂实验：每题先并行运行独立的
+`A` / `B_empty` producer wave、分别冻结 claim，再并行运行 `B_claim` / `B_forced_claim`
+consumer wave。`claim_producer_variant` 明确选择后两臂消费 `A` 或 `B_empty` 的 bundle。
+`B_claim` 评估模型自主检索 claim 的真实端到端路径，
 `B_forced_claim` 是强制提供同一冻结 claim 的受控对照，主比较是两者分别相对 `B_empty` 的差异。
+
+自动化 runner 还支持全量自适应两阶段：先把物理 `A` / `B_empty` 作为对称的 `S1` / `S2`
+跑完整套任务，再按冻结规则选出唯一全局胜者并重标为逻辑 A；随后才运行两个 claim consumer。
+该模式不会逐题拼接两个 producer，也不会让 claim 阶段参与 producer 选择。
 
 ## 与官方口径的关系
 
@@ -46,7 +52,8 @@ token 计量由 `acn_eval` 自己从上游响应的 `usage` 累计，写进 `res
 容器 attempt TOML 固定
 `workspace_root=/app`、`runtime_root=/logs/agent/runtime`、`output_dir=/logs/agent/evaluation`、
 `acn_config=/opt/acn-eval/acn.toml`；`B_claim` 和 `B_forced_claim` 设置
-`claim_bundle=/opt/acn-eval/claims.json`，A / B_empty 容器中不存在该文件。前者只在模型调用
+`claim_bundle=/opt/acn-eval/claims.json`，A / B_empty 容器中不存在该文件；该路径挂载的是
+`claim_producer_variant` 绑定的不可变 bundle。前者只在模型调用
 `consult_router` 时取得 claim；后者启动时通过相同 router 检索，并把返回的完整 claim 放入首轮任务上下文。
 
 ACN 不把任意“模型不再调用工具”当作完成。evaluation profile 额外暴露无参数的 `submit_task`；模型完成
@@ -115,14 +122,21 @@ PYTHONPATH=benchmarks/deepswe/src python -m acn_deepswe.presmoke_cli \
 或环境时用 `--read-key-stdin` 按提示隐藏输入；它只在真实执行且环境无该变量时读取，dry-run
 不读，已有环境值优先，进程退出时清除。
 
-冻结 manifest 中的每题独立执行 `A → freeze → B_empty/B_claim/B_forced_claim`，并以 `task_workers` 限制题间
-并发；同一题内部保持串行，`max_retries=0`。启动配置的
-`run_all_variants_without_claims=true` 会要求每题实际执行四臂：若 A 没有 eligible claim，freeze barrier
+冻结 manifest 中的每题按两个 barrier wave 执行：`A + B_empty` 并行，二者完成并分别 freeze 后，
+`B_claim + B_forced_claim` 并行。共享 attempt semaphore 以 `task_workers` 限制全机实际活跃
+Pier/Docker attempt 数，不会因题内并行把 20 放大成 40；`max_retries=0`。启动配置的
+`run_all_variants_without_claims=true` 会要求每题实际执行四臂：若选定 producer 没有 eligible claim，freeze barrier
 仍产出可审计的空 bundle，两个带 claim 的 B 臂照常执行并记录 `EMPTY_CLAIM_BUNDLE`，绝不伪造或借用其他题的
 claim。未开启该开关时才保留历史的“两个带 claim B 臂不适用”行为。基础设施或 Gate 失败会以非零退出，但不会自动重试
 solve。输出 aggregate manifest 在
 `output_dir/presmoke-aggregate.json`，各题 manifest、jobs 与 claim bundle 在
-`output_dir/tasks/<task>/`。
+`output_dir/tasks/<task>/`。A 与 B_empty 的冻结文件分别是 `claims.json` 和
+`claims-b-empty.json`，manifest 同时绑定两个 hash、claim id 集合和最终选定 producer。
+
+自适应模式使用 `adaptive_producer_selection=true`、`claim_producer_variant=adaptive`、
+`smoke_size=0`。自动编排目录为 `producers/` 与 `consumers/`，两阶段之间冻结
+`producer-selection.json`；排序依次使用全量 verifier 通过数、F2P micro，完全相同则选 S1。
+consumer task manifest 会记录物理臂到逻辑四臂的映射，汇总统计按逻辑 A/B_empty 展示。
 
 真实执行在创建任何 attempt 目录前硬性检查：`pier` 必须是其 venv 的 `bin/pier`，且
 该 venv 的 PEP 610 `direct_url` 必须以 editable 方式明确指向 frozen Pier checkout；两份

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import secrets
+import threading
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -101,6 +102,9 @@ class PresmokeHostRunner:
         self.completion_manifest_path = completion_manifest_path
         self._completed_task_results = completed_task_results
         self._validate_specs()
+        # 每题内部有两个并行 arm；共享 semaphore 保证全机活跃 Pier attempt
+        # 仍不超过用户配置的 task_workers，而不是把 20 静默放大成 40。
+        self._attempt_semaphore = threading.BoundedSemaphore(task_workers)
         self._task_runner_factory = task_runner_factory or self._build_task_runner
 
     def run(self, *, execute: bool = False) -> tuple[PresmokeTaskResult, ...]:
@@ -159,13 +163,15 @@ class PresmokeHostRunner:
     def _ordered_results(
         self, results: dict[str, PresmokeTaskResult]
     ) -> tuple[PresmokeTaskResult, ...]:
-        return tuple(
-            results[task_id] for task_id in self.frozen_task_ids if task_id in results
-        )
+        return tuple(results[task_id] for task_id in self.frozen_task_ids if task_id in results)
 
-    @staticmethod
-    def _build_task_runner(spec: PresmokeTaskSpec) -> Task1HostRunner:
-        return Task1HostRunner(spec.experiment, spec.jobs_directory, spec.execution)
+    def _build_task_runner(self, spec: PresmokeTaskSpec) -> Task1HostRunner:
+        return Task1HostRunner(
+            spec.experiment,
+            spec.jobs_directory,
+            spec.execution,
+            attempt_semaphore=self._attempt_semaphore,
+        )
 
     def _validate_specs(self) -> None:
         expected = self.frozen_task_ids
@@ -194,9 +200,7 @@ class PresmokeHostRunner:
             if len(attempts) != 4 or any(attempt.task_id != spec.task_id for attempt in attempts):
                 raise ValueError(f"task {spec.task_id} 必须拥有独立的四臂 ExperimentManifest")
             variants = tuple(attempt.variant for attempt in attempts)
-            if variants[0] != "A" or set(variants[1:]) != {
-                "B_empty", "B_claim", "B_forced_claim"
-            }:
+            if variants[0] != "A" or set(variants[1:]) != {"B_empty", "B_claim", "B_forced_claim"}:
                 raise ValueError(
                     f"task {spec.task_id} 四臂必须是 A 后接 B_empty/B_claim/B_forced_claim"
                 )
@@ -236,7 +240,9 @@ class PresmokeHostRunner:
             "status": "completed" if len(terminal) == len(self.frozen_task_ids) else "in_progress",
             "task_order": list(self.frozen_task_ids),
             # 保留旧字段，供已有只读归档继续识别完整、Gate 通过的 task。
-            "completed_tasks": [result.to_dict() for result in terminal if result.status == "passed"],
+            "completed_tasks": [
+                result.to_dict() for result in terminal if result.status == "passed"
+            ],
             "task_results": [result.to_dict() for result in terminal],
             "interrupted_retries": dict(interrupted_retries),
         }
@@ -251,6 +257,15 @@ class PresmokeHostRunner:
             status = "completed_with_no_eligible_claim"
         else:
             status = "passed"
+        cohort_metrics = _cohort_metrics(results)
+        producer_variants = sorted(
+            {
+                row["claim_producer_variant"]
+                for row in cohort_metrics.values()
+                if isinstance(row, Mapping)
+                and row.get("claim_producer_variant") in {"A", "B_empty"}
+            }
+        )
         payload = {
             "schema_version": 1,
             "status": status,
@@ -258,24 +273,28 @@ class PresmokeHostRunner:
             "task_order": list(self.frozen_task_ids),
             "task_results": [result.to_dict() for result in results],
             "claim_funnel": _claim_funnel(results),
-            "cohort_metrics": _cohort_metrics(results),
+            "claim_producer_variants": producer_variants,
+            "cohort_metrics": cohort_metrics,
             "cohort_definitions": {
                 "success_efficiency": (
-                    "A verifier passed and A produced at least one frozen claim; "
+                    "selected producer verifier passed and produced at least one frozen claim; "
                     "primary cohort for claim-assisted success and efficiency comparisons"
                 ),
                 "failure_recovery": (
-                    "A verifier failed but A produced at least one frozen claim; "
+                    "selected producer verifier failed but produced at least one frozen claim; "
                     "reported separately as recovery from unverified producer output"
                 ),
-                "unpaired_no_claim": "A produced no frozen claim; claim arms are not paired",
+                "unpaired_no_claim": (
+                    "selected producer produced no frozen claim; claim arms are not paired"
+                ),
             },
             "usage_metric_definitions": {
                 "token_totals_and_means": (
                     "observed values; lower bounds when incomplete_model_responses is non-zero"
                 ),
                 "paired_token_deltas": (
-                    "B observed value minus A observed value; either side may be a lower bound "
+                    "consumer observed value minus selected producer observed value; either side "
+                    "may be a lower bound "
                     "when token_delta_includes_observed_lower_bound is true"
                 ),
             },
@@ -304,9 +323,11 @@ def load_terminal_task_results(
         if not isinstance(manifest_path, str) or not Path(manifest_path).is_absolute():
             continue
         if status == "passed":
-            if _is_completed_task_manifest(
-                spec, Path(manifest_path)
-            ) or _is_a_only_task_manifest(spec, Path(manifest_path)):
+            if (
+                _is_completed_task_manifest(spec, Path(manifest_path))
+                or _is_a_only_task_manifest(spec, Path(manifest_path))
+                or _is_producer_pair_task_manifest(spec, Path(manifest_path))
+            ):
                 terminal.append(
                     PresmokeTaskResult(
                         spec.task_id,
@@ -365,9 +386,7 @@ def _completion_manifest_records(path: Path) -> dict[str, Mapping[str, object]]:
     return candidates
 
 
-def reserve_interrupted_retries(
-    completion_manifest_path: Path, task_ids: tuple[str, ...]
-) -> None:
+def reserve_interrupted_retries(completion_manifest_path: Path, task_ids: tuple[str, ...]) -> None:
     """为被中断且无终态的 task 预留唯一一次显式重跑机会。"""
     if not completion_manifest_path.is_absolute():
         raise ValueError("completion_manifest_path 必须为绝对路径")
@@ -461,6 +480,8 @@ def _terminal_result_from_task_manifest(
         return PresmokeTaskResult(spec.task_id, "passed", str(path), None)
     if _is_a_only_task_manifest(spec, path):
         return PresmokeTaskResult(spec.task_id, "passed", str(path), None)
+    if _is_producer_pair_task_manifest(spec, path):
+        return PresmokeTaskResult(spec.task_id, "passed", str(path), None)
     if _is_no_eligible_claim_task_manifest(spec, path):
         return PresmokeTaskResult(spec.task_id, "no_eligible_claim", str(path), None)
     return None
@@ -500,14 +521,62 @@ def _is_a_only_task_manifest(spec: PresmokeTaskSpec, path: Path) -> bool:
     for attempt_id, variant in expected.items():
         record = observed[attempt_id]
         if variant == "A":
-            if record.get("status") not in {"passed", "agent_failed"} or not _has_valid_gated_attempt_evidence(
-                attempt_id, variant, record
-            ):
+            if record.get("status") not in {
+                "passed",
+                "agent_failed",
+            } or not _has_valid_gated_attempt_evidence(attempt_id, variant, record):
                 return False
             continue
         if (
             record.get("status") != "not_run"
             or record.get("reason") != "A_ONLY"
+            or record.get("result_path") is not None
+            or record.get("gate_path") is not None
+        ):
+            return False
+    return True
+
+
+def _is_producer_pair_task_manifest(spec: PresmokeTaskSpec, path: Path) -> bool:
+    """确认 S1=A、S2=B_empty 均完成 Gate，claim consumers 尚未启动。"""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if (
+        not isinstance(raw, Mapping)
+        or raw.get("failure") is not None
+        or not _task_manifest_matches_provenance(spec, raw)
+    ):
+        return False
+    execution = raw.get("execution")
+    if not isinstance(execution, Mapping) or execution.get("phase_mode") != "adaptive_producers":
+        return False
+    records = raw.get("attempt_results")
+    if not isinstance(records, list) or len(records) != 4:
+        return False
+    expected = {attempt.attempt_id: attempt.variant for attempt in spec.experiment.attempts}
+    observed = {
+        record.get("attempt_id"): record
+        for record in records
+        if isinstance(record, Mapping) and isinstance(record.get("attempt_id"), str)
+    }
+    if set(observed) != set(expected):
+        return False
+    for attempt_id, variant in expected.items():
+        record = observed[attempt_id]
+        if record.get("variant") != variant:
+            return False
+        if variant in {"A", "B_empty"}:
+            if record.get("status") not in {
+                "passed",
+                "agent_failed",
+            } or not _has_valid_gated_attempt_evidence(attempt_id, variant, record):
+                return False
+            continue
+        if (
+            record.get("status") != "not_run"
+            or record.get("reason") != "PRODUCER_PAIR_ONLY"
             or record.get("result_path") is not None
             or record.get("gate_path") is not None
         ):
@@ -556,16 +625,15 @@ def _is_no_eligible_claim_task_manifest(spec: PresmokeTaskSpec, path: Path) -> b
                 or record.get("gate_path") is not None
             ):
                 return False
-        elif record.get("status") not in {"passed", "agent_failed"} or not _has_valid_gated_attempt_evidence(
-            attempt_id, variant, record
-        ):
+        elif record.get("status") not in {
+            "passed",
+            "agent_failed",
+        } or not _has_valid_gated_attempt_evidence(attempt_id, variant, record):
             return False
     return True
 
 
-def _task_manifest_matches_provenance(
-    spec: PresmokeTaskSpec, raw: Mapping[str, object]
-) -> bool:
+def _task_manifest_matches_provenance(spec: PresmokeTaskSpec, raw: Mapping[str, object]) -> bool:
     """resume 只能复用与当前 spec 完整 provenance 一致的旧 task。"""
     experiment = raw.get("experiment")
     provenance = experiment.get("provenance") if isinstance(experiment, Mapping) else None
@@ -619,10 +687,7 @@ def _claim_funnel(results: tuple[PresmokeTaskResult, ...]) -> dict[str, dict[str
         "injected_claim_count",
         "used_claim_count",
     )
-    funnel = {
-        variant: {field: 0 for field in fields}
-        for variant in ("B_claim", "B_forced_claim")
-    }
+    funnel = {variant: {field: 0 for field in fields} for variant in ("B_claim", "B_forced_claim")}
     for result in results:
         path = Path(result.manifest_path)
         if not path.is_file():
@@ -672,26 +737,34 @@ _USAGE_FIELDS = _REQUEST_USAGE_FIELDS + _TOKEN_USAGE_FIELDS
 
 
 def _cohort_metrics(results: tuple[PresmokeTaskResult, ...]) -> dict[str, object]:
-    """按 producer verifier cohort 汇总成功率、用量与同题 B-A 差值。"""
+    """按 producer verifier cohort 汇总成功率、用量与同题 consumer-producer 差值。"""
     cohorts: dict[str, dict[str, object]] = {}
     for task in results:
         validated = _validated_cohort_attempts(task)
         if validated is None:
             continue
-        cohort, attempts = validated
-        cohort_row = cohorts.setdefault(cohort, _new_cohort_row())
+        cohort, producer_variant, attempts = validated
+        cohort_row = cohorts.setdefault(cohort, _new_cohort_row(producer_variant))
+        if cohort_row.get("claim_producer_variant") != producer_variant:
+            raise ValueError(f"同一 cohort 混入多个 claim producer: {cohort}")
         cohort_row["task_count"] = int(cohort_row["task_count"]) + 1
         variants = cohort_row["variants"]
         if not isinstance(variants, dict):
             continue
         for variant, (passed, usage) in attempts.items():
             _accumulate_variant(variants[variant], passed, usage)
-        a_attempt = attempts.get("A")
-        paired = cohort_row["paired_against_a"]
-        if cohort == "unpaired_no_claim" or a_attempt is None or not isinstance(paired, dict):
+        producer_attempt = attempts.get(producer_variant)
+        paired = cohort_row["paired_against_producer"]
+        if (
+            cohort == "unpaired_no_claim"
+            or producer_attempt is None
+            or not isinstance(paired, dict)
+        ):
             continue
-        a_passed, a_usage = a_attempt
-        for variant in _METRIC_VARIANTS[1:]:
+        producer_passed, producer_usage = producer_attempt
+        for variant in _METRIC_VARIANTS:
+            if variant == producer_variant:
+                continue
             b_attempt = attempts.get(variant)
             if b_attempt is None:
                 continue
@@ -701,22 +774,25 @@ def _cohort_metrics(results: tuple[PresmokeTaskResult, ...]) -> dict[str, object
                 continue
             pair["pairs"] = int(pair["pairs"]) + 1
             pair["verifier_passed_delta"] = int(pair["verifier_passed_delta"]) + (
-                int(b_passed) - int(a_passed)
+                int(b_passed) - int(producer_passed)
             )
             usage_delta = pair["usage_delta_totals"]
             if isinstance(usage_delta, dict):
                 for field in _USAGE_FIELDS:
-                    usage_delta[field] = int(usage_delta[field]) + b_usage[field] - a_usage[field]
-            if a_usage["incomplete_model_responses"] or b_usage["incomplete_model_responses"]:
-                pair["pairs_with_incomplete_usage"] = (
-                    int(pair["pairs_with_incomplete_usage"]) + 1
-                )
+                    usage_delta[field] = (
+                        int(usage_delta[field]) + b_usage[field] - producer_usage[field]
+                    )
+            if (
+                producer_usage["incomplete_model_responses"]
+                or b_usage["incomplete_model_responses"]
+            ):
+                pair["pairs_with_incomplete_usage"] = int(pair["pairs_with_incomplete_usage"]) + 1
     return {cohort: _finalize_cohort_row(row) for cohort, row in cohorts.items()}
 
 
 def _validated_cohort_attempts(
     task: PresmokeTaskResult,
-) -> tuple[str, dict[str, tuple[bool, dict[str, int]]]] | None:
+) -> tuple[str, str, dict[str, tuple[bool, dict[str, int]]]] | None:
     """只接受四臂均有 Gate pass 且哈希闭合的完整 task，避免部分结果污染统计。"""
     if task.status != "passed" or task.error is not None:
         return None
@@ -724,9 +800,17 @@ def _validated_cohort_attempts(
     if manifest is None or manifest.get("failure") is not None:
         return None
     cohort = manifest.get("experiment_cohort")
+    producer_variant = manifest.get("claim_producer_variant", "A")
+    logical_variant_map = manifest.get("logical_variant_map")
+    execution = manifest.get("execution")
     records = manifest.get("attempt_results")
     if (
         cohort not in {"success_efficiency", "failure_recovery", "unpaired_no_claim"}
+        or producer_variant not in {"A", "B_empty"}
+        or (
+            isinstance(execution, Mapping)
+            and execution.get("claim_producer_variant", producer_variant) != producer_variant
+        )
         or not isinstance(records, list)
         or len(records) != len(_METRIC_VARIANTS)
     ):
@@ -769,15 +853,39 @@ def _validated_cohort_attempts(
                 return None
             usage_values[field] = value
         if (
-            usage_values["complete_model_responses"]
-            + usage_values["incomplete_model_responses"]
+            usage_values["complete_model_responses"] + usage_values["incomplete_model_responses"]
             != usage_values["model_requests"]
         ):
             return None
         attempts[variant] = (verifier_passed, usage_values)
     if set(attempts) != set(_METRIC_VARIANTS):
         return None
-    return cohort, attempts
+    producer_attempt = attempts.get(producer_variant)
+    if producer_attempt is None:
+        return None
+    expected_cohort = "success_efficiency" if producer_attempt[0] else "failure_recovery"
+    if cohort != "unpaired_no_claim" and cohort != expected_cohort:
+        return None
+    if logical_variant_map is not None:
+        if (
+            not isinstance(logical_variant_map, Mapping)
+            or set(logical_variant_map) != set(_METRIC_VARIANTS)
+            or not all(
+                isinstance(physical_variant, str)
+                for physical_variant in logical_variant_map.values()
+            )
+            or set(logical_variant_map.values()) != set(_METRIC_VARIANTS)
+            or logical_variant_map.get("A") != producer_variant
+            or logical_variant_map.get("B_claim") != "B_claim"
+            or logical_variant_map.get("B_forced_claim") != "B_forced_claim"
+        ):
+            return None
+        attempts = {
+            logical_variant: attempts[physical_variant]
+            for logical_variant, physical_variant in logical_variant_map.items()
+        }
+        producer_variant = "A"
+    return cohort, producer_variant, attempts
 
 
 def _sha256_file_if_present(path: Path) -> str | None:
@@ -787,9 +895,21 @@ def _sha256_file_if_present(path: Path) -> str | None:
         return None
 
 
-def _new_cohort_row() -> dict[str, object]:
+def _new_cohort_row(producer_variant: str = "A") -> dict[str, object]:
+    paired = {
+        variant: {
+            "pairs": 0,
+            "verifier_passed_delta": 0,
+            "pairs_with_incomplete_usage": 0,
+            "usage_delta_totals": {field: 0 for field in _USAGE_FIELDS},
+        }
+        for variant in _METRIC_VARIANTS
+        if variant != producer_variant
+    }
+    producer_slug = producer_variant.lower()
     return {
         "task_count": 0,
+        "claim_producer_variant": producer_variant,
         "variants": {
             variant: {
                 "attempts": 0,
@@ -799,15 +919,8 @@ def _new_cohort_row() -> dict[str, object]:
             }
             for variant in _METRIC_VARIANTS
         },
-        "paired_against_a": {
-            variant: {
-                "pairs": 0,
-                "verifier_passed_delta": 0,
-                "pairs_with_incomplete_usage": 0,
-                "usage_delta_totals": {field: 0 for field in _USAGE_FIELDS},
-            }
-            for variant in _METRIC_VARIANTS[1:]
-        },
+        "paired_against_producer": paired,
+        f"paired_against_{producer_slug}": paired,
     }
 
 
@@ -835,15 +948,13 @@ def _finalize_cohort_row(row: dict[str, object]) -> dict[str, object]:
             incomplete = int(metrics["incomplete_usage_attempts"])
             totals = metrics["usage_totals"]
             metrics["verifier_pass_rate"] = passed / attempts if attempts else None
-            metrics["incomplete_usage_attempt_rate"] = (
-                incomplete / attempts if attempts else None
-            )
+            metrics["incomplete_usage_attempt_rate"] = incomplete / attempts if attempts else None
             metrics["token_values_are_observed_lower_bound"] = incomplete > 0
             metrics["usage_means"] = {
                 field: (int(totals[field]) / attempts if attempts else None)
                 for field in _USAGE_FIELDS
             }
-    paired = row["paired_against_a"]
+    paired = row["paired_against_producer"]
     if isinstance(paired, dict):
         for metrics in paired.values():
             if not isinstance(metrics, dict):
@@ -858,8 +969,7 @@ def _finalize_cohort_row(row: dict[str, object]) -> dict[str, object]:
             )
             metrics["token_delta_includes_observed_lower_bound"] = incomplete_pairs > 0
             metrics["usage_delta_means"] = {
-                field: (int(totals[field]) / pairs if pairs else None)
-                for field in _USAGE_FIELDS
+                field: (int(totals[field]) / pairs if pairs else None) for field in _USAGE_FIELDS
             }
     return row
 

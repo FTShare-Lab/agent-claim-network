@@ -38,6 +38,8 @@ def _write_metric_manifest(
     *,
     failed_variant: str | None = None,
     incomplete_variant: str | None = None,
+    claim_producer_variant: str = "A",
+    logical_variant_map: dict[str, str] | None = None,
 ) -> Path:
     manifest = root / "task-manifest.json"
     records = []
@@ -94,7 +96,12 @@ def _write_metric_manifest(
     manifest.write_text(
         json.dumps(
             {
-                "experiment_cohort": "success_efficiency",
+                "experiment_cohort": (
+                    "success_efficiency" if claim_producer_variant == "A" else "failure_recovery"
+                ),
+                "claim_producer_variant": claim_producer_variant,
+                "logical_variant_map": logical_variant_map,
+                "execution": {"claim_producer_variant": claim_producer_variant},
                 "attempt_results": records,
                 "failure": "GATE_FAILED" if failed_variant is not None else None,
             }
@@ -120,21 +127,56 @@ class PresmokeRunnerTests(unittest.TestCase):
             -3,
         )
         self.assertEqual(
-            metrics["paired_against_a"]["B_forced_claim"]["usage_delta_totals"][
-                "input_tokens"
-            ],
+            metrics["paired_against_a"]["B_forced_claim"]["usage_delta_totals"]["input_tokens"],
             -400,
+        )
+
+    def test_cohort_metrics_pair_against_b_empty_when_selected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = _write_metric_manifest(Path(directory), claim_producer_variant="B_empty")
+            metrics = _cohort_metrics(
+                (PresmokeTaskResult("task-a", "passed", str(manifest), None),)
+            )["failure_recovery"]
+
+        self.assertEqual(metrics["claim_producer_variant"], "B_empty")
+        self.assertEqual(
+            metrics["paired_against_b_empty"]["B_claim"]["verifier_passed_delta"],
+            1,
+        )
+        self.assertEqual(
+            metrics["paired_against_b_empty"]["B_claim"]["usage_delta_totals"]["model_requests"],
+            -2,
+        )
+
+    def test_adaptive_metrics_relabel_the_global_winner_as_logical_a(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = _write_metric_manifest(
+                Path(directory),
+                claim_producer_variant="B_empty",
+                logical_variant_map={
+                    "A": "B_empty",
+                    "B_empty": "A",
+                    "B_claim": "B_claim",
+                    "B_forced_claim": "B_forced_claim",
+                },
+            )
+            metrics = _cohort_metrics(
+                (PresmokeTaskResult("task-a", "passed", str(manifest), None),)
+            )["failure_recovery"]
+
+        self.assertEqual(metrics["claim_producer_variant"], "A")
+        self.assertEqual(metrics["variants"]["A"]["verifier_pass_rate"], 0.0)
+        self.assertEqual(metrics["variants"]["B_empty"]["verifier_pass_rate"], 1.0)
+        self.assertEqual(
+            metrics["paired_against_a"]["B_claim"]["usage_delta_totals"]["model_requests"],
+            -2,
         )
 
     def test_cohort_metrics_exclude_entire_task_when_any_arm_fails_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manifest = _write_metric_manifest(Path(directory), failed_variant="B_claim")
             metrics = _cohort_metrics(
-                (
-                    PresmokeTaskResult(
-                        "task-a", "failed", str(manifest), "CLAIM_DELIVERY_REPEATED"
-                    ),
-                )
+                (PresmokeTaskResult("task-a", "failed", str(manifest), "CLAIM_DELIVERY_REPEATED"),)
             )
 
         self.assertEqual(metrics, {})

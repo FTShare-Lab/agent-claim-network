@@ -49,29 +49,25 @@ class AttemptPlan:
 def build_attempt_plan(
     manifest: FrozenDatasetManifest, output_root: Path, seed: int
 ) -> AttemptPlan:
-    """每个 task 固定先 A，再按固定 seed 平衡三个 B 臂的顺序。"""
+    """每题先冻结 A/B_empty producer wave，再平衡两个 claim consumer 的顺序。"""
     if not output_root.is_absolute():
         raise ValueError(f"计划输出根目录必须为绝对路径: {output_root}")
     shuffled_ids = list(manifest.task_ids)
     random.Random(seed).shuffle(shuffled_ids)
-    b_orders = (
-        ("B_empty", "B_claim", "B_forced_claim"),
-        ("B_claim", "B_forced_claim", "B_empty"),
-        ("B_forced_claim", "B_empty", "B_claim"),
-        ("B_empty", "B_forced_claim", "B_claim"),
-        ("B_claim", "B_empty", "B_forced_claim"),
-        ("B_forced_claim", "B_claim", "B_empty"),
+    consumer_orders = (
+        ("B_claim", "B_forced_claim"),
+        ("B_forced_claim", "B_claim"),
     )
-    b_variants_by_task = {
-        task_id: b_orders[index % len(b_orders)]
+    consumers_by_task = {
+        task_id: consumer_orders[index % len(consumer_orders)]
         for index, task_id in enumerate(shuffled_ids)
     }
     attempts: list[AttemptManifest] = []
     for task_id in manifest.task_ids:
         attempts.append(_attempt(task_id, "A", output_root))
+        attempts.append(_attempt(task_id, "B_empty", output_root))
         attempts.extend(
-            _attempt(task_id, variant, output_root)
-            for variant in b_variants_by_task[task_id]
+            _attempt(task_id, variant, output_root) for variant in consumers_by_task[task_id]
         )
     return AttemptPlan(1, manifest.candidates_hash, seed, tuple(attempts))
 

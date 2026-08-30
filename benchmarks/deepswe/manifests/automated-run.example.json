@@ -20,6 +20,7 @@
   "task_workers": 20,
   "cleanup_stale_pier_resources": true,
   "run_all_variants_without_claims": true,
+  "claim_producer_variant": "A",
   "smoke_size": 30,
   "full_size": 113,
   "dataset_seed": 20260813,

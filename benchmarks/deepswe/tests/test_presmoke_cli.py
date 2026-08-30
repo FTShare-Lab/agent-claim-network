@@ -196,6 +196,117 @@ class PresmokeCliTests(unittest.TestCase):
             )
         )
 
+    def test_full_run_can_bind_b_empty_as_claim_producer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = write_fixture(root)
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw["claim_producer_variant"] = "B_empty"
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            config = load_config(config_path)
+
+            with patch("acn_deepswe.presmoke_cli.verify_checkout_revision"):
+                specs, _ = build_task_specs(config, "https://upstream.invalid")
+
+        spec = specs[0]
+        assert spec.execution is not None
+        task_output = config.output_dir / "tasks" / spec.task_id
+        self.assertEqual(spec.execution.claim_producer_variant, "B_empty")
+        self.assertEqual(
+            spec.execution.artifacts.claim_bundle,
+            task_output / "claims-b-empty.json",
+        )
+        self.assertEqual(
+            spec.execution.artifacts.a_claim_bundle,
+            task_output / "claims.json",
+        )
+        self.assertEqual(
+            spec.execution.artifacts.b_empty_claim_bundle,
+            task_output / "claims-b-empty.json",
+        )
+
+    def test_adaptive_consumer_resolves_global_winner_and_preserves_output_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = write_fixture(root)
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            source_output = root / "producer-output"
+            aggregate = source_output / "presmoke-aggregate.json"
+            aggregate.parent.mkdir(parents=True)
+            aggregate.write_text(json.dumps({"status": "passed"}), encoding="utf-8")
+            task_sources: dict[str, dict[str, str]] = {}
+            for index, task_id in enumerate(TASK_IDS):
+                task_source = (
+                    source_output / "resumes" / "resume-001"
+                    if index == 0
+                    else source_output
+                )
+                manifest = task_source / "tasks" / task_id / "manifest.json"
+                manifest.parent.mkdir(parents=True, exist_ok=True)
+                manifest.write_text(json.dumps({"task_id": task_id}), encoding="utf-8")
+                task_sources[task_id] = {
+                    "source_output_dir": str(task_source),
+                    "task_manifest_path": str(manifest),
+                    "task_manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+                }
+            selection = root / "producer-selection.json"
+            selection.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "selected",
+                        "candidate_aliases": {"S1": "A", "S2": "B_empty"},
+                        "winner_variant": "B_empty",
+                        "source_output_dir": str(source_output),
+                        "producer_aggregate_path": str(aggregate),
+                        "producer_aggregate_sha256": hashlib.sha256(
+                            aggregate.read_bytes()
+                        ).hexdigest(),
+                        "task_order": list(TASK_IDS),
+                        "task_sources": task_sources,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            raw.update(
+                {
+                    "claim_producer_variant": "adaptive",
+                    "adaptive_source_output_dir": str(source_output),
+                    "producer_selection_manifest": str(selection),
+                }
+            )
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            config = load_config(config_path)
+
+            with patch("acn_deepswe.presmoke_cli.verify_checkout_revision"):
+                specs, _ = build_task_specs(config, "https://upstream.invalid")
+
+        spec = specs[0]
+        assert spec.execution is not None
+        selected_task_source = source_output / "resumes" / "resume-001"
+        self.assertEqual(spec.execution.claim_producer_variant, "B_empty")
+        self.assertEqual(
+            spec.execution.artifacts.claim_bundle,
+            selected_task_source / "tasks" / spec.task_id / "claims-b-empty.json",
+        )
+        self.assertTrue(
+            all(
+                Path(attempt.output_path).is_relative_to(selected_task_source)
+                for attempt in spec.experiment.attempts[:2]
+            )
+        )
+        self.assertTrue(
+            all(
+                Path(attempt.output_path).is_relative_to(config.attempt_plan.parent)
+                and not Path(attempt.output_path).is_relative_to(source_output)
+                for attempt in spec.experiment.attempts[2:]
+            )
+        )
+        self.assertEqual(
+            spec.execution.adaptive_source_manifest,
+            selected_task_source / "tasks" / spec.task_id / "manifest.json",
+        )
+
     def test_b_only_config_is_mutually_exclusive_with_run_a_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

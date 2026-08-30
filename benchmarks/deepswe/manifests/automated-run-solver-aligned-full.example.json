@@ -20,6 +20,8 @@
   "task_workers": 20,
   "cleanup_stale_pier_resources": true,
   "run_all_variants_without_claims": true,
+  "claim_producer_variant": "adaptive",
+  "adaptive_producer_selection": true,
   "smoke_size": 0,
   "full_size": 113,
   "dataset_seed": 20260817,

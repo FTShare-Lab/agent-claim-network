@@ -21,6 +21,7 @@ from urllib.parse import unquote, urlparse
 
 from .dataset import FrozenDatasetManifest
 from .host_runner import (
+    CLAIM_BUNDLE_VARIANTS,
     DEFAULT_PROGRESS_POLL_SECS,
     DEFAULT_PROGRESS_STALL_AFTER_SECS,
     EVALUATION_AUTO_COMPACT_CTX_RATIO,
@@ -118,6 +119,10 @@ _ALLOWED_CONFIG_FIELDS = frozenset(
         "run_all_variants_without_claims",
         "run_a_only",
         "b_only_from_a_output_dir",
+        "claim_producer_variant",
+        "producer_pair_only",
+        "adaptive_source_output_dir",
+        "producer_selection_manifest",
     }
 )
 
@@ -156,6 +161,10 @@ class PresmokeConfig:
     run_all_variants_without_claims: bool = False
     run_a_only: bool = False
     b_only_from_a_output_dir: Path | None = None
+    claim_producer_variant: str = "A"
+    producer_pair_only: bool = False
+    adaptive_source_output_dir: Path | None = None
+    producer_selection_manifest: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -386,12 +395,36 @@ def load_config(path: Path) -> PresmokeConfig:
         raise PresmokeCliError("config.progress.stall_after_secs 不得小于 poll_secs")
     run_a_only = _boolean(raw.get("run_a_only", False), "run_a_only")
     b_only_from_a_output_dir = _optional_absolute_path(raw, "b_only_from_a_output_dir")
-    if run_a_only and b_only_from_a_output_dir is not None:
-        raise PresmokeCliError("run_a_only 与 b_only_from_a_output_dir 不能同时启用")
+    producer_pair_only = _boolean(raw.get("producer_pair_only", False), "producer_pair_only")
+    adaptive_source_output_dir = _optional_absolute_path(raw, "adaptive_source_output_dir")
+    producer_selection_manifest = _optional_absolute_path(raw, "producer_selection_manifest")
+    claim_producer_variant = _claim_producer_variant(raw)
+    adaptive_consumer = adaptive_source_output_dir is not None
+    if adaptive_consumer != (producer_selection_manifest is not None):
+        raise PresmokeCliError(
+            "adaptive_source_output_dir 与 producer_selection_manifest 必须同时提供"
+        )
+    phase_modes = sum((run_a_only, b_only_from_a_output_dir is not None, producer_pair_only, adaptive_consumer))
+    if phase_modes > 1:
+        raise PresmokeCliError(
+            "A-only/B-only/adaptive producer/adaptive consumer 不能同时启用或组合"
+        )
     if b_only_from_a_output_dir is not None and _paths_overlap(
         paths["output_dir"], b_only_from_a_output_dir
     ):
         raise PresmokeCliError("B-only output_dir 与 A-only source output 必须完全隔离")
+    if adaptive_source_output_dir is not None and _paths_overlap(
+        paths["output_dir"], adaptive_source_output_dir
+    ):
+        raise PresmokeCliError("adaptive consumer output 与 producer source 必须完全隔离")
+    if claim_producer_variant != "A" and (run_a_only or b_only_from_a_output_dir is not None):
+        raise PresmokeCliError("A-only/B-only 接续模式仅支持 claim_producer_variant=A")
+    if producer_pair_only and claim_producer_variant != "adaptive":
+        raise PresmokeCliError("producer_pair_only 必须使用 claim_producer_variant=adaptive")
+    if adaptive_consumer and claim_producer_variant != "adaptive":
+        raise PresmokeCliError("adaptive consumer 必须使用 claim_producer_variant=adaptive")
+    if claim_producer_variant == "adaptive" and not (producer_pair_only or adaptive_consumer):
+        raise PresmokeCliError("claim_producer_variant=adaptive 仅用于自适应两阶段")
     run_class = _run_class(raw)
     model_egress_mode = _model_egress_mode(raw)
     harness_mode = _harness_mode(raw)
@@ -452,6 +485,10 @@ def load_config(path: Path) -> PresmokeConfig:
         ),
         run_a_only=run_a_only,
         b_only_from_a_output_dir=b_only_from_a_output_dir,
+        claim_producer_variant=claim_producer_variant,
+        producer_pair_only=producer_pair_only,
+        adaptive_source_output_dir=adaptive_source_output_dir,
+        producer_selection_manifest=producer_selection_manifest,
     )
 
 
@@ -528,6 +565,8 @@ def build_task_specs(
             "冻结 manifest.task_directory_hashes 必须是对象；请从原 DeepSWE checkout 和 normalized task 目录重新生成清单"
         )
     by_task = _attempts_by_task(plan, frozen_task_ids)
+    resolved_producer = _resolved_claim_producer(config)
+    adaptive_task_sources = _adaptive_task_source_roots(config, frozen_task_ids)
     skill_hash = sha256_directory_tree(frozen_skill)
     acn_binary_hash = (
         frozen_runtime.acn_binary_hash if frozen_runtime is not None else _sha256_file(acn_eval)
@@ -617,6 +656,9 @@ def build_task_specs(
                 )
                 for attempt in attempts
             )
+        adaptive_task_source = adaptive_task_sources.get(task_id)
+        if config.adaptive_source_output_dir is not None and adaptive_task_source is None:
+            raise PresmokeCliError(f"producer selection 缺少 task source: {task_id}")
         if config.b_only_from_a_output_dir is not None:
             source_a = attempts[0]
             attempts = (
@@ -634,6 +676,23 @@ def build_task_specs(
                 ),
                 *attempts[1:],
             )
+        elif adaptive_task_source is not None:
+            producer_attempts = tuple(
+                AttemptManifest(
+                    attempt.schema_version,
+                    attempt.attempt_id,
+                    attempt.task_id,
+                    attempt.variant,
+                    str(
+                        adaptive_task_source
+                        / "attempts"
+                        / attempt.attempt_id
+                        / "output"
+                    ),
+                )
+                for attempt in attempts[:2]
+            )
+            attempts = (*producer_attempts, *attempts[2:])
         task_plan = AttemptPlan(1, plan.freeze_candidates_hash, plan.seed, attempts)
         experiment = build_experiment_manifest(
             f"{config.frozen_manifest.stem}-{task_id}",
@@ -650,10 +709,27 @@ def build_task_specs(
             if config.b_only_from_a_output_dir is not None
             else None
         )
-        claim_bundle = (
+        adaptive_source_manifest = (
+            adaptive_task_source / "tasks" / task_id / "manifest.json"
+            if adaptive_task_source is not None
+            else None
+        )
+        a_claim_bundle = (
             config.b_only_from_a_output_dir / "tasks" / task_id / "claims.json"
             if config.b_only_from_a_output_dir is not None
-            else task_output / "claims.json"
+            else (
+                adaptive_task_source / "tasks" / task_id / "claims.json"
+                if adaptive_task_source is not None
+                else task_output / "claims.json"
+            )
+        )
+        b_empty_claim_bundle = (
+            adaptive_task_source / "tasks" / task_id / "claims-b-empty.json"
+            if adaptive_task_source is not None
+            else task_output / "claims-b-empty.json"
+        )
+        claim_bundle = (
+            b_empty_claim_bundle if resolved_producer == "B_empty" else a_claim_bundle
         )
         specs.append(
             PresmokeTaskSpec(
@@ -665,6 +741,8 @@ def build_task_specs(
                         frozen_skill=frozen_skill,
                         claim_bundle=claim_bundle,
                         normalized_task_dir=(config.normalized_root / task_id),
+                        a_claim_bundle=a_claim_bundle,
+                        b_empty_claim_bundle=b_empty_claim_bundle,
                     ),
                     task_prompt=prompt,
                     upstream_base_url=upstream_base_url,
@@ -680,6 +758,10 @@ def build_task_specs(
                     run_all_variants_without_claims=config.run_all_variants_without_claims,
                     run_a_only=config.run_a_only,
                     a_only_source_manifest=a_only_source_manifest,
+                    claim_producer_variant=resolved_producer,
+                    run_producer_pair_only=config.producer_pair_only,
+                    adaptive_source_manifest=adaptive_source_manifest,
+                    producer_selection_manifest=config.producer_selection_manifest,
                     progress_poll_secs=config.progress["poll_secs"],
                     progress_stall_after_secs=config.progress["stall_after_secs"],
                     docker_root=docker_root,
@@ -969,10 +1051,14 @@ def _next_resume_root(output_dir: Path) -> Path:
 def _task_has_partial_artifacts(spec: PresmokeTaskSpec) -> bool:
     """原 task 目录或任一 arm 输出已出现，即视为中断而非尚未调度。"""
     source_manifest = spec.execution.a_only_source_manifest if spec.execution is not None else None
+    adaptive_source = (
+        spec.execution.adaptive_source_manifest if spec.execution is not None else None
+    )
     return spec.manifest_path.exists() or any(
         Path(attempt.output_path).exists()
         for attempt in spec.experiment.attempts
-        if source_manifest is None or attempt.variant != "A"
+        if (source_manifest is None or attempt.variant != "A")
+        and (adaptive_source is None or attempt.variant in CLAIM_BUNDLE_VARIANTS)
     )
 
 
@@ -1147,14 +1233,21 @@ def dry_run_summary(
         "host_capacity": config.host_capacity,
         "run_all_variants_without_claims": config.run_all_variants_without_claims,
         "run_a_only": config.run_a_only,
-        "phase_mode": (
-            "b_only_from_a"
-            if config.b_only_from_a_output_dir is not None
-            else ("a_only" if config.run_a_only else "full")
-        ),
+        "claim_producer_variant": config.claim_producer_variant,
+        "phase_mode": _phase_mode(config),
         "b_only_from_a_output_dir": (
             str(config.b_only_from_a_output_dir)
             if config.b_only_from_a_output_dir is not None
+            else None
+        ),
+        "adaptive_source_output_dir": (
+            str(config.adaptive_source_output_dir)
+            if config.adaptive_source_output_dir is not None
+            else None
+        ),
+        "producer_selection_manifest": (
+            str(config.producer_selection_manifest)
+            if config.producer_selection_manifest is not None
             else None
         ),
         "progress": config.progress,
@@ -1165,12 +1258,32 @@ def dry_run_summary(
                 "arms": [
                     attempt.variant
                     for attempt in spec.experiment.attempts
-                    if config.b_only_from_a_output_dir is None or attempt.variant != "A"
+                    if _phase_includes_arm(config, attempt.variant)
                 ],
             }
             for spec in specs
         ],
     }
+
+
+def _phase_mode(config: PresmokeConfig) -> str:
+    if config.producer_pair_only:
+        return "adaptive_producers"
+    if config.adaptive_source_output_dir is not None:
+        return "adaptive_consumers"
+    if config.b_only_from_a_output_dir is not None:
+        return "b_only_from_a"
+    return "a_only" if config.run_a_only else "full"
+
+
+def _phase_includes_arm(config: PresmokeConfig, variant: str) -> bool:
+    if config.producer_pair_only:
+        return variant in {"A", "B_empty"}
+    if config.adaptive_source_output_dir is not None:
+        return variant in {"B_claim", "B_forced_claim"}
+    if config.b_only_from_a_output_dir is not None:
+        return variant != "A"
+    return True
 
 
 def _attempts_by_task(
@@ -1291,6 +1404,98 @@ def _harness_mode(raw: Mapping[str, object]) -> str:
     return value
 
 
+def _claim_producer_variant(raw: Mapping[str, object]) -> str:
+    value = raw.get("claim_producer_variant", "A")
+    if value not in {"A", "B_empty", "adaptive"}:
+        raise PresmokeCliError(
+            "config.claim_producer_variant 仅支持 A、B_empty 或 adaptive"
+        )
+    return value
+
+
+def _resolved_claim_producer(config: PresmokeConfig) -> str:
+    if config.claim_producer_variant != "adaptive":
+        return config.claim_producer_variant
+    if config.producer_pair_only:
+        return "adaptive"
+    path = config.producer_selection_manifest
+    if path is None:
+        raise PresmokeCliError("adaptive consumer 缺少 producer selection manifest")
+    selection = _read_object(path, "producer selection manifest")
+    if (
+        selection.get("schema_version") != 1
+        or selection.get("status") != "selected"
+        or selection.get("candidate_aliases") != {"S1": "A", "S2": "B_empty"}
+    ):
+        raise PresmokeCliError("producer selection manifest schema/alias 无效")
+    winner = selection.get("winner_variant")
+    if winner not in {"A", "B_empty"}:
+        raise PresmokeCliError("producer selection winner_variant 无效")
+    return winner
+
+
+def _adaptive_task_source_roots(
+    config: PresmokeConfig, frozen_task_ids: tuple[str, ...]
+) -> dict[str, Path]:
+    producer_output = config.adaptive_source_output_dir
+    selection_path = config.producer_selection_manifest
+    if producer_output is None:
+        return {}
+    if selection_path is None:
+        raise PresmokeCliError("adaptive consumer 缺少 producer selection manifest")
+    selection = _read_object(selection_path, "producer selection manifest")
+    source_value = selection.get("source_output_dir")
+    aggregate_value = selection.get("producer_aggregate_path")
+    aggregate_hash = selection.get("producer_aggregate_sha256")
+    aggregate = producer_output / "presmoke-aggregate.json"
+    if (
+        not isinstance(source_value, str)
+        or Path(source_value).resolve() != producer_output.resolve()
+        or not isinstance(aggregate_value, str)
+        or Path(aggregate_value).resolve() != aggregate.resolve()
+        or not aggregate.is_file()
+        or aggregate_hash != _sha256_file(aggregate)
+        or selection.get("task_order") != list(frozen_task_ids)
+    ):
+        raise PresmokeCliError("producer selection 未绑定当前冻结 task/aggregate")
+    raw_sources = selection.get("task_sources")
+    if not isinstance(raw_sources, Mapping) or set(raw_sources) != set(frozen_task_ids):
+        raise PresmokeCliError("producer selection task_sources 不完整")
+    roots: dict[str, Path] = {}
+    resumes_root = producer_output.resolve() / "resumes"
+    for task_id in frozen_task_ids:
+        raw_source = raw_sources.get(task_id)
+        if not isinstance(raw_source, Mapping) or set(raw_source) != {
+            "source_output_dir",
+            "task_manifest_path",
+            "task_manifest_sha256",
+        }:
+            raise PresmokeCliError(f"producer selection task source schema 无效: {task_id}")
+        root_value = raw_source.get("source_output_dir")
+        manifest_value = raw_source.get("task_manifest_path")
+        manifest_hash = raw_source.get("task_manifest_sha256")
+        if not isinstance(root_value, str) or not isinstance(manifest_value, str):
+            raise PresmokeCliError(f"producer selection task source 路径无效: {task_id}")
+        source_root = Path(root_value)
+        manifest = Path(manifest_value)
+        if not source_root.is_absolute() or not manifest.is_absolute():
+            raise PresmokeCliError(f"producer selection task source 必须为绝对路径: {task_id}")
+        source_root = source_root.resolve()
+        manifest = manifest.resolve()
+        valid_resume = (
+            source_root.parent == resumes_root
+            and re.fullmatch(r"resume-[0-9]+", source_root.name) is not None
+        )
+        if source_root != producer_output.resolve() and not valid_resume:
+            raise PresmokeCliError(f"producer selection task source 越出原始或 resume 根: {task_id}")
+        if manifest != source_root / "tasks" / task_id / "manifest.json":
+            raise PresmokeCliError(f"producer selection task manifest 布局无效: {task_id}")
+        if not manifest.is_file() or manifest_hash != _sha256_file(manifest):
+            raise PresmokeCliError(f"producer selection task manifest 内容漂移: {task_id}")
+        roots[task_id] = source_root
+    return roots
+
+
 def _positive_int_mapping(
     raw: Mapping[str, object], field: str, required: tuple[str, ...]
 ) -> dict[str, int]:
@@ -1403,10 +1608,14 @@ def _effective_config_hash(config: PresmokeConfig) -> str:
         "progress": config.progress,
         "run_all_variants_without_claims": config.run_all_variants_without_claims,
         "run_a_only": config.run_a_only,
-        "phase_mode": (
-            "b_only_from_a"
-            if config.b_only_from_a_output_dir is not None
-            else ("a_only" if config.run_a_only else "full")
+        "claim_producer_variant": config.claim_producer_variant,
+        "producer_pair_only": config.producer_pair_only,
+        "phase_mode": _phase_mode(config),
+        "producer_selection_manifest_hash": (
+            _sha256_file(config.producer_selection_manifest)
+            if config.producer_selection_manifest is not None
+            and config.producer_selection_manifest.is_file()
+            else None
         ),
         "auto_compact_ctx_ratio": EVALUATION_AUTO_COMPACT_CTX_RATIO,
         "file_read_max_chars": EVALUATION_FILE_READ_MAX_CHARS,

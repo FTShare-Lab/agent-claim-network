@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import json
 import os
 import random
@@ -69,6 +70,8 @@ class AutomatedRunConfig:
     run_all_variants_without_claims: bool = False
     run_a_only: bool = False
     b_only_from_a_output_dir: Path | None = None
+    claim_producer_variant: str = "A"
+    adaptive_producer_selection: bool = False
     reuse_local_agent_image_fingerprint: str | None = None
 
 
@@ -119,6 +122,8 @@ _ALLOWED_CONFIG_FIELDS = frozenset(
         "run_all_variants_without_claims",
         "run_a_only",
         "b_only_from_a_output_dir",
+        "claim_producer_variant",
+        "adaptive_producer_selection",
         "reuse_local_agent_image_fingerprint",
     }
 )
@@ -216,6 +221,10 @@ def load_config(path: Path) -> AutomatedRunConfig:
         raise AutomatedRunError("smoke_size 必须小于 full_size，才能避免全量重复执行 Smoke")
     run_a_only = _boolean(raw.get("run_a_only", False), "run_a_only")
     b_only_from_a_output_dir = _optional_absolute_path(raw, "b_only_from_a_output_dir")
+    claim_producer_variant = _claim_producer_variant(raw)
+    adaptive_producer_selection = _boolean(
+        raw.get("adaptive_producer_selection", False), "adaptive_producer_selection"
+    )
     if run_a_only and b_only_from_a_output_dir is not None:
         raise AutomatedRunError("run_a_only 与 b_only_from_a_output_dir 不能同时启用")
     if b_only_from_a_output_dir is not None and smoke_size != 0:
@@ -224,6 +233,21 @@ def load_config(path: Path) -> AutomatedRunConfig:
         paths["run_root"] / "full" / "output", b_only_from_a_output_dir
     ):
         raise AutomatedRunError("B-only run_root 与 A-only source output 必须完全隔离")
+    if claim_producer_variant != "A" and (run_a_only or b_only_from_a_output_dir is not None):
+        raise AutomatedRunError("A-only/B-only 接续模式仅支持 claim_producer_variant=A")
+    if adaptive_producer_selection:
+        if smoke_size != 0:
+            raise AutomatedRunError("adaptive producer selection 必须设置 smoke_size=0")
+        if run_a_only or b_only_from_a_output_dir is not None:
+            raise AutomatedRunError("adaptive producer selection 不可组合 A-only/B-only")
+        if claim_producer_variant != "adaptive":
+            raise AutomatedRunError(
+                "adaptive producer selection 必须使用 claim_producer_variant=adaptive"
+            )
+    elif claim_producer_variant == "adaptive":
+        raise AutomatedRunError(
+            "claim_producer_variant=adaptive 必须显式启用 adaptive_producer_selection"
+        )
     run_class = _run_class(raw)
     model_egress_mode = _model_egress_mode(raw)
     harness_mode = _harness_mode(raw)
@@ -291,6 +315,8 @@ def load_config(path: Path) -> AutomatedRunConfig:
         ),
         run_a_only=run_a_only,
         b_only_from_a_output_dir=b_only_from_a_output_dir,
+        claim_producer_variant=claim_producer_variant,
+        adaptive_producer_selection=adaptive_producer_selection,
         reuse_local_agent_image_fingerprint=image_fingerprint,
     )
 
@@ -334,30 +360,59 @@ def prepare_run(config: AutomatedRunConfig) -> dict[str, object]:
             raise AutomatedRunError("Smoke 与补齐全量阶段的任务划分不完整")
 
         acn_revision = _current_acn_revision()
-        smoke = (
-            _prepare_phase(
+        if config.adaptive_producer_selection:
+            smoke = {"skipped": True, "task_count": 0, "task_ids": []}
+            producers = _prepare_phase(
                 config,
                 staging,
-                "smoke",
+                "producers",
                 all_manifest,
-                smoke_ids,
+                full_ids,
                 normalized_root,
                 acn_revision,
-                config.smoke_plan_seed,
+                config.full_plan_seed,
             )
-            if smoke_ids
-            else {"skipped": True, "task_count": 0, "task_ids": []}
-        )
-        full = _prepare_phase(
-            config,
-            staging,
-            "full",
-            all_manifest,
-            full_ids,
-            normalized_root,
-            acn_revision,
-            config.full_plan_seed,
-        )
+            consumers = _prepare_phase(
+                config,
+                staging,
+                "consumers",
+                all_manifest,
+                full_ids,
+                normalized_root,
+                acn_revision,
+                config.full_plan_seed,
+            )
+            phases: dict[str, object] = {
+                "smoke": smoke,
+                "producers": producers,
+                "consumers": consumers,
+            }
+        else:
+            smoke = (
+                _prepare_phase(
+                    config,
+                    staging,
+                    "smoke",
+                    all_manifest,
+                    smoke_ids,
+                    normalized_root,
+                    acn_revision,
+                    config.smoke_plan_seed,
+                )
+                if smoke_ids
+                else {"skipped": True, "task_count": 0, "task_ids": []}
+            )
+            full = _prepare_phase(
+                config,
+                staging,
+                "full",
+                all_manifest,
+                full_ids,
+                normalized_root,
+                acn_revision,
+                config.full_plan_seed,
+            )
+            phases = {"smoke": smoke, "full": full}
         summary = {
             "schema_version": 1,
             "status": "prepared",
@@ -373,13 +428,18 @@ def prepare_run(config: AutomatedRunConfig) -> dict[str, object]:
             "pier_egress_proxy_content_digest": config.pier_egress_proxy_content_digest,
             "task_workers": config.task_workers,
             "host_capacity": config.host_capacity,
+            "claim_producer_variant": config.claim_producer_variant,
+            "adaptive_producer_selection": config.adaptive_producer_selection,
             "phase_mode": (
-                "b_only_from_a"
-                if config.b_only_from_a_output_dir is not None
-                else ("a_only" if config.run_a_only else "full")
+                "adaptive_two_stage"
+                if config.adaptive_producer_selection
+                else (
+                    "b_only_from_a"
+                    if config.b_only_from_a_output_dir is not None
+                    else ("a_only" if config.run_a_only else "full")
+                )
             ),
-            "smoke": smoke,
-            "full": full,
+            **phases,
         }
         _atomic_write_json(staging / "automation.json", summary)
         staging.replace(config.run_root)
@@ -424,7 +484,38 @@ def _run_automated_locked(
     if prepared.get("status") != "prepared":
         raise AutomatedRunError("自动化运行描述不是可启动的 prepared 状态")
 
-    if config.smoke_size == 0:
+    if config.adaptive_producer_selection:
+        producers = _completed_phase_or_run(
+            config.run_root,
+            "producers",
+            read_key_stdin=read_key_stdin,
+            allow_interrupted_resume=allow_interrupted_resume,
+        )
+        phases = {"producers": producers}
+        selection: dict[str, object] | None = None
+        if producers.get("completed") is True:
+            selection = _select_adaptive_producer(config.run_root)
+            phases["consumers"] = _completed_phase_or_run(
+                config.run_root,
+                "consumers",
+                read_key_stdin=read_key_stdin,
+                allow_interrupted_resume=allow_interrupted_resume,
+            )
+        else:
+            phases["consumers"] = {
+                "started": False,
+                "completed": False,
+                "reason": "producer_phase_not_completed",
+            }
+        completed = all(item.get("completed") is True for item in phases.values())
+        status = (
+            "completed"
+            if completed
+            else "consumers_not_completed"
+            if producers.get("completed") is True
+            else "producers_not_completed"
+        )
+    elif config.smoke_size == 0:
         phases: dict[str, dict[str, object]] = {
             "full": _completed_phase_or_run(
                 config.run_root,
@@ -465,6 +556,8 @@ def _run_automated_locked(
         "status": status,
         "phases": phases,
     }
+    if config.adaptive_producer_selection:
+        summary["producer_selection"] = selection
     _atomic_write_json(summary_path, summary)
     return summary
 
@@ -474,7 +567,12 @@ def monitor_run(run_root: Path) -> dict[str, object]:
     if not run_root.is_absolute() or not run_root.is_dir():
         raise AutomatedRunError(f"run_root 不存在或不是绝对目录: {run_root}")
     phase_statuses: dict[str, object] = {}
-    for phase in ("smoke", "full"):
+    phases = (
+        ("producers", "consumers")
+        if (run_root / "producers").is_dir() or (run_root / "consumers").is_dir()
+        else ("smoke", "full")
+    )
+    for phase in phases:
         aggregate = run_root / phase / "output" / "presmoke-aggregate.json"
         if aggregate.is_file():
             phase_statuses[phase] = _read_json_object(aggregate, f"{phase} aggregate").get("status")
@@ -582,6 +680,10 @@ def _prepare_phase(
     acn_revision: str,
     plan_seed: int,
 ) -> dict[str, object]:
+    adaptive_producers = config.adaptive_producer_selection and phase == "producers"
+    adaptive_consumers = config.adaptive_producer_selection and phase == "consumers"
+    if config.adaptive_producer_selection and not (adaptive_producers or adaptive_consumers):
+        raise AutomatedRunError(f"adaptive run 不支持阶段: {phase}")
     phase_root = staging / phase
     phase_root.mkdir()
     # 所有文件先写入 staging，再由调用方原子发布为 run_root；供后续 CLI 读取的
@@ -623,6 +725,16 @@ def _prepare_phase(
         "task_workers": config.task_workers,
         "run_all_variants_without_claims": config.run_all_variants_without_claims,
         "run_a_only": config.run_a_only,
+        "claim_producer_variant": (
+            "adaptive" if adaptive_producers or adaptive_consumers else config.claim_producer_variant
+        ),
+        "producer_pair_only": adaptive_producers,
+        "adaptive_source_output_dir": (
+            str(config.run_root / "producers" / "output") if adaptive_consumers else None
+        ),
+        "producer_selection_manifest": (
+            str(config.run_root / "producer-selection.json") if adaptive_consumers else None
+        ),
         "b_only_from_a_output_dir": (
             str(config.b_only_from_a_output_dir)
             if config.b_only_from_a_output_dir is not None
@@ -743,6 +855,199 @@ def _completed_phase_or_run(
     return _run_phase(run_root, phase, read_key_stdin=read_key_stdin)
 
 
+def _select_adaptive_producer(run_root: Path) -> dict[str, object]:
+    """按预注册全量口径选择 producer；不允许逐 task 混合两个物理臂。"""
+    source_output = (run_root / "producers" / "output").resolve()
+    aggregate_path = source_output / "presmoke-aggregate.json"
+    aggregate = _read_json_object(aggregate_path, "producer aggregate")
+    if aggregate.get("status") != "passed":
+        raise AutomatedRunError("producer aggregate 未完整通过，拒绝选择逻辑 A")
+    task_order = aggregate.get("task_order")
+    task_results = aggregate.get("task_results")
+    if (
+        not isinstance(task_order, list)
+        or not task_order
+        or not all(isinstance(task_id, str) and task_id for task_id in task_order)
+        or len(set(task_order)) != len(task_order)
+        or not isinstance(task_results, list)
+        or len(task_results) != len(task_order)
+    ):
+        raise AutomatedRunError("producer aggregate task 集合不完整")
+
+    aliases = {"S1": "A", "S2": "B_empty"}
+    scores = {
+        alias: {
+            "physical_variant": variant,
+            "valid_attempts": 0,
+            "verifier_passed": 0,
+            "f2p_passed": 0,
+            "f2p_total": 0,
+        }
+        for alias, variant in aliases.items()
+    }
+    task_sources: dict[str, dict[str, str]] = {}
+    for expected_task_id, raw_task in zip(task_order, task_results, strict=True):
+        if (
+            not isinstance(raw_task, Mapping)
+            or raw_task.get("task_id") != expected_task_id
+            or raw_task.get("status") != "passed"
+        ):
+            raise AutomatedRunError(f"producer task 未完整通过: {expected_task_id}")
+        manifest_value = raw_task.get("manifest_path")
+        if not isinstance(manifest_value, str):
+            raise AutomatedRunError(f"producer task manifest 越出冻结目录: {expected_task_id}")
+        expected_manifest = Path(manifest_value).resolve()
+        task_source_output = _producer_task_source_root(
+            source_output, expected_task_id, expected_manifest
+        )
+        manifest = _read_json_object(expected_manifest, f"producer task {expected_task_id}")
+        task_sources[expected_task_id] = {
+            "source_output_dir": str(task_source_output),
+            "task_manifest_path": str(expected_manifest),
+            "task_manifest_sha256": _sha256_file(expected_manifest),
+        }
+        execution = manifest.get("execution")
+        records = manifest.get("attempt_results")
+        if (
+            manifest.get("failure") is not None
+            or not isinstance(execution, Mapping)
+            or execution.get("phase_mode") != "adaptive_producers"
+            or execution.get("run_producer_pair_only") is not True
+            or not isinstance(records, list)
+            or len(records) != 4
+        ):
+            raise AutomatedRunError(f"producer task 不是完整双臂阶段: {expected_task_id}")
+        by_variant = {
+            record.get("variant"): record for record in records if isinstance(record, Mapping)
+        }
+        if set(by_variant) != {"A", "B_empty", "B_claim", "B_forced_claim"}:
+            raise AutomatedRunError(f"producer task 四臂身份无效: {expected_task_id}")
+        for alias, variant in aliases.items():
+            record = by_variant[variant]
+            if (
+                record.get("status") not in {"passed", "agent_failed"}
+                or not isinstance(record.get("verifier_passed"), bool)
+            ):
+                raise AutomatedRunError(f"producer {alias} 缺少有效 Gate 终态: {expected_task_id}")
+            attempt_id = record.get("attempt_id")
+            result_value = record.get("result_path")
+            result_hash = record.get("result_hash")
+            if not isinstance(attempt_id, str) or not attempt_id:
+                raise AutomatedRunError(f"producer {alias} attempt_id 无效: {expected_task_id}")
+            expected_result = (
+                task_source_output
+                / "attempts"
+                / attempt_id
+                / "output"
+                / "attempt-result.json"
+            )
+            if (
+                not isinstance(result_value, str)
+                or Path(result_value).resolve() != expected_result
+                or not isinstance(result_hash, str)
+                or result_hash != _sha256_file(expected_result)
+            ):
+                raise AutomatedRunError(f"producer {alias} result 绑定无效: {expected_task_id}")
+            result = _read_json_object(expected_result, f"producer {alias} attempt result")
+            rewards = result.get("pier_trial")
+            rewards = rewards.get("verifier_rewards") if isinstance(rewards, Mapping) else None
+            if (
+                result.get("attempt_id") != attempt_id
+                or result.get("variant") != variant
+                or result.get("verifier_passed") != record.get("verifier_passed")
+                or not isinstance(rewards, Mapping)
+            ):
+                raise AutomatedRunError(f"producer {alias} verifier 证据无效: {expected_task_id}")
+            f2p_passed = _reward_count(rewards.get("f2p_passed"), "f2p_passed")
+            f2p_total = _reward_count(rewards.get("f2p_total"), "f2p_total")
+            if f2p_passed > f2p_total:
+                raise AutomatedRunError(f"producer {alias} F2P 计数无效: {expected_task_id}")
+            score = scores[alias]
+            score["valid_attempts"] += 1
+            score["verifier_passed"] += int(record["verifier_passed"])
+            score["f2p_passed"] += f2p_passed
+            score["f2p_total"] += f2p_total
+        for variant in ("B_claim", "B_forced_claim"):
+            record = by_variant[variant]
+            if record.get("status") != "not_run" or record.get("reason") != "PRODUCER_PAIR_ONLY":
+                raise AutomatedRunError(f"producer 阶段提前执行 claim arm: {expected_task_id}")
+
+    for score in scores.values():
+        total = score["f2p_total"]
+        if total <= 0:
+            raise AutomatedRunError("producer 全量 F2P denominator 必须大于 0")
+        score["f2p_micro"] = score["f2p_passed"] / total
+    s1 = scores["S1"]
+    s2 = scores["S2"]
+    if s2["verifier_passed"] > s1["verifier_passed"]:
+        winner_alias = "S2"
+    elif s2["verifier_passed"] < s1["verifier_passed"]:
+        winner_alias = "S1"
+    else:
+        s1_cross = s1["f2p_passed"] * s2["f2p_total"]
+        s2_cross = s2["f2p_passed"] * s1["f2p_total"]
+        winner_alias = "S2" if s2_cross > s1_cross else "S1"
+    loser_alias = "S2" if winner_alias == "S1" else "S1"
+    winner_variant = aliases[winner_alias]
+    loser_variant = aliases[loser_alias]
+    selection = {
+        "schema_version": 1,
+        "status": "selected",
+        "candidate_aliases": aliases,
+        "score_rule": ["verifier_passed", "f2p_micro", "S1_on_exact_tie"],
+        "source_output_dir": str(source_output),
+        "producer_aggregate_path": str(aggregate_path),
+        "producer_aggregate_sha256": _sha256_file(aggregate_path),
+        "task_order": task_order,
+        "task_sources": task_sources,
+        "candidates": scores,
+        "winner_alias": winner_alias,
+        "loser_alias": loser_alias,
+        "winner_variant": winner_variant,
+        "loser_variant": loser_variant,
+        "logical_labels": {"A": winner_variant, "B_empty": loser_variant},
+    }
+    selection_path = run_root / "producer-selection.json"
+    if selection_path.exists():
+        if _read_json_object(selection_path, "producer selection") != selection:
+            raise AutomatedRunError("既有 producer selection 与冻结评分证据不一致")
+    else:
+        _atomic_write_json(selection_path, selection)
+    return selection
+
+
+def _producer_task_source_root(
+    producer_output: Path, task_id: str, manifest_path: Path
+) -> Path:
+    try:
+        task_source_output = manifest_path.parents[2]
+    except IndexError as error:
+        raise AutomatedRunError(f"producer task manifest 层级无效: {task_id}") from error
+    if manifest_path != task_source_output / "tasks" / task_id / "manifest.json":
+        raise AutomatedRunError(f"producer task manifest 不在标准 task 目录: {task_id}")
+    resumes_root = producer_output / "resumes"
+    valid_resume = (
+        task_source_output.parent == resumes_root
+        and re.fullmatch(r"resume-[0-9]+", task_source_output.name) is not None
+    )
+    if task_source_output != producer_output and not valid_resume:
+        raise AutomatedRunError(f"producer task source 越出原始或 resume 根目录: {task_id}")
+    return task_source_output
+
+
+def _reward_count(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise AutomatedRunError(f"verifier reward {field} 必须为非负整数")
+    return value
+
+
+def _sha256_file(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as error:
+        raise AutomatedRunError(f"无法读取冻结证据文件: {path}") from error
+
+
 def _current_acn_revision() -> str:
     """正式冻结只接受可由单一 commit 完整还原的干净工作树。"""
     revision = subprocess.run(
@@ -856,6 +1161,13 @@ def _harness_mode(raw: Mapping[str, object]) -> str:
     value = raw.get("harness_mode", "standard")
     if value not in {"standard", "minimal"}:
         raise AutomatedRunError("harness_mode 仅支持 standard 或 minimal")
+    return value
+
+
+def _claim_producer_variant(raw: Mapping[str, object]) -> str:
+    value = raw.get("claim_producer_variant", "A")
+    if value not in {"A", "B_empty", "adaptive"}:
+        raise AutomatedRunError("claim_producer_variant 仅支持 A、B_empty 或 adaptive")
     return value
 
 
