@@ -358,15 +358,29 @@ pub(crate) struct ProviderTerminalFailure {
     message: String,
 }
 
-/// Provider 明确拒绝了过大的 HTTP 请求体。Adapter 只负责统一分类，是否能通过
-/// 剥离媒体恢复由持有完整 provider-neutral history 的 turn loop 决定。
+/// Provider 或其上游 transport 明确拒绝了过大的请求。Adapter 只负责统一分类，
+/// 是否能通过剥离媒体恢复由持有完整 provider-neutral history 的 turn loop 决定。
 #[derive(Debug, thiserror::Error)]
-#[error("LLM provider request is too large (HTTP 413)")]
-pub(crate) struct ProviderRequestTooLarge;
+#[error("LLM provider request exceeds the upstream size limit")]
+pub(crate) struct ProviderRequestTooLarge {
+    discard_visible_output: bool,
+}
 
 impl ProviderRequestTooLarge {
     pub(crate) fn new() -> Self {
-        Self
+        Self {
+            discard_visible_output: false,
+        }
+    }
+
+    pub(crate) fn after_visible_output() -> Self {
+        Self {
+            discard_visible_output: true,
+        }
+    }
+
+    pub(crate) fn should_discard_visible_output(&self) -> bool {
+        self.discard_visible_output
     }
 }
 

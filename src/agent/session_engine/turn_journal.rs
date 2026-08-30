@@ -118,6 +118,12 @@ impl SessionTurnEventRecorder for TurnJournalDurableEventRecorder {
                     )
                     .await
             }
+            SessionTurnEvent::AssistantOutputDiscarded => {
+                self.assistant_delta_flusher.flush();
+                self.sink
+                    .send_immediate_durable(TurnJournalEventKind::AssistantOutputDiscarded)
+                    .await
+            }
             SessionTurnEvent::NonStreamingFallbackAttemptFailed {
                 attempt,
                 max_attempts,

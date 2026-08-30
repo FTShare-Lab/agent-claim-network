@@ -665,6 +665,7 @@ impl AnthropicProviderAdapter {
                     emit(ProviderEvent::AssistantTextDelta { text });
                 }
                 SessionTurnEvent::AssistantMessageCompleted { .. }
+                | SessionTurnEvent::AssistantOutputDiscarded
                 | SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
                 | SessionTurnEvent::NonStreamingFallbackAttemptFailed { .. }
                 | SessionTurnEvent::NonStreamingFallbackSucceeded { .. }
@@ -2494,7 +2495,7 @@ mod tests {
 
         let classified = classify_request_too_large(&error).expect("HTTP 413 classification");
 
-        assert!(classified.to_string().contains("HTTP 413"));
+        assert!(classified.to_string().contains("upstream size limit"));
         assert!(!classified.to_string().contains("provider limit"));
         assert!(classify_request_too_large(&AnthropicError::Status {
             status: 400,

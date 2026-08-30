@@ -319,6 +319,9 @@ impl SessionTuiState {
                 self.transcript.set_activity(None);
                 self.transcript.push_assistant_delta(text);
             }
+            SessionEvent::AssistantOutputDiscarded => {
+                self.transcript.discard_active_assistant();
+            }
             SessionEvent::AssistantMessageCompleted { text } => {
                 self.transcript.set_activity(None);
                 self.transcript.complete_assistant_message(text);

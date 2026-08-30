@@ -54,9 +54,14 @@ const NON_STREAMING_FALLBACK_BASE_DELAY: Duration = Duration::from_millis(250);
 const NON_STREAMING_FALLBACK_MAX_DELAY: Duration = Duration::from_secs(4);
 const MAX_CONTEXT_WINDOW_RECOVERIES: usize = 2;
 const OVERSIZED_IMAGE_PLACEHOLDER: &str =
-    "[image attachment removed after HTTP 413 request_too_large]";
+    "[image attachment removed after upstream request_too_large]";
 const OVERSIZED_DOCUMENT_PLACEHOLDER: &str =
-    "[document attachment removed after HTTP 413 request_too_large]";
+    "[document attachment removed after upstream request_too_large]";
+const OVERSIZED_MEDIA_RECOVERY_CONTEXT: &str = r#"<request_size_recovery>
+The previous provider request exceeded the upstream size limit. All image and document payloads were removed before this retry, so their pixels or document contents are not available in the current model context.
+
+If completing the task still requires visual or document inspection, use the available file-reading tool to read only the few local files necessary to complete the task. For attachments without a readable local path, ask the user to provide a smaller file in a later message.
+</request_size_recovery>"#;
 // Provider WAL 是发起网络 I/O 前的内部保护边界，不与用户可配置的
 // LLM 请求超时共用几分钟的等待时间。
 const PROVIDER_WAL_PREPARATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1461,10 +1466,6 @@ impl AgentTurnLoop {
             .as_deref()
             .map(SessionTurnPreflight::frozen_provider_history_prefix_len)
             .unwrap_or(0);
-        let mut frozen_provider_prefix = FrozenProviderRequestPrefix::new(
-            &provider_messages,
-            frozen_provider_history_prefix_len,
-        )?;
         let mut committed = Vec::new();
         let (user_message, text_attachment_reads, attachment_warnings) = session_user_message(
             user_text,
@@ -1484,6 +1485,15 @@ impl AgentTurnLoop {
             recovered_model_context,
         )
         .await?;
+        // 精确 Provider WAL 缺失、identity 变化，或进程在 clean WAL 写入前退出时，
+        // canonical/journal 中的恢复边界仍必须阻止旧媒体重新进入请求。
+        if replace_media_before_latest_request_size_recovery(&mut provider_messages) > 0 {
+            self.provider.discard_runtime_chain(runtime_chain_id).await;
+        }
+        let mut frozen_provider_prefix = FrozenProviderRequestPrefix::new(
+            &provider_messages,
+            frozen_provider_history_prefix_len,
+        )?;
         let initial_context = self
             .observe_model_context(&provider_messages, &mut context_appender)
             .await?;
@@ -1505,8 +1515,6 @@ impl AgentTurnLoop {
         let mut pending_process_deliveries = Vec::<PendingProcessDelivery>::new();
         let mut context_continuation = ContextWindowContinuation::default();
         let mut context_window_recoveries = 0usize;
-        let mut oversized_media_recovery_attempted = false;
-
         let mut turn_idx = 0usize;
         let mut provider_request_idx = 0usize;
         loop {
@@ -1593,6 +1601,12 @@ impl AgentTurnLoop {
                 frozen_provider_prefix.clear();
                 // 同时废弃 connection-local previous_response_id；健康 socket 与
                 // runtime-chain sticky HTTP 状态仍可保留，下一请求必须发送完整新窗口。
+                self.provider.discard_runtime_chain(runtime_chain_id).await;
+            }
+            if replace_media_before_latest_request_size_recovery(&mut provider_messages) > 0 {
+                // projection 在 compaction 或其他 provider history 重建后重新剥离了旧
+                // 媒体；旧 cache/replay 已不再描述实际请求，必须从干净窗口开新链。
+                frozen_provider_prefix.clear();
                 self.provider.discard_runtime_chain(runtime_chain_id).await;
             }
             // steering、context 观察和 compaction 都可能让出执行权；若此时已收到
@@ -1706,15 +1720,35 @@ impl AgentTurnLoop {
             let provider_call = match provider_call {
                 Ok(provider_call) => provider_call,
                 Err(error)
-                    if !oversized_media_recovery_attempted
-                        && error.downcast_ref::<ProviderRequestTooLarge>().is_some()
+                    if error.downcast_ref::<ProviderRequestTooLarge>().is_some()
                         && replace_oversized_provider_media(&mut provider_messages) > 0 =>
                 {
-                    oversized_media_recovery_attempted = true;
+                    if error
+                        .downcast_ref::<ProviderRequestTooLarge>()
+                        .is_some_and(ProviderRequestTooLarge::should_discard_visible_output)
+                    {
+                        let discarded = SessionTurnEvent::AssistantOutputDiscarded;
+                        record_durable_event(&mut durable_recorder, discarded.clone()).await?;
+                        emit(discarded);
+                    }
+                    let recovery_context = CompletedSessionTurnMessage::new(
+                        SessionTurnMessage::model_context(
+                            ModelContextSource::RequestSizeRecovery,
+                            OVERSIZED_MEDIA_RECOVERY_CONTEXT,
+                        ),
+                        self.now(),
+                    );
+                    // journal 必须先于恢复请求持久化；成功 turn 再由 committed 进入
+                    // canonical。每次真实剥离都追加新边界，不能按相同 fingerprint 去重。
+                    if let Some(recorder) = durable_recorder.as_deref_mut() {
+                        recorder.record_completed_message(&recovery_context).await?;
+                    }
+                    provider_messages.push(recovery_context.message.clone());
+                    committed.push(recovery_context);
                     frozen_provider_prefix.clear();
                     self.provider.discard_runtime_chain(runtime_chain_id).await;
                     let warning = SessionTurnEvent::Warning {
-                        message: "上游拒绝了过大的请求；已从模型上下文中移除图片 / PDF，并自动重试一次。如仍需模型查看，请在后续消息重新附加较小文件。".into(),
+                        message: "上游拒绝了过大的请求；已从上下文中移除图片 / PDF 并重试。".into(),
                     };
                     record_durable_event(&mut durable_recorder, warning.clone()).await?;
                     emit(warning);
@@ -2085,7 +2119,13 @@ impl AgentTurnLoop {
                         .downcast_ref::<ProviderRequestPreparationFailure>()
                         .is_some() =>
             {
-                Err(error)
+                if emitted_assistant_text
+                    && error.downcast_ref::<ProviderRequestTooLarge>().is_some()
+                {
+                    Err(ProviderRequestTooLarge::after_visible_output().into())
+                } else {
+                    Err(error)
+                }
             }
             Err(mut previous_error)
                 if emitted_assistant_text
@@ -2219,7 +2259,13 @@ impl AgentTurnLoop {
                                 };
                             record_durable_event(durable_recorder, failed_event.clone()).await?;
                             emit(failed_event);
-                            return Err(error);
+                            return if emitted_assistant_text
+                                && error.downcast_ref::<ProviderRequestTooLarge>().is_some()
+                            {
+                                Err(ProviderRequestTooLarge::after_visible_output().into())
+                            } else {
+                                Err(error)
+                            };
                         }
                         Err(error) => {
                             let (error_text, _) = truncate_chars(
@@ -2665,6 +2711,26 @@ fn runtime_context_text(now: DateTime<Utc>, workspace_root: &Path) -> String {
 /// 若本轮最终失败，则沿用现有 failed-turn 不提交 canonical 的语义。清除 replay 可避免
 /// 相同 provider 的私有历史绕过本次剥离。
 fn replace_oversized_provider_media(messages: &mut [SessionTurnMessage]) -> usize {
+    replace_provider_media_with_oversized_placeholders(messages)
+}
+
+/// 最后一道恢复边界覆盖它之前的全部媒体；边界后的显式重读属于新事件，仍可发送。
+/// 该投影使 canonical/journal fallback 与精确 Provider WAL 具有相同的
+/// request-too-large 语义。
+fn replace_media_before_latest_request_size_recovery(messages: &mut [SessionTurnMessage]) -> usize {
+    let Some(boundary) = messages.iter().rposition(|message| {
+        message
+            .model_context_snapshot()
+            .is_some_and(|(source, _, _)| *source == ModelContextSource::RequestSizeRecovery)
+    }) else {
+        return 0;
+    };
+    replace_provider_media_with_oversized_placeholders(&mut messages[..boundary])
+}
+
+fn replace_provider_media_with_oversized_placeholders(
+    messages: &mut [SessionTurnMessage],
+) -> usize {
     let mut replaced = 0usize;
     for message in messages.iter_mut() {
         for block in &mut message.content {
@@ -3630,6 +3696,7 @@ fn provider_request_contains_process_tool_result(
 mod tests {
     use std::collections::{BTreeMap, HashSet, VecDeque};
     use std::future::pending;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
 
@@ -3645,6 +3712,7 @@ mod tests {
         ProviderRequestPreparationFailure, ProviderRequestProgress, ProviderRequestTooLarge,
         ProviderStreamFailure, ProviderTerminalFailure, CONTINUATION_TRIGGER,
         OVERSIZED_DOCUMENT_PLACEHOLDER, OVERSIZED_IMAGE_PLACEHOLDER,
+        OVERSIZED_MEDIA_RECOVERY_CONTEXT,
     };
     use crate::agent::fs::LocalFsMemoryStore;
     use crate::api::{
@@ -3716,6 +3784,12 @@ mod tests {
     struct OversizedFallbackProvider {
         calls: AtomicUsize,
         requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    struct RepeatedMediaRecoveryProvider {
+        calls: AtomicUsize,
+        requests: Mutex<Vec<ProviderRequest>>,
+        reread_path: PathBuf,
     }
 
     struct ZeroTextRecoverableProvider {
@@ -3974,6 +4048,33 @@ mod tests {
 
         async fn discard_runtime_chain(&self, _chain_id: ProviderRuntimeChainId) {
             self.discarded_chains.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for RepeatedMediaRecoveryProvider {
+        async fn send(
+            &self,
+            request: ProviderRequest,
+            _emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        ) -> anyhow::Result<ProviderResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requests.lock().await.push(request);
+            match call {
+                0 | 2 => Err(ProviderRequestTooLarge::new().into()),
+                1 => Ok(response(
+                    vec![SessionTurnContentBlock::ToolUse {
+                        id: "toolu_reread".into(),
+                        name: "file_read".into(),
+                        input: json!({"path": self.reread_path}),
+                    }],
+                    ProviderStop::ToolUse,
+                )),
+                _ => Ok(response(
+                    vec![SessionTurnContentBlock::text("recovered twice")],
+                    ProviderStop::Done,
+                )),
+            }
         }
     }
 
@@ -7057,6 +7158,24 @@ mod tests {
         let cleaned_wire = serde_json::to_string(&requests[1].messages).unwrap();
         assert!(cleaned_wire.contains(OVERSIZED_IMAGE_PLACEHOLDER));
         assert!(cleaned_wire.contains(OVERSIZED_DOCUMENT_PLACEHOLDER));
+        assert!(cleaned_wire.contains("<request_size_recovery>"));
+        assert!(cleaned_wire.contains("few local files necessary to complete the task"));
+        assert_eq!(
+            requests[1]
+                .messages
+                .iter()
+                .filter(|message| {
+                    message
+                        .model_context_snapshot()
+                        .is_some_and(|(source, _, text)| {
+                            *source == ModelContextSource::RequestSizeRecovery
+                                && text == OVERSIZED_MEDIA_RECOVERY_CONTEXT
+                        })
+                })
+                .count(),
+            1,
+            "413 恢复说明必须作为一条独立的 provider-visible ModelContext"
+        );
         assert!(!cleaned_wire.contains("historical-pdf-base64"));
         assert!(!cleaned_wire.contains("opaque"));
         assert!(!requests[1].messages.iter().any(|message| {
@@ -7072,6 +7191,12 @@ mod tests {
             &non_context_messages(&turn)[0].content[1],
             SessionTurnContentBlock::Image { .. }
         ));
+        assert!(turn.messages.iter().any(|message| {
+            message
+                .message
+                .model_context_snapshot()
+                .is_some_and(|(source, _, _)| *source == ModelContextSource::RequestSizeRecovery)
+        }));
         assert_eq!(
             events
                 .iter()
@@ -7124,6 +7249,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_media_in_same_turn_can_trigger_another_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let initial_path = dir.path().join("initial.png");
+        let reread_path = dir.path().join("reread.png");
+        tokio::fs::write(&initial_path, tiny_png_bytes())
+            .await
+            .unwrap();
+        tokio::fs::write(&reread_path, tiny_png_bytes())
+            .await
+            .unwrap();
+        let provider = Arc::new(RepeatedMediaRecoveryProvider {
+            calls: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+            reread_path,
+        });
+        let turn_loop = tool_loop(provider.clone());
+        let mut with_image = request();
+        with_image.user_attachments =
+            vec![crate::api::SessionAttachment::LocalImage { path: initial_path }];
+        let mut events = Vec::new();
+
+        let turn = turn_loop
+            .run_session_turn(with_image, &mut |event| events.push(event))
+            .await
+            .unwrap();
+
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0].messages.iter().any(|message| message
+            .content
+            .iter()
+            .any(|block| matches!(block, SessionTurnContentBlock::Image { .. }))));
+        assert!(!requests[1].messages.iter().any(|message| message
+            .content
+            .iter()
+            .any(|block| matches!(block, SessionTurnContentBlock::Image { .. }))));
+        assert!(requests[2].messages.iter().any(|message| message
+            .content
+            .iter()
+            .any(|block| matches!(block, SessionTurnContentBlock::Image { .. }))));
+        assert!(!requests[3].messages.iter().any(|message| message
+            .content
+            .iter()
+            .any(|block| matches!(block, SessionTurnContentBlock::Image { .. }))));
+        assert_eq!(
+            requests[3]
+                .messages
+                .iter()
+                .filter(|message| message
+                    .model_context_snapshot()
+                    .is_some_and(|(source, _, _)| {
+                        *source == ModelContextSource::RequestSizeRecovery
+                    }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    SessionTurnEvent::Warning { message }
+                        if message == "上游拒绝了过大的请求；已从上下文中移除图片 / PDF 并重试。"
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(
+            turn.messages
+                .iter()
+                .filter(
+                    |message| message.message.model_context_snapshot().is_some_and(
+                        |(source, _, _)| { *source == ModelContextSource::RequestSizeRecovery }
+                    )
+                )
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn fallback_request_too_large_exits_fallback_loop_and_uses_media_recovery() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shot.png");
@@ -7168,6 +7374,15 @@ mod tests {
                 .count(),
             1
         );
+        let discarded = events
+            .iter()
+            .position(|event| matches!(event, SessionTurnEvent::AssistantOutputDiscarded))
+            .expect("the partial streaming attempt must be discarded before retry");
+        let warning = events
+            .iter()
+            .position(|event| matches!(event, SessionTurnEvent::Warning { .. }))
+            .expect("media recovery must emit a warning");
+        assert!(discarded < warning);
     }
 
     #[tokio::test]
@@ -7384,6 +7599,54 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn normalize_provider_messages_preserves_request_size_recovery_boundary() {
+        let recovery = SessionTurnMessage::model_context(
+            ModelContextSource::RequestSizeRecovery,
+            OVERSIZED_MEDIA_RECOVERY_CONTEXT,
+        );
+        let messages = vec![
+            SessionTurnMessage::user_text("request with removed media"),
+            recovery.clone(),
+            SessionTurnMessage::user_text("later user suffix"),
+        ];
+
+        let normalized = super::normalize_provider_messages(&messages);
+
+        assert_eq!(normalized, messages);
+        assert_eq!(normalized[1], recovery);
+    }
+
+    #[test]
+    fn request_size_recovery_boundary_only_strips_media_before_it() {
+        let mut messages = vec![
+            SessionTurnMessage::user_content(vec![SessionTurnContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "old-image".into(),
+            }]),
+            SessionTurnMessage::model_context(
+                ModelContextSource::RequestSizeRecovery,
+                OVERSIZED_MEDIA_RECOVERY_CONTEXT,
+            ),
+            SessionTurnMessage::user_content(vec![SessionTurnContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "new-image".into(),
+            }]),
+        ];
+
+        let replaced = super::replace_media_before_latest_request_size_recovery(&mut messages);
+
+        assert_eq!(replaced, 1);
+        assert!(matches!(
+            &messages[0].content[0],
+            SessionTurnContentBlock::Text { text } if text == OVERSIZED_IMAGE_PLACEHOLDER
+        ));
+        assert!(matches!(
+            &messages[2].content[0],
+            SessionTurnContentBlock::Image { data, .. } if data == "new-image"
+        ));
     }
 
     #[test]

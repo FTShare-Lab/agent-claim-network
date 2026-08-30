@@ -1697,7 +1697,7 @@ mod tests {
         let classified = classify_request_too_large(&error).expect("HTTP 413 classification");
         let classified = classified.to_string();
 
-        assert!(classified.contains("HTTP 413"));
+        assert!(classified.contains("upstream size limit"));
         assert!(!classified.contains(echoed_system));
         assert!(!classified.contains(echoed_user));
         assert!(!classified.contains(echoed_tool));

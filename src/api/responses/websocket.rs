@@ -16,7 +16,10 @@ use tokio::time::Instant;
 use super::client::compute_backoff;
 use super::protocol::{ReducedResponses, ResponsesRequest};
 use super::streaming::ResponsesEventDecoder;
-use super::{redact_responses_error_body, ResponsesError, ResponsesStreamEvent};
+use super::{
+    is_explicit_websocket_message_too_big, redact_responses_error_body, ResponsesError,
+    ResponsesStreamEvent,
+};
 use crate::api::llm_http::read_llm_error_body;
 use crate::api::{ProviderRecoveryInterrupt, ProviderRuntimeChainId, ProviderRuntimeFallbackScope};
 
@@ -318,6 +321,17 @@ impl ResponsesWebSocketTransport {
                 }
                 Err(WebSocketRequestFailure::ConnectionLimit) => {
                     self.pool.clear_chain(chain_id).await;
+                    return Ok(WebSocketSendOutcome::FallbackToHttp);
+                }
+                Err(WebSocketRequestFailure::Response(error))
+                    if is_explicit_websocket_message_too_big(&error) =>
+                {
+                    // 1009 只说明当前 WebSocket frame 过大；HTTP 可能仍能承载完整
+                    // 请求，因此跳过无效的 WS 重试，但不能把 endpoint 标成 sticky。
+                    self.pool.clear_chain(chain_id).await;
+                    if emitted_visible_text && !retry_after_partial {
+                        return Err(error);
+                    }
                     return Ok(WebSocketSendOutcome::FallbackToHttp);
                 }
                 Err(WebSocketRequestFailure::Response(error))
@@ -1166,6 +1180,8 @@ mod tests {
         MaxOutputThenRateLimitThenSuccess,
         RateLimitError,
         ServerErrorStatusCodeOnce,
+        WebSocketMessageTooBigHttpSuccess,
+        WebSocketMessageTooBigThenHttpMessageTooBigThenSuccess,
         UnauthorizedError,
         PingBetweenRequests,
         TrailingEventAfterTerminal,
@@ -1318,6 +1334,22 @@ mod tests {
             )
                 .into_response();
         }
+        if matches!(
+            &state.behavior,
+            FakeBehavior::WebSocketMessageTooBigThenHttpMessageTooBigThenSuccess
+        ) && request_number == 1
+        {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "error": {
+                        "type": "server_error",
+                        "message": "responses websocket upstream failed before any response event: upstream closed the connection (1009 message too big): message too big"
+                    }
+                })),
+            )
+                .into_response();
+        }
         if matches!(&state.behavior, FakeBehavior::VisibleThenClose)
             && request.get("stream").and_then(Value::as_bool) != Some(true)
         {
@@ -1449,6 +1481,27 @@ mod tests {
                             "error":{
                                 "type":"server_error",
                                 "message":"temporarily unavailable"
+                            }
+                        }),
+                    )
+                    .await;
+                    return;
+                }
+                FakeBehavior::WebSocketMessageTooBigHttpSuccess
+                | FakeBehavior::WebSocketMessageTooBigThenHttpMessageTooBigThenSuccess
+                    if matches!(
+                        &state.behavior,
+                        FakeBehavior::WebSocketMessageTooBigHttpSuccess
+                    ) || request_count == 1 =>
+                {
+                    send_json_frame(
+                        &mut socket,
+                        json!({
+                            "type":"error",
+                            "status_code":502,
+                            "error":{
+                                "type":"server_error",
+                                "message":"responses websocket upstream failed before any response event: upstream closed the connection (1009 message too big): message too big"
                             }
                         }),
                     )
@@ -1599,6 +1652,8 @@ mod tests {
                 | FakeBehavior::MaxOutputThenSuccess
                 | FakeBehavior::MaxOutputThenRateLimitThenSuccess
                 | FakeBehavior::ServerErrorStatusCodeOnce
+                | FakeBehavior::WebSocketMessageTooBigHttpSuccess
+                | FakeBehavior::WebSocketMessageTooBigThenHttpMessageTooBigThenSuccess
                 | FakeBehavior::BlockFirst(_)
                 | FakeBehavior::GateFirst { .. }
                 | FakeBehavior::CloseAfterSignal { .. } => {
@@ -2117,6 +2172,132 @@ mod tests {
         assert!(matches!(outcome, WebSocketSendOutcome::Response(_)));
         assert_eq!(state.connections.load(Ordering::SeqCst), 2);
         assert_eq!(state.http_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_ws_1009_uses_http_without_retry_or_sticky() {
+        let (server, state) =
+            start_websocket_server(FakeBehavior::WebSocketMessageTooBigHttpSuccess).await;
+        let client = super::super::ResponsesClient::new(
+            server.endpoint.clone(),
+            "test-key".into(),
+            Duration::from_secs(2),
+            3,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap()
+        .with_websockets(1)
+        .unwrap();
+        let chain = ProviderRuntimeChainId::new();
+        let media_request = request(vec![json!({
+            "type":"message",
+            "role":"user",
+            "content":[{"type":"input_image","image_url":"data:image/png;base64,bWVkaWE="}]
+        })]);
+
+        for _ in 0..2 {
+            let response = client
+                .send_with_retry_count_for_runtime_chain(
+                    &media_request,
+                    3,
+                    Some(chain),
+                    None,
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.output_text, "http");
+        }
+
+        assert_eq!(state.connections.load(Ordering::SeqCst), 2);
+        assert_eq!(state.http_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(state.requests.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn explicit_ws_1009_falls_back_without_sticky_then_http_error_strips_media() {
+        use base64::Engine;
+
+        use crate::api::{
+            AgentTurnLoop, OpenAiCompatibleResponsesProviderAdapter, SessionAttachment,
+            SessionTurnContentBlock, SessionTurnEvent, SessionTurnRequest,
+        };
+        use crate::config::ToolConfig;
+        use crate::tool::ToolRegistry;
+
+        let (server, state) = start_websocket_server(
+            FakeBehavior::WebSocketMessageTooBigThenHttpMessageTooBigThenSuccess,
+        )
+        .await;
+        let adapter = Arc::new(
+            OpenAiCompatibleResponsesProviderAdapter::new(
+                "test-key".into(),
+                server.endpoint.clone(),
+                "test-model".into(),
+                Duration::from_secs(2),
+                3,
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .unwrap()
+            .with_websockets(true, 1)
+            .unwrap(),
+        );
+        let tools = Arc::new(ToolRegistry::new(&ToolConfig::default()).unwrap());
+        let turn_loop = AgentTurnLoop::new(adapter, tools, 32);
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let mut events = Vec::new();
+
+        let turn = turn_loop
+            .run_session_turn_with_runtime_chain_hooks(
+                SessionTurnRequest {
+                    current_session_id: None,
+                    current_turn_id: None,
+                    system_prompt: "system".into(),
+                    history: Vec::new(),
+                    user_text: "inspect media".into(),
+                    user_attachments: vec![SessionAttachment::InlineImage {
+                        media_type: "image/png".into(),
+                        data: base64::engine::general_purpose::STANDARD.encode(png),
+                    }],
+                    skill_instructions: Vec::new(),
+                },
+                ProviderRuntimeChainId::new(),
+                &mut |event| events.push(event),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(turn.messages.iter().any(|message| {
+            message.content.iter().any(
+                |block| matches!(block, SessionTurnContentBlock::Text { text } if text == "ok"),
+            )
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    SessionTurnEvent::Warning { message }
+                        if message == "上游拒绝了过大的请求；已从上下文中移除图片 / PDF 并重试。"
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(state.connections.load(Ordering::SeqCst), 2);
+        assert_eq!(state.http_requests.load(Ordering::SeqCst), 1);
+        let requests = state.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].to_string().contains("input_image"));
+        assert!(!requests[1].to_string().contains("input_image"));
+        assert!(requests[1].to_string().contains("request_size_recovery"));
     }
 
     #[tokio::test]

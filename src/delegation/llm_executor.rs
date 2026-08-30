@@ -322,6 +322,7 @@ impl DelegationExecutor for LlmDelegationExecutor {
                 | SessionTurnEvent::RecapRequested { .. }
                 | SessionTurnEvent::CompactionSkipped { .. }
                 | SessionTurnEvent::AssistantTextDelta { .. }
+                | SessionTurnEvent::AssistantOutputDiscarded
                 | SessionTurnEvent::AssistantMessageCompleted { .. }
                 | SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
                 | SessionTurnEvent::NonStreamingFallbackAttemptFailed { .. }
@@ -572,6 +573,7 @@ impl SessionTurnEventRecorder for DelegationTranscriptRecorder {
             | SessionTurnEvent::RecapRequested { .. }
             | SessionTurnEvent::CompactionSkipped { .. }
             | SessionTurnEvent::AssistantTextDelta { .. }
+            | SessionTurnEvent::AssistantOutputDiscarded
             | SessionTurnEvent::AssistantMessageCompleted { .. }
             | SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
             | SessionTurnEvent::NonStreamingFallbackAttemptFailed { .. }

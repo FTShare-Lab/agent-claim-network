@@ -2734,6 +2734,9 @@ impl SessionEngine {
                     journal_emitter.assistant_delta(text.clone());
                     emit(SessionEvent::AssistantTextDelta { text });
                 }
+                SessionTurnEvent::AssistantOutputDiscarded => {
+                    emit(SessionEvent::AssistantOutputDiscarded);
+                }
                 SessionTurnEvent::AssistantMessageCompleted { text } => {
                     journal_emitter.flush_assistant_delta();
                     emit(SessionEvent::AssistantMessageCompleted { text });

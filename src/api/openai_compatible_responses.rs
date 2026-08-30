@@ -22,8 +22,9 @@ use super::provider::{
 };
 use super::redact_media_error_body;
 use super::responses::{
-    is_stream_recovery_failure, ResponsesClient, ResponsesError, ResponsesReasoning,
-    ResponsesRequest, ResponsesStreamEvent, ResponsesTerminal, ResponsesTool,
+    is_explicit_websocket_message_too_big, is_stream_recovery_failure, ResponsesClient,
+    ResponsesError, ResponsesReasoning, ResponsesRequest, ResponsesStreamEvent, ResponsesTerminal,
+    ResponsesTool,
 };
 use super::types::{ProviderReplayState, SessionTurnContentBlock, SessionTurnMessage};
 use super::SessionTurnInterrupted;
@@ -860,11 +861,12 @@ fn wrap_media_rejection(
 fn classify_request_too_large(
     error: &OpenAiCompatibleResponsesError,
 ) -> Option<ProviderRequestTooLarge> {
-    let OpenAiCompatibleResponsesError::Client(ResponsesError::Status { status: 413, .. }) = error
-    else {
+    let OpenAiCompatibleResponsesError::Client(error) = error else {
         return None;
     };
-    Some(ProviderRequestTooLarge::new())
+    (matches!(error, ResponsesError::Status { status: 413, .. })
+        || is_explicit_websocket_message_too_big(error))
+    .then(ProviderRequestTooLarge::new)
 }
 
 fn output_shape(reason: impl Into<String>) -> OpenAiCompatibleResponsesError {
@@ -1413,7 +1415,7 @@ mod tests {
 
         let classified = classify_request_too_large(&error).expect("HTTP 413 classification");
 
-        assert!(classified.to_string().contains("HTTP 413"));
+        assert!(classified.to_string().contains("upstream size limit"));
         assert!(!classified.to_string().contains("gateway limit"));
         assert!(
             classify_request_too_large(&OpenAiCompatibleResponsesError::Client(
@@ -1424,6 +1426,34 @@ mod tests {
             ))
             .is_none()
         );
+    }
+
+    #[test]
+    fn explicit_websocket_1009_proxy_error_is_classified_without_generic_502s() {
+        let classified = classify_request_too_large(&OpenAiCompatibleResponsesError::Client(
+            ResponsesError::Status {
+                status: 502,
+                body: "responses websocket upstream failed: upstream closed the connection (1009 message too big): message too big".into(),
+            },
+        ))
+        .expect("explicit WebSocket 1009 classification");
+        assert!(classified.to_string().contains("upstream size limit"));
+
+        for body in [
+            "ordinary bad gateway",
+            "message too big without a WebSocket close code",
+            "upstream closed with 1009 for an unspecified reason",
+        ] {
+            assert!(
+                classify_request_too_large(&OpenAiCompatibleResponsesError::Client(
+                    ResponsesError::Status {
+                        status: 502,
+                        body: body.into(),
+                    }
+                ))
+                .is_none()
+            );
+        }
     }
 
     #[test]

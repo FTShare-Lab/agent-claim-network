@@ -269,6 +269,9 @@ pub enum SessionTurnEvent {
     AssistantTextDelta {
         text: String,
     },
+    /// 当前 provider attempt 已显示的未完成 assistant 文本不会进入 canonical，
+    /// 消费方必须在恢复重试前移除该临时输出。
+    AssistantOutputDiscarded,
     AssistantMessageCompleted {
         text: String,
     },
@@ -452,6 +455,7 @@ pub enum ModelContextSource {
     Runtime,
     BackgroundProcess,
     Delegation,
+    RequestSizeRecovery,
 }
 
 impl ModelContextSource {
@@ -460,6 +464,7 @@ impl ModelContextSource {
             Self::Runtime => "runtime",
             Self::BackgroundProcess => "background_process",
             Self::Delegation => "delegation",
+            Self::RequestSizeRecovery => "request_size_recovery",
         }
     }
 }

@@ -10,6 +10,19 @@ mod websocket;
 
 const REDACTED_RESPONSES_PAYLOAD: &str = "[redacted Responses request/replay payload]";
 
+/// 部分兼容网关把上游 WebSocket 的 1009 大消息关闭包装成 500/502。
+/// 只有同时保留关闭码与明确尺寸原因时才识别，避免把普通网关故障误判为请求过大。
+pub(super) fn is_explicit_websocket_message_too_big(error: &ResponsesError) -> bool {
+    let ResponsesError::Status { status, body } = error else {
+        return false;
+    };
+    if !matches!(*status, 500 | 502) {
+        return false;
+    }
+    let normalized = body.to_ascii_lowercase();
+    normalized.contains("1009") && normalized.contains("message too big")
+}
+
 pub(super) fn redact_responses_error_body(body: &str) -> String {
     let redacted = match serde_json::from_str::<serde_json::Value>(body) {
         Ok(mut value) => {
@@ -95,6 +108,34 @@ pub use protocol::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_websocket_message_too_big_requires_status_code_and_reason() {
+        for status in [500, 502] {
+            assert!(is_explicit_websocket_message_too_big(
+                &ResponsesError::Status {
+                    status,
+                    body: "upstream closed (1009 MESSAGE TOO BIG): message too big".into(),
+                }
+            ));
+        }
+        for error in [
+            ResponsesError::Status {
+                status: 502,
+                body: "ordinary bad gateway".into(),
+            },
+            ResponsesError::Status {
+                status: 502,
+                body: "message too big".into(),
+            },
+            ResponsesError::Status {
+                status: 413,
+                body: "upstream closed (1009 message too big)".into(),
+            },
+        ] {
+            assert!(!is_explicit_websocket_message_too_big(&error));
+        }
+    }
 
     #[test]
     fn responses_error_redaction_removes_nested_and_embedded_replay() {

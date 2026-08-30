@@ -184,7 +184,11 @@ impl TranscriptState {
                     chunks.push(fixed_timeline_chunk(entry.display_lines(width), width))
                 }
                 HistoryEntry::Tool(_) if has_active_turn => {
-                    chunks.push(fixed_timeline_chunk(entry.live_status_lines(width), width))
+                    let mut lines = entry.live_status_lines(width);
+                    if needs_blank_before_entry(&self.history, index) {
+                        lines.insert(0, Line::default());
+                    }
+                    chunks.push(fixed_timeline_chunk(lines, width))
                 }
                 HistoryEntry::Tool(cell) if !cell.completed => {
                     chunks.push(fixed_timeline_chunk(entry.live_status_lines(width), width))
@@ -196,7 +200,13 @@ impl TranscriptState {
             }
         }
         if let Some(activity) = &self.activity {
-            chunks.push(fixed_timeline_chunk(vec![activity_line(activity)], width));
+            let mut lines = vec![activity_line(activity)];
+            // activity 不是 history entry，无法经过统一的 entry gap 判断；
+            // Warning / Status 后需在 live region 主动补回恰好一行间隔。
+            if matches!(self.history.last(), Some(HistoryEntry::Status(_))) {
+                lines.insert(0, Line::default());
+            }
+            chunks.push(fixed_timeline_chunk(lines, width));
         }
         if let Some(last_chunk) = chunks.last_mut() {
             match last_chunk {
@@ -302,6 +312,19 @@ impl TranscriptState {
             .push(HistoryEntry::Assistant(AssistantCell { text }));
         if self.active_user.is_some() {
             self.active_assistant = Some(index);
+        }
+    }
+
+    pub(super) fn discard_active_assistant(&mut self) {
+        let Some(index) = self.active_assistant.take() else {
+            return;
+        };
+        if index.saturating_add(1) == self.history.len()
+            && matches!(self.history.last(), Some(HistoryEntry::Assistant(_)))
+        {
+            self.history.pop();
+        } else if let Some(HistoryEntry::Assistant(cell)) = self.history.get_mut(index) {
+            cell.text.clear();
         }
     }
 
@@ -614,7 +637,9 @@ fn needs_blank_before_entry(history: &[HistoryEntry], index: usize) -> bool {
             (history.get(index.saturating_sub(1)), history.get(index)),
             (
                 Some(HistoryEntry::Status(_)),
-                Some(HistoryEntry::Assistant(_) | HistoryEntry::Error(_))
+                Some(
+                    HistoryEntry::Assistant(_) | HistoryEntry::Tool(_) | HistoryEntry::Error(_)
+                )
             )
         )
         || matches!(

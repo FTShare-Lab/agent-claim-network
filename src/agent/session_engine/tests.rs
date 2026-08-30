@@ -132,6 +132,7 @@ enum ProviderStep {
 struct RecordingProvider {
     steps: Mutex<VecDeque<ProviderStep>>,
     requests: Mutex<Vec<ProviderRequest>>,
+    history_media_policy: ProviderHistoryMediaPolicy,
 }
 
 impl RecordingProvider {
@@ -139,7 +140,13 @@ impl RecordingProvider {
         Self {
             steps: Mutex::new(VecDeque::from(steps)),
             requests: Mutex::new(Vec::new()),
+            history_media_policy: ProviderHistoryMediaPolicy::Placeholder,
         }
+    }
+
+    fn with_history_media_policy(mut self, policy: ProviderHistoryMediaPolicy) -> Self {
+        self.history_media_policy = policy;
+        self
     }
 
     async fn requests(&self) -> Vec<ProviderRequest> {
@@ -149,6 +156,10 @@ impl RecordingProvider {
 
 #[async_trait]
 impl ProviderAdapter for RecordingProvider {
+    fn history_media_policy(&self) -> ProviderHistoryMediaPolicy {
+        self.history_media_policy
+    }
+
     fn emit_preflight_context_estimate(&self) -> bool {
         false
     }
@@ -2718,6 +2729,21 @@ async fn request_too_large_media_cleanup_persists_provider_history_for_resume() 
         .content
         .iter()
         .any(|block| matches!(block, SessionContentBlock::Image { .. }))));
+    assert!(canonical_messages
+        .iter()
+        .any(|message| message.content.iter().any(|block| matches!(
+            block,
+            SessionContentBlock::ModelContext {
+                source: ModelContextSource::RequestSizeRecovery,
+                text,
+                ..
+            } if text.contains("few local files necessary to complete the task")
+        ))));
+    let journal = replay_turn_journal(session.read_turn_journal().await);
+    assert!(journal.turns[0].model_context.iter().any(|context| {
+        context.source == ModelContextSource::RequestSizeRecovery
+            && context.text.contains("<request_size_recovery>")
+    }));
     let metadata = session.read_metadata().await.unwrap();
     let stable_history = metadata
         .compaction
@@ -2726,7 +2752,9 @@ async fn request_too_large_media_cleanup_persists_provider_history_for_resume() 
         .expect("successful media recovery must persist provider history");
     assert!(stable_history.pending_turn.is_none());
     let stable_wire = serde_json::to_string(&stable_history.messages).unwrap();
-    assert!(stable_wire.contains("image attachment removed after HTTP 413"));
+    assert!(stable_wire.contains("image attachment removed after upstream request_too_large"));
+    assert!(stable_wire.contains("<request_size_recovery>"));
+    assert!(stable_wire.contains("few local files necessary to complete the task"));
     assert!(!stable_history.messages.iter().any(|message| message
         .content
         .iter()
@@ -2751,6 +2779,159 @@ async fn request_too_large_media_cleanup_persists_provider_history_for_resume() 
         .content
         .iter()
         .any(|block| matches!(block, SessionTurnContentBlock::Image { .. }))));
+}
+
+#[tokio::test]
+async fn request_too_large_recovery_discards_streaming_partial_before_tool_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let image_path = dir.path().join("partial-before-413.png");
+    let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2));
+    let mut image_bytes = Vec::new();
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut image_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    tokio::fs::write(&image_path, image_bytes).await.unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        error_step(
+            "stream transport failed",
+            vec![ProviderEvent::AssistantTextDelta {
+                text: "ghost partial".into(),
+            }],
+        ),
+        request_too_large_step(),
+        tool_use_step(
+            "toolu_after_413",
+            "working_note",
+            json!({"action": "add", "note": "continue after recovery"}),
+        ),
+        response_step("finished after tool", Vec::new()),
+    ]));
+    let (engine, store) = build_test_engine(&dir, provider);
+    let mut session = create_test_session(&store, "session_4130beef").await;
+    let mut events = Vec::new();
+
+    engine
+        .run_turn_with_attachments(
+            &mut session,
+            "inspect and continue with a tool",
+            vec![SessionAttachment::LocalImage { path: image_path }],
+            |event| events.push(event),
+        )
+        .await
+        .unwrap();
+
+    let discarded = events
+        .iter()
+        .position(|event| matches!(event, SessionEvent::AssistantOutputDiscarded))
+        .expect("streaming partial must be discarded");
+    let warning = events
+        .iter()
+        .position(|event| matches!(event, SessionEvent::Warning { .. }))
+        .expect("media recovery warning must be emitted");
+    let tool_started = events
+        .iter()
+        .position(|event| matches!(event, SessionEvent::ToolCallStarted { .. }))
+        .expect("clean retry should be allowed to return a tool call");
+    assert!(discarded < warning && warning < tool_started);
+
+    let journal_read = session.read_turn_journal().await;
+    assert!(journal_read
+        .events
+        .iter()
+        .any(|event| matches!(event.kind, TurnJournalEventKind::AssistantOutputDiscarded)));
+    let projection = replay_turn_journal(journal_read);
+    assert!(!projection.turns[0].assistant_text.contains("ghost partial"));
+    assert!(!projection.turns[0]
+        .timeline_items
+        .iter()
+        .any(|item| matches!(
+            item,
+            crate::session::TurnJournalTimelineItem::Assistant { text, .. }
+                if text.contains("ghost partial")
+        )));
+    assert!(
+        !serde_json::to_string(&session.read_messages().await.unwrap())
+            .unwrap()
+            .contains("ghost partial")
+    );
+}
+
+#[tokio::test]
+async fn request_too_large_boundary_rebuilds_clean_history_without_provider_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let image_path = dir.path().join("canonical-image.png");
+    let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2));
+    let mut image_bytes = Vec::new();
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut image_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    tokio::fs::write(&image_path, image_bytes).await.unwrap();
+    let provider = Arc::new(
+        RecordingProvider::new(vec![
+            request_too_large_step(),
+            response_step("recovered", Vec::new()),
+            response_step("continued from canonical", Vec::new()),
+        ])
+        .with_history_media_policy(ProviderHistoryMediaPolicy::Preserve),
+    );
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_4130cafe").await;
+
+    engine
+        .run_turn_with_attachments(
+            &mut session,
+            "inspect canonical image",
+            vec![SessionAttachment::LocalImage { path: image_path }],
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+    let mut compaction = session
+        .read_metadata()
+        .await
+        .unwrap()
+        .compaction
+        .expect("provider WAL should exist after the recovered request");
+    compaction.provider_history = None;
+    session.update_compaction(compaction).await.unwrap();
+    let agent_id = session.metadata.agent_id.clone();
+    let session_id = session.metadata.id.clone();
+    drop(session);
+    let mut resumed = store
+        .load_existing_session(&agent_id, &session_id)
+        .await
+        .unwrap();
+
+    engine
+        .run_turn(&mut resumed, "continue without provider WAL", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 3);
+    let rebuilt_wire = serde_json::to_string(&requests[2].messages).unwrap();
+    assert!(rebuilt_wire.contains("image attachment removed after upstream request_too_large"));
+    assert!(rebuilt_wire.contains("<request_size_recovery>"));
+    assert!(!requests[2].messages.iter().any(|message| message
+        .content
+        .iter()
+        .any(|block| matches!(block, SessionTurnContentBlock::Image { .. }))));
+    assert!(resumed
+        .read_messages()
+        .await
+        .unwrap()
+        .iter()
+        .any(|message| message
+            .content
+            .iter()
+            .any(|block| matches!(block, SessionContentBlock::Image { .. }))));
 }
 
 #[tokio::test]
@@ -2795,9 +2976,16 @@ async fn failed_inline_media_cleanup_resumes_from_clean_provider_history() {
         .downcast_ref::<crate::api::ProviderRequestTooLarge>()
         .is_some());
     assert_eq!(warnings.len(), 1);
-    assert!(warnings[0].contains("重新附加较小文件"));
-    assert!(!warnings[0].contains("保留在本地"));
+    assert_eq!(
+        warnings[0],
+        "上游拒绝了过大的请求；已从上下文中移除图片 / PDF 并重试。"
+    );
     assert!(session.read_messages().await.unwrap().is_empty());
+    let failed_journal = replay_turn_journal(session.read_turn_journal().await);
+    assert!(failed_journal.turns[0]
+        .model_context
+        .iter()
+        .any(|context| context.source == ModelContextSource::RequestSizeRecovery));
     let failed_requests = provider.requests().await;
     assert_eq!(failed_requests.len(), 2);
     let metadata = session.read_metadata().await.unwrap();
@@ -2809,7 +2997,9 @@ async fn failed_inline_media_cleanup_resumes_from_clean_provider_history() {
     assert!(pending_history.pending_turn.is_some());
     assert_eq!(pending_history.messages, failed_requests[1].messages);
     let pending_wire = serde_json::to_string(&pending_history.messages).unwrap();
-    assert!(pending_wire.contains("image attachment removed after HTTP 413"));
+    assert!(pending_wire.contains("image attachment removed after upstream request_too_large"));
+    assert!(pending_wire.contains("<request_size_recovery>"));
+    assert!(pending_wire.contains("few local files necessary to complete the task"));
     assert!(!pending_wire.contains(&inline_data));
 
     let agent_id = session.metadata.agent_id.clone();
@@ -2833,6 +3023,103 @@ async fn failed_inline_media_cleanup_resumes_from_clean_provider_history() {
         .content
         .iter()
         .any(|block| matches!(block, SessionTurnContentBlock::Image { .. }))));
+    assert!(resumed
+        .read_messages()
+        .await
+        .unwrap()
+        .iter()
+        .any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    SessionContentBlock::ModelContext {
+                        source: ModelContextSource::RequestSizeRecovery,
+                        ..
+                    }
+                )
+            })
+        }));
+}
+
+#[tokio::test]
+async fn failed_media_cleanup_recovers_boundary_without_provider_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2));
+    let mut image_bytes = Vec::new();
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut image_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    let inline_data = BASE64_STANDARD.encode(image_bytes);
+    let provider = Arc::new(RecordingProvider::new(vec![
+        request_too_large_step(),
+        request_too_large_step(),
+        response_step("continued from journal boundary", Vec::new()),
+    ]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_4130dead").await;
+
+    engine
+        .run_turn_with_attachments(
+            &mut session,
+            "inspect failed clipboard image",
+            vec![SessionAttachment::InlineImage {
+                media_type: "image/png".into(),
+                data: inline_data.clone(),
+            }],
+            |_| {},
+        )
+        .await
+        .expect_err("cleaned retry should preserve a failed journal boundary");
+
+    let mut compaction = session
+        .read_metadata()
+        .await
+        .unwrap()
+        .compaction
+        .expect("failed cleaned request should leave a Provider WAL");
+    compaction.provider_history = None;
+    session.update_compaction(compaction).await.unwrap();
+    let agent_id = session.metadata.agent_id.clone();
+    let session_id = session.metadata.id.clone();
+    drop(session);
+    let mut resumed = store
+        .load_existing_session(&agent_id, &session_id)
+        .await
+        .unwrap();
+
+    engine
+        .run_turn(&mut resumed, "continue from journal only", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 3);
+    let rebuilt_wire = serde_json::to_string(&requests[2].messages).unwrap();
+    assert!(rebuilt_wire.contains("<request_size_recovery>"));
+    assert!(!rebuilt_wire.contains(&inline_data));
+    assert!(!requests[2].messages.iter().any(|message| message
+        .content
+        .iter()
+        .any(|block| matches!(block, SessionTurnContentBlock::Image { .. }))));
+    assert!(resumed
+        .read_messages()
+        .await
+        .unwrap()
+        .iter()
+        .any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    SessionContentBlock::ModelContext {
+                        source: ModelContextSource::RequestSizeRecovery,
+                        ..
+                    }
+                )
+            })
+        }));
 }
 
 #[tokio::test]

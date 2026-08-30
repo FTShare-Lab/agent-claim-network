@@ -4154,6 +4154,111 @@ fn active_assistant_delta_stays_in_inline_live_region_until_completed() {
 }
 
 #[test]
+fn request_size_warning_keeps_single_gap_before_thinking_activity() {
+    let mut state = super::TuiState::new();
+    state.begin_pending_turn("inspect oversized media".into());
+    state.apply_event(SessionEvent::TurnStarted {
+        turn_id: "turn_413_thinking".into(),
+    });
+    state.apply_event(SessionEvent::UserMessageAccepted {
+        text: "inspect oversized media".into(),
+    });
+    state.apply_event(SessionEvent::Warning {
+        message: "上游拒绝了过大的请求；已从上下文中移除图片 / PDF 并重试。".into(),
+    });
+
+    let live_lines = lines_plain_text(&state.active_assistant_lines(96));
+    let warning_index = live_lines
+        .iter()
+        .position(|line| line.contains("Warning: 上游拒绝了过大的请求"))
+        .expect("413 recovery warning");
+    let thinking_index = live_lines
+        .iter()
+        .position(|line| line.contains("thinking..."))
+        .expect("retry activity");
+    assert_eq!(
+        blank_lines_between(&live_lines, warning_index, thinking_index),
+        1,
+        "413 recovery warning 与 thinking activity 之间应恰好保留一行空行:\n{}",
+        live_lines.join("\n")
+    );
+}
+
+#[test]
+fn discarded_assistant_output_does_not_survive_media_recovery_tool_response() {
+    let mut state = super::TuiState::new();
+    state.begin_pending_turn("inspect image".into());
+    state.apply_event(SessionEvent::TurnStarted {
+        turn_id: "turn_413".into(),
+    });
+    state.apply_event(SessionEvent::UserMessageAccepted {
+        text: "inspect image".into(),
+    });
+    state.apply_event(SessionEvent::AssistantTextDelta {
+        text: "ghost partial".into(),
+    });
+    state.apply_event(SessionEvent::AssistantOutputDiscarded);
+    state.apply_event(SessionEvent::Warning {
+        message: "上游拒绝了过大的请求；已从上下文中移除图片 / PDF 并重试。".into(),
+    });
+    state.apply_event(SessionEvent::ToolCallStarted {
+        id: "toolu_after_413".into(),
+        name: "working_note".into(),
+        summary: "记录恢复进度".into(),
+    });
+
+    let live_lines = lines_plain_text(&state.active_assistant_lines(96));
+    let warning_index = live_lines
+        .iter()
+        .position(|line| line.contains("Warning: 上游拒绝了过大的请求"))
+        .expect("413 recovery warning");
+    let tool_index = live_lines
+        .iter()
+        .position(|line| line.contains("Calling working_note"))
+        .expect("tool call after 413 recovery");
+    assert_eq!(
+        blank_lines_between(&live_lines, warning_index, tool_index),
+        1,
+        "413 recovery warning 与后续工具调用之间应恰好保留一行空行:\n{}",
+        live_lines.join("\n")
+    );
+
+    state.apply_event(SessionEvent::ToolCallCompleted {
+        id: "toolu_after_413".into(),
+        summary: "tool working_note ok".into(),
+        file_change: None,
+        outcome: ToolExecutionOutcome::Completed,
+    });
+    state.apply_event(SessionEvent::TurnCommitted { message_count: 3 });
+
+    let committed_lines = lines_plain_text(&super::history_render_lines_with_width(&state, 96));
+    let committed_warning_index = committed_lines
+        .iter()
+        .position(|line| line.contains("Warning: 上游拒绝了过大的请求"))
+        .expect("committed 413 recovery warning");
+    let committed_tool_index = committed_lines
+        .iter()
+        .position(|line| line.contains("Called working_note"))
+        .expect("committed tool call after 413 recovery");
+    assert_eq!(
+        blank_lines_between(
+            &committed_lines,
+            committed_warning_index,
+            committed_tool_index
+        ),
+        1,
+        "提交后的 413 recovery warning 与工具调用之间应恰好保留一行空行:\n{}",
+        committed_lines.join("\n")
+    );
+
+    let transcript = state.transcript_text();
+    assert!(!transcript.contains("ghost partial"));
+    assert!(
+        transcript.contains("Warning: 上游拒绝了过大的请求；已从上下文中移除图片 / PDF 并重试。")
+    );
+}
+
+#[test]
 fn running_live_box_uses_configured_visual_row_limit() {
     let mut state = super::TuiState::new();
     state.apply_event(SessionEvent::StatusChanged {
