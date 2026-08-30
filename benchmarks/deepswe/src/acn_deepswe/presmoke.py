@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -257,6 +258,27 @@ class PresmokeHostRunner:
             "task_order": list(self.frozen_task_ids),
             "task_results": [result.to_dict() for result in results],
             "claim_funnel": _claim_funnel(results),
+            "cohort_metrics": _cohort_metrics(results),
+            "cohort_definitions": {
+                "success_efficiency": (
+                    "A verifier passed and A produced at least one frozen claim; "
+                    "primary cohort for claim-assisted success and efficiency comparisons"
+                ),
+                "failure_recovery": (
+                    "A verifier failed but A produced at least one frozen claim; "
+                    "reported separately as recovery from unverified producer output"
+                ),
+                "unpaired_no_claim": "A produced no frozen claim; claim arms are not paired",
+            },
+            "usage_metric_definitions": {
+                "token_totals_and_means": (
+                    "observed values; lower bounds when incomplete_model_responses is non-zero"
+                ),
+                "paired_token_deltas": (
+                    "B observed value minus A observed value; either side may be a lower bound "
+                    "when token_delta_includes_observed_lower_bound is true"
+                ),
+            },
         }
         _atomic_write_json(self.aggregate_manifest_path, payload)
 
@@ -556,11 +578,23 @@ def _has_valid_gated_attempt_evidence(
     """确认一个已运行 arm 的 result 与 Gate 都与冻结 attempt 对齐。"""
     result_path = record.get("result_path")
     gate_path = record.get("gate_path")
-    if not isinstance(result_path, str) or not isinstance(gate_path, str):
+    result_hash = record.get("result_hash")
+    gate_hash = record.get("gate_hash")
+    if not all(
+        isinstance(value, str) and value
+        for value in (result_path, gate_path, result_hash, gate_hash)
+    ):
+        return False
+    result_file = Path(result_path)
+    gate_file = Path(gate_path)
+    if (
+        _sha256_file_if_present(result_file) != result_hash
+        or _sha256_file_if_present(gate_file) != gate_hash
+    ):
         return False
     try:
-        result = json.loads(Path(result_path).read_text(encoding="utf-8"))
-        gate = json.loads(Path(gate_path).read_text(encoding="utf-8"))
+        result = json.loads(result_file.read_text(encoding="utf-8"))
+        gate = json.loads(gate_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
     return (
@@ -581,6 +615,7 @@ def _claim_funnel(results: tuple[PresmokeTaskResult, ...]) -> dict[str, dict[str
         "retrieved",
         "injected",
         "used",
+        "delivery_evidence_count",
         "injected_claim_count",
         "used_claim_count",
     )
@@ -610,11 +645,231 @@ def _claim_funnel(results: tuple[PresmokeTaskResult, ...]) -> dict[str, dict[str
             for field in ("bundle_available", "retrieved", "injected", "used"):
                 if observation.get(field) is True:
                     funnel[variant][field] += 1
-            for field in ("injected_claim_count", "used_claim_count"):
+            for field in (
+                "delivery_evidence_count",
+                "injected_claim_count",
+                "used_claim_count",
+            ):
                 value = observation.get(field)
                 if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                     funnel[variant][field] += value
     return funnel
+
+
+_METRIC_VARIANTS = ("A", "B_empty", "B_claim", "B_forced_claim")
+_REQUEST_USAGE_FIELDS = (
+    "model_requests",
+    "complete_model_responses",
+    "incomplete_model_responses",
+)
+_TOKEN_USAGE_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "reasoning_tokens",
+)
+_USAGE_FIELDS = _REQUEST_USAGE_FIELDS + _TOKEN_USAGE_FIELDS
+
+
+def _cohort_metrics(results: tuple[PresmokeTaskResult, ...]) -> dict[str, object]:
+    """按 producer verifier cohort 汇总成功率、用量与同题 B-A 差值。"""
+    cohorts: dict[str, dict[str, object]] = {}
+    for task in results:
+        validated = _validated_cohort_attempts(task)
+        if validated is None:
+            continue
+        cohort, attempts = validated
+        cohort_row = cohorts.setdefault(cohort, _new_cohort_row())
+        cohort_row["task_count"] = int(cohort_row["task_count"]) + 1
+        variants = cohort_row["variants"]
+        if not isinstance(variants, dict):
+            continue
+        for variant, (passed, usage) in attempts.items():
+            _accumulate_variant(variants[variant], passed, usage)
+        a_attempt = attempts.get("A")
+        paired = cohort_row["paired_against_a"]
+        if cohort == "unpaired_no_claim" or a_attempt is None or not isinstance(paired, dict):
+            continue
+        a_passed, a_usage = a_attempt
+        for variant in _METRIC_VARIANTS[1:]:
+            b_attempt = attempts.get(variant)
+            if b_attempt is None:
+                continue
+            b_passed, b_usage = b_attempt
+            pair = paired[variant]
+            if not isinstance(pair, dict):
+                continue
+            pair["pairs"] = int(pair["pairs"]) + 1
+            pair["verifier_passed_delta"] = int(pair["verifier_passed_delta"]) + (
+                int(b_passed) - int(a_passed)
+            )
+            usage_delta = pair["usage_delta_totals"]
+            if isinstance(usage_delta, dict):
+                for field in _USAGE_FIELDS:
+                    usage_delta[field] = int(usage_delta[field]) + b_usage[field] - a_usage[field]
+            if a_usage["incomplete_model_responses"] or b_usage["incomplete_model_responses"]:
+                pair["pairs_with_incomplete_usage"] = (
+                    int(pair["pairs_with_incomplete_usage"]) + 1
+                )
+    return {cohort: _finalize_cohort_row(row) for cohort, row in cohorts.items()}
+
+
+def _validated_cohort_attempts(
+    task: PresmokeTaskResult,
+) -> tuple[str, dict[str, tuple[bool, dict[str, int]]]] | None:
+    """只接受四臂均有 Gate pass 且哈希闭合的完整 task，避免部分结果污染统计。"""
+    if task.status != "passed" or task.error is not None:
+        return None
+    manifest = _read_mapping_if_present(Path(task.manifest_path))
+    if manifest is None or manifest.get("failure") is not None:
+        return None
+    cohort = manifest.get("experiment_cohort")
+    records = manifest.get("attempt_results")
+    if (
+        cohort not in {"success_efficiency", "failure_recovery", "unpaired_no_claim"}
+        or not isinstance(records, list)
+        or len(records) != len(_METRIC_VARIANTS)
+    ):
+        return None
+    attempts: dict[str, tuple[bool, dict[str, int]]] = {}
+    for record in records:
+        if not isinstance(record, Mapping):
+            return None
+        attempt_id = record.get("attempt_id")
+        variant = record.get("variant")
+        if (
+            not isinstance(attempt_id, str)
+            or not attempt_id
+            or variant not in _METRIC_VARIANTS
+            or variant in attempts
+            or record.get("status") not in {"passed", "agent_failed"}
+        ):
+            return None
+        result_path = record.get("result_path")
+        if not isinstance(result_path, str) or not _has_valid_gated_attempt_evidence(
+            attempt_id, variant, record
+        ):
+            return None
+        result_file = Path(result_path)
+        attempt_result = _read_mapping_if_present(result_file)
+        if attempt_result is None:
+            return None
+        verifier_passed = attempt_result.get("verifier_passed")
+        usage = attempt_result.get("usage")
+        if (
+            not isinstance(verifier_passed, bool)
+            or record.get("verifier_passed") != verifier_passed
+            or not isinstance(usage, Mapping)
+        ):
+            return None
+        usage_values: dict[str, int] = {}
+        for field in _USAGE_FIELDS:
+            value = usage.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return None
+            usage_values[field] = value
+        if (
+            usage_values["complete_model_responses"]
+            + usage_values["incomplete_model_responses"]
+            != usage_values["model_requests"]
+        ):
+            return None
+        attempts[variant] = (verifier_passed, usage_values)
+    if set(attempts) != set(_METRIC_VARIANTS):
+        return None
+    return cohort, attempts
+
+
+def _sha256_file_if_present(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _new_cohort_row() -> dict[str, object]:
+    return {
+        "task_count": 0,
+        "variants": {
+            variant: {
+                "attempts": 0,
+                "verifier_passed": 0,
+                "incomplete_usage_attempts": 0,
+                "usage_totals": {field: 0 for field in _USAGE_FIELDS},
+            }
+            for variant in _METRIC_VARIANTS
+        },
+        "paired_against_a": {
+            variant: {
+                "pairs": 0,
+                "verifier_passed_delta": 0,
+                "pairs_with_incomplete_usage": 0,
+                "usage_delta_totals": {field: 0 for field in _USAGE_FIELDS},
+            }
+            for variant in _METRIC_VARIANTS[1:]
+        },
+    }
+
+
+def _accumulate_variant(row: object, passed: bool, usage: Mapping[str, int]) -> None:
+    if not isinstance(row, dict):
+        return
+    row["attempts"] = int(row["attempts"]) + 1
+    row["verifier_passed"] = int(row["verifier_passed"]) + int(passed)
+    if usage["incomplete_model_responses"]:
+        row["incomplete_usage_attempts"] = int(row["incomplete_usage_attempts"]) + 1
+    totals = row["usage_totals"]
+    if isinstance(totals, dict):
+        for field in _USAGE_FIELDS:
+            totals[field] = int(totals[field]) + usage[field]
+
+
+def _finalize_cohort_row(row: dict[str, object]) -> dict[str, object]:
+    variants = row["variants"]
+    if isinstance(variants, dict):
+        for metrics in variants.values():
+            if not isinstance(metrics, dict):
+                continue
+            attempts = int(metrics["attempts"])
+            passed = int(metrics["verifier_passed"])
+            incomplete = int(metrics["incomplete_usage_attempts"])
+            totals = metrics["usage_totals"]
+            metrics["verifier_pass_rate"] = passed / attempts if attempts else None
+            metrics["incomplete_usage_attempt_rate"] = (
+                incomplete / attempts if attempts else None
+            )
+            metrics["token_values_are_observed_lower_bound"] = incomplete > 0
+            metrics["usage_means"] = {
+                field: (int(totals[field]) / attempts if attempts else None)
+                for field in _USAGE_FIELDS
+            }
+    paired = row["paired_against_a"]
+    if isinstance(paired, dict):
+        for metrics in paired.values():
+            if not isinstance(metrics, dict):
+                continue
+            pairs = int(metrics["pairs"])
+            delta = int(metrics["verifier_passed_delta"])
+            incomplete_pairs = int(metrics["pairs_with_incomplete_usage"])
+            totals = metrics["usage_delta_totals"]
+            metrics["verifier_pass_rate_delta"] = delta / pairs if pairs else None
+            metrics["pairs_with_incomplete_usage_rate"] = (
+                incomplete_pairs / pairs if pairs else None
+            )
+            metrics["token_delta_includes_observed_lower_bound"] = incomplete_pairs > 0
+            metrics["usage_delta_means"] = {
+                field: (int(totals[field]) / pairs if pairs else None)
+                for field in _USAGE_FIELDS
+            }
+    return row
+
+
+def _read_mapping_if_present(path: Path) -> Mapping[str, object] | None:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return raw if isinstance(raw, Mapping) else None
 
 
 def _atomic_write_json(path: Path, payload: object) -> None:

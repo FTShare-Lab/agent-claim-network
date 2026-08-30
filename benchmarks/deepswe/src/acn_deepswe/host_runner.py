@@ -307,7 +307,7 @@ def build_attempt_toml(
     prompt = (
         f"Please solve this issue:\n\n{task_prompt}\n\n{MINIMAL_TASK_GUIDANCE}"
         if harness_mode == "minimal"
-        else "先读取并遵循 /coding-benchmark skill。\n\n" + task_prompt
+        else "请执行 /coding-benchmark，并解决以下任务：\n\n" + task_prompt
     )
     lines = [
         "schema_version = 1",
@@ -688,7 +688,7 @@ class Task1HostRunner:
                 records.append(a_record)
                 if a_record.status in {"gate_failed", "infrastructure_failed"}:
                     raise TaskExecutionError(a_record.reason)
-                self._freeze_after_a(attempts[0], execution)
+                self._freeze_after_a(attempts[0], execution, a_record)
                 has_frozen_claims = bool(self._frozen_claim_ids)
                 cohort = (
                     "success_efficiency"
@@ -1123,15 +1123,31 @@ class Task1HostRunner:
             raise ValueError(f"verifier 重判仍无结果: {reason}")
         return trial_dir, evidence
 
-    def _freeze_after_a(self, attempt: AttemptManifest, execution: Task1ExecutionConfig) -> None:
+    def _freeze_after_a(
+        self,
+        attempt: AttemptManifest,
+        execution: Task1ExecutionConfig,
+        a_record: AttemptExecutionRecord,
+    ) -> None:
         evaluation_dir = self._find_evaluation_dir(attempt)
         result = read_rust_result(evaluation_dir / "result.json")
         if Path(result.event_ledger_path).name != "events.jsonl":
             raise TaskExecutionError("Rust result event_ledger_path 不符合定版文件名")
         host_ledger = (evaluation_dir / "events.jsonl").resolve()
+        if a_record.result_path is None or a_record.verifier_passed is None:
+            raise TaskExecutionError("A attempt 缺少 producer verifier 证据，不能冻结 claim")
+        attempt_result_path = Path(a_record.result_path).resolve()
+        attempt_result_hash = _sha256_file(attempt_result_path)
         append_freeze_barrier(host_ledger, attempt.attempt_id, f"freeze-{attempt.attempt_id}")
         bundle = freeze_claim_bundle(
-            host_ledger, attempt.attempt_id, execution.artifacts.claim_bundle.resolve()
+            host_ledger,
+            attempt.attempt_id,
+            execution.artifacts.claim_bundle.resolve(),
+            producer_verification={
+                "attempt_id": attempt.attempt_id,
+                "verifier_passed": a_record.verifier_passed,
+                "attempt_result_sha256": attempt_result_hash,
+            },
         )
         self._frozen_claim_ids = tuple(claim.claim_id for claim in bundle.claims)
         self._frozen_claim_bundle_hash = _sha256_file(execution.artifacts.claim_bundle)
@@ -1680,6 +1696,29 @@ def _validate_source_claim_bundle(
         raise TaskExecutionError("A-only claim bundle manifest identity 无效")
     if metadata.get("bundle_hash") != bundle_hash:
         raise TaskExecutionError("A-only claim bundle 内容已漂移")
+    producer = metadata.get("producer_verification")
+    expected_producer_fields = {
+        "attempt_id",
+        "verifier_passed",
+        "attempt_result_sha256",
+    }
+    if not isinstance(producer, Mapping) or set(producer) != expected_producer_fields:
+        raise TaskExecutionError("A-only claim bundle 缺少完整 producer_verification")
+    verifier_passed = source_result.get("verifier_passed")
+    producer_passed = producer.get("verifier_passed")
+    producer_result_hash = producer.get("attempt_result_sha256")
+    if (
+        producer.get("attempt_id") != attempt_id
+        or not isinstance(producer_passed, bool)
+        or producer_passed != verifier_passed
+        or not _is_sha256(producer_result_hash)
+    ):
+        raise TaskExecutionError("A-only claim bundle producer verifier identity 不一致")
+    attempt_result_path = (
+        bundle_path.parents[2] / "attempts" / attempt_id / "output" / "attempt-result.json"
+    )
+    if producer_result_hash != _sha256_file(attempt_result_path):
+        raise TaskExecutionError("A-only claim bundle producer verifier 证据已漂移")
     raw_claims = json.loads(bundle_path.read_text(encoding="utf-8")).get("claims")
     metadata_claims = metadata.get("claims")
     if not isinstance(raw_claims, list) or not isinstance(metadata_claims, list):
@@ -1907,10 +1946,12 @@ def _claim_observation(
     used_ids = set(claim_used_ids)
     return {
         "delivery": "forced" if variant == "B_forced_claim" else "on_demand",
+        "delivery_evidence_count": len(router_evidence),
         "bundle_available": bool(frozen_claim_content_hashes),
         "retrieved": bool(router_evidence),
         "injected": bool(injected_ids),
         "used": bool(used_ids),
+        "used_attribution": "finalize_recap_self_report",
         "injected_claim_count": len(injected_ids),
         "used_claim_count": len(used_ids),
     }

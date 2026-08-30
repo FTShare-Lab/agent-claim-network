@@ -100,7 +100,7 @@ pub(super) fn format_router_scopes_overview(snapshot: &ScopesOverviewSnapshot) -
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "团队 router 当前在这些 scope 下有 claim：\n\n{scope_lines}\n\n当用户请求与这些 scope 相关、需要利用团队已有共享知识时（例如查找可复用判断、复用其他 agent 的 claim、检查潜在 claim 冲突等等），，使用 consult_router tool 查询具体 claim。"
+        "团队 router 当前在这些 scope 下有 claim：\n\n{scope_lines}\n\n当用户请求与这些 scope 相关、需要利用团队已有共享知识时（例如查找可复用判断、复用其他 agent 的 claim、检查潜在 claim 冲突等），使用 consult_router tool 查询具体 claim。"
     )
 }
 

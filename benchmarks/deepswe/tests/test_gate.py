@@ -269,3 +269,21 @@ class GateValidatorTests(unittest.TestCase):
         )
 
         self.assertIn("CLAIM_NOT_INJECTED", result.reason)
+
+    def test_claim_delivery_must_have_at_most_one_evidence_record(self) -> None:
+        base = _b_claim_input()
+
+        repeated = GateValidator().validate(
+            replace(base, router_evidence=(base.router_evidence[0], base.router_evidence[0]))
+        )
+        forced_missing = GateValidator().validate(
+            replace(
+                base,
+                variant="B_forced_claim",
+                router_evidence=(),
+                claim_used_ids=(),
+            )
+        )
+
+        self.assertIn("CLAIM_DELIVERY_REPEATED", repeated.reason)
+        self.assertIn("FORCED_CLAIM_DELIVERY_COUNT_INVALID", forced_missing.reason)

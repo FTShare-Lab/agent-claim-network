@@ -78,9 +78,8 @@ class ConfigGenerationTests(unittest.TestCase):
             with self.subTest(variant=attempt.variant):
                 rendered = tomllib.loads(build_attempt_toml(attempt, "fix the bug", 5100))
                 self.assertEqual(rendered["workspace_root"], "/app")
-                self.assertTrue(
-                    rendered["task_prompt"].startswith("先读取并遵循 /coding-benchmark")
-                )
+                self.assertTrue(rendered["task_prompt"].startswith("请执行 /coding-benchmark"))
+                self.assertNotIn("读取并遵循", rendered["task_prompt"])
                 self.assertEqual(rendered["attempt_deadline_secs"], 5100)
                 self.assertEqual(rendered["model_egress_mode"], "pier")
                 self.assertEqual(rendered["harness_mode"], "standard")
@@ -766,6 +765,29 @@ class ProvenanceTests(unittest.TestCase):
             with (
                 patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True),
                 self.assertRaisesRegex(TaskExecutionError, "claim bundle 内容已漂移"),
+            ):
+                Task1HostRunner(
+                    b_experiment, root / "followup" / "jobs", b_execution
+                ).validate_b_only_source()
+
+    def test_b_only_followup_rejects_missing_producer_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, source_execution = _run_a_only_source(root / "source")
+            bundle = source_execution.artifacts.claim_bundle
+            metadata_path = bundle.with_name(bundle.name + ".manifest.json")
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            del metadata["producer_verification"]
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            _, b_execution, b_experiment = _b_only_followup(
+                root / "followup", source_execution, provenance()
+            )
+
+            with (
+                patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True),
+                self.assertRaisesRegex(
+                    TaskExecutionError, "缺少完整 producer_verification"
+                ),
             ):
                 Task1HostRunner(
                     b_experiment, root / "followup" / "jobs", b_execution

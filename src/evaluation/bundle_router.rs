@@ -18,6 +18,19 @@ use crate::router::{
 
 use super::EVALUATION_SCHEMA_VERSION;
 
+/// 冻结 bundle 在单个 attempt 内的唯一交付方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrozenClaimDeliveryPolicy {
+    /// 仅供通用单元测试和非正式调用；正式评测不会使用。
+    Unrestricted,
+    /// A/B_empty 不允许通过 router 获得 claim。
+    Disabled,
+    /// B_claim 可读取一次 system overview，并执行一次 query。
+    OnDemandOnce,
+    /// B_forced_claim 由 harness 一次性交付完整 bundle，模型侧查询被禁用。
+    ForcedOnce,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrozenClaimBundle {
@@ -36,6 +49,9 @@ pub struct FrozenClaimBundleRouter {
     evidence: Mutex<Vec<RouterEvidence>>,
     evidence_sequence: AtomicU64,
     evidence_audit_incomplete: AtomicBool,
+    delivery_policy: FrozenClaimDeliveryPolicy,
+    overview_delivered: AtomicBool,
+    delivery_consumed: AtomicBool,
 }
 
 impl FrozenClaimBundleRouter {
@@ -79,7 +95,39 @@ impl FrozenClaimBundleRouter {
             evidence: Mutex::new(Vec::new()),
             evidence_sequence: AtomicU64::new(0),
             evidence_audit_incomplete: AtomicBool::new(false),
+            delivery_policy: FrozenClaimDeliveryPolicy::Unrestricted,
+            overview_delivered: AtomicBool::new(false),
+            delivery_consumed: AtomicBool::new(false),
         })
+    }
+
+    pub fn with_delivery_policy(mut self, policy: FrozenClaimDeliveryPolicy) -> Self {
+        self.delivery_policy = policy;
+        self
+    }
+
+    /// B_forced_claim 的唯一交付入口：一次返回完整冻结 bundle，同时写入一条 router evidence。
+    pub fn deliver_forced_claims_once(
+        &self,
+        task_prompt: &str,
+    ) -> anyhow::Result<Vec<CandidateClaim>> {
+        if self.delivery_policy != FrozenClaimDeliveryPolicy::ForcedOnce {
+            anyhow::bail!("stage=router 当前 attempt 不允许 forced claim 交付");
+        }
+        self.consume_delivery("forced claim bundle 已交付，拒绝重复交付")?;
+        let candidates = self
+            .claims
+            .iter()
+            .cloned()
+            .map(|claim| CandidateClaim {
+                claim,
+                open_dispute_ids: Vec::new(),
+                resolved_dispute_ids: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let query = AgentQuery::from_task("evaluation/forced_claims", task_prompt);
+        self.record_evidence(&query, &candidates)?;
+        Ok(candidates)
     }
 
     pub fn take_evidence(&self) -> Vec<RouterEvidence> {
@@ -96,45 +144,19 @@ impl FrozenClaimBundleRouter {
     pub fn audit_is_incomplete(&self) -> bool {
         self.evidence_audit_incomplete.load(Ordering::Acquire)
     }
-}
 
-#[async_trait]
-impl RouterClient for FrozenClaimBundleRouter {
-    async fn query(&self, agent_query: &AgentQuery) -> anyhow::Result<RouterQueryResult> {
-        let mut candidate_claims = self
-            .claims
-            .iter()
-            .cloned()
-            .filter_map(|claim| {
-                let document = RetrievalDocument::from_claim(&claim, Vec::new(), Vec::new());
-                let score = query_match_score(agent_query, &document, claim.status)?;
-                Some((
-                    score,
-                    CandidateClaim {
-                        claim,
-                        open_dispute_ids: Vec::new(),
-                        resolved_dispute_ids: Vec::new(),
-                    },
-                ))
-            })
-            .collect::<Vec<_>>();
-        candidate_claims.sort_by(|left, right| {
-            right
-                .0
-                .cmp(&left.0)
-                .then_with(|| {
-                    right
-                        .1
-                        .claim
-                        .effective_updated_at()
-                        .cmp(&left.1.claim.effective_updated_at())
-                })
-                .then_with(|| left.1.claim.id.as_str().cmp(right.1.claim.id.as_str()))
-        });
-        let candidate_claims = candidate_claims
-            .into_iter()
-            .map(|(_, candidate)| candidate)
-            .collect::<Vec<_>>();
+    fn consume_delivery(&self, duplicate_message: &str) -> anyhow::Result<()> {
+        self.delivery_consumed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| anyhow::anyhow!(duplicate_message.to_owned()))?;
+        Ok(())
+    }
+
+    fn record_evidence(
+        &self,
+        agent_query: &AgentQuery,
+        candidate_claims: &[CandidateClaim],
+    ) -> anyhow::Result<()> {
         let candidate_claim_ids = candidate_claims
             .iter()
             .map(|candidate| candidate.claim.id.to_string())
@@ -182,6 +204,60 @@ impl RouterClient for FrozenClaimBundleRouter {
                 );
             }
         }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RouterClient for FrozenClaimBundleRouter {
+    async fn query(&self, agent_query: &AgentQuery) -> anyhow::Result<RouterQueryResult> {
+        match self.delivery_policy {
+            FrozenClaimDeliveryPolicy::Disabled => {
+                anyhow::bail!("stage=router 当前 attempt 禁止 claim 查询")
+            }
+            FrozenClaimDeliveryPolicy::ForcedOnce => {
+                anyhow::bail!("stage=router frozen claims 已由 harness 完整交付，禁止重复查询")
+            }
+            FrozenClaimDeliveryPolicy::OnDemandOnce => {
+                self.consume_delivery("stage=router B_claim 只允许一次 query，拒绝重复查询")?;
+            }
+            FrozenClaimDeliveryPolicy::Unrestricted => {}
+        }
+        let mut candidate_claims = self
+            .claims
+            .iter()
+            .cloned()
+            .filter_map(|claim| {
+                let document = RetrievalDocument::from_claim(&claim, Vec::new(), Vec::new());
+                let score = query_match_score(agent_query, &document, claim.status)?;
+                Some((
+                    score,
+                    CandidateClaim {
+                        claim,
+                        open_dispute_ids: Vec::new(),
+                        resolved_dispute_ids: Vec::new(),
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+        candidate_claims.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| {
+                    right
+                        .1
+                        .claim
+                        .effective_updated_at()
+                        .cmp(&left.1.claim.effective_updated_at())
+                })
+                .then_with(|| left.1.claim.id.as_str().cmp(right.1.claim.id.as_str()))
+        });
+        let candidate_claims = candidate_claims
+            .into_iter()
+            .map(|(_, candidate)| candidate)
+            .collect::<Vec<_>>();
+        self.record_evidence(agent_query, &candidate_claims)?;
         Ok(RouterQueryResult {
             candidate_claims,
             disputes: Vec::new(),
@@ -190,7 +266,21 @@ impl RouterClient for FrozenClaimBundleRouter {
     }
 
     async fn scopes_overview(&self) -> anyhow::Result<ScopesOverviewSnapshot> {
-        Ok(self.overview.clone())
+        let visible = match self.delivery_policy {
+            FrozenClaimDeliveryPolicy::Disabled => false,
+            FrozenClaimDeliveryPolicy::ForcedOnce => {
+                !self.delivery_consumed.load(Ordering::Acquire)
+            }
+            FrozenClaimDeliveryPolicy::OnDemandOnce => {
+                !self.overview_delivered.swap(true, Ordering::AcqRel)
+            }
+            FrozenClaimDeliveryPolicy::Unrestricted => true,
+        };
+        Ok(if visible {
+            self.overview.clone()
+        } else {
+            ScopesOverviewSnapshot { scopes: Vec::new() }
+        })
     }
 }
 
@@ -341,5 +431,77 @@ mod tests {
         assert_eq!(result.candidate_claims[1].claim, other);
         let evidence = router.take_evidence();
         assert_eq!(evidence[0].bundle_hash, None);
+    }
+
+    #[tokio::test]
+    async fn on_demand_policy_exposes_overview_and_query_only_once() {
+        let claim = sample_claim(
+            "claim_11111111",
+            "payment timeout",
+            "connection pool exhaustion causes payment timeout",
+        );
+        let router = FrozenClaimBundleRouter::new(
+            FrozenClaimBundle {
+                schema_version: EVALUATION_SCHEMA_VERSION,
+                claims: vec![claim],
+            },
+            "attempt-001".into(),
+            None,
+        )
+        .unwrap()
+        .with_delivery_policy(FrozenClaimDeliveryPolicy::OnDemandOnce);
+
+        assert_eq!(router.scopes_overview().await.unwrap().scopes.len(), 1);
+        assert!(router.scopes_overview().await.unwrap().scopes.is_empty());
+        let query = AgentQuery::from_task("billing/payment", "payment timeout");
+        assert_eq!(
+            router.query(&query).await.unwrap().candidate_claims.len(),
+            1
+        );
+        assert!(router
+            .query(&query)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("只允许一次"));
+        assert_eq!(router.take_evidence().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn forced_policy_delivers_complete_bundle_once_and_hides_router_afterwards() {
+        let first = sample_claim("claim_11111111", "first", "first fact");
+        let mut second = sample_claim("claim_22222222", "second", "unrelated fact");
+        second.scope = "operations/incidents".into();
+        let router = FrozenClaimBundleRouter::new(
+            FrozenClaimBundle {
+                schema_version: EVALUATION_SCHEMA_VERSION,
+                claims: vec![first, second],
+            },
+            "attempt-001".into(),
+            None,
+        )
+        .unwrap()
+        .with_delivery_policy(FrozenClaimDeliveryPolicy::ForcedOnce);
+
+        let delivered = router
+            .deliver_forced_claims_once("fix payment timeout")
+            .unwrap();
+
+        assert_eq!(delivered.len(), 2);
+        assert!(router.scopes_overview().await.unwrap().scopes.is_empty());
+        assert!(router
+            .query(&AgentQuery::from_task("billing/payment", "payment timeout"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("完整交付"));
+        assert!(router
+            .deliver_forced_claims_once("fix payment timeout")
+            .unwrap_err()
+            .to_string()
+            .contains("拒绝重复交付"));
+        let evidence = router.take_evidence();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].injected_claim_ids.len(), 2);
     }
 }
