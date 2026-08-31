@@ -42,7 +42,12 @@ token 计量由 `acn_eval` 自己从上游响应的 `usage` 累计，写进 `res
 `assets/coding-benchmark/SKILL.md`（hash 写入 manifest），路径为
 `/logs/agent/runtime/skills/coding-benchmark`；`minimal` 四臂改用精简 system/task prompt，只保留
 `code_run`、托管进程、claim/router 与提交工具，不加载 skill、文件工具、working note 或 `ACN.md`。
-两种 harness 都可用于正式对照，但正式运行仍强制 `model_egress_mode="pier"`，不能用 direct egress。
+机制 canary 另提供三个显式模式：`concise` 使用精简 prompt、无 skill/`ACN.md`，但保留 standard
+工具面；`pi_like` 只保留受管 shell、`file_read`、`file_write`、claim/router 与提交工具，并使用
+50KB 可确认分页输出、16,384 token reserve 触发和约 20k recent tail；`open_code_like` 在其上增加
+`file_patch`。这些名称表示同模型下的机制近似，不代表外部 harness 的完整兼容：搜索仍通过
+`code_run`，没有原生 `grep`/`glob` 别名或 LSP，长输出也使用 ACN cursor 分页而非临时文件 spill。
+所有 harness 都可用于正式对照，但正式运行仍强制 `model_egress_mode="pier"`，不能用 direct egress。
 评测生成的 `acn.toml` 将
 `max_parallel_tool_calls` 设为 `5`、`file_diff_max_changed_lines` 设为 `200`；
 `code_run` 观察窗口仍用产品内部护栏，不开放 TOML。A-only 短评测 prompt 与提交纪律的决策记录见
@@ -55,6 +60,10 @@ token 计量由 `acn_eval` 自己从上游响应的 `usage` 累计，写进 `res
 `claim_bundle=/opt/acn-eval/claims.json`，A / B_empty 容器中不存在该文件；该路径挂载的是
 `claim_producer_variant` 绑定的不可变 bundle。前者只在模型调用
 `consult_router` 时取得 claim；后者启动时通过相同 router 检索，并把返回的完整 claim 放入首轮任务上下文。
+`claim_quality_gate` 默认 `none`，保持历史运行兼容；显式设为 `verified_producer_only` 后，verifier
+未通过的 producer claim 不进入正常 bundle，而只以 ID/hash 写入 bundle manifest 的
+`quarantined_claims`。这类任务标为 `failed_producer_quarantine`，与真正没有 claim 的
+`unpaired_no_claim` 分开统计。
 
 ACN 不把任意“模型不再调用工具”当作完成。evaluation profile 额外暴露无参数的 `submit_task`；模型完成
 实现、测试与 diff 检查后应把它作为唯一工具调用。提交后 turn loop 不再请求模型，随后才运行 session
@@ -131,7 +140,8 @@ claim。未开启该开关时才保留历史的“两个带 claim B 臂不适用
 solve。输出 aggregate manifest 在
 `output_dir/presmoke-aggregate.json`，各题 manifest、jobs 与 claim bundle 在
 `output_dir/tasks/<task>/`。A 与 B_empty 的冻结文件分别是 `claims.json` 和
-`claims-b-empty.json`，manifest 同时绑定两个 hash、claim id 集合和最终选定 producer。
+`claims-b-empty.json`，manifest 同时绑定两个 hash、eligible/quarantined claim id 集合、quality gate
+和最终选定 producer。
 
 自适应模式使用 `adaptive_producer_selection=true`、`claim_producer_variant=adaptive`、
 `smoke_size=0`。自动编排目录为 `producers/` 与 `consumers/`，两阶段之间冻结
@@ -250,6 +260,8 @@ score 的直接复刻，因而不得把本表与外部公布分数当作同口�
 Gate 只验证基础设施、claim 归因与隔离：artifact hash、verifier 是否真的跑过、usage 是否
 完整上报、Pier task checksum/trial 隔离，以及 `B_empty` 不得见到任何 claim、带 claim 的两个 B 臂
 只能使用冻结 bundle 内的 claim。A 的 verifier 结果仅决定 `success_efficiency` 或 `failure_recovery` 的统计分层；
+开启 `verified_producer_only` 后，失败 producer 的 claim 会进入 `failed_producer_quarantine`，不会再按
+`failure_recovery` 正常交付；
 在 `run_all_variants_without_claims=true` 的四臂模式下，没有 claim 的任务会执行四臂并显式标为
 `EMPTY_CLAIM_BUNDLE`，不可与成功注入 claim 的结果混同。`presmoke-aggregate.json` 会单列 `claim_funnel`：每臂的
 bundle 可用、router 检索、内容注入、模型报告使用及对应 claim 数，不能用“挂载成功”代替这些证据。

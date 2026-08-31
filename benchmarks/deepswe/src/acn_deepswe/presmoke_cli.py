@@ -107,6 +107,7 @@ _ALLOWED_CONFIG_FIELDS = frozenset(
         "acn_version",
         "model_egress_mode",
         "harness_mode",
+        "claim_quality_gate",
         "file_edit_authority_enabled",
         "resources",
         "timeouts",
@@ -149,6 +150,7 @@ class PresmokeConfig:
     acn_version: str
     model_egress_mode: str
     harness_mode: str
+    claim_quality_gate: str
     file_edit_authority_enabled: bool
     resources: dict[str, int]
     timeouts: dict[str, int]
@@ -255,7 +257,6 @@ def main(argv: list[str] | None = None) -> int:
                     frozen_runtime=frozen_runtime,
                     docker_root=docker_root,
                 )
-                validate_b_only_sources(all_specs)
                 completion_manifest_path = config.output_dir / "task-completions.json"
                 completed = (
                     load_terminal_task_results(all_specs, completion_manifest_path)
@@ -272,6 +273,7 @@ def main(argv: list[str] | None = None) -> int:
                     task_id for task_id in frozen_task_ids if task_id not in completed_ids
                 )
                 specs = all_specs
+                resume_root: Path | None = None
                 if args.resume and pending_ids:
                     interrupted_ids = tuple(
                         spec.task_id
@@ -295,6 +297,12 @@ def main(argv: list[str] | None = None) -> int:
                         attempt_output_root=resume_root,
                         docker_root=docker_root,
                     )
+                elif args.resume:
+                    specs = ()
+                # 续跑必须先排除已完成 task，并把中断 task 重定位到新的 resume root；
+                # 否则正常存在的 producer bundle 会被误判为复用旧产物。
+                validate_b_only_sources(specs)
+                if resume_root is not None:
                     _write_resume_descriptor(resume_root, config, completed, specs)
                 runner = PresmokeHostRunner(
                     specs,
@@ -428,6 +436,7 @@ def load_config(path: Path) -> PresmokeConfig:
     run_class = _run_class(raw)
     model_egress_mode = _model_egress_mode(raw)
     harness_mode = _harness_mode(raw)
+    claim_quality_gate = _claim_quality_gate(raw)
     acn_main_revision = _git_revision(raw, "acn_main_revision")
     acn_version = _version(raw, "acn_version")
     file_edit_authority_enabled = _boolean(
@@ -467,6 +476,7 @@ def load_config(path: Path) -> PresmokeConfig:
         acn_version=acn_version,
         model_egress_mode=model_egress_mode,
         harness_mode=harness_mode,
+        claim_quality_gate=claim_quality_gate,
         file_edit_authority_enabled=file_edit_authority_enabled,
         resources=resources,
         timeouts=timeouts,
@@ -753,6 +763,7 @@ def build_task_specs(
                     frozen_pier_source_root=pier_source_root,
                     model_egress_mode=config.model_egress_mode,
                     harness_mode=config.harness_mode,
+                    claim_quality_gate=config.claim_quality_gate,
                     task_workers=config.task_workers,
                     require_eligible_claim=False,
                     run_all_variants_without_claims=config.run_all_variants_without_claims,
@@ -1228,6 +1239,7 @@ def dry_run_summary(
         "acn_version": config.acn_version,
         "model_egress_mode": config.model_egress_mode,
         "harness_mode": config.harness_mode,
+        "claim_quality_gate": config.claim_quality_gate,
         "file_edit_authority_enabled": config.file_edit_authority_enabled,
         "task_workers": config.task_workers,
         "host_capacity": config.host_capacity,
@@ -1399,8 +1411,15 @@ def _model_egress_mode(raw: Mapping[str, object]) -> str:
 
 def _harness_mode(raw: Mapping[str, object]) -> str:
     value = raw.get("harness_mode", "standard")
-    if value not in {"standard", "minimal"}:
-        raise PresmokeCliError("config.harness_mode 仅支持 standard 或 minimal")
+    if value not in {"standard", "minimal", "concise", "pi_like", "open_code_like"}:
+        raise PresmokeCliError("config.harness_mode 无效")
+    return value
+
+
+def _claim_quality_gate(raw: Mapping[str, object]) -> str:
+    value = raw.get("claim_quality_gate", "none")
+    if value not in {"none", "verified_producer_only"}:
+        raise PresmokeCliError("config.claim_quality_gate 无效")
     return value
 
 
@@ -1599,6 +1618,7 @@ def _effective_config_hash(config: PresmokeConfig) -> str:
         "acn_version": config.acn_version,
         "model_egress_mode": config.model_egress_mode,
         "harness_mode": config.harness_mode,
+        "claim_quality_gate": config.claim_quality_gate,
         "file_edit_authority_enabled": config.file_edit_authority_enabled,
         "host_capacity": config.host_capacity,
         "cleanup_stale_pier_resources": config.cleanup_stale_pier_resources,

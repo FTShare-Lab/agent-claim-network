@@ -64,6 +64,22 @@ class DatasetAndPlanTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(DatasetFreezeError):
                 FrozenDatasetManifest.from_dict({**manifest, field: value})
 
+    def test_frozen_manifest_accepts_acn_harness_claim_canary_algorithm(self) -> None:
+        manifest = FrozenDatasetManifest.from_dict(
+            {
+                "schema_version": 1,
+                "algorithm": "official_v1.1_acn_harness_claim_canary_v1",
+                "seed": 20260831,
+                "candidates_hash": "a" * 64,
+                "task_ids": ["task-a"],
+            }
+        )
+
+        self.assertEqual(
+            manifest.algorithm,
+            "official_v1.1_acn_harness_claim_canary_v1",
+        )
+
     def test_freeze_rejects_non_positive_sample_size(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "tasks"

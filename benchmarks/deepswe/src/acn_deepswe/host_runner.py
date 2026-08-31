@@ -41,6 +41,9 @@ CONTAINER_MODEL_KEY_ENV = "ACN_EVAL_MODEL_KEY"
 EVALUATION_AUTO_COMPACT_CTX_RATIO = 0.80
 EVALUATION_FILE_READ_MAX_CHARS = 20_000
 EVALUATION_CODE_RUN_MAX_OUTPUT_CHARS = 20_000
+COMPACT_HARNESS_CODE_RUN_MAX_OUTPUT_CHARS = 50_000
+COMPACT_HARNESS_CONTEXT_RESERVE_TOKENS = 16_384
+COMPACT_HARNESS_RECENT_TOKENS = 20_000
 # 评测原先钉死 parallel=1 / diff=20，单次修补和同轮读文件都偏碎。
 # parallel 回到 ACN 默认 5；diff 提到 200，让一处函数级改动能一次 file_patch 落地。
 # code_run yield 是产品内部护栏，评测不覆盖。
@@ -53,7 +56,10 @@ CLAIM_BUNDLE_VARIANTS = frozenset(("B_claim", "B_forced_claim"))
 CLAIM_PRODUCER_VARIANTS = frozenset(("A", "B_empty"))
 DEFAULT_PROGRESS_POLL_SECS = 30
 DEFAULT_PROGRESS_STALL_AFTER_SECS = 600
-EVALUATION_HARNESS_MODES = frozenset(("standard", "minimal"))
+EVALUATION_HARNESS_MODES = frozenset(
+    ("standard", "minimal", "concise", "pi_like", "open_code_like")
+)
+CLAIM_QUALITY_GATES = frozenset(("none", "verified_producer_only"))
 MINIMAL_TASK_GUIDANCE = """
 
 You can execute shell commands and edit files to implement the necessary changes.
@@ -77,6 +83,32 @@ Work step-by-step so you can iterate on the implementation and any failures:
 - Bound exploratory commands and malformed-input reproductions with a short timeout; this does not replace the complete project test suite.
 - The container has a strict process/thread budget. Before a full test command that starts workers, inspect `/sys/fs/cgroup/pids.max` and use the test runner's worker option to stay below it. If you see `EAGAIN` or a thread/process creation failure, retry with fewer workers.
 - Do not call `submit_task` while implementation, verification, or diff inspection remains.
+""".strip()
+
+CONCISE_TASK_GUIDANCE = """
+
+Work directly in the repository. Inspect the relevant code, reproduce the issue when practical,
+make the smallest complete change, run focused tests followed by broader verification when
+feasible, and inspect the final diff. Finish with the no-argument `submit_task` tool as the only
+tool call in the final response.
+""".strip()
+
+PI_LIKE_TASK_GUIDANCE = """
+
+Work directly in the repository. Use `code_run` for bounded search and commands, `file_read` for
+focused reads, and `file_write` for edits. Inspect the relevant code, reproduce the issue when
+practical, make the smallest complete change, run focused tests followed by broader verification
+when feasible, and inspect the final diff. Finish with the no-argument `submit_task` tool as the
+only tool call in the final response.
+""".strip()
+
+OPEN_CODE_LIKE_TASK_GUIDANCE = """
+
+Work directly in the repository. Use `code_run` for bounded search and commands, `file_read` for
+focused reads, and prefer `file_patch` for localized edits; use `file_write` when replacing or
+creating a complete file is clearer. Reproduce the issue when practical, run focused tests followed
+by broader verification when feasible, and inspect the final diff. Finish with the no-argument
+`submit_task` tool as the only tool call in the final response.
 """.strip()
 
 
@@ -127,6 +159,7 @@ class Task1ExecutionConfig:
     run_a_only: bool = False
     a_only_source_manifest: Path | None = None
     claim_producer_variant: str = "A"
+    claim_quality_gate: str = "none"
     run_producer_pair_only: bool = False
     adaptive_source_manifest: Path | None = None
     producer_selection_manifest: Path | None = None
@@ -174,7 +207,9 @@ class AOnlySourceEvidence:
     a_record: AttemptExecutionRecord
     cohort: str
     claim_ids: tuple[str, ...]
+    quarantined_claim_ids: tuple[str, ...]
     claim_bundle_hash: str
+    claim_bundle_manifest_hash: str
     pier_task_checksum: str
     source_manifest_hash: str
 
@@ -187,7 +222,9 @@ class AdaptiveSourceEvidence:
     selected_variant: str
     cohort: str
     claim_ids: tuple[str, ...]
+    quarantined_claim_ids: tuple[str, ...]
     claim_bundle_hash: str
+    claim_bundle_manifest_hash: str
     pier_task_checksum: str
     source_manifest_hash: str
     selection_manifest_hash: str
@@ -326,12 +363,8 @@ def build_attempt_toml(
     if model_egress_mode not in {"pier", "direct"}:
         raise ValueError("model_egress_mode 仅支持 pier 或 direct")
     if harness_mode not in EVALUATION_HARNESS_MODES:
-        raise ValueError("harness_mode 仅支持 standard 或 minimal")
-    prompt = (
-        f"Please solve this issue:\n\n{task_prompt}\n\n{MINIMAL_TASK_GUIDANCE}"
-        if harness_mode == "minimal"
-        else "请执行 /coding-benchmark，并解决以下任务：\n\n" + task_prompt
-    )
+        raise ValueError("harness_mode 无效")
+    prompt = _task_prompt_for_harness(task_prompt, harness_mode)
     lines = [
         "schema_version = 1",
         f"attempt_id = {json.dumps(attempt.attempt_id)}",
@@ -351,6 +384,20 @@ def build_attempt_toml(
     return "\n".join(lines) + "\n"
 
 
+def _task_prompt_for_harness(task_prompt: str, harness_mode: str) -> str:
+    if harness_mode == "standard":
+        return "请执行 /coding-benchmark，并解决以下任务：\n\n" + task_prompt
+    guidance = {
+        "minimal": MINIMAL_TASK_GUIDANCE,
+        "concise": CONCISE_TASK_GUIDANCE,
+        "pi_like": PI_LIKE_TASK_GUIDANCE,
+        "open_code_like": OPEN_CODE_LIKE_TASK_GUIDANCE,
+    }.get(harness_mode)
+    if guidance is None:
+        raise ValueError("harness_mode 无效")
+    return f"Please solve this issue:\n\n{task_prompt}\n\n{guidance}"
+
+
 def attempt_deadline_secs(provenance: EvaluationProvenance) -> int:
     """留出收尾余量：acn_eval 必须早于 Pier 墙钟停下并写出证据。"""
     agent_seconds = _positive_int(provenance.timeouts, "agent_seconds")
@@ -360,9 +407,34 @@ def attempt_deadline_secs(provenance: EvaluationProvenance) -> int:
     return agent_seconds - reserve
 
 
-def build_acn_config(provenance: EvaluationProvenance, upstream_base_url: str) -> str:
+def build_acn_config(
+    provenance: EvaluationProvenance,
+    upstream_base_url: str,
+    harness_mode: str = "standard",
+) -> str:
     """容器内 ACN 配置；模型 key 只经 api_key_env 从容器环境读取。"""
+    if harness_mode not in EVALUATION_HARNESS_MODES:
+        raise ValueError("harness_mode 无效")
     resources = provenance.resources
+    context_window = _positive_int(resources, "context_window")
+    compact_tools = harness_mode in {"pi_like", "open_code_like"}
+    auto_compact_ctx_ratio = EVALUATION_AUTO_COMPACT_CTX_RATIO
+    code_run_max_output_chars = EVALUATION_CODE_RUN_MAX_OUTPUT_CHARS
+    compaction = {"auto_compact_ctx_ratio": auto_compact_ctx_ratio}
+    if compact_tools:
+        auto_compact_ctx_ratio = max(
+            0.0,
+            (context_window - COMPACT_HARNESS_CONTEXT_RESERVE_TOKENS) / context_window,
+        )
+        recent_ratio = min(1.0, COMPACT_HARNESS_RECENT_TOKENS / context_window)
+        code_run_max_output_chars = COMPACT_HARNESS_CODE_RUN_MAX_OUTPUT_CHARS
+        compaction = {
+            "auto_compact_ctx_ratio": auto_compact_ctx_ratio,
+            "tail_target_ctx_ratio": recent_ratio,
+            "tail_hard_ctx_ratio": min(1.0, recent_ratio * 2),
+            "tail_previous_real_user_turns": 1,
+            "tool_result_raw_max_chars": code_run_max_output_chars,
+        }
     sections = {
         "": {"upstream": "eval"},
         "upstreams.eval": {
@@ -413,9 +485,7 @@ def build_acn_config(provenance: EvaluationProvenance, upstream_base_url: str) -
             "id_mint_max_retries": 3,
             "notify_on_finalize_completion": False,
         },
-        "agent.session.compaction": {
-            "auto_compact_ctx_ratio": EVALUATION_AUTO_COMPACT_CTX_RATIO,
-        },
+        "agent.session.compaction": compaction,
         "agent.session.memory_review": {"enabled": False},
         "agent.memory": {"enabled": False},
         "agent.tool": {
@@ -423,7 +493,7 @@ def build_acn_config(provenance: EvaluationProvenance, upstream_base_url: str) -
             "file_diff_max_changed_lines": EVALUATION_FILE_DIFF_MAX_CHANGED_LINES,
             "file_edit_authority_enabled": provenance.file_edit_authority_enabled,
             "max_parallel_tool_calls": EVALUATION_MAX_PARALLEL_TOOL_CALLS,
-            "code_run_max_output_chars": EVALUATION_CODE_RUN_MAX_OUTPUT_CHARS,
+            "code_run_max_output_chars": code_run_max_output_chars,
         },
         "agent.attachment": {
             "enabled": False,
@@ -471,7 +541,10 @@ def write_attempt_files(
             harness_mode,
         ),
     )
-    _atomic_write_text(acn_path, build_acn_config(provenance, upstream_base_url))
+    _atomic_write_text(
+        acn_path,
+        build_acn_config(provenance, upstream_base_url, harness_mode),
+    )
     return AttemptFiles(attempt_path, acn_path)
 
 
@@ -631,7 +704,9 @@ class Task1HostRunner:
         self._frozen_claim_bundle_hash: str | None = None
         self._frozen_claim_ids: tuple[str, ...] = ()
         self._producer_bundle_hashes: dict[str, str] = {}
+        self._producer_bundle_manifest_hashes: dict[str, str] = {}
         self._producer_claim_ids: dict[str, tuple[str, ...]] = {}
+        self._producer_quarantined_claim_ids: dict[str, tuple[str, ...]] = {}
         self._pier_trial_uris: set[str] = set()
         self._pier_trial_directories: set[Path] = set()
         self._pier_task_checksum: str | None = None
@@ -705,7 +780,9 @@ class Task1HostRunner:
         self._frozen_claim_bundle_hash = None
         self._frozen_claim_ids = ()
         self._producer_bundle_hashes.clear()
+        self._producer_bundle_manifest_hashes.clear()
         self._producer_claim_ids.clear()
+        self._producer_quarantined_claim_ids.clear()
         self._pier_trial_uris.clear()
         self._pier_trial_directories.clear()
         self._pier_task_checksum = None
@@ -722,7 +799,13 @@ class Task1HostRunner:
                 self._frozen_claim_ids = source.claim_ids
                 self._frozen_claim_bundle_hash = source.claim_bundle_hash
                 self._producer_claim_ids["A"] = source.claim_ids
+                self._producer_quarantined_claim_ids["A"] = (
+                    source.quarantined_claim_ids
+                )
                 self._producer_bundle_hashes["A"] = source.claim_bundle_hash
+                self._producer_bundle_manifest_hashes["A"] = (
+                    source.claim_bundle_manifest_hash
+                )
                 self._pier_task_checksum = source.pier_task_checksum
                 self._a_only_source_manifest_hash = source.source_manifest_hash
             elif execution.adaptive_source_manifest is not None:
@@ -734,7 +817,13 @@ class Task1HostRunner:
                 self._frozen_claim_ids = source.claim_ids
                 self._frozen_claim_bundle_hash = source.claim_bundle_hash
                 self._producer_claim_ids[source.selected_variant] = source.claim_ids
+                self._producer_quarantined_claim_ids[source.selected_variant] = (
+                    source.quarantined_claim_ids
+                )
                 self._producer_bundle_hashes[source.selected_variant] = source.claim_bundle_hash
+                self._producer_bundle_manifest_hashes[source.selected_variant] = (
+                    source.claim_bundle_manifest_hash
+                )
                 self._pier_task_checksum = source.pier_task_checksum
                 self._adaptive_source_manifest_hash = source.source_manifest_hash
                 self._producer_selection_manifest_hash = source.selection_manifest_hash
@@ -743,15 +832,8 @@ class Task1HostRunner:
                 records_by_id[a_record.attempt_id] = a_record
                 self._raise_if_attempt_failed(a_record)
                 self._freeze_after_producer(attempts[0], execution, a_record)
-                has_frozen_claims = bool(self._frozen_claim_ids)
-                cohort = (
-                    (
-                        "success_efficiency"
-                        if a_record.verifier_passed is True
-                        else "failure_recovery"
-                    )
-                    if has_frozen_claims
-                    else "unpaired_no_claim"
+                cohort = self._producer_cohort(
+                    "A", a_record.verifier_passed is True
                 )
             else:
                 b_empty = next(attempt for attempt in attempts if attempt.variant == "B_empty")
@@ -768,15 +850,9 @@ class Task1HostRunner:
                         for record in producer_records
                         if record.variant == execution.claim_producer_variant
                     )
-                    has_frozen_claims = bool(self._frozen_claim_ids)
-                    cohort = (
-                        (
-                            "success_efficiency"
-                            if producer_record.verifier_passed is True
-                            else "failure_recovery"
-                        )
-                        if has_frozen_claims
-                        else "unpaired_no_claim"
+                    cohort = self._producer_cohort(
+                        execution.claim_producer_variant,
+                        producer_record.verifier_passed is True,
                     )
             if execution.run_producer_pair_only:
                 for attempt in attempts:
@@ -1295,14 +1371,30 @@ class Task1HostRunner:
                 "verifier_passed": record.verifier_passed,
                 "attempt_result_sha256": attempt_result_hash,
             },
+            quality_gate=execution.claim_quality_gate,
         )
         claim_ids = tuple(claim.claim_id for claim in bundle.claims)
+        quarantined_claim_ids = tuple(
+            claim.claim_id for claim in bundle.quarantined_claims
+        )
         bundle_hash = _sha256_file(output_path)
+        bundle_manifest_hash = _sha256_file(
+            output_path.with_name(output_path.name + ".manifest.json")
+        )
         self._producer_claim_ids[attempt.variant] = claim_ids
+        self._producer_quarantined_claim_ids[attempt.variant] = quarantined_claim_ids
         self._producer_bundle_hashes[attempt.variant] = bundle_hash
+        self._producer_bundle_manifest_hashes[attempt.variant] = bundle_manifest_hash
         if attempt.variant == execution.claim_producer_variant:
             self._frozen_claim_ids = claim_ids
             self._frozen_claim_bundle_hash = bundle_hash
+
+    def _producer_cohort(self, variant: str, verifier_passed: bool) -> str:
+        if self._producer_claim_ids.get(variant):
+            return "success_efficiency" if verifier_passed else "failure_recovery"
+        if self._producer_quarantined_claim_ids.get(variant):
+            return "failed_producer_quarantine"
+        return "unpaired_no_claim"
 
     @staticmethod
     def _producer_bundle_path(execution: Task1ExecutionConfig, producer_variant: str) -> Path:
@@ -1422,6 +1514,7 @@ class Task1HostRunner:
                 "experiment": experiment,
                 "frozen_claim_bundle_hash": self._frozen_claim_bundle_hash,
                 "claim_producer_variant": execution.claim_producer_variant,
+                "claim_quality_gate": execution.claim_quality_gate,
                 "logical_variant_map": (
                     {
                         "A": execution.claim_producer_variant,
@@ -1440,7 +1533,13 @@ class Task1HostRunner:
                     variant: {
                         "path": str(self._producer_bundle_path(execution, variant)),
                         "bundle_hash": bundle_hash,
+                        "bundle_manifest_hash": self._producer_bundle_manifest_hashes.get(
+                            variant
+                        ),
                         "claim_ids": list(self._producer_claim_ids.get(variant, ())),
+                        "quarantined_claim_ids": list(
+                            self._producer_quarantined_claim_ids.get(variant, ())
+                        ),
                     }
                     for variant, bundle_hash in sorted(self._producer_bundle_hashes.items())
                 },
@@ -1469,6 +1568,7 @@ class Task1HostRunner:
                     "run_a_only": execution.run_a_only,
                     "run_producer_pair_only": execution.run_producer_pair_only,
                     "claim_producer_variant": execution.claim_producer_variant,
+                    "claim_quality_gate": execution.claim_quality_gate,
                     "phase_mode": (
                         "adaptive_consumers"
                         if execution.adaptive_source_manifest is not None
@@ -1576,23 +1676,37 @@ class Task1HostRunner:
             source_result, source_gate = _validate_source_a_record(
                 a_record, attempts[0], source_output
             )
-            bundle_hash, claim_ids = _validate_source_claim_bundle(
+            (
+                bundle_hash,
+                bundle_manifest_hash,
+                claim_ids,
+                quarantined_claim_ids,
+            ) = _validate_source_claim_bundle(
                 expected_bundle,
                 attempts[0].attempt_id,
                 source_result,
+                execution.claim_quality_gate,
             )
             if source.get("frozen_claim_bundle_hash") != bundle_hash:
                 raise TaskExecutionError("A-only source manifest 的 claim bundle hash 不一致")
             if source_experiment.get("claim_bundle_hash") != bundle_hash:
                 raise TaskExecutionError("A-only experiment 的 claim bundle hash 不一致")
+            _validate_source_bundle_manifest_entry(
+                source,
+                "A",
+                expected_bundle,
+                bundle_hash,
+                bundle_manifest_hash,
+                claim_ids,
+                quarantined_claim_ids,
+                execution.claim_quality_gate,
+            )
             verifier_passed = source_result.get("verifier_passed")
             if not isinstance(verifier_passed, bool) or a_record.verifier_passed != verifier_passed:
                 raise TaskExecutionError("A-only verifier 证据与 attempt record 不一致")
             cohort = source.get("experiment_cohort")
-            expected_cohort = (
-                ("success_efficiency" if verifier_passed else "failure_recovery")
-                if claim_ids
-                else "unpaired_no_claim"
+            expected_cohort = _source_producer_cohort(
+                claim_ids, quarantined_claim_ids, verifier_passed
             )
             if cohort != expected_cohort:
                 raise TaskExecutionError("A-only experiment cohort 与冻结证据不一致")
@@ -1606,7 +1720,9 @@ class Task1HostRunner:
                 a_record=a_record,
                 cohort=expected_cohort,
                 claim_ids=claim_ids,
+                quarantined_claim_ids=quarantined_claim_ids,
                 claim_bundle_hash=bundle_hash,
+                claim_bundle_manifest_hash=bundle_manifest_hash,
                 pier_task_checksum=task_checksum,
                 source_manifest_hash=_sha256_file(source_manifest),
             )
@@ -1659,26 +1775,55 @@ class Task1HostRunner:
                 "A": source_manifest.parent / "claims.json",
                 "B_empty": source_manifest.parent / "claims-b-empty.json",
             }
-            bundle_evidence: dict[str, tuple[str, tuple[str, ...]]] = {}
+            bundle_evidence: dict[
+                str, tuple[str, str, tuple[str, ...], tuple[str, ...]]
+            ] = {}
             frozen = source.get("frozen_claim_bundles")
             if not isinstance(frozen, Mapping) or set(frozen) != set(CLAIM_PRODUCER_VARIANTS):
                 raise TaskExecutionError("adaptive producer manifest 缺少双 bundle 证据")
             for attempt in attempts[:2]:
                 variant = attempt.variant
-                bundle_hash, claim_ids = _validate_source_claim_bundle(
-                    bundle_paths[variant], attempt.attempt_id, results[variant]
+                (
+                    bundle_hash,
+                    bundle_manifest_hash,
+                    claim_ids,
+                    quarantined_claim_ids,
+                ) = _validate_source_claim_bundle(
+                    bundle_paths[variant],
+                    attempt.attempt_id,
+                    results[variant],
+                    execution.claim_quality_gate,
                 )
                 entry = frozen.get(variant)
                 if (
                     not isinstance(entry, Mapping)
                     or entry.get("bundle_hash") != bundle_hash
+                    or (
+                        entry.get("bundle_manifest_hash") != bundle_manifest_hash
+                        and (
+                            execution.claim_quality_gate != "none"
+                            or entry.get("bundle_manifest_hash") is not None
+                        )
+                    )
                     or entry.get("claim_ids") != list(claim_ids)
+                    or entry.get("quarantined_claim_ids", [])
+                    != list(quarantined_claim_ids)
                     or Path(str(entry.get("path"))).resolve() != bundle_paths[variant].resolve()
                 ):
                     raise TaskExecutionError(f"adaptive producer {variant} bundle 绑定不一致")
-                bundle_evidence[variant] = (bundle_hash, claim_ids)
+                bundle_evidence[variant] = (
+                    bundle_hash,
+                    bundle_manifest_hash,
+                    claim_ids,
+                    quarantined_claim_ids,
+                )
             selected_result = results[selected_variant]
-            bundle_hash, claim_ids = bundle_evidence[selected_variant]
+            (
+                bundle_hash,
+                bundle_manifest_hash,
+                claim_ids,
+                quarantined_claim_ids,
+            ) = bundle_evidence[selected_variant]
             if execution.claim_producer_variant != selected_variant:
                 raise TaskExecutionError("consumer config 与全量 producer winner 不一致")
             if execution.artifacts.claim_bundle.resolve() != bundle_paths[selected_variant].resolve():
@@ -1686,10 +1831,8 @@ class Task1HostRunner:
             verifier_passed = selected_result.get("verifier_passed")
             if not isinstance(verifier_passed, bool):
                 raise TaskExecutionError("selected producer 缺少 verifier 结果")
-            cohort = (
-                ("success_efficiency" if verifier_passed else "failure_recovery")
-                if claim_ids
-                else "unpaired_no_claim"
+            cohort = _source_producer_cohort(
+                claim_ids, quarantined_claim_ids, verifier_passed
             )
             pier_trial = _required_mapping(selected_result, "pier_trial")
             task_checksum = pier_trial.get("task_checksum")
@@ -1700,7 +1843,9 @@ class Task1HostRunner:
                 selected_variant=selected_variant,
                 cohort=cohort,
                 claim_ids=claim_ids,
+                quarantined_claim_ids=quarantined_claim_ids,
                 claim_bundle_hash=bundle_hash,
+                claim_bundle_manifest_hash=bundle_manifest_hash,
                 pier_task_checksum=task_checksum,
                 source_manifest_hash=_sha256_file(source_manifest),
                 selection_manifest_hash=_sha256_file(selection_manifest),
@@ -1747,6 +1892,7 @@ class Task1HostRunner:
             ("upstream_base_url", execution.upstream_base_url),
             ("model_egress_mode", execution.model_egress_mode),
             ("harness_mode", execution.harness_mode),
+            ("claim_quality_gate", execution.claim_quality_gate),
             ("task_workers", execution.task_workers),
             ("progress_poll_secs", execution.progress_poll_secs),
             ("progress_stall_after_secs", execution.progress_stall_after_secs),
@@ -1758,7 +1904,10 @@ class Task1HostRunner:
             ("phase_mode", "adaptive_producers"),
         )
         for name, value in expected_execution:
-            if source_execution.get(name) != value:
+            source_value = source_execution.get(
+                name, "none" if name == "claim_quality_gate" else None
+            )
+            if source_value != value:
                 raise TaskExecutionError(f"adaptive producer execution 配置漂移: {name}")
         source_pier = source_execution.get("pier_executable")
         if (
@@ -1807,6 +1956,7 @@ class Task1HostRunner:
             ("upstream_base_url", execution.upstream_base_url),
             ("model_egress_mode", execution.model_egress_mode),
             ("harness_mode", execution.harness_mode),
+            ("claim_quality_gate", execution.claim_quality_gate),
             ("task_workers", execution.task_workers),
             ("progress_poll_secs", execution.progress_poll_secs),
             ("progress_stall_after_secs", execution.progress_stall_after_secs),
@@ -1817,7 +1967,10 @@ class Task1HostRunner:
             ("run_a_only", True),
         )
         for name, value in expected_execution:
-            if source_execution.get(name) != value:
+            source_value = source_execution.get(
+                name, "none" if name == "claim_quality_gate" else None
+            )
+            if source_value != value:
                 raise TaskExecutionError(f"A-only source execution 配置漂移: {name}")
         source_pier = source_execution.get("pier_executable")
         if (
@@ -1873,7 +2026,9 @@ class Task1HostRunner:
         if execution.model_egress_mode not in {"pier", "direct"}:
             raise TaskExecutionError("model_egress_mode 仅支持 pier 或 direct")
         if execution.harness_mode not in EVALUATION_HARNESS_MODES:
-            raise TaskExecutionError("harness_mode 仅支持 standard 或 minimal")
+            raise TaskExecutionError("harness_mode 无效")
+        if execution.claim_quality_gate not in CLAIM_QUALITY_GATES:
+            raise TaskExecutionError("claim_quality_gate 无效")
         for path in (
             execution.artifacts.acn_eval,
             execution.artifacts.frozen_skill,
@@ -2287,7 +2442,8 @@ def _validate_source_claim_bundle(
     bundle_path: Path,
     attempt_id: str,
     source_result: Mapping[str, object],
-) -> tuple[str, tuple[str, ...]]:
+    expected_quality_gate: str,
+) -> tuple[str, str, tuple[str, ...], tuple[str, ...]]:
     metadata_path = bundle_path.with_name(bundle_path.name + ".manifest.json")
     metadata = _read_json_mapping(metadata_path, "A-only claim bundle manifest")
     bundle_hash, content_hashes = _frozen_bundle_evidence(bundle_path)
@@ -2313,6 +2469,11 @@ def _validate_source_claim_bundle(
         or not _is_sha256(producer_result_hash)
     ):
         raise TaskExecutionError("A-only claim bundle producer verifier identity 不一致")
+    quality_gate = metadata.get("quality_gate", "none")
+    if quality_gate not in CLAIM_QUALITY_GATES:
+        raise TaskExecutionError("A-only claim bundle quality_gate 无效")
+    if quality_gate != expected_quality_gate:
+        raise TaskExecutionError("A-only claim bundle quality_gate 与执行配置不一致")
     attempt_result_path = (
         bundle_path.parents[2] / "attempts" / attempt_id / "output" / "attempt-result.json"
     )
@@ -2336,6 +2497,29 @@ def _validate_source_claim_bundle(
         if raw_metadata.get("content_hash") != _canonical_json_hash(raw_claim):
             raise TaskExecutionError("A-only claim bundle claim 内容已漂移")
         claim_ids.append(claim_id)
+    raw_quarantined = metadata.get("quarantined_claims", [])
+    if not isinstance(raw_quarantined, list):
+        raise TaskExecutionError("A-only claim bundle quarantined_claims schema 无效")
+    quarantined_claim_ids: list[str] = []
+    for raw_metadata in raw_quarantined:
+        if not isinstance(raw_metadata, Mapping):
+            raise TaskExecutionError("A-only claim bundle 含无效 quarantined claim")
+        claim_id = raw_metadata.get("claim_id")
+        if (
+            not isinstance(claim_id, str)
+            or not claim_id
+            or not _is_sha256(raw_metadata.get("content_hash"))
+        ):
+            raise TaskExecutionError("A-only claim bundle quarantined claim identity 无效")
+        quarantined_claim_ids.append(claim_id)
+    if len(set(quarantined_claim_ids)) != len(quarantined_claim_ids):
+        raise TaskExecutionError("A-only claim bundle 含重复 quarantined claim")
+    should_quarantine = quality_gate == "verified_producer_only" and not producer_passed
+    if should_quarantine:
+        if claim_ids or set(claim_ids) & set(quarantined_claim_ids):
+            raise TaskExecutionError("A-only claim bundle 未正确隔离 failed producer claim")
+    elif quarantined_claim_ids:
+        raise TaskExecutionError("A-only claim bundle 出现无依据 quarantined claim")
     rust_events = source_result.get("rust_events")
     if not isinstance(rust_events, str) or not Path(rust_events).is_absolute():
         raise TaskExecutionError("A-only A result 缺少绝对 rust_events 路径")
@@ -2358,7 +2542,52 @@ def _validate_source_claim_bundle(
         or events[-2].event_type != "attempt_finished"
     ):
         raise TaskExecutionError("A-only freeze barrier 与 event ledger 不一致")
-    return bundle_hash, tuple(claim_ids)
+    return (
+        bundle_hash,
+        _sha256_file(metadata_path),
+        tuple(claim_ids),
+        tuple(quarantined_claim_ids),
+    )
+
+
+def _validate_source_bundle_manifest_entry(
+    source: Mapping[str, object],
+    variant: str,
+    bundle_path: Path,
+    bundle_hash: str,
+    bundle_manifest_hash: str,
+    claim_ids: tuple[str, ...],
+    quarantined_claim_ids: tuple[str, ...],
+    quality_gate: str,
+) -> None:
+    frozen = source.get("frozen_claim_bundles")
+    entry = frozen.get(variant) if isinstance(frozen, Mapping) else None
+    if not isinstance(entry, Mapping):
+        raise TaskExecutionError(f"source manifest 缺少 {variant} bundle 证据")
+    manifest_hash = entry.get("bundle_manifest_hash")
+    if (
+        entry.get("bundle_hash") != bundle_hash
+        or entry.get("claim_ids") != list(claim_ids)
+        or entry.get("quarantined_claim_ids", []) != list(quarantined_claim_ids)
+        or Path(str(entry.get("path"))).resolve() != bundle_path.resolve()
+        or (
+            manifest_hash != bundle_manifest_hash
+            and (quality_gate != "none" or manifest_hash is not None)
+        )
+    ):
+        raise TaskExecutionError(f"source manifest 的 {variant} bundle 绑定不一致")
+
+
+def _source_producer_cohort(
+    claim_ids: tuple[str, ...],
+    quarantined_claim_ids: tuple[str, ...],
+    verifier_passed: bool,
+) -> str:
+    if claim_ids:
+        return "success_efficiency" if verifier_passed else "failure_recovery"
+    if quarantined_claim_ids:
+        return "failed_producer_quarantine"
+    return "unpaired_no_claim"
 
 
 def _positive_int(values: dict[str, int], key: str) -> int:

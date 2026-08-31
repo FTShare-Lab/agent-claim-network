@@ -29,13 +29,16 @@ use crate::tool::EvaluationSubmission;
 pub const EVALUATION_SCHEMA_VERSION: u32 = 1;
 pub const EVALUATION_MODEL_KEY_ENV: &str = "ACN_EVAL_MODEL_KEY";
 
-/// 评测 harness 的模型可见面。默认保持既有 profile，minimal 只用于显式上限对照。
+/// 评测 harness 的模型可见面。默认保持既有 profile，其余模式只用于显式机制对照。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvaluationHarnessMode {
     #[default]
     Standard,
     Minimal,
+    Concise,
+    PiLike,
+    OpenCodeLike,
 }
 
 /// 评测 runtime 的 ACN.md 只承载 claim 交付契约；通用工程流程由冻结 skill 单一维护。
@@ -1154,6 +1157,36 @@ model_egress_mode = "pier"
         assert!(EvaluationRunPaths::from_config(&config).is_ok());
         assert_eq!(config.model_egress_mode, "pier");
         assert_eq!(config.harness_mode, EvaluationHarnessMode::Standard);
+    }
+
+    #[test]
+    fn evaluation_attempt_config_accepts_all_explicit_harness_modes() {
+        for (raw_mode, expected) in [
+            ("minimal", EvaluationHarnessMode::Minimal),
+            ("concise", EvaluationHarnessMode::Concise),
+            ("pi_like", EvaluationHarnessMode::PiLike),
+            ("open_code_like", EvaluationHarnessMode::OpenCodeLike),
+        ] {
+            let config: EvaluationAttemptConfig = toml::from_str(&format!(
+                r#"
+schema_version = 1
+attempt_id = "attempt-001"
+task_prompt = "repair the fixture"
+workspace_root = "/tmp/acn-eval/workspace"
+runtime_root = "/tmp/acn-eval/runtime"
+acn_config = "/tmp/acn-eval/acn.toml"
+output_dir = "/tmp/acn-eval/output"
+upstream = "eval"
+variant = "A"
+attempt_deadline_secs = 1
+model_egress_mode = "pier"
+harness_mode = "{raw_mode}"
+"#
+            ))
+            .unwrap();
+
+            assert_eq!(config.harness_mode, expected);
+        }
     }
 
     #[tokio::test]

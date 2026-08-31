@@ -23,6 +23,7 @@ SUPPORTED_FREEZE_ALGORITHMS = frozenset(
         FREEZE_ALGORITHM,
         "official_v1.1_luna_max_extreme_cohorts_v1",
         "official_v1.1_luna_max_user_selected_followup_v1",
+        "official_v1.1_acn_harness_claim_canary_v1",
     }
 )
 

@@ -128,7 +128,13 @@ class PresmokeCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config_path = write_fixture(Path(directory))
             raw = json.loads(config_path.read_text(encoding="utf-8"))
-            raw.update({"harness_mode": "minimal", "run_a_only": True})
+            raw.update(
+                {
+                    "harness_mode": "open_code_like",
+                    "claim_quality_gate": "verified_producer_only",
+                    "run_a_only": True,
+                }
+            )
             config_path.write_text(json.dumps(raw), encoding="utf-8")
             config = load_config(config_path)
             plan = json.loads(config.attempt_plan.read_text(encoding="utf-8"))
@@ -152,7 +158,11 @@ class PresmokeCliTests(unittest.TestCase):
         self.assertTrue(
             all(
                 spec.execution is None
-                or (spec.execution.harness_mode == "minimal" and spec.execution.run_a_only)
+                or (
+                    spec.execution.harness_mode == "open_code_like"
+                    and spec.execution.claim_quality_gate == "verified_producer_only"
+                    and spec.execution.run_a_only
+                )
                 for spec in specs
             )
         )
@@ -817,6 +827,70 @@ class PresmokeCliTests(unittest.TestCase):
         runner.assert_called_once()
         specs = runner.call_args.args[0]
         self.assertEqual(tuple(spec.task_id for spec in specs), TASK_IDS)
+        self.assertEqual(fake_runner.calls, [True])
+
+    def test_resume_validates_only_pending_specs_after_relocation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_fixture(Path(directory))
+            completed_result = PresmokeTaskResult(
+                TASK_IDS[0],
+                "passed",
+                str(Path(directory) / "completed-manifest.json"),
+                None,
+            )
+            fake_runner = _FakeRunner()
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "ACN_EVAL_UPSTREAM_KEY": "test-key",
+                        "ACN_EVAL_UPSTREAM_BASE_URL": "https://upstream.invalid",
+                    },
+                    clear=True,
+                ),
+                patch(
+                    "acn_deepswe.presmoke_cli.load_terminal_task_results",
+                    return_value=(completed_result,),
+                ),
+                patch(
+                    "acn_deepswe.presmoke_cli.validate_b_only_sources"
+                ) as validate_sources,
+                patch(
+                    "acn_deepswe.presmoke_cli.PresmokeHostRunner",
+                    return_value=fake_runner,
+                ) as runner,
+                patch("acn_deepswe.presmoke_cli.verify_acn_revision"),
+                patch("acn_deepswe.presmoke_cli.verify_checkout_revision"),
+                patch("acn_deepswe.presmoke_cli._verify_acn_eval_build_info"),
+                patch(
+                    "acn_deepswe.presmoke_cli._docker_image_content_digest",
+                    return_value="sha256:" + "1" * 64,
+                ),
+                patch("acn_deepswe.presmoke_cli.os.access", return_value=True),
+                patch(
+                    "acn_deepswe.presmoke_cli.subprocess.run",
+                    side_effect=successful_preflight_commands(config.parent),
+                ),
+            ):
+                result = main(["--config", str(config), "--resume"])
+
+        self.assertEqual(result, 0)
+        validate_sources.assert_called_once()
+        validated_specs = validate_sources.call_args.args[0]
+        self.assertEqual(
+            tuple(spec.task_id for spec in validated_specs),
+            TASK_IDS[1:],
+        )
+        self.assertTrue(
+            all(
+                spec.manifest_path.is_relative_to(
+                    Path(directory) / "output" / "resumes" / "resume-001" / "tasks"
+                )
+                for spec in validated_specs
+            )
+        )
+        runner.assert_called_once()
+        self.assertEqual(runner.call_args.args[0], validated_specs)
         self.assertEqual(fake_runner.calls, [True])
 
     def test_resume_rejects_a_recorded_gate_or_protocol_failure_without_starting_tasks(

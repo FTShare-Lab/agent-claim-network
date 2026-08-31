@@ -36,7 +36,8 @@ class AutomatedRunTests(unittest.TestCase):
             config = load_config(
                 write_config(
                     root,
-                    harness_mode="minimal",
+                    harness_mode="open_code_like",
+                    claim_quality_gate="verified_producer_only",
                     run_a_only=True,
                     smoke_size=0,
                     full_size=len(TASK_IDS),
@@ -50,9 +51,11 @@ class AutomatedRunTests(unittest.TestCase):
             full_config = json.loads((config.run_root / "full" / "presmoke-run.json").read_text())
 
         self.assertTrue(config.run_a_only)
-        self.assertEqual(config.harness_mode, "minimal")
+        self.assertEqual(config.harness_mode, "open_code_like")
+        self.assertEqual(config.claim_quality_gate, "verified_producer_only")
         self.assertTrue(full_config["run_a_only"])
-        self.assertEqual(full_config["harness_mode"], "minimal")
+        self.assertEqual(full_config["harness_mode"], "open_code_like")
+        self.assertEqual(full_config["claim_quality_gate"], "verified_producer_only")
 
     def test_config_forwards_b_only_source_for_full_task_set(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

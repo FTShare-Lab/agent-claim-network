@@ -211,6 +211,30 @@ impl ToolRegistry {
         self
     }
 
+    /// Pi 风格机制对照：受管 shell + 分页文件读写，不提供 patch/note/skill。
+    pub fn for_pi_like_evaluation(mut self, secret_env: String) -> Self {
+        self.access = ToolAccessProfile::pi_like_evaluation();
+        self.evaluation_secret_env = Some(secret_env);
+        self.memory_store = None;
+        self.session_search = None;
+        self.mcp_manager = None;
+        self.delegation_host = None;
+        self.delegation_progress = None;
+        self
+    }
+
+    /// OpenCode 风格机制对照：在 Pi 风格工具面上增加局部 patch。
+    pub fn for_open_code_like_evaluation(mut self, secret_env: String) -> Self {
+        self.access = ToolAccessProfile::open_code_like_evaluation();
+        self.evaluation_secret_env = Some(secret_env);
+        self.memory_store = None;
+        self.session_search = None;
+        self.mcp_manager = None;
+        self.delegation_host = None;
+        self.delegation_progress = None;
+        self
+    }
+
     /// 为单个非交互评测 attempt 装配显式提交控制器。
     ///
     /// 该方法不自行提升权限；调用方仍须先选择 evaluation profile。普通 session 从不调用它，
@@ -598,7 +622,8 @@ impl ToolRegistry {
         ];
         definitions.retain(|definition| match definition.name.as_str() {
             "code_run" | "write_stdin" | "process_list" => self.access.local_tools,
-            "file_read" | "file_patch" | "file_write" => self.access.file_tools,
+            "file_read" | "file_write" => self.access.file_tools,
+            "file_patch" => self.access.file_tools && self.access.file_patch,
             "web_search" | "web_fetch" => self.access.web_tools,
             "web_request" => self.access.web_tools,
             "working_note" => self.access.working_note,
@@ -848,7 +873,9 @@ impl ToolRegistry {
             "write_stdin" if self.access.local_tools => self.write_stdin(input, &context).await,
             "process_list" if self.access.local_tools => self.process_list(input, &context).await,
             "file_read" if self.access.file_tools => self.file_read(input, &context).await,
-            "file_patch" if self.access.file_tools => self.file_patch(input, &context).await,
+            "file_patch" if self.access.file_tools && self.access.file_patch => {
+                self.file_patch(input, &context).await
+            }
             "file_write" if self.access.file_tools => self.file_write(input, &context).await,
             "web_search" if self.access.web_tools => self.web_search(input).await,
             "web_fetch" if self.access.web_tools => self.web_fetch(input).await,

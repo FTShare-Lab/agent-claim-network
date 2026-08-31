@@ -54,6 +54,7 @@ class AutomatedRunConfig:
     acn_version: str
     model_egress_mode: str
     harness_mode: str
+    claim_quality_gate: str
     file_edit_authority_enabled: bool
     task_workers: int
     smoke_size: int
@@ -106,6 +107,7 @@ _ALLOWED_CONFIG_FIELDS = frozenset(
         "acn_version",
         "model_egress_mode",
         "harness_mode",
+        "claim_quality_gate",
         "file_edit_authority_enabled",
         "task_workers",
         "smoke_size",
@@ -251,6 +253,7 @@ def load_config(path: Path) -> AutomatedRunConfig:
     run_class = _run_class(raw)
     model_egress_mode = _model_egress_mode(raw)
     harness_mode = _harness_mode(raw)
+    claim_quality_gate = _claim_quality_gate(raw)
     acn_main_revision = _git_revision(raw, "acn_main_revision")
     acn_version = _version(raw, "acn_version")
     file_edit_authority_enabled = _boolean(
@@ -293,6 +296,7 @@ def load_config(path: Path) -> AutomatedRunConfig:
         acn_version=acn_version,
         model_egress_mode=model_egress_mode,
         harness_mode=harness_mode,
+        claim_quality_gate=claim_quality_gate,
         file_edit_authority_enabled=file_edit_authority_enabled,
         task_workers=_positive_int(raw.get("task_workers"), "task_workers"),
         smoke_size=smoke_size,
@@ -423,6 +427,7 @@ def prepare_run(config: AutomatedRunConfig) -> dict[str, object]:
             "acn_version": config.acn_version,
             "model_egress_mode": config.model_egress_mode,
             "harness_mode": config.harness_mode,
+            "claim_quality_gate": config.claim_quality_gate,
             "file_edit_authority_enabled": config.file_edit_authority_enabled,
             "pier_egress_proxy_image": config.pier_egress_proxy_image,
             "pier_egress_proxy_content_digest": config.pier_egress_proxy_content_digest,
@@ -720,6 +725,7 @@ def _prepare_phase(
         "acn_version": config.acn_version,
         "model_egress_mode": config.model_egress_mode,
         "harness_mode": config.harness_mode,
+        "claim_quality_gate": config.claim_quality_gate,
         "file_edit_authority_enabled": config.file_edit_authority_enabled,
         "acn_revision": acn_revision,
         "task_workers": config.task_workers,
@@ -1159,8 +1165,15 @@ def _model_egress_mode(raw: Mapping[str, object]) -> str:
 
 def _harness_mode(raw: Mapping[str, object]) -> str:
     value = raw.get("harness_mode", "standard")
-    if value not in {"standard", "minimal"}:
-        raise AutomatedRunError("harness_mode 仅支持 standard 或 minimal")
+    if value not in {"standard", "minimal", "concise", "pi_like", "open_code_like"}:
+        raise AutomatedRunError("harness_mode 无效")
+    return value
+
+
+def _claim_quality_gate(raw: Mapping[str, object]) -> str:
+    value = raw.get("claim_quality_gate", "none")
+    if value not in {"none", "verified_producer_only"}:
+        raise AutomatedRunError("claim_quality_gate 无效")
     return value
 
 
