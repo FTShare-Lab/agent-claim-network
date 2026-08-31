@@ -19,6 +19,12 @@ impl ToolRegistry {
         Ok(())
     }
 
+    pub(crate) fn release_delegation_runtime_lease_for_session(&self, session_id: &SessionId) {
+        if let Some(host) = &self.delegation_host {
+            host.release_runner_for(session_id);
+        }
+    }
+
     pub(crate) async fn bind_delegation_fallback_root_for_session(
         &self,
         session_id: &SessionId,

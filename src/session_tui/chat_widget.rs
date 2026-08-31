@@ -201,6 +201,7 @@ impl ChatWidget {
             match self.state.begin_clipboard_image_read() {
                 Ok(Some((limits, input_revision))) => {
                     self.state.mark_clipboard_image_read_started();
+                    let interaction_generation = self.state.interaction_generation();
                     let tx = self.app_event_tx.clone();
                     tokio::spawn(async move {
                         let result = tokio::task::spawn_blocking(move || {
@@ -208,7 +209,7 @@ impl ChatWidget {
                         })
                         .await
                         .unwrap_or_else(|e| Err(format!("剪贴板读取任务失败: {e}")));
-                        tx.clipboard_image_read(input_revision, result);
+                        tx.clipboard_image_read(interaction_generation, input_revision, result);
                     });
                 }
                 Ok(None) => {
@@ -233,7 +234,9 @@ impl ChatWidget {
             // Ctrl+O：预览附件（光标命中的一个，否则全部）。
             // 临时落盘与 `open` 拉起由 App 层处理。
             match self.state.preview_target_at_cursor() {
-                PreviewHit::Targets(targets) => self.app_event_tx.preview_attachment(targets),
+                PreviewHit::Targets(targets) => self
+                    .app_event_tx
+                    .preview_attachment(self.state.interaction_generation(), targets),
                 PreviewHit::NoAttachments => {
                     self.state
                         .push_system("输入框里没有可预览的附件（@path 或 [Image #N]）");
@@ -379,8 +382,11 @@ impl ChatWidget {
             }
             KeyCode::Esc => {
                 // queued input 的取回优先于当前 session task 的中断能力。compact、inbox
-                // 等非 turn task 同样允许排队输入，不能因为它们不可中断就跳过取回。
-                if self.state.restore_latest_queued_input_to_composer() {
+                // 等非 turn task 同样允许排队输入；Finalizing/Closed 的输入锁则必须连
+                // Esc 取回一起禁用，避免把目标 session 队列移回旧页面甚至覆盖丢失。
+                if self.state.input_accepts_text()
+                    && self.state.restore_latest_queued_input_to_composer()
+                {
                     self.app_event_tx.request_render();
                 } else {
                     self.app_event_tx.interrupt();
@@ -632,6 +638,15 @@ impl ChatWidget {
             0
         };
         let mut activity_lines = self.state.active_timeline_lines(box_content_width);
+        if self.state.status == SessionRuntimeStatus::SyncingInbox
+            && activity_lines
+                .first()
+                .is_some_and(|line| line.to_string().trim().is_empty())
+        {
+            // `Inbox started` 已经留在 scrollback；它与 activity 之间的历史间隔
+            // 不能落进 live box，框内第一行应直接显示当前同步活动。
+            activity_lines.remove(0);
+        }
         activity_lines.extend(network_status_lines);
         let show_live_box = has_animation_sidecar
             || !activity_lines.is_empty()
@@ -2083,6 +2098,24 @@ mod tests {
     }
 
     #[test]
+    fn esc_during_finalizing_keeps_target_queue_untouched() {
+        let (sender, mut rx) = AppEventSender::channel();
+        let mut chat = ChatWidget::new(sender);
+        chat.state_mut().status = SessionRuntimeStatus::Finalizing;
+        chat.state_mut().queue_pending_turn("first target input");
+        chat.state_mut().queue_pending_turn("second target input");
+
+        chat.handle_key_event(esc());
+        chat.handle_key_event(esc());
+
+        assert_eq!(chat.state().input(), "");
+        assert_eq!(chat.state().queued_count(), 2);
+        assert_eq!(rx.try_recv().unwrap(), AppEvent::InterruptRequested);
+        assert_eq!(rx.try_recv().unwrap(), AppEvent::InterruptRequested);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn ctrl_c_requests_exit_when_idle_and_composer_is_empty() {
         let (sender, mut rx) = AppEventSender::channel();
         let mut chat = ChatWidget::new(sender);
@@ -2680,15 +2713,19 @@ mod tests {
     fn ctrl_o_requests_preview_for_at_path_under_cursor() {
         let (sender, mut rx) = AppEventSender::channel();
         let mut chat = ChatWidget::new(sender);
+        chat.state_mut().bump_interaction_generation();
         chat.state_mut().push_input_text("看下 @docs/a.md");
 
         chat.handle_key_event(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
 
         assert_eq!(
             rx.try_recv().unwrap(),
-            AppEvent::PreviewAttachment(vec![super::super::attachment::PreviewTarget::AtPath {
-                raw_path: "docs/a.md".into()
-            }])
+            AppEvent::PreviewAttachment {
+                interaction_generation: 1,
+                targets: vec![super::super::attachment::PreviewTarget::AtPath {
+                    raw_path: "docs/a.md".into()
+                }]
+            }
         );
     }
 

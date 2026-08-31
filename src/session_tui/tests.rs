@@ -1687,7 +1687,7 @@ fn hidden_final_micro_tetris_does_not_force_working_title_on_narrow_width() {
 fn resumed_session_does_not_show_idle_micro_tetris() {
     let mut state = super::TuiState::new();
     state.set_status_notice("Subagent old completed");
-    state.reset_for_resumed_session();
+    state.reset_for_session_switch();
     state.status = SessionRuntimeStatus::Open;
     state.push_historical_turns(&[HistoricalTurn {
         user_text: "旧问题".into(),
@@ -1858,7 +1858,7 @@ fn slash_menu_lists_matching_commands_and_bolds_first_match() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    // 9 条原生命令超过 5 行窗口：只显示前 5 条（字母序），其余靠上下键滚动
+    // 原生命令超过 5 行窗口：只显示前 5 条（字母序），其余靠上下键滚动
     assert!(text.contains("/compact"));
     assert!(text.contains("/copy"));
     assert!(text.contains("/inbox"));
@@ -1897,7 +1897,7 @@ fn slash_menu_puts_skills_first_and_scrolls_window_with_selection() {
     assert!(!text.contains("/inbox"));
 
     // 连续向下移动选中，窗口跟随滚动，末尾的原生命令进入视野
-    for _ in 0..10 {
+    for _ in 0..11 {
         assert!(state.select_next_slash_completion());
     }
     let text = super::composer_lines_with_width(&state, 96)
@@ -2160,6 +2160,7 @@ fn help_lists_slash_commands_alphabetically() {
     let help = text.find("/help").expect("/help should render");
     let inbox = text.find("/inbox").expect("/inbox should render");
     let mcp = text.find("/mcp").expect("/mcp should render");
+    let new = text.find("/new").expect("/new should render");
     let ps = text.find("/ps").expect("/ps should render");
     let resume = text.find("/resume").expect("/resume should render");
     let skills = text.find("/skills").expect("/skills should render");
@@ -2170,7 +2171,8 @@ fn help_lists_slash_commands_alphabetically() {
     assert!(exit < help);
     assert!(help < inbox);
     assert!(inbox < mcp);
-    assert!(mcp < ps);
+    assert!(mcp < new);
+    assert!(new < ps);
     assert!(ps < resume);
     assert!(resume < skills);
     assert!(skills < subagents);
@@ -2240,6 +2242,7 @@ fn slash_commands_are_classified_for_tui_loop() {
     assert_eq!(classify("/help"), super::InputAction::Help);
     assert_eq!(classify("/inbox"), super::InputAction::Inbox);
     assert_eq!(classify("/mcp"), super::InputAction::Mcp);
+    assert_eq!(classify("/new"), super::InputAction::New);
     assert_eq!(classify("/ps"), super::InputAction::Ps);
     assert_eq!(classify("/skills"), super::InputAction::Skills);
     assert_eq!(classify("/subagents"), super::InputAction::Subagents);
@@ -2601,7 +2604,7 @@ fn resume_reset_drops_temporary_command_echo_before_restored_history() {
     state.push_command_echo("/resume".into());
     state.push_system("Loading resumable sessions...");
 
-    state.reset_for_resumed_session();
+    state.reset_for_session_switch();
     state.session_id = Some("session_2222bbbb".into());
     state.push_historical_turns(&[HistoricalTurn {
         user_text: "恢复的用户消息".into(),
@@ -2616,6 +2619,75 @@ fn resume_reset_drops_temporary_command_echo_before_restored_history() {
     assert!(text.contains("恢复的回复"));
     assert!(text.contains("Session session_2222bbbb resumed."));
     assert!(super::composer_hint(&state).starts_with("session_2222bbbb "));
+}
+
+#[test]
+fn resume_inbox_failure_warning_has_blank_line_on_both_sides() {
+    let mut state = super::TuiState::new();
+    state.push_system("history tail");
+    state.finish_resume_inbox_with_warning("Warning: Inbox sync failed; run /inbox to retry.");
+    state.push_system("next entry");
+
+    let transcript = state.transcript_text();
+    let lines = transcript.lines().collect::<Vec<_>>();
+    let warning_index = lines
+        .iter()
+        .position(|line| line.contains("Warning: Inbox sync failed; run /inbox to retry."))
+        .expect("Resume inbox warning should render");
+    assert!(lines[warning_index.saturating_sub(1)].trim().is_empty());
+    assert!(lines
+        .get(warning_index.saturating_add(1))
+        .is_some_and(|line| line.trim().is_empty()));
+    assert_eq!(state.status, SessionRuntimeStatus::Open);
+}
+
+#[test]
+fn session_switch_reset_preserves_early_interaction_generation() {
+    let mut state = super::TuiState::new();
+    state.bump_interaction_generation();
+
+    state.reset_for_session_switch();
+
+    assert_eq!(state.interaction_generation(), 1);
+}
+
+#[test]
+fn session_switch_reset_clears_session_projection_and_keeps_process_context() {
+    let mut state = super::TuiState::new();
+    state.set_workspace_context("/workspace/example".into(), "feature/example".into());
+    state.apply_event(SessionEvent::SessionStarted {
+        session_id: SessionId::from_str("session_1111aaaa").unwrap(),
+        agent_id: AgentId::new("agent-a").unwrap(),
+    });
+    state.apply_event(SessionEvent::ContextUsageUpdated {
+        used_tokens: 136_000,
+    });
+    state.apply_event(SessionEvent::LocalClaimsUpdated { total: 9 });
+    state.apply_event(SessionEvent::InboxCompleted {
+        processed: 1,
+        new_claim_ids: vec!["claim_00000001".parse().unwrap()],
+        updated_claim_ids: vec![],
+        new_dispute_ids: vec![],
+        deprecated_claim_ids: vec![],
+    });
+    state.push_system("old session only");
+    state.queue_pending_turn("queued for target");
+    state.open_process_panel();
+
+    state.reset_for_session_switch();
+
+    assert!(state.transcript_text().is_empty());
+    assert_eq!(state.context_label(), "0k/200k");
+    assert_eq!(state.network_snapshot(), &Default::default());
+    assert!(!state.process_panel_visible());
+    assert_eq!(state.workspace_label(), "/workspace/example");
+    assert_eq!(state.branch_label(), "feature/example");
+    assert_eq!(
+        state
+            .pop_queued_turn()
+            .map(|input| input.command_text().to_string()),
+        Some("queued for target".into())
+    );
 }
 
 #[test]
@@ -2933,6 +3005,36 @@ fn inbox_events_render_status_summary() {
     assert!(text.contains("new_claims=1"));
     assert!(text.contains("updated_claims=1"));
     assert!(text.contains("new_disputes=1"));
+}
+
+#[test]
+fn syncing_inbox_live_box_starts_with_activity_then_network_snapshot() {
+    let mut state = super::TuiState::new();
+    state.apply_event(SessionEvent::LocalClaimsUpdated { total: 0 });
+    state.apply_event(SessionEvent::StatusChanged {
+        status: SessionRuntimeStatus::SyncingInbox,
+    });
+    state.apply_event(SessionEvent::InboxStarted);
+
+    let lines = lines_plain_text(&super::inline_live_lines_with_width(&state, 80));
+    let top_index = lines
+        .iter()
+        .position(|line| line.contains("Inbox · Syncing updates · 0s"))
+        .expect("Inbox live box title should render");
+    let bottom_index = lines[top_index..]
+        .iter()
+        .position(|line| line.trim_start().starts_with('└'))
+        .map(|offset| top_index + offset)
+        .expect("Inbox live box bottom border should render");
+    let content = lines[top_index.saturating_add(1)..bottom_index]
+        .iter()
+        .map(|line| {
+            line.trim_matches(|ch: char| ch == '┆' || ch.is_whitespace())
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(content, vec!["syncing inbox...", "local claims 0"]);
 }
 
 #[test]

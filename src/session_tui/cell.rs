@@ -251,6 +251,7 @@ const HELP_ENTRIES: &[(&str, &str)] = &[
     ("/help", "show this help"),
     ("/inbox", "sync maintainer messages"),
     ("/mcp", "inspect MCP servers and tools"),
+    ("/new", "create and switch to a new session"),
     ("/ps", "inspect and manage background processes"),
     ("/resume", "reopen a previous session"),
     ("/skills", "list available skills"),

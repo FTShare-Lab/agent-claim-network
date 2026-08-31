@@ -83,6 +83,7 @@ pub struct SessionTuiState {
     at_path_scan_generation: u64,
     pending_at_path_scans: BTreeSet<u64>,
     pending_clipboard_image_reads: usize,
+    interaction_generation: u64,
     next_input_submission_sequence: u64,
 }
 
@@ -202,6 +203,7 @@ impl Default for SessionTuiState {
             at_path_scan_generation: 0,
             pending_at_path_scans: BTreeSet::new(),
             pending_clipboard_image_reads: 0,
+            interaction_generation: 0,
             next_input_submission_sequence: 0,
         }
     }
@@ -1045,6 +1047,10 @@ impl SessionTuiState {
         self.pending_clipboard_image_reads = self.pending_clipboard_image_reads.saturating_add(1);
     }
 
+    pub(super) fn discard_clipboard_image_read(&mut self) {
+        self.pending_clipboard_image_reads = self.pending_clipboard_image_reads.saturating_sub(1);
+    }
+
     /// 把规格化完成的剪贴板图片挂成 `[Image #N]` 附件。
     pub(super) fn apply_clipboard_image_read(
         &mut self,
@@ -1252,6 +1258,14 @@ impl SessionTuiState {
         !self.bottom_pane.finalize_failed() && super::bottom_pane::input_accepts_text(self.status)
     }
 
+    pub(super) fn interaction_generation(&self) -> u64 {
+        self.interaction_generation
+    }
+
+    pub(super) fn bump_interaction_generation(&mut self) {
+        self.interaction_generation = self.interaction_generation.wrapping_add(1);
+    }
+
     pub(super) fn finalize_failed(&self) -> bool {
         self.bottom_pane.finalize_failed()
     }
@@ -1288,11 +1302,20 @@ impl SessionTuiState {
         self.transcript.push_system(message);
     }
 
+    pub(super) fn finish_resume_inbox_with_warning(&mut self, warning: impl Into<String>) {
+        self.status = SessionRuntimeStatus::Open;
+        self.foreground_task_started_at = None;
+        self.transcript.set_activity(None);
+        self.transcript.push_system("");
+        self.transcript.push_warning(warning);
+        self.transcript.push_system("");
+    }
+
     pub(super) fn last_committed_assistant_text(&self) -> Option<&str> {
         self.transcript.last_committed_assistant_text()
     }
 
-    pub(super) fn reset_for_resumed_session(&mut self) {
+    pub(super) fn reset_for_session_switch(&mut self) {
         self.transcript.clear();
         self.network = NetworkSnapshot::default();
         self.context_used_tokens = None;
@@ -2596,6 +2619,26 @@ mod tests {
         assert!(state
             .transcript_text()
             .contains("输入内容已变化，请重新添加图片"));
+    }
+
+    #[test]
+    fn discarded_cross_session_clipboard_result_releases_pending_slot_without_notice() {
+        let mut state = SessionTuiState::new();
+        state.set_attachment_config(AttachmentConfig {
+            max_files_per_turn: 1,
+            ..AttachmentConfig::default()
+        });
+        let Some((_limits, _revision)) = state.begin_clipboard_image_read().unwrap() else {
+            panic!("Clipboard image should be enabled by default");
+        };
+        state.mark_clipboard_image_read_started();
+        state.discard_clipboard_image_read();
+
+        let Some((_limits, _revision)) = state.begin_clipboard_image_read().unwrap() else {
+            panic!("Discarded read must release its pending attachment slot");
+        };
+        assert!(state.transcript_text().is_empty());
+        assert_eq!(state.bottom_pane.effective_attachment_count(), 0);
     }
 
     #[test]

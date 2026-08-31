@@ -32,8 +32,16 @@ pub(super) enum WorkerEvent {
     ResumeListLoaded {
         sessions: Vec<crate::session::ResumedSessionSummary>,
     },
-    ResumeSessionLoaded {
-        result: anyhow::Result<ResumeSessionOutcome>,
+    ResumeListFailed(anyhow::Error),
+    ResumeSessionReserved {
+        result: anyhow::Result<ResumeSessionReservation>,
+    },
+    ResumeHistoryLoaded {
+        result: anyhow::Result<ResumeHistoryOutcome>,
+    },
+    ResumeInboxFinished {
+        session: crate::session::SessionHandle,
+        result: anyhow::Result<crate::agent::InboxProcessReport>,
     },
     TurnFinished {
         turn_id: u64,
@@ -60,6 +68,7 @@ pub(super) enum WorkerEvent {
         result: FinalizeEnqueueOutcome,
     },
     RecapEnqueueFinished {
+        session_id: SessionId,
         result: anyhow::Result<()>,
     },
     McpOperationFinished {
@@ -74,11 +83,14 @@ pub(super) struct McpOperationOutcome {
     pub(super) error: Option<String>,
 }
 
-pub(super) struct ResumeSessionOutcome {
+pub(super) struct ResumeSessionReservation {
     pub(super) session: crate::session::SessionHandle,
     pub(super) runtime_lease: crate::session::SessionRuntimeLease,
     pub(super) temporary_session_id: Option<SessionId>,
-    pub(super) inbox_report: crate::agent::InboxProcessReport,
+}
+
+pub(super) struct ResumeHistoryOutcome {
+    pub(super) session: crate::session::SessionHandle,
     pub(super) last_turns: Vec<crate::session::HistoricalTimelineTurn>,
     pub(super) turn_count: usize,
     pub(super) local_claim_count: Option<usize>,
@@ -609,13 +621,15 @@ pub(super) fn spawn_resume_list_worker(
                 let _ = worker_tx.send(WorkerEvent::ResumeListLoaded { sessions });
             }
             Err(error) => {
-                let _ = worker_tx.send(WorkerEvent::ResumeSessionLoaded { result: Err(error) });
+                let _ = worker_tx.send(WorkerEvent::ResumeListFailed(error));
             }
         }
     })
 }
 
-pub(super) fn spawn_resume_open_worker(
+/// 切换前只取得目标 runtime lease 并完成现有 Resume metadata 校验。
+/// 历史读取与 inbox 都留到旧 session handoff 成功之后。
+pub(super) fn spawn_resume_preflight_worker(
     engine: SessionEngine,
     session_id: SessionId,
     temporary_session_id: Option<SessionId>,
@@ -624,9 +638,25 @@ pub(super) fn spawn_resume_open_worker(
     tokio::spawn(async move {
         let result = async {
             let resumed = engine.reopen_existing_session(&session_id).await?;
-            let session = resumed.session;
-            let runtime_lease = resumed.runtime_lease;
-            let inbox_report = engine.process_inbox_for_resume(&session).await?;
+            anyhow::Ok(ResumeSessionReservation {
+                session: resumed.session,
+                runtime_lease: resumed.runtime_lease,
+                temporary_session_id,
+            })
+        }
+        .await;
+        let _ = worker_tx.send(WorkerEvent::ResumeSessionReserved { result });
+    })
+}
+
+/// handoff 后只读恢复目标历史、ctx 与 local claims；不执行 inbox，也不改写消息。
+pub(super) fn spawn_resume_history_worker(
+    engine: SessionEngine,
+    session: crate::session::SessionHandle,
+    worker_tx: mpsc::UnboundedSender<WorkerEvent>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = async {
             let messages = session.read_messages().await?;
             let journal_read = session.read_turn_journal().await;
             let (last_turns, journal_warning) =
@@ -652,11 +682,8 @@ pub(super) fn spawn_resume_open_worker(
                     None
                 }
             };
-            anyhow::Ok(ResumeSessionOutcome {
+            anyhow::Ok(ResumeHistoryOutcome {
                 session,
-                runtime_lease,
-                temporary_session_id,
-                inbox_report,
                 last_turns,
                 turn_count,
                 local_claim_count,
@@ -665,7 +692,57 @@ pub(super) fn spawn_resume_open_worker(
             })
         }
         .await;
-        let _ = worker_tx.send(WorkerEvent::ResumeSessionLoaded { result });
+        let _ = worker_tx.send(WorkerEvent::ResumeHistoryLoaded { result });
+    })
+}
+
+/// 目标历史已经可见后执行 Resume inbox。沿用 resume 专用的单人/团队语义，成功时
+/// 补发可见进度；失败不发送 Error 事件，最终由 App 降级成固定 warning 并恢复 Open。
+pub(super) fn spawn_resume_inbox_worker(
+    engine: SessionEngine,
+    session: crate::session::SessionHandle,
+    worker_tx: mpsc::UnboundedSender<WorkerEvent>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let send_event = |event| {
+            let _ = worker_tx.send(WorkerEvent::Session {
+                task_id: None,
+                event,
+            });
+        };
+        send_event(SessionEvent::StatusChanged {
+            status: crate::agent::SessionRuntimeStatus::SyncingInbox,
+        });
+        send_event(SessionEvent::InboxStarted);
+        let result = engine.process_inbox_for_resume(&session).await;
+        if let Ok(report) = &result {
+            send_event(SessionEvent::TeamServicesConnectionUpdated {
+                status: report.team_services,
+            });
+            for warning in &report.warnings {
+                send_event(SessionEvent::Warning {
+                    message: warning.clone(),
+                });
+            }
+            send_event(SessionEvent::InboxCompleted {
+                processed: report.total,
+                new_claim_ids: report.new_claim_ids.clone(),
+                updated_claim_ids: report.updated_claim_ids.clone(),
+                new_dispute_ids: report.new_dispute_ids.clone(),
+                deprecated_claim_ids: report.deprecated_claim_ids.clone(),
+            });
+            match engine.local_claim_count().await {
+                Ok(total) => send_event(SessionEvent::LocalClaimsUpdated { total }),
+                Err(error) => log::warn!(
+                    target: "session_tui",
+                    "Resume inbox 后刷新 local claim 计数失败: {error:#}"
+                ),
+            }
+            send_event(SessionEvent::StatusChanged {
+                status: crate::agent::SessionRuntimeStatus::Open,
+            });
+        }
+        let _ = worker_tx.send(WorkerEvent::ResumeInboxFinished { session, result });
     })
 }
 
@@ -988,6 +1065,7 @@ pub(super) fn spawn_recap_enqueue_worker(
     worker_tx: mpsc::UnboundedSender<WorkerEvent>,
 ) {
     tokio::spawn(async move {
+        let result_session_id = session_id.clone();
         let result = match supervisor {
             Some(supervisor) => {
                 crate::supervisor::enqueue_recap(&supervisor, session_id, recap_end_index)
@@ -996,7 +1074,10 @@ pub(super) fn spawn_recap_enqueue_worker(
             }
             None => Err(anyhow::anyhow!("supervisor is not configured")),
         };
-        let _ = worker_tx.send(WorkerEvent::RecapEnqueueFinished { result });
+        let _ = worker_tx.send(WorkerEvent::RecapEnqueueFinished {
+            session_id: result_session_id,
+            result,
+        });
     });
 }
 
@@ -1085,6 +1166,7 @@ fn spawn_finalize_worker(
 ) {
     tokio::spawn(async move {
         let _runtime_lease = runtime_lease;
+        let session_id = session.metadata.id.clone();
         let event_tx = worker_tx.clone();
         let result = engine
             .finalize_session(&mut session, move |event| {
@@ -1095,6 +1177,9 @@ fn spawn_finalize_worker(
             })
             .await
             .map(|_| ());
+        if result.is_ok() {
+            engine.release_delegation_runtime_lease(&session_id);
+        }
         let _ = worker_tx.send(WorkerEvent::FinalizeFinished { task_id, result });
     });
 }
@@ -1134,6 +1219,7 @@ fn spawn_finalize_enqueue_worker(
         .await
         {
             Ok(Some(job_id)) => {
+                engine.release_delegation_runtime_lease(&session.metadata.id);
                 let result = FinalizeEnqueueOutcome::Enqueued {
                     job_id,
                     session_id: session.metadata.id.clone(),
@@ -1142,6 +1228,7 @@ fn spawn_finalize_enqueue_worker(
             }
             Ok(None) => {
                 let event_tx = worker_tx.clone();
+                let session_id = session.metadata.id.clone();
                 let result = engine
                     .finalize_session(&mut session, move |event| {
                         let _ = event_tx.send(WorkerEvent::Session {
@@ -1151,6 +1238,9 @@ fn spawn_finalize_enqueue_worker(
                     })
                     .await
                     .map(|_| ());
+                if result.is_ok() {
+                    engine.release_delegation_runtime_lease(&session_id);
+                }
                 let _ = worker_tx.send(WorkerEvent::FinalizeFinished { task_id, result });
             }
             Err(error) => {

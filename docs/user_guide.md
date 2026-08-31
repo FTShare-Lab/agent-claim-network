@@ -177,12 +177,19 @@ acn --resume
 - `/exit`：结束当前 session，并把 finalize 交给后台 supervisor
 - `/inbox`：同步团队消息；单人模式会明确提示团队服务未配置
 - `/mcp`：查看 MCP server、连接状态和工具
+- `/new`：先收尾当前 session，再刷新欢迎页并按正常启动流程创建新 session
 - `/ps`：查看、选择和终止当前 session 可见的受管进程
-- `/resume`：选择可恢复的 session
+- `/resume`：选择并切换到可恢复的 Closed/Interrupted session
 - `/skills`：查看当前 Agent upstream 的 Skill
 - `/subagents`：查看当前 session 的 subagents
 - `!cmd`：运行本地 shell 命令
 - `@path`：把文本、图片或 PDF 加入当前输入
+
+`/new` 与 `/resume` 都可以在非空的空闲 session 中使用。
+
+handoff 成功后才清空旧页面。`/new` 会显示正常欢迎页，并执行与直接启动相同的 `inbox → prompt → create session → Open`；`/resume` 会先加载并显示目标既有历史、context 与 local claims，再在历史页面可见地同步 inbox；恢复过程不会替换已有历史消息或 system prompt。Resume inbox 失败时显示 `Warning: Inbox sync failed; run /inbox to retry.`，可以继续对话或稍后手动 `/inbox`。
+
+handoff 成功后的目标 startup、历史加载和 inbox 期间允许继续输入，但内容只进入既有队列，在目标 `Open` 后按顺序发送。切换决定之前已经发起的旧 `/copy`、附件预览或剪贴板图片读取即使稍后完成，也不会把结果提示写进目标 transcript。
 
 附件相关按键：
 
@@ -293,7 +300,7 @@ acn mcp logout my-server
 
 自动或手动 compact 只同步生成上下文 summary；有未 recap 的 committed history 时，会把冻结消息 target 静默投递为后台 Recap job。Recap 失败不影响已经成功的 compact，也不发送系统通知；后续 compact 或 Finalize 会继续覆盖剩余区间。
 
-退出非空 session 时，ACN 通常把最终 recap、claim 和 trace 工作交给同一个 supervisor；团队模式还会报告符合条件的 dispute，然后尽快归还终端。Finalize 比排队中的 Recap 优先，但不会打断已经开始的模型请求。
+退出或通过 `/new`、`/resume` 切走非空 session 时，ACN 通常把最终 recap、claim 和 trace 工作交给同一个 supervisor；团队模式还会报告符合条件的 dispute。Finalize job 持久化入队后，会话切换无需等待它执行完成。Finalize 比排队中的 Recap 优先，但不会打断已经开始的模型请求。
 
 查看任务：
 

@@ -2,6 +2,8 @@
 
 > 状态：已实现（2026-08-28）。
 
+> 后续范围说明（2026-08-31）：本文当时明确保留的“非空会话内 `/resume` 不支持、`/new` 不实现”限制，后续由 `docs/PRDs/PRD_in_session_new_resume.md` 替代。本文定义的异常 Open/Closed/Finalizing 恢复、候选筛选与 runtime lease 语义继续有效；本说明只记录后续需求覆盖关系，不改写本文实施时的历史拍板。
+
 ## 目标
 
 允许用户通过启动参数 `acn --resume`、`acn --resume <session_id>`，以及空白启动 session 中的 `/resume`，继续因断电、关机或进程异常退出而仍为 `Open` 的 session，同时避免两个进程并发写同一 session。

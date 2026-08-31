@@ -384,6 +384,22 @@ impl DelegationToolHost {
         runners.insert(session_id.clone(), runner.clone());
         Ok(runner)
     }
+
+    fn release_runner_for(&self, session_id: &SessionId) {
+        let runner = match self.runners.lock() {
+            Ok(mut runners) => runners.remove(session_id),
+            Err(_) => {
+                log::warn!(
+                    target: "tool",
+                    "subagent runner registry lock poisoned while releasing session {session_id}"
+                );
+                None
+            }
+        };
+        // 从 registry 摘除空闲 runner 会释放它持有的 runtime lease；若仍有 detached
+        // task 持有 runner，lease 会跟随 task 活到真正退出，保留原有跨进程保护。
+        drop(runner);
+    }
 }
 
 #[derive(Clone)]

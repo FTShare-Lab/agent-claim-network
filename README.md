@@ -137,7 +137,7 @@ cd /path/to/workspace
 acn
 ```
 
-启动时的目录会是工作目录，作为工具和 `!命令` 的 cwd。进 TUI 后 `/help` 看命令；常用：`Enter` 发送、`Shift+Enter` 换行、`Ctrl+Enter` 插话、`/exit` 结束。
+启动时的目录会是工作目录，作为工具和 `!命令` 的 cwd。进 TUI 后 `/help` 看命令；常用：`Enter` 发送、`Shift+Enter` 换行、`Ctrl+Enter` 插话、`/new` 新建会话、`/resume` 切换历史会话、`/exit` 结束。
 
 <details>
 <summary><b>改用 Anthropic 协议</b></summary>
@@ -223,8 +223,9 @@ acn update
 | `/copy` | 复制最近一条回复 |
 | `/inbox` | 同步团队消息（单人模式会提示未配置） |
 | `/mcp` | MCP 状态与工具 |
+| `/new` | 创建并切换到新会话 |
 | `/ps` | 后台进程 |
-| `/resume` | 选择历史会话 |
+| `/resume` | 选择并切换到历史会话 |
 | `/skills` | Skill 列表 |
 | `/subagents` | 子代理 |
 | `/exit` | 结束会话 |

@@ -1498,6 +1498,12 @@ impl SessionEngine {
             .context("绑定 subagent session runtime lease 失败")
     }
 
+    pub(crate) fn release_delegation_runtime_lease(&self, session_id: &SessionId) {
+        self.turn_loop
+            .tool_registry()
+            .release_delegation_runtime_lease_for_session(session_id);
+    }
+
     pub(crate) async fn process_snapshots_for_session(
         &self,
         session_id: &SessionId,
