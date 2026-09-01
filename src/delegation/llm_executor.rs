@@ -860,6 +860,7 @@ fn file_mutation_evidence_from_tool_results(turn: &SessionTurn) -> FileMutationE
                         tools.insert(id.clone(), (name.clone(), input_path));
                     }
                 }
+                SessionTurnContentBlock::InvalidToolUse { .. } => {}
                 SessionTurnContentBlock::ToolResult {
                     tool_use_id,
                     content,
@@ -954,6 +955,7 @@ fn append_text_blocks(message: &SessionTurnMessage, out: &mut String) {
             | SessionTurnContentBlock::ModelContext { .. }
             | SessionTurnContentBlock::SkillInstructions { .. }
             | SessionTurnContentBlock::ToolUse { .. }
+            | SessionTurnContentBlock::InvalidToolUse { .. }
             | SessionTurnContentBlock::ToolResult { .. } => {}
         }
     }

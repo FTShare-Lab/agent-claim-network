@@ -587,9 +587,10 @@ fn push_user_message(
                 tool_use_id,
                 content,
             } => tool_results.push((tool_use_id, content)),
-            SessionTurnContentBlock::ToolUse { .. } => {
+            SessionTurnContentBlock::ToolUse { .. }
+            | SessionTurnContentBlock::InvalidToolUse { .. } => {
                 return Err(OpenAiCompatibleChatError::OutputShape {
-                    reason: "user message 不允许包含 ToolUse".into(),
+                    reason: "user message 不允许包含 tool call".into(),
                     raw: String::new(),
                 });
             }
@@ -657,6 +658,9 @@ fn assistant_message_to_chat(
             }
             SessionTurnContentBlock::ToolUse { id, name, input } => {
                 tool_calls.push(ChatToolCall::function(id, name, input.to_string()));
+            }
+            SessionTurnContentBlock::InvalidToolUse { id, name, .. } => {
+                tool_calls.push(ChatToolCall::function(id, name, "{}"));
             }
             SessionTurnContentBlock::ToolResult { .. } => {
                 return Err(OpenAiCompatibleChatError::OutputShape {
@@ -767,10 +771,13 @@ fn provider_response_from_turn(
 ) -> Result<ProviderResponse, OpenAiCompatibleChatError> {
     let stop = provider_stop_from_turn(&turn);
     let assistant_message = assistant_turn_message(turn, model)?;
-    let has_tool_use = assistant_message
-        .content
-        .iter()
-        .any(|block| matches!(block, SessionTurnContentBlock::ToolUse { .. }));
+    let has_tool_use = assistant_message.content.iter().any(|block| {
+        matches!(
+            block,
+            SessionTurnContentBlock::ToolUse { .. }
+                | SessionTurnContentBlock::InvalidToolUse { .. }
+        )
+    });
     if stop == ProviderStop::ToolUse && !has_tool_use {
         return Err(OpenAiCompatibleChatError::NoConsumableOutput {
             reason: "Chat 工具终态没有完整 tool call".into(),
@@ -823,7 +830,9 @@ fn assistant_turn_message(
         replay_messages,
         ..
     } = turn;
+    let raw_message_replay = message_from_response(&message);
     let mut content = Vec::new();
+    let mut has_invalid_tool_use = false;
     let ChatCompletionMessage {
         content: message_content,
         tool_calls,
@@ -843,16 +852,36 @@ fn assistant_turn_message(
                 raw: String::new(),
             });
         }
-        content.push(SessionTurnContentBlock::ToolUse {
-            id: tool_call.id,
-            name: tool_call.function.name,
-            input: parse_tool_arguments(&tool_call.function.arguments)?,
-        });
+        let block = match parse_tool_arguments(&tool_call.function.arguments) {
+            Ok(input) => SessionTurnContentBlock::ToolUse {
+                id: tool_call.id,
+                name: tool_call.function.name,
+                input,
+            },
+            Err(error) => {
+                has_invalid_tool_use = true;
+                SessionTurnContentBlock::InvalidToolUse {
+                    id: tool_call.id,
+                    name: tool_call.function.name,
+                    error,
+                }
+            }
+        };
+        content.push(block);
     }
     let mut message = SessionTurnMessage {
         role: "assistant".into(),
         provider_replay: None,
         content,
+    };
+    let replay_messages = match replay_messages {
+        Some(messages) => Some(messages),
+        None if has_invalid_tool_use => Some(vec![serde_json::to_value(raw_message_replay)
+            .map_err(|error| OpenAiCompatibleChatError::OutputShape {
+                reason: format!("序列化 Chat malformed tool call replay 失败: {error}"),
+                raw: String::new(),
+            })?]),
+        None => None,
     };
     if let Some(messages) = replay_messages {
         message.provider_replay = Some(ProviderReplayState::OpenAiChatCompletions {
@@ -863,20 +892,14 @@ fn assistant_turn_message(
     Ok(message)
 }
 
-fn parse_tool_arguments(raw: &str) -> Result<Value, OpenAiCompatibleChatError> {
+fn parse_tool_arguments(raw: &str) -> Result<Value, String> {
     if raw.trim().is_empty() {
         return Ok(json!({}));
     }
-    let value =
-        serde_json::from_str::<Value>(raw).map_err(|e| OpenAiCompatibleChatError::OutputShape {
-            reason: format!("tool_call.arguments 不是合法 JSON: {e}"),
-            raw: raw.to_string(),
-        })?;
+    let value = serde_json::from_str::<Value>(raw)
+        .map_err(|error| format!("tool_call.arguments 不是合法 JSON: {error}"))?;
     if !value.is_object() {
-        return Err(OpenAiCompatibleChatError::OutputShape {
-            reason: "tool_call.arguments 必须是 JSON object".into(),
-            raw: raw.to_string(),
-        });
+        return Err("tool_call.arguments 必须是 JSON object".into());
     }
     Ok(value)
 }
@@ -1489,6 +1512,92 @@ mod tests {
             &message.content[1],
             SessionTurnContentBlock::ToolUse { name, .. } if name == "workspace_read"
         ));
+    }
+
+    #[test]
+    fn malformed_and_non_object_chat_arguments_become_recoverable_tool_calls() {
+        for (arguments, expected_error) in [
+            (r#"{"path":"unfinished""#, "不是合法 JSON"),
+            (r#"["not", "an", "object"]"#, "必须是 JSON object"),
+        ] {
+            let response = provider_response_from_turn(
+                ContinuedChatTurn {
+                    message: ChatCompletionMessage {
+                        role: Some("assistant".into()),
+                        content: None,
+                        tool_calls: vec![ChatToolCall::function(
+                            "call_bad",
+                            "workspace_read",
+                            arguments,
+                        )],
+                    },
+                    finish_reason: Some(ChatFinishReason::ToolCalls),
+                    merged_text: String::new(),
+                    replay_messages: None,
+                },
+                "test-model",
+            )
+            .unwrap();
+
+            assert_eq!(response.stop, ProviderStop::ToolUse);
+            assert!(matches!(
+                response.assistant_message.content.as_slice(),
+                [SessionTurnContentBlock::InvalidToolUse { id, name, error }]
+                    if id == "call_bad" && name == "workspace_read" && error.contains(expected_error)
+            ));
+            assert!(matches!(
+                response.assistant_message.provider_replay.as_ref(),
+                Some(ProviderReplayState::OpenAiChatCompletions { messages, .. })
+                    if messages[0]["tool_calls"][0]["function"]["arguments"] == arguments
+            ));
+        }
+    }
+
+    #[test]
+    fn length_finish_preserves_invalid_and_valid_tool_calls_for_recovery() {
+        let malformed = r#"{"path":"unfinished""#;
+        let response = provider_response_from_turn(
+            ContinuedChatTurn {
+                message: ChatCompletionMessage {
+                    role: Some("assistant".into()),
+                    content: None,
+                    tool_calls: vec![
+                        ChatToolCall::function("call_bad", "workspace_read", malformed),
+                        ChatToolCall::function(
+                            "call_good",
+                            "workspace_read",
+                            r#"{"path":"README.md"}"#,
+                        ),
+                    ],
+                },
+                finish_reason: Some(ChatFinishReason::Length),
+                merged_text: String::new(),
+                replay_messages: None,
+            },
+            "test-model",
+        )
+        .unwrap();
+
+        assert_eq!(response.stop, ProviderStop::MaxTokens);
+        assert!(matches!(
+            response.assistant_message.content.as_slice(),
+            [
+                SessionTurnContentBlock::InvalidToolUse {
+                    id: bad_id, error, ..
+                },
+                SessionTurnContentBlock::ToolUse {
+                    id: good_id, input, ..
+                }
+            ] if bad_id == "call_bad"
+                && good_id == "call_good"
+                && error.contains("line 1 column")
+                && input == &json!({"path":"README.md"})
+        ));
+    }
+
+    #[test]
+    fn empty_chat_arguments_remain_an_empty_object() {
+        assert_eq!(parse_tool_arguments("\n").unwrap(), json!({}));
     }
 
     #[test]

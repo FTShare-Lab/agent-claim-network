@@ -102,7 +102,10 @@ fn redact_memory_tool_messages(
         .iter()
         .flat_map(|message| message.content.iter())
         .filter_map(|block| match block {
-            SessionTurnContentBlock::ToolUse { id, name, .. } if name == "memory" => {
+            SessionTurnContentBlock::ToolUse { id, name, .. }
+            | SessionTurnContentBlock::InvalidToolUse { id, name, .. }
+                if name == "memory" =>
+            {
                 Some(id.clone())
             }
             _ => None,
@@ -111,7 +114,10 @@ fn redact_memory_tool_messages(
     for message in &mut messages {
         for block in &mut message.content {
             let replacement = match block {
-                SessionTurnContentBlock::ToolUse { name, .. } if name == "memory" => {
+                SessionTurnContentBlock::ToolUse { name, .. }
+                | SessionTurnContentBlock::InvalidToolUse { name, .. }
+                    if name == "memory" =>
+                {
                     Some(if memory_enabled {
                         "[tool_use memory input omitted from recap transcript]"
                     } else {
@@ -836,6 +842,11 @@ pub(super) fn estimated_session_message_tokens_projected<'a>(
                     canonical_tokens = canonical_tokens
                         .saturating_add(estimate_text_tokens(name))
                         .saturating_add(estimate_json_tokens(input));
+                }
+                SessionContentBlock::InvalidToolUse { name, error, .. } => {
+                    canonical_tokens = canonical_tokens
+                        .saturating_add(estimate_text_tokens(name))
+                        .saturating_add(estimate_text_tokens(error));
                 }
                 SessionContentBlock::ToolResult { content, .. } => {
                     let chars = content.chars().count();

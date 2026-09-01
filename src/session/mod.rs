@@ -523,6 +523,11 @@ pub enum SessionContentBlock {
         name: String,
         input: Value,
     },
+    InvalidToolUse {
+        id: String,
+        name: String,
+        error: String,
+    },
     ToolResult {
         tool_use_id: String,
         content: String,
@@ -594,6 +599,9 @@ impl From<SessionTurnContentBlock> for SessionContentBlock {
             SessionTurnContentBlock::ToolUse { id, name, input } => {
                 Self::ToolUse { id, name, input }
             }
+            SessionTurnContentBlock::InvalidToolUse { id, name, error } => {
+                Self::InvalidToolUse { id, name, error }
+            }
             SessionTurnContentBlock::ToolResult {
                 tool_use_id,
                 content,
@@ -632,6 +640,9 @@ impl From<SessionContentBlock> for SessionTurnContentBlock {
                 filename,
             },
             SessionContentBlock::ToolUse { id, name, input } => Self::ToolUse { id, name, input },
+            SessionContentBlock::InvalidToolUse { id, name, error } => {
+                Self::InvalidToolUse { id, name, error }
+            }
             SessionContentBlock::ToolResult {
                 tool_use_id,
                 content,
@@ -2765,6 +2776,22 @@ frontier:
         );
         // filename 为 None 时序列化省略字段，与旧格式一致
         assert_eq!(serde_json::to_string(&back).unwrap(), legacy);
+    }
+
+    #[test]
+    fn invalid_tool_use_round_trips_without_raw_arguments() {
+        let block = SessionContentBlock::InvalidToolUse {
+            id: "call_bad".into(),
+            name: "file_read".into(),
+            error: "function_call.arguments 不是合法 JSON: expected value at line 1 column 13"
+                .into(),
+        };
+
+        let encoded = serde_json::to_string(&block).unwrap();
+        let decoded: SessionContentBlock = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded, block);
+        assert!(!encoded.contains("unfinished secret arguments"));
     }
 
     #[tokio::test]

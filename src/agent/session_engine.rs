@@ -5640,6 +5640,7 @@ fn first_text_session_content(blocks: &[SessionContentBlock]) -> Option<&str> {
         SessionContentBlock::Image { .. }
         | SessionContentBlock::Document { .. }
         | SessionContentBlock::ToolUse { .. }
+        | SessionContentBlock::InvalidToolUse { .. }
         | SessionContentBlock::ToolResult { .. } => None,
     })
 }

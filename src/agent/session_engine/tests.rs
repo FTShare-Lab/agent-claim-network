@@ -929,6 +929,7 @@ fn last_user_text(request: &ProviderRequest) -> String {
                     SessionTurnContentBlock::Image { .. }
                     | SessionTurnContentBlock::Document { .. }
                     | SessionTurnContentBlock::ToolUse { .. }
+                    | SessionTurnContentBlock::InvalidToolUse { .. }
                     | SessionTurnContentBlock::ToolResult { .. } => None,
                 })
                 .collect::<Vec<_>>()
@@ -948,6 +949,7 @@ fn text_content(message: &SessionMessage) -> String {
             SessionContentBlock::Image { .. }
             | SessionContentBlock::Document { .. }
             | SessionContentBlock::ToolUse { .. }
+            | SessionContentBlock::InvalidToolUse { .. }
             | SessionContentBlock::ToolResult { .. } => None,
         })
         .collect::<Vec<_>>()
@@ -12653,6 +12655,7 @@ fn historical_provider_context_flattens_media_blocks_without_base64() {
             SessionTurnContentBlock::Image { .. }
             | SessionTurnContentBlock::Document { .. }
             | SessionTurnContentBlock::ToolUse { .. }
+            | SessionTurnContentBlock::InvalidToolUse { .. }
             | SessionTurnContentBlock::ToolResult { .. } => "",
         })
         .collect::<Vec<_>>()

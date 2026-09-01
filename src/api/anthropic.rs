@@ -880,6 +880,9 @@ fn session_turn_block_to_api(block: SessionTurnContentBlock) -> Option<Value> {
         SessionTurnContentBlock::ToolUse { id, name, input } => {
             Some(json!({"type": "tool_use", "id": id, "name": name, "input": input}))
         }
+        SessionTurnContentBlock::InvalidToolUse { id, name, .. } => {
+            Some(json!({"type": "tool_use", "id": id, "name": name, "input": {}}))
+        }
         SessionTurnContentBlock::ToolResult {
             tool_use_id,
             content,

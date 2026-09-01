@@ -82,6 +82,9 @@ fn estimate_session_turn_content_block_tokens(block: &SessionTurnContentBlock) -
         SessionTurnContentBlock::ToolUse { name, input, .. } => {
             estimate_text_tokens(name).saturating_add(estimate_json_tokens(input))
         }
+        SessionTurnContentBlock::InvalidToolUse { name, error, .. } => {
+            estimate_text_tokens(name).saturating_add(estimate_text_tokens(error))
+        }
         SessionTurnContentBlock::ToolResult { content, .. } => estimate_text_tokens(content),
     }
 }
