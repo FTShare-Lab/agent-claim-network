@@ -154,7 +154,11 @@ class GateValidator:
             failures.append("B_EMPTY_ROUTER_NOT_EMPTY")
         if value.variant not in {"B_claim", "B_forced_claim"}:
             return
+        if len(value.router_evidence) > 1:
+            failures.append("CLAIM_DELIVERY_REPEATED")
         frozen = set(value.frozen_claim_ids)
+        if value.variant == "B_forced_claim" and frozen and len(value.router_evidence) != 1:
+            failures.append("FORCED_CLAIM_DELIVERY_COUNT_INVALID")
         if not frozen:
             if value.allow_empty_claim_bundle:
                 warnings.append("EMPTY_CLAIM_BUNDLE")

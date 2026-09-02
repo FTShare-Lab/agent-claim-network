@@ -2451,7 +2451,7 @@ impl SessionEngine {
         emit(SessionEvent::StatusChanged {
             status: SessionRuntimeStatus::Initializing,
         });
-        let session_fallback_scope = crate::api::ProviderRuntimeFallbackScope::new_root();
+        let inbox_fallback_scope = crate::api::ProviderRuntimeFallbackScope::new_root();
         let inbox_report = match self.runtime_profile {
             SessionRuntimeProfile::Interactive => {
                 emit(SessionEvent::StartupProgress {
@@ -2463,7 +2463,7 @@ impl SessionEngine {
                 let inbox_generator = SessionInboxJsonGenerator {
                     prompt_registry: &self.prompt_registry,
                     json_caller: &self.json_caller,
-                    fallback_scope: session_fallback_scope.clone(),
+                    fallback_scope: inbox_fallback_scope.clone(),
                 };
                 let report = self.runner.process_inbox_with(&inbox_generator).await?;
                 emit(SessionEvent::TeamServicesConnectionUpdated {
@@ -2497,7 +2497,7 @@ impl SessionEngine {
                 max_attempts,
             )
             .await?;
-        session.replace_runtime_fallback_root(session_fallback_scope);
+        session.replace_runtime_fallback_root(inbox_fallback_scope);
         emit(SessionEvent::SessionStarted {
             session_id: session.metadata.id.clone(),
             agent_id: self.agent.agent_id.clone(),

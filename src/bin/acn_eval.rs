@@ -15,6 +15,7 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::Command;
 
+use agent_claim_network::build_info;
 use agent_claim_network::evaluation::{
     load_attempt_config, run_attempt, EvaluationResult, EVALUATION_MODEL_KEY_ENV,
 };
@@ -26,7 +27,19 @@ const MAX_MODEL_KEY_BYTES: usize = 512;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config_path = parse_cli(std::env::args().collect())?;
+    let args = std::env::args().collect::<Vec<_>>();
+    if build_info_json_requested(&args) {
+        println!(
+            "{}",
+            serde_json::json!({
+                "version": build_info::PACKAGE_VERSION,
+                "commit": build_info::GIT_COMMIT_FULL,
+                "commit_timestamp": build_info::GIT_COMMIT_TIMESTAMP,
+            })
+        );
+        return Ok(());
+    }
+    let config_path = parse_cli(args)?;
     bootstrap_model_key()?;
     let config = load_attempt_config(&config_path).await?;
     let result = run_attempt(config).await?;
@@ -210,7 +223,7 @@ fn parse_cli(args: Vec<String>) -> anyhow::Result<PathBuf> {
                 ));
             }
             "--help" | "-h" => {
-                println!("Usage: acn_eval --config <absolute attempt.toml>");
+                println!("Usage: acn_eval --config <absolute attempt.toml> | --build-info-json");
                 std::process::exit(0);
             }
             other => anyhow::bail!("未知参数: {other}"),
@@ -222,6 +235,13 @@ fn parse_cli(args: Vec<String>) -> anyhow::Result<PathBuf> {
         anyhow::bail!("--config 必须是绝对路径: {}", config.display());
     }
     Ok(config)
+}
+
+fn build_info_json_requested(args: &[String]) -> bool {
+    args.len() == 2
+        && args
+            .get(1)
+            .is_some_and(|value| value == "--build-info-json")
 }
 
 fn print_result_path(result: &EvaluationResult) -> anyhow::Result<()> {
@@ -265,6 +285,20 @@ mod tests {
             .unwrap(),
             PathBuf::from("/tmp/run.toml")
         );
+    }
+
+    #[test]
+    fn build_info_json_flag_requires_a_single_exact_argument() {
+        assert!(build_info_json_requested(&[
+            "acn_eval".into(),
+            "--build-info-json".into()
+        ]));
+        assert!(!build_info_json_requested(&["acn_eval".into()]));
+        assert!(!build_info_json_requested(&[
+            "acn_eval".into(),
+            "--build-info-json".into(),
+            "extra".into()
+        ]));
     }
 
     #[cfg(unix)]

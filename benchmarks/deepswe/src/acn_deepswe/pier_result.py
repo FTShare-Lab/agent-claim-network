@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -25,6 +26,8 @@ class PierTrialEvidence:
     task_name: str
     task_checksum: str
     verifier_rewards: dict[str, float | int] | None
+    exception_type: str | None
+    exception_message: str | None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -34,7 +37,40 @@ class PierTrialEvidence:
             "task_name": self.task_name,
             "task_checksum": self.task_checksum,
             "verifier_rewards": self.verifier_rewards,
+            "exception_type": self.exception_type,
+            "exception_message_sha256": (
+                hashlib.sha256(self.exception_message.encode("utf-8")).hexdigest()
+                if self.exception_message is not None
+                else None
+            ),
         }
+
+    def infrastructure_failure_reason(self) -> str | None:
+        """只把已知 verifier/Docker 故障从普通 0 分中分离出来。"""
+        if self.verifier_rewards is not None or self.exception_type is None:
+            return None
+        if self.exception_type == "VerifierTimeoutError":
+            return "VERIFIER_TIMEOUT"
+        infrastructure_types = {
+            "DockerError",
+            "DockerComposeError",
+            "EnvironmentError",
+            "EnvironmentBuildError",
+        }
+        if self.exception_type in infrastructure_types:
+            return f"PIER_INFRASTRUCTURE_EXCEPTION:{self.exception_type}"
+        message = (self.exception_message or "").lower()
+        markers = (
+            "docker compose command failed",
+            "oci runtime exec failed",
+            "cannot connect to the docker daemon",
+            "no space left on device",
+            "context deadline exceeded",
+            "setns process exit status",
+        )
+        if any(marker in message for marker in markers):
+            return "PIER_DOCKER_INFRASTRUCTURE_FAILURE"
+        return None
 
     def verifier_for(self, attempt_id: str) -> VerifierResult:
         """null verifier_result 表示未运行；其余值已在读取边界完成校验。"""
@@ -74,6 +110,7 @@ def read_single_trial_evidence(job_directory: Path) -> tuple[Path, PierTrialEvid
     if not isinstance(raw.get("agent_info"), Mapping):
         raise PierResultError("TrialResult.agent_info 必须是对象")
     verifier_rewards = _verifier_rewards(raw.get("verifier_result"))
+    exception_type, exception_message = _exception_info(raw.get("exception_info"))
     return result_path.parent, PierTrialEvidence(
         result_path=result_path.resolve(),
         trial_name=trial_name,
@@ -81,6 +118,8 @@ def read_single_trial_evidence(job_directory: Path) -> tuple[Path, PierTrialEvid
         task_name=task_name,
         task_checksum=task_checksum,
         verifier_rewards=verifier_rewards,
+        exception_type=exception_type,
+        exception_message=exception_message,
     )
 
 
@@ -115,3 +154,17 @@ def _verifier_rewards(value: object) -> dict[str, float | int] | None:
     if rewards.get("reward") not in {0, 1}:
         raise PierResultError("TrialResult.verifier_result.rewards.reward 必须是 0 或 1")
     return {str(key): item for key, item in rewards.items()}
+
+
+def _exception_info(value: object) -> tuple[str | None, str | None]:
+    if value is None:
+        return None, None
+    if not isinstance(value, Mapping):
+        raise PierResultError("TrialResult.exception_info 必须是对象或 null")
+    exception_type = value.get("exception_type")
+    exception_message = value.get("exception_message")
+    if not isinstance(exception_type, str) or not exception_type:
+        raise PierResultError("TrialResult.exception_info.exception_type 必须是非空字符串")
+    if not isinstance(exception_message, str) or not exception_message:
+        raise PierResultError("TrialResult.exception_info.exception_message 必须是非空字符串")
+    return exception_type, exception_message

@@ -847,29 +847,6 @@ mod tests {
         format!("http://{addr}")
     }
 
-    async fn spawn_responses(responses: Vec<(u16, String)>) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            for (status, body) in responses {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut buf = vec![0; 8192];
-                let _ = socket.read(&mut buf).await.unwrap();
-                let reason = if status == 200 {
-                    "OK"
-                } else {
-                    "Internal Server Error"
-                };
-                let response = format!(
-                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
-                    body.len(),
-                );
-                socket.write_all(response.as_bytes()).await.unwrap();
-            }
-        });
-        format!("http://{addr}")
-    }
-
     async fn spawn_body_sequence(bodies: Vec<String>) -> (String, tokio::task::JoinHandle<usize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -911,6 +888,29 @@ mod tests {
             expected
         });
         (format!("http://{addr}"), handle)
+    }
+
+    async fn spawn_responses(responses: Vec<(u16, String)>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0; 8192];
+                let _ = socket.read(&mut buf).await.unwrap();
+                let reason = if status == 200 {
+                    "OK"
+                } else {
+                    "Internal Server Error"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len(),
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        format!("http://{addr}")
     }
 
     async fn spawn_server(

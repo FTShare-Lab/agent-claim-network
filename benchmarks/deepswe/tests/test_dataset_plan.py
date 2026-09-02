@@ -43,7 +43,8 @@ class DatasetAndPlanTests(unittest.TestCase):
         for offset in range(0, 20, 4):
             variants = [attempt.variant for attempt in plan.attempts[offset : offset + 4]]
             self.assertEqual(variants[0], "A")
-            self.assertEqual(set(variants[1:]), {"B_empty", "B_claim", "B_forced_claim"})
+            self.assertEqual(variants[1], "B_empty")
+            self.assertEqual(set(variants[2:]), {"B_claim", "B_forced_claim"})
         output_paths = [attempt.output_path for attempt in plan.attempts]
         self.assertEqual(len(output_paths), len(set(output_paths)))
         self.assertEqual(
@@ -63,6 +64,22 @@ class DatasetAndPlanTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(DatasetFreezeError):
                 FrozenDatasetManifest.from_dict({**manifest, field: value})
 
+    def test_frozen_manifest_accepts_acn_harness_claim_canary_algorithm(self) -> None:
+        manifest = FrozenDatasetManifest.from_dict(
+            {
+                "schema_version": 1,
+                "algorithm": "official_v1.1_acn_harness_claim_canary_v1",
+                "seed": 20260831,
+                "candidates_hash": "a" * 64,
+                "task_ids": ["task-a"],
+            }
+        )
+
+        self.assertEqual(
+            manifest.algorithm,
+            "official_v1.1_acn_harness_claim_canary_v1",
+        )
+
     def test_freeze_rejects_non_positive_sample_size(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "tasks"
@@ -71,10 +88,13 @@ class DatasetAndPlanTests(unittest.TestCase):
             (task / "task.toml").write_text(TASK)
 
             for sample_size in (0, -1):
-                with self.subTest(sample_size=sample_size), self.assertRaisesRegex(
-                    DatasetFreezeError, "正整数"
+                with (
+                    self.subTest(sample_size=sample_size),
+                    self.assertRaisesRegex(DatasetFreezeError, "正整数"),
                 ):
-                    freeze_dataset(root, Path(directory) / "freeze.json", seed=17, sample_size=sample_size)
+                    freeze_dataset(
+                        root, Path(directory) / "freeze.json", seed=17, sample_size=sample_size
+                    )
 
     def test_execution_freeze_records_revisions_hashes_and_normalized_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -207,7 +227,9 @@ docker_image = "public.ecr.aws/example/task:v1"
 
 def _commit_checkout(checkout: Path) -> None:
     subprocess.run(["git", "init", str(checkout)], check=True, capture_output=True, text=True)
-    subprocess.run(["git", "-C", str(checkout), "add", "."], check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-C", str(checkout), "add", "."], check=True, capture_output=True, text=True
+    )
     subprocess.run(
         [
             "git",

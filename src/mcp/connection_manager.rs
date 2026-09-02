@@ -2275,7 +2275,7 @@ mod tests {
         manager.refresh_all().await.unwrap();
         for text in ["first", "second"] {
             manager
-                .call_tool("stdio_server", "ping", Some(json!({"text": text})), None)
+                .call_tool("stdio_server", "ping", Some(json!({ "text": text })), None)
                 .await
                 .unwrap();
         }
@@ -2918,7 +2918,7 @@ mod tests {
         manager.refresh_all().await.unwrap();
         for text in ["first", "second"] {
             manager
-                .call_tool("http_server", "ping", Some(json!({"text": text})), None)
+                .call_tool("http_server", "ping", Some(json!({ "text": text })), None)
                 .await
                 .unwrap();
         }

@@ -121,6 +121,16 @@ pub enum ToolError {
     Mcp(String),
 }
 
+impl ToolError {
+    pub(crate) fn code(&self) -> Option<&'static str> {
+        match self {
+            Self::RuntimeResourceExhausted(_) => Some("runtime_resource_exhausted"),
+            Self::CodeRunInternalTimeout { .. } => Some("code_run_internal_timeout"),
+            _ => None,
+        }
+    }
+}
+
 /// 仅用于非交互评测的显式完成信号。
 ///
 /// 控制器由评测入口创建并以 clone 交给该 attempt 的 tool registry；因此提交状态不会
@@ -142,16 +152,6 @@ impl EvaluationSubmission {
 
     pub(crate) fn was_submitted(&self) -> bool {
         self.submitted.load(Ordering::Acquire)
-    }
-}
-
-impl ToolError {
-    pub(crate) fn code(&self) -> Option<&'static str> {
-        match self {
-            Self::RuntimeResourceExhausted(_) => Some("runtime_resource_exhausted"),
-            Self::CodeRunInternalTimeout { .. } => Some("code_run_internal_timeout"),
-            _ => None,
-        }
     }
 }
 
@@ -296,6 +296,7 @@ pub(crate) struct ProcessSnapshot {
 struct ToolAccessProfile {
     local_tools: bool,
     file_tools: bool,
+    file_patch: bool,
     web_tools: bool,
     working_note: bool,
     ask_user: bool,
@@ -314,6 +315,7 @@ impl ToolAccessProfile {
         Self {
             local_tools: true,
             file_tools: true,
+            file_patch: true,
             web_tools: true,
             working_note: true,
             ask_user: true,
@@ -332,6 +334,7 @@ impl ToolAccessProfile {
         Self {
             local_tools: true,
             file_tools: true,
+            file_patch: true,
             web_tools: true,
             working_note: false,
             ask_user: false,
@@ -350,6 +353,7 @@ impl ToolAccessProfile {
         Self {
             local_tools: false,
             file_tools: false,
+            file_patch: false,
             web_tools: false,
             working_note: false,
             ask_user: false,
@@ -368,6 +372,7 @@ impl ToolAccessProfile {
         Self {
             local_tools: true,
             file_tools: true,
+            file_patch: true,
             web_tools: false,
             working_note: true,
             ask_user: false,
@@ -387,6 +392,7 @@ impl ToolAccessProfile {
         Self {
             local_tools: true,
             file_tools: false,
+            file_patch: false,
             web_tools: false,
             working_note: false,
             ask_user: false,
@@ -398,6 +404,32 @@ impl ToolAccessProfile {
             delegation_progress: false,
             delegation_child: false,
             background_process_context: false,
+        }
+    }
+
+    fn pi_like_evaluation() -> Self {
+        Self {
+            local_tools: true,
+            file_tools: true,
+            file_patch: false,
+            web_tools: false,
+            working_note: false,
+            ask_user: false,
+            memory: false,
+            router: true,
+            session_search: false,
+            mcp: false,
+            delegation: false,
+            delegation_progress: false,
+            delegation_child: false,
+            background_process_context: true,
+        }
+    }
+
+    fn open_code_like_evaluation() -> Self {
+        Self {
+            file_patch: true,
+            ..Self::pi_like_evaluation()
         }
     }
 }

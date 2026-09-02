@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 pub const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const GIT_COMMIT: &str = env!("ACN_GIT_COMMIT");
+pub const GIT_COMMIT_FULL: &str = env!("ACN_GIT_COMMIT_FULL");
 pub const GIT_COMMIT_TIMESTAMP: &str = env!("ACN_GIT_COMMIT_TIMESTAMP");
 
 /// 用于跨进程判断两个 ACN 运行时是否来自同一份构建。

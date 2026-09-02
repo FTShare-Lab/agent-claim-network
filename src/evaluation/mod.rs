@@ -24,31 +24,35 @@ use crate::bootstrap::build_evaluation_session_engine;
 use crate::claim::Claim;
 use crate::claim::{AgentId, ClaimId, SessionId};
 use crate::config::{resolve_workspace_root, Config, LlmProvider};
-use crate::router::{AgentQuery, RouterClient};
 use crate::tool::EvaluationSubmission;
 
 pub const EVALUATION_SCHEMA_VERSION: u32 = 1;
 pub const EVALUATION_MODEL_KEY_ENV: &str = "ACN_EVAL_MODEL_KEY";
 
-/// 评测 harness 的模型可见面。默认保持既有 profile，minimal 只用于显式上限对照。
+/// 评测 harness 的模型可见面。默认保持既有 profile，其余模式只用于显式机制对照。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvaluationHarnessMode {
     #[default]
     Standard,
     Minimal,
+    Concise,
+    PiLike,
+    OpenCodeLike,
 }
 
-/// 评测 runtime 的 ACN.md 对所有 arm 固定注入相同的解题纪律与 Claim 使用边界。
-const EVALUATION_ACN_MD_GUIDANCE: &str = r#"对于需要修改代码的任务，按“定位相关代码、构造最小复现、实施最小修复、复跑验证、检查边界或回归、检查 diff、提交”逐步推进。任何尚未准备结束的 assistant 回复，都必须通过至少一个工具调用取得新的可证伪证据或推进实际修改；不得只给出计划，也不得用无信息量命令凑调用次数。只有已核验任务验收条件并检查 diff 后，才可在仅包含无参数 `submit_task` 的回复中结束。仓库已有测试全部通过，不等于题面验收条件已经覆盖；题面写到但现有测试未覆盖的行为、边界和异常路径，仍须核验后再提交。不要为提交而 git config / git commit，除非题面明确要求。
+/// 评测 runtime 的 ACN.md 只承载 claim 交付契约；通用工程流程由冻结 skill 单一维护。
+const EVALUATION_ACN_MD_GUIDANCE: &str = r#"不要在会话中创建、更新或删除 claim 或 dispute；会话结束后的 finalize 会另线提取可复用判断。
 
-若当前任务可能与团队已有 claim 有关，先查看冻结 router 的 scope overview；存在相关 scope 时，用 `consult_router` 查询候选 claim。
+system prompt 中的 router scope overview 已是本 attempt 的冻结快照，不要再调用 overview。若当前 user turn 含 `<frozen-claims>`，这些内容就是本 attempt 的完整强制交付，不要调用 `consult_router`。否则，仅当 scope overview 非空时，在形成具体检索问题后选择最相关的一个 scope，调用一次 `consult_router` query；后续直接使用该次返回，不要重复查询。
 
 候选 claim 只是此前探索的经验和线索，不代表其中的方案已经成功，也不保证在当前任务或当前代码状态下仍成立。始终以当前任务契约、工作区事实以及可复现的工具和测试结果独立判断；证据不足、条件不符或与当前证据冲突时，不要沿用其中的解法。
 
-使用候选 claim 时，应区分其中已验证的核心机制与尚未覆盖的边界；主路径成立不代表方案已经完整。采用 claim 指导执行前，应结合当前任务契约主动检查其适用条件、例外、反例和组合交互。涉及代码修改时，还应独立验证异常路径、空值或极端输入、状态生命周期、兼容性及错误优先级，不能只复现 claim 中已有的实现路径或测试。"#;
+使用候选 claim 时，应区分其中已验证的核心机制与尚未覆盖的边界；采用前主动检查适用条件、例外、反例和组合交互，并独立验证异常路径、空值或极端输入、状态生命周期、兼容性及错误优先级。"#;
 
-pub use bundle_router::{FrozenClaimBundle, FrozenClaimBundleRouter, RouterEvidence};
+pub use bundle_router::{
+    FrozenClaimBundle, FrozenClaimBundleRouter, FrozenClaimDeliveryPolicy, RouterEvidence,
+};
 
 /// 单个 benchmark attempt 的外部配置；不含任何 credential。
 #[derive(Debug, Clone, Deserialize)]
@@ -494,6 +498,15 @@ async fn run_attempt_inner(
             .await
             .context("stage=runtime 写入 evaluation ACN.md 引导失败")?;
     }
+    let (turn_prompt, forced_claim_ids) =
+        task_prompt_with_forced_claims(config, router.as_ref()).await?;
+    if !forced_claim_ids.is_empty() {
+        buffer_direct_event(
+            &event_tx,
+            "forced_claim_context",
+            json!({ "claim_ids": forced_claim_ids }),
+        );
+    }
     let submission = EvaluationSubmission::new();
     let engine = build_evaluation_session_engine(
         &cfg,
@@ -512,15 +525,6 @@ async fn run_attempt_inner(
         .await
         .context("stage=session 创建单次 session 失败")?;
     let mut session = start.session;
-    let (turn_prompt, forced_claim_ids) =
-        task_prompt_with_forced_claims(config, router.as_ref()).await?;
-    if !forced_claim_ids.is_empty() {
-        buffer_direct_event(
-            &event_tx,
-            "forced_claim_context",
-            json!({ "claim_ids": forced_claim_ids }),
-        );
-    }
     let turn_result = engine
         .run_turn(&mut session, turn_prompt, |event| {
             buffer_session_event(&event_tx, event)
@@ -541,11 +545,10 @@ async fn write_evaluation_acn_md(path: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("写入 evaluation ACN.md 失败: {}", path.display()))
 }
 
-/// B_forced_claim 在首轮 user turn 附上经冻结 router 查询得到的完整 claim。
+/// B_forced_claim 在首轮 user turn 一次性附上冻结 router 的完整 claim bundle。
 ///
-/// 这里刻意仍经过 `RouterClient::query`，而不是直接读取 bundle：router evidence 因此能
-/// 证明发送给模型的内容来自固定 bundle，并与普通 B_claim 的归因口径一致。B_claim 本身
-/// 不走这条路径，继续保持由模型自主调用 `consult_router` 的端到端语义。
+/// 专用交付入口会记录唯一 router evidence 并立即封闭模型侧查询；B_claim 仍由模型
+/// 自主调用一次 `consult_router`，从而把强制交付和按需检索保持为两个清晰实验契约。
 async fn task_prompt_with_forced_claims(
     config: &EvaluationAttemptConfig,
     router: &FrozenClaimBundleRouter,
@@ -553,30 +556,21 @@ async fn task_prompt_with_forced_claims(
     if config.variant != "B_forced_claim" {
         return Ok((config.task_prompt.clone(), Vec::new()));
     }
-    let overview = router
-        .scopes_overview()
-        .await
-        .context("stage=router B_forced_claim 读取冻结 claim scope 失败")?;
-    let mut candidates = BTreeMap::new();
-    for item in overview.scopes {
-        let query = AgentQuery::from_task(item.scope, config.task_prompt.clone());
-        let result = router
-            .query(&query)
-            .await
-            .context("stage=router B_forced_claim 查询冻结 claim bundle 失败")?;
-        for candidate in result.candidate_claims {
-            candidates.insert(candidate.claim.id.to_string(), candidate);
-        }
-    }
+    let candidates = router
+        .deliver_forced_claims_once(&config.task_prompt)
+        .context("stage=router B_forced_claim 一次性交付冻结 claim bundle 失败")?;
     // 四臂评测允许 A 未产生 eligible claim。此时 bundle 仍经同一冻结与审计链路
     // 传入，但 B_forced_claim 没有可注入的内容，应退化为原任务 prompt 而非在请求
     // 模型前失败；Gate 会以 EMPTY_CLAIM_BUNDLE 保留该事实。
     if candidates.is_empty() {
         return Ok((config.task_prompt.clone(), Vec::new()));
     }
-    let claim_ids = candidates.keys().cloned().collect::<Vec<_>>();
+    let claim_ids = candidates
+        .iter()
+        .map(|candidate| candidate.claim.id.to_string())
+        .collect::<Vec<_>>();
     let claims = candidates
-        .into_values()
+        .into_iter()
         .map(|candidate| candidate.claim)
         .collect::<Vec<_>>();
     let rendered_claims = serde_json::to_string_pretty(&claims)
@@ -758,7 +752,14 @@ async fn load_bundle_router(
             None,
         ),
     };
+    let policy = match config.variant.as_str() {
+        "B_claim" => FrozenClaimDeliveryPolicy::OnDemandOnce,
+        "B_forced_claim" => FrozenClaimDeliveryPolicy::ForcedOnce,
+        "A" | "B_empty" => FrozenClaimDeliveryPolicy::Disabled,
+        _ => anyhow::bail!("stage=router 未知评测 variant: {}", config.variant),
+    };
     FrozenClaimBundleRouter::new(bundle, config.attempt_id.clone(), bundle_hash)
+        .map(|router| router.with_delivery_policy(policy))
         .context("stage=router 构造冻结 bundle router 失败")
 }
 
@@ -1158,8 +1159,38 @@ model_egress_mode = "pier"
         assert_eq!(config.harness_mode, EvaluationHarnessMode::Standard);
     }
 
+    #[test]
+    fn evaluation_attempt_config_accepts_all_explicit_harness_modes() {
+        for (raw_mode, expected) in [
+            ("minimal", EvaluationHarnessMode::Minimal),
+            ("concise", EvaluationHarnessMode::Concise),
+            ("pi_like", EvaluationHarnessMode::PiLike),
+            ("open_code_like", EvaluationHarnessMode::OpenCodeLike),
+        ] {
+            let config: EvaluationAttemptConfig = toml::from_str(&format!(
+                r#"
+schema_version = 1
+attempt_id = "attempt-001"
+task_prompt = "repair the fixture"
+workspace_root = "/tmp/acn-eval/workspace"
+runtime_root = "/tmp/acn-eval/runtime"
+acn_config = "/tmp/acn-eval/acn.toml"
+output_dir = "/tmp/acn-eval/output"
+upstream = "eval"
+variant = "A"
+attempt_deadline_secs = 1
+model_egress_mode = "pier"
+harness_mode = "{raw_mode}"
+"#
+            ))
+            .unwrap();
+
+            assert_eq!(config.harness_mode, expected);
+        }
+    }
+
     #[tokio::test]
-    async fn evaluation_acn_md_contains_fixed_solving_and_claim_guidance() {
+    async fn evaluation_acn_md_contains_only_the_single_delivery_claim_contract() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ACN.md");
 
@@ -1169,12 +1200,13 @@ model_egress_mode = "pier"
             tokio::fs::read_to_string(path).await.unwrap(),
             EVALUATION_ACN_MD_GUIDANCE
         );
-        assert!(EVALUATION_ACN_MD_GUIDANCE.contains("至少一个工具调用"));
-        assert!(EVALUATION_ACN_MD_GUIDANCE.contains("submit_task"));
-        assert!(EVALUATION_ACN_MD_GUIDANCE.contains("题面验收条件已经覆盖"));
-        assert!(EVALUATION_ACN_MD_GUIDANCE.contains("git commit"));
+        assert!(EVALUATION_ACN_MD_GUIDANCE.contains("不要再调用 overview"));
+        assert!(EVALUATION_ACN_MD_GUIDANCE.contains("调用一次 `consult_router` query"));
+        assert!(EVALUATION_ACN_MD_GUIDANCE.contains("<frozen-claims>"));
         assert!(EVALUATION_ACN_MD_GUIDANCE.contains("consult_router"));
         assert!(EVALUATION_ACN_MD_GUIDANCE.contains("候选 claim 只是此前探索的经验和线索"));
+        assert!(!EVALUATION_ACN_MD_GUIDANCE.contains("submit_task"));
+        assert!(!EVALUATION_ACN_MD_GUIDANCE.contains("git commit"));
     }
 
     #[test]
@@ -1311,7 +1343,8 @@ model_egress_mode = "pier"
             "attempt-001".into(),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
         )
-        .unwrap();
+        .unwrap()
+        .with_delivery_policy(FrozenClaimDeliveryPolicy::ForcedOnce);
         let config = EvaluationAttemptConfig {
             schema_version: EVALUATION_SCHEMA_VERSION,
             attempt_id: "attempt-001".into(),
@@ -1349,7 +1382,8 @@ model_egress_mode = "pier"
             "attempt-001".into(),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
         )
-        .unwrap();
+        .unwrap()
+        .with_delivery_policy(FrozenClaimDeliveryPolicy::ForcedOnce);
         let config = EvaluationAttemptConfig {
             schema_version: EVALUATION_SCHEMA_VERSION,
             attempt_id: "attempt-001".into(),
@@ -1372,7 +1406,9 @@ model_egress_mode = "pier"
 
         assert_eq!(prompt, config.task_prompt);
         assert!(claim_ids.is_empty());
-        assert!(router.take_evidence().is_empty());
+        let evidence = router.take_evidence();
+        assert_eq!(evidence.len(), 1);
+        assert!(evidence[0].injected_claim_ids.is_empty());
     }
 
     #[tokio::test]

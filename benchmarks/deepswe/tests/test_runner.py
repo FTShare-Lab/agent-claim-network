@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 import tomllib
 import unittest
 from dataclasses import replace
@@ -12,6 +13,7 @@ from acn_deepswe.assets import frozen_coding_benchmark_skill
 from acn_deepswe.dataset import FrozenDatasetManifest
 from acn_deepswe.host_runner import (
     AttemptProgressMonitor,
+    COMPACT_HARNESS_CODE_RUN_MAX_OUTPUT_CHARS,
     CONTAINER_MODEL_KEY_ENV,
     EVALUATION_AUTO_COMPACT_CTX_RATIO,
     EVALUATION_CODE_RUN_MAX_OUTPUT_CHARS,
@@ -54,6 +56,22 @@ allow_internet = false
 allow_internet = false
 """
 
+_cleanup_trial_images_patcher: object | None = None
+_cleanup_trial_images_mock: object | None = None
+
+
+def setUpModule() -> None:
+    global _cleanup_trial_images_patcher, _cleanup_trial_images_mock
+    _cleanup_trial_images_patcher = patch(
+        "acn_deepswe.host_runner.cleanup_finished_trial_images", return_value=0
+    )
+    _cleanup_trial_images_mock = _cleanup_trial_images_patcher.start()
+
+
+def tearDownModule() -> None:
+    assert _cleanup_trial_images_patcher is not None
+    _cleanup_trial_images_patcher.stop()
+
 
 class ConfigGenerationTests(unittest.TestCase):
     def test_claim_variants_attempt_toml_declare_a_claim_bundle(self) -> None:
@@ -62,9 +80,8 @@ class ConfigGenerationTests(unittest.TestCase):
             with self.subTest(variant=attempt.variant):
                 rendered = tomllib.loads(build_attempt_toml(attempt, "fix the bug", 5100))
                 self.assertEqual(rendered["workspace_root"], "/app")
-                self.assertTrue(
-                    rendered["task_prompt"].startswith("先读取并遵循 /coding-benchmark")
-                )
+                self.assertTrue(rendered["task_prompt"].startswith("请执行 /coding-benchmark"))
+                self.assertNotIn("读取并遵循", rendered["task_prompt"])
                 self.assertEqual(rendered["attempt_deadline_secs"], 5100)
                 self.assertEqual(rendered["model_egress_mode"], "pier")
                 self.assertEqual(rendered["harness_mode"], "standard")
@@ -93,6 +110,33 @@ class ConfigGenerationTests(unittest.TestCase):
         self.assertIn("retry with fewer workers", rendered["task_prompt"])
         self.assertNotIn("/coding-benchmark", rendered["task_prompt"])
         self.assertNotIn("不要扫整个仓库", rendered["task_prompt"])
+
+    def test_mechanism_harnesses_freeze_distinct_prompts_and_compaction(self) -> None:
+        attempt = build_attempt_plan(DATASET, Path("/tmp/acn-eval-plan"), seed=2).attempts[0]
+
+        concise = tomllib.loads(
+            build_attempt_toml(attempt, "fix the bug", 5100, harness_mode="concise")
+        )
+        pi_like = tomllib.loads(
+            build_attempt_toml(attempt, "fix the bug", 5100, harness_mode="pi_like")
+        )
+        open_code_like = tomllib.loads(
+            build_attempt_toml(attempt, "fix the bug", 5100, harness_mode="open_code_like")
+        )
+        pi_config = tomllib.loads(build_acn_config(provenance(), UPSTREAM, "pi_like"))
+
+        self.assertNotIn("/coding-benchmark", concise["task_prompt"])
+        self.assertIn("`file_write`", pi_like["task_prompt"])
+        self.assertNotIn("`file_patch`", pi_like["task_prompt"])
+        self.assertIn("`file_patch`", open_code_like["task_prompt"])
+        self.assertEqual(
+            pi_config["agent"]["tool"]["code_run_max_output_chars"],
+            COMPACT_HARNESS_CODE_RUN_MAX_OUTPUT_CHARS,
+        )
+        self.assertEqual(
+            pi_config["agent"]["session"]["compaction"]["tail_previous_real_user_turns"],
+            1,
+        )
 
     def test_attempt_deadline_leaves_room_before_the_pier_wall_clock(self) -> None:
         self.assertEqual(attempt_deadline_secs(provenance()), 240)
@@ -135,7 +179,7 @@ class ConfigGenerationTests(unittest.TestCase):
             parsed["agent"]["tool"]["max_parallel_tool_calls"],
             EVALUATION_MAX_PARALLEL_TOOL_CALLS,
         )
-        self.assertFalse(parsed["agent"]["tool"]["file_edit_authority_enabled"])
+        self.assertTrue(parsed["agent"]["tool"]["file_edit_authority_enabled"])
         self.assertFalse(parsed["agent"]["memory"]["enabled"])
         self.assertFalse(parsed["agent"]["session"]["memory_review"]["enabled"])
         self.assertEqual(
@@ -240,8 +284,19 @@ class DryRunTests(unittest.TestCase):
             experiment = build_experiment_manifest("experiment-1", plan, "b" * 64, provenance())
             steps = Task1HostRunner(experiment, Path(directory) / "jobs").run_task1()
         self.assertEqual(
-            {step.phase for step in steps},
-            {"A", "freeze", "B_empty", "B_claim", "B_forced_claim"},
+            tuple(step.phase for step in steps),
+            (
+                "A",
+                "B_empty",
+                "freeze_A",
+                "freeze_B_empty",
+                plan.attempts[2].variant,
+                plan.attempts[3].variant,
+            ),
+        )
+        self.assertEqual(
+            tuple(attempt.variant for attempt in plan.attempts[:2]),
+            ("A", "B_empty"),
         )
 
     def test_runner_preserves_crossbalanced_b_order(self) -> None:
@@ -259,8 +314,15 @@ class DryRunTests(unittest.TestCase):
             )
             steps = Task1HostRunner(crossbalanced, Path(directory) / "jobs").run_task1()
         self.assertEqual(
-            {step.phase for step in steps},
-            {"A", "freeze", "B_empty", "B_claim", "B_forced_claim"},
+            tuple(step.phase for step in steps),
+            (
+                "A",
+                "B_empty",
+                "freeze_A",
+                "freeze_B_empty",
+                "B_forced_claim",
+                "B_claim",
+            ),
         )
 
 
@@ -270,9 +332,7 @@ class IsolationTests(unittest.TestCase):
             task_toml = Path(directory) / "task.toml"
             task_toml.write_text(TASK_TOML, encoding="utf-8")
 
-            self.assertTrue(
-                _pier_task_matches_attempt(task_toml, "task-1", "datacurve/task-1")
-            )
+            self.assertTrue(_pier_task_matches_attempt(task_toml, "task-1", "datacurve/task-1"))
             self.assertFalse(_pier_task_matches_attempt(task_toml, "task-1", "task-1"))
             self.assertFalse(
                 _pier_task_matches_attempt(task_toml, "another-task", "datacurve/task-1")
@@ -308,7 +368,8 @@ class RealExecutionTests(unittest.TestCase):
             bundle = json.loads(artifacts.claim_bundle.read_text())
             bundle_hash = hashlib.sha256(artifacts.claim_bundle.read_bytes()).hexdigest()
 
-        self.assertEqual(variants, [item.variant for item in plan.attempts])
+        self.assertEqual(set(variants[:2]), {"A", "B_empty"})
+        self.assertEqual(set(variants[2:]), {"B_claim", "B_forced_claim"})
         self.assertEqual([item["status"] for item in manifest["attempt_results"]], ["passed"] * 4)
         self.assertEqual(manifest["experiment_cohort"], "success_efficiency")
         self.assertEqual(bundle["claims"][0]["id"], "claim-1")
@@ -328,8 +389,88 @@ class RealExecutionTests(unittest.TestCase):
         )
         self.assertTrue(all(env["PYTHONDONTWRITEBYTECODE"] == "1" for env in pier_envs))
         self.assertTrue(
-            all(item["progress_path"].endswith("/progress.json") for item in manifest["attempt_results"])
+            all(
+                item["progress_path"].endswith("/progress.json")
+                for item in manifest["attempt_results"]
+            )
         )
+
+    def test_b_empty_can_be_the_bound_claim_producer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = build_attempt_plan(DATASET, root / "run", seed=2)
+            experiment = build_experiment_manifest("experiment-1", plan, "b" * 64, provenance())
+            a_bundle = root / "claims.json"
+            b_empty_bundle = root / "claims-b-empty.json"
+            artifacts = replace(
+                _artifacts(root, claim_bundle=b_empty_bundle),
+                a_claim_bundle=a_bundle,
+                b_empty_claim_bundle=b_empty_bundle,
+            )
+            execution = replace(_execution(root, artifacts), claim_producer_variant="B_empty")
+
+            def run(command: list[str], **_kwargs: object) -> FakeCompleted:
+                job = json.loads(Path(command[-1]).read_text())
+                attempt = next(item for item in plan.attempts if item.attempt_id == job["job_name"])
+                _write_fake_trial(
+                    Path(job["jobs_dir"]),
+                    attempt,
+                    bundle_path=artifacts.claim_bundle,
+                )
+                return FakeCompleted(0)
+
+            with patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True):
+                Task1HostRunner(experiment, root / "jobs", execution, run=run).run_task1(
+                    execute=True
+                )
+            manifest = json.loads(execution.manifest_path.read_text())
+            b_empty_metadata = json.loads(
+                b_empty_bundle.with_name("claims-b-empty.json.manifest.json").read_text()
+            )
+            a_bundle_exists = a_bundle.is_file()
+            b_empty_bundle_exists = b_empty_bundle.is_file()
+            b_empty_bundle_hash = hashlib.sha256(b_empty_bundle.read_bytes()).hexdigest()
+
+        self.assertTrue(a_bundle_exists)
+        self.assertTrue(b_empty_bundle_exists)
+        self.assertEqual(manifest["claim_producer_variant"], "B_empty")
+        self.assertEqual(manifest["execution"]["claim_producer_variant"], "B_empty")
+        self.assertEqual(
+            b_empty_metadata["attempt_id"],
+            next(item.attempt_id for item in plan.attempts if item.variant == "B_empty"),
+        )
+        self.assertEqual(
+            manifest["frozen_claim_bundle_hash"],
+            b_empty_bundle_hash,
+        )
+        self.assertEqual(set(manifest["frozen_claim_bundles"]), {"A", "B_empty"})
+
+    def test_both_attempt_waves_execute_concurrently(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = build_attempt_plan(DATASET, root / "run", seed=2)
+            experiment = build_experiment_manifest("experiment-1", plan, "b" * 64, provenance())
+            artifacts = _artifacts(root, claim_bundle=root / "claims.json")
+            execution = replace(_execution(root, artifacts), task_workers=2)
+            wave_barrier = threading.Barrier(2)
+
+            def run(command: list[str], **_kwargs: object) -> FakeCompleted:
+                job = json.loads(Path(command[-1]).read_text())
+                attempt = next(item for item in plan.attempts if item.attempt_id == job["job_name"])
+                wave_barrier.wait(timeout=2)
+                _write_fake_trial(
+                    Path(job["jobs_dir"]),
+                    attempt,
+                    bundle_path=artifacts.claim_bundle,
+                )
+                return FakeCompleted(0)
+
+            with patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True):
+                result = Task1HostRunner(experiment, root / "jobs", execution, run=run).run_task1(
+                    execute=True
+                )
+
+        self.assertEqual(result.status, "passed")
 
     def test_operator_interruption_preserves_progress_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -507,7 +648,7 @@ class ProvenanceTests(unittest.TestCase):
             [item["status"] for item in manifest["attempt_results"]], ["agent_failed"] * 4
         )
 
-    def test_a_verifier_gate_failure_stops_before_b_empty(self) -> None:
+    def test_producer_wave_gate_failure_stops_before_claim_consumers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             plan = build_attempt_plan(DATASET, root / "run", seed=2)
@@ -535,9 +676,16 @@ class ProvenanceTests(unittest.TestCase):
                 )
             manifest = json.loads(execution.manifest_path.read_text())
 
-        self.assertEqual(len(manifest["attempt_results"]), 1)
-        self.assertEqual(manifest["attempt_results"][0]["status"], "gate_failed")
-        self.assertIn("VERIFIER_DID_NOT_RUN", manifest["attempt_results"][0]["reason"])
+        self.assertEqual(len(manifest["attempt_results"]), 2)
+        self.assertEqual(
+            {item["variant"] for item in manifest["attempt_results"]}, {"A", "B_empty"}
+        )
+        self.assertTrue(
+            all(item["status"] == "gate_failed" for item in manifest["attempt_results"])
+        )
+        self.assertTrue(
+            all("VERIFIER_DID_NOT_RUN" in item["reason"] for item in manifest["attempt_results"])
+        )
 
     def test_direct_model_egress_is_explicit_but_cannot_pass_the_formal_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -550,7 +698,9 @@ class ProvenanceTests(unittest.TestCase):
             def run(command: list[str], **_kwargs: object) -> FakeCompleted:
                 job = json.loads(Path(command[-1]).read_text())
                 attempt = next(item for item in plan.attempts if item.attempt_id == job["job_name"])
-                _write_fake_trial(Path(job["jobs_dir"]), attempt, bundle_path=artifacts.claim_bundle)
+                _write_fake_trial(
+                    Path(job["jobs_dir"]), attempt, bundle_path=artifacts.claim_bundle
+                )
                 return FakeCompleted(0)
 
             with (
@@ -593,7 +743,7 @@ class ProvenanceTests(unittest.TestCase):
                 )
             manifest = json.loads(execution.manifest_path.read_text())
 
-        self.assertEqual(variants, ["A", "B_empty"])
+        self.assertEqual(set(variants), {"A", "B_empty"})
         self.assertIsNone(manifest["failure"])
         self.assertEqual(
             [item["variant"] for item in manifest["attempt_results"]],
@@ -614,9 +764,7 @@ class ProvenanceTests(unittest.TestCase):
             plan = build_attempt_plan(DATASET, root / "run", seed=2)
             experiment = build_experiment_manifest("experiment-1", plan, "b" * 64, provenance())
             artifacts = _artifacts(root, claim_bundle=root / "claims.json")
-            execution = replace(
-                _execution(root, artifacts), run_all_variants_without_claims=True
-            )
+            execution = replace(_execution(root, artifacts), run_all_variants_without_claims=True)
             variants: list[str] = []
 
             def run(command: list[str], **_kwargs: object) -> FakeCompleted:
@@ -637,19 +785,18 @@ class ProvenanceTests(unittest.TestCase):
                 )
             manifest = json.loads(execution.manifest_path.read_text())
 
-        self.assertEqual(variants, [item.variant for item in plan.attempts])
-        self.assertEqual(
-            [item["status"] for item in manifest["attempt_results"]], ["passed"] * 4
-        )
+        self.assertEqual(set(variants[:2]), {"A", "B_empty"})
+        self.assertEqual(set(variants[2:]), {"B_claim", "B_forced_claim"})
+        self.assertEqual([item["status"] for item in manifest["attempt_results"]], ["passed"] * 4)
         claim_records = [
-            item for item in manifest["attempt_results"] if item["variant"] in {"B_claim", "B_forced_claim"}
+            item
+            for item in manifest["attempt_results"]
+            if item["variant"] in {"B_claim", "B_forced_claim"}
         ]
         self.assertTrue(
             all(item["claim_observation"]["bundle_available"] is False for item in claim_records)
         )
-        self.assertTrue(
-            all("EMPTY_CLAIM_BUNDLE" in item["reason"] for item in claim_records)
-        )
+        self.assertTrue(all("EMPTY_CLAIM_BUNDLE" in item["reason"] for item in claim_records))
         self.assertTrue(manifest["execution"]["run_all_variants_without_claims"])
 
     def test_run_a_only_freezes_claims_and_skips_b_arms(self) -> None:
@@ -696,6 +843,198 @@ class ProvenanceTests(unittest.TestCase):
         self.assertTrue(manifest["execution"]["run_a_only"])
         self.assertIsNone(manifest["failure"])
 
+    def test_adaptive_producer_phase_freezes_both_candidates_and_skips_claim_arms(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = build_attempt_plan(DATASET, root / "run", seed=2)
+            experiment = build_experiment_manifest("producer-pair", plan, "b" * 64, provenance())
+            a_bundle = root / "claims.json"
+            b_empty_bundle = root / "claims-b-empty.json"
+            artifacts = replace(
+                _artifacts(root, claim_bundle=a_bundle),
+                a_claim_bundle=a_bundle,
+                b_empty_claim_bundle=b_empty_bundle,
+            )
+            execution = replace(
+                _execution(root, artifacts),
+                claim_producer_variant="adaptive",
+                run_producer_pair_only=True,
+            )
+            variants: list[str] = []
+
+            def run(command: list[str], **_kwargs: object) -> FakeCompleted:
+                job = json.loads(Path(command[-1]).read_text())
+                attempt = next(item for item in plan.attempts if item.attempt_id == job["job_name"])
+                variants.append(attempt.variant)
+                _write_fake_trial(
+                    Path(job["jobs_dir"]),
+                    attempt,
+                    bundle_path=artifacts.claim_bundle,
+                )
+                return FakeCompleted(0)
+
+            with patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True):
+                Task1HostRunner(experiment, root / "jobs", execution, run=run).run_task1(
+                    execute=True
+                )
+            manifest = json.loads(execution.manifest_path.read_text())
+            a_bundle_exists = a_bundle.is_file()
+            b_empty_bundle_exists = b_empty_bundle.is_file()
+
+        self.assertEqual(set(variants), {"A", "B_empty"})
+        self.assertTrue(a_bundle_exists)
+        self.assertTrue(b_empty_bundle_exists)
+        self.assertEqual(manifest["execution"]["phase_mode"], "adaptive_producers")
+        self.assertEqual(manifest["claim_producer_variant"], "adaptive")
+        self.assertEqual(set(manifest["frozen_claim_bundles"]), {"A", "B_empty"})
+        self.assertEqual(
+            [item["status"] for item in manifest["attempt_results"][-2:]],
+            ["not_run", "not_run"],
+        )
+        self.assertEqual(
+            [item["reason"] for item in manifest["attempt_results"][-2:]],
+            ["PRODUCER_PAIR_ONLY", "PRODUCER_PAIR_ONLY"],
+        )
+
+    def test_adaptive_consumer_uses_b_empty_winner_claims_without_rerunning_producers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_output = root / "source" / "output"
+            source_plan = build_attempt_plan(DATASET, source_output, seed=2)
+            source_experiment = build_experiment_manifest(
+                "producer-pair", source_plan, "b" * 64, provenance()
+            )
+            source_fixture = root / "source" / "fixture"
+            source_fixture.mkdir(parents=True)
+            a_bundle = source_output / "tasks" / "task-1" / "claims.json"
+            b_empty_bundle = source_output / "tasks" / "task-1" / "claims-b-empty.json"
+            source_artifacts = replace(
+                _artifacts(source_fixture, claim_bundle=a_bundle),
+                a_claim_bundle=a_bundle,
+                b_empty_claim_bundle=b_empty_bundle,
+            )
+            source_execution = replace(
+                _execution(source_fixture, source_artifacts),
+                manifest_path=source_output / "tasks" / "task-1" / "manifest.json",
+                claim_producer_variant="adaptive",
+                run_producer_pair_only=True,
+            )
+
+            def run_source(command: list[str], **_kwargs: object) -> FakeCompleted:
+                job = json.loads(Path(command[-1]).read_text())
+                attempt = next(
+                    item for item in source_plan.attempts if item.attempt_id == job["job_name"]
+                )
+                _write_fake_trial(
+                    Path(job["jobs_dir"]),
+                    attempt,
+                    bundle_path=a_bundle,
+                    claim_variants=frozenset({"B_empty"}),
+                )
+                return FakeCompleted(0)
+
+            with patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True):
+                Task1HostRunner(
+                    source_experiment,
+                    root / "source" / "jobs",
+                    source_execution,
+                    run=run_source,
+                ).run_task1(execute=True)
+            aggregate = source_output / "presmoke-aggregate.json"
+            aggregate.write_text(json.dumps({"schema_version": 1, "status": "passed"}))
+            selection = root / "producer-selection.json"
+            selection.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "selected",
+                        "candidate_aliases": {"S1": "A", "S2": "B_empty"},
+                        "score_rule": [
+                            "verifier_passed",
+                            "f2p_micro",
+                            "S1_on_exact_tie",
+                        ],
+                        "source_output_dir": str(source_output),
+                        "producer_aggregate_path": str(aggregate),
+                        "producer_aggregate_sha256": hashlib.sha256(
+                            aggregate.read_bytes()
+                        ).hexdigest(),
+                        "task_order": ["task-1"],
+                        "task_sources": {
+                            "task-1": {
+                                "source_output_dir": str(source_output),
+                                "task_manifest_path": str(source_execution.manifest_path),
+                                "task_manifest_sha256": hashlib.sha256(
+                                    source_execution.manifest_path.read_bytes()
+                                ).hexdigest(),
+                            }
+                        },
+                        "winner_alias": "S2",
+                        "loser_alias": "S1",
+                        "winner_variant": "B_empty",
+                        "loser_variant": "A",
+                        "logical_labels": {"A": "B_empty", "B_empty": "A"},
+                    }
+                )
+            )
+
+            consumer_output = root / "consumer" / "output"
+            consumer_plan = build_attempt_plan(DATASET, consumer_output, seed=2)
+            consumer_experiment = build_experiment_manifest(
+                "claim-consumers", consumer_plan, "b" * 64, provenance()
+            )
+            consumer_fixture = root / "consumer" / "fixture"
+            consumer_fixture.mkdir(parents=True)
+            consumer_artifacts = replace(
+                _artifacts(consumer_fixture, claim_bundle=b_empty_bundle),
+                a_claim_bundle=a_bundle,
+                b_empty_claim_bundle=b_empty_bundle,
+            )
+            consumer_execution = replace(
+                _execution(consumer_fixture, consumer_artifacts),
+                manifest_path=consumer_output / "tasks" / "task-1" / "manifest.json",
+                claim_producer_variant="B_empty",
+                adaptive_source_manifest=source_execution.manifest_path,
+                producer_selection_manifest=selection,
+            )
+            variants: list[str] = []
+
+            def run_consumer(command: list[str], **_kwargs: object) -> FakeCompleted:
+                job = json.loads(Path(command[-1]).read_text())
+                attempt = next(
+                    item for item in consumer_plan.attempts if item.attempt_id == job["job_name"]
+                )
+                variants.append(attempt.variant)
+                _write_fake_trial(
+                    Path(job["jobs_dir"]),
+                    attempt,
+                    bundle_path=b_empty_bundle,
+                )
+                return FakeCompleted(0)
+
+            with patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True):
+                Task1HostRunner(
+                    consumer_experiment,
+                    root / "consumer" / "jobs",
+                    consumer_execution,
+                    run=run_consumer,
+                ).run_task1(execute=True)
+            manifest = json.loads(consumer_execution.manifest_path.read_text())
+
+        self.assertEqual(set(variants), {"B_claim", "B_forced_claim"})
+        self.assertEqual(manifest["execution"]["phase_mode"], "adaptive_consumers")
+        self.assertEqual(manifest["claim_producer_variant"], "B_empty")
+        self.assertEqual(
+            manifest["logical_variant_map"],
+            {"A": "B_empty", "B_empty": "A", "B_claim": "B_claim", "B_forced_claim": "B_forced_claim"},
+        )
+        self.assertTrue(
+            all(
+                item["claim_observation"]["bundle_available"]
+                for item in manifest["attempt_results"][-2:]
+            )
+        )
+
     def test_b_only_followup_reuses_a_evidence_and_runs_only_three_b_arms(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -718,9 +1057,7 @@ class ProvenanceTests(unittest.TestCase):
                 )
                 return FakeCompleted(0)
 
-            with patch.dict(
-                "os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True
-            ):
+            with patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True):
                 Task1HostRunner(
                     b_experiment, root / "followup" / "jobs", b_execution, run=run
                 ).run_task1(execute=True)
@@ -751,10 +1088,54 @@ class ProvenanceTests(unittest.TestCase):
             )
 
             with (
-                patch.dict(
-                    "os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True
-                ),
+                patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True),
                 self.assertRaisesRegex(TaskExecutionError, "claim bundle 内容已漂移"),
+            ):
+                Task1HostRunner(
+                    b_experiment, root / "followup" / "jobs", b_execution
+                ).validate_b_only_source()
+
+    def test_b_only_followup_rejects_missing_producer_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, source_execution = _run_a_only_source(root / "source")
+            bundle = source_execution.artifacts.claim_bundle
+            metadata_path = bundle.with_name(bundle.name + ".manifest.json")
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            del metadata["producer_verification"]
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            _, b_execution, b_experiment = _b_only_followup(
+                root / "followup", source_execution, provenance()
+            )
+
+            with (
+                patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True),
+                self.assertRaisesRegex(TaskExecutionError, "缺少完整 producer_verification"),
+            ):
+                Task1HostRunner(
+                    b_experiment, root / "followup" / "jobs", b_execution
+                ).validate_b_only_source()
+
+    def test_b_only_followup_rejects_tampered_quarantine_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, source_execution = _run_a_only_source(
+                root / "source",
+                verifier_passed=False,
+                claim_quality_gate="verified_producer_only",
+            )
+            bundle = source_execution.artifacts.claim_bundle
+            metadata_path = bundle.with_name(bundle.name + ".manifest.json")
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["quarantined_claims"][0]["claim_id"] = "claim-tampered"
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            _, b_execution, b_experiment = _b_only_followup(
+                root / "followup", source_execution, provenance()
+            )
+
+            with (
+                patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True),
+                self.assertRaisesRegex(TaskExecutionError, "bundle 绑定不一致"),
             ):
                 Task1HostRunner(
                     b_experiment, root / "followup" / "jobs", b_execution
@@ -770,9 +1151,7 @@ class ProvenanceTests(unittest.TestCase):
             )
 
             with (
-                patch.dict(
-                    "os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True
-                ),
+                patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True),
                 self.assertRaisesRegex(TaskExecutionError, "provenance 漂移: reasoning_effort"),
             ):
                 Task1HostRunner(
@@ -802,9 +1181,7 @@ class ProvenanceTests(unittest.TestCase):
                 )
                 return FakeCompleted(0)
 
-            with patch.dict(
-                "os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True
-            ):
+            with patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True):
                 result = Task1HostRunner(
                     b_experiment, root / "followup" / "jobs", b_execution, run=run
                 ).run_task1(execute=True)
@@ -851,6 +1228,59 @@ class ProvenanceTests(unittest.TestCase):
         self.assertEqual(set(variants), {"A", "B_empty", "B_claim", "B_forced_claim"})
         self.assertEqual(manifest["experiment_cohort"], "failure_recovery")
 
+    def test_verified_producer_gate_quarantines_failed_claims_before_consumers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = build_attempt_plan(DATASET, root / "run", seed=2)
+            experiment = build_experiment_manifest("experiment-1", plan, "b" * 64, provenance())
+            artifacts = _artifacts(root, claim_bundle=root / "claims.json")
+            execution = replace(
+                _execution(root, artifacts),
+                claim_quality_gate="verified_producer_only",
+                run_all_variants_without_claims=True,
+            )
+            variants: list[str] = []
+
+            def run(command: list[str], **_kwargs: object) -> FakeCompleted:
+                job = json.loads(Path(command[-1]).read_text())
+                attempt = next(item for item in plan.attempts if item.attempt_id == job["job_name"])
+                variants.append(attempt.variant)
+                _write_fake_trial(
+                    Path(job["jobs_dir"]),
+                    attempt,
+                    bundle_path=artifacts.claim_bundle,
+                    verifier_passed=attempt.variant != "A",
+                )
+                return FakeCompleted(0)
+
+            with patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True):
+                Task1HostRunner(experiment, root / "jobs", execution, run=run).run_task1(
+                    execute=True
+                )
+            manifest = json.loads(execution.manifest_path.read_text())
+            bundle = json.loads(artifacts.claim_bundle.read_text())
+            metadata = json.loads(
+                artifacts.claim_bundle.with_name("claims.json.manifest.json").read_text()
+            )
+
+        self.assertEqual(set(variants), {"A", "B_empty", "B_claim", "B_forced_claim"})
+        self.assertEqual(bundle["claims"], [])
+        self.assertEqual(metadata["quality_gate"], "verified_producer_only")
+        self.assertEqual(
+            [claim["claim_id"] for claim in metadata["quarantined_claims"]],
+            ["claim-1"],
+        )
+        self.assertEqual(manifest["experiment_cohort"], "failed_producer_quarantine")
+        self.assertEqual(manifest["execution"]["claim_quality_gate"], "verified_producer_only")
+        self.assertEqual(
+            manifest["frozen_claim_bundles"]["A"]["quarantined_claim_ids"],
+            ["claim-1"],
+        )
+        self.assertRegex(
+            manifest["frozen_claim_bundles"]["A"]["bundle_manifest_hash"],
+            r"^[0-9a-f]{64}$",
+        )
+
     def test_hard_gate_rejects_ineligible_a_before_b_arms(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -881,7 +1311,7 @@ class ProvenanceTests(unittest.TestCase):
                 )
             manifest = json.loads(execution.manifest_path.read_text())
 
-        self.assertEqual(variants, ["A"])
+        self.assertEqual(set(variants), {"A", "B_empty"})
         self.assertEqual(manifest["failure"], "NO_ELIGIBLE_CLAIM")
 
     def test_pier_process_failure_is_recorded_as_infrastructure_failure(self) -> None:
@@ -939,6 +1369,59 @@ class ProvenanceTests(unittest.TestCase):
         self.assertEqual(record["status"], "infrastructure_failed")
         self.assertEqual(record["reason"], "UPSTREAM_CONCURRENCY_EXHAUSTED")
         self.assertIsNone(record["gate_path"])
+
+    def test_verifier_timeout_replays_frozen_patch_once_without_model_agent(self) -> None:
+        assert _cleanup_trial_images_mock is not None
+        _cleanup_trial_images_mock.reset_mock()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = build_attempt_plan(DATASET, root / "run", seed=2)
+            experiment = build_experiment_manifest("experiment-1", plan, "b" * 64, provenance())
+            artifacts = _artifacts(root, claim_bundle=root / "claims.json")
+            execution = replace(_execution(root, artifacts), run_a_only=True)
+            agent_imports: list[str] = []
+
+            def run(command: list[str], **_kwargs: object) -> FakeCompleted:
+                job = json.loads(Path(command[-1]).read_text())
+                agent_imports.append(job["agents"][0]["import_path"])
+                attempt = plan.attempts[0]
+                is_regrade = job["job_name"].endswith("-verifier-regrade-1")
+                _write_fake_trial(
+                    Path(job["jobs_dir"]),
+                    attempt,
+                    bundle_path=artifacts.claim_bundle,
+                    verifier_ran=is_regrade,
+                    job_name=job["job_name"],
+                    exception_info=(
+                        None
+                        if is_regrade
+                        else {
+                            "exception_type": "VerifierTimeoutError",
+                            "exception_message": "Verifier execution timed out",
+                        }
+                    ),
+                )
+                return FakeCompleted(0)
+
+            with patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True):
+                result = Task1HostRunner(experiment, root / "jobs", execution, run=run).run_task1(
+                    execute=True
+                )
+
+            manifest = json.loads(execution.manifest_path.read_text(encoding="utf-8"))
+            attempt_result = json.loads(
+                Path(manifest["attempt_results"][0]["result_path"]).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(result.status, "passed")
+        self.assertEqual(len(agent_imports), 2)
+        cleaned_trials = [item.args[0] for item in _cleanup_trial_images_mock.call_args_list]
+        self.assertEqual(len(cleaned_trials), 2)
+        self.assertEqual(len(set(cleaned_trials)), 2)
+        self.assertTrue(agent_imports[0].endswith(":AcnEvalPierAgent"))
+        self.assertTrue(agent_imports[1].endswith(":AcnPatchReplayPierAgent"))
+        self.assertEqual(attempt_result["verifier_regrade"]["trigger"], "VERIFIER_TIMEOUT")
+        self.assertTrue(attempt_result["verifier_passed"])
 
 
 class SentinelTests(unittest.TestCase):
@@ -1005,11 +1488,14 @@ def _write_fake_trial(
     exit_type: str = "completed",
     verifier_ran: bool = True,
     emit_claim: bool = True,
+    claim_variants: frozenset[str] = frozenset({"A"}),
     verifier_passed: bool = True,
+    job_name: str | None = None,
+    exception_info: dict[str, str] | None = None,
 ) -> None:
     attempt_id = attempt.attempt_id
     variant = attempt.variant
-    trial = jobs_dir / attempt_id / "trial-1"
+    trial = jobs_dir / (job_name or attempt_id) / "trial-1"
     evaluation = trial / "agent" / "evaluation"
     evaluation.mkdir(parents=True)
     (trial / "artifacts").mkdir()
@@ -1072,7 +1558,7 @@ def _write_fake_trial(
     )
 
     events: list[dict[str, object]] = []
-    if variant == "A" and emit_claim:
+    if variant in claim_variants and emit_claim:
         events.append(
             {
                 "schema_version": 1,
@@ -1111,7 +1597,11 @@ def _write_fake_trial(
         json.dumps(
             {
                 "task_name": f"datacurve/{attempt.task_id}",
-                "trial_name": attempt.attempt_id,
+                "trial_name": (
+                    f"{attempt.task_id}__def5678"
+                    if job_name is not None and job_name.endswith("-verifier-regrade-1")
+                    else f"{attempt.task_id}__abc1234"
+                ),
                 "trial_uri": trial.resolve().as_uri(),
                 "task_checksum": "checksum",
                 "config": {},
@@ -1119,13 +1609,18 @@ def _write_fake_trial(
                 "verifier_result": {"rewards": {"reward": 1 if verifier_passed else 0}}
                 if verifier_ran
                 else None,
+                "exception_info": exception_info,
             }
         )
     )
 
 
 def _run_a_only_source(
-    root: Path, *, emit_claim: bool = True
+    root: Path,
+    *,
+    emit_claim: bool = True,
+    verifier_passed: bool = True,
+    claim_quality_gate: str = "none",
 ) -> tuple[AttemptPlan, Task1ExecutionConfig]:
     root.mkdir(parents=True)
     output = root / "output"
@@ -1141,6 +1636,7 @@ def _run_a_only_source(
         _execution(fixture, artifacts),
         manifest_path=output / "tasks" / "task-1" / "manifest.json",
         run_a_only=True,
+        claim_quality_gate=claim_quality_gate,
     )
 
     def run(command: list[str], **_kwargs: object) -> FakeCompleted:
@@ -1151,6 +1647,7 @@ def _run_a_only_source(
             attempt,
             bundle_path=artifacts.claim_bundle,
             emit_claim=emit_claim,
+            verifier_passed=verifier_passed,
         )
         return FakeCompleted(0)
 
@@ -1176,6 +1673,7 @@ def _b_only_followup(
         manifest_path=output / "tasks" / "task-1" / "manifest.json",
         run_all_variants_without_claims=True,
         a_only_source_manifest=source_execution.manifest_path,
+        claim_quality_gate=source_execution.claim_quality_gate,
     )
     return plan, execution, experiment
 
@@ -1185,6 +1683,9 @@ def provenance() -> EvaluationProvenance:
         deepswe_revision="deepswe@abc",
         pier_revision="datacurve-pier==0.3.0",
         acn_revision="acn@def",
+        acn_main_revision="9b818d70ddfad2f7d5e1972577dd294b19481c92",
+        acn_version="0.2.5",
+        run_class="diagnostic",
         acn_binary_hash=hashlib.sha256(b"fixture").hexdigest(),
         acn_config_hash="2" * 64,
         dataset_candidates_hash="a" * 64,
@@ -1197,10 +1698,13 @@ def provenance() -> EvaluationProvenance:
         normalized_task_tree_hash=_fixture_task_tree_hash(),
         agent_image_reference_sha256="5" * 64,
         verifier_image_reference_sha256="6" * 64,
+        pier_egress_proxy_image_reference_sha256="8" * 64,
         agent_image_content_digest="sha256:" + "7" * 64,
         verifier_image_content_digest="sha256:" + "7" * 64,
+        pier_egress_proxy_image_content_digest="sha256:" + "9" * 64,
         model="fixture-model",
         reasoning_effort="max",
+        file_edit_authority_enabled=True,
         resources={
             "cpus": 2,
             "memory_mb": 4096,
@@ -1208,7 +1712,11 @@ def provenance() -> EvaluationProvenance:
             "max_tokens": 1024,
             "context_window": 8192,
         },
-        timeouts={"agent_seconds": 300, "deadline_reserve_seconds": 60},
+        timeouts={
+            "agent_seconds": 300,
+            "deadline_reserve_seconds": 60,
+            "verifier_seconds": 300,
+        },
         llm_retry={"retry_count": 3, "retry_base_delay_ms": 1000, "retry_max_delay_ms": 30000},
         network_translation_warning="translated",
     )

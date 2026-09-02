@@ -248,8 +248,8 @@ pub fn build_agent_cli_session_engine_with_mcp(
     Ok(engine)
 }
 
-/// 构造非交互评测 session engine。两种 profile 都保留冻结 router 与 claim finalize；
-/// minimal 不加载 skill、文件工具、working note 或 ACN.md。
+/// 构造非交互评测 session engine。所有 profile 都保留冻结 router 与 claim finalize；
+/// 非 standard 模式不加载 skill 或 ACN.md，工具面由显式 harness mode 决定。
 pub(crate) fn build_evaluation_session_engine(
     cfg: &Config,
     upstream: &ResolvedUpstream,
@@ -271,8 +271,8 @@ pub(crate) fn build_evaluation_session_engine(
         Arc::new(LocalFsClaimStore::new(agent_home.clone()));
     let reported_dispute_claim_sets: Arc<dyn ReportedDisputeClaimSetStore> =
         Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home.clone()));
-    let minimal = harness_mode == EvaluationHarnessMode::Minimal;
-    let available_skills = if minimal {
+    let concise = harness_mode != EvaluationHarnessMode::Standard;
+    let available_skills = if concise {
         Vec::new()
     } else {
         load_available_skills(cfg)?
@@ -311,10 +311,19 @@ pub(crate) fn build_evaluation_session_engine(
         .with_process_id_attempts(cfg.agent.session.id_mint_max_attempts())
         .with_process_owner_agent_id(upstream.agent_id.clone())
         .with_router_client(router);
-    let tools = if minimal {
-        tools.for_minimal_evaluation(cfg.agent.llm.api_key_env.clone())
-    } else {
-        tools.for_evaluation(cfg.agent.llm.api_key_env.clone())
+    let tools = match harness_mode {
+        EvaluationHarnessMode::Standard | EvaluationHarnessMode::Concise => {
+            tools.for_evaluation(cfg.agent.llm.api_key_env.clone())
+        }
+        EvaluationHarnessMode::Minimal => {
+            tools.for_minimal_evaluation(cfg.agent.llm.api_key_env.clone())
+        }
+        EvaluationHarnessMode::PiLike => {
+            tools.for_pi_like_evaluation(cfg.agent.llm.api_key_env.clone())
+        }
+        EvaluationHarnessMode::OpenCodeLike => {
+            tools.for_open_code_like_evaluation(cfg.agent.llm.api_key_env.clone())
+        }
     };
     let tools = Arc::new(
         tools
@@ -356,7 +365,7 @@ pub(crate) fn build_evaluation_session_engine(
             workspace_root: cfg.agent.tool.workspace_root.clone(),
             turn_journal: cfg.agent.session.turn_journal.clone(),
             subagent_max_concurrent: cfg.agent.session.subagents.max_concurrent,
-            runtime_profile: if minimal {
+            runtime_profile: if concise {
                 crate::agent::SessionRuntimeProfile::EvaluationMinimal
             } else {
                 crate::agent::SessionRuntimeProfile::Evaluation
@@ -369,7 +378,7 @@ pub(crate) fn build_evaluation_session_engine(
     ))
     .with_fork_memory_review(false)
     .with_attachment_config(cfg.agent.attachment.clone());
-    Ok(if minimal {
+    Ok(if concise {
         engine
     } else {
         engine.with_acn_md_path(cfg.storage.acn_md_path())

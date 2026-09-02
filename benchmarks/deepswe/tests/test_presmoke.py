@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import threading
@@ -10,6 +11,7 @@ from acn_deepswe.dataset import FrozenDatasetManifest
 from acn_deepswe.host_runner import TaskExecutionError, TaskExecutionResult
 from acn_deepswe.plan import build_attempt_plan
 from acn_deepswe.presmoke import (
+    _cohort_metrics,
     PresmokeExecutionError,
     PresmokeHostRunner,
     PresmokeTaskResult,
@@ -31,7 +33,169 @@ TASK_IDS = (
 )
 
 
+def _write_metric_manifest(
+    root: Path,
+    *,
+    failed_variant: str | None = None,
+    incomplete_variant: str | None = None,
+    claim_producer_variant: str = "A",
+    logical_variant_map: dict[str, str] | None = None,
+) -> Path:
+    manifest = root / "task-manifest.json"
+    records = []
+    for variant, passed, requests, input_tokens in (
+        ("A", True, 10, 1000),
+        ("B_empty", False, 9, 900),
+        ("B_claim", True, 7, 700),
+        ("B_forced_claim", True, 6, 600),
+    ):
+        attempt_id = f"task-a-{variant}"
+        incomplete = 1 if variant == incomplete_variant else 0
+        result_path = root / f"{variant}.result.json"
+        gate_path = root / f"{variant}.gate.json"
+        result_path.write_text(
+            json.dumps(
+                {
+                    "attempt_id": attempt_id,
+                    "variant": variant,
+                    "verifier_passed": passed,
+                    "usage": {
+                        "model_requests": requests,
+                        "complete_model_responses": requests - incomplete,
+                        "incomplete_model_responses": incomplete,
+                        "input_tokens": input_tokens,
+                        "output_tokens": 100,
+                        "cache_read_tokens": 500,
+                        "reasoning_tokens": 50,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        gate_path.write_text(
+            json.dumps(
+                {
+                    "attempt_id": attempt_id,
+                    "decision": "fail" if variant == failed_variant else "pass",
+                }
+            ),
+            encoding="utf-8",
+        )
+        records.append(
+            {
+                "attempt_id": attempt_id,
+                "variant": variant,
+                "status": "gate_failed" if variant == failed_variant else "passed",
+                "result_path": str(result_path),
+                "gate_path": str(gate_path),
+                "result_hash": hashlib.sha256(result_path.read_bytes()).hexdigest(),
+                "gate_hash": hashlib.sha256(gate_path.read_bytes()).hexdigest(),
+                "verifier_passed": passed,
+            }
+        )
+    manifest.write_text(
+        json.dumps(
+            {
+                "experiment_cohort": (
+                    "success_efficiency" if claim_producer_variant == "A" else "failure_recovery"
+                ),
+                "claim_producer_variant": claim_producer_variant,
+                "logical_variant_map": logical_variant_map,
+                "execution": {"claim_producer_variant": claim_producer_variant},
+                "attempt_results": records,
+                "failure": "GATE_FAILED" if failed_variant is not None else None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return manifest
+
+
 class PresmokeRunnerTests(unittest.TestCase):
+    def test_cohort_metrics_keep_success_efficiency_separate_and_report_paired_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = _write_metric_manifest(root)
+            metrics = _cohort_metrics(
+                (PresmokeTaskResult("task-a", "passed", str(manifest), None),)
+            )["success_efficiency"]
+
+        self.assertEqual(metrics["task_count"], 1)
+        self.assertEqual(metrics["variants"]["B_claim"]["verifier_pass_rate"], 1.0)
+        self.assertEqual(
+            metrics["paired_against_a"]["B_claim"]["usage_delta_totals"]["model_requests"],
+            -3,
+        )
+        self.assertEqual(
+            metrics["paired_against_a"]["B_forced_claim"]["usage_delta_totals"]["input_tokens"],
+            -400,
+        )
+
+    def test_cohort_metrics_pair_against_b_empty_when_selected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = _write_metric_manifest(Path(directory), claim_producer_variant="B_empty")
+            metrics = _cohort_metrics(
+                (PresmokeTaskResult("task-a", "passed", str(manifest), None),)
+            )["failure_recovery"]
+
+        self.assertEqual(metrics["claim_producer_variant"], "B_empty")
+        self.assertEqual(
+            metrics["paired_against_b_empty"]["B_claim"]["verifier_passed_delta"],
+            1,
+        )
+        self.assertEqual(
+            metrics["paired_against_b_empty"]["B_claim"]["usage_delta_totals"]["model_requests"],
+            -2,
+        )
+
+    def test_adaptive_metrics_relabel_the_global_winner_as_logical_a(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = _write_metric_manifest(
+                Path(directory),
+                claim_producer_variant="B_empty",
+                logical_variant_map={
+                    "A": "B_empty",
+                    "B_empty": "A",
+                    "B_claim": "B_claim",
+                    "B_forced_claim": "B_forced_claim",
+                },
+            )
+            metrics = _cohort_metrics(
+                (PresmokeTaskResult("task-a", "passed", str(manifest), None),)
+            )["failure_recovery"]
+
+        self.assertEqual(metrics["claim_producer_variant"], "A")
+        self.assertEqual(metrics["variants"]["A"]["verifier_pass_rate"], 0.0)
+        self.assertEqual(metrics["variants"]["B_empty"]["verifier_pass_rate"], 1.0)
+        self.assertEqual(
+            metrics["paired_against_a"]["B_claim"]["usage_delta_totals"]["model_requests"],
+            -2,
+        )
+
+    def test_cohort_metrics_exclude_entire_task_when_any_arm_fails_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = _write_metric_manifest(Path(directory), failed_variant="B_claim")
+            metrics = _cohort_metrics(
+                (PresmokeTaskResult("task-a", "failed", str(manifest), "CLAIM_DELIVERY_REPEATED"),)
+            )
+
+        self.assertEqual(metrics, {})
+
+    def test_cohort_metrics_mark_recovered_incomplete_usage_as_token_lower_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = _write_metric_manifest(Path(directory), incomplete_variant="B_claim")
+            metrics = _cohort_metrics(
+                (PresmokeTaskResult("task-a", "passed", str(manifest), None),)
+            )["success_efficiency"]
+
+        claim = metrics["variants"]["B_claim"]
+        pair = metrics["paired_against_a"]["B_claim"]
+        self.assertEqual(claim["incomplete_usage_attempts"], 1)
+        self.assertEqual(claim["incomplete_usage_attempt_rate"], 1.0)
+        self.assertTrue(claim["token_values_are_observed_lower_bound"])
+        self.assertEqual(pair["pairs_with_incomplete_usage"], 1)
+        self.assertTrue(pair["token_delta_includes_observed_lower_bound"])
+
     def test_manifest_task_count_is_not_hardcoded_to_five(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manifest = Path(directory) / "tasks.json"
@@ -209,7 +373,26 @@ class PresmokeRunnerTests(unittest.TestCase):
             [item["task_id"] for item in checkpoint["completed_tasks"]], list(TASK_IDS)
         )
 
-    def test_failure_is_checkpointed_as_a_terminal_state_and_not_reclassified_as_pending(self) -> None:
+    def test_resume_rejects_completed_task_from_different_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = build_specs(root)[0]
+            write_completed_task_artifacts(spec)
+            changed = replace(
+                spec,
+                experiment=replace(
+                    spec.experiment,
+                    provenance=replace(spec.experiment.provenance, model="different-model"),
+                ),
+            )
+
+            completed = load_completed_task_results((changed,), root / "task-completions.json")
+
+        self.assertEqual(completed, ())
+
+    def test_failure_is_checkpointed_as_a_terminal_state_and_not_reclassified_as_pending(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             specs = build_specs(root)
@@ -389,6 +572,9 @@ def build_specs(root: Path) -> tuple[PresmokeTaskSpec, ...]:
         deepswe_revision="deepswe@abc",
         pier_revision="pier@abc",
         acn_revision="acn@abc",
+        acn_main_revision="9b818d70ddfad2f7d5e1972577dd294b19481c92",
+        acn_version="0.2.5",
+        run_class="diagnostic",
         acn_binary_hash="1" * 64,
         acn_config_hash="2" * 64,
         dataset_candidates_hash="a" * 64,
@@ -401,10 +587,13 @@ def build_specs(root: Path) -> tuple[PresmokeTaskSpec, ...]:
         normalized_task_tree_hash="5" * 64,
         agent_image_reference_sha256="6" * 64,
         verifier_image_reference_sha256="7" * 64,
+        pier_egress_proxy_image_reference_sha256="8" * 64,
         agent_image_content_digest=None,
         verifier_image_content_digest=None,
+        pier_egress_proxy_image_content_digest="sha256:" + "9" * 64,
         model="fixture-model",
         reasoning_effort="max",
+        file_edit_authority_enabled=True,
         resources={
             "cpus": 2,
             "memory_mb": 4096,
@@ -415,7 +604,11 @@ def build_specs(root: Path) -> tuple[PresmokeTaskSpec, ...]:
             "max_input_tokens": 20,
             "max_output_tokens": 20,
         },
-        timeouts={"agent_seconds": 2, "deadline_reserve_seconds": 1},
+        timeouts={
+            "agent_seconds": 2,
+            "deadline_reserve_seconds": 1,
+            "verifier_seconds": 2,
+        },
         llm_retry={"retry_count": 1, "retry_base_delay_ms": 1, "retry_max_delay_ms": 2},
         network_translation_warning="translated",
     )
@@ -460,11 +653,20 @@ def write_completed_task_artifacts(spec: PresmokeTaskSpec) -> None:
                 "status": "passed",
                 "result_path": str(result_path),
                 "gate_path": str(gate_path),
+                "result_hash": hashlib.sha256(result_path.read_bytes()).hexdigest(),
+                "gate_hash": hashlib.sha256(gate_path.read_bytes()).hexdigest(),
             }
         )
     spec.manifest_path.parent.mkdir(parents=True)
     spec.manifest_path.write_text(
-        json.dumps({"failure": None, "attempt_results": records}), encoding="utf-8"
+        json.dumps(
+            {
+                "failure": None,
+                "experiment": spec.experiment.to_dict(),
+                "attempt_results": records,
+            }
+        ),
+        encoding="utf-8",
     )
 
 
@@ -502,11 +704,20 @@ def write_a_only_task_artifacts(spec: PresmokeTaskSpec) -> None:
                 "status": "passed",
                 "result_path": str(result_path),
                 "gate_path": str(gate_path),
+                "result_hash": hashlib.sha256(result_path.read_bytes()).hexdigest(),
+                "gate_hash": hashlib.sha256(gate_path.read_bytes()).hexdigest(),
             }
         )
     spec.manifest_path.parent.mkdir(parents=True)
     spec.manifest_path.write_text(
-        json.dumps({"failure": None, "attempt_results": records}), encoding="utf-8"
+        json.dumps(
+            {
+                "failure": None,
+                "experiment": spec.experiment.to_dict(),
+                "attempt_results": records,
+            }
+        ),
+        encoding="utf-8",
     )
 
 
@@ -544,9 +755,18 @@ def write_no_eligible_claim_task_artifacts(spec: PresmokeTaskSpec) -> None:
                 "status": "passed",
                 "result_path": str(result_path),
                 "gate_path": str(gate_path),
+                "result_hash": hashlib.sha256(result_path.read_bytes()).hexdigest(),
+                "gate_hash": hashlib.sha256(gate_path.read_bytes()).hexdigest(),
             }
         )
     spec.manifest_path.parent.mkdir(parents=True)
     spec.manifest_path.write_text(
-        json.dumps({"failure": None, "attempt_results": records}), encoding="utf-8"
+        json.dumps(
+            {
+                "failure": None,
+                "experiment": spec.experiment.to_dict(),
+                "attempt_results": records,
+            }
+        ),
+        encoding="utf-8",
     )

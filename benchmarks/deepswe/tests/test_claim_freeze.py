@@ -90,6 +90,141 @@ class ClaimFreezeTests(unittest.TestCase):
             with self.assertRaisesRegex(ClaimFreezeError, "freeze barrier"):
                 freeze_claim_bundle(ledger, "attempt-a", Path(directory) / "claims.json")
 
+    def test_freeze_binds_optional_producer_verification_only_to_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = root / "events.jsonl"
+            ledger.write_text(
+                json.dumps(event(1, "attempt-a", "claim_freeze_barrier", {"barrier_id": "a"}))
+                + "\n"
+            )
+            producer = {
+                "attempt_id": "attempt-a",
+                "verifier_passed": True,
+                "attempt_result_sha256": "a" * 64,
+            }
+
+            frozen = freeze_claim_bundle(
+                ledger,
+                "attempt-a",
+                root / "claims.json",
+                producer_verification=producer,
+            )
+            stored = json.loads((root / "claims.json").read_text())
+            metadata = json.loads((root / "claims.json.manifest.json").read_text())
+
+        self.assertEqual(frozen.producer_verification, producer)
+        self.assertNotIn("producer_verification", stored)
+        self.assertEqual(metadata["producer_verification"], producer)
+
+    def test_verified_producer_gate_quarantines_failed_producer_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = root / "events.jsonl"
+            ledger.write_text(
+                "".join(
+                    json.dumps(item) + "\n"
+                    for item in (
+                        event(
+                            1,
+                            "attempt-a",
+                            "claim_snapshot",
+                            {"claim": claim("claim-unverified", "局部线索", "active")},
+                        ),
+                        event(
+                            2,
+                            "attempt-a",
+                            "claim_freeze_barrier",
+                            {"barrier_id": "a"},
+                        ),
+                    )
+                )
+            )
+            producer = {
+                "attempt_id": "attempt-a",
+                "verifier_passed": False,
+                "attempt_result_sha256": "b" * 64,
+            }
+
+            frozen = freeze_claim_bundle(
+                ledger,
+                "attempt-a",
+                root / "claims.json",
+                producer_verification=producer,
+                quality_gate="verified_producer_only",
+            )
+            stored = json.loads((root / "claims.json").read_text())
+            metadata = json.loads((root / "claims.json.manifest.json").read_text())
+
+        self.assertEqual(frozen.claims, ())
+        self.assertEqual(
+            [item.claim_id for item in frozen.quarantined_claims],
+            ["claim-unverified"],
+        )
+        self.assertEqual(stored["claims"], [])
+        self.assertEqual(metadata["quality_gate"], "verified_producer_only")
+        self.assertEqual(
+            [item["claim_id"] for item in metadata["quarantined_claims"]],
+            ["claim-unverified"],
+        )
+
+    def test_verified_producer_gate_keeps_verified_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = root / "events.jsonl"
+            ledger.write_text(
+                "".join(
+                    json.dumps(item) + "\n"
+                    for item in (
+                        event(
+                            1,
+                            "attempt-a",
+                            "claim_snapshot",
+                            {"claim": claim("claim-verified", "已验证线索", "active")},
+                        ),
+                        event(
+                            2,
+                            "attempt-a",
+                            "claim_freeze_barrier",
+                            {"barrier_id": "a"},
+                        ),
+                    )
+                )
+            )
+
+            frozen = freeze_claim_bundle(
+                ledger,
+                "attempt-a",
+                root / "claims.json",
+                producer_verification={
+                    "attempt_id": "attempt-a",
+                    "verifier_passed": True,
+                    "attempt_result_sha256": "c" * 64,
+                },
+                quality_gate="verified_producer_only",
+            )
+
+        self.assertEqual([item.claim_id for item in frozen.claims], ["claim-verified"])
+        self.assertEqual(frozen.quarantined_claims, ())
+
+    def test_verified_producer_gate_requires_verification_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = root / "events.jsonl"
+            ledger.write_text(
+                json.dumps(
+                    event(1, "attempt-a", "claim_freeze_barrier", {"barrier_id": "a"})
+                )
+                + "\n"
+            )
+            with self.assertRaisesRegex(ClaimFreezeError, "producer_verification"):
+                freeze_claim_bundle(
+                    ledger,
+                    "attempt-a",
+                    root / "claims.json",
+                    quality_gate="verified_producer_only",
+                )
+
     def test_freeze_refuses_to_overwrite_an_existing_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

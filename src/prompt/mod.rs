@@ -485,13 +485,15 @@ mod tests {
         assert!(out.contains("改代码并通过验收"));
         assert!(out.contains("submit_task"));
         assert!(out.contains("验收条件"));
-        assert!(out.contains("git commit"));
+        assert!(out.contains("skill 正文会在 user turn 前自动注入"));
+        assert!(out.contains("不要用 `file_read` 重复读取其 `spec_path`"));
+        assert!(!out.contains("git commit"));
         assert!(out.contains("file_read"));
         assert!(out.contains("code_run"));
         assert!(out.contains("consult_router"));
         assert!(out.contains("不要在会话中创建、更新或删除 claim"));
         assert!(out.contains("finalize"));
-        assert!(out.contains("候选 claim 只是此前探索的经验和线索"));
+        assert!(out.contains("具体的冻结 claim 交付协议由下方 `ACN.md` 给出"));
         assert!(out.contains("self claims 快照"));
         assert!(!out.contains("思考并**用自然语言**回答用户的问题"));
         assert!(!out.contains("create_subagent"));

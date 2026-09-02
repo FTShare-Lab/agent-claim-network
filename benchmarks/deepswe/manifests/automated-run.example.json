@@ -4,14 +4,23 @@
   "source_tasks_root": "/absolute/path/to/DeepSWE/tasks",
   "pier_checkout": "/absolute/path/to/pier",
   "pier_executable": "/absolute/path/to/pier/.venv/bin/pier",
+  "pier_egress_proxy_image": "pier-egress-proxy:ubuntu-24.04",
+  "pier_egress_proxy_content_digest": "sha256:1d2c98c535415f3a4177b68f209f2d5b88f8312fa9b3c624b47bb702361786e9",
   "acn_eval": "/absolute/path/to/acn_eval",
   "frozen_skill": "/absolute/path/to/agent_claim_network/benchmarks/deepswe/assets/coding-benchmark",
   "model": "deepseek-v4-flash-local-exp",
   "response_model": "deepseek-v4-flash",
   "reasoning_effort": "max",
+  "run_class": "formal",
+  "acn_main_revision": "9b818d70ddfad2f7d5e1972577dd294b19481c92",
+  "acn_version": "0.2.5",
   "model_egress_mode": "pier",
-  "task_workers": 30,
+  "harness_mode": "standard",
+  "file_edit_authority_enabled": true,
+  "task_workers": 20,
+  "cleanup_stale_pier_resources": true,
   "run_all_variants_without_claims": true,
+  "claim_producer_variant": "A",
   "smoke_size": 30,
   "full_size": 113,
   "dataset_seed": 20260813,
@@ -23,18 +32,24 @@
   },
   "resources": {
     "cpus": 2,
-    "memory_mb": 8192,
+    "memory_mb": 16384,
     "storage_mb": 20480,
     "max_tokens": 65536,
     "context_window": 1000000
   },
   "timeouts": {
     "agent_seconds": 5400,
-    "deadline_reserve_seconds": 120
+    "deadline_reserve_seconds": 120,
+    "verifier_seconds": 2700
   },
   "llm_retry": {
     "retry_count": 2,
     "retry_base_delay_ms": 1000,
     "retry_max_delay_ms": 30000
+  },
+  "host_capacity": {
+    "memory_reserve_mb": 65536,
+    "disk_reserve_mb": 65536,
+    "disk_admission_mb_per_worker": 20480
   }
 }

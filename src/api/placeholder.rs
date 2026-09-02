@@ -579,7 +579,7 @@ mod tests {
                 "source_claim_ids": []
             }));
         }
-        let v = serde_json::json!({"new_claims": claims});
+        let v = serde_json::json!({ "new_claims": claims });
         let out = resolve_placeholders(v, now()).unwrap();
         // claim 11 的 id 也已派生
         let id11 = out["new_claims"][11]["id"].as_str().unwrap();

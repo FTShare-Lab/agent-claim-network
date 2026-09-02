@@ -436,7 +436,7 @@ async fn wait_subagents_returns_no_active_and_rejects_invalid_explicit_ids() {
     let cross_session = registry
         .dispatch_with_context(
             "wait_subagents",
-            json!({"subagent_ids": [foreign_id]}),
+            json!({ "subagent_ids": [foreign_id] }),
             wait_test_context(&session_id),
         )
         .await

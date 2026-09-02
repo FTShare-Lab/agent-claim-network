@@ -8913,7 +8913,7 @@ fn parse_compaction_summary_outcome_requires_committed_and_active_shape() {
         .unwrap_err();
     assert!(err.to_string().contains("active_turn_summary key"));
 
-    let err = parse_compaction_summary_outcome(json!({"active_turn_summary": null}), &inputs)
+    let err = parse_compaction_summary_outcome(json!({ "active_turn_summary": null }), &inputs)
         .unwrap_err();
     assert!(err.to_string().contains("committed_summary key"));
 

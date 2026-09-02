@@ -382,6 +382,69 @@ async fn minimal_evaluation_registry_keeps_only_process_claim_and_submission_too
 }
 
 #[tokio::test]
+async fn pi_and_open_code_like_evaluation_profiles_have_the_expected_file_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let router = || {
+        Arc::new(TestRouter {
+            result: sample_router_result(),
+            overview: sample_scopes_overview(),
+        })
+    };
+    let pi_registry = ToolRegistry::new(&test_tool_config(dir.path()))
+        .unwrap()
+        .with_router_client(router())
+        .for_pi_like_evaluation("ACN_TEST_EVALUATION_SECRET".into())
+        .with_evaluation_submission(EvaluationSubmission::new());
+    let open_code_registry = ToolRegistry::new(&test_tool_config(dir.path()))
+        .unwrap()
+        .with_router_client(router())
+        .for_open_code_like_evaluation("ACN_TEST_EVALUATION_SECRET".into())
+        .with_evaluation_submission(EvaluationSubmission::new());
+
+    let names = |registry: &ToolRegistry| {
+        registry
+            .definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        names(&pi_registry),
+        vec![
+            "code_run",
+            "write_stdin",
+            "process_list",
+            "file_read",
+            "file_write",
+            "consult_router",
+            "submit_task",
+        ]
+    );
+    assert_eq!(
+        names(&open_code_registry),
+        vec![
+            "code_run",
+            "write_stdin",
+            "process_list",
+            "file_read",
+            "file_patch",
+            "file_write",
+            "consult_router",
+            "submit_task",
+        ]
+    );
+    assert!(matches!(
+        pi_registry
+            .dispatch(
+                "file_patch",
+                json!({"path": "README.md", "old_content": "a", "new_content": "b"}),
+            )
+            .await,
+        Err(ToolError::UnknownTool(_))
+    ));
+}
+
+#[tokio::test]
 async fn evaluation_code_run_removes_configured_secret_from_pipe_environment() {
     let _secret = EnvVarGuard::set("ACN_TEST_EVALUATION_SECRET", "secret-value");
     let _visible = EnvVarGuard::set("ACN_TEST_EVALUATION_VISIBLE", "visible-value");

@@ -17,6 +17,7 @@ from .schemas import EventLedger
 CLAIM_SNAPSHOT_EVENT = "claim_snapshot"
 FREEZE_BARRIER_EVENT = "claim_freeze_barrier"
 EXCLUDED_STATUSES = frozenset({"stale", "disputed", "deprecated"})
+CLAIM_QUALITY_GATES = frozenset({"none", "verified_producer_only"})
 
 
 class ClaimFreezeError(ValueError):
@@ -44,6 +45,9 @@ class ClaimBundle:
     source_ledger_hash: str
     claims: tuple[FrozenClaim, ...]
     bundle_hash: str
+    producer_verification: dict[str, object] | None = None
+    quality_gate: str = "none"
+    quarantined_claims: tuple[FrozenClaim, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         """这是 Rust `FrozenClaimBundle` 可直接读取的 bundle，不能加入审计字段。"""
@@ -53,7 +57,7 @@ class ClaimBundle:
         }
 
     def manifest_dict(self) -> dict[str, object]:
-        return {
+        result = {
             "schema_version": self.schema_version,
             "attempt_id": self.attempt_id,
             "barrier_seq": self.barrier_seq,
@@ -61,15 +65,38 @@ class ClaimBundle:
             "claims": [claim.manifest_dict() for claim in self.claims],
             "bundle_hash": self.bundle_hash,
         }
+        if self.producer_verification is not None:
+            result["producer_verification"] = dict(self.producer_verification)
+        result["quality_gate"] = self.quality_gate
+        result["quarantined_claims"] = [
+            claim.manifest_dict() for claim in self.quarantined_claims
+        ]
+        return result
 
 
-def freeze_claim_bundle(host_ledger: Path, attempt_id: str, output_path: Path) -> ClaimBundle:
+def freeze_claim_bundle(
+    host_ledger: Path,
+    attempt_id: str,
+    output_path: Path,
+    *,
+    producer_verification: Mapping[str, object] | None = None,
+    quality_gate: str = "none",
+) -> ClaimBundle:
     """仅冻结 barrier 前、同一 attempt、状态 active 的 claim_snapshot。"""
     if not output_path.is_absolute():
         raise ClaimFreezeError(f"claim bundle 输出必须为绝对路径: {output_path}")
     metadata_path = output_path.with_name(output_path.name + ".manifest.json")
     if output_path.exists() or metadata_path.exists():
         raise ClaimFreezeError(f"claim bundle 输出已存在，拒绝覆盖: {output_path}")
+    producer = _validate_producer_verification(producer_verification, attempt_id)
+    if quality_gate not in CLAIM_QUALITY_GATES:
+        raise ClaimFreezeError(
+            "quality_gate 仅支持 none 或 verified_producer_only"
+        )
+    if quality_gate == "verified_producer_only" and producer is None:
+        raise ClaimFreezeError(
+            "verified_producer_only 必须提供 producer_verification"
+        )
     events = read_rust_event_ledger(host_ledger)
     target = [event for event in events if event.attempt_id == attempt_id]
     _validate_monotonic_sequences(target, attempt_id)
@@ -87,12 +114,29 @@ def freeze_claim_bundle(host_ledger: Path, attempt_id: str, output_path: Path) -
         if snapshot is None:
             continue
         snapshots[snapshot.claim_id] = snapshot
-    claims = tuple(sorted(snapshots.values(), key=lambda item: item.claim_id))
+    discovered_claims = tuple(sorted(snapshots.values(), key=lambda item: item.claim_id))
+    producer_failed = producer is not None and producer["verifier_passed"] is False
+    quarantined_claims = (
+        discovered_claims
+        if quality_gate == "verified_producer_only" and producer_failed
+        else ()
+    )
+    claims = () if quarantined_claims else discovered_claims
     source_hash = hashlib.sha256(host_ledger.read_bytes()).hexdigest()
     bundle_body = {"schema_version": 1, "claims": [claim.to_dict() for claim in claims]}
     bundle_bytes = _bundle_file_bytes(bundle_body)
     bundle_hash = hashlib.sha256(bundle_bytes).hexdigest()
-    bundle = ClaimBundle(1, attempt_id, barrier.seq, source_hash, claims, bundle_hash)
+    bundle = ClaimBundle(
+        1,
+        attempt_id,
+        barrier.seq,
+        source_hash,
+        claims,
+        bundle_hash,
+        producer,
+        quality_gate,
+        quarantined_claims,
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_new(output_path, bundle_bytes)
     _atomic_write_new(
@@ -102,6 +146,24 @@ def freeze_claim_bundle(host_ledger: Path, attempt_id: str, output_path: Path) -
         ).encode("utf-8"),
     )
     return bundle
+
+
+def _validate_producer_verification(
+    value: Mapping[str, object] | None, attempt_id: str
+) -> dict[str, object] | None:
+    if value is None:
+        return None
+    expected_fields = {"attempt_id", "verifier_passed", "attempt_result_sha256"}
+    if set(value) != expected_fields or value.get("attempt_id") != attempt_id:
+        raise ClaimFreezeError("producer_verification identity 或字段无效")
+    if not isinstance(value.get("verifier_passed"), bool):
+        raise ClaimFreezeError("producer_verification.verifier_passed 必须为 bool")
+    result_hash = value.get("attempt_result_sha256")
+    if not isinstance(result_hash, str) or len(result_hash) != 64 or any(
+        character not in "0123456789abcdef" for character in result_hash
+    ):
+        raise ClaimFreezeError("producer_verification.attempt_result_sha256 必须为 SHA-256")
+    return dict(value)
 
 
 def append_freeze_barrier(host_ledger: Path, attempt_id: str, barrier_id: str) -> EventLedger:

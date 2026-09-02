@@ -1118,7 +1118,7 @@ mod tests {
                     &mut |_| {},
                 )
                 .unwrap();
-                let mut delta = json!({"type":delta_type});
+                let mut delta = json!({ "type": delta_type });
                 if let Some(value) = invalid_value.clone() {
                     delta[field] = value;
                 }

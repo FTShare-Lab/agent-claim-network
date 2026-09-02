@@ -3635,7 +3635,6 @@ mod tests {
         );
         assert_eq!(watchdog_payload["code"], "code_run_internal_timeout");
     }
-
     struct FakeProvider {
         responses: Mutex<VecDeque<ProviderResponse>>,
         requests: Mutex<Vec<ProviderRequest>>,
