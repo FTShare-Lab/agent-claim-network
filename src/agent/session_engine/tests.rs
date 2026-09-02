@@ -4831,6 +4831,70 @@ async fn ambiguous_stream_attempt_followed_by_fallback_rejection_keeps_wal() {
 }
 
 #[tokio::test]
+async fn accepted_response_after_ambiguous_attempt_lets_later_rejection_clear_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        error_step(
+            "stream transport failed",
+            vec![ProviderEvent::AssistantTextDelta {
+                text: "uncertain partial".into(),
+            }],
+        ),
+        tool_use_step(
+            "toolu_after_ambiguous",
+            "working_note",
+            json!({"action": "add", "note": "ACCEPTED_AFTER_AMBIGUOUS"}),
+        ),
+        ProviderStep::Rejected {
+            message: "provider rejected tool continuation",
+        },
+        response_step("continued without the rejected request", Vec::new()),
+    ]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_a11b1c07").await;
+
+    let error = engine
+        .run_turn(&mut session, "AMBIGUOUS_THEN_ACCEPTED", |_| {})
+        .await
+        .unwrap_err();
+    assert!(
+        error.downcast_ref::<crate::api::ProviderRequestRejected>().is_some(),
+        "an accepted response resolves the earlier ambiguity, so the later rejection must keep its classification: {error:#}"
+    );
+
+    let first_requests = provider.requests().await;
+    assert_eq!(first_requests.len(), 3);
+    assert_eq!(first_requests[0].messages, first_requests[1].messages);
+    let restored = session
+        .read_metadata()
+        .await
+        .unwrap()
+        .compaction
+        .and_then(|state| state.provider_history)
+        .expect("the accepted request boundary must remain available for recovery");
+    assert_eq!(restored.messages, first_requests[1].messages);
+    assert_ne!(restored.messages, first_requests[2].messages);
+
+    let agent_id = session.metadata.agent_id.clone();
+    let session_id = session.metadata.id.clone();
+    drop(session);
+    let mut resumed = store
+        .load_existing_session(&agent_id, &session_id)
+        .await
+        .unwrap();
+    engine
+        .run_turn(&mut resumed, "continue after rejected continuation", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 4);
+    let resumed_wire = serde_json::to_string(&requests[3].messages).unwrap();
+    assert!(resumed_wire.contains("tools_completed"));
+    assert!(resumed_wire.contains("ACCEPTED_AFTER_AMBIGUOUS"));
+}
+
+#[tokio::test]
 async fn ambiguous_internal_retry_followed_by_rejection_keeps_wal() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(InternalRetryThenRejectedProvider {

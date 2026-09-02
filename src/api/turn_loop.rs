@@ -2313,6 +2313,9 @@ impl AgentTurnLoop {
             if let Some(context_appender) = context_appender.as_mut() {
                 context_appender.after_provider_response_success().await?;
             }
+            // 本次响应已被接受，说明此前发送结果不明确的请求已经得到确定结果；
+            // 后续请求的失败应按自身结果处理，不再整轮冻结请求历史。
+            ambiguous_provider_send_seen = false;
             for tool_use in &tool_uses {
                 if !seen_tool_use_ids.insert(tool_use.id.clone()) {
                     anyhow::bail!(
