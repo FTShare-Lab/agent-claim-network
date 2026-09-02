@@ -613,6 +613,13 @@ fn live_region_shows_local_claims_and_last_router_lookup() {
 #[test]
 fn live_region_tracks_recent_acn_contribution() {
     let mut state = super::TuiState::new();
+    state.apply_event(SessionEvent::LocalClaimsUpdated { total: 7 });
+    state.apply_event(SessionEvent::ToolCallCompleted {
+        id: "toolu_router".into(),
+        summary: "tool consult_router ok claims=3 disputes=1".into(),
+        file_change: None,
+        outcome: ToolExecutionOutcome::Completed,
+    });
     state.apply_event(SessionEvent::InboxCompleted {
         processed: 2,
         new_claim_ids: vec!["claim_00000001".parse().unwrap()],
@@ -643,13 +650,11 @@ fn live_region_tracks_recent_acn_contribution() {
         .join("\n");
     assert!(finalize_text.contains("finalize · claims +1 / ~1 / -0 · disputes +0"));
 
-    state.apply_event(SessionEvent::CompactionCompleted {
-        compacted_until: 8,
-        recapped_until: 18,
-        new_claim_ids: vec!["claim_00000004".parse().unwrap()],
-        updated_claim_ids: vec!["claim_00000006".parse().unwrap()],
-        used_claim_ids: vec![],
-        new_dispute_ids: vec!["dispute_00000002".parse().unwrap()],
+    state.apply_event(SessionEvent::CompactionStarted {
+        compact_start_index: 0,
+        compact_end_index: 8,
+        recap_start_index: 0,
+        recap_end_index: 18,
     });
 
     let compact_text = super::inline_live_lines_with_width(&state, 96)
@@ -657,7 +662,11 @@ fn live_region_tracks_recent_acn_contribution() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(compact_text.contains("compact · claims +1 / ~1 / -0 · disputes +1"));
+    assert!(!compact_text.contains("finalize · claims"));
+    assert!(!compact_text.contains("compact · claims"));
+    assert!(!compact_text.contains("inbox 2 · claims"));
+    assert!(compact_text.contains("local claims 7"));
+    assert!(compact_text.contains("last router consult claims 3 · disputes 1"));
 }
 
 #[test]
@@ -1678,7 +1687,7 @@ fn hidden_final_micro_tetris_does_not_force_working_title_on_narrow_width() {
 fn resumed_session_does_not_show_idle_micro_tetris() {
     let mut state = super::TuiState::new();
     state.set_status_notice("Subagent old completed");
-    state.reset_for_resumed_session();
+    state.reset_for_session_switch();
     state.status = SessionRuntimeStatus::Open;
     state.push_historical_turns(&[HistoricalTurn {
         user_text: "旧问题".into(),
@@ -1849,7 +1858,7 @@ fn slash_menu_lists_matching_commands_and_bolds_first_match() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    // 9 条原生命令超过 5 行窗口：只显示前 5 条（字母序），其余靠上下键滚动
+    // 原生命令超过 5 行窗口：只显示前 5 条（字母序），其余靠上下键滚动
     assert!(text.contains("/compact"));
     assert!(text.contains("/copy"));
     assert!(text.contains("/inbox"));
@@ -1888,7 +1897,7 @@ fn slash_menu_puts_skills_first_and_scrolls_window_with_selection() {
     assert!(!text.contains("/inbox"));
 
     // 连续向下移动选中，窗口跟随滚动，末尾的原生命令进入视野
-    for _ in 0..10 {
+    for _ in 0..11 {
         assert!(state.select_next_slash_completion());
     }
     let text = super::composer_lines_with_width(&state, 96)
@@ -2151,6 +2160,7 @@ fn help_lists_slash_commands_alphabetically() {
     let help = text.find("/help").expect("/help should render");
     let inbox = text.find("/inbox").expect("/inbox should render");
     let mcp = text.find("/mcp").expect("/mcp should render");
+    let new = text.find("/new").expect("/new should render");
     let ps = text.find("/ps").expect("/ps should render");
     let resume = text.find("/resume").expect("/resume should render");
     let skills = text.find("/skills").expect("/skills should render");
@@ -2161,7 +2171,8 @@ fn help_lists_slash_commands_alphabetically() {
     assert!(exit < help);
     assert!(help < inbox);
     assert!(inbox < mcp);
-    assert!(mcp < ps);
+    assert!(mcp < new);
+    assert!(new < ps);
     assert!(ps < resume);
     assert!(resume < skills);
     assert!(skills < subagents);
@@ -2231,6 +2242,7 @@ fn slash_commands_are_classified_for_tui_loop() {
     assert_eq!(classify("/help"), super::InputAction::Help);
     assert_eq!(classify("/inbox"), super::InputAction::Inbox);
     assert_eq!(classify("/mcp"), super::InputAction::Mcp);
+    assert_eq!(classify("/new"), super::InputAction::New);
     assert_eq!(classify("/ps"), super::InputAction::Ps);
     assert_eq!(classify("/skills"), super::InputAction::Skills);
     assert_eq!(classify("/subagents"), super::InputAction::Subagents);
@@ -2592,7 +2604,7 @@ fn resume_reset_drops_temporary_command_echo_before_restored_history() {
     state.push_command_echo("/resume".into());
     state.push_system("Loading resumable sessions...");
 
-    state.reset_for_resumed_session();
+    state.reset_for_session_switch();
     state.session_id = Some("session_2222bbbb".into());
     state.push_historical_turns(&[HistoricalTurn {
         user_text: "恢复的用户消息".into(),
@@ -2607,6 +2619,111 @@ fn resume_reset_drops_temporary_command_echo_before_restored_history() {
     assert!(text.contains("恢复的回复"));
     assert!(text.contains("Session session_2222bbbb resumed."));
     assert!(super::composer_hint(&state).starts_with("session_2222bbbb "));
+}
+
+#[test]
+fn resume_inbox_failure_warning_has_blank_line_on_both_sides() {
+    let mut state = super::TuiState::new();
+    state.push_system("history tail");
+    state.finish_resume_inbox_with_warnings(vec![
+        "Warning: Inbox sync failed; run /inbox to retry.".into(),
+    ]);
+    state.push_system("next entry");
+
+    let transcript = state.transcript_text();
+    let lines = transcript.lines().collect::<Vec<_>>();
+    let warning_index = lines
+        .iter()
+        .position(|line| line.contains("Warning: Inbox sync failed; run /inbox to retry."))
+        .expect("Resume inbox warning should render");
+    assert!(lines[warning_index.saturating_sub(1)].trim().is_empty());
+    assert!(lines
+        .get(warning_index.saturating_add(1))
+        .is_some_and(|line| line.trim().is_empty()));
+    assert_eq!(state.status, SessionRuntimeStatus::Open);
+}
+
+#[test]
+fn direct_resume_startup_warning_follows_inbox_and_precedes_queued_input() {
+    let mut state = super::TuiState::new();
+    state.push_system("Inbox completed: processed=0");
+    state.finish_resume_inbox_with_warnings(vec![
+        "Warning: MCP server broken-startup failed: connection closed".into(),
+    ]);
+    state.push_command_echo("QUEUED-DIRECT-731".into());
+
+    let lines = state
+        .transcript_text()
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let inbox_index = lines
+        .iter()
+        .position(|line| line.contains("Inbox completed: processed=0"))
+        .expect("Inbox completion should render");
+    let warning_index = lines
+        .iter()
+        .position(|line| line.contains("Warning: MCP server broken-startup failed"))
+        .expect("deferred startup warning should render");
+    let queued_index = lines
+        .iter()
+        .position(|line| line.contains("QUEUED-DIRECT-731"))
+        .expect("queued input should render");
+
+    assert_eq!(warning_index, inbox_index + 2);
+    assert_eq!(queued_index, warning_index + 2);
+    assert!(lines[inbox_index + 1].trim().is_empty());
+    assert!(lines[warning_index + 1].trim().is_empty());
+    assert_eq!(state.status, SessionRuntimeStatus::Open);
+}
+
+#[test]
+fn session_switch_reset_preserves_early_interaction_generation() {
+    let mut state = super::TuiState::new();
+    state.bump_interaction_generation();
+
+    state.reset_for_session_switch();
+
+    assert_eq!(state.interaction_generation(), 1);
+}
+
+#[test]
+fn session_switch_reset_clears_session_projection_and_keeps_process_context() {
+    let mut state = super::TuiState::new();
+    state.set_workspace_context("/workspace/example".into(), "feature/example".into());
+    state.apply_event(SessionEvent::SessionStarted {
+        session_id: SessionId::from_str("session_1111aaaa").unwrap(),
+        agent_id: AgentId::new("agent-a").unwrap(),
+    });
+    state.apply_event(SessionEvent::ContextUsageUpdated {
+        used_tokens: 136_000,
+    });
+    state.apply_event(SessionEvent::LocalClaimsUpdated { total: 9 });
+    state.apply_event(SessionEvent::InboxCompleted {
+        processed: 1,
+        new_claim_ids: vec!["claim_00000001".parse().unwrap()],
+        updated_claim_ids: vec![],
+        new_dispute_ids: vec![],
+        deprecated_claim_ids: vec![],
+    });
+    state.push_system("old session only");
+    state.queue_pending_turn("queued for target");
+    state.open_process_panel();
+
+    state.reset_for_session_switch();
+
+    assert!(state.transcript_text().is_empty());
+    assert_eq!(state.context_label(), "0k/200k");
+    assert_eq!(state.network_snapshot(), &Default::default());
+    assert!(!state.process_panel_visible());
+    assert_eq!(state.workspace_label(), "/workspace/example");
+    assert_eq!(state.branch_label(), "feature/example");
+    assert_eq!(
+        state
+            .pop_queued_turn()
+            .map(|input| input.command_text().to_string()),
+        Some("queued for target".into())
+    );
 }
 
 #[test]
@@ -2927,12 +3044,51 @@ fn inbox_events_render_status_summary() {
 }
 
 #[test]
+fn syncing_inbox_live_box_starts_with_activity_then_network_snapshot() {
+    let mut state = super::TuiState::new();
+    state.apply_event(SessionEvent::LocalClaimsUpdated { total: 0 });
+    state.apply_event(SessionEvent::StatusChanged {
+        status: SessionRuntimeStatus::SyncingInbox,
+    });
+    state.apply_event(SessionEvent::InboxStarted);
+
+    let lines = lines_plain_text(&super::inline_live_lines_with_width(&state, 80));
+    let top_index = lines
+        .iter()
+        .position(|line| line.contains("Inbox · Syncing updates · 0s"))
+        .expect("Inbox live box title should render");
+    let bottom_index = lines[top_index..]
+        .iter()
+        .position(|line| line.trim_start().starts_with('└'))
+        .map(|offset| top_index + offset)
+        .expect("Inbox live box bottom border should render");
+    let content = lines[top_index.saturating_add(1)..bottom_index]
+        .iter()
+        .map(|line| {
+            line.trim_matches(|ch: char| ch == '┆' || ch.is_whitespace())
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(content, vec!["syncing inbox...", "local claims 0"]);
+}
+
+#[test]
 fn multiline_compact_like_input_is_submitted_as_plain_input() {
     let input = "/compact\n继续说明";
 
     assert_eq!(
         super::classify_input(input, &Default::default()),
         super::InputAction::Send(input.into())
+    );
+}
+
+#[test]
+fn recap_enqueue_is_silent_on_success_and_uses_fixed_warning_on_failure() {
+    assert_eq!(super::app::recap_enqueue_warning(&Ok(())), None);
+    assert_eq!(
+        super::app::recap_enqueue_warning(&Err(anyhow::anyhow!("unavailable"))),
+        Some("Background recap could not be queued and will retry later.")
     );
 }
 
@@ -2978,14 +3134,7 @@ fn compaction_progress_is_visible() {
     assert!(!compacting_text.contains("compacting session"));
     assert!(!state.transcript_text().contains("compaction started"));
 
-    state.apply_event(SessionEvent::CompactionCompleted {
-        compacted_until: 2,
-        recapped_until: 4,
-        new_claim_ids: vec!["claim_00000001".parse().unwrap()],
-        updated_claim_ids: vec![],
-        used_claim_ids: vec![],
-        new_dispute_ids: vec![],
-    });
+    state.apply_event(SessionEvent::CompactionCompleted { compacted_until: 2 });
     assert_eq!(state.status, SessionRuntimeStatus::Compacting);
     assert!(!state.transcript_text().contains("compaction completed"));
 
@@ -4140,6 +4289,111 @@ fn active_assistant_delta_stays_in_inline_live_region_until_completed() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(scrollback_text.contains("hello"));
+}
+
+#[test]
+fn request_size_warning_keeps_single_gap_before_thinking_activity() {
+    let mut state = super::TuiState::new();
+    state.begin_pending_turn("inspect oversized media".into());
+    state.apply_event(SessionEvent::TurnStarted {
+        turn_id: "turn_413_thinking".into(),
+    });
+    state.apply_event(SessionEvent::UserMessageAccepted {
+        text: "inspect oversized media".into(),
+    });
+    state.apply_event(SessionEvent::Warning {
+        message: "上游拒绝了过大的请求；已从上下文中移除图片 / PDF 并重试。".into(),
+    });
+
+    let live_lines = lines_plain_text(&state.active_assistant_lines(96));
+    let warning_index = live_lines
+        .iter()
+        .position(|line| line.contains("Warning: 上游拒绝了过大的请求"))
+        .expect("413 recovery warning");
+    let thinking_index = live_lines
+        .iter()
+        .position(|line| line.contains("thinking..."))
+        .expect("retry activity");
+    assert_eq!(
+        blank_lines_between(&live_lines, warning_index, thinking_index),
+        1,
+        "413 recovery warning 与 thinking activity 之间应恰好保留一行空行:\n{}",
+        live_lines.join("\n")
+    );
+}
+
+#[test]
+fn discarded_assistant_output_does_not_survive_media_recovery_tool_response() {
+    let mut state = super::TuiState::new();
+    state.begin_pending_turn("inspect image".into());
+    state.apply_event(SessionEvent::TurnStarted {
+        turn_id: "turn_413".into(),
+    });
+    state.apply_event(SessionEvent::UserMessageAccepted {
+        text: "inspect image".into(),
+    });
+    state.apply_event(SessionEvent::AssistantTextDelta {
+        text: "ghost partial".into(),
+    });
+    state.apply_event(SessionEvent::AssistantOutputDiscarded);
+    state.apply_event(SessionEvent::Warning {
+        message: "上游拒绝了过大的请求；已从上下文中移除图片 / PDF 并重试。".into(),
+    });
+    state.apply_event(SessionEvent::ToolCallStarted {
+        id: "toolu_after_413".into(),
+        name: "working_note".into(),
+        summary: "记录恢复进度".into(),
+    });
+
+    let live_lines = lines_plain_text(&state.active_assistant_lines(96));
+    let warning_index = live_lines
+        .iter()
+        .position(|line| line.contains("Warning: 上游拒绝了过大的请求"))
+        .expect("413 recovery warning");
+    let tool_index = live_lines
+        .iter()
+        .position(|line| line.contains("Calling working_note"))
+        .expect("tool call after 413 recovery");
+    assert_eq!(
+        blank_lines_between(&live_lines, warning_index, tool_index),
+        1,
+        "413 recovery warning 与后续工具调用之间应恰好保留一行空行:\n{}",
+        live_lines.join("\n")
+    );
+
+    state.apply_event(SessionEvent::ToolCallCompleted {
+        id: "toolu_after_413".into(),
+        summary: "tool working_note ok".into(),
+        file_change: None,
+        outcome: ToolExecutionOutcome::Completed,
+    });
+    state.apply_event(SessionEvent::TurnCommitted { message_count: 3 });
+
+    let committed_lines = lines_plain_text(&super::history_render_lines_with_width(&state, 96));
+    let committed_warning_index = committed_lines
+        .iter()
+        .position(|line| line.contains("Warning: 上游拒绝了过大的请求"))
+        .expect("committed 413 recovery warning");
+    let committed_tool_index = committed_lines
+        .iter()
+        .position(|line| line.contains("Called working_note"))
+        .expect("committed tool call after 413 recovery");
+    assert_eq!(
+        blank_lines_between(
+            &committed_lines,
+            committed_warning_index,
+            committed_tool_index
+        ),
+        1,
+        "提交后的 413 recovery warning 与工具调用之间应恰好保留一行空行:\n{}",
+        committed_lines.join("\n")
+    );
+
+    let transcript = state.transcript_text();
+    assert!(!transcript.contains("ghost partial"));
+    assert!(
+        transcript.contains("Warning: 上游拒绝了过大的请求；已从上下文中移除图片 / PDF 并重试。")
+    );
 }
 
 #[test]

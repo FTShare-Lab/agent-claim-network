@@ -3,11 +3,13 @@ import { AlertCircle, Ban, Copy, KeyRound, Plus, ShieldCheck } from 'lucide-reac
 
 import { StatusBadge } from '../components/badges/StatusBadge'
 import { DataTable } from '../components/data-table/DataTable'
+import { teamAuthErrorMessage } from '../features/team-auth/errors'
 import { useCreateTeamAuthKeyMutation, useRevokeTeamAuthKeyMutation, useTeamAuthKeysQuery, useTeamAuthStatusQuery } from '../features/team-auth/hooks'
 import type { CreateTeamAuthKeyResponse, TeamAuthKey } from '../features/team-auth/types'
 import { PageContainer } from '../layouts/PageContainer'
 import { copyTextToClipboard } from '../lib/clipboard'
 import { formatDateTime } from '../lib/format'
+import { ApiError } from '../lib/apiClient'
 import { isStaticDemo } from '../lib/runtime'
 
 export function TeamAuthPage() {
@@ -18,8 +20,9 @@ export function TeamAuthPage() {
   const [agentId, setAgentId] = useState('')
   const [createdKey, setCreatedKey] = useState<CreateTeamAuthKeyResponse | null>(null)
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
-  const statusError = errorMessage(statusQuery.error)
-  const keysError = errorMessage(keysQuery.error)
+  const statusError = teamAuthErrorMessage(statusQuery.error)
+  const keysError = teamAuthErrorMessage(keysQuery.error)
+  const managementUnavailable = keysQuery.error instanceof ApiError && keysQuery.error.status === 403
   const activeCount = useMemo(
     () => keysQuery.data?.filter((item) => item.status === 'active').length ?? 0,
     [keysQuery.data],
@@ -103,14 +106,18 @@ export function TeamAuthPage() {
                 className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none focus:border-slate-400"
                 placeholder="agent_id"
                 value={agentId}
-                disabled={isStaticDemo}
+                disabled={isStaticDemo || managementUnavailable}
                 onChange={(event) => setAgentId(event.target.value)}
               />
               <button
                 type="button"
                 className="inline-flex items-center gap-1.5 rounded-md bg-blue-700 px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-blue-800 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-500"
-                disabled={isStaticDemo || !agentId.trim() || createMutation.isPending}
-                title={isStaticDemo ? 'Static preview is read-only' : undefined}
+                disabled={isStaticDemo || managementUnavailable || !agentId.trim() || createMutation.isPending}
+                title={isStaticDemo
+                  ? 'Static preview is read-only'
+                  : managementUnavailable
+                    ? 'Enable Maintainer admin auth to manage team auth keys.'
+                    : undefined}
                 onClick={createKey}
               >
                 <Plus className="h-4 w-4" />
@@ -223,7 +230,7 @@ export function TeamAuthPage() {
           ]}
             rows={sortedKeys}
             getRowId={(row) => row.key_id}
-            emptyState={keysError ? 'Unable to load team auth keys.' : keysQuery.isLoading ? 'Loading keys...' : 'No team auth keys have been created.'}
+            emptyState={keysError ? 'Team auth key management is unavailable.' : keysQuery.isLoading ? 'Loading keys...' : 'No team auth keys have been created.'}
           />
         </div>
       </section>
@@ -252,9 +259,4 @@ function AuthStatusPill({ label, enabled }: { label: string; enabled?: boolean }
       </span>
     </span>
   )
-}
-
-function errorMessage(error: unknown) {
-  if (!error) return null
-  return error instanceof Error ? error.message : String(error)
 }

@@ -28,6 +28,7 @@ export type OutboxMessageSnapshot = {
   id: string
   message_type: 'policy_update' | 'claim_attribute_update'
   policy: Policy
+  arbitration_resolution?: unknown
   handled_at?: string
 }
 

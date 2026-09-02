@@ -83,6 +83,7 @@ pub struct SessionTuiState {
     at_path_scan_generation: u64,
     pending_at_path_scans: BTreeSet<u64>,
     pending_clipboard_image_reads: usize,
+    interaction_generation: u64,
     next_input_submission_sequence: u64,
 }
 
@@ -121,7 +122,6 @@ pub(super) struct ContributionSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ContributionKind {
     Inbox,
-    Compact,
     Finalize,
 }
 
@@ -155,6 +155,7 @@ fn is_elapsed_title_status(status: SessionRuntimeStatus) -> bool {
             | SessionRuntimeStatus::Running
             | SessionRuntimeStatus::SyncingInbox
             | SessionRuntimeStatus::Compacting
+            | SessionRuntimeStatus::Resuming
             | SessionRuntimeStatus::Finalizing
     )
 }
@@ -203,6 +204,7 @@ impl Default for SessionTuiState {
             at_path_scan_generation: 0,
             pending_at_path_scans: BTreeSet::new(),
             pending_clipboard_image_reads: 0,
+            interaction_generation: 0,
             next_input_submission_sequence: 0,
         }
     }
@@ -284,6 +286,10 @@ impl SessionTuiState {
                     SessionRuntimeStatus::Compacting => {
                         self.transcript.set_activity(None);
                     }
+                    SessionRuntimeStatus::Resuming => {
+                        self.transcript
+                            .set_activity(Some("waiting for target finalization...".into()));
+                    }
                     SessionRuntimeStatus::Finalizing => {
                         self.transcript
                             .set_activity(Some(self.finalizing_activity_label()));
@@ -319,6 +325,9 @@ impl SessionTuiState {
             SessionEvent::AssistantTextDelta { text } => {
                 self.transcript.set_activity(None);
                 self.transcript.push_assistant_delta(text);
+            }
+            SessionEvent::AssistantOutputDiscarded => {
+                self.transcript.discard_active_assistant();
             }
             SessionEvent::AssistantMessageCompleted { text } => {
                 self.transcript.set_activity(None);
@@ -524,29 +533,16 @@ impl SessionTuiState {
                 }
                 self.status = SessionRuntimeStatus::Compacting;
                 self.transcript.set_activity(None);
+                self.network.clear_last_contribution();
             }
-            SessionEvent::CompactionCompleted {
-                compacted_until: _,
-                recapped_until: _,
-                new_claim_ids,
-                updated_claim_ids,
-                used_claim_ids: _,
-                new_dispute_ids,
-            } => {
+            SessionEvent::CompactionCompleted { compacted_until: _ } => {
                 if self.turn_in_flight {
                     self.status = SessionRuntimeStatus::Running;
                     self.foreground_task_started_at = Some(Instant::now());
                 }
                 self.transcript.set_activity(None);
-                self.network.last_contribution = Some(ContributionSnapshot {
-                    kind: ContributionKind::Compact,
-                    processed: None,
-                    new_claims: new_claim_ids.len(),
-                    updated_claims: updated_claim_ids.len(),
-                    deprecated_claims: 0,
-                    new_disputes: new_dispute_ids.len(),
-                });
             }
+            SessionEvent::RecapRequested { .. } => {}
             SessionEvent::CompactionFailed { error } => {
                 self.status = SessionRuntimeStatus::Error;
                 self.foreground_task_started_at = None;
@@ -610,6 +606,7 @@ impl SessionTuiState {
             SessionRuntimeStatus::Running => "running",
             SessionRuntimeStatus::SyncingInbox => "syncing inbox",
             SessionRuntimeStatus::Compacting => "compacting",
+            SessionRuntimeStatus::Resuming => "resuming",
             SessionRuntimeStatus::Finalizing => "finalizing",
             SessionRuntimeStatus::Error => "error",
             SessionRuntimeStatus::Closed => "closed",
@@ -952,6 +949,7 @@ impl SessionTuiState {
                 SessionRuntimeStatus::Running
                     | SessionRuntimeStatus::SyncingInbox
                     | SessionRuntimeStatus::Compacting
+                    | SessionRuntimeStatus::Resuming
                     | SessionRuntimeStatus::Finalizing
             )
     }
@@ -1054,6 +1052,10 @@ impl SessionTuiState {
 
     pub(super) fn mark_clipboard_image_read_started(&mut self) {
         self.pending_clipboard_image_reads = self.pending_clipboard_image_reads.saturating_add(1);
+    }
+
+    pub(super) fn discard_clipboard_image_read(&mut self) {
+        self.pending_clipboard_image_reads = self.pending_clipboard_image_reads.saturating_sub(1);
     }
 
     /// 把规格化完成的剪贴板图片挂成 `[Image #N]` 附件。
@@ -1263,6 +1265,14 @@ impl SessionTuiState {
         !self.bottom_pane.finalize_failed() && super::bottom_pane::input_accepts_text(self.status)
     }
 
+    pub(super) fn interaction_generation(&self) -> u64 {
+        self.interaction_generation
+    }
+
+    pub(super) fn bump_interaction_generation(&mut self) {
+        self.interaction_generation = self.interaction_generation.wrapping_add(1);
+    }
+
     pub(super) fn finalize_failed(&self) -> bool {
         self.bottom_pane.finalize_failed()
     }
@@ -1299,11 +1309,33 @@ impl SessionTuiState {
         self.transcript.push_system(message);
     }
 
+    pub(super) fn begin_target_resume_wait(&mut self, session_id: &str) {
+        self.apply_event(SessionEvent::StatusChanged {
+            status: SessionRuntimeStatus::Resuming,
+        });
+        self.transcript
+            .set_activity(Some(format!("Target resume {session_id} finalizing...")));
+    }
+
+    pub(super) fn finish_resume_inbox_with_warnings(&mut self, warnings: Vec<String>) {
+        self.status = SessionRuntimeStatus::Open;
+        self.foreground_task_started_at = None;
+        self.transcript.set_activity(None);
+        if warnings.is_empty() {
+            return;
+        }
+        self.transcript.push_system("");
+        for warning in warnings {
+            self.transcript.push_warning(warning);
+        }
+        self.transcript.push_system("");
+    }
+
     pub(super) fn last_committed_assistant_text(&self) -> Option<&str> {
         self.transcript.last_committed_assistant_text()
     }
 
-    pub(super) fn reset_for_resumed_session(&mut self) {
+    pub(super) fn reset_for_session_switch(&mut self) {
         self.transcript.clear();
         self.network = NetworkSnapshot::default();
         self.context_used_tokens = None;
@@ -1712,6 +1744,14 @@ impl SessionTuiState {
     ) -> Vec<QueuedInput> {
         self.input_queue
             .drain_inputs_for_restore_before(restore_before)
+    }
+
+    pub(super) fn discard_queued_inputs_in_submission_range(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> usize {
+        self.input_queue.discard_submission_range(start, end)
     }
 
     pub(super) fn restore_latest_queued_input_to_composer(&mut self) -> bool {
@@ -2607,6 +2647,26 @@ mod tests {
         assert!(state
             .transcript_text()
             .contains("输入内容已变化，请重新添加图片"));
+    }
+
+    #[test]
+    fn discarded_cross_session_clipboard_result_releases_pending_slot_without_notice() {
+        let mut state = SessionTuiState::new();
+        state.set_attachment_config(AttachmentConfig {
+            max_files_per_turn: 1,
+            ..AttachmentConfig::default()
+        });
+        let Some((_limits, _revision)) = state.begin_clipboard_image_read().unwrap() else {
+            panic!("Clipboard image should be enabled by default");
+        };
+        state.mark_clipboard_image_read_started();
+        state.discard_clipboard_image_read();
+
+        let Some((_limits, _revision)) = state.begin_clipboard_image_read().unwrap() else {
+            panic!("Discarded read must release its pending attachment slot");
+        };
+        assert!(state.transcript_text().is_empty());
+        assert_eq!(state.bottom_pane.effective_attachment_count(), 0);
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub(super) enum SlashCommandAction {
     Help,
     Inbox,
     Mcp,
+    New,
     Ps,
     Resume,
     Skills,
@@ -58,6 +59,11 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         command: "/mcp",
         description: "查看 MCP servers 与 tools",
         action: SlashCommandAction::Mcp,
+    },
+    SlashCommandSpec {
+        command: "/new",
+        description: "创建并切换到新 session",
+        action: SlashCommandAction::New,
     },
     SlashCommandSpec {
         command: "/ps",
@@ -298,6 +304,7 @@ mod tests {
                 "/help",
                 "/inbox",
                 "/mcp",
+                "/new",
                 "/ps",
                 "/resume",
                 "/skills",
@@ -325,6 +332,7 @@ mod tests {
                 "/help",
                 "/inbox",
                 "/mcp",
+                "/new",
                 "/ps",
                 "/resume",
                 "/skills",
@@ -347,11 +355,13 @@ mod tests {
     fn skill_colliding_with_native_command_is_skipped() {
         let catalog = SlashCommandCatalog::with_skills([
             ("resume", "撞名 skill"),
+            ("new", "撞名 skill"),
             ("ps", "撞名 skill"),
             ("subagents", "撞名 skill"),
         ]);
         for (command, action) in [
             ("/resume", SlashCommandAction::Resume),
+            ("/new", SlashCommandAction::New),
             ("/ps", SlashCommandAction::Ps),
             ("/subagents", SlashCommandAction::Subagents),
         ] {

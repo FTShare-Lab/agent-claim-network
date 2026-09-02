@@ -319,8 +319,10 @@ impl DelegationExecutor for LlmDelegationExecutor {
                 | SessionTurnEvent::ContextUsageUpdated { .. }
                 | SessionTurnEvent::CompactionStarted { .. }
                 | SessionTurnEvent::CompactionCompleted { .. }
+                | SessionTurnEvent::RecapRequested { .. }
                 | SessionTurnEvent::CompactionSkipped { .. }
                 | SessionTurnEvent::AssistantTextDelta { .. }
+                | SessionTurnEvent::AssistantOutputDiscarded
                 | SessionTurnEvent::AssistantMessageCompleted { .. }
                 | SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
                 | SessionTurnEvent::NonStreamingFallbackAttemptFailed { .. }
@@ -568,8 +570,10 @@ impl SessionTurnEventRecorder for DelegationTranscriptRecorder {
             | SessionTurnEvent::ContextUsageUpdated { .. }
             | SessionTurnEvent::CompactionStarted { .. }
             | SessionTurnEvent::CompactionCompleted { .. }
+            | SessionTurnEvent::RecapRequested { .. }
             | SessionTurnEvent::CompactionSkipped { .. }
             | SessionTurnEvent::AssistantTextDelta { .. }
+            | SessionTurnEvent::AssistantOutputDiscarded
             | SessionTurnEvent::AssistantMessageCompleted { .. }
             | SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
             | SessionTurnEvent::NonStreamingFallbackAttemptFailed { .. }
@@ -856,6 +860,7 @@ fn file_mutation_evidence_from_tool_results(turn: &SessionTurn) -> FileMutationE
                         tools.insert(id.clone(), (name.clone(), input_path));
                     }
                 }
+                SessionTurnContentBlock::InvalidToolUse { .. } => {}
                 SessionTurnContentBlock::ToolResult {
                     tool_use_id,
                     content,
@@ -950,6 +955,7 @@ fn append_text_blocks(message: &SessionTurnMessage, out: &mut String) {
             | SessionTurnContentBlock::ModelContext { .. }
             | SessionTurnContentBlock::SkillInstructions { .. }
             | SessionTurnContentBlock::ToolUse { .. }
+            | SessionTurnContentBlock::InvalidToolUse { .. }
             | SessionTurnContentBlock::ToolResult { .. } => {}
         }
     }

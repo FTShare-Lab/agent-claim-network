@@ -1,6 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { teamAuthErrorMessage } from '../features/team-auth/errors'
 import { copyTextToClipboard } from '../lib/clipboard'
+
+describe('errorMessage', () => {
+  it('formats backend text as a complete sentence', () => {
+    expect(teamAuthErrorMessage(new Error('maintainer admin auth must be enabled'))).toBe(
+      'Maintainer admin auth must be enabled.',
+    )
+    expect(teamAuthErrorMessage(new Error('Already complete.'))).toBe('Already complete.')
+  })
+})
 
 describe('copyTextToClipboard', () => {
   let clipboardDescriptor: PropertyDescriptor | undefined

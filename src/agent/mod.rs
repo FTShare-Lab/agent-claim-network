@@ -30,5 +30,8 @@ pub use session_engine::{
     SessionEvent, SessionFinalizeReport, SessionRuntimeProfile, SessionRuntimeStatus,
     SessionStartReport, SessionTurnControl, SessionTurnControlReceiver,
 };
+pub(crate) use session_engine::{
+    SessionFinalizeOnceOutcome, SessionFinalizePreemptionControl, SessionRecapPreemptionControl,
+};
 pub use traits::{InboxReader, LocalClaimStore, MemoryStore, ReportedDisputeClaimSetStore};
 pub use user_shell::{UserShellCommandOutput, UserShellCommandStatus};

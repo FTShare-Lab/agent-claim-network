@@ -10,6 +10,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::arbitration::ArbitrationResolutionContext;
 use super::id::{InboxId, PolicyId};
 use super::policy::{Policy, PolicyMessageType};
 use crate::time::serde_utc_opt;
@@ -39,7 +40,7 @@ impl InboxMessage {
     pub fn policy(&self) -> &Policy {
         match &self.kind {
             InboxMessageKind::PolicyUpdate { policy }
-            | InboxMessageKind::ClaimAttributeUpdate { policy } => policy,
+            | InboxMessageKind::ClaimAttributeUpdate { policy, .. } => policy,
         }
     }
 
@@ -62,8 +63,18 @@ impl InboxMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "message_type", rename_all = "snake_case")]
 pub enum InboxMessageKind {
-    PolicyUpdate { policy: Policy },
-    ClaimAttributeUpdate { policy: Policy },
+    PolicyUpdate {
+        policy: Policy,
+    },
+    ClaimAttributeUpdate {
+        policy: Policy,
+        #[serde(
+            default,
+            alias = "arbitration_decision",
+            skip_serializing_if = "Option::is_none"
+        )]
+        arbitration_resolution: Option<Box<ArbitrationResolutionContext>>,
+    },
 }
 
 #[cfg(test)]
@@ -107,12 +118,14 @@ mod tests {
             id: InboxId::random(),
             kind: InboxMessageKind::ClaimAttributeUpdate {
                 policy: sample_policy(),
+                arbitration_resolution: None,
             },
             handled_at: None,
         };
         let yaml = serde_yaml_ng::to_string(&msg).unwrap();
         assert!(yaml.contains("message_type: claim_attribute_update"));
         assert!(yaml.contains("policy:"));
+        assert!(!yaml.contains("arbitration_decision"));
         let back: InboxMessage = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(msg, back);
     }

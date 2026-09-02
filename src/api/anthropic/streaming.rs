@@ -60,6 +60,7 @@ impl AnthropicMessagesClient {
             tools,
             max_tokens,
             retry_count,
+            true,
             emit,
             false,
             false,
@@ -80,6 +81,7 @@ impl AnthropicMessagesClient {
         tools: Option<Vec<super::protocol::ApiToolDefinition>>,
         max_tokens: u32,
         retry_count: u32,
+        allow_continuation: bool,
         retry_after_partial: bool,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
         observer: &mut super::AnthropicContinuationRequestObserver<'_>,
@@ -91,6 +93,7 @@ impl AnthropicMessagesClient {
             tools,
             max_tokens,
             retry_count,
+            allow_continuation,
             emit,
             false,
             retry_after_partial,
@@ -111,6 +114,7 @@ impl AnthropicMessagesClient {
         tools: Option<Vec<super::protocol::ApiToolDefinition>>,
         max_tokens: u32,
         retry_count: u32,
+        allow_continuation: bool,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
         error_on_unresolved_max_tokens: bool,
         retry_after_partial: bool,
@@ -122,8 +126,13 @@ impl AnthropicMessagesClient {
         let mut last_blocks = Vec::new();
         let mut last_stop_reason = String::from("end_turn");
         let mut replay_messages = Vec::new();
+        let max_continuation_turns = if allow_continuation {
+            MAX_CONTINUATION_TURNS
+        } else {
+            0
+        };
 
-        for round in 0..=MAX_CONTINUATION_TURNS {
+        for round in 0..=max_continuation_turns {
             if recovery_interrupt.is_some_and(ProviderRecoveryInterrupt::is_cancelled) {
                 if last_stop_reason == "max_tokens"
                     && last_response.is_some()
@@ -243,16 +252,16 @@ impl AnthropicMessagesClient {
                 last_stop_reason = "end_turn".into();
                 break;
             }
-            if round == MAX_CONTINUATION_TURNS && error_on_unresolved_max_tokens {
+            if round == max_continuation_turns && error_on_unresolved_max_tokens {
                 return Err(AnthropicError::OutputShape {
                     reason: format!(
                         "assistant max_tokens continuation 超过上限: {}",
-                        MAX_CONTINUATION_TURNS + 1
+                        max_continuation_turns + 1
                     ),
                     raw: merged_text,
                 });
             }
-            if round == MAX_CONTINUATION_TURNS {
+            if round == max_continuation_turns {
                 break;
             }
             let continuation = json!({"role": "user", "content": CONTINUATION_TRIGGER});
@@ -833,7 +842,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
-    use crate::api::{ProviderRequestObserver, SessionTurnMessage};
+    use crate::api::{ProviderRequestObserver, SessionTurnContentBlock, SessionTurnMessage};
 
     #[derive(Default)]
     struct RecordingRequestObserver {
@@ -1032,6 +1041,84 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn streaming_complete_non_object_tool_input_reaches_recoverable_adapter_path() {
+        let secret = "private-tool-argument";
+        let mut turn = StreamingAssistantTurn::default();
+        for event in [
+            json!({"type":"message_start", "message":{"usage":{"input_tokens":3}}}),
+            json!({
+                "type":"content_block_start", "index":0,
+                "content_block":{
+                    "type":"tool_use", "id":"toolu_bad", "name":"file_read", "input":{}
+                }
+            }),
+            json!({
+                "type":"content_block_delta", "index":0,
+                "delta":{
+                    "type":"input_json_delta",
+                    "partial_json":serde_json::to_string(&json!([secret])).unwrap()
+                }
+            }),
+            json!({"type":"content_block_stop", "index":0}),
+            json!({
+                "type":"message_delta", "delta":{"stop_reason":"tool_use"},
+                "usage":{"output_tokens":9}
+            }),
+            json!({"type":"message_stop"}),
+        ] {
+            turn.apply_event(&event, &mut |_| {}).unwrap();
+        }
+
+        let mut completed = turn.finish().unwrap();
+        completed.replay_messages = vec![json!({
+            "role":"assistant",
+            "content":completed.final_blocks.clone()
+        })];
+        let message = super::super::assistant_turn_message(&completed, "test-model").unwrap();
+
+        assert!(matches!(
+            message.content.as_slice(),
+            [SessionTurnContentBlock::InvalidToolUse { error, .. }]
+                if error.contains("array") && !error.contains(secret)
+        ));
+        let replay = match message.provider_replay.as_ref() {
+            Some(crate::api::ProviderReplayState::AnthropicMessages { messages, .. }) => messages,
+            other => panic!("expected Anthropic replay, got {other:?}"),
+        };
+        assert_eq!(replay[0]["content"][0]["input"], json!({}));
+    }
+
+    #[test]
+    fn streaming_malformed_tool_input_remains_a_stream_failure() {
+        let mut turn = StreamingAssistantTurn::default();
+        for event in [
+            json!({"type":"message_start", "message":{}}),
+            json!({
+                "type":"content_block_start", "index":0,
+                "content_block":{
+                    "type":"tool_use", "id":"toolu_bad", "name":"file_read", "input":{}
+                }
+            }),
+            json!({
+                "type":"content_block_delta", "index":0,
+                "delta":{"type":"input_json_delta", "partial_json":"{\"path\":"}
+            }),
+        ] {
+            turn.apply_event(&event, &mut |_| {}).unwrap();
+        }
+
+        let error = turn
+            .apply_event(
+                &json!({"type":"content_block_stop", "index":0}),
+                &mut |_| {},
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, AnthropicError::StreamFailure { .. }));
+        assert!(error.to_string().contains("input_json_delta 解析失败"));
     }
 
     #[test]
@@ -1421,6 +1508,7 @@ mod tests {
                 None,
                 128,
                 0,
+                true,
                 false,
                 &mut |_| {},
                 &mut request_observer,
@@ -1521,6 +1609,7 @@ mod tests {
                 None,
                 32,
                 0,
+                true,
                 false,
                 &mut |_| {},
                 &mut request_observer,

@@ -177,6 +177,14 @@ samp {
   padding-top: 0;
 }
 
+.acn-detail-drawer {
+  overflow-wrap: anywhere;
+}
+
+.acn-data-table tbody td {
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 767px) {
   .acn-data-table {
     overflow: visible;
@@ -228,6 +236,11 @@ samp {
     padding: 8px 0;
     border-bottom: 1px solid var(--border-subtle);
     text-align: right;
+  }
+
+  .acn-data-table tbody td > * {
+    min-width: 0;
+    max-width: 100%;
   }
 
   .acn-data-table tbody td.hidden {

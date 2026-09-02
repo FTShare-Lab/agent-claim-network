@@ -117,6 +117,8 @@ pub enum TurnJournalEventKind {
     AssistantDelta {
         text: String,
     },
+    /// 丢弃最近一个尚未完成的 assistant 流式片段；该 attempt 未进入 canonical。
+    AssistantOutputDiscarded,
     AssistantCompleted {
         text: String,
     },
@@ -1155,6 +1157,9 @@ impl TurnAccumulator {
             TurnJournalEventKind::AssistantDelta { text } => {
                 self.push_assistant_delta(text);
             }
+            TurnJournalEventKind::AssistantOutputDiscarded => {
+                self.discard_incomplete_assistant();
+            }
             TurnJournalEventKind::AssistantCompleted { text } => {
                 self.push_assistant_completed(text);
             }
@@ -1410,6 +1415,15 @@ impl TurnAccumulator {
                     text,
                     completed: true,
                 })),
+        }
+    }
+
+    fn discard_incomplete_assistant(&mut self) {
+        if matches!(
+            self.timeline_items.last(),
+            Some(TimelineAccumulatorItem::Assistant(segment)) if !segment.completed
+        ) {
+            self.timeline_items.pop();
         }
     }
 

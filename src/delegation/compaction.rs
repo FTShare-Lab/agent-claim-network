@@ -321,11 +321,6 @@ impl DelegationPreflightCompactor {
         self.compacted_since_last_check = true;
         emit(SessionTurnEvent::CompactionCompleted {
             compacted_until: state.compacted_until,
-            recapped_until: 0,
-            new_claim_ids: Vec::new(),
-            updated_claim_ids: Vec::new(),
-            used_claim_ids: Vec::new(),
-            new_dispute_ids: Vec::new(),
         });
         self.provider_context_anchor = None;
         Ok(())

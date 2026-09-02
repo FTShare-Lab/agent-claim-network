@@ -5,9 +5,9 @@ use futures::StreamExt;
 use rand::Rng;
 
 use super::protocol::{reduce_response_value, ReducedResponses, ResponsesRequest};
-use super::redact_responses_error_body;
 use super::streaming::ResponsesSseDecoder;
 use super::websocket::{ResponsesWebSocketTransport, WebSocketSendOutcome};
+use super::{is_explicit_websocket_message_too_big, redact_responses_error_body};
 use crate::api::endpoint::{resolve_llm_endpoint, LlmEndpointKind};
 use crate::api::evaluation_usage::{record_evaluation_request_started, record_evaluation_usage};
 use crate::api::llm_http::{read_llm_error_body, LlmHttpError, LlmHttpPhase};
@@ -464,6 +464,9 @@ async fn response_json(
 }
 
 fn is_retryable(error: &ResponsesError) -> bool {
+    if is_explicit_websocket_message_too_big(error) {
+        return false;
+    }
     match error {
         ResponsesError::Http(error) => error.is_retryable(),
         ResponsesError::Status { status, .. } => *status == 429 || *status >= 500,

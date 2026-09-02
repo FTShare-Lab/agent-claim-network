@@ -15,7 +15,6 @@ function DrawerHarness({ modal }: { modal: boolean }) {
       <DetailDrawer
         open={open}
         modal={modal}
-        size="default"
         label="Claim"
         title="payment_timeout"
         onClose={() => setOpen(false)}
@@ -34,6 +33,7 @@ describe('DetailDrawer', () => {
     trigger.focus()
     fireEvent.click(trigger)
     const dialog = screen.getByRole('dialog')
+    expect(dialog).toHaveClass('max-w-[760px]')
     expect(dialog).not.toHaveAttribute('aria-modal')
     expect(document.getElementById('root')).not.toHaveAttribute('inert')
     expect(document.body.style.overflow).not.toBe('hidden')

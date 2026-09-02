@@ -18,7 +18,9 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use super::context::AgentContext;
-use super::inbox::InboxJsonGenerator;
+use super::inbox::{
+    ClaimAttributeUpdateJsonValidator, InboxJsonGenerator, PreparedClaimAttributeUpdate,
+};
 use super::runner::{AgentRunner, InboxProcessReport};
 use super::runner_trace::trace_name_from_task;
 use super::user_shell::{
@@ -28,12 +30,13 @@ use crate::api::{
     context_recovery_protected_tail_from_marker, ensure_compaction_request_within_context_window,
     estimate_session_turn_messages_tokens, project_compaction_input_media,
     project_turn_message_for_safe_transcript, trailing_model_context_segments, AgentTurnLoop,
-    CompletedSessionTurnMessage, ContextUsageSnapshot, ContextUsageSource, InboxInternalizeKind,
-    InternalizeRequest, MemoryReviewLoop, ModelContextSource, ProviderReplayIdentity,
-    SessionAttachment, SessionCompactionOutcome, SessionTurn, SessionTurnContentBlock,
-    SessionTurnContextAppender, SessionTurnEvent, SessionTurnEventRecorder, SessionTurnHooks,
-    SessionTurnInterrupted, SessionTurnMessage, SessionTurnPreflight, SessionTurnRequest,
-    StructuredJsonAttemptRequest, StructuredJsonCaller, ToolBoundaryControl, TurnMessage,
+    ClaimAttributeUpdateInternalizeRequest, CompletedSessionTurnMessage, ContextUsageSnapshot,
+    ContextUsageSource, InboxInternalizeKind, InternalizeRequest, MemoryReviewLoop,
+    ModelContextSource, ProviderReplayIdentity, SessionAttachment, SessionCompactionOutcome,
+    SessionTurn, SessionTurnContentBlock, SessionTurnContextAppender, SessionTurnEvent,
+    SessionTurnEventRecorder, SessionTurnHooks, SessionTurnInterrupted, SessionTurnMessage,
+    SessionTurnPreflight, SessionTurnRequest, StructuredJsonAttemptRequest, StructuredJsonCaller,
+    ToolBoundaryControl, TurnMessage,
 };
 use crate::claim::{AgentId, Claim, ClaimId, DisputeId, SessionId, SourceId, TraceId};
 use crate::config::{
@@ -48,11 +51,11 @@ use crate::prompt::PromptRegistry;
 use crate::session::{
     canonical_user_content_hash, read_session_turn_journal, replay_turn_journal,
     turn_journal_recovery_context_for_chain, ActiveTurnCompactionCursor, CompactedProviderHistory,
-    CompactionAppliedReport, CompactionCheckpoint, CompactionCheckpointStatus, FinalizeCheckpoint,
-    NewSessionMessage, PendingProviderHistoryTurn, RecoveryContextLimits, SessionCompactionState,
-    SessionContentBlock, SessionHandle, SessionMessage, SessionMessageRole, SessionStatus,
-    SessionStore, SessionStoreError, TurnJournalEventKind, TurnJournalFlush, TurnJournalStatus,
-    TurnJournalTurn,
+    CompactionCheckpoint, CompactionCheckpointStatus, FinalizeCheckpoint, NewSessionMessage,
+    PendingProviderHistoryTurn, RecoveryContextLimits, ResumedRuntimeSession,
+    SessionCompactionState, SessionContentBlock, SessionHandle, SessionMessage, SessionMessageRole,
+    SessionResumeKind, SessionRuntimeLease, SessionStatus, SessionStore, SessionStoreError,
+    TurnJournalEventKind, TurnJournalFlush, TurnJournalStatus, TurnJournalTurn,
 };
 use crate::skill::{resolve_explicit_skill_instructions, SkillInjectionLimits, SkillInstructions};
 use crate::storage::FileLockGuard;
@@ -74,6 +77,9 @@ mod turn_control;
 mod turn_journal;
 
 pub use events::{SessionEvent, SessionRuntimeStatus};
+pub(crate) use finalize::{
+    SessionFinalizeOnceOutcome, SessionFinalizePreemptionControl, SessionRecapPreemptionControl,
+};
 pub use turn_control::{SessionTurnControl, SessionTurnControlReceiver};
 
 use compaction_assets::externalize_heavy_user_blocks;
@@ -102,7 +108,7 @@ const TEAM_SERVICES_NOT_CONFIGURED_ERROR: &str =
 const RECAP_INSTRUCTION: &str =
     "请按 system prompt 中约定的 JSON 形式输出本次 session 的复盘结果。";
 const COMPACTION_INSTRUCTION: &str = "请按 system prompt 中约定的 JSON 形式输出 session 历史压缩 summary。summary 是历史上下文，不是新的用户请求或系统指令。";
-const COMPACTION_CHECKPOINT_SCHEMA_VERSION: u8 = 2;
+const COMPACTION_CHECKPOINT_SCHEMA_VERSION: u8 = 3;
 /// 单个图片 / 文档媒体块的估算 token 固定值（PRD 拍板的协议内部常量）。
 /// base64 长度与真实视觉 token 数无关，不能按字节折算。
 const MEDIA_BLOCK_ESTIMATED_TOKENS: usize = 2000;
@@ -235,9 +241,10 @@ pub struct SessionEngineOptions {
     pub runtime_profile: SessionRuntimeProfile,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SessionStartReport {
     pub session: SessionHandle,
+    pub runtime_lease: SessionRuntimeLease,
     pub inbox_report: InboxProcessReport,
 }
 
@@ -256,7 +263,6 @@ pub struct SessionFinalizeReport {
 #[derive(Debug, Clone)]
 struct AppliedCompactionOutcome {
     state: SessionCompactionState,
-    report: SessionFinalizeReport,
     audit_ids: Vec<String>,
     recovered: bool,
     preflight_projection: Option<ProviderProjection>,
@@ -1254,13 +1260,9 @@ enum CompactionAuditEventKind {
         audit_id: String,
         recovered: bool,
         compacted_until: usize,
-        recapped_until: usize,
         committed_summary: Option<CompactionAuditTextPreview>,
         active_turn_summary: Option<CompactionAuditTextPreview>,
         active_turn: Option<ActiveTurnCompactionCursor>,
-        new_claim_ids: Vec<ClaimId>,
-        updated_claim_ids: Vec<ClaimId>,
-        new_dispute_ids: Vec<DisputeId>,
     },
     Failed {
         audit_id: String,
@@ -1307,6 +1309,54 @@ impl InboxJsonGenerator for SessionInboxJsonGenerator<'_> {
                 vec![SessionTurnMessage::user_text(user_text)],
                 crate::api::BufferedProviderRuntime::new(self.fallback_scope.clone()),
                 preferred_transport,
+            )
+            .await
+    }
+
+    async fn generate_claim_attribute_update_json(
+        &self,
+        request: ClaimAttributeUpdateInternalizeRequest,
+    ) -> anyhow::Result<serde_json::Value> {
+        let system_prompt = self
+            .prompt_registry
+            .render(PROMPT_INBOX_CLAIM_ATTRIBUTE_UPDATE_INTERNALIZE, ())
+            .context("渲染 inbox_claim_attribute_update_internalize prompt 失败")?;
+        let user_text = serde_json::to_string_pretty(&request)?;
+        self.json_caller
+            .generate_json(
+                system_prompt,
+                vec![SessionTurnMessage::user_text(user_text)],
+            )
+            .await
+    }
+
+    async fn generate_validated_claim_attribute_update_json(
+        &self,
+        request: ClaimAttributeUpdateInternalizeRequest,
+        validator: &mut ClaimAttributeUpdateJsonValidator<'_>,
+    ) -> anyhow::Result<PreparedClaimAttributeUpdate> {
+        let agent_id = request.agent_id.clone();
+        let system_prompt = self
+            .prompt_registry
+            .render(PROMPT_INBOX_CLAIM_ATTRIBUTE_UPDATE_INTERNALIZE, ())
+            .context("渲染 inbox_claim_attribute_update_internalize prompt 失败")?;
+        let user_text = serde_json::to_string_pretty(&request)?;
+        self.json_caller
+            .generate_json_validated_with_guarded_attempts(
+                StructuredJsonAttemptRequest::claim_attribute_update(
+                    system_prompt,
+                    vec![SessionTurnMessage::user_text(user_text)],
+                ),
+                validator,
+                |retry, total, error| {
+                    log::warn!(
+                        target: "agent",
+                        "agent {} ClaimAttributeUpdate 输出校验失败，重试 ({retry}/{total}): {error:#}",
+                        agent_id
+                    );
+                },
+                |_| std::future::ready(()),
+                |_, _| Ok(()),
             )
             .await
     }
@@ -1484,6 +1534,24 @@ impl SessionEngine {
 
     pub fn mcp_manager(&self) -> Option<Arc<McpConnectionManager>> {
         self.mcp_manager.clone()
+    }
+
+    pub(crate) async fn bind_delegation_runtime_lease(
+        &self,
+        session_id: &SessionId,
+        runtime_lease: SessionRuntimeLease,
+    ) -> anyhow::Result<()> {
+        self.turn_loop
+            .tool_registry()
+            .bind_delegation_runtime_lease_for_session(session_id, runtime_lease)
+            .await
+            .context("绑定 subagent session runtime lease 失败")
+    }
+
+    pub(crate) fn release_delegation_runtime_lease(&self, session_id: &SessionId) {
+        self.turn_loop
+            .tool_registry()
+            .release_delegation_runtime_lease_for_session(session_id);
     }
 
     pub(crate) async fn process_snapshots_for_session(
@@ -2287,7 +2355,6 @@ impl SessionEngine {
         session: &SessionHandle,
         audit_ids: &[String],
         outcome: &AppliedCompactionOutcome,
-        recapped_until: usize,
         recovered: bool,
     ) {
         for audit_id in audit_ids {
@@ -2297,7 +2364,6 @@ impl SessionEngine {
                     audit_id: audit_id.clone(),
                     recovered,
                     compacted_until: outcome.state.committed_message_until(),
-                    recapped_until,
                     committed_summary: non_empty_preview(
                         outcome.state.committed_summary(),
                         COMPACTION_AUDIT_SUMMARY_PREVIEW_CHARS,
@@ -2308,9 +2374,6 @@ impl SessionEngine {
                         },
                     ),
                     active_turn: outcome.state.frontier.active_turn.clone(),
-                    new_claim_ids: outcome.report.new_claim_ids.clone(),
-                    updated_claim_ids: outcome.report.updated_claim_ids.clone(),
-                    new_dispute_ids: outcome.report.new_dispute_ids.clone(),
                 },
             )
             .await;
@@ -2368,29 +2431,94 @@ impl SessionEngine {
             .await?)
     }
 
+    pub async fn resume_target_status(
+        &self,
+        session_id: &SessionId,
+    ) -> anyhow::Result<SessionStatus> {
+        Ok(self
+            .session_store
+            .read_existing_session_status(&self.agent.agent_id, session_id)
+            .await?)
+    }
+
     pub async fn reopen_existing_session(
         &self,
         session_id: &SessionId,
-    ) -> anyhow::Result<SessionHandle> {
+    ) -> anyhow::Result<ResumedRuntimeSession> {
         // read state 是单次运行期安全状态；resume 后必须重新建立所需读取许可。
         self.turn_loop.clear_file_read_state(session_id).await;
-        let session = self
+        let resumed = self
             .session_store
-            .with_session_cleanup_lock(&self.agent.agent_id, || async {
-                let mut session = self
-                    .session_store
-                    .open_existing_session(&self.agent.agent_id, session_id)
-                    .await?;
-                self.abandon_session_delegations_best_effort(
-                    &session,
-                    "session restored after runtime exit",
-                )
-                .await;
-                session.mark_open(Utc::now()).await?;
-                Ok::<SessionHandle, anyhow::Error>(session)
-            })
+            .resume_runtime_session(&self.agent.agent_id, session_id)
             .await?;
+        if resumed.kind != SessionResumeKind::Finalizing {
+            self.abandon_session_delegations_best_effort(
+                &resumed.session,
+                "session restored after runtime exit",
+            )
+            .await;
+        }
+        let event = match resumed.kind {
+            SessionResumeKind::Closed => "Session resumed",
+            SessionResumeKind::Interrupted => "Interrupted session resumed",
+            SessionResumeKind::Finalizing => "Finalizing session reserved for resume",
+        };
+        self.append_session_event_log(&resumed.session, "INFO", event)
+            .await;
+        Ok(resumed)
+    }
+
+    /// TUI Resume 先取得 runtime lease，但让 Closed session 保持 Closed，
+    /// 直到 Supervisor 已把上一轮未成功 Finalize job 对账完成。
+    pub async fn reserve_existing_session(
+        &self,
+        session_id: &SessionId,
+    ) -> anyhow::Result<ResumedRuntimeSession> {
+        self.turn_loop.clear_file_read_state(session_id).await;
+        let resumed = self
+            .session_store
+            .reserve_runtime_session(&self.agent.agent_id, session_id)
+            .await?;
+        if resumed.kind == SessionResumeKind::Interrupted {
+            self.abandon_session_delegations_best_effort(
+                &resumed.session,
+                "session restored after runtime exit",
+            )
+            .await;
+            self.append_session_event_log(&resumed.session, "INFO", "Interrupted session resumed")
+                .await;
+        }
+        Ok(resumed)
+    }
+
+    /// Supervisor 已完成 Closed 对账后，提交 reopen 并恢复普通 Resume 清理语义。
+    pub async fn complete_closed_resume(
+        &self,
+        mut session: SessionHandle,
+    ) -> anyhow::Result<SessionHandle> {
+        session.mark_open(Utc::now()).await?;
+        self.abandon_session_delegations_best_effort(
+            &session,
+            "session restored after runtime exit",
+        )
+        .await;
         self.append_session_event_log(&session, "INFO", "Session resumed")
+            .await;
+        Ok(session)
+    }
+
+    /// Finalizing takeover 成功并提交 Open 后，才完成既有 Resume hydration 与 delegation 清理。
+    pub async fn complete_finalizing_resume(
+        &self,
+        session_id: &SessionId,
+    ) -> anyhow::Result<SessionHandle> {
+        let session = self.load_existing_session(session_id).await?;
+        self.abandon_session_delegations_best_effort(
+            &session,
+            "session restored after finalizing takeover",
+        )
+        .await;
+        self.append_session_event_log(&session, "INFO", "Finalizing session resumed")
             .await;
         Ok(session)
     }
@@ -2486,9 +2614,9 @@ impl SessionEngine {
         emit(SessionEvent::StartupProgress {
             label: "creating session...".into(),
         });
-        let mut session = self
+        let runtime_session = self
             .session_store
-            .create_with_metadata_id_factory(
+            .create_runtime_with_metadata_id_factory(
                 &self.runner.agent_id,
                 &system_prompt,
                 self.session_source.clone(),
@@ -2497,6 +2625,7 @@ impl SessionEngine {
                 max_attempts,
             )
             .await?;
+        let mut session = runtime_session.session;
         session.replace_runtime_fallback_root(inbox_fallback_scope);
         emit(SessionEvent::SessionStarted {
             session_id: session.metadata.id.clone(),
@@ -2511,6 +2640,7 @@ impl SessionEngine {
         });
         Ok(SessionStartReport {
             session,
+            runtime_lease: runtime_session.runtime_lease,
             inbox_report,
         })
     }
@@ -2711,24 +2841,19 @@ impl SessionEngine {
                         recap_end_index,
                     });
                 }
-                SessionTurnEvent::CompactionCompleted {
-                    compacted_until,
-                    recapped_until,
-                    new_claim_ids,
-                    updated_claim_ids,
-                    used_claim_ids,
-                    new_dispute_ids,
-                } => {
-                    emit(SessionEvent::CompactionCompleted {
-                        compacted_until,
-                        recapped_until,
-                        new_claim_ids,
-                        updated_claim_ids,
-                        used_claim_ids,
-                        new_dispute_ids,
-                    });
+                SessionTurnEvent::CompactionCompleted { compacted_until } => {
+                    emit(SessionEvent::CompactionCompleted { compacted_until });
                     emit(SessionEvent::StatusChanged {
                         status: SessionRuntimeStatus::Running,
+                    });
+                }
+                SessionTurnEvent::RecapRequested {
+                    session_id,
+                    recap_end_index,
+                } => {
+                    emit(SessionEvent::RecapRequested {
+                        session_id,
+                        recap_end_index,
                     });
                 }
                 SessionTurnEvent::CompactionSkipped { warning } => {
@@ -2743,6 +2868,9 @@ impl SessionEngine {
                 SessionTurnEvent::AssistantTextDelta { text } => {
                     journal_emitter.assistant_delta(text.clone());
                     emit(SessionEvent::AssistantTextDelta { text });
+                }
+                SessionTurnEvent::AssistantOutputDiscarded => {
+                    emit(SessionEvent::AssistantOutputDiscarded);
                 }
                 SessionTurnEvent::AssistantMessageCompleted { text } => {
                     journal_emitter.flush_assistant_delta();
@@ -3737,12 +3865,10 @@ impl SessionEngine {
                 "session {} recovered compaction checkpoint before preflight planning",
                 session.metadata.id
             );
-            let recapped_until = session.read_metadata().await?.recapped_until;
             self.append_compaction_audit_completed(
                 session,
                 &outcome.audit_ids,
                 &outcome,
-                recapped_until,
                 outcome.recovered,
             )
             .await;
@@ -3834,30 +3960,15 @@ impl SessionEngine {
                 return Err(e);
             }
         };
-        let recapped_until = match session.read_metadata().await {
-            Ok(metadata) => metadata.recapped_until,
-            Err(e) => {
-                emit(SessionTurnEvent::CompactionFailed {
-                    error: e.to_string(),
-                });
-                return Err(e.into());
-            }
-        };
         self.append_compaction_audit_completed(
             session,
             &outcome.audit_ids,
             &outcome,
-            recapped_until,
             outcome.recovered,
         )
         .await;
         emit(SessionTurnEvent::CompactionCompleted {
             compacted_until: outcome.state.committed_message_until(),
-            recapped_until,
-            new_claim_ids: outcome.report.new_claim_ids.clone(),
-            updated_claim_ids: outcome.report.updated_claim_ids.clone(),
-            used_claim_ids: outcome.report.used_claim_ids.clone(),
-            new_dispute_ids: outcome.report.new_dispute_ids.clone(),
         });
         self.clear_active_context_usage_anchor(&session.metadata.id);
         let state = outcome.state;
@@ -4292,43 +4403,18 @@ impl SessionEngine {
                 .map(|active| active.transcript_with_tool_results_omitted.as_slice()),
             summary_max_chars: self.compaction.summary_max_chars,
         };
-        let (generated_compaction, prepared_recap) = if plan.committed_transcript.is_some()
+        let prepared_summary = self.prepare_compaction_summary_request(&summary_inputs)?;
+        if plan.committed_transcript.is_some()
             && plan.ranges.recap_start_index < plan.ranges.recap_end_index
         {
-            let recap_segment = session_messages
-                .get(plan.ranges.recap_start_index..plan.ranges.recap_end_index)
-                .with_context(|| {
-                    format!(
-                        "session compact recap 范围越界: [{}, {})",
-                        plan.ranges.recap_start_index, plan.ranges.recap_end_index
-                    )
-                })?;
-            let prepared_summary = self.prepare_compaction_summary_request(&summary_inputs)?;
-            let (summary_result, recap_result) = tokio::join!(
-                self.generate_prepared_compaction_summary(
-                    session,
-                    &summary_inputs,
-                    prepared_summary,
-                    emit,
-                ),
-                self.prepare_finalize_segment(recap_segment, session.runtime_fallback_scope()),
-            );
-            let generated_compaction = summary_result?;
-            let prepared_recap = match recap_result {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    let audit_ids = vec![generated_compaction.audit_id.clone()];
-                    return self.fail_compaction_audit(session, &audit_ids, error).await;
-                }
-            };
-            (generated_compaction, Some(prepared_recap))
-        } else {
-            (
-                self.generate_compaction_summary(session, &summary_inputs, emit)
-                    .await?,
-                None,
-            )
-        };
+            emit(SessionEvent::RecapRequested {
+                session_id: session.metadata.id.clone(),
+                recap_end_index: plan.ranges.recap_end_index,
+            });
+        }
+        let generated_compaction = self
+            .generate_prepared_compaction_summary(session, &summary_inputs, prepared_summary, emit)
+            .await?;
         let mut audit_ids = vec![generated_compaction.audit_id.clone()];
         macro_rules! audit_try {
             ($expr:expr) => {
@@ -4457,7 +4543,6 @@ impl SessionEngine {
             audit_try!(session.update_compaction(candidate_state.clone()).await);
             return Ok(AppliedCompactionOutcome {
                 state: candidate_state,
-                report: SessionFinalizeReport::default(),
                 audit_ids,
                 recovered: false,
                 preflight_projection: Some(preflight_projection),
@@ -4475,50 +4560,16 @@ impl SessionEngine {
                     plan.ranges.summary_start_index, plan.ranges.summary_end_index
                 )
             }));
-        let recap_segment = audit_try!(session_messages
-            .get(plan.ranges.recap_start_index..plan.ranges.recap_end_index)
-            .with_context(|| {
-                format!(
-                    "session compact recap 范围越界: [{}, {})",
-                    plan.ranges.recap_start_index, plan.ranges.recap_end_index
-                )
-            }));
         let summary_segment_hash = audit_try!(hash_session_segment(summary_segment));
-        let recap_segment_hash = audit_try!(hash_session_segment(recap_segment));
-        let (used_claim_ids, prepared_claims, prepared_disputes) = match prepared_recap {
-            Some(prepared) => prepared,
-            None => audit_try!(
-                self.prepare_finalize_segment(recap_segment, session.runtime_fallback_scope())
-                    .await
-            ),
-        };
-        let trace_text = session_trace_text(recap_segment);
-        let trace_created_at = Utc::now();
-        let trace_id = checkpoint_trace_id(
-            &trace_text,
-            &used_claim_ids,
-            &prepared_claims,
-            trace_created_at,
-        );
         let checkpoint = CompactionCheckpoint {
             schema_version: Some(COMPACTION_CHECKPOINT_SCHEMA_VERSION),
             audit_ids: audit_ids.clone(),
             summary_start_index: plan.ranges.summary_start_index,
             summary_end_index: plan.ranges.summary_end_index,
             summary_segment_hash,
-            recap_start_index: plan.ranges.recap_start_index,
-            recap_end_index: plan.ranges.recap_end_index,
-            recap_segment_hash,
             summary: committed_summary,
             active_turn_summary,
             active_turn: active_turn_cursor,
-            prepared_claims,
-            prepared_disputes,
-            used_claim_ids,
-            trace_text,
-            trace_created_at,
-            trace_id,
-            applied_report: None,
             status: CompactionCheckpointStatus::Prepared,
         };
         audit_try!(session.write_compaction_checkpoint(&checkpoint).await);
@@ -4526,7 +4577,6 @@ impl SessionEngine {
             self.apply_prepared_compaction_checkpoint(
                 session,
                 checkpoint,
-                session_messages,
                 Some(active_context),
                 Some(active_suffix),
                 false,
@@ -4647,6 +4697,38 @@ impl SessionEngine {
                     ranges.summary_start_index,
                     ranges.summary_end_index
                 );
+                if ranges.recap_start_index < ranges.recap_end_index {
+                    emit(SessionEvent::StatusChanged {
+                        status: SessionRuntimeStatus::Compacting,
+                    });
+                    emit(SessionEvent::CompactionStarted {
+                        compact_start_index: ranges.summary_start_index,
+                        compact_end_index: ranges.summary_end_index,
+                        recap_start_index: ranges.recap_start_index,
+                        recap_end_index: ranges.recap_end_index,
+                    });
+                    emit(SessionEvent::RecapRequested {
+                        session_id: metadata.id.clone(),
+                        recap_end_index: ranges.recap_end_index,
+                    });
+                    let state = metadata.compaction.clone().unwrap_or_else(|| {
+                        SessionCompactionState::from_committed_summary(0, String::new(), Utc::now())
+                    });
+                    emit(SessionEvent::CompactionCompleted {
+                        compacted_until: state.committed_message_until(),
+                    });
+                    emit(SessionEvent::StatusChanged {
+                        status: SessionRuntimeStatus::Open,
+                    });
+                    return Ok(ManualCompactionOutcome::Compacted(Box::new(
+                        AppliedCompactionOutcome {
+                            state,
+                            audit_ids: Vec::new(),
+                            recovered: false,
+                            preflight_projection: None,
+                        },
+                    )));
+                }
                 return Ok(ManualCompactionOutcome::Noop(compaction_noop_reason(
                     &metadata, &ranges,
                 )));
@@ -4678,15 +4760,10 @@ impl SessionEngine {
             .await;
         match result {
             Ok(outcome) => {
-                let recapped_until = session.read_metadata().await?.recapped_until;
-                emit_warnings(&outcome.report.warnings, emit);
-                self.append_session_warnings_log(session, &outcome.report.warnings)
-                    .await;
                 self.append_compaction_audit_completed(
                     session,
                     &outcome.audit_ids,
                     &outcome,
-                    recapped_until,
                     outcome.recovered,
                 )
                 .await;
@@ -4696,22 +4773,13 @@ impl SessionEngine {
                     .await;
                 emit(SessionEvent::CompactionCompleted {
                     compacted_until: outcome.state.committed_message_until(),
-                    recapped_until,
-                    new_claim_ids: outcome.report.new_claim_ids.clone(),
-                    updated_claim_ids: outcome.report.updated_claim_ids.clone(),
-                    used_claim_ids: outcome.report.used_claim_ids.clone(),
-                    new_dispute_ids: outcome.report.new_dispute_ids.clone(),
                 });
                 self.append_session_event_log(
                     session,
                     "INFO",
                     format!(
-                        "Compaction completed: compacted_until={} recapped_until={} new_claims={} updated_claims={} new_disputes={}",
-                        outcome.state.committed_message_until(),
-                        recapped_until,
-                        outcome.report.new_claim_ids.len(),
-                        outcome.report.updated_claim_ids.len(),
-                        outcome.report.new_dispute_ids.len()
+                        "Compaction completed: compacted_until={}",
+                        outcome.state.committed_message_until()
                     ),
                 )
                 .await;
@@ -4731,7 +4799,6 @@ impl SessionEngine {
                         );
                     }
                 }
-                self.emit_local_claims_updated(emit).await;
                 Ok(ManualCompactionOutcome::Compacted(Box::new(outcome)))
             }
             Err(e) => Err(e),
@@ -4757,16 +4824,7 @@ impl SessionEngine {
                     ranges.summary_start_index, ranges.summary_end_index
                 )
             })?;
-        let recap_segment = session_messages
-            .get(ranges.recap_start_index..ranges.recap_end_index)
-            .with_context(|| {
-                format!(
-                    "session compact recap 范围越界: [{}, {})",
-                    ranges.recap_start_index, ranges.recap_end_index
-                )
-            })?;
         let summary_segment_hash = hash_session_segment(summary_segment)?;
-        let recap_segment_hash = hash_session_segment(recap_segment)?;
         let mut generated_audit_ids = Vec::<String>::new();
         macro_rules! audit_try {
             ($expr:expr) => {
@@ -4789,39 +4847,43 @@ impl SessionEngine {
             Some(checkpoint)
                 if checkpoint.summary_start_index == ranges.summary_start_index
                     && checkpoint.summary_end_index == ranges.summary_end_index
-                    && checkpoint.recap_start_index == ranges.recap_start_index
-                    && checkpoint.recap_end_index == ranges.recap_end_index
                     && checkpoint.schema_version == Some(COMPACTION_CHECKPOINT_SCHEMA_VERSION)
                     && checkpoint.status == CompactionCheckpointStatus::Prepared =>
             {
                 recovered_checkpoint = true;
-                if let Err(error) = validate_compaction_checkpoint_segments(
-                    &checkpoint,
-                    &summary_segment_hash,
-                    &recap_segment_hash,
-                ) {
+                if let Err(error) =
+                    validate_compaction_checkpoint_segment(&checkpoint, &summary_segment_hash)
+                {
                     return self
                         .fail_compaction_audit(session, &checkpoint.audit_ids, error)
                         .await;
+                }
+                if ranges.recap_start_index < ranges.recap_end_index {
+                    emit(SessionEvent::RecapRequested {
+                        session_id: session.metadata.id.clone(),
+                        recap_end_index: ranges.recap_end_index,
+                    });
                 }
                 checkpoint
             }
             Some(checkpoint)
                 if checkpoint.summary_start_index == ranges.summary_start_index
                     && checkpoint.summary_end_index == ranges.summary_end_index
-                    && checkpoint.recap_start_index == ranges.recap_start_index
-                    && checkpoint.recap_end_index == ranges.recap_end_index
                     && checkpoint.schema_version == Some(COMPACTION_CHECKPOINT_SCHEMA_VERSION)
                     && checkpoint.status == CompactionCheckpointStatus::Applied =>
             {
-                if let Err(error) = validate_compaction_checkpoint_segments(
-                    &checkpoint,
-                    &summary_segment_hash,
-                    &recap_segment_hash,
-                ) {
+                if let Err(error) =
+                    validate_compaction_checkpoint_segment(&checkpoint, &summary_segment_hash)
+                {
                     return self
                         .fail_compaction_audit(session, &checkpoint.audit_ids, error)
                         .await;
+                }
+                if ranges.recap_start_index < ranges.recap_end_index {
+                    emit(SessionEvent::RecapRequested {
+                        session_id: session.metadata.id.clone(),
+                        recap_end_index: ranges.recap_end_index,
+                    });
                 }
                 let state = match self
                     .commit_applied_compaction_checkpoint(session, &checkpoint, None, None)
@@ -4834,10 +4896,8 @@ impl SessionEngine {
                             .await;
                     }
                 };
-                let report = report_from_compaction_checkpoint(&checkpoint, Vec::new());
                 return Ok(AppliedCompactionOutcome {
                     state,
-                    report,
                     audit_ids: checkpoint.audit_ids.clone(),
                     recovered: true,
                     preflight_projection: None,
@@ -4848,181 +4908,71 @@ impl SessionEngine {
                     (!c.committed_summary().trim().is_empty())
                         .then(|| c.committed_summary().to_string())
                 });
-                let has_summary_work = ranges.summary_start_index < ranges.summary_end_index;
-                let has_recap_work = ranges.recap_start_index < ranges.recap_end_index;
-                let (used_claim_ids, prepared_claims, prepared_disputes, summary, audit_ids) =
-                    match (has_recap_work, has_summary_work) {
-                        (true, true) => {
-                            let summary_transcript =
-                                session_compaction_transcript_projection_with_memory_mode(
-                                    summary_segment,
-                                    self.compaction.tool_result_raw_max_chars,
-                                    self.turn_loop.tool_registry().memory_enabled(),
-                                );
-                            let summary_inputs = CompactionSummaryInputs {
-                                audit: CompactionAuditSummaryContext {
-                                    trigger: CompactionAuditTrigger::ManualCheckpoint,
-                                    scope: CompactionAuditScope::Committed,
-                                    turn_id: None,
-                                    base_message_count: None,
-                                    ranges,
-                                },
-                                committed_start_index: Some(ranges.summary_start_index),
-                                committed_end_index: Some(ranges.summary_end_index),
-                                prior_committed_summary: prior_summary.as_deref(),
-                                committed_transcript: Some(&summary_transcript.full),
-                                committed_transcript_with_large_tool_results_omitted: Some(
-                                    &summary_transcript.large_tool_results_omitted,
-                                ),
-                                committed_transcript_with_tool_results_omitted: Some(
-                                    &summary_transcript.tool_results_omitted,
-                                ),
-                                prior_active_turn_summary: None,
-                                active_turn_user_anchor: None,
-                                active_turn_start_segment: None,
-                                active_turn_end_segment: None,
-                                active_turn_transcript: None,
-                                active_turn_transcript_with_large_tool_results_omitted: None,
-                                active_turn_transcript_with_tool_results_omitted: None,
-                                summary_max_chars: self.compaction.summary_max_chars,
-                            };
-                            let prepared_summary =
-                                self.prepare_compaction_summary_request(&summary_inputs)?;
-                            let (summary_result, recap_result) = tokio::join!(
-                                self.generate_prepared_compaction_summary(
-                                    session,
-                                    &summary_inputs,
-                                    prepared_summary,
-                                    emit,
-                                ),
-                                self.prepare_finalize_segment(
-                                    recap_segment,
-                                    session.runtime_fallback_scope(),
-                                ),
-                            );
-                            let generated_compaction = summary_result?;
-                            generated_audit_ids.push(generated_compaction.audit_id.clone());
-                            let compaction = generated_compaction.outcome;
-                            let (used_claim_ids, prepared_claims, prepared_disputes) =
-                                audit_try!(recap_result);
-                            let summary = audit_try!(validate_compaction_summary_text(
-                                audit_try!(compaction.committed_summary.with_context(|| {
-                                    "compaction summary missing committed_summary"
-                                })),
-                                "committed_summary",
-                                self.compaction.summary_max_chars,
-                            ));
-                            (
-                                used_claim_ids,
-                                prepared_claims,
-                                prepared_disputes,
-                                summary,
-                                vec![generated_compaction.audit_id],
-                            )
-                        }
-                        (true, false) => {
-                            let (used_claim_ids, prepared_claims, prepared_disputes) = self
-                                .prepare_finalize_segment(
-                                    recap_segment,
-                                    session.runtime_fallback_scope(),
-                                )
-                                .await?;
-                            let summary = metadata
-                                .compaction
-                                .as_ref()
-                                .map(|c| c.committed_summary().to_string())
-                                .unwrap_or_default();
-                            (
-                                used_claim_ids,
-                                prepared_claims,
-                                prepared_disputes,
-                                summary,
-                                Vec::new(),
-                            )
-                        }
-                        (false, true) => {
-                            let summary_transcript =
-                                session_compaction_transcript_projection_with_memory_mode(
-                                    summary_segment,
-                                    self.compaction.tool_result_raw_max_chars,
-                                    self.turn_loop.tool_registry().memory_enabled(),
-                                );
-                            let summary_inputs = CompactionSummaryInputs {
-                                audit: CompactionAuditSummaryContext {
-                                    trigger: CompactionAuditTrigger::ManualCheckpoint,
-                                    scope: CompactionAuditScope::Committed,
-                                    turn_id: None,
-                                    base_message_count: None,
-                                    ranges,
-                                },
-                                committed_start_index: Some(ranges.summary_start_index),
-                                committed_end_index: Some(ranges.summary_end_index),
-                                prior_committed_summary: prior_summary.as_deref(),
-                                committed_transcript: Some(&summary_transcript.full),
-                                committed_transcript_with_large_tool_results_omitted: Some(
-                                    &summary_transcript.large_tool_results_omitted,
-                                ),
-                                committed_transcript_with_tool_results_omitted: Some(
-                                    &summary_transcript.tool_results_omitted,
-                                ),
-                                prior_active_turn_summary: None,
-                                active_turn_user_anchor: None,
-                                active_turn_start_segment: None,
-                                active_turn_end_segment: None,
-                                active_turn_transcript: None,
-                                active_turn_transcript_with_large_tool_results_omitted: None,
-                                active_turn_transcript_with_tool_results_omitted: None,
-                                summary_max_chars: self.compaction.summary_max_chars,
-                            };
-                            let generated_compaction = self
-                                .generate_compaction_summary(session, &summary_inputs, emit)
-                                .await?;
-                            generated_audit_ids.push(generated_compaction.audit_id.clone());
-                            let compaction = generated_compaction.outcome;
-                            let summary = audit_try!(validate_compaction_summary_text(
-                                audit_try!(compaction.committed_summary.with_context(|| {
-                                    "compaction summary missing committed_summary"
-                                })),
-                                "committed_summary",
-                                self.compaction.summary_max_chars,
-                            ));
-                            (
-                                Vec::new(),
-                                Vec::new(),
-                                Vec::new(),
-                                summary,
-                                vec![generated_compaction.audit_id],
-                            )
-                        }
-                        (false, false) => unreachable!("compact noop should be handled by caller"),
-                    };
-                let trace_text = session_trace_text(recap_segment);
-                let trace_created_at = Utc::now();
-                let trace_id = checkpoint_trace_id(
-                    &trace_text,
-                    &used_claim_ids,
-                    &prepared_claims,
-                    trace_created_at,
+                let summary_transcript = session_compaction_transcript_projection_with_memory_mode(
+                    summary_segment,
+                    self.compaction.tool_result_raw_max_chars,
+                    self.turn_loop.tool_registry().memory_enabled(),
                 );
+                let summary_inputs = CompactionSummaryInputs {
+                    audit: CompactionAuditSummaryContext {
+                        trigger: CompactionAuditTrigger::ManualCheckpoint,
+                        scope: CompactionAuditScope::Committed,
+                        turn_id: None,
+                        base_message_count: None,
+                        ranges,
+                    },
+                    committed_start_index: Some(ranges.summary_start_index),
+                    committed_end_index: Some(ranges.summary_end_index),
+                    prior_committed_summary: prior_summary.as_deref(),
+                    committed_transcript: Some(&summary_transcript.full),
+                    committed_transcript_with_large_tool_results_omitted: Some(
+                        &summary_transcript.large_tool_results_omitted,
+                    ),
+                    committed_transcript_with_tool_results_omitted: Some(
+                        &summary_transcript.tool_results_omitted,
+                    ),
+                    prior_active_turn_summary: None,
+                    active_turn_user_anchor: None,
+                    active_turn_start_segment: None,
+                    active_turn_end_segment: None,
+                    active_turn_transcript: None,
+                    active_turn_transcript_with_large_tool_results_omitted: None,
+                    active_turn_transcript_with_tool_results_omitted: None,
+                    summary_max_chars: self.compaction.summary_max_chars,
+                };
+                let prepared_summary = self.prepare_compaction_summary_request(&summary_inputs)?;
+                if ranges.recap_start_index < ranges.recap_end_index {
+                    emit(SessionEvent::RecapRequested {
+                        session_id: session.metadata.id.clone(),
+                        recap_end_index: ranges.recap_end_index,
+                    });
+                }
+                let generated_compaction = self
+                    .generate_prepared_compaction_summary(
+                        session,
+                        &summary_inputs,
+                        prepared_summary,
+                        emit,
+                    )
+                    .await?;
+                generated_audit_ids.push(generated_compaction.audit_id.clone());
+                let summary = audit_try!(validate_compaction_summary_text(
+                    audit_try!(generated_compaction
+                        .outcome
+                        .committed_summary
+                        .with_context(|| { "compaction summary missing committed_summary" })),
+                    "committed_summary",
+                    self.compaction.summary_max_chars,
+                ));
                 let checkpoint = CompactionCheckpoint {
                     schema_version: Some(COMPACTION_CHECKPOINT_SCHEMA_VERSION),
-                    audit_ids: audit_ids.clone(),
+                    audit_ids: vec![generated_compaction.audit_id],
                     summary_start_index: ranges.summary_start_index,
                     summary_end_index: ranges.summary_end_index,
                     summary_segment_hash: summary_segment_hash.clone(),
-                    recap_start_index: ranges.recap_start_index,
-                    recap_end_index: ranges.recap_end_index,
-                    recap_segment_hash: recap_segment_hash.clone(),
                     summary,
                     active_turn_summary: None,
                     active_turn: None,
-                    prepared_claims,
-                    prepared_disputes,
-                    used_claim_ids,
-                    trace_text,
-                    trace_created_at,
-                    trace_id,
-                    applied_report: None,
                     status: CompactionCheckpointStatus::Prepared,
                 };
                 audit_try!(session.write_compaction_checkpoint(&checkpoint).await);
@@ -5034,7 +4984,6 @@ impl SessionEngine {
             .apply_prepared_compaction_checkpoint(
                 session,
                 checkpoint,
-                &session_messages,
                 None,
                 None,
                 recovered_checkpoint,
@@ -5055,34 +5004,12 @@ impl SessionEngine {
         &self,
         session: &mut SessionHandle,
         checkpoint: CompactionCheckpoint,
-        session_messages: &[SessionMessage],
         active_context: Option<ActiveProjectionContext<'_>>,
         active_suffix: Option<&[SessionTurnMessage]>,
         recovered: bool,
     ) -> anyhow::Result<AppliedCompactionOutcome> {
-        let recap_segment = session_messages
-            .get(checkpoint.recap_start_index..checkpoint.recap_end_index)
-            .with_context(|| {
-                format!(
-                    "session compact recap checkpoint 范围越界: [{}, {})",
-                    checkpoint.recap_start_index, checkpoint.recap_end_index
-                )
-            })?;
-        let report = self
-            .apply_prepared_finalize_batch(
-                finalize::FinalizeTraceInput::Messages(recap_segment),
-                checkpoint.used_claim_ids.clone(),
-                checkpoint.prepared_claims.clone(),
-                checkpoint.prepared_disputes.clone(),
-                checkpoint.trace_created_at,
-                checkpoint.trace_id.clone(),
-            )
-            .await?;
-        self.append_session_warnings_log(session, &report.warnings)
-            .await;
         let applied_checkpoint = CompactionCheckpoint {
             status: CompactionCheckpointStatus::Applied,
-            applied_report: Some(compaction_applied_report_from_finalize_report(&report)),
             ..checkpoint
         };
         session
@@ -5098,7 +5025,6 @@ impl SessionEngine {
             .await?;
         Ok(AppliedCompactionOutcome {
             state,
-            report,
             audit_ids: applied_checkpoint.audit_ids.clone(),
             recovered,
             preflight_projection: None,
@@ -5152,9 +5078,7 @@ impl SessionEngine {
             state.active_turn_summary = checkpoint.active_turn_summary.clone();
             state.frontier.active_turn = checkpoint.active_turn.clone();
         }
-        session
-            .update_compaction_and_recapped_until(state.clone(), checkpoint.recap_end_index)
-            .await?;
+        session.update_compaction(state.clone()).await?;
         Ok(state)
     }
 
@@ -5202,28 +5126,16 @@ impl SessionEngine {
                     checkpoint.summary_start_index, checkpoint.summary_end_index
                 )
             }));
-        let recap_segment = checkpoint_audit_try!(session_messages
-            .get(checkpoint.recap_start_index..checkpoint.recap_end_index)
-            .with_context(|| {
-                format!(
-                    "session compact checkpoint recap 范围越界: [{}, {})",
-                    checkpoint.recap_start_index, checkpoint.recap_end_index
-                )
-            }));
         let summary_hash = checkpoint_audit_try!(hash_session_segment(summary_segment));
-        let recap_hash = checkpoint_audit_try!(hash_session_segment(recap_segment));
-        checkpoint_audit_try!(validate_compaction_checkpoint_segments(
+        checkpoint_audit_try!(validate_compaction_checkpoint_segment(
             &checkpoint,
-            &summary_hash,
-            &recap_hash
+            &summary_hash
         ));
-        let advanced_recapped_until = checkpoint.recap_end_index > metadata.recapped_until;
-        let mut outcome = match checkpoint.status {
+        let outcome = match checkpoint.status {
             CompactionCheckpointStatus::Prepared => checkpoint_audit_try!(
                 self.apply_prepared_compaction_checkpoint(
                     session,
                     checkpoint,
-                    &session_messages,
                     active_context,
                     active_suffix,
                     true,
@@ -5231,7 +5143,6 @@ impl SessionEngine {
                 .await
             ),
             CompactionCheckpointStatus::Applied => {
-                let report = report_from_compaction_checkpoint(&checkpoint, Vec::new());
                 let state = checkpoint_audit_try!(
                     self.commit_applied_compaction_checkpoint(
                         session,
@@ -5243,14 +5154,12 @@ impl SessionEngine {
                 );
                 AppliedCompactionOutcome {
                     state,
-                    report,
                     audit_ids: checkpoint.audit_ids.clone(),
                     recovered: true,
                     preflight_projection: None,
                 }
             }
         };
-        outcome.report.advanced_recapped_until |= advanced_recapped_until;
         Ok(Some(outcome))
     }
 
@@ -5867,6 +5776,7 @@ fn first_text_session_content(blocks: &[SessionContentBlock]) -> Option<&str> {
         SessionContentBlock::Image { .. }
         | SessionContentBlock::Document { .. }
         | SessionContentBlock::ToolUse { .. }
+        | SessionContentBlock::InvalidToolUse { .. }
         | SessionContentBlock::ToolResult { .. } => None,
     })
 }
@@ -5907,9 +5817,7 @@ fn recoverable_checkpoint_ranges(
         .as_ref()
         .map(SessionCompactionState::committed_message_until)
         .unwrap_or(0);
-    if checkpoint.summary_start_index != summary_start_index
-        || checkpoint.recap_start_index != metadata.recapped_until
-    {
+    if checkpoint.summary_start_index != summary_start_index {
         return Ok(None);
     }
     if checkpoint.summary_end_index < checkpoint.summary_start_index {
@@ -5919,13 +5827,6 @@ fn recoverable_checkpoint_ranges(
             checkpoint.summary_end_index
         );
     }
-    if checkpoint.recap_end_index < checkpoint.recap_start_index {
-        anyhow::bail!(
-            "session compact checkpoint recap 范围非法: [{}, {})",
-            checkpoint.recap_start_index,
-            checkpoint.recap_end_index
-        );
-    }
     if checkpoint.summary_end_index > metadata.message_count {
         anyhow::bail!(
             "session compact checkpoint summary_end_index={} 大于 message_count={}",
@@ -5933,23 +5834,14 @@ fn recoverable_checkpoint_ranges(
             metadata.message_count
         );
     }
-    if checkpoint.recap_end_index > metadata.message_count {
-        anyhow::bail!(
-            "session compact checkpoint recap_end_index={} 大于 message_count={}",
-            checkpoint.recap_end_index,
-            metadata.message_count
-        );
-    }
-    if checkpoint.summary_start_index == checkpoint.summary_end_index
-        && checkpoint.recap_start_index == checkpoint.recap_end_index
-    {
+    if checkpoint.summary_start_index == checkpoint.summary_end_index {
         return Ok(None);
     }
     Ok(Some(CompactionRanges {
         summary_start_index: checkpoint.summary_start_index,
         summary_end_index: checkpoint.summary_end_index,
-        recap_start_index: checkpoint.recap_start_index,
-        recap_end_index: checkpoint.recap_end_index,
+        recap_start_index: metadata.recapped_until,
+        recap_end_index: metadata.message_count,
     }))
 }
 
@@ -6025,23 +5917,15 @@ fn format_count(value: usize) -> String {
     formatted
 }
 
-fn validate_compaction_checkpoint_segments(
+fn validate_compaction_checkpoint_segment(
     checkpoint: &CompactionCheckpoint,
     summary_segment_hash: &str,
-    recap_segment_hash: &str,
 ) -> anyhow::Result<()> {
     if checkpoint.summary_segment_hash != summary_segment_hash {
         anyhow::bail!(
             "session compact checkpoint summary_segment_hash 不匹配: checkpoint={} actual={}",
             checkpoint.summary_segment_hash,
             summary_segment_hash
-        );
-    }
-    if checkpoint.recap_segment_hash != recap_segment_hash {
-        anyhow::bail!(
-            "session compact checkpoint recap_segment_hash 不匹配: checkpoint={} actual={}",
-            checkpoint.recap_segment_hash,
-            recap_segment_hash
         );
     }
     Ok(())
@@ -6065,56 +5949,6 @@ fn report_from_finalize_checkpoint(
     checkpoint: &FinalizeCheckpoint,
     warnings: Vec<String>,
 ) -> SessionFinalizeReport {
-    let (new_claim_ids, updated_claim_ids) =
-        partition_prepared_claim_ids(&checkpoint.prepared_claims);
-    SessionFinalizeReport {
-        trace_id: checkpoint.trace_id.clone(),
-        new_claim_ids,
-        updated_claim_ids,
-        used_claim_ids: checkpoint.used_claim_ids.clone(),
-        new_dispute_ids: checkpoint
-            .prepared_disputes
-            .iter()
-            .map(|dispute| dispute.id.clone())
-            .collect(),
-        advanced_recapped_until: false,
-        finalized_unrecapped_messages: false,
-        warnings,
-    }
-}
-
-fn compaction_applied_report_from_finalize_report(
-    report: &SessionFinalizeReport,
-) -> CompactionAppliedReport {
-    CompactionAppliedReport {
-        trace_id: report.trace_id.clone(),
-        new_claim_ids: report.new_claim_ids.clone(),
-        updated_claim_ids: report.updated_claim_ids.clone(),
-        used_claim_ids: report.used_claim_ids.clone(),
-        new_dispute_ids: report.new_dispute_ids.clone(),
-        warnings: report.warnings.clone(),
-    }
-}
-
-fn report_from_compaction_checkpoint(
-    checkpoint: &CompactionCheckpoint,
-    mut warnings: Vec<String>,
-) -> SessionFinalizeReport {
-    if let Some(applied_report) = checkpoint.applied_report.as_ref() {
-        let mut stored_warnings = applied_report.warnings.clone();
-        stored_warnings.append(&mut warnings);
-        return SessionFinalizeReport {
-            trace_id: applied_report.trace_id.clone(),
-            new_claim_ids: applied_report.new_claim_ids.clone(),
-            updated_claim_ids: applied_report.updated_claim_ids.clone(),
-            used_claim_ids: applied_report.used_claim_ids.clone(),
-            new_dispute_ids: applied_report.new_dispute_ids.clone(),
-            advanced_recapped_until: false,
-            finalized_unrecapped_messages: false,
-            warnings: stored_warnings,
-        };
-    }
-
     let (new_claim_ids, updated_claim_ids) =
         partition_prepared_claim_ids(&checkpoint.prepared_claims);
     SessionFinalizeReport {

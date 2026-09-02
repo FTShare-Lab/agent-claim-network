@@ -343,6 +343,7 @@ mod tests {
         assert!(is_retryable_http_status(StatusCode::TOO_MANY_REQUESTS));
         assert!(is_retryable_http_status(StatusCode::INTERNAL_SERVER_ERROR));
         assert!(!is_retryable_http_status(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_http_status(StatusCode::CONFLICT));
         assert!(!is_retryable_http_status(StatusCode::NOT_FOUND));
     }
 

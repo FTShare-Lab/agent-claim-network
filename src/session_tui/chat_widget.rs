@@ -50,6 +50,7 @@ pub(super) struct ChatWidget {
     state: SessionTuiState,
     app_event_tx: AppEventSender,
     live_response_preview_max_lines: usize,
+    startup_scrollback_visible: bool,
 }
 
 impl ChatWidget {
@@ -60,6 +61,7 @@ impl ChatWidget {
             live_response_preview_max_lines: resolve_live_response_preview_max_lines(
                 DEFAULT_LIVE_RESPONSE_PREVIEW_MAX_LINES,
             ),
+            startup_scrollback_visible: true,
         }
     }
 
@@ -78,6 +80,10 @@ impl ChatWidget {
     pub(super) fn set_tui_config(&mut self, config: AgentSessionTuiConfig) {
         self.live_response_preview_max_lines =
             resolve_live_response_preview_max_lines(config.live_response_preview_max_lines);
+    }
+
+    pub(super) fn set_startup_scrollback_visible(&mut self, visible: bool) {
+        self.startup_scrollback_visible = visible;
     }
 
     pub(super) fn refresh_at_path_completion(&mut self) {
@@ -201,6 +207,7 @@ impl ChatWidget {
             match self.state.begin_clipboard_image_read() {
                 Ok(Some((limits, input_revision))) => {
                     self.state.mark_clipboard_image_read_started();
+                    let interaction_generation = self.state.interaction_generation();
                     let tx = self.app_event_tx.clone();
                     tokio::spawn(async move {
                         let result = tokio::task::spawn_blocking(move || {
@@ -208,7 +215,7 @@ impl ChatWidget {
                         })
                         .await
                         .unwrap_or_else(|e| Err(format!("剪贴板读取任务失败: {e}")));
-                        tx.clipboard_image_read(input_revision, result);
+                        tx.clipboard_image_read(interaction_generation, input_revision, result);
                     });
                 }
                 Ok(None) => {
@@ -233,7 +240,9 @@ impl ChatWidget {
             // Ctrl+O：预览附件（光标命中的一个，否则全部）。
             // 临时落盘与 `open` 拉起由 App 层处理。
             match self.state.preview_target_at_cursor() {
-                PreviewHit::Targets(targets) => self.app_event_tx.preview_attachment(targets),
+                PreviewHit::Targets(targets) => self
+                    .app_event_tx
+                    .preview_attachment(self.state.interaction_generation(), targets),
                 PreviewHit::NoAttachments => {
                     self.state
                         .push_system("输入框里没有可预览的附件（@path 或 [Image #N]）");
@@ -379,8 +388,11 @@ impl ChatWidget {
             }
             KeyCode::Esc => {
                 // queued input 的取回优先于当前 session task 的中断能力。compact、inbox
-                // 等非 turn task 同样允许排队输入，不能因为它们不可中断就跳过取回。
-                if self.state.restore_latest_queued_input_to_composer() {
+                // 等非 turn task 同样允许排队输入；Finalizing/Closed 的输入锁则必须连
+                // Esc 取回一起禁用，避免把目标 session 队列移回旧页面甚至覆盖丢失。
+                if self.state.input_accepts_text()
+                    && self.state.restore_latest_queued_input_to_composer()
+                {
                     self.app_event_tx.request_render();
                 } else {
                     self.app_event_tx.interrupt();
@@ -496,7 +508,8 @@ impl ChatWidget {
     pub(super) fn render_inline(&self, width: u16, height: u16) -> InlineRender {
         let render_width = terminal_render_width(width);
         let scrollback = self.state.scrollback_lines(render_width);
-        let flush_start_separator = self.state.start_separator_pending();
+        let flush_start_separator =
+            self.startup_scrollback_visible && self.state.start_separator_pending();
         let live = self.live_lines(render_width, height, width);
         let mut scrollback_lines: Vec<Line<'static>> = Vec::new();
         if flush_start_separator {
@@ -506,10 +519,12 @@ impl ChatWidget {
                     .map(apply_surface_style),
             );
         }
-        if scrollback.starts_at_history_beginning && !scrollback.lines.is_empty() {
-            scrollback_lines.push(apply_surface_style(Line::default()));
+        if self.startup_scrollback_visible {
+            if scrollback.starts_at_history_beginning && !scrollback.lines.is_empty() {
+                scrollback_lines.push(apply_surface_style(Line::default()));
+            }
+            scrollback_lines.extend(scrollback.lines.into_iter().map(apply_surface_style));
         }
-        scrollback_lines.extend(scrollback.lines.into_iter().map(apply_surface_style));
         let live_lines: Vec<_> = live.lines.into_iter().map(apply_surface_style).collect();
         let cursor =
             (self.state.input_accepts_text() && live.cursor_base_row.is_some()).then(|| {
@@ -632,6 +647,15 @@ impl ChatWidget {
             0
         };
         let mut activity_lines = self.state.active_timeline_lines(box_content_width);
+        if self.state.status == SessionRuntimeStatus::SyncingInbox
+            && activity_lines
+                .first()
+                .is_some_and(|line| line.to_string().trim().is_empty())
+        {
+            // `Inbox started` 已经留在 scrollback；它与 activity 之间的历史间隔
+            // 不能落进 live box，框内第一行应直接显示当前同步活动。
+            activity_lines.remove(0);
+        }
         activity_lines.extend(network_status_lines);
         let show_live_box = has_animation_sidecar
             || !activity_lines.is_empty()
@@ -829,6 +853,7 @@ fn ctrl_c_requests_exit(status: SessionRuntimeStatus) -> bool {
             | SessionRuntimeStatus::Running
             | SessionRuntimeStatus::SyncingInbox
             | SessionRuntimeStatus::Compacting
+            | SessionRuntimeStatus::Resuming
             | SessionRuntimeStatus::Error
             | SessionRuntimeStatus::Finalizing
     )
@@ -1091,6 +1116,10 @@ fn live_box_title(state: &SessionTuiState) -> String {
             "Compacting · Session history · {}s",
             state.foreground_task_elapsed_secs()
         ),
+        SessionRuntimeStatus::Resuming => format!(
+            "Resuming · Waiting for target finalization · {}s",
+            state.foreground_task_elapsed_secs()
+        ),
         SessionRuntimeStatus::Finalizing => format!(
             "Finalizing · Committing contribution · {}s",
             state.foreground_task_elapsed_secs()
@@ -1134,6 +1163,7 @@ fn idle_box_content(state: &SessionTuiState) -> Option<IdleBoxContent> {
         | SessionRuntimeStatus::Running
         | SessionRuntimeStatus::SyncingInbox
         | SessionRuntimeStatus::Compacting
+        | SessionRuntimeStatus::Resuming
         | SessionRuntimeStatus::Finalizing
         | SessionRuntimeStatus::Closed => None,
     }
@@ -1198,12 +1228,8 @@ fn network_status_lines(state: &SessionTuiState, width: u16) -> Vec<Line<'static
                     Span::raw(contribution.new_disputes.to_string()),
                 ])
             }
-            ContributionKind::Compact | ContributionKind::Finalize => {
-                let label = match contribution.kind {
-                    ContributionKind::Compact => "compact",
-                    ContributionKind::Finalize => "finalize",
-                    ContributionKind::Inbox => unreachable!("Inbox contribution handled above"),
-                };
+            ContributionKind::Finalize => {
+                let label = "finalize";
                 Line::from(vec![
                     Span::styled(
                         format!("{label} · claims +"),
@@ -1381,6 +1407,7 @@ fn status_style(status: SessionRuntimeStatus) -> Style {
         SessionRuntimeStatus::Running => Style::default().fg(Color::Yellow),
         SessionRuntimeStatus::SyncingInbox => Style::default().fg(Color::Cyan),
         SessionRuntimeStatus::Compacting => Style::default().fg(Color::Yellow),
+        SessionRuntimeStatus::Resuming => Style::default().fg(Color::Cyan),
         SessionRuntimeStatus::Finalizing => Style::default().fg(Color::Magenta),
         SessionRuntimeStatus::Error => Style::default().fg(Color::Red),
         SessionRuntimeStatus::Closed => Style::default().fg(Color::DarkGray),
@@ -1395,6 +1422,7 @@ pub(super) fn inline_cursor_for_width(state: &SessionTuiState, width: u16) -> Op
         live_response_preview_max_lines: resolve_live_response_preview_max_lines(
             DEFAULT_LIVE_RESPONSE_PREVIEW_MAX_LINES,
         ),
+        startup_scrollback_visible: true,
     }
     .render_inline(width, u16::MAX)
     .cursor
@@ -1424,6 +1452,7 @@ pub(super) fn inline_live_lines_with_width(
         live_response_preview_max_lines: resolve_live_response_preview_max_lines(
             DEFAULT_LIVE_RESPONSE_PREVIEW_MAX_LINES,
         ),
+        startup_scrollback_visible: true,
     }
     .render_inline(width, u16::MAX)
     .live_lines
@@ -1440,6 +1469,7 @@ pub(super) fn inline_scrollback_lines_with_width(
         live_response_preview_max_lines: resolve_live_response_preview_max_lines(
             DEFAULT_LIVE_RESPONSE_PREVIEW_MAX_LINES,
         ),
+        startup_scrollback_visible: true,
     }
     .render_inline(width, u16::MAX)
     .scrollback_lines
@@ -1472,6 +1502,7 @@ pub(super) fn inline_live_lines_with_size_and_preview_max(
         live_response_preview_max_lines: resolve_live_response_preview_max_lines(
             live_response_preview_max_lines,
         ),
+        startup_scrollback_visible: true,
     }
     .render_inline(width, height)
     .live_lines
@@ -1645,6 +1676,65 @@ mod tests {
         chat.handle_key_event(ctrl_c());
         assert_eq!(rx.try_recv().unwrap(), AppEvent::ExitRequested);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn resuming_wait_shows_fixed_title_and_queued_input_hint() {
+        let (sender, _rx) = AppEventSender::channel();
+        let mut chat = ChatWidget::new(sender);
+        chat.state_mut()
+            .begin_target_resume_wait("session_d0121648");
+
+        assert!(live_box_title(chat.state())
+            .starts_with("Resuming · Waiting for target finalization · "));
+        let live = chat
+            .render_inline(120, 36)
+            .live_lines
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(live.contains("Target resume session_d0121648 finalizing..."));
+        assert_eq!(
+            composer_hint(chat.state()),
+            "waiting for target finalization... inputs will be queued"
+        );
+        chat.state_mut().queue_pending_turn("queued for target");
+        assert_eq!(
+            composer_hint(chat.state()),
+            "waiting for target finalization... inputs queued=1"
+        );
+    }
+
+    #[test]
+    fn direct_resume_defers_all_scrollback_until_target_is_available() {
+        let (sender, _rx) = AppEventSender::channel();
+        let mut chat = ChatWidget::new(sender);
+        chat.state_mut().push_system("Warning: MCP startup failed");
+        chat.set_startup_scrollback_visible(false);
+
+        let hidden = chat.render_inline(120, 36);
+        assert!(!hidden.start_separator_flushed);
+        assert!(!hidden
+            .scrollback_lines
+            .iter()
+            .any(|line| line.to_string().contains("Agent Claim Network")));
+        assert!(!hidden
+            .scrollback_lines
+            .iter()
+            .any(|line| line.to_string().contains("MCP startup failed")));
+
+        chat.set_startup_scrollback_visible(true);
+        let visible = chat.render_inline(120, 36);
+        assert!(visible.start_separator_flushed);
+        assert!(visible
+            .scrollback_lines
+            .iter()
+            .any(|line| line.to_string().contains("Agent Claim Network")));
+        assert!(visible
+            .scrollback_lines
+            .iter()
+            .any(|line| line.to_string().contains("MCP startup failed")));
     }
 
     #[test]
@@ -2082,6 +2172,24 @@ mod tests {
 
         chat.handle_key_event(esc());
 
+        assert_eq!(rx.try_recv().unwrap(), AppEvent::InterruptRequested);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn esc_during_finalizing_keeps_target_queue_untouched() {
+        let (sender, mut rx) = AppEventSender::channel();
+        let mut chat = ChatWidget::new(sender);
+        chat.state_mut().status = SessionRuntimeStatus::Finalizing;
+        chat.state_mut().queue_pending_turn("first target input");
+        chat.state_mut().queue_pending_turn("second target input");
+
+        chat.handle_key_event(esc());
+        chat.handle_key_event(esc());
+
+        assert_eq!(chat.state().input(), "");
+        assert_eq!(chat.state().queued_count(), 2);
+        assert_eq!(rx.try_recv().unwrap(), AppEvent::InterruptRequested);
         assert_eq!(rx.try_recv().unwrap(), AppEvent::InterruptRequested);
         assert!(rx.try_recv().is_err());
     }
@@ -2684,15 +2792,19 @@ mod tests {
     fn ctrl_o_requests_preview_for_at_path_under_cursor() {
         let (sender, mut rx) = AppEventSender::channel();
         let mut chat = ChatWidget::new(sender);
+        chat.state_mut().bump_interaction_generation();
         chat.state_mut().push_input_text("看下 @docs/a.md");
 
         chat.handle_key_event(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
 
         assert_eq!(
             rx.try_recv().unwrap(),
-            AppEvent::PreviewAttachment(vec![super::super::attachment::PreviewTarget::AtPath {
-                raw_path: "docs/a.md".into()
-            }])
+            AppEvent::PreviewAttachment {
+                interaction_generation: 1,
+                targets: vec![super::super::attachment::PreviewTarget::AtPath {
+                    raw_path: "docs/a.md".into()
+                }]
+            }
         );
     }
 

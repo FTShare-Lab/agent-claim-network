@@ -290,8 +290,12 @@ describe('workbench page table ordering', () => {
       status: 'deprecated',
       updated_at: '2026-07-29T11:00:00Z',
     }
-    const latestActivePolicy = policies[policies.length - 1]
-    const allPolicies = [...policies, newestDeprecatedPolicy]
+    const newestResolutionPolicy = {
+      ...policyRecord(241, '2026-07-30T10:00:00Z'),
+      message_type: 'claim_attribute_update' as const,
+      name: 'newest-resolution-result',
+    }
+    const allPolicies = [...policies, newestDeprecatedPolicy, newestResolutionPolicy]
     const actions = policies.map((policy, index) => ({
       created_at: policy.created_at,
       maintainer_action_id: hexId('intent', index + 1),
@@ -428,9 +432,9 @@ describe('workbench page table ordering', () => {
 
     const policyRows = rowsUnderHeading('Policy History')
     expect(policyRows).toHaveLength(10)
-    expect(within(policyRows[0]).getByText(latestActivePolicy.name)).toBeInTheDocument()
+    expect(within(policyRows[0]).getByText(newestDeprecatedPolicy.name)).toBeInTheDocument()
     expect(
-      policyRows.some((row) => within(row).queryByText(newestDeprecatedPolicy.name)),
+      policyRows.some((row) => within(row).queryByText(newestResolutionPolicy.name)),
     ).toBe(false)
 
     const actionRows = rowsUnderHeading('Maintainer Actions')

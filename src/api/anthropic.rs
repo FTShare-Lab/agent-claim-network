@@ -28,8 +28,9 @@ use super::llm_http::{read_llm_error_body, LlmHttpError, LlmHttpPhase};
 use super::provider::{
     NoopProviderRequestObserver, ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy,
     ProviderNoConsumableOutput, ProviderReplayIdentity, ProviderReplayProtocol, ProviderRequest,
-    ProviderRequestObserver, ProviderRequestPreparationFailure, ProviderResponse, ProviderStop,
-    ProviderStreamFailure, ProviderTerminalFailure, ProviderTransport, ToolSpec,
+    ProviderRequestObserver, ProviderRequestPreparationFailure, ProviderRequestTooLarge,
+    ProviderResponse, ProviderStop, ProviderStreamFailure, ProviderTerminalFailure,
+    ProviderTransport, ToolSpec,
 };
 use super::redact_media_error_body;
 use super::types::{SessionTurnContentBlock, SessionTurnEvent, SessionTurnMessage};
@@ -339,6 +340,7 @@ impl AnthropicMessagesClient {
             tools,
             max_tokens,
             retry_count,
+            true,
             false,
             None,
             None,
@@ -357,6 +359,7 @@ impl AnthropicMessagesClient {
         tools: Option<Vec<ApiToolDefinition>>,
         max_tokens: u32,
         retry_count: u32,
+        allow_continuation: bool,
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         observer: &mut AnthropicContinuationRequestObserver<'_>,
     ) -> Result<ContinuedAssistantTurn, AnthropicError> {
@@ -366,6 +369,7 @@ impl AnthropicMessagesClient {
             tools,
             max_tokens,
             retry_count,
+            allow_continuation,
             false,
             Some(observer),
             recovery_interrupt,
@@ -384,6 +388,7 @@ impl AnthropicMessagesClient {
         tools: Option<Vec<ApiToolDefinition>>,
         max_tokens: u32,
         retry_count: u32,
+        allow_continuation: bool,
         error_on_unresolved_max_tokens: bool,
         mut request_observer: Option<&mut AnthropicContinuationRequestObserver<'_>>,
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
@@ -393,8 +398,13 @@ impl AnthropicMessagesClient {
         let mut last_blocks = Vec::new();
         let mut last_stop_reason = String::from("end_turn");
         let mut replay_messages = Vec::new();
+        let max_continuation_turns = if allow_continuation {
+            MAX_CONTINUATION_TURNS
+        } else {
+            0
+        };
 
-        for round in 0..=MAX_CONTINUATION_TURNS {
+        for round in 0..=max_continuation_turns {
             if recovery_interrupt.is_some_and(ProviderRecoveryInterrupt::is_cancelled) {
                 if last_stop_reason == "max_tokens"
                     && last_response.is_some()
@@ -514,16 +524,16 @@ impl AnthropicMessagesClient {
                 last_stop_reason = "end_turn".into();
                 break;
             }
-            if round == MAX_CONTINUATION_TURNS && error_on_unresolved_max_tokens {
+            if round == max_continuation_turns && error_on_unresolved_max_tokens {
                 return Err(AnthropicError::OutputShape {
                     reason: format!(
                         "assistant max_tokens continuation 超过上限: {}",
-                        MAX_CONTINUATION_TURNS + 1
+                        max_continuation_turns + 1
                     ),
                     raw: merged_text,
                 });
             }
-            if round == MAX_CONTINUATION_TURNS {
+            if round == max_continuation_turns {
                 break;
             }
             let continuation = json!({"role": "user", "content": CONTINUATION_TRIGGER});
@@ -655,12 +665,14 @@ impl AnthropicProviderAdapter {
                     emit(ProviderEvent::AssistantTextDelta { text });
                 }
                 SessionTurnEvent::AssistantMessageCompleted { .. }
+                | SessionTurnEvent::AssistantOutputDiscarded
                 | SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
                 | SessionTurnEvent::NonStreamingFallbackAttemptFailed { .. }
                 | SessionTurnEvent::NonStreamingFallbackSucceeded { .. }
                 | SessionTurnEvent::Warning { .. }
                 | SessionTurnEvent::CompactionStarted { .. }
                 | SessionTurnEvent::CompactionCompleted { .. }
+                | SessionTurnEvent::RecapRequested { .. }
                 | SessionTurnEvent::CompactionSkipped { .. }
                 | SessionTurnEvent::CompactionFailed { .. }
                 | SessionTurnEvent::ToolCallStarted { .. }
@@ -676,6 +688,7 @@ impl AnthropicProviderAdapter {
                     api_tools,
                     request.max_tokens,
                     retry_count,
+                    request.allow_continuation,
                     retry_after_partial,
                     &mut provider_emit,
                     &mut request_observer,
@@ -690,6 +703,7 @@ impl AnthropicProviderAdapter {
                     api_tools,
                     request.max_tokens,
                     retry_count,
+                    request.allow_continuation,
                     recovery_interrupt.as_ref(),
                     &mut request_observer,
                 )
@@ -703,6 +717,9 @@ impl AnthropicProviderAdapter {
             Err(error) => {
                 if matches!(&error, AnthropicError::RecoveryInterrupted) {
                     return Err(SessionTurnInterrupted.into());
+                }
+                if let Some(error) = classify_request_too_large(&error) {
+                    return Err(error.into());
                 }
                 if request.stream && anthropic_adapter_stream_failure(&error) {
                     return Err(ProviderStreamFailure::new(error.to_string()).into());
@@ -863,6 +880,9 @@ fn session_turn_block_to_api(block: SessionTurnContentBlock) -> Option<Value> {
         SessionTurnContentBlock::ToolUse { id, name, input } => {
             Some(json!({"type": "tool_use", "id": id, "name": name, "input": input}))
         }
+        SessionTurnContentBlock::InvalidToolUse { id, name, .. } => {
+            Some(json!({"type": "tool_use", "id": id, "name": name, "input": {}}))
+        }
         SessionTurnContentBlock::ToolResult {
             tool_use_id,
             content,
@@ -907,9 +927,13 @@ fn assistant_turn_message(
     } else {
         assistant_content_blocks_without_thinking(turn)
     };
-    let has_tool_use = content
-        .iter()
-        .any(|block| matches!(block, SessionTurnContentBlock::ToolUse { .. }));
+    let has_tool_use = content.iter().any(|block| {
+        matches!(
+            block,
+            SessionTurnContentBlock::ToolUse { .. }
+                | SessionTurnContentBlock::InvalidToolUse { .. }
+        )
+    });
     if turn.final_stop_reason == "tool_use" && !has_tool_use {
         return Err(AnthropicError::NoConsumableOutput {
             reason: "Anthropic tool_use 终态没有完整 tool_use block".into(),
@@ -953,10 +977,37 @@ fn assistant_turn_message(
         role: "assistant".into(),
         provider_replay: Some(crate::api::ProviderReplayState::AnthropicMessages {
             model: model.to_string(),
-            messages: turn.replay_messages.clone(),
+            messages: normalized_anthropic_replay_messages(&turn.replay_messages),
         }),
         content,
     })
+}
+
+/// Anthropic 要求历史中的 `tool_use.input` 也是 object。模型若返回合法 JSON
+/// 非 object，canonical 会把它转成可恢复的 InvalidToolUse；同协议 replay 只修正
+/// 该字段为 `{}`，其余 thinking/signature 与扩展字段保持原样。
+fn normalized_anthropic_replay_messages(messages: &[Value]) -> Vec<Value> {
+    let mut normalized = messages.to_vec();
+    for message in &mut normalized {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in content {
+            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            if block.get("input").is_some_and(Value::is_object) {
+                continue;
+            }
+            if let Some(object) = block.as_object_mut() {
+                object.insert("input".into(), json!({}));
+            }
+        }
+    }
+    normalized
 }
 
 fn provider_stop_from_turn(
@@ -1077,19 +1128,31 @@ fn api_block_to_session_turn_block(
                 filename: None,
             })
         }
-        Some("tool_use") => Ok(SessionTurnContentBlock::ToolUse {
-            id: block
+        Some("tool_use") => {
+            let id = block
                 .get("id")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
-                .to_string(),
-            name: block
+                .to_string();
+            let name = block
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
-                .to_string(),
-            input: block.get("input").cloned().unwrap_or_else(|| json!({})),
-        }),
+                .to_string();
+            let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+            if input.is_object() {
+                Ok(SessionTurnContentBlock::ToolUse { id, name, input })
+            } else {
+                Ok(SessionTurnContentBlock::InvalidToolUse {
+                    id,
+                    name,
+                    error: format!(
+                        "Anthropic tool_use.input 必须是 JSON object，实际为 {}",
+                        json_value_type(&input)
+                    ),
+                })
+            }
+        }
         Some("tool_result") => Ok(SessionTurnContentBlock::ToolResult {
             tool_use_id: block
                 .get("tool_use_id")
@@ -1106,6 +1169,17 @@ fn api_block_to_session_turn_block(
             reason: format!("未知 content block type: {other:?}"),
             raw: block.to_string(),
         }),
+    }
+}
+
+fn json_value_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -1129,6 +1203,13 @@ fn wrap_media_rejection(error: AnthropicError, request_has_media: bool) -> Anthr
         }
         other => other,
     }
+}
+
+fn classify_request_too_large(error: &AnthropicError) -> Option<ProviderRequestTooLarge> {
+    let AnthropicError::Status { status: 413, .. } = error else {
+        return None;
+    };
+    Some(ProviderRequestTooLarge::new())
 }
 
 const REDACTED_ANTHROPIC_PAYLOAD: &str = "[redacted Anthropic request/replay payload]";
@@ -1762,6 +1843,168 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_non_object_tool_inputs_become_recoverable_and_replay_is_normalized() {
+        let secret = "private-tool-argument";
+        for (input, expected_type) in [
+            (json!([secret]), "array"),
+            (json!(secret), "string"),
+            (json!(7), "number"),
+            (json!(true), "boolean"),
+            (Value::Null, "null"),
+        ] {
+            let replay_message = json!({
+                "role":"assistant",
+                "content":[
+                    {"type":"thinking", "thinking":"private", "signature":"opaque"},
+                    {
+                        "type":"tool_use",
+                        "id":"toolu_bad",
+                        "name":"file_read",
+                        "input":input
+                    }
+                ]
+            });
+            let turn = ContinuedAssistantTurn {
+                final_response: json!({}),
+                final_blocks: replay_message["content"].as_array().unwrap().clone(),
+                final_stop_reason: "tool_use".into(),
+                merged_text: String::new(),
+                replay_messages: vec![replay_message],
+            };
+
+            let message = assistant_turn_message(&turn, "test-model").unwrap();
+
+            assert!(matches!(
+                message.content.as_slice(),
+                [SessionTurnContentBlock::InvalidToolUse { id, name, error }]
+                    if id == "toolu_bad"
+                        && name == "file_read"
+                        && error.contains(expected_type)
+                        && !error.contains(secret)
+            ));
+            assert_eq!(
+                provider_stop_from_turn(&turn).unwrap(),
+                ProviderStop::ToolUse
+            );
+            let replay = match message.provider_replay.as_ref() {
+                Some(crate::api::ProviderReplayState::AnthropicMessages { messages, .. }) => {
+                    messages
+                }
+                other => panic!("expected Anthropic replay, got {other:?}"),
+            };
+            assert_eq!(replay[0]["content"][0]["signature"], "opaque");
+            assert_eq!(replay[0]["content"][1]["input"], json!({}));
+            assert!(!serde_json::to_string(replay).unwrap().contains(secret));
+        }
+    }
+
+    #[test]
+    fn anthropic_invalid_tool_input_does_not_block_valid_sibling() {
+        let replay_message = json!({
+            "role":"assistant",
+            "content":[
+                {
+                    "type":"tool_use",
+                    "id":"toolu_bad",
+                    "name":"file_read",
+                    "input":["README.md"]
+                },
+                {
+                    "type":"tool_use",
+                    "id":"toolu_good",
+                    "name":"file_read",
+                    "input":{"path":"README.md"}
+                }
+            ]
+        });
+        let turn = ContinuedAssistantTurn {
+            final_response: json!({}),
+            final_blocks: replay_message["content"].as_array().unwrap().clone(),
+            final_stop_reason: "max_tokens".into(),
+            merged_text: String::new(),
+            replay_messages: vec![replay_message],
+        };
+
+        let message = assistant_turn_message(&turn, "test-model").unwrap();
+
+        assert!(matches!(
+            message.content.as_slice(),
+            [
+                SessionTurnContentBlock::InvalidToolUse { id: bad_id, .. },
+                SessionTurnContentBlock::ToolUse {
+                    id: good_id,
+                    input,
+                    ..
+                }
+            ] if bad_id == "toolu_bad"
+                && good_id == "toolu_good"
+                && input == &json!({"path":"README.md"})
+        ));
+        assert_eq!(
+            provider_stop_from_turn(&turn).unwrap(),
+            ProviderStop::ToolUse
+        );
+        let replay = match message.provider_replay.as_ref() {
+            Some(crate::api::ProviderReplayState::AnthropicMessages { messages, .. }) => messages,
+            other => panic!("expected Anthropic replay, got {other:?}"),
+        };
+        assert_eq!(replay[0]["content"][0]["input"], json!({}));
+        assert_eq!(
+            replay[0]["content"][1]["input"],
+            json!({"path":"README.md"})
+        );
+
+        let wire = serde_json::to_value(session_turn_messages_to_api(
+            vec![
+                message,
+                SessionTurnMessage::user_content(vec![
+                    SessionTurnContentBlock::ToolResult {
+                        tool_use_id: "toolu_bad".into(),
+                        content: r#"{"ok":false,"outcome":{"kind":"dispatch_failure"}}"#.into(),
+                    },
+                    SessionTurnContentBlock::ToolResult {
+                        tool_use_id: "toolu_good".into(),
+                        content: r#"{"ok":true}"#.into(),
+                    },
+                ]),
+            ],
+            "test-model",
+        ))
+        .unwrap();
+        assert_eq!(wire[0]["content"][0]["input"], json!({}));
+        assert_eq!(wire[0]["content"][1]["input"], json!({"path":"README.md"}));
+        assert_eq!(wire[1]["content"][0]["tool_use_id"], "toolu_bad");
+        assert_eq!(wire[1]["content"][1]["tool_use_id"], "toolu_good");
+    }
+
+    #[test]
+    fn anthropic_missing_tool_input_remains_compatible_with_empty_object() {
+        let replay_message = json!({
+            "role":"assistant",
+            "content":[{"type":"tool_use", "id":"toolu_1", "name":"file_read"}]
+        });
+        let turn = ContinuedAssistantTurn {
+            final_response: json!({}),
+            final_blocks: replay_message["content"].as_array().unwrap().clone(),
+            final_stop_reason: "tool_use".into(),
+            merged_text: String::new(),
+            replay_messages: vec![replay_message],
+        };
+
+        let message = assistant_turn_message(&turn, "test-model").unwrap();
+
+        assert!(matches!(
+            message.content.as_slice(),
+            [SessionTurnContentBlock::ToolUse { input, .. }] if input == &json!({})
+        ));
+        let replay = match message.provider_replay.as_ref() {
+            Some(crate::api::ProviderReplayState::AnthropicMessages { messages, .. }) => messages,
+            other => panic!("expected Anthropic replay, got {other:?}"),
+        };
+        assert_eq!(replay[0]["content"][0]["input"], json!({}));
+    }
+
+    #[test]
     fn anthropic_reasoning_only_success_is_rejected_without_exposing_payload() {
         let secret = "private-thinking";
         let turn = ContinuedAssistantTurn {
@@ -2005,6 +2248,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn max_token_response_does_not_continue_when_request_disables_it() {
+        let (endpoint, requests) = spawn_json_server(vec![json!({
+            "content":[{"type":"text", "text":"partial"}],
+            "stop_reason":"max_tokens",
+            "usage":{"input_tokens":1,"output_tokens":2}
+        })])
+        .await;
+        let adapter = AnthropicProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            32,
+            Duration::from_secs(5),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        let response = adapter
+            .send(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 32,
+                    stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: None,
+                    allow_continuation: false,
+                    retry_count_override: Some(0),
+                },
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.stop, ProviderStop::MaxTokens);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn safe_steer_after_send_keeps_successful_max_tokens_response_without_continuation() {
         let (endpoint, requests) = spawn_json_server(vec![json!({
             "content":[{"type":"text", "text":"partial-answer"}],
@@ -2042,6 +2329,7 @@ mod tests {
                     runtime_chain_id: None,
                     runtime_fallback_scope: None,
                     recovery_interrupt: Some(interrupt),
+                    allow_continuation: true,
                     retry_count_override: None,
                 },
                 &mut |_| {},
@@ -2099,6 +2387,7 @@ mod tests {
                     runtime_chain_id: None,
                     runtime_fallback_scope: None,
                     recovery_interrupt: Some(interrupt.clone()),
+                    allow_continuation: true,
                     retry_count_override: None,
                 },
                 &mut |_| {},
@@ -2162,6 +2451,7 @@ mod tests {
                     runtime_chain_id: None,
                     runtime_fallback_scope: None,
                     recovery_interrupt: None,
+                    allow_continuation: true,
                     retry_count_override: None,
                 },
                 &mut |_| {},
@@ -2246,6 +2536,65 @@ mod tests {
         ));
         assert_eq!(requests.lock().unwrap().len(), 1);
         assert_eq!(messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn non_streaming_non_object_tool_input_returns_recoverable_call_without_retry() {
+        let secret = "private-tool-argument";
+        let (endpoint, requests) = spawn_json_server(vec![json!({
+            "content":[{
+                "type":"tool_use",
+                "id":"toolu_bad",
+                "name":"file_read",
+                "input":[secret]
+            }],
+            "stop_reason":"tool_use",
+            "usage":{"input_tokens":1,"output_tokens":2}
+        })])
+        .await;
+        let adapter = AnthropicProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            128,
+            Duration::from_secs(2),
+            3,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        let response = adapter
+            .send(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: vec![ToolSpec {
+                        name: "file_read".into(),
+                        description: "Read a file".into(),
+                        input_schema: json!({"type":"object"}),
+                    }],
+                    max_tokens: 128,
+                    stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: None,
+                    allow_continuation: true,
+                    retry_count_override: None,
+                },
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.stop, ProviderStop::ToolUse);
+        assert!(matches!(
+            response.assistant_message.content.as_slice(),
+            [SessionTurnContentBlock::InvalidToolUse { error, .. }]
+                if error.contains("array") && !error.contains(secret)
+        ));
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -2413,6 +2762,24 @@ mod tests {
         assert!(text.contains("可能不支持图片 / PDF 附件"));
         assert!(text.contains("unsupported content type"));
         assert!(!is_retryable(&error));
+    }
+
+    #[test]
+    fn http_413_is_classified_as_request_too_large() {
+        let error = AnthropicError::Status {
+            status: 413,
+            body: "request body exceeds provider limit".into(),
+        };
+
+        let classified = classify_request_too_large(&error).expect("HTTP 413 classification");
+
+        assert!(classified.to_string().contains("upstream size limit"));
+        assert!(!classified.to_string().contains("provider limit"));
+        assert!(classify_request_too_large(&AnthropicError::Status {
+            status: 400,
+            body: "bad request".into(),
+        })
+        .is_none());
     }
 
     #[test]

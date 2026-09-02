@@ -116,6 +116,145 @@ pub fn team_store_disputes_dir(team_root: &Path) -> PathBuf {
     team_root.join("maintainer").join("disputes")
 }
 
+pub fn team_store_arbitrations_dir(team_root: &Path) -> PathBuf {
+    team_root.join("maintainer").join("arbitrations")
+}
+
+pub fn team_store_arbitration_dispute_dir(
+    team_root: &Path,
+    dispute_id: &crate::claim::DisputeId,
+) -> PathBuf {
+    team_store_arbitrations_dir(team_root).join(dispute_id.as_str())
+}
+
+/// 每个 Dispute 唯一的当前 Analysis。再次 Analyze 会原子覆盖该文件。
+pub fn team_store_arbitration_current_analysis_path(
+    team_root: &Path,
+    dispute_id: &crate::claim::DisputeId,
+) -> PathBuf {
+    team_store_arbitration_dispute_dir(team_root, dispute_id).join("analysis.yaml")
+}
+
+/// 旧版本自动分析路径，只用于读取兼容。
+pub fn team_store_arbitration_legacy_automatic_analysis_path(
+    team_root: &Path,
+    dispute_id: &crate::claim::DisputeId,
+) -> PathBuf {
+    team_store_arbitration_dispute_dir(team_root, dispute_id).join("automatic_analysis.yaml")
+}
+
+/// 旧版本人工分析路径，只用于读取兼容。
+pub fn team_store_arbitration_legacy_manual_analysis_path(
+    team_root: &Path,
+    dispute_id: &crate::claim::DisputeId,
+) -> PathBuf {
+    team_store_arbitration_dispute_dir(team_root, dispute_id).join("manual_analysis.yaml")
+}
+
+pub fn team_store_arbitration_resolution_path(
+    team_root: &Path,
+    dispute_id: &crate::claim::DisputeId,
+) -> PathBuf {
+    team_store_arbitration_dispute_dir(team_root, dispute_id).join("resolution.yaml")
+}
+
+/// 旧版本 resolution 记录使用的只读兼容目录；新写入不再使用。
+pub fn team_store_arbitration_legacy_decisions_dir(
+    team_root: &Path,
+    dispute_id: &crate::claim::DisputeId,
+) -> PathBuf {
+    team_store_arbitration_dispute_dir(team_root, dispute_id).join("decisions")
+}
+
+pub fn team_store_arbitration_pending_deliveries_dir(team_root: &Path) -> PathBuf {
+    team_store_arbitrations_dir(team_root).join("pending-deliveries")
+}
+
+pub fn team_store_arbitration_pending_delivery_path(
+    team_root: &Path,
+    resolution_id: &crate::claim::ArbitrationResolutionId,
+) -> PathBuf {
+    team_store_arbitration_pending_deliveries_dir(team_root).join(format!("{resolution_id}.yaml"))
+}
+
+pub fn team_store_arbitration_pending_observations_dir(team_root: &Path) -> PathBuf {
+    team_store_arbitrations_dir(team_root).join("pending-observations")
+}
+
+pub fn team_store_arbitration_pending_observation_path(
+    team_root: &Path,
+    resolution_id: &crate::claim::ArbitrationResolutionId,
+) -> PathBuf {
+    team_store_arbitration_pending_observations_dir(team_root).join(format!("{resolution_id}.yaml"))
+}
+
+pub fn team_store_arbitration_event_inbox_index_path(
+    team_root: &Path,
+    inbox_id: &crate::claim::InboxId,
+) -> PathBuf {
+    team_store_arbitrations_dir(team_root)
+        .join("event-index")
+        .join("inboxes")
+        .join(format!("{inbox_id}.yaml"))
+}
+
+pub fn team_store_arbitration_event_claim_index_dir(
+    team_root: &Path,
+    claim_id: &crate::claim::ClaimId,
+) -> PathBuf {
+    team_store_arbitrations_dir(team_root)
+        .join("event-index")
+        .join("claims")
+        .join(claim_id.as_str())
+}
+
+pub fn team_store_arbitration_event_policy_index_path(
+    team_root: &Path,
+    policy_id: &crate::claim::PolicyId,
+) -> PathBuf {
+    team_store_arbitrations_dir(team_root)
+        .join("event-index")
+        .join("policies")
+        .join(format!("{policy_id}.yaml"))
+}
+
+pub fn team_store_arbitration_adoption_candidates_dir(
+    team_root: &Path,
+    dispute_id: &crate::claim::DisputeId,
+    resolution_id: &crate::claim::ArbitrationResolutionId,
+    policy_id: &crate::claim::PolicyId,
+) -> PathBuf {
+    team_store_arbitration_dispute_dir(team_root, dispute_id)
+        .join("adoption-candidates")
+        .join(resolution_id.as_str())
+        .join(policy_id.as_str())
+}
+
+pub fn team_store_arbitration_adoption_candidate_path(
+    team_root: &Path,
+    dispute_id: &crate::claim::DisputeId,
+    resolution_id: &crate::claim::ArbitrationResolutionId,
+    policy_id: &crate::claim::PolicyId,
+    claim_id: &crate::claim::ClaimId,
+) -> PathBuf {
+    team_store_arbitration_adoption_candidates_dir(team_root, dispute_id, resolution_id, policy_id)
+        .join(format!("{claim_id}.yaml"))
+}
+
+pub fn team_store_arbitration_observations_dir(
+    team_root: &Path,
+    dispute_id: &crate::claim::DisputeId,
+) -> PathBuf {
+    team_store_arbitration_dispute_dir(team_root, dispute_id).join("observations")
+}
+
+pub fn team_store_arbitration_lock_path(
+    team_root: &Path,
+    dispute_id: &crate::claim::DisputeId,
+) -> PathBuf {
+    team_store_arbitration_dispute_dir(team_root, dispute_id).join("arbitration.lock")
+}
+
 pub fn team_store_policies_dir(team_root: &Path) -> PathBuf {
     team_root.join("maintainer").join("policies")
 }
@@ -197,8 +336,17 @@ pub fn agent_home_pending_maintainer_uploads_lock_path(agent_home: &Path) -> Pat
     agent_home_maintainer_uploads_dir(agent_home).join("pending.lock")
 }
 
+pub fn agent_home_maintainer_upload_delivery_lock_path(agent_home: &Path) -> PathBuf {
+    agent_home_maintainer_uploads_dir(agent_home).join("delivery.lock")
+}
+
 pub fn agent_home_runtime_dir(agent_home: &Path) -> PathBuf {
     agent_home.join("runtime")
+}
+
+/// `<agent_home>/knowledge_apply.lock`：inbox 与 recap/finalize 共用的知识应用锁。
+pub fn agent_home_knowledge_apply_lock_path(agent_home: &Path) -> PathBuf {
+    agent_home.join("knowledge_apply.lock")
 }
 
 pub fn agent_home_supervisor_dir(agent_home: &Path) -> PathBuf {
@@ -227,6 +375,17 @@ pub fn agent_home_reported_dispute_claim_sets_path(agent_home: &Path) -> PathBuf
 
 pub fn agent_home_inbox_dir(agent_home: &Path) -> PathBuf {
     agent_home.join("inbox")
+}
+
+pub fn agent_home_inbox_effects_dir(agent_home: &Path) -> PathBuf {
+    agent_home_inbox_dir(agent_home).join("effects")
+}
+
+pub fn agent_home_inbox_effect_path(
+    agent_home: &Path,
+    inbox_id: &crate::claim::InboxId,
+) -> PathBuf {
+    agent_home_inbox_effects_dir(agent_home).join(format!("{inbox_id}.yaml"))
 }
 
 pub fn agent_home_memories_dir(agent_home: &Path) -> PathBuf {
@@ -362,6 +521,14 @@ mod tests {
         assert_eq!(
             agent_home_pending_maintainer_uploads_lock_path(&home),
             PathBuf::from("/tmp/agents/agent-a/maintainer_uploads/pending.lock")
+        );
+        assert_eq!(
+            agent_home_maintainer_upload_delivery_lock_path(&home),
+            PathBuf::from("/tmp/agents/agent-a/maintainer_uploads/delivery.lock")
+        );
+        assert_eq!(
+            agent_home_knowledge_apply_lock_path(&home),
+            PathBuf::from("/tmp/agents/agent-a/knowledge_apply.lock")
         );
         assert_eq!(
             agent_home_supervisor_jobs_dir(&home),

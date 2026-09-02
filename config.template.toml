@@ -49,6 +49,26 @@ password_env = "ACN_MAINTAINER_ADMIN_PASSWORD"
 [maintainer.auth.team]
 enabled = false
 
+[maintainer.arbitration]
+enabled = false
+mode = "shadow"
+confidence_threshold = 0.90
+max_source_claims = 20
+
+# 仅在 maintainer.arbitration.enabled=true 时需要。
+# [maintainer.llm]
+# provider = "openai_responses"
+# endpoint = "https://api.openai.com/v1"
+# model = "gpt-5.6-luna"
+# reasoning_effort = "high"
+# api_key_env = "ACN_LLM_API_KEY"
+# max_tokens = 65536
+# context_window = 200000
+# timeout_secs = 300
+# retry_count = 2
+# retry_base_delay_ms = 500
+# retry_max_delay_ms = 5000
+
 [agent.llm]
 provider = "openai_responses"
 endpoint = "https://api.openai.com/v1"

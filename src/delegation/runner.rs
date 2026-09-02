@@ -26,6 +26,7 @@ use crate::config::{
     DEFAULT_SESSION_DELEGATION_WAIT_MAX_TIMEOUT_SECS,
     DEFAULT_SESSION_DELEGATION_WAIT_MIN_TIMEOUT_SECS, DEFAULT_SESSION_DELEGATION_WALL_TIMEOUT_SECS,
 };
+use crate::session::SessionRuntimeLease;
 
 const INITIAL_STEERING_READ_LIMIT: usize = 64;
 
@@ -295,6 +296,9 @@ struct DelegationRunnerInner {
     state: tokio::sync::Mutex<RunnerState>,
     pump_lock: tokio::sync::Mutex<()>,
     fallback_root: tokio::sync::RwLock<ProviderRuntimeFallbackScope>,
+    /// TUI 退出时 subagent 可能已脱离 parent turn 继续运行；只要 runner
+    /// 仍有队列或执行 task，就必须阻止另一进程恢复同一 session。
+    runtime_lease: tokio::sync::RwLock<Option<SessionRuntimeLease>>,
 }
 
 #[derive(Default)]
@@ -329,6 +333,7 @@ impl DelegationRunner {
                 state: tokio::sync::Mutex::new(RunnerState::default()),
                 pump_lock: tokio::sync::Mutex::new(()),
                 fallback_root: tokio::sync::RwLock::new(ProviderRuntimeFallbackScope::new_root()),
+                runtime_lease: tokio::sync::RwLock::new(None),
             }),
         })
     }
@@ -347,6 +352,10 @@ impl DelegationRunner {
 
     pub(crate) async fn bind_fallback_root(&self, root: ProviderRuntimeFallbackScope) {
         *self.inner.fallback_root.write().await = root;
+    }
+
+    pub(crate) async fn bind_runtime_lease(&self, runtime_lease: SessionRuntimeLease) {
+        *self.inner.runtime_lease.write().await = Some(runtime_lease);
     }
 
     pub async fn create(
@@ -1018,6 +1027,71 @@ mod tests {
             .iter()
             .all(|summary| summary.status == DelegationStatus::Completed));
         assert_eq!(max_active.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn detached_subagent_keeps_session_runtime_lease() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let runtime_lock = dir.path().join("runtime.lock");
+        let owner_lease = SessionRuntimeLease::acquire_for_test(&runtime_lock)
+            .await
+            .expect("runtime lease");
+        let active = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicUsize::new(0));
+        let runner = runner(
+            DelegationStore::new(dir.path().join("sessions/session_aaaaaaaa")),
+            RecordingExecutor {
+                active: Arc::clone(&active),
+                max_active: Arc::new(AtomicUsize::new(0)),
+                delay: Duration::ZERO,
+                release: Some(Arc::clone(&release)),
+                fail: false,
+                seen_initial_steering: None,
+            },
+            1,
+            Duration::from_secs(5),
+        );
+        runner
+            .bind_runtime_lease(owner_lease.clone_for_worker())
+            .await;
+        runner
+            .create(request("turn-detached-runtime-lease"))
+            .await
+            .expect("create delegation");
+        time::timeout(TEST_EVENT_TIMEOUT, async {
+            while active.load(Ordering::SeqCst) == 0 {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("delegation should start");
+
+        drop(owner_lease);
+        drop(runner);
+        assert!(
+            crate::storage::FileLockGuard::try_lock_exclusive(&runtime_lock)
+                .await
+                .expect("try runtime lock")
+                .is_none(),
+            "detached subagent must retain the session runtime lease"
+        );
+
+        release.store(1, Ordering::SeqCst);
+        let reacquired = time::timeout(TEST_EVENT_TIMEOUT, async {
+            loop {
+                if let Some(guard) =
+                    crate::storage::FileLockGuard::try_lock_exclusive(&runtime_lock)
+                        .await
+                        .expect("try runtime lock")
+                {
+                    return guard;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("runtime lease should release after detached subagent finishes");
+        drop(reacquired);
     }
 
     #[tokio::test]

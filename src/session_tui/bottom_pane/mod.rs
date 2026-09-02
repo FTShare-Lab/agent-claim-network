@@ -45,6 +45,7 @@ pub enum InputAction {
     Help,
     Inbox,
     Mcp,
+    New,
     Ps,
     Compact,
     Copy,
@@ -951,6 +952,12 @@ impl BottomPane {
                 format!("input will be queued · queued={queued_count}")
             }
             SessionRuntimeStatus::Compacting => "input will be queued".into(),
+            SessionRuntimeStatus::Resuming if queued_count > 0 => {
+                format!("waiting for target finalization... inputs queued={queued_count}")
+            }
+            SessionRuntimeStatus::Resuming => {
+                "waiting for target finalization... inputs will be queued".into()
+            }
             SessionRuntimeStatus::Finalizing => "finalizing session...".into(),
             SessionRuntimeStatus::Closed => "session closed".into(),
         }
@@ -1277,6 +1284,7 @@ pub fn classify_input(raw: &str, catalog: &SlashCommandCatalog) -> InputAction {
                 SlashCommandAction::Help => InputAction::Help,
                 SlashCommandAction::Inbox => InputAction::Inbox,
                 SlashCommandAction::Mcp => InputAction::Mcp,
+                SlashCommandAction::New => InputAction::New,
                 SlashCommandAction::Ps => InputAction::Ps,
                 SlashCommandAction::Resume => InputAction::Resume,
                 SlashCommandAction::Skills => InputAction::Skills,
@@ -1316,6 +1324,7 @@ pub(super) fn input_accepts_text(status: SessionRuntimeStatus) -> bool {
             | SessionRuntimeStatus::Running
             | SessionRuntimeStatus::SyncingInbox
             | SessionRuntimeStatus::Compacting
+            | SessionRuntimeStatus::Resuming
             | SessionRuntimeStatus::Error
     )
 }

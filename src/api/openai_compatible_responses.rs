@@ -16,13 +16,15 @@ use super::provider::{
     NoopProviderRequestObserver, ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy,
     ProviderNoConsumableOutput, ProviderRecoveryInterrupt, ProviderReplayIdentity,
     ProviderReplayProtocol, ProviderRequest, ProviderRequestObserver,
-    ProviderRequestPreparationFailure, ProviderResponse, ProviderRuntimeChainId, ProviderStop,
-    ProviderStreamFailure, ProviderTerminalFailure, ProviderTransport, ToolSpec,
+    ProviderRequestPreparationFailure, ProviderRequestTooLarge, ProviderResponse,
+    ProviderRuntimeChainId, ProviderStop, ProviderStreamFailure, ProviderTerminalFailure,
+    ProviderTransport, ToolSpec,
 };
 use super::redact_media_error_body;
 use super::responses::{
-    is_stream_recovery_failure, ResponsesClient, ResponsesError, ResponsesReasoning,
-    ResponsesRequest, ResponsesStreamEvent, ResponsesTerminal, ResponsesTool,
+    is_explicit_websocket_message_too_big, is_stream_recovery_failure, ResponsesClient,
+    ResponsesError, ResponsesReasoning, ResponsesRequest, ResponsesStreamEvent, ResponsesTerminal,
+    ResponsesTool,
 };
 use super::types::{ProviderReplayState, SessionTurnContentBlock, SessionTurnMessage};
 use super::SessionTurnInterrupted;
@@ -167,6 +169,7 @@ impl OpenAiCompatibleResponsesProviderAdapter {
         max_tokens: u32,
         stream: bool,
         retry_count: u32,
+        allow_continuation: bool,
         runtime_chain_id: Option<ProviderRuntimeChainId>,
         runtime_fallback_scope: Option<&crate::api::ProviderRuntimeFallbackScope>,
         retry_after_partial: bool,
@@ -184,8 +187,13 @@ impl OpenAiCompatibleResponsesProviderAdapter {
             ProviderTransport::ResponsesNonStreaming
         };
         let mut provider_messages = base_messages.to_vec();
+        let max_continuation_turns = if allow_continuation {
+            MAX_CONTINUATION_TURNS
+        } else {
+            0
+        };
 
-        for round in 0..=MAX_CONTINUATION_TURNS {
+        for round in 0..=max_continuation_turns {
             if recovery_interrupt.is_some_and(ProviderRecoveryInterrupt::is_cancelled) {
                 if last_terminal == ResponsesTerminal::MaxOutputTokens
                     && last_function_calls.is_empty()
@@ -341,7 +349,7 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                 last_terminal = ResponsesTerminal::Completed;
                 break;
             }
-            if round == MAX_CONTINUATION_TURNS {
+            if round == max_continuation_turns {
                 break;
             }
             let continuation = user_text_item(CONTINUATION_TRIGGER);
@@ -455,6 +463,7 @@ impl OpenAiCompatibleResponsesProviderAdapter {
             .unwrap_or(self.client.retry_count());
         let retry_after_partial =
             request.stream_output_mode == crate::api::ProviderStreamOutputMode::Buffered;
+        let allow_continuation = request.allow_continuation;
         let base_messages = request.messages;
         let input = session_turn_messages_to_responses(base_messages.clone(), &self.model)?;
         let recovery_interrupt = request.recovery_interrupt.clone();
@@ -468,6 +477,7 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                 request.max_tokens,
                 request.stream,
                 retry_count,
+                allow_continuation,
                 request.runtime_chain_id,
                 request.runtime_fallback_scope.as_ref(),
                 retry_after_partial,
@@ -487,6 +497,9 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                     OpenAiCompatibleResponsesError::Client(ResponsesError::RecoveryInterrupted)
                 ) {
                     return Err(SessionTurnInterrupted.into());
+                }
+                if let Some(error) = classify_request_too_large(&error) {
+                    return Err(error.into());
                 }
                 if request.stream && responses_adapter_stream_failure(&error) {
                     return Err(ProviderStreamFailure::new(error.to_string()).into());
@@ -641,8 +654,9 @@ fn push_user_items(
                 "call_id":tool_use_id,
                 "output":content,
             })),
-            SessionTurnContentBlock::ToolUse { .. } => {
-                return Err(output_shape("user message 不允许包含 ToolUse"));
+            SessionTurnContentBlock::ToolUse { .. }
+            | SessionTurnContentBlock::InvalidToolUse { .. } => {
+                return Err(output_shape("user message 不允许包含 tool call"));
             }
         }
     }
@@ -685,6 +699,15 @@ fn push_assistant_items(
                     "call_id":id,
                     "name":name,
                     "arguments":input.to_string(),
+                }));
+            }
+            SessionTurnContentBlock::InvalidToolUse { id, name, .. } => {
+                flush_assistant_text(items, &mut text_parts);
+                items.push(json!({
+                    "type":"function_call",
+                    "call_id":id,
+                    "name":name,
+                    "arguments":"{}",
                 }));
             }
             SessionTurnContentBlock::SkillInstructions { .. } => {
@@ -745,11 +768,19 @@ fn provider_response_from_turn(
         content.push(SessionTurnContentBlock::text(turn.merged_text));
     }
     for call in turn.function_calls {
-        content.push(SessionTurnContentBlock::ToolUse {
-            id: call.call_id,
-            name: call.name,
-            input: parse_tool_arguments(&call.arguments)?,
-        });
+        let block = match parse_tool_arguments(&call.arguments) {
+            Ok(input) => SessionTurnContentBlock::ToolUse {
+                id: call.call_id,
+                name: call.name,
+                input,
+            },
+            Err(error) => SessionTurnContentBlock::InvalidToolUse {
+                id: call.call_id,
+                name: call.name,
+                error,
+            },
+        };
+        content.push(block);
     }
     if content.is_empty() {
         let item_types = replay_item_types(&turn.replay_items);
@@ -783,17 +814,20 @@ fn provider_response_from_turn(
 }
 
 fn is_tool_use(block: &SessionTurnContentBlock) -> bool {
-    matches!(block, SessionTurnContentBlock::ToolUse { .. })
+    matches!(
+        block,
+        SessionTurnContentBlock::ToolUse { .. } | SessionTurnContentBlock::InvalidToolUse { .. }
+    )
 }
 
-fn parse_tool_arguments(raw: &str) -> Result<Value, OpenAiCompatibleResponsesError> {
+fn parse_tool_arguments(raw: &str) -> Result<Value, String> {
     if raw.trim().is_empty() {
         return Ok(json!({}));
     }
     let value = serde_json::from_str::<Value>(raw)
-        .map_err(|error| output_shape(format!("function_call.arguments 不是合法 JSON: {error}")))?;
+        .map_err(|error| format!("function_call.arguments 不是合法 JSON: {error}"))?;
     if !value.is_object() {
-        return Err(output_shape("function_call.arguments 必须是 JSON object"));
+        return Err("function_call.arguments 必须是 JSON object".into());
     }
     Ok(value)
 }
@@ -844,6 +878,17 @@ fn wrap_media_rejection(
         }
         other => other,
     }
+}
+
+fn classify_request_too_large(
+    error: &OpenAiCompatibleResponsesError,
+) -> Option<ProviderRequestTooLarge> {
+    let OpenAiCompatibleResponsesError::Client(error) = error else {
+        return None;
+    };
+    (matches!(error, ResponsesError::Status { status: 413, .. })
+        || is_explicit_websocket_message_too_big(error))
+    .then(ProviderRequestTooLarge::new)
 }
 
 fn output_shape(reason: impl Into<String>) -> OpenAiCompatibleResponsesError {
@@ -1371,6 +1416,108 @@ mod tests {
     }
 
     #[test]
+    fn malformed_and_non_object_function_arguments_become_recoverable_tool_calls() {
+        for (arguments, expected_error) in [
+            (r#"{"path":"unfinished""#, "不是合法 JSON"),
+            (r#"["not", "an", "object"]"#, "必须是 JSON object"),
+        ] {
+            let response = provider_response_from_turn(
+                ContinuedResponsesTurn {
+                    merged_text: String::new(),
+                    replay_items: vec![json!({
+                        "type": "function_call",
+                        "call_id": "call_bad",
+                        "name": "file_read",
+                        "arguments": arguments,
+                    })],
+                    function_calls: vec![super::super::responses::ResponsesFunctionCall {
+                        call_id: "call_bad".into(),
+                        name: "file_read".into(),
+                        arguments: arguments.into(),
+                    }],
+                    terminal: ResponsesTerminal::Completed,
+                    transport: ProviderTransport::ResponsesSse,
+                },
+                "test-model",
+            )
+            .unwrap();
+
+            assert_eq!(response.stop, ProviderStop::ToolUse);
+            assert!(matches!(
+                response.assistant_message.content.as_slice(),
+                [SessionTurnContentBlock::InvalidToolUse { id, name, error }]
+                    if id == "call_bad" && name == "file_read" && error.contains(expected_error)
+            ));
+            assert!(matches!(
+                response.assistant_message.provider_replay.as_ref(),
+                Some(ProviderReplayState::OpenAiResponses { items, .. })
+                    if items[0]["arguments"] == arguments
+            ));
+        }
+    }
+
+    #[test]
+    fn max_output_tokens_preserves_invalid_and_valid_function_calls_for_recovery() {
+        let malformed = r#"{"path":"unfinished""#;
+        let response = provider_response_from_turn(
+            ContinuedResponsesTurn {
+                merged_text: String::new(),
+                replay_items: vec![
+                    json!({
+                        "type": "function_call",
+                        "call_id": "call_bad",
+                        "name": "file_read",
+                        "arguments": malformed,
+                    }),
+                    json!({
+                        "type": "function_call",
+                        "call_id": "call_good",
+                        "name": "file_read",
+                        "arguments": r#"{"path":"README.md"}"#,
+                    }),
+                ],
+                function_calls: vec![
+                    super::super::responses::ResponsesFunctionCall {
+                        call_id: "call_bad".into(),
+                        name: "file_read".into(),
+                        arguments: malformed.into(),
+                    },
+                    super::super::responses::ResponsesFunctionCall {
+                        call_id: "call_good".into(),
+                        name: "file_read".into(),
+                        arguments: r#"{"path":"README.md"}"#.into(),
+                    },
+                ],
+                terminal: ResponsesTerminal::MaxOutputTokens,
+                transport: ProviderTransport::ResponsesSse,
+            },
+            "test-model",
+        )
+        .unwrap();
+
+        assert_eq!(response.stop, ProviderStop::MaxTokens);
+        assert!(matches!(
+            response.assistant_message.content.as_slice(),
+            [
+                SessionTurnContentBlock::InvalidToolUse {
+                    id: bad_id, error, ..
+                },
+                SessionTurnContentBlock::ToolUse {
+                    id: good_id, input, ..
+                }
+            ] if bad_id == "call_bad"
+                && good_id == "call_good"
+                && error.contains("line 1 column")
+                && input == &json!({"path":"README.md"})
+        ));
+    }
+
+    #[test]
+    fn empty_function_arguments_remain_an_empty_object() {
+        assert_eq!(parse_tool_arguments("  ").unwrap(), json!({}));
+    }
+
+    #[test]
     fn media_4xx_gets_hint_without_protocol_fallback() {
         let error = wrap_media_rejection(
             OpenAiCompatibleResponsesError::Client(ResponsesError::Status {
@@ -1382,6 +1529,56 @@ mod tests {
 
         assert!(error.to_string().contains("可能不支持图片 / PDF 附件"));
         assert!(error.to_string().contains("bad input"));
+    }
+
+    #[test]
+    fn http_413_is_classified_as_request_too_large() {
+        let error = OpenAiCompatibleResponsesError::Client(ResponsesError::Status {
+            status: 413,
+            body: "request body exceeds gateway limit".into(),
+        });
+
+        let classified = classify_request_too_large(&error).expect("HTTP 413 classification");
+
+        assert!(classified.to_string().contains("upstream size limit"));
+        assert!(!classified.to_string().contains("gateway limit"));
+        assert!(
+            classify_request_too_large(&OpenAiCompatibleResponsesError::Client(
+                ResponsesError::Status {
+                    status: 429,
+                    body: "rate limited".into(),
+                }
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn explicit_websocket_1009_proxy_error_is_classified_without_generic_502s() {
+        let classified = classify_request_too_large(&OpenAiCompatibleResponsesError::Client(
+            ResponsesError::Status {
+                status: 502,
+                body: "responses websocket upstream failed: upstream closed the connection (1009 message too big): message too big".into(),
+            },
+        ))
+        .expect("explicit WebSocket 1009 classification");
+        assert!(classified.to_string().contains("upstream size limit"));
+
+        for body in [
+            "ordinary bad gateway",
+            "message too big without a WebSocket close code",
+            "upstream closed with 1009 for an unspecified reason",
+        ] {
+            assert!(
+                classify_request_too_large(&OpenAiCompatibleResponsesError::Client(
+                    ResponsesError::Status {
+                        status: 502,
+                        body: body.into(),
+                    }
+                ))
+                .is_none()
+            );
+        }
     }
 
     #[test]
@@ -1488,6 +1685,7 @@ mod tests {
                     runtime_chain_id: None,
                     runtime_fallback_scope: None,
                     recovery_interrupt: None,
+                    allow_continuation: true,
                     retry_count_override: None,
                 },
                 &mut |event| events.push(event),
@@ -1555,6 +1753,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn max_token_response_does_not_continue_when_request_disables_it() {
+        let (endpoint, requests) = spawn_json_sequence(vec![json!({
+            "status":"incomplete",
+            "incomplete_details":{"reason":"max_output_tokens"},
+            "output":[{
+                "type":"message","id":"msg_1","role":"assistant","status":"incomplete",
+                "content":[{"type":"output_text","text":"partial"}]
+            }]
+        })])
+        .await;
+        let adapter = OpenAiCompatibleResponsesProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            Duration::from_secs(5),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        let response = adapter
+            .send(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 32,
+                    stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: None,
+                    allow_continuation: false,
+                    retry_count_override: Some(0),
+                },
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.stop, ProviderStop::MaxTokens);
+        assert_eq!(requests.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn safe_steer_after_send_keeps_successful_incomplete_response_without_continuation() {
         let output = json!({
             "type":"message","id":"msg_1","role":"assistant","status":"incomplete",
@@ -1595,6 +1839,7 @@ mod tests {
                     runtime_chain_id: None,
                     runtime_fallback_scope: None,
                     recovery_interrupt: Some(interrupt),
+                    allow_continuation: true,
                     retry_count_override: None,
                 },
                 &mut |_| {},
@@ -1656,6 +1901,7 @@ mod tests {
                     runtime_chain_id: None,
                     runtime_fallback_scope: None,
                     recovery_interrupt: Some(interrupt.clone()),
+                    allow_continuation: true,
                     retry_count_override: None,
                 },
                 &mut |_| {},

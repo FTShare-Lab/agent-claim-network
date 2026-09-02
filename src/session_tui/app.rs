@@ -26,12 +26,15 @@ use crate::mcp::connection_manager::{
     McpConnectionManager, McpRuntimeState, McpRuntimeTransition, McpServerStatus,
 };
 use crate::mcp::redact::redact_mcp_sensitive_text;
+use crate::session::SessionResumeKind;
 use crate::skill::SkillSummary;
 use crate::supervisor::SupervisorLaunchConfig;
 
 use super::app_event::{AppEvent, AppEventSender};
 use super::at_path_completion::{read_directory_entries, AtPathCompletionLimits};
-use super::attachment::{prepare_preview_files, PreviewFile, PreviewTarget, ResolvedAtPaths};
+use super::attachment::{
+    prepare_preview_files, PreviewFailure, PreviewFile, PreviewTarget, ResolvedAtPaths,
+};
 use super::bottom_pane::{classify_input, input_accepts_text, InputAction, InputDraft};
 use super::chat_widget::ChatWidget;
 use super::cleanup_housekeeping::{
@@ -41,8 +44,10 @@ use super::input_queue::QueuedInput;
 use super::mcp_panel::McpPanelRequest;
 use super::process_panel::{ProcessPanelKeyAction, ProcessTerminationTarget};
 use super::runtime::{
-    spawn_resume_list_worker, spawn_resume_open_worker, spawn_start_worker, CompactWorkerOutcome,
-    FinalizeEnqueueOutcome, McpOperationOutcome, PendingSteerInput, SessionTaskState, WorkerEvent,
+    spawn_recap_enqueue_worker, spawn_resume_history_worker, spawn_resume_inbox_worker,
+    spawn_resume_list_worker, spawn_resume_preflight_worker, spawn_start_worker,
+    CompactWorkerOutcome, FinalizeEnqueueOutcome, McpOperationOutcome, PendingSteerInput,
+    ResumeHistoryOutcome, ResumeSessionReservation, SessionTaskState, WorkerEvent,
 };
 use super::session_picker::SessionPickerState;
 use super::slash_command::SlashCommandCatalog;
@@ -62,6 +67,17 @@ const FIRST_DELEGATION_NOTICE_GRACE_SECS: i64 = 60;
 const DELEGATION_NOTICE_PREFIX: &str = "Subagent ";
 const SKILLS_NAME_COL_WIDTH: usize = 28;
 const SKILLS_DESC_COL_WIDTH: usize = 77;
+const RECAP_ENQUEUE_WARNING: &str = "Background recap could not be queued and will retry later.";
+const FINALIZING_RESUME_ERROR: &str =
+    "This session is still finalizing; wait for finalization to complete before resuming.";
+
+fn foreground_finalizing_resume_error(session_id: &SessionId) -> String {
+    format!("{session_id} is still finalizing foreground; Try again after its completion.")
+}
+
+pub(super) fn recap_enqueue_warning(result: &anyhow::Result<()>) -> Option<&'static str> {
+    result.as_ref().err().map(|_| RECAP_ENQUEUE_WARNING)
+}
 
 fn is_ctrl_c_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
@@ -177,10 +193,21 @@ struct SessionTuiApp {
     start_handle: Option<JoinHandle<()>>,
     resume_handle: Option<JoinHandle<()>>,
     session: Option<crate::session::SessionHandle>,
+    _runtime_lease: Option<crate::session::SessionRuntimeLease>,
+    current_session_has_real_user_input: bool,
+    resume_switch_pending: bool,
+    resume_input_boundary: Option<u64>,
+    discarded_resume_input_sequences: BTreeSet<u64>,
+    finalize_continuation: Option<SessionFinalizeContinuation>,
     session_task: SessionTaskState,
     session_picker: Option<SessionPickerState>,
+    resume_picker_on_failure: Option<SessionPickerState>,
+    direct_resume_pending: bool,
+    deferred_direct_resume_startup_warnings: Vec<String>,
     mcp_manager: Option<Arc<McpConnectionManager>>,
     mcp_operation_tasks: JoinSet<()>,
+    /// Ctrl+O 任务独立保留临时路径，确保 completion 尚未被事件循环消费时退出也能清理。
+    preview_tasks: JoinSet<Vec<PathBuf>>,
     supervisor: Option<SupervisorLaunchConfig>,
     cleanup_housekeeping: Option<SessionCleanupHousekeepingConfig>,
     cleanup_activity: SessionCleanupActivity,
@@ -204,6 +231,23 @@ struct SessionTuiApp {
     /// 每个 optimistic `/ps` terminate 都必须先实际绘制一帧，再允许 worker 覆盖为
     /// authoritative snapshot；不能用时间延迟猜测 TUI 是否已经完成 draw。
     process_termination_render_acks: BTreeMap<u64, oneshot::Sender<()>>,
+}
+
+enum SessionSwitchTarget {
+    New,
+    Resume(Box<ResumeSessionReservation>),
+}
+
+enum FinalizeContinuation<T> {
+    Exit,
+    Switch(T),
+}
+
+type SessionFinalizeContinuation = FinalizeContinuation<SessionSwitchTarget>;
+
+enum FinalizeSuccessAction<T> {
+    Exit,
+    Install(T),
 }
 
 enum PendingInputSubmission {
@@ -234,10 +278,12 @@ impl SessionTuiApp {
         supervisor: Option<SupervisorLaunchConfig>,
         cleanup_housekeeping: Option<SessionCleanupHousekeepingConfig>,
     ) -> anyhow::Result<Self> {
+        let direct_resume_pending = matches!(&startup_resume, StartupResume::Session(_));
         let tui = Tui::enter()?;
         let (app_event_tx, app_event_rx) = AppEventSender::channel();
         let cleanup_activity = SessionCleanupActivity::new();
         let mut chat_widget = ChatWidget::new(app_event_tx);
+        chat_widget.set_startup_scrollback_visible(!direct_resume_pending);
         chat_widget.set_tui_config(tui_config);
         chat_widget.state_mut().set_at_path_completion_config(
             engine.workspace_root().to_path_buf(),
@@ -259,6 +305,7 @@ impl SessionTuiApp {
                 .map(|skill| (skill.name.as_str(), skill.description.as_str())),
         );
         let mcp_manager = engine.mcp_manager();
+        let mut deferred_direct_resume_startup_warnings = Vec::new();
         if let Some(manager) = &mcp_manager {
             let snapshot = manager.snapshot_sync();
             let warnings = mcp_startup_warnings(&snapshot);
@@ -266,9 +313,11 @@ impl SessionTuiApp {
                 .state_mut()
                 .set_mcp_runtime(manager.config_path().to_path_buf(), snapshot);
             for warning in warnings {
-                chat_widget
-                    .state_mut()
-                    .push_system(format!("Warning: {warning}"));
+                let warning = format!("Warning: {warning}");
+                if direct_resume_pending {
+                    deferred_direct_resume_startup_warnings.push(warning.clone());
+                }
+                chat_widget.state_mut().push_system(warning);
             }
         }
         chat_widget.handle_session_event(SessionEvent::StartupProgress {
@@ -286,10 +335,20 @@ impl SessionTuiApp {
             start_handle: None,
             resume_handle: None,
             session: None,
+            _runtime_lease: None,
+            current_session_has_real_user_input: false,
+            resume_switch_pending: false,
+            resume_input_boundary: None,
+            discarded_resume_input_sequences: BTreeSet::new(),
+            finalize_continuation: None,
             session_task: SessionTaskState::default(),
             session_picker: None,
+            resume_picker_on_failure: None,
+            direct_resume_pending,
+            deferred_direct_resume_startup_warnings,
             mcp_manager,
             mcp_operation_tasks: JoinSet::new(),
+            preview_tasks: JoinSet::new(),
             supervisor,
             cleanup_housekeeping,
             cleanup_activity,
@@ -420,11 +479,7 @@ impl SessionTuiApp {
         if let Some(handle) = self.resize_render_handle.take() {
             handle.abort();
         }
-        // 预览时临时落盘的剪贴板图片在退出前统一清理，不留敏感内容。
-        // Preview.app 已把内容载入内存，删除底层文件不影响已打开的窗口。
-        for path in self.preview_temp_files.drain(..) {
-            let _ = tokio::fs::remove_file(path).await;
-        }
+        cleanup_preview_temp_files(&mut self.preview_temp_files, &mut self.preview_tasks).await;
         // `/exit` 会在 finalize 中按 session 收束；这里覆盖 TUI 初始化/事件循环失败及
         // 正常 runtime 返回，避免受管 terminal 仅因没有走到 finalize 而存活到宿主退出。
         self.engine.shutdown_background_processes().await;
@@ -561,10 +616,26 @@ impl SessionTuiApp {
                 if !self.session_task.current_task_matches(task_id) {
                     return Ok(false);
                 }
+                if let SessionEvent::RecapRequested {
+                    session_id,
+                    recap_end_index,
+                } = &event
+                {
+                    spawn_recap_enqueue_worker(
+                        self.supervisor.clone(),
+                        session_id.clone(),
+                        *recap_end_index,
+                        self.worker_tx.clone(),
+                    );
+                    return Ok(false);
+                }
                 if let Some(turn_id) = task_id {
                     if let SessionEvent::TurnCommitted { .. } = &event {
                         self.session_task.mark_turn_committed(turn_id);
                     }
+                }
+                if matches!(&event, SessionEvent::UserMessageAccepted { .. }) {
+                    self.current_session_has_real_user_input = true;
                 }
                 let should_restore_late_async_inputs = matches!(
                     &event,
@@ -604,7 +675,9 @@ impl SessionTuiApp {
                             status: report.inbox_report.team_services,
                         },
                     );
+                    self._runtime_lease = Some(report.runtime_lease);
                     self.session = Some(report.session);
+                    self.current_session_has_real_user_input = false;
                     self.start_handle = None;
                     self.chat_widget
                         .handle_session_event(SessionEvent::StatusChanged {
@@ -641,58 +714,138 @@ impl SessionTuiApp {
                 ));
                 self.tui.render_requester().schedule_render();
             }
-            WorkerEvent::ResumeSessionLoaded { result } => {
+            WorkerEvent::ResumeListFailed(error) => {
                 self.resume_handle = None;
+                let state = self.chat_widget.state_mut();
+                if self.session.is_none() {
+                    state.status = SessionRuntimeStatus::Error;
+                }
+                state.push_error(format!("Resume failed: {error:#}"));
+                self.restore_queued_inputs_after_resume_interrupted();
+                self.mark_pending_async_inputs_for_restore();
+                self.tui.render_requester().schedule_render();
+            }
+            WorkerEvent::ResumeFinalizingStarted { session_id } => {
+                self.chat_widget
+                    .state_mut()
+                    .begin_target_resume_wait(session_id.as_str());
+                self.tui.render_requester().schedule_render();
+            }
+            WorkerEvent::ResumeSessionReserved { result } => {
+                self.resume_handle = None;
+                let is_session_switch = std::mem::take(&mut self.resume_switch_pending);
+                let is_direct_resume = std::mem::take(&mut self.direct_resume_pending);
                 match result {
-                    Ok(outcome) => {
-                        self.invalidate_process_panel_snapshot();
-                        let state = self.chat_widget.state_mut();
-                        state.reset_for_resumed_session();
-                        state.session_id = Some(outcome.session.metadata.id.to_string());
-                        state.agent_id = Some(outcome.session.metadata.agent_id.to_string());
-                        state.model_name = Some(self.engine.session_model().to_string());
-                        state.set_context_window(self.engine.context_window());
-                        state.message_count = outcome.session.metadata.message_count;
-                        state.turn_count = outcome.turn_count;
-                        state.status = SessionRuntimeStatus::Open;
-                        state.apply_event(SessionEvent::TeamServicesConnectionUpdated {
-                            status: outcome.inbox_report.team_services,
-                        });
-                        for warning in &outcome.inbox_report.warnings {
-                            state.apply_event(SessionEvent::Warning {
-                                message: warning.clone(),
-                            });
-                        }
-                        if let Some(total) = outcome.local_claim_count {
-                            state.apply_event(SessionEvent::LocalClaimsUpdated { total });
-                        }
-                        if let Some(used_tokens) = outcome.context_used_tokens {
-                            state.apply_event(SessionEvent::ContextUsageUpdated { used_tokens });
-                        }
-                        state.push_historical_timeline_turns(&outcome.last_turns);
-                        if let Some(warning) = outcome.journal_warning {
-                            state.push_system(warning);
-                        }
-                        state.push_system(format!(
-                            "Session {} resumed.",
-                            outcome.session.metadata.id
-                        ));
-                        self.session = Some(outcome.session);
-                        self.maybe_dispatch_next_queued_input()?;
-                        self.tui.draw_after_state_reload(
-                            &mut self.chat_widget,
-                            self.session_picker.as_ref(),
-                        )?;
-                        return Ok(false);
+                    Ok(reservation) if is_session_switch => {
+                        self.resume_picker_on_failure = None;
+                        // A 已可接管但 B 尚未完成 handoff。保留 submission 边界到 A
+                        // 完成安装，让此前已经 Enter、仍在异步预处理的输入即使晚于
+                        // B 进入 Finalizing 返回，也只能进入目标 A 的既有队列。
+                        self.continue_session_switch(SessionSwitchTarget::Resume(Box::new(
+                            reservation,
+                        )))?;
                     }
-                    Err(e) => {
-                        self.chat_widget
-                            .state_mut()
-                            .push_error(format!("Resume failed: {e:#}"));
+                    Ok(reservation) => {
+                        self.resume_picker_on_failure = None;
+                        self.resume_input_boundary = None;
+                        self.chat_widget.set_startup_scrollback_visible(true);
+                        self.begin_resume_session_startup(reservation)?;
+                    }
+                    Err(failure) if failure.finalizing_target => {
+                        log::warn!(
+                            target: "session_tui",
+                            "Finalizing session resume failed: {:#}",
+                            failure.error
+                        );
+                        self.discard_inputs_from_resume_wait();
+                        let message = if failure.foreground_finalizing {
+                            foreground_finalizing_resume_error(&failure.target_session_id)
+                        } else {
+                            FINALIZING_RESUME_ERROR.to_string()
+                        };
+                        if is_direct_resume {
+                            self.resume_picker_on_failure = None;
+                            self.restore_queued_inputs_after_resume_interrupted();
+                            if !failure.foreground_finalizing {
+                                self.chat_widget.set_startup_scrollback_visible(true);
+                                self.tui
+                                    .draw(&mut self.chat_widget, self.session_picker.as_ref())?;
+                            }
+                            anyhow::bail!(message);
+                        }
+                        let state = self.chat_widget.state_mut();
+                        if self.session.is_some() {
+                            state.apply_event(SessionEvent::StatusChanged {
+                                status: SessionRuntimeStatus::Open,
+                            });
+                        } else {
+                            state.status = SessionRuntimeStatus::Error;
+                        }
+                        if let Some(mut picker) = self.resume_picker_on_failure.take() {
+                            picker.set_selected_inline_error(message);
+                            self.session_picker = Some(picker);
+                        } else {
+                            state.push_error(message);
+                        }
+                        // 选择 Finalizing 目标前已经排队的 B 输入不属于等待期；恢复到
+                        // 当前 composer。边界后的输入已在上面清除，不会被恢复。
+                        self.restore_queued_inputs_after_resume_interrupted();
+                    }
+                    Err(failure) => {
+                        self.resume_picker_on_failure = None;
+                        self.resume_input_boundary = None;
+                        if is_direct_resume {
+                            self.chat_widget.set_startup_scrollback_visible(true);
+                        }
+                        let state = self.chat_widget.state_mut();
+                        if self.session.is_none() {
+                            state.status = SessionRuntimeStatus::Error;
+                        }
+                        state.push_error(format!("Resume failed: {:#}", failure.error));
                         self.restore_queued_inputs_after_resume_interrupted();
                         self.mark_pending_async_inputs_for_restore();
                     }
                 }
+                self.tui.render_requester().schedule_render();
+            }
+            WorkerEvent::ResumeHistoryLoaded { result } => {
+                self.resume_handle = None;
+                match result {
+                    Ok(outcome) => self.install_resume_history_and_start_inbox(outcome)?,
+                    Err(error) => {
+                        self.resume_input_boundary = None;
+                        let state = self.chat_widget.state_mut();
+                        state.status = SessionRuntimeStatus::Error;
+                        state.push_error(format!("Resume failed: {error:#}"));
+                        state.restore_queued_inputs_to_composer();
+                        self.mark_pending_async_inputs_for_restore();
+                        self.tui.render_requester().schedule_render();
+                    }
+                }
+            }
+            WorkerEvent::ResumeInboxFinished { session, result } => {
+                self.resume_handle = None;
+                self.session = Some(session);
+                self.current_session_has_real_user_input = true;
+                let mut warnings = Vec::new();
+                if let Err(error) = result {
+                    log::warn!(target: "session_tui", "Resume inbox sync failed: {error:#}");
+                    warnings.push("Warning: Inbox sync failed; run /inbox to retry.".into());
+                }
+                warnings.append(&mut self.deferred_direct_resume_startup_warnings);
+                let has_warnings = !warnings.is_empty();
+                self.chat_widget
+                    .state_mut()
+                    .finish_resume_inbox_with_warnings(warnings);
+                // 目标 A 已安装且进入 Open；此后才返回的 submission 会自然按 A
+                // 的普通输入语义处理，不再需要 handoff 强制排队。
+                self.resume_input_boundary = None;
+                if has_warnings {
+                    // Direct Resume 的启动 warning 必须先实际绘制，再允许等待期输入进入 A。
+                    self.tui
+                        .draw(&mut self.chat_widget, self.session_picker.as_ref())?;
+                }
+                self.maybe_dispatch_next_queued_input()?;
                 self.tui.render_requester().schedule_render();
             }
             WorkerEvent::TurnFinished { turn_id, result } => {
@@ -760,16 +913,20 @@ impl SessionTuiApp {
                     if !self.session_task.finish_finalize(task_id) {
                         return Ok(false);
                     }
-                    // Finalize worker 会先发 SessionClosed，再发 FinalizeFinished。SessionClosed
-                    // 只排队重绘；这里退出前必须同步画最后一帧，避免 drop 时清掉尚未落入
-                    // scrollback 的 "{session_id} closed"。
-                    self.tui
-                        .draw(&mut self.chat_widget, self.session_picker.as_ref())?;
-                    return Ok(true);
+                    let continuation = self
+                        .finalize_continuation
+                        .take()
+                        .unwrap_or(FinalizeContinuation::Exit);
+                    return self.complete_finalize_continuation(continuation);
                 }
                 Err(e) => {
                     if !self.session_task.finish_finalize(task_id) {
                         return Ok(false);
+                    }
+                    if let Some(FinalizeContinuation::Switch(target)) =
+                        self.finalize_continuation.take()
+                    {
+                        self.restore_after_switch_finalize_failure(target);
                     }
                     self.chat_widget
                         .handle_session_event(SessionEvent::StatusChanged {
@@ -789,24 +946,53 @@ impl SessionTuiApp {
                 }
                 match result {
                     FinalizeEnqueueOutcome::Enqueued { job_id, session_id } => {
-                        self.chat_widget
-                            .state_mut()
-                            .push_system(finalize_enqueue_exit_message(&job_id, &session_id));
-                        self.tui
-                            .draw(&mut self.chat_widget, self.session_picker.as_ref())?;
-                        return Ok(true);
+                        let continuation = self
+                            .finalize_continuation
+                            .take()
+                            .unwrap_or(FinalizeContinuation::Exit);
+                        match finalize_success_action(continuation) {
+                            FinalizeSuccessAction::Exit => {
+                                self.chat_widget.state_mut().push_system(
+                                    finalize_enqueue_exit_message(&job_id, &session_id),
+                                );
+                                self.tui
+                                    .draw(&mut self.chat_widget, self.session_picker.as_ref())?;
+                                return Ok(true);
+                            }
+                            FinalizeSuccessAction::Install(target) => {
+                                self.begin_session_switch_target(target)?;
+                                return Ok(false);
+                            }
+                        }
                     }
                     FinalizeEnqueueOutcome::Fallback { session, error } => {
                         self.chat_widget.state_mut().push_system(format!(
                             "Background finalize unavailable, finalizing here: {error:#}"
                         ));
                         self.tui.render_requester().schedule_render();
+                        let runtime_lease = self.runtime_lease_for_worker()?;
                         self.session_task.spawn_tracked_finalize(
                             self.engine.clone(),
                             *session,
+                            runtime_lease,
                             self.worker_tx.clone(),
                         );
                     }
+                }
+            }
+            WorkerEvent::RecapEnqueueFinished { session_id, result } => {
+                if !recap_enqueue_result_belongs_to_visible_session(
+                    self.chat_widget.state().session_id.as_deref(),
+                    &session_id,
+                ) {
+                    return Ok(false);
+                }
+                if let Some(message) = recap_enqueue_warning(&result) {
+                    self.chat_widget
+                        .handle_session_event(SessionEvent::Warning {
+                            message: message.to_string(),
+                        });
+                    self.tui.render_requester().schedule_render();
                 }
             }
             WorkerEvent::CompactFinished { task_id, result } => {
@@ -892,9 +1078,17 @@ impl SessionTuiApp {
                 self.handle_ready_steer_input(sequence, input).await?
             }
             AppEvent::ClipboardImageRead {
+                interaction_generation,
                 input_revision,
                 result,
             } => {
+                if !interaction_event_belongs_to_current(
+                    self.chat_widget.state().interaction_generation(),
+                    interaction_generation,
+                ) {
+                    self.chat_widget.state_mut().discard_clipboard_image_read();
+                    return Ok(false);
+                }
                 self.chat_widget
                     .state_mut()
                     .apply_clipboard_image_read(input_revision, result);
@@ -933,41 +1127,71 @@ impl SessionTuiApp {
                 self.handle_at_path_resolved(sequence, expanded_input, draft, result)
                     .await?
             }
-            AppEvent::PreviewAttachment(targets) => {
+            AppEvent::PreviewAttachment {
+                interaction_generation,
+                targets,
+            } => {
                 let tx = self.chat_widget.event_tx();
                 let workspace_root = self.engine.workspace_root().to_path_buf();
-                tokio::spawn(async move {
-                    tx.preview_launched(preview_attachments_task(targets, workspace_root).await);
-                });
+                spawn_preview_task(
+                    &mut self.preview_tasks,
+                    tx,
+                    interaction_generation,
+                    targets,
+                    workspace_root,
+                );
             }
-            AppEvent::PreviewLaunched(result) => match result {
-                Ok(files) => {
-                    let labels = files
-                        .iter()
-                        .map(|file| file.label.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let hint = if files.len() > 1 {
-                        format!("已在默认应用打开 {} 个附件: {labels}", files.len())
-                    } else {
-                        format!("已在默认应用打开: {labels}")
-                    };
-                    self.chat_widget.state_mut().push_system(hint);
-                    for file in files {
-                        if file.temporary {
-                            self.preview_temp_files.push(file.path);
+            AppEvent::PreviewLaunched {
+                interaction_generation,
+                result,
+            } => {
+                self.preview_temp_files
+                    .extend(preview_temporary_paths(&result));
+                match result {
+                    Ok(files) => {
+                        if !interaction_event_belongs_to_current(
+                            self.chat_widget.state().interaction_generation(),
+                            interaction_generation,
+                        ) {
+                            return Ok(false);
                         }
+                        let labels = files
+                            .iter()
+                            .map(|file| file.label.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let hint = if files.len() > 1 {
+                            format!("已在默认应用打开 {} 个附件: {labels}", files.len())
+                        } else {
+                            format!("已在默认应用打开: {labels}")
+                        };
+                        self.chat_widget.state_mut().push_system(hint);
+                        self.tui.render_requester().schedule_render();
                     }
-                    self.tui.render_requester().schedule_render();
+                    Err(failure) => {
+                        if !interaction_event_belongs_to_current(
+                            self.chat_widget.state().interaction_generation(),
+                            interaction_generation,
+                        ) {
+                            return Ok(false);
+                        }
+                        self.chat_widget
+                            .state_mut()
+                            .push_error(format!("Preview failed: {}", failure.message));
+                        self.tui.render_requester().schedule_render();
+                    }
                 }
-                Err(message) => {
-                    self.chat_widget
-                        .state_mut()
-                        .push_error(format!("Preview failed: {message}"));
-                    self.tui.render_requester().schedule_render();
+            }
+            AppEvent::ClipboardTextWritten {
+                interaction_generation,
+                result,
+            } => {
+                if !interaction_event_belongs_to_current(
+                    self.chat_widget.state().interaction_generation(),
+                    interaction_generation,
+                ) {
+                    return Ok(false);
                 }
-            },
-            AppEvent::ClipboardTextWritten(result) => {
                 match result {
                     Ok(()) => self
                         .chat_widget
@@ -1017,11 +1241,16 @@ impl SessionTuiApp {
             AppEvent::ExitRequested => return self.request_exit(),
             AppEvent::InterruptRequested => return Ok(self.interrupt()),
             AppEvent::PickerSessionSelected(session_id) => {
-                self.session_picker = None;
+                self.resume_picker_on_failure = self.session_picker.take().map(|mut picker| {
+                    picker.clear_inline_error();
+                    picker
+                });
+                self.chat_widget.state_mut().bump_interaction_generation();
                 self.start_resume_open(session_id)?;
             }
             AppEvent::PickerCancelled => {
                 self.session_picker = None;
+                self.resume_picker_on_failure = None;
                 self.restore_queued_inputs_after_resume_interrupted();
                 self.tui.render_requester().schedule_render();
             }
@@ -1040,6 +1269,10 @@ impl SessionTuiApp {
         draft: InputDraft,
         result: Result<ResolvedAtPaths, String>,
     ) -> anyhow::Result<()> {
+        if self.discarded_resume_input_sequences.remove(&sequence) {
+            self.flush_ready_input_submissions()?;
+            return Ok(());
+        }
         let restore_to_composer = self.take_pending_async_input_restore(sequence);
         match result {
             Ok(resolved) => {
@@ -1087,6 +1320,10 @@ impl SessionTuiApp {
         sequence: u64,
         input: QueuedInput,
     ) -> anyhow::Result<()> {
+        if self.discarded_resume_input_sequences.remove(&sequence) {
+            self.flush_ready_input_submissions()?;
+            return Ok(());
+        }
         self.pending_input_submissions.insert(
             sequence,
             PendingInputSubmission::Ready {
@@ -1105,6 +1342,10 @@ impl SessionTuiApp {
         sequence: u64,
         input: QueuedInput,
     ) -> anyhow::Result<()> {
+        if self.discarded_resume_input_sequences.remove(&sequence) {
+            self.flush_ready_input_submissions()?;
+            return Ok(());
+        }
         if !input.attachments().is_empty() {
             let state = self.chat_widget.state_mut();
             state.set_status_notice(ATTACHMENT_STEER_QUEUE_NOTICE);
@@ -1319,6 +1560,16 @@ impl SessionTuiApp {
         if finalize_failed {
             return Ok(());
         }
+        if resume_input_submission_forces_queue(
+            self.resume_handle.is_some(),
+            self.chat_widget.state().status,
+            self.resume_input_boundary,
+            input.submission_sequence(),
+        ) {
+            self.chat_widget.state_mut().queue_pending_turn(input);
+            self.tui.render_requester().schedule_render();
+            return Ok(());
+        }
         let dispatch_blocked = input_dispatch_is_blocked(
             self.session_task.task_running(),
             self.start_handle.is_some(),
@@ -1404,6 +1655,12 @@ impl SessionTuiApp {
                     .settle_turn_animation_before_command();
                 self.copy_last_assistant_response();
             }
+            InputAction::New => {
+                self.chat_widget
+                    .state_mut()
+                    .settle_turn_animation_before_command();
+                self.start_new_session()?;
+            }
             InputAction::Resume => {
                 self.chat_widget
                     .state_mut()
@@ -1414,7 +1671,7 @@ impl SessionTuiApp {
                 self.chat_widget
                     .state_mut()
                     .settle_turn_animation_before_command();
-                self.start_finalize()?;
+                self.start_finalize(FinalizeContinuation::Exit)?;
             }
             InputAction::Help => {
                 let state = self.chat_widget.state_mut();
@@ -1678,6 +1935,13 @@ impl SessionTuiApp {
             && self.chat_widget.state().input_accepts_text()
     }
 
+    fn runtime_lease_for_worker(&self) -> anyhow::Result<crate::session::SessionRuntimeLease> {
+        self._runtime_lease
+            .as_ref()
+            .map(crate::session::SessionRuntimeLease::clone_for_worker)
+            .ok_or_else(|| anyhow::anyhow!("session runtime lease is unavailable"))
+    }
+
     fn maybe_dispatch_next_queued_input(&mut self) -> anyhow::Result<()> {
         while self.session_can_dispatch_input() {
             let Some(next_input) = self.chat_widget.state_mut().pop_queued_turn() else {
@@ -1705,10 +1969,33 @@ impl SessionTuiApp {
         self.mark_pending_async_inputs_for_restore();
     }
 
+    fn discard_inputs_from_resume_wait(&mut self) -> usize {
+        let Some(start) = self.resume_input_boundary.take() else {
+            return 0;
+        };
+        let end = self.chat_widget.state().current_input_submission_sequence();
+        if start >= end {
+            return 0;
+        }
+        self.chat_widget
+            .state_mut()
+            .discard_queued_inputs_in_submission_range(start, end);
+        self.pending_input_submissions
+            .retain(|sequence, _| !(start..end).contains(sequence));
+        self.deferred_input_restores
+            .retain(|sequence, _| !(start..end).contains(sequence));
+        for sequence in start..end {
+            self.discarded_resume_input_sequences.insert(sequence);
+            self.skip_input_submission_sequence(sequence);
+        }
+        usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX)
+    }
+
     fn start_turn(&mut self, input: QueuedInput) -> anyhow::Result<()> {
         let Some(session) = self.session.clone() else {
             return Ok(());
         };
+        let runtime_lease = self.runtime_lease_for_worker()?;
         let visible_text = input.command_text().to_string();
         self.chat_widget
             .state_mut()
@@ -1718,6 +2005,7 @@ impl SessionTuiApp {
         self.session_task.spawn_tracked_turn(
             self.engine.clone(),
             session,
+            runtime_lease,
             input,
             self.worker_tx.clone(),
         );
@@ -1728,11 +2016,13 @@ impl SessionTuiApp {
         let Some(session) = self.session.clone() else {
             return Ok(());
         };
+        let runtime_lease = self.runtime_lease_for_worker()?;
         self.tui
             .draw(&mut self.chat_widget, self.session_picker.as_ref())?;
         self.session_task.spawn_tracked_user_shell_command(
             self.engine.clone(),
             session,
+            runtime_lease,
             command,
             self.worker_tx.clone(),
         );
@@ -1746,7 +2036,7 @@ impl SessionTuiApp {
         if self.resume_handle.is_some() {
             self.chat_widget
                 .state_mut()
-                .push_system("Resume is running, please wait");
+                .push_system("Session switch is running, please wait");
             self.tui.render_requester().schedule_render();
             return Ok(false);
         }
@@ -1770,7 +2060,7 @@ impl SessionTuiApp {
             self.chat_widget
                 .state_mut()
                 .settle_turn_animation_before_command();
-            self.start_finalize()
+            self.start_finalize(FinalizeContinuation::Exit)
         } else {
             self.chat_widget
                 .state_mut()
@@ -1784,9 +2074,11 @@ impl SessionTuiApp {
         let Some(session) = self.session.clone() else {
             return Ok(());
         };
+        let runtime_lease = self.runtime_lease_for_worker()?;
         self.session_task.spawn_tracked_compact(
             self.engine.clone(),
             session,
+            runtime_lease,
             self.worker_tx.clone(),
         );
         self.tui.render_requester().schedule_render();
@@ -1797,10 +2089,162 @@ impl SessionTuiApp {
         let Some(session) = self.session.clone() else {
             return Ok(());
         };
-        self.session_task
-            .spawn_tracked_inbox(self.engine.clone(), session, self.worker_tx.clone());
+        let runtime_lease = self.runtime_lease_for_worker()?;
+        self.session_task.spawn_tracked_inbox(
+            self.engine.clone(),
+            session,
+            runtime_lease,
+            self.worker_tx.clone(),
+        );
         self.tui.render_requester().schedule_render();
         Ok(())
+    }
+
+    fn continue_session_switch(&mut self, target: SessionSwitchTarget) -> anyhow::Result<()> {
+        let current_is_empty = !current_session_has_content(
+            self.session
+                .as_ref()
+                .map(|session| session.metadata.message_count),
+            self.current_session_has_real_user_input,
+        );
+        if current_is_empty {
+            let target_deletes_old_session = matches!(
+                &target,
+                SessionSwitchTarget::Resume(reservation)
+                    if reservation.temporary_session_id.is_some()
+            );
+            let old_session_id = self
+                .session
+                .as_ref()
+                .map(|session| session.metadata.id.clone());
+            self.begin_session_switch_target(target)?;
+            if let Some(session_id) = old_session_id.filter(|_| !target_deletes_old_session) {
+                self.schedule_empty_session_delete(session_id, "切换后临时空 session");
+            }
+            return Ok(());
+        }
+        self.start_finalize(FinalizeContinuation::Switch(target))?;
+        Ok(())
+    }
+
+    fn begin_session_switch_target(&mut self, target: SessionSwitchTarget) -> anyhow::Result<()> {
+        match target {
+            SessionSwitchTarget::New => self.begin_new_session_startup()?,
+            SessionSwitchTarget::Resume(reservation) => {
+                self.begin_resume_session_startup(*reservation)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn begin_new_session_startup(&mut self) -> anyhow::Result<()> {
+        self.invalidate_process_panel_snapshot();
+        self.session = None;
+        self._runtime_lease = None;
+        self.current_session_has_real_user_input = false;
+        let state = self.chat_widget.state_mut();
+        state.reset_for_session_switch();
+        state.session_id = None;
+        state.agent_id = Some(self.engine.agent_id().to_string());
+        state.model_name = Some(self.engine.session_model().to_string());
+        state.set_context_window(self.engine.context_window());
+        state.message_count = 0;
+        state.turn_count = 0;
+        state.apply_event(SessionEvent::StartupProgress {
+            label: "initializing agent...".into(),
+        });
+        self.tui
+            .draw_after_state_reload(&mut self.chat_widget, self.session_picker.as_ref())?;
+        self.start_handle = Some(spawn_start_worker(
+            self.engine.clone(),
+            self.max_attempts,
+            self.worker_tx.clone(),
+        ));
+        Ok(())
+    }
+
+    fn begin_resume_session_startup(
+        &mut self,
+        mut reservation: ResumeSessionReservation,
+    ) -> anyhow::Result<()> {
+        self.invalidate_process_panel_snapshot();
+        let temporary_session_id = reservation.temporary_session_id.take();
+        self.session = Some(reservation.session);
+        self._runtime_lease = Some(reservation.runtime_lease);
+        self.current_session_has_real_user_input = true;
+        let session = self
+            .session
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("resume target session is unavailable"))?;
+        let state = self.chat_widget.state_mut();
+        state.reset_for_session_switch();
+        state.session_id = Some(session.metadata.id.to_string());
+        state.agent_id = Some(session.metadata.agent_id.to_string());
+        state.model_name = Some(self.engine.session_model().to_string());
+        state.set_context_window(self.engine.context_window());
+        state.message_count = session.metadata.message_count;
+        state.turn_count = 0;
+        state.apply_event(SessionEvent::StartupProgress {
+            label: "loading session history...".into(),
+        });
+        if let Some(session_id) = temporary_session_id {
+            self.schedule_empty_session_delete(session_id, "Resume 后临时空 session");
+        }
+        self.tui
+            .draw_after_state_reload(&mut self.chat_widget, self.session_picker.as_ref())?;
+        self.resume_handle = Some(spawn_resume_history_worker(
+            self.engine.clone(),
+            session,
+            self.worker_tx.clone(),
+        ));
+        Ok(())
+    }
+
+    fn install_resume_history_and_start_inbox(
+        &mut self,
+        outcome: ResumeHistoryOutcome,
+    ) -> anyhow::Result<()> {
+        let session = outcome.session;
+        let state = self.chat_widget.state_mut();
+        state.message_count = session.metadata.message_count;
+        state.turn_count = outcome.turn_count;
+        if let Some(total) = outcome.local_claim_count {
+            state.apply_event(SessionEvent::LocalClaimsUpdated { total });
+        }
+        if let Some(used_tokens) = outcome.context_used_tokens {
+            state.apply_event(SessionEvent::ContextUsageUpdated { used_tokens });
+        }
+        state.push_historical_timeline_turns(&outcome.last_turns);
+        if let Some(warning) = outcome.journal_warning {
+            state.push_system(warning);
+        }
+        state.push_system(format!("Session {} resumed.", session.metadata.id));
+        self.session = Some(session.clone());
+        self.tui
+            .draw_after_state_reload(&mut self.chat_widget, self.session_picker.as_ref())?;
+        self.resume_handle = Some(spawn_resume_inbox_worker(
+            self.engine.clone(),
+            session,
+            self.worker_tx.clone(),
+        ));
+        Ok(())
+    }
+
+    fn schedule_empty_session_delete(&self, session_id: SessionId, context: &'static str) {
+        let engine = self.engine.clone();
+        tokio::spawn(async move {
+            match engine.delete_empty_session(&session_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    log::warn!(target: "session_tui", "{context} 未被删除: {session_id}")
+                }
+                Err(error) => log::warn!(
+                    target: "session_tui",
+                    "删除{context}失败 ({session_id}): {error:#}"
+                ),
+            }
+        });
     }
 
     fn start_resume(&mut self) -> anyhow::Result<()> {
@@ -1811,21 +2255,14 @@ impl SessionTuiApp {
             self.tui.render_requester().schedule_render();
             return Ok(());
         }
-        if self.session_task.task_running() || self.resume_handle.is_some() {
-            self.chat_widget
-                .state_mut()
-                .push_system("A task is running, please wait.");
-            self.tui.render_requester().schedule_render();
-            return Ok(());
-        }
-        if self
-            .session
-            .as_ref()
-            .is_some_and(|session| session.metadata.message_count != 0)
+        if self.session_task.task_running()
+            || self.resume_handle.is_some()
+            || self.resume_switch_pending
+            || self.finalize_continuation.is_some()
         {
             self.chat_widget
                 .state_mut()
-                .push_system("Please /exit the current session before resuming.");
+                .push_system("A task is running, please wait.");
             self.tui.render_requester().schedule_render();
             return Ok(());
         }
@@ -1843,29 +2280,69 @@ impl SessionTuiApp {
             self.tui.render_requester().schedule_render();
             return Ok(());
         }
-        if self
-            .session
-            .as_ref()
-            .is_some_and(|session| session.metadata.message_count != 0)
-        {
-            self.chat_widget
-                .state_mut()
-                .push_system("Please /exit the current session before resuming.");
-            self.tui.render_requester().schedule_render();
-            return Ok(());
-        }
         let temporary_session_id = self
             .session
             .as_ref()
-            .filter(|session| session.metadata.message_count == 0)
+            .filter(|session| {
+                !current_session_has_content(
+                    Some(session.metadata.message_count),
+                    self.current_session_has_real_user_input,
+                )
+            })
             .map(|session| session.metadata.id.clone());
-        self.resume_handle = Some(spawn_resume_open_worker(
+        self.resume_switch_pending = self.session.is_some();
+        self.resume_input_boundary =
+            Some(self.chat_widget.state().current_input_submission_sequence());
+        self.resume_handle = Some(spawn_resume_preflight_worker(
             self.engine.clone(),
             session_id,
             temporary_session_id,
+            self.supervisor.clone(),
             self.worker_tx.clone(),
         ));
         self.tui.render_requester().schedule_render();
+        Ok(())
+    }
+
+    fn start_new_session(&mut self) -> anyhow::Result<()> {
+        if self.start_handle.is_some() {
+            self.chat_widget
+                .state_mut()
+                .push_system("Session still initializing, please wait.");
+            self.tui.render_requester().schedule_render();
+            return Ok(());
+        }
+        if self.session.is_none()
+            || self.session_task.task_running()
+            || self.resume_handle.is_some()
+            || self.resume_switch_pending
+            || self.finalize_continuation.is_some()
+        {
+            self.chat_widget
+                .state_mut()
+                .push_system("A task is running, please wait.");
+            self.tui.render_requester().schedule_render();
+            return Ok(());
+        }
+        self.chat_widget.state_mut().bump_interaction_generation();
+        let current_is_empty = !current_session_has_content(
+            self.session
+                .as_ref()
+                .map(|session| session.metadata.message_count),
+            self.current_session_has_real_user_input,
+        );
+        if current_is_empty {
+            let old_session_id = self
+                .session
+                .as_ref()
+                .map(|session| session.metadata.id.clone());
+            self.begin_new_session_startup()?;
+            if let Some(session_id) = old_session_id {
+                self.schedule_empty_session_delete(session_id, "切换后临时空 session");
+            }
+        } else {
+            self.start_finalize(FinalizeContinuation::Switch(SessionSwitchTarget::New))?;
+        }
         Ok(())
     }
 
@@ -1952,12 +2429,52 @@ impl SessionTuiApp {
             return;
         };
         let tx = self.chat_widget.event_tx();
+        let interaction_generation = self.chat_widget.state().interaction_generation();
         tokio::spawn(async move {
-            tx.clipboard_text_written(write_text_to_clipboard(text).await);
+            tx.clipboard_text_written(interaction_generation, write_text_to_clipboard(text).await);
         });
     }
 
-    fn start_finalize(&mut self) -> anyhow::Result<bool> {
+    fn complete_finalize_continuation(
+        &mut self,
+        continuation: SessionFinalizeContinuation,
+    ) -> anyhow::Result<bool> {
+        match finalize_success_action(continuation) {
+            FinalizeSuccessAction::Exit => {
+                // Finalize worker 会先发 SessionClosed，再发 FinalizeFinished。SessionClosed
+                // 只排队重绘；这里退出前必须同步画最后一帧，避免 drop 时清掉尚未落入
+                // scrollback 的 "{session_id} closed"。
+                self.tui
+                    .draw(&mut self.chat_widget, self.session_picker.as_ref())?;
+                Ok(true)
+            }
+            FinalizeSuccessAction::Install(target) => {
+                self.begin_session_switch_target(target)?;
+                Ok(false)
+            }
+        }
+    }
+
+    fn restore_after_switch_finalize_failure(&mut self, target: SessionSwitchTarget) {
+        match target {
+            SessionSwitchTarget::New => {}
+            SessionSwitchTarget::Resume(reservation) => {
+                // 薄 reservation 不回滚目标状态；drop lease 后它会按 Interrupted 再次可见。
+                if resume_handoff_failure_discards_waiting_input(reservation.resume_kind) {
+                    // D11 只覆盖 Finalizing 目标：确保已经排队和仍在异步预处理的输入
+                    // 都不会落入 A/B。普通 Closed/Open Resume 保留既有失败语义。
+                    self.discard_inputs_from_resume_wait();
+                } else {
+                    self.resume_input_boundary = None;
+                }
+            }
+        }
+    }
+
+    fn start_finalize(
+        &mut self,
+        continuation: SessionFinalizeContinuation,
+    ) -> anyhow::Result<bool> {
         if self.resume_handle.is_some() {
             self.chat_widget
                 .state_mut()
@@ -1971,16 +2488,19 @@ impl SessionTuiApp {
         if self.session_task.finalize_running() {
             return Ok(false);
         }
+        self.finalize_continuation = Some(continuation);
         self.chat_widget
             .handle_session_event(SessionEvent::StatusChanged {
                 status: SessionRuntimeStatus::Finalizing,
             });
         self.tui
             .draw(&mut self.chat_widget, self.session_picker.as_ref())?;
+        let runtime_lease = self.runtime_lease_for_worker()?;
         if let Some(supervisor) = self.supervisor.clone() {
             self.session_task.spawn_tracked_finalize_enqueue(
                 self.engine.clone(),
                 session,
+                runtime_lease,
                 supervisor,
                 self.worker_tx.clone(),
             );
@@ -1988,6 +2508,7 @@ impl SessionTuiApp {
             self.session_task.spawn_tracked_finalize(
                 self.engine.clone(),
                 session,
+                runtime_lease,
                 self.worker_tx.clone(),
             );
         }
@@ -2010,6 +2531,24 @@ fn finalize_enqueue_exit_message(job_id: &str, session_id: &crate::claim::Sessio
     )
 }
 
+fn recap_enqueue_result_belongs_to_visible_session(
+    visible_session_id: Option<&str>,
+    result_session_id: &SessionId,
+) -> bool {
+    visible_session_id == Some(result_session_id.as_str())
+}
+
+fn interaction_event_belongs_to_current(current_generation: u64, event_generation: u64) -> bool {
+    current_generation == event_generation
+}
+
+fn finalize_success_action<T>(continuation: FinalizeContinuation<T>) -> FinalizeSuccessAction<T> {
+    match continuation {
+        FinalizeContinuation::Exit => FinalizeSuccessAction::Exit,
+        FinalizeContinuation::Switch(target) => FinalizeSuccessAction::Install(target),
+    }
+}
+
 fn append_directory_context(user_text: &str, directory_context: &str) -> String {
     if directory_context.is_empty() {
         return user_text.to_string();
@@ -2023,24 +2562,94 @@ fn append_directory_context(user_text: &str, directory_context: &str) -> String 
     expanded
 }
 
+fn preview_temporary_paths(result: &Result<Vec<PreviewFile>, PreviewFailure>) -> Vec<PathBuf> {
+    match result {
+        Ok(files) => files
+            .iter()
+            .filter(|file| file.temporary)
+            .map(|file| file.path.clone())
+            .collect(),
+        Err(failure) => failure.temporary_paths.clone(),
+    }
+}
+
+fn spawn_preview_task(
+    tasks: &mut JoinSet<Vec<PathBuf>>,
+    tx: AppEventSender,
+    interaction_generation: u64,
+    targets: Vec<PreviewTarget>,
+    workspace_root: PathBuf,
+) {
+    tasks.spawn(async move {
+        let result = preview_attachments_task(targets, workspace_root).await;
+        let temporary_paths = preview_temporary_paths(&result);
+        tx.preview_launched(interaction_generation, result);
+        temporary_paths
+    });
+}
+
+async fn cleanup_preview_temp_files(
+    tracked_paths: &mut Vec<PathBuf>,
+    tasks: &mut JoinSet<Vec<PathBuf>>,
+) {
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(paths) => tracked_paths.extend(paths),
+            Err(error) => {
+                log::warn!(target: "session_tui", "附件预览任务收束失败: {error}")
+            }
+        }
+    }
+    tracked_paths.sort();
+    tracked_paths.dedup();
+    // Preview.app 已把成功打开的内容载入内存；删除底层文件不影响已打开的窗口。
+    for path in tracked_paths.drain(..) {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+}
+
 /// 把一组附件落成本地文件并用 `open` 交给系统默认应用（图片 / PDF 为
 /// Preview.app）。`open` 每次调用都会确定性地打开新窗口并前置，没有
 /// Quick Look 面板复用导致"看着还是上一张"的问题；文件准备走 spawn_blocking。
 async fn preview_attachments_task(
     targets: Vec<PreviewTarget>,
     workspace_root: PathBuf,
-) -> Result<Vec<PreviewFile>, String> {
+) -> Result<Vec<PreviewFile>, PreviewFailure> {
     if !cfg!(target_os = "macos") {
-        return Err("附件预览仅支持 macOS".into());
+        return Err(PreviewFailure {
+            message: "附件预览仅支持 macOS".into(),
+            temporary_paths: Vec::new(),
+        });
     }
-    let files = tokio::task::spawn_blocking(move || {
-        prepare_preview_files(targets, &workspace_root).map_err(|e| e.to_string())
-    })
-    .await
-    .unwrap_or_else(|e| Err(format!("预览准备任务失败: {e}")))?;
+    let files =
+        match tokio::task::spawn_blocking(move || prepare_preview_files(targets, &workspace_root))
+            .await
+        {
+            Ok(Ok(files)) => files,
+            Ok(Err(error)) => {
+                return Err(PreviewFailure {
+                    message: error.source.to_string(),
+                    temporary_paths: error.temporary_paths,
+                });
+            }
+            Err(error) => {
+                return Err(PreviewFailure {
+                    message: format!("预览准备任务失败: {error}"),
+                    temporary_paths: Vec::new(),
+                });
+            }
+        };
     if files.is_empty() {
-        return Err("没有可预览的附件".into());
+        return Err(PreviewFailure {
+            message: "没有可预览的附件".into(),
+            temporary_paths: Vec::new(),
+        });
     }
+    let temporary_paths = files
+        .iter()
+        .filter(|file| file.temporary)
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
     let mut command = tokio::process::Command::new("open");
     for file in &files {
         command.arg(&file.path);
@@ -2052,9 +2661,15 @@ async fn preview_attachments_task(
         .stderr(std::process::Stdio::null())
         .status()
         .await
-        .map_err(|e| format!("执行 open 失败: {e}"))?;
+        .map_err(|error| PreviewFailure {
+            message: format!("执行 open 失败: {error}"),
+            temporary_paths: temporary_paths.clone(),
+        })?;
     if !status.success() {
-        return Err(format!("Open 退出异常: {status}"));
+        return Err(PreviewFailure {
+            message: format!("Open 退出异常: {status}"),
+            temporary_paths,
+        });
     }
     Ok(files)
 }
@@ -2091,6 +2706,33 @@ fn input_can_be_queued(status: SessionRuntimeStatus) -> bool {
     input_accepts_text(status)
 }
 
+fn resume_wait_forces_queue(resume_running: bool, status: SessionRuntimeStatus) -> bool {
+    resume_running && input_can_be_queued(status)
+}
+
+fn resume_handoff_submission_forces_queue(
+    resume_input_boundary: Option<u64>,
+    submission_sequence: Option<u64>,
+) -> bool {
+    resume_input_boundary
+        .zip(submission_sequence)
+        .is_some_and(|(boundary, sequence)| sequence >= boundary)
+}
+
+fn resume_handoff_failure_discards_waiting_input(resume_kind: SessionResumeKind) -> bool {
+    resume_kind == SessionResumeKind::Finalizing
+}
+
+fn resume_input_submission_forces_queue(
+    resume_running: bool,
+    status: SessionRuntimeStatus,
+    resume_input_boundary: Option<u64>,
+    submission_sequence: Option<u64>,
+) -> bool {
+    resume_wait_forces_queue(resume_running, status)
+        || resume_handoff_submission_forces_queue(resume_input_boundary, submission_sequence)
+}
+
 fn input_dispatch_is_blocked(
     session_task_running: bool,
     start_running: bool,
@@ -2114,7 +2756,7 @@ fn route_input_submission(
     ) {
         // 管理面板只是前台 live view；运行中的 turn 不能把它们排入 queued input。
         InputSubmissionRoute::Dispatch
-    } else if dispatch_blocked {
+    } else if dispatch_blocked && input_can_be_queued {
         InputSubmissionRoute::Queue
     } else if session_can_dispatch {
         InputSubmissionRoute::Dispatch
@@ -2282,6 +2924,13 @@ fn pending_submission_should_restore(
     explicit_restore || async_input_sequence_should_restore(sequence, restore_before)
 }
 
+fn current_session_has_content(
+    current_message_count: Option<usize>,
+    has_real_user_input: bool,
+) -> bool {
+    current_message_count.is_some_and(|message_count| message_count != 0 || has_real_user_input)
+}
+
 fn pending_restore_should_wait_for_turn(
     active_turn_id: Option<u64>,
     defer_until_turn_id: Option<u64>,
@@ -2426,6 +3075,59 @@ mod tests {
     use crate::mcp::config::{
         read_mcp_json_config, write_mcp_json_config_atomic, McpJsonConfig, McpServerConfig,
     };
+
+    #[test]
+    fn foreground_finalizing_error_includes_target_session_id() -> anyhow::Result<()> {
+        let session_id: SessionId = "session_abcd1234".parse()?;
+
+        assert_eq!(
+            foreground_finalizing_resume_error(&session_id),
+            "session_abcd1234 is still finalizing foreground; Try again after its completion."
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn preview_shutdown_cleans_temp_file_before_completion_event_is_consumed() {
+        use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+        use base64::Engine as _;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let missing_path = temp_dir.path().join("missing-preview-target");
+        let (sender, mut receiver) = AppEventSender::channel();
+        let mut tasks = JoinSet::new();
+        spawn_preview_task(
+            &mut tasks,
+            sender,
+            7,
+            vec![
+                PreviewTarget::InlineImage {
+                    name: "[Image #1]".into(),
+                    media_type: "image/png".into(),
+                    data: BASE64_STANDARD.encode(b"temporary preview image"),
+                },
+                PreviewTarget::AtPath {
+                    raw_path: missing_path.to_string_lossy().into_owned(),
+                },
+            ],
+            temp_dir.path().to_path_buf(),
+        );
+
+        let mut tracked_paths = Vec::new();
+        cleanup_preview_temp_files(&mut tracked_paths, &mut tasks).await;
+
+        let AppEvent::PreviewLaunched {
+            interaction_generation,
+            result: Err(failure),
+        } = receiver.try_recv().unwrap()
+        else {
+            panic!("expected queued preview failure");
+        };
+        assert_eq!(interaction_generation, 7);
+        assert_eq!(failure.temporary_paths.len(), 1);
+        assert!(!failure.temporary_paths[0].exists());
+    }
 
     #[tokio::test]
     async fn tui_disable_persists_config_when_transport_release_times_out() {
@@ -2785,6 +3487,7 @@ done
         assert!(input_can_be_queued(SessionRuntimeStatus::Running));
         assert!(input_can_be_queued(SessionRuntimeStatus::SyncingInbox));
         assert!(input_can_be_queued(SessionRuntimeStatus::Compacting));
+        assert!(input_can_be_queued(SessionRuntimeStatus::Resuming));
         assert!(input_can_be_queued(SessionRuntimeStatus::Open));
         assert!(!input_can_be_queued(SessionRuntimeStatus::Finalizing));
         assert!(!input_can_be_queued(SessionRuntimeStatus::Closed));
@@ -2796,6 +3499,75 @@ done
         assert!(input_dispatch_is_blocked(false, true, false));
         assert!(input_dispatch_is_blocked(true, false, false));
         assert!(!input_dispatch_is_blocked(false, false, false));
+    }
+
+    #[test]
+    fn resume_wait_queues_all_accepted_input_before_command_routing() {
+        assert!(resume_wait_forces_queue(
+            true,
+            SessionRuntimeStatus::Resuming
+        ));
+        assert!(!resume_wait_forces_queue(
+            false,
+            SessionRuntimeStatus::Resuming
+        ));
+        assert!(!resume_wait_forces_queue(
+            true,
+            SessionRuntimeStatus::Finalizing
+        ));
+    }
+
+    #[test]
+    fn resume_handoff_queues_late_preprocessed_input_after_b_starts_finalizing() {
+        assert!(resume_input_submission_forces_queue(
+            false,
+            SessionRuntimeStatus::Finalizing,
+            Some(7),
+            Some(7),
+        ));
+        assert!(resume_input_submission_forces_queue(
+            false,
+            SessionRuntimeStatus::Finalizing,
+            Some(7),
+            Some(8),
+        ));
+        assert!(!resume_input_submission_forces_queue(
+            false,
+            SessionRuntimeStatus::Finalizing,
+            Some(7),
+            Some(6),
+        ));
+        assert!(!resume_input_submission_forces_queue(
+            false,
+            SessionRuntimeStatus::Finalizing,
+            None,
+            Some(7),
+        ));
+    }
+
+    #[test]
+    fn resume_handoff_failure_discards_waiting_input_only_for_finalizing_target() {
+        assert!(resume_handoff_failure_discards_waiting_input(
+            SessionResumeKind::Finalizing
+        ));
+        assert!(!resume_handoff_failure_discards_waiting_input(
+            SessionResumeKind::Closed
+        ));
+        assert!(!resume_handoff_failure_discards_waiting_input(
+            SessionResumeKind::Interrupted
+        ));
+    }
+
+    #[test]
+    fn session_switch_commands_queue_while_foreground_work_is_busy() {
+        let catalog = SlashCommandCatalog::default();
+        for command in ["/new", "/resume"] {
+            let action = classify_input(command, &catalog);
+            assert_eq!(
+                route_input_submission(&action, false, true, false, true),
+                InputSubmissionRoute::Queue
+            );
+        }
     }
 
     #[test]
@@ -2945,6 +3717,7 @@ done
         assert!(command_echoes(&InputAction::Inbox));
         assert!(command_echoes(&InputAction::Compact));
         assert!(command_echoes(&InputAction::Copy));
+        assert!(command_echoes(&InputAction::New));
         assert!(command_echoes(&InputAction::Resume));
         assert!(command_echoes(&InputAction::Skills));
         assert!(command_echoes(&InputAction::Exit));
@@ -3016,6 +3789,52 @@ done
     }
 
     #[test]
+    fn recap_enqueue_completion_is_scoped_to_visible_session() {
+        let old_session_id = "session_cf983ed9".parse::<SessionId>().unwrap();
+
+        assert!(recap_enqueue_result_belongs_to_visible_session(
+            Some("session_cf983ed9"),
+            &old_session_id
+        ));
+        assert!(!recap_enqueue_result_belongs_to_visible_session(
+            Some("session_8a7b6c5d"),
+            &old_session_id
+        ));
+        assert!(!recap_enqueue_result_belongs_to_visible_session(
+            None,
+            &old_session_id
+        ));
+    }
+
+    #[test]
+    fn interaction_completion_is_scoped_to_current_generation() {
+        assert!(interaction_event_belongs_to_current(7, 7));
+        assert!(!interaction_event_belongs_to_current(8, 7));
+    }
+
+    #[test]
+    fn finalize_success_continuation_exits_or_installs_prepared_target() {
+        assert!(matches!(
+            finalize_success_action(FinalizeContinuation::<u8>::Exit),
+            FinalizeSuccessAction::Exit
+        ));
+        assert!(matches!(
+            finalize_success_action(FinalizeContinuation::Switch(7_u8)),
+            FinalizeSuccessAction::Install(7)
+        ));
+    }
+
+    #[test]
+    fn session_switch_finalize_disables_new_input() {
+        assert!(!input_accepts_text(SessionRuntimeStatus::Finalizing));
+        let action = classify_input("must not be accepted", &Default::default());
+        assert_eq!(
+            route_input_submission(&action, false, true, false, false),
+            InputSubmissionRoute::Reject
+        );
+    }
+
+    #[test]
     fn resume_interruption_restores_queue_only_after_workers_stop() {
         assert!(resume_interruption_can_restore_queued_inputs(
             false, false, false
@@ -3029,6 +3848,14 @@ done
         assert!(!resume_interruption_can_restore_queued_inputs(
             false, false, true
         ));
+    }
+
+    #[test]
+    fn current_session_content_includes_journal_only_user_input() {
+        assert!(current_session_has_content(Some(0), true));
+        assert!(current_session_has_content(Some(1), false));
+        assert!(!current_session_has_content(Some(0), false));
+        assert!(!current_session_has_content(None, true));
     }
 
     #[test]

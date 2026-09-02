@@ -111,7 +111,11 @@ impl MemoryReviewLoop {
             }
 
             match provider_response.stop {
-                ProviderStop::MaxTokens => {
+                ProviderStop::MaxTokens
+                    if !tool_uses
+                        .iter()
+                        .any(|tool_use| tool_use.dispatch_rejection.is_some()) =>
+                {
                     anyhow::bail!(
                         "review_memory provider stop=MaxTokens 且包含 ToolUse，拒绝执行半截工具调用"
                     );
@@ -119,7 +123,7 @@ impl MemoryReviewLoop {
                 ProviderStop::ContextWindowExceeded => {
                     anyhow::bail!("Memory review 上下文已满，本次后台整理已停止，未执行工具。");
                 }
-                ProviderStop::Done | ProviderStop::ToolUse => {}
+                ProviderStop::Done | ProviderStop::ToolUse | ProviderStop::MaxTokens => {}
             }
             if turn_idx + 1 == self.max_turns {
                 anyhow::bail!("review_memory 达到最大 tool 循环轮数: {}", self.max_turns);
@@ -128,8 +132,16 @@ impl MemoryReviewLoop {
             messages.push(assistant_message);
             let mut tool_results = Vec::with_capacity(tool_uses.len());
             for tool_use in tool_uses {
-                let content =
-                    execute_memory_tool_use(&self.tools, &tool_use.name, tool_use.input).await;
+                let content = match tool_use.dispatch_rejection {
+                    Some(error) => serialize_tool_result(json!({
+                        "ok": false,
+                        "outcome": ToolExecutionOutcome::DispatchFailure,
+                        "error": format!("工具参数非法: {error}"),
+                    })),
+                    None => {
+                        execute_memory_tool_use(&self.tools, &tool_use.name, tool_use.input).await
+                    }
+                };
                 tool_results.push(SessionTurnContentBlock::ToolResult {
                     tool_use_id: tool_use.id,
                     content,
@@ -171,6 +183,7 @@ impl MemoryReviewLoop {
             runtime_chain_id: Some(runtime.chain_id),
             runtime_fallback_scope: Some(runtime.fallback_scope.clone()),
             recovery_interrupt: None,
+            allow_continuation: true,
             retry_count_override: None,
         };
         let mut attempt = 0;
@@ -233,6 +246,7 @@ struct CanonicalToolUse {
     id: String,
     name: String,
     input: Value,
+    dispatch_rejection: Option<String>,
 }
 
 fn validate_assistant_message(message: &SessionTurnMessage) -> anyhow::Result<()> {
@@ -254,22 +268,30 @@ fn validate_assistant_message(message: &SessionTurnMessage) -> anyhow::Result<()
 fn collect_tool_uses(message: &SessionTurnMessage) -> anyhow::Result<Vec<CanonicalToolUse>> {
     let mut tool_uses = Vec::new();
     for block in &message.content {
-        if let SessionTurnContentBlock::ToolUse { id, name, input } = block {
-            if id.trim().is_empty() {
-                anyhow::bail!("tool_use id 不能为空");
+        let (id, name, input, dispatch_rejection) = match block {
+            SessionTurnContentBlock::ToolUse { id, name, input } => {
+                if !input.is_object() {
+                    anyhow::bail!("tool_use input 必须是 JSON object: {name}");
+                }
+                (id, name, input.clone(), None)
             }
-            if name.trim().is_empty() {
-                anyhow::bail!("tool_use name 不能为空");
+            SessionTurnContentBlock::InvalidToolUse { id, name, error } => {
+                (id, name, json!({}), Some(error.clone()))
             }
-            if !input.is_object() {
-                anyhow::bail!("tool_use input 必须是 JSON object: {name}");
-            }
-            tool_uses.push(CanonicalToolUse {
-                id: id.clone(),
-                name: name.clone(),
-                input: input.clone(),
-            });
+            _ => continue,
+        };
+        if id.trim().is_empty() {
+            anyhow::bail!("tool_use id 不能为空");
         }
+        if name.trim().is_empty() {
+            anyhow::bail!("tool_use name 不能为空");
+        }
+        tool_uses.push(CanonicalToolUse {
+            id: id.clone(),
+            name: name.clone(),
+            input,
+            dispatch_rejection,
+        });
     }
     Ok(tool_uses)
 }
@@ -411,6 +433,133 @@ mod tests {
         };
         assert!(content.contains("background memory review 禁止调用非 memory 工具"));
         assert!(content.contains("file_read"));
+    }
+
+    #[tokio::test]
+    async fn memory_review_loop_returns_error_tool_result_for_invalid_arguments_and_continues() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider: Arc<dyn ProviderAdapter> = Arc::new(RecordingProvider {
+            requests: requests.clone(),
+            responses: Mutex::new(VecDeque::from([
+                Ok(ProviderResponse {
+                    assistant_message: SessionTurnMessage {
+                        role: "assistant".into(),
+                        provider_replay: None,
+                        content: vec![SessionTurnContentBlock::InvalidToolUse {
+                            id: "toolu_memory_bad".into(),
+                            name: "memory".into(),
+                            error: "function_call.arguments 不是合法 JSON: expected value at line 1 column 13".into(),
+                        }],
+                    },
+                    stop: ProviderStop::ToolUse,
+                }),
+                Ok(ProviderResponse {
+                    assistant_message: SessionTurnMessage::assistant_text("Nothing to save."),
+                    stop: ProviderStop::Done,
+                }),
+            ])),
+            discarded_chains: Arc::new(Mutex::new(Vec::new())),
+        });
+        let home = tempfile::tempdir().unwrap();
+        let memory_store = Arc::new(LocalFsMemoryStore::new(
+            home.path().to_path_buf(),
+            DEFAULT_MEMORY_CHAR_LIMIT,
+            DEFAULT_USER_CHAR_LIMIT,
+            false,
+        ));
+        let tools = Arc::new(
+            ToolRegistry::new(&ToolConfig::default())
+                .unwrap()
+                .with_memory_store(memory_store),
+        );
+        let review_loop =
+            MemoryReviewLoop::new(provider, tools, 4, 1024, 1, Duration::ZERO, Duration::ZERO);
+
+        review_loop
+            .run(
+                MemoryReviewRequest {
+                    system_prompt: "review system".into(),
+                    transcript: vec![SessionTurnMessage::user_text("hello")],
+                },
+                "review prompt".into(),
+            )
+            .await
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let last = requests[1].messages.last().unwrap();
+        let SessionTurnContentBlock::ToolResult {
+            tool_use_id,
+            content,
+        } = &last.content[0]
+        else {
+            panic!("expected tool result");
+        };
+        assert_eq!(tool_use_id, "toolu_memory_bad");
+        assert!(content.contains("工具参数非法"));
+        assert!(content.contains("不是合法 JSON"));
+    }
+
+    #[tokio::test]
+    async fn memory_review_recovers_invalid_arguments_at_max_tokens() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider: Arc<dyn ProviderAdapter> = Arc::new(RecordingProvider {
+            requests: requests.clone(),
+            responses: Mutex::new(VecDeque::from([
+                Ok(ProviderResponse {
+                    assistant_message: SessionTurnMessage {
+                        role: "assistant".into(),
+                        provider_replay: None,
+                        content: vec![SessionTurnContentBlock::InvalidToolUse {
+                            id: "toolu_memory_bad".into(),
+                            name: "memory".into(),
+                            error: "function_call.arguments 不是合法 JSON: EOF while parsing a value at line 1 column 13".into(),
+                        }],
+                    },
+                    stop: ProviderStop::MaxTokens,
+                }),
+                Ok(ProviderResponse {
+                    assistant_message: SessionTurnMessage::assistant_text("Nothing to save."),
+                    stop: ProviderStop::Done,
+                }),
+            ])),
+            discarded_chains: Arc::new(Mutex::new(Vec::new())),
+        });
+        let home = tempfile::tempdir().unwrap();
+        let memory_store = Arc::new(LocalFsMemoryStore::new(
+            home.path().to_path_buf(),
+            DEFAULT_MEMORY_CHAR_LIMIT,
+            DEFAULT_USER_CHAR_LIMIT,
+            false,
+        ));
+        let tools = Arc::new(
+            ToolRegistry::new(&ToolConfig::default())
+                .unwrap()
+                .with_memory_store(memory_store),
+        );
+        let review_loop =
+            MemoryReviewLoop::new(provider, tools, 4, 1024, 1, Duration::ZERO, Duration::ZERO);
+
+        review_loop
+            .run(
+                MemoryReviewRequest {
+                    system_prompt: "review system".into(),
+                    transcript: vec![SessionTurnMessage::user_text("hello")],
+                },
+                "review prompt".into(),
+            )
+            .await
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let last = requests[1].messages.last().unwrap();
+        let SessionTurnContentBlock::ToolResult { content, .. } = &last.content[0] else {
+            panic!("expected tool result");
+        };
+        assert!(content.contains("工具参数非法"));
+        assert!(content.contains("line 1 column 13"));
     }
 
     #[tokio::test]

@@ -96,6 +96,7 @@ pub(super) async fn externalize_heavy_user_blocks(
                 },
                 SessionTurnContentBlock::ModelContext { .. }
                 | SessionTurnContentBlock::ToolUse { .. }
+                | SessionTurnContentBlock::InvalidToolUse { .. }
                 | SessionTurnContentBlock::ToolResult { .. } => None,
             };
             let Some(candidate) = candidate else {

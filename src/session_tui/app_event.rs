@@ -9,7 +9,7 @@ use crate::attachment::NormalizedMedia;
 use crate::claim::SessionId;
 
 use super::at_path_completion::AtPathDirectoryEntry;
-use super::attachment::{PreviewFile, PreviewTarget, ResolvedAtPaths};
+use super::attachment::{PreviewFailure, PreviewFile, PreviewTarget, ResolvedAtPaths};
 use super::bottom_pane::InputDraft;
 use super::input_queue::QueuedInput;
 use super::mcp_panel::McpPanelRequest;
@@ -27,6 +27,7 @@ pub(super) enum AppEvent {
     },
     /// 剪贴板图片在 spawn_blocking 中读取 / 规格化后的回灌结果。
     ClipboardImageRead {
+        interaction_generation: u64,
         input_revision: u64,
         result: Result<Option<NormalizedMedia>, String>,
     },
@@ -51,11 +52,20 @@ pub(super) enum AppEvent {
     },
     /// Ctrl+O：请求预览附件（光标命中的一个，或输入框里的全部；
     /// 由 App 层负责落盘与拉起 Quick Look）。
-    PreviewAttachment(Vec<PreviewTarget>),
+    PreviewAttachment {
+        interaction_generation: u64,
+        targets: Vec<PreviewTarget>,
+    },
     /// 预览文件准备 / 拉起完成的回灌结果（临时文件需登记以便退出清理）。
-    PreviewLaunched(Result<Vec<PreviewFile>, String>),
+    PreviewLaunched {
+        interaction_generation: u64,
+        result: Result<Vec<PreviewFile>, PreviewFailure>,
+    },
     /// `/copy` 写入系统剪贴板后的回灌结果。
-    ClipboardTextWritten(Result<(), String>),
+    ClipboardTextWritten {
+        interaction_generation: u64,
+        result: Result<(), String>,
+    },
     /// `/mcp` 面板触发的 server 操作。
     McpPanelRequest(McpPanelRequest),
     ProcessPanelAction(ProcessPanelKeyAction),
@@ -98,10 +108,12 @@ impl AppEventSender {
 
     pub(super) fn clipboard_image_read(
         &self,
+        interaction_generation: u64,
         input_revision: u64,
         result: Result<Option<NormalizedMedia>, String>,
     ) {
         self.send(AppEvent::ClipboardImageRead {
+            interaction_generation,
             input_revision,
             result,
         });
@@ -133,16 +145,37 @@ impl AppEventSender {
         });
     }
 
-    pub(super) fn preview_attachment(&self, targets: Vec<PreviewTarget>) {
-        self.send(AppEvent::PreviewAttachment(targets));
+    pub(super) fn preview_attachment(
+        &self,
+        interaction_generation: u64,
+        targets: Vec<PreviewTarget>,
+    ) {
+        self.send(AppEvent::PreviewAttachment {
+            interaction_generation,
+            targets,
+        });
     }
 
-    pub(super) fn preview_launched(&self, result: Result<Vec<PreviewFile>, String>) {
-        self.send(AppEvent::PreviewLaunched(result));
+    pub(super) fn preview_launched(
+        &self,
+        interaction_generation: u64,
+        result: Result<Vec<PreviewFile>, PreviewFailure>,
+    ) {
+        self.send(AppEvent::PreviewLaunched {
+            interaction_generation,
+            result,
+        });
     }
 
-    pub(super) fn clipboard_text_written(&self, result: Result<(), String>) {
-        self.send(AppEvent::ClipboardTextWritten(result));
+    pub(super) fn clipboard_text_written(
+        &self,
+        interaction_generation: u64,
+        result: Result<(), String>,
+    ) {
+        self.send(AppEvent::ClipboardTextWritten {
+            interaction_generation,
+            result,
+        });
     }
 
     pub(super) fn mcp_panel_request(&self, request: McpPanelRequest) {

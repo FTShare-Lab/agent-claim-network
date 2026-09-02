@@ -152,6 +152,8 @@ pub use provider::{
     ProviderRuntimeChainId, ProviderRuntimeFallbackScope, ProviderStop, ProviderStreamOutputMode,
     ToolSpec,
 };
+#[cfg(test)]
+pub(crate) use provider::{ProviderRequestTooLarge, ProviderStreamFailure};
 pub use responses::{
     ReducedResponses, ResponsesClient, ResponsesError, ResponsesFunctionCall, ResponsesReasoning,
     ResponsesRequest, ResponsesStreamEvent, ResponsesTerminal, ResponsesTool,
@@ -174,7 +176,8 @@ pub use turn_loop::{
     AgentTurnLoop, SessionTurnContextAppender, SessionTurnEventRecorder, SessionTurnPreflight,
 };
 pub use types::{
-    AvailableSkill, ClaimDraft, CompletedSessionTurnMessage, DisputeDraft, InboxInternalizeKind,
+    AvailableSkill, ClaimAttributeUpdateInternalizeItem, ClaimAttributeUpdateInternalizeRequest,
+    ClaimDraft, CompletedSessionTurnMessage, DisputeDraft, InboxInternalizeKind,
     InternalizeOutcome, InternalizeRequest, MemoryReviewRequest, ModelContextSource,
     ProviderReplayState, RecapOutcome, SessionAttachment, SessionCompactionOutcome,
     SessionCompactionRequest, SessionRecapRequest, SessionSearchSummaryOutcome,

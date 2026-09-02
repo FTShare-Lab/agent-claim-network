@@ -16,8 +16,16 @@ type AgentOrderRow = {
 
 type PolicyOrderRow = {
   id: string
-  status: 'active' | 'deprecated'
+  message_type: 'policy_update' | 'claim_attribute_update'
   created_at: string
+  updated_at?: string
+}
+
+type DisputeOrderRow = {
+  id: string
+  status: 'open' | 'resolved'
+  created_at: string
+  resolved_at?: string
 }
 
 type ActionOrderRow = {
@@ -51,9 +59,14 @@ const CLAIM_STATUS_ORDER: Record<ClaimOrderRow['claim']['status'], number> = {
   deprecated: 2,
 }
 
-const POLICY_STATUS_ORDER: Record<PolicyOrderRow['status'], number> = {
-  active: 0,
-  deprecated: 1,
+const POLICY_MESSAGE_TYPE_ORDER: Record<PolicyOrderRow['message_type'], number> = {
+  policy_update: 0,
+  claim_attribute_update: 1,
+}
+
+const DISPUTE_STATUS_ORDER: Record<DisputeOrderRow['status'], number> = {
+  open: 0,
+  resolved: 1,
 }
 
 export function orderClaimsByStatusAndRecentChange<T extends ClaimOrderRow>(rows: readonly T[]) {
@@ -86,13 +99,33 @@ export function orderAgentsByRecentActivity<T extends AgentOrderRow>(rows: reado
   })
 }
 
-export function orderPoliciesByStatusAndPublishedAt<T extends PolicyOrderRow>(rows: readonly T[]) {
-  return [...rows].sort(
-    (left, right) =>
-      POLICY_STATUS_ORDER[left.status] - POLICY_STATUS_ORDER[right.status] ||
+export function orderPoliciesByTypeAndRecentChange<T extends PolicyOrderRow>(rows: readonly T[]) {
+  return [...rows].sort((left, right) => {
+    const effectiveLeft = left.updated_at ?? left.created_at
+    const effectiveRight = right.updated_at ?? right.created_at
+    return (
+      POLICY_MESSAGE_TYPE_ORDER[left.message_type] -
+        POLICY_MESSAGE_TYPE_ORDER[right.message_type] ||
+      compareTimeDescending(effectiveLeft, effectiveRight) ||
       compareTimeDescending(left.created_at, right.created_at) ||
-      compareTextAscending(left.id, right.id),
-  )
+      compareTextAscending(left.id, right.id)
+    )
+  })
+}
+
+export function orderDisputesByStatusAndRecentChange<T extends DisputeOrderRow>(
+  rows: readonly T[],
+) {
+  return [...rows].sort((left, right) => {
+    const effectiveLeft = left.resolved_at ?? left.created_at
+    const effectiveRight = right.resolved_at ?? right.created_at
+    return (
+      DISPUTE_STATUS_ORDER[left.status] - DISPUTE_STATUS_ORDER[right.status] ||
+      compareTimeDescending(effectiveLeft, effectiveRight) ||
+      compareTimeDescending(left.created_at, right.created_at) ||
+      compareTextAscending(left.id, right.id)
+    )
+  })
 }
 
 export function orderActionsByCreatedAt<T extends ActionOrderRow>(rows: readonly T[]) {

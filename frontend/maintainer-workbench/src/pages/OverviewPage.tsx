@@ -11,7 +11,7 @@ import type { AgentStatusSummary, MaintainerStatusCounts } from '../features/ove
 
 function Panel({ title, action, children }: { title: string; action?: React.ReactNode; children: React.ReactNode }) {
   return (
-    <section className="rounded-[var(--radius-md)] bg-white p-5 ring-1 ring-slate-200/80">
+    <section className="min-w-0 rounded-[var(--radius-md)] bg-white p-5 ring-1 ring-slate-200/80">
       <div className="mb-4 flex items-center justify-between gap-3">
         <h2 className="text-sm font-semibold tracking-tight text-slate-900">{title}</h2>
         {action}
@@ -241,7 +241,7 @@ export function OverviewPage() {
   return (
     <PageContainer
       title="Network Operations Overview"
-      subtitle="Review what needs a Maintainer decision, then inspect network health and evidence."
+      subtitle="Review what needs a Maintainer resolution, then inspect network health and evidence."
     >
       <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,1.55fr)_minmax(320px,0.85fr)]">
         <Panel
@@ -258,7 +258,7 @@ export function OverviewPage() {
                 <CheckCircle2 aria-hidden="true" className="h-5 w-5" />
               </span>
               <div className="min-w-0 flex-1">
-                <div className="text-sm font-semibold text-slate-900">No network decisions are waiting.</div>
+                <div className="text-sm font-semibold text-slate-900">No network resolutions are waiting.</div>
                 <p className="mt-0.5 text-xs leading-5 text-slate-600">
                   Disputes, stale suggestions, agent risk, and recent HTTP errors are clear in this snapshot.
                 </p>
@@ -371,10 +371,10 @@ export function OverviewPage() {
       </section>
 
       <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,1.45fr)_minmax(340px,0.8fr)]">
-        <section className="rounded-[var(--radius-md)] bg-white p-5 ring-1 ring-slate-200/80">
+        <section className="min-w-0 rounded-[var(--radius-md)] bg-white p-5 ring-1 ring-slate-200/80">
           <div className="flex flex-col gap-3 border-b border-slate-100 pb-3 sm:flex-row sm:items-center sm:justify-between">
             <h2 className="text-sm font-semibold text-slate-900">Network Activity</h2>
-            <div role="tablist" aria-label="Network activity type" className="inline-flex w-fit rounded-lg bg-[var(--bg-muted)] p-1">
+            <div role="tablist" aria-label="Network activity type" className="inline-flex max-w-full w-fit overflow-x-auto rounded-lg bg-[var(--bg-muted)] p-1">
               {[
                 ['disputes', 'Disputes', disputes.length],
                 ['policies', 'Policies', data.recent_policy_events.length],
@@ -388,8 +388,8 @@ export function OverviewPage() {
                   aria-controls={`activity-${value}`}
                   onClick={() => setActivityTab(value as typeof activityTab)}
                   className={activityTab === value
-                    ? 'rounded-md bg-white px-3 py-1.5 text-xs font-semibold text-slate-900 shadow-sm'
-                    : 'rounded-md px-3 py-1.5 text-xs font-medium text-slate-500 transition-colors hover:text-slate-900'}
+                    ? 'shrink-0 rounded-md bg-white px-3 py-1.5 text-xs font-semibold text-slate-900 shadow-sm'
+                    : 'shrink-0 rounded-md px-3 py-1.5 text-xs font-medium text-slate-500 transition-colors hover:text-slate-900'}
                 >
                   {label} <span className="ml-1 font-mono text-[10px] text-slate-500">{count}</span>
                 </button>

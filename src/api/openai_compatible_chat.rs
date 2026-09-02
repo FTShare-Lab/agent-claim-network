@@ -23,8 +23,8 @@ use super::provider::{
     NoopProviderRequestObserver, ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy,
     ProviderNoConsumableOutput, ProviderRecoveryInterrupt, ProviderReplayIdentity,
     ProviderReplayProtocol, ProviderRequest, ProviderRequestObserver,
-    ProviderRequestPreparationFailure, ProviderResponse, ProviderStop, ProviderStreamFailure,
-    ProviderTerminalFailure, ProviderTransport, ToolSpec,
+    ProviderRequestPreparationFailure, ProviderRequestTooLarge, ProviderResponse, ProviderStop,
+    ProviderStreamFailure, ProviderTerminalFailure, ProviderTransport, ToolSpec,
 };
 use super::redact_media_error_body;
 use super::types::{ProviderReplayState, SessionTurnContentBlock, SessionTurnMessage};
@@ -151,6 +151,7 @@ impl OpenAiCompatibleChatProviderAdapter {
         max_tokens: u32,
         stream: bool,
         retry_count: u32,
+        allow_continuation: bool,
         retry_after_partial: bool,
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         emit: &mut (dyn FnMut(ProviderEvent) + Send),
@@ -162,8 +163,13 @@ impl OpenAiCompatibleChatProviderAdapter {
         let mut last_finish_reason = Some(ChatFinishReason::Stop);
         let mut continuation_requests_started = 0usize;
         let mut provider_messages = base_messages.to_vec();
+        let max_continuation_turns = if allow_continuation {
+            MAX_CONTINUATION_TURNS
+        } else {
+            0
+        };
 
-        for round in 0..=MAX_CONTINUATION_TURNS {
+        for round in 0..=max_continuation_turns {
             if let Some(interrupt) = recovery_interrupt.filter(|interrupt| interrupt.is_cancelled())
             {
                 if last_finish_reason == Some(ChatFinishReason::Length) && last_message.is_some() {
@@ -306,7 +312,7 @@ impl OpenAiCompatibleChatProviderAdapter {
                 last_finish_reason = Some(ChatFinishReason::Stop);
                 break;
             }
-            if round == MAX_CONTINUATION_TURNS {
+            if round == max_continuation_turns {
                 break;
             }
             let continuation = ChatMessage::user(CONTINUATION_TRIGGER.to_string());
@@ -436,6 +442,7 @@ impl OpenAiCompatibleChatProviderAdapter {
             .unwrap_or(self.client.retry_count());
         let retry_after_partial =
             request.stream_output_mode == crate::api::ProviderStreamOutputMode::Buffered;
+        let allow_continuation = request.allow_continuation;
         let recovery_interrupt = request.recovery_interrupt.clone();
         let base_messages = request.messages;
         let mut messages = session_turn_messages_to_chat(base_messages.clone(), &self.model)?;
@@ -450,6 +457,7 @@ impl OpenAiCompatibleChatProviderAdapter {
                 request.max_tokens,
                 request.stream,
                 retry_count,
+                allow_continuation,
                 retry_after_partial,
                 recovery_interrupt.as_ref(),
                 emit,
@@ -467,6 +475,9 @@ impl OpenAiCompatibleChatProviderAdapter {
                     OpenAiCompatibleChatError::Client(ChatCompletionsError::RecoveryInterrupted)
                 ) {
                     return Err(SessionTurnInterrupted.into());
+                }
+                if let Some(error) = classify_request_too_large(&error) {
+                    return Err(error.into());
                 }
                 if request.stream && chat_adapter_stream_failure(&error) {
                     return Err(ProviderStreamFailure::new(error.to_string()).into());
@@ -576,9 +587,10 @@ fn push_user_message(
                 tool_use_id,
                 content,
             } => tool_results.push((tool_use_id, content)),
-            SessionTurnContentBlock::ToolUse { .. } => {
+            SessionTurnContentBlock::ToolUse { .. }
+            | SessionTurnContentBlock::InvalidToolUse { .. } => {
                 return Err(OpenAiCompatibleChatError::OutputShape {
-                    reason: "user message 不允许包含 ToolUse".into(),
+                    reason: "user message 不允许包含 tool call".into(),
                     raw: String::new(),
                 });
             }
@@ -647,6 +659,9 @@ fn assistant_message_to_chat(
             SessionTurnContentBlock::ToolUse { id, name, input } => {
                 tool_calls.push(ChatToolCall::function(id, name, input.to_string()));
             }
+            SessionTurnContentBlock::InvalidToolUse { id, name, .. } => {
+                tool_calls.push(ChatToolCall::function(id, name, "{}"));
+            }
             SessionTurnContentBlock::ToolResult { .. } => {
                 return Err(OpenAiCompatibleChatError::OutputShape {
                     reason: "assistant message 不允许包含 ToolResult".into(),
@@ -708,6 +723,16 @@ fn wrap_media_rejection(
     }
 }
 
+fn classify_request_too_large(
+    error: &OpenAiCompatibleChatError,
+) -> Option<ProviderRequestTooLarge> {
+    let OpenAiCompatibleChatError::Client(ChatCompletionsError::Status { status: 413, .. }) = error
+    else {
+        return None;
+    };
+    Some(ProviderRequestTooLarge::new())
+}
+
 fn first_choice(
     response: ChatCompletionResponse,
 ) -> Result<ChatCompletionChoice, OpenAiCompatibleChatError> {
@@ -746,10 +771,13 @@ fn provider_response_from_turn(
 ) -> Result<ProviderResponse, OpenAiCompatibleChatError> {
     let stop = provider_stop_from_turn(&turn);
     let assistant_message = assistant_turn_message(turn, model)?;
-    let has_tool_use = assistant_message
-        .content
-        .iter()
-        .any(|block| matches!(block, SessionTurnContentBlock::ToolUse { .. }));
+    let has_tool_use = assistant_message.content.iter().any(|block| {
+        matches!(
+            block,
+            SessionTurnContentBlock::ToolUse { .. }
+                | SessionTurnContentBlock::InvalidToolUse { .. }
+        )
+    });
     if stop == ProviderStop::ToolUse && !has_tool_use {
         return Err(OpenAiCompatibleChatError::NoConsumableOutput {
             reason: "Chat 工具终态没有完整 tool call".into(),
@@ -802,7 +830,9 @@ fn assistant_turn_message(
         replay_messages,
         ..
     } = turn;
+    let raw_message_replay = message_from_response(&message);
     let mut content = Vec::new();
+    let mut has_invalid_tool_use = false;
     let ChatCompletionMessage {
         content: message_content,
         tool_calls,
@@ -822,16 +852,36 @@ fn assistant_turn_message(
                 raw: String::new(),
             });
         }
-        content.push(SessionTurnContentBlock::ToolUse {
-            id: tool_call.id,
-            name: tool_call.function.name,
-            input: parse_tool_arguments(&tool_call.function.arguments)?,
-        });
+        let block = match parse_tool_arguments(&tool_call.function.arguments) {
+            Ok(input) => SessionTurnContentBlock::ToolUse {
+                id: tool_call.id,
+                name: tool_call.function.name,
+                input,
+            },
+            Err(error) => {
+                has_invalid_tool_use = true;
+                SessionTurnContentBlock::InvalidToolUse {
+                    id: tool_call.id,
+                    name: tool_call.function.name,
+                    error,
+                }
+            }
+        };
+        content.push(block);
     }
     let mut message = SessionTurnMessage {
         role: "assistant".into(),
         provider_replay: None,
         content,
+    };
+    let replay_messages = match replay_messages {
+        Some(messages) => Some(messages),
+        None if has_invalid_tool_use => Some(vec![serde_json::to_value(raw_message_replay)
+            .map_err(|error| OpenAiCompatibleChatError::OutputShape {
+                reason: format!("序列化 Chat malformed tool call replay 失败: {error}"),
+                raw: String::new(),
+            })?]),
+        None => None,
     };
     if let Some(messages) = replay_messages {
         message.provider_replay = Some(ProviderReplayState::OpenAiChatCompletions {
@@ -842,20 +892,14 @@ fn assistant_turn_message(
     Ok(message)
 }
 
-fn parse_tool_arguments(raw: &str) -> Result<Value, OpenAiCompatibleChatError> {
+fn parse_tool_arguments(raw: &str) -> Result<Value, String> {
     if raw.trim().is_empty() {
         return Ok(json!({}));
     }
-    let value =
-        serde_json::from_str::<Value>(raw).map_err(|e| OpenAiCompatibleChatError::OutputShape {
-            reason: format!("tool_call.arguments 不是合法 JSON: {e}"),
-            raw: raw.to_string(),
-        })?;
+    let value = serde_json::from_str::<Value>(raw)
+        .map_err(|error| format!("tool_call.arguments 不是合法 JSON: {error}"))?;
     if !value.is_object() {
-        return Err(OpenAiCompatibleChatError::OutputShape {
-            reason: "tool_call.arguments 必须是 JSON object".into(),
-            raw: raw.to_string(),
-        });
+        return Err("tool_call.arguments 必须是 JSON object".into());
     }
     Ok(value)
 }
@@ -1227,6 +1271,7 @@ mod tests {
                     runtime_chain_id: None,
                     runtime_fallback_scope: None,
                     recovery_interrupt: None,
+                    allow_continuation: true,
                     retry_count_override: None,
                 },
                 &mut |_| {},
@@ -1256,6 +1301,7 @@ mod tests {
                     runtime_chain_id: None,
                     runtime_fallback_scope: None,
                     recovery_interrupt: None,
+                    allow_continuation: true,
                     retry_count_override: None,
                 },
                 &mut |_| {},
@@ -1281,6 +1327,50 @@ mod tests {
             &second[1..],
             "observer 上报的 neutral history 必须映射为同一份 Chat messages（除 system）"
         );
+    }
+
+    #[tokio::test]
+    async fn max_token_response_does_not_continue_when_request_disables_it() {
+        let (endpoint, captured) = spawn_chat_json_sequence(vec![json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "partial"},
+                "finish_reason": "length"
+            }]
+        })])
+        .await;
+        let adapter = OpenAiCompatibleChatProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            Duration::from_secs(5),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        let response = adapter
+            .send(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 32,
+                    stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: None,
+                    allow_continuation: false,
+                    retry_count_override: Some(0),
+                },
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.stop, ProviderStop::MaxTokens);
+        assert_eq!(captured.await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1321,6 +1411,7 @@ mod tests {
                     runtime_chain_id: None,
                     runtime_fallback_scope: None,
                     recovery_interrupt: Some(interrupt),
+                    allow_continuation: true,
                     retry_count_override: None,
                 },
                 &mut |_| {},
@@ -1378,6 +1469,7 @@ mod tests {
                     runtime_chain_id: None,
                     runtime_fallback_scope: None,
                     recovery_interrupt: Some(interrupt.clone()),
+                    allow_continuation: true,
                     retry_count_override: None,
                 },
                 &mut |_| {},
@@ -1420,6 +1512,92 @@ mod tests {
             &message.content[1],
             SessionTurnContentBlock::ToolUse { name, .. } if name == "workspace_read"
         ));
+    }
+
+    #[test]
+    fn malformed_and_non_object_chat_arguments_become_recoverable_tool_calls() {
+        for (arguments, expected_error) in [
+            (r#"{"path":"unfinished""#, "不是合法 JSON"),
+            (r#"["not", "an", "object"]"#, "必须是 JSON object"),
+        ] {
+            let response = provider_response_from_turn(
+                ContinuedChatTurn {
+                    message: ChatCompletionMessage {
+                        role: Some("assistant".into()),
+                        content: None,
+                        tool_calls: vec![ChatToolCall::function(
+                            "call_bad",
+                            "workspace_read",
+                            arguments,
+                        )],
+                    },
+                    finish_reason: Some(ChatFinishReason::ToolCalls),
+                    merged_text: String::new(),
+                    replay_messages: None,
+                },
+                "test-model",
+            )
+            .unwrap();
+
+            assert_eq!(response.stop, ProviderStop::ToolUse);
+            assert!(matches!(
+                response.assistant_message.content.as_slice(),
+                [SessionTurnContentBlock::InvalidToolUse { id, name, error }]
+                    if id == "call_bad" && name == "workspace_read" && error.contains(expected_error)
+            ));
+            assert!(matches!(
+                response.assistant_message.provider_replay.as_ref(),
+                Some(ProviderReplayState::OpenAiChatCompletions { messages, .. })
+                    if messages[0]["tool_calls"][0]["function"]["arguments"] == arguments
+            ));
+        }
+    }
+
+    #[test]
+    fn length_finish_preserves_invalid_and_valid_tool_calls_for_recovery() {
+        let malformed = r#"{"path":"unfinished""#;
+        let response = provider_response_from_turn(
+            ContinuedChatTurn {
+                message: ChatCompletionMessage {
+                    role: Some("assistant".into()),
+                    content: None,
+                    tool_calls: vec![
+                        ChatToolCall::function("call_bad", "workspace_read", malformed),
+                        ChatToolCall::function(
+                            "call_good",
+                            "workspace_read",
+                            r#"{"path":"README.md"}"#,
+                        ),
+                    ],
+                },
+                finish_reason: Some(ChatFinishReason::Length),
+                merged_text: String::new(),
+                replay_messages: None,
+            },
+            "test-model",
+        )
+        .unwrap();
+
+        assert_eq!(response.stop, ProviderStop::MaxTokens);
+        assert!(matches!(
+            response.assistant_message.content.as_slice(),
+            [
+                SessionTurnContentBlock::InvalidToolUse {
+                    id: bad_id, error, ..
+                },
+                SessionTurnContentBlock::ToolUse {
+                    id: good_id, input, ..
+                }
+            ] if bad_id == "call_bad"
+                && good_id == "call_good"
+                && error.contains("line 1 column")
+                && input == &json!({"path":"README.md"})
+        ));
+    }
+
+    #[test]
+    fn empty_chat_arguments_remain_an_empty_object() {
+        assert_eq!(parse_tool_arguments("\n").unwrap(), json!({}));
     }
 
     #[test]
@@ -1602,6 +1780,46 @@ mod tests {
         // 上游核心错误信息必须保留
         assert!(text.contains("1210: 文件格式不正确"));
         assert!(text.contains("HTTP 400"));
+    }
+
+    #[test]
+    fn http_413_is_classified_as_request_too_large_before_media_hinting() {
+        let echoed_system = "private system prompt";
+        let echoed_user = "private user request";
+        let echoed_tool = "private tool arguments";
+        let error = OpenAiCompatibleChatError::Client(ChatCompletionsError::Status {
+            status: 413,
+            body: json!({
+                "error": "request too large",
+                "request": {
+                    "messages": [
+                        {"role": "system", "content": echoed_system},
+                        {"role": "user", "content": echoed_user}
+                    ],
+                    "tools": [{"arguments": echoed_tool}],
+                    "image": format!("data:image/png;base64,{}", "A".repeat(300))
+                }
+            })
+            .to_string(),
+        });
+
+        let classified = classify_request_too_large(&error).expect("HTTP 413 classification");
+        let classified = classified.to_string();
+
+        assert!(classified.contains("upstream size limit"));
+        assert!(!classified.contains(echoed_system));
+        assert!(!classified.contains(echoed_user));
+        assert!(!classified.contains(echoed_tool));
+        assert!(!classified.contains(&"A".repeat(300)));
+        assert!(
+            classify_request_too_large(&OpenAiCompatibleChatError::Client(
+                ChatCompletionsError::Status {
+                    status: 400,
+                    body: "bad request".into(),
+                }
+            ))
+            .is_none()
+        );
     }
 
     #[test]

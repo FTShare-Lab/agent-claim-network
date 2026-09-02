@@ -25,9 +25,7 @@ use agent_claim_network::session::{
 };
 use agent_claim_network::session_tui::{self, StartupResume};
 use agent_claim_network::storage::{paths, read_yaml, FileLockGuard};
-use agent_claim_network::supervisor::{
-    self, FinalizingSessionDiagnostic, SupervisorLaunchConfig, SupervisorRetryTarget,
-};
+use agent_claim_network::supervisor::{self, SupervisorLaunchConfig, SupervisorRetryTarget};
 use agent_claim_network::update::{
     self, UpdateOptions, DEFAULT_UPDATE_BRANCH, DEFAULT_UPDATE_REPOSITORY_URL,
 };
@@ -82,12 +80,12 @@ async fn main() -> anyhow::Result<()> {
         ),
         timing: session_tui::SessionCleanupHousekeepingTiming::default(),
     };
-    // 先恢复可能中断的 finalize job，再判断目标 session 是否可 resume。否则 supervisor
-    // 崩溃留下的 queued/running job 会被预检反复报告为“请等待”，却没有进程继续执行。
+    // 先恢复可能中断的 recap/finalize job，再判断目标 session 是否可 resume。否则
+    // supervisor 崩溃留下的 queued/running job 会没有进程继续执行。
     if let Err(error) = supervisor::ensure_supervisor_running(&supervisor_launch).await {
         log::warn!(
             target: "acn",
-            "finalize supervisor 启动或接管失败，本次会话继续运行: {error:#}"
+            "recap/finalize supervisor 启动或接管失败，本次会话继续运行: {error:#}"
         );
     }
     if let Some(message) =
@@ -414,16 +412,6 @@ async fn direct_resume_preflight_failure(
         Ok(metadata) => metadata,
         Err(error) => return Some(format!("Resume failed: {error:#}\n")),
     };
-    if metadata.agent_id == *agent_id && metadata.status == SessionStatus::Finalizing {
-        let diagnostic =
-            supervisor::diagnose_finalizing_session(&cfg.agent_home(agent_id), session_id).await;
-        return Some(match diagnostic {
-            Ok(diagnostic) => direct_resume_finalizing_message(session_id, &diagnostic),
-            Err(error) => {
-                format!("Resume failed: session {session_id} 的 finalize 状态检查失败：{error:#}\n")
-            }
-        });
-    }
     direct_resume_metadata_failure(agent_id, session_id, &metadata)
 }
 
@@ -438,51 +426,14 @@ fn direct_resume_metadata_failure(
             metadata.agent_id, expected_agent_id
         ));
     }
-    if metadata.status != SessionStatus::Closed {
-        return Some(direct_resume_not_closed_message(
-            session_id,
-            metadata.status,
+    if metadata.status == SessionStatus::Open
+        && (metadata.closed_at.is_some() || metadata.finalized_at.is_some())
+    {
+        return Some(format!(
+            "Resume failed: Session {session_id} has inconsistent Open metadata.\n"
         ));
     }
     None
-}
-
-fn direct_resume_not_closed_message(session_id: &SessionId, status: SessionStatus) -> String {
-    format!(
-        "Resume failed: You can only resume Closed sessions.\nSession {session_id} current status: {}.\n",
-        session_status_label(status)
-    )
-}
-
-fn direct_resume_finalizing_message(
-    session_id: &SessionId,
-    diagnostic: &FinalizingSessionDiagnostic,
-) -> String {
-    match diagnostic {
-        FinalizingSessionDiagnostic::Queued { job_id } => format!(
-            "Resume failed: session {session_id} 正在等待 finalize（job {job_id}）。请稍后重试。\n"
-        ),
-        FinalizingSessionDiagnostic::Running { job_id } => format!(
-            "Resume failed: session {session_id} 正在 finalize（job {job_id}）。请稍后重试。\n"
-        ),
-        FinalizingSessionDiagnostic::Failed { job_id } => format!(
-            "Resume failed: session {session_id} 的 finalize 失败。\nJob: {job_id}\n\n请运行：\nacn supervisor retry {session_id}\n"
-        ),
-        FinalizingSessionDiagnostic::RunningWithoutJob => format!(
-            "Resume failed: session {session_id} 正在 finalize。请稍后重试。\n"
-        ),
-        FinalizingSessionDiagnostic::Orphaned => format!(
-            "Resume failed: session {session_id} 的 finalize 未完成。\n\n请运行：\nacn supervisor retry {session_id}\n"
-        ),
-    }
-}
-
-fn session_status_label(status: SessionStatus) -> &'static str {
-    match status {
-        SessionStatus::Open => "Open",
-        SessionStatus::Finalizing => "Finalizing",
-        SessionStatus::Closed => "Closed",
-    }
 }
 
 async fn run_mcp_cli(args: Vec<String>) -> anyhow::Result<()> {
@@ -1707,7 +1658,7 @@ async fn run_supervisor_cli(args: Vec<String>) -> anyhow::Result<()> {
     };
     match cli.command {
         SupervisorCommand::Run => {
-            // finalize 不调用 agent 工具；给复用的 SessionEngine 一个稳定、中性的工作目录。
+            // recap/finalize 不调用 agent 工具；给复用的 SessionEngine 一个稳定、中性的工作目录。
             cfg.set_tool_workspace_root(agent_home.clone());
             let runtime_fingerprint = supervisor::runtime_fingerprint(&cfg, &upstream)?;
             if let Some(expected) = cli.expected_runtime_fingerprint.as_deref() {
@@ -1814,7 +1765,7 @@ fn acn_usage() -> &'static str {
   acn supervisor <status|jobs|retry|stop> [options]
   acn mcp <list|get|add|remove|enable|disable|login|logout|status> [options]
 
-启动 ACN 交互式 TUI session。普通用户通常只需要运行 `acn`；后台 finalize supervisor 会自动启动，无需手动管理。
+启动 ACN 交互式 TUI session。普通用户通常只需要运行 `acn`；后台 recap/finalize supervisor 会自动启动，无需手动管理。
 
 选项:
   --config <path>             指定 config.toml；不传则按 ACN_CONFIG 和默认配置查找
@@ -1836,7 +1787,7 @@ Session 维护命令:
 
 Supervisor 排障命令:
   acn supervisor status       查看后台 supervisor 是否在运行、PID、uptime 和队列概况
-  acn supervisor jobs [-l n]  查看最近 finalize job；默认 5 条，-l 0 显示全部
+  acn supervisor jobs [-l n]  查看最近 recap/finalize job；默认 5 条，-l 0 显示全部
   acn supervisor retry <id>   按 session_id（推荐）或 job_id 重试失败的 finalize
   acn supervisor stop         优雅停止后台 supervisor
 
@@ -1998,7 +1949,7 @@ fn supervisor_usage() -> &'static str {
   acn supervisor stop [options]
   acn supervisor run [options]
 
-管理 ACN finalize supervisor。普通用户无需手动启动；`run` 是 ACN 自动拉起的后台内部命令，开发和排障时主要使用 status/jobs/retry/stop。
+管理 ACN recap/finalize supervisor。普通用户无需手动启动；`run` 是 ACN 自动拉起的后台内部命令，开发和排障时主要使用 status/jobs/retry/stop。
 
 选项:
   --config <path>      指定 config.toml；应与启动 TUI 时使用的配置一致
@@ -2080,14 +2031,18 @@ fn supervisor_status_text(
             supervisor::SupervisorRuntimeState::Stuck { .. } => "stuck_current",
         };
         text.push_str(&format!(
-            "{}: {} agent_id={} session_id={} attempts={} manual_retries={} started_at={}",
+            "{}: {} kind={} agent_id={} session_id={} target={} attempts={} manual_retries={} started_at={}",
             label,
             job.id,
+            job.kind,
             job.agent_id
                 .as_ref()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| "-".to_string()),
             job.session_id,
+            job.recap_end_index
+                .map(|target| target.to_string())
+                .unwrap_or_else(|| "-".to_string()),
             job.attempts,
             job.manual_retries,
             format_optional_time(job.started_at.as_ref())
@@ -2102,8 +2057,10 @@ fn supervisor_status_text(
 fn supervisor_jobs_text(jobs: &[supervisor::SupervisorJobView], limit: usize) -> String {
     let header = [
         "job_id",
+        "kind",
         "agent_id",
         "session_id",
+        "target",
         "status",
         "created_at",
         "started_at",
@@ -2118,6 +2075,7 @@ fn supervisor_jobs_text(jobs: &[supervisor::SupervisorJobView], limit: usize) ->
         .map(|job| {
             [
                 clean_table_field(&job.id),
+                clean_table_field(&job.kind),
                 clean_table_field(
                     &job.agent_id
                         .as_ref()
@@ -2125,6 +2083,9 @@ fn supervisor_jobs_text(jobs: &[supervisor::SupervisorJobView], limit: usize) ->
                         .unwrap_or_else(|| "-".to_string()),
                 ),
                 clean_table_field(job.session_id.as_str()),
+                job.recap_end_index
+                    .map(|target| target.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
                 clean_table_field(&job.status),
                 format_time(&job.created_at),
                 format_optional_time(job.started_at.as_ref()),
@@ -2159,7 +2120,7 @@ fn recent_supervisor_jobs(
     jobs[start..].iter().rev().collect()
 }
 
-fn supervisor_jobs_column_widths(header: &[&str; 10], rows: &[[String; 10]]) -> [usize; 10] {
+fn supervisor_jobs_column_widths(header: &[&str; 12], rows: &[[String; 12]]) -> [usize; 12] {
     let mut widths = header.map(UnicodeWidthStr::width);
     for row in rows {
         for (index, cell) in row.iter().enumerate() {
@@ -2169,7 +2130,7 @@ fn supervisor_jobs_column_widths(header: &[&str; 10], rows: &[[String; 10]]) -> 
     widths
 }
 
-fn push_supervisor_jobs_row<T: AsRef<str>>(text: &mut String, row: &[T; 10], widths: &[usize; 10]) {
+fn push_supervisor_jobs_row<T: AsRef<str>>(text: &mut String, row: &[T; 12], widths: &[usize; 12]) {
     for (index, cell) in row.iter().enumerate() {
         if index > 0 {
             text.push_str("  ");
@@ -2258,8 +2219,8 @@ mod tests {
         SessionStatus,
     };
     use agent_claim_network::supervisor::{
-        FinalizingSessionDiagnostic, SupervisorJobView, SupervisorQueueSummary,
-        SupervisorRuntimeState, SupervisorStatusSnapshot, SupervisorStopReport,
+        SupervisorJobView, SupervisorQueueSummary, SupervisorRuntimeState,
+        SupervisorStatusSnapshot, SupervisorStopReport,
     };
     use chrono::{DateTime, Utc};
     use std::path::PathBuf;
@@ -2666,56 +2627,13 @@ api_key_env = "UNUSED_TEST_LLM_KEY"
     }
 
     #[test]
-    fn direct_resume_rejects_non_closed_session_with_terminal_message() {
-        let session_id = SessionId::from_str("session_1234abcd").unwrap();
-
-        assert_eq!(
-            super::direct_resume_not_closed_message(&session_id, SessionStatus::Finalizing),
-            "Resume failed: You can only resume Closed sessions.\nSession session_1234abcd current status: Finalizing.\n"
-        );
-    }
-
-    #[test]
-    fn direct_resume_finalizing_message_explains_job_state_and_retry_command() {
-        let session_id = SessionId::from_str("session_1234abcd").unwrap();
-
-        assert_eq!(
-            super::direct_resume_finalizing_message(
-                &session_id,
-                &FinalizingSessionDiagnostic::Queued {
-                    job_id: "job_queued".into(),
-                },
-            ),
-            "Resume failed: session session_1234abcd 正在等待 finalize（job job_queued）。请稍后重试。\n"
-        );
-        assert_eq!(
-            super::direct_resume_finalizing_message(
-                &session_id,
-                &FinalizingSessionDiagnostic::Failed {
-                    job_id: "job_failed".into(),
-                },
-            ),
-            "Resume failed: session session_1234abcd 的 finalize 失败。\nJob: job_failed\n\n请运行：\nacn supervisor retry session_1234abcd\n"
-        );
-        assert_eq!(
-            super::direct_resume_finalizing_message(
-                &session_id,
-                &FinalizingSessionDiagnostic::Orphaned,
-            ),
-            "Resume failed: session session_1234abcd 的 finalize 未完成。\n\n请运行：\nacn supervisor retry session_1234abcd\n"
-        );
-    }
-
-    #[test]
-    fn direct_resume_metadata_failure_allows_only_closed_sessions() {
+    fn direct_resume_metadata_failure_allows_consistent_open_closed_and_finalizing_sessions() {
         let agent = AgentId::new("agent-a").unwrap();
         let session_id = SessionId::from_str("session_1234abcd").unwrap();
         let metadata =
             test_session_metadata(agent.clone(), session_id.clone(), SessionStatus::Open);
 
-        let failure = super::direct_resume_metadata_failure(&agent, &session_id, &metadata)
-            .expect("open direct resume should be rejected");
-        assert!(failure.contains("You can only resume Closed sessions"));
+        assert!(super::direct_resume_metadata_failure(&agent, &session_id, &metadata).is_none());
 
         let metadata =
             test_session_metadata(agent.clone(), session_id.clone(), SessionStatus::Closed);
@@ -2723,9 +2641,7 @@ api_key_env = "UNUSED_TEST_LLM_KEY"
 
         let metadata =
             test_session_metadata(agent.clone(), session_id.clone(), SessionStatus::Finalizing);
-        let failure = super::direct_resume_metadata_failure(&agent, &session_id, &metadata)
-            .expect("finalizing direct resume should be rejected");
-        assert!(failure.contains("You can only resume Closed sessions"));
+        assert!(super::direct_resume_metadata_failure(&agent, &session_id, &metadata).is_none());
         let mut metadata =
             test_session_metadata(agent.clone(), session_id.clone(), SessionStatus::Closed);
         metadata.finalized_at = Some(metadata.updated_at);
@@ -2737,7 +2653,7 @@ api_key_env = "UNUSED_TEST_LLM_KEY"
         metadata.finalized_at = Some(metadata.updated_at);
         let failure = super::direct_resume_metadata_failure(&agent, &session_id, &metadata)
             .expect("open finalized metadata should be rejected");
-        assert!(failure.contains("You can only resume Closed sessions"));
+        assert!(failure.contains("inconsistent Open metadata"));
     }
 
     #[test]
@@ -3873,7 +3789,9 @@ retry_max_delay_ms = 5000
             current_job: Some(SupervisorJobView {
                 id: "job_1".to_string(),
                 agent_id: Some(AgentId::new("agent-a").unwrap()),
+                kind: "finalize".to_string(),
                 session_id: SessionId::from_str("session_1234abcd").unwrap(),
+                recap_end_index: None,
                 status: "running".to_string(),
                 created_at: now,
                 started_at: Some(now),
@@ -3916,7 +3834,9 @@ retry_max_delay_ms = 5000
             current_job: Some(SupervisorJobView {
                 id: "job_1".to_string(),
                 agent_id: Some(AgentId::new("agent-a").unwrap()),
+                kind: "finalize".to_string(),
                 session_id: SessionId::from_str("session_1234abcd").unwrap(),
+                recap_end_index: None,
                 status: "running".to_string(),
                 created_at: now,
                 started_at: Some(now),
@@ -3948,7 +3868,9 @@ retry_max_delay_ms = 5000
         let jobs = [SupervisorJobView {
             id: "job_1".to_string(),
             agent_id: Some(AgentId::new("agent-a").unwrap()),
+            kind: "recap".to_string(),
             session_id: SessionId::from_str("session_1234abcd").unwrap(),
+            recap_end_index: Some(42),
             status: "failed".to_string(),
             created_at: now,
             started_at: Some(now),
@@ -3979,7 +3901,9 @@ retry_max_delay_ms = 5000
             .map(|idx| SupervisorJobView {
                 id: format!("job_{idx}"),
                 agent_id: Some(AgentId::new("agent-a").unwrap()),
+                kind: "finalize".to_string(),
                 session_id: SessionId::from_str("session_1234abcd").unwrap(),
+                recap_end_index: None,
                 status: "succeeded".to_string(),
                 created_at: now + chrono::Duration::seconds(i64::from(idx)),
                 started_at: None,
@@ -4013,7 +3937,9 @@ retry_max_delay_ms = 5000
             .map(|idx| SupervisorJobView {
                 id: format!("job_{idx}"),
                 agent_id: Some(AgentId::new("agent-a").unwrap()),
+                kind: "finalize".to_string(),
                 session_id: SessionId::from_str("session_1234abcd").unwrap(),
+                recap_end_index: None,
                 status: "succeeded".to_string(),
                 created_at: now + chrono::Duration::seconds(i64::from(idx)),
                 started_at: None,

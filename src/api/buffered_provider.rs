@@ -101,6 +101,7 @@ mod tests {
             runtime_chain_id: Some(ProviderRuntimeChainId::new()),
             runtime_fallback_scope: Some(ProviderRuntimeFallbackScope::new_root()),
             recovery_interrupt: None,
+            allow_continuation: true,
             retry_count_override: None,
         }
     }

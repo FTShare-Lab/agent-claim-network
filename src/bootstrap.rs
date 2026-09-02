@@ -31,6 +31,10 @@ use crate::claim::{AgentId, Claim, Dispute, InboxId, InboxMessage};
 use crate::config::{Config, LlmChatConfig, LlmProvider, ResolvedUpstream};
 use crate::delegation::{DelegationRunnerConfig, DelegationWaitConfig, LlmDelegationExecutor};
 use crate::evaluation::EvaluationHarnessMode;
+use crate::maintainer::arbitration::{
+    lease_base_duration, ArbitrationContextBuilder, ArbitrationService, ArbitrationStore,
+    LlmArbitrationEvaluator, ResolutionService, SystemArbitrationClock,
+};
 use crate::maintainer::http_client::HttpMaintainerClient;
 use crate::maintainer::traits::MaintainerClient;
 use crate::maintainer::Maintainer;
@@ -49,6 +53,7 @@ use crate::tool::{EvaluationSubmission, ToolRegistry};
 
 const ROUTER_VECTOR_WORKER_TASK_NAME: &str = "router_vector_worker";
 const ROUTER_REFRESH_WORKER_TASK_NAME: &str = "router_refresh_worker";
+const MAINTAINER_LLM_WEBSOCKET_CAPACITY: usize = 1;
 const REQUIRED_SESSION_PROMPTS: &[&str] = &[
     "agent_system",
     "evaluation_agent_system",
@@ -465,13 +470,24 @@ pub async fn build_refreshed_mcp_manager(cfg: &Config) -> Arc<McpConnectionManag
 }
 
 pub(crate) fn build_provider_adapter(cfg: &Config) -> anyhow::Result<Arc<dyn ProviderAdapter>> {
-    let chat = &cfg.agent.llm;
+    build_provider_adapter_for(
+        &cfg.agent.llm,
+        "agent.llm",
+        cfg.agent.session.subagents.max_concurrent.saturating_add(3),
+    )
+}
+
+fn build_provider_adapter_for(
+    chat: &LlmChatConfig,
+    config_path: &str,
+    responses_websocket_capacity: usize,
+) -> anyhow::Result<Arc<dyn ProviderAdapter>> {
     match chat.provider {
         LlmProvider::Anthropic => {
             let key = chat
                 .api_key
                 .clone()
-                .with_context(|| missing_loaded_api_key_message(chat))?;
+                .with_context(|| missing_loaded_api_key_message(chat, config_path))?;
             Ok(Arc::new(
                 AnthropicProviderAdapter::new(
                     key,
@@ -495,7 +511,7 @@ pub(crate) fn build_provider_adapter(cfg: &Config) -> anyhow::Result<Arc<dyn Pro
             let key = chat
                 .api_key
                 .clone()
-                .with_context(|| missing_loaded_api_key_message(chat))?;
+                .with_context(|| missing_loaded_api_key_message(chat, config_path))?;
             Ok(Arc::new(
                 OpenAiCompatibleChatProviderAdapter::new(
                     key,
@@ -514,7 +530,7 @@ pub(crate) fn build_provider_adapter(cfg: &Config) -> anyhow::Result<Arc<dyn Pro
             let key = chat
                 .api_key
                 .clone()
-                .with_context(|| missing_loaded_api_key_message(chat))?;
+                .with_context(|| missing_loaded_api_key_message(chat, config_path))?;
             let adapter = OpenAiCompatibleResponsesProviderAdapter::new(
                 key,
                 chat.endpoint.clone(),
@@ -526,21 +542,18 @@ pub(crate) fn build_provider_adapter(cfg: &Config) -> anyhow::Result<Arc<dyn Pro
             )?
             .with_reasoning_effort(chat.reasoning_effort)
             .with_sampling_parameters(chat.temperature, chat.top_p)
-            .with_websockets(
-                chat.supports_websockets,
-                cfg.agent.session.subagents.max_concurrent.saturating_add(3),
-            )?;
+            .with_websockets(chat.supports_websockets, responses_websocket_capacity)?;
             Ok(Arc::new(adapter))
         }
     }
 }
 
-fn missing_loaded_api_key_message(chat: &LlmChatConfig) -> String {
+fn missing_loaded_api_key_message(chat: &LlmChatConfig, config_path: &str) -> String {
     if chat.api_key_env.trim().is_empty() {
-        "[agent.llm].api_key_env 为空，无法读取 LLM provider API key".to_string()
+        format!("[{config_path}].api_key_env 为空，无法读取 LLM provider API key")
     } else {
         format!(
-            "[agent.llm].api_key_env '{}' 对应的环境变量为空，无法读取 LLM provider API key",
+            "[{config_path}].api_key_env '{}' 对应的环境变量为空，无法读取 LLM provider API key",
             chat.api_key_env
         )
     }
@@ -606,6 +619,60 @@ pub fn build_maintainer_service(cfg: &Config) -> Arc<Maintainer> {
             cfg.maintainer.history.clone(),
         ),
     ))
+}
+
+pub fn build_maintainer_arbitration_service(
+    cfg: &Config,
+    maintainer: Arc<Maintainer>,
+    router: Arc<dyn RouterClient>,
+) -> anyhow::Result<Option<Arc<ArbitrationService>>> {
+    if !cfg.maintainer.arbitration.enabled {
+        return Ok(None);
+    }
+    let llm = cfg
+        .maintainer
+        .llm
+        .as_ref()
+        .context("maintainer arbitration 已启用，但缺少 [maintainer.llm]")?;
+    let provider =
+        build_provider_adapter_for(llm, "maintainer.llm", MAINTAINER_LLM_WEBSOCKET_CAPACITY)?;
+    let caller = Arc::new(StructuredJsonCaller::new(
+        provider,
+        llm.max_tokens,
+        llm.retry_count,
+        Duration::from_millis(llm.retry_base_delay_ms),
+        Duration::from_millis(llm.retry_max_delay_ms),
+    ));
+    let prompts = Arc::new(PromptRegistry::from_config(&cfg.prompt)?);
+    prompts.validate_renderable(&[
+        "maintainer_arbitration_proposal",
+        "maintainer_arbitration_verification",
+    ])?;
+    let evaluator = Arc::new(LlmArbitrationEvaluator::new(
+        caller,
+        prompts,
+        llm,
+        cfg.maintainer.arbitration.confidence_threshold,
+    )?);
+    let store = ArbitrationStore::new(cfg.storage.team_root.clone());
+    let context_builder = ArbitrationContextBuilder::new(
+        store.clone(),
+        router,
+        cfg.maintainer.arbitration.clone(),
+        llm.clone(),
+    );
+    let resolution_service = ResolutionService::new(maintainer, store.clone());
+    Ok(Some(Arc::new(ArbitrationService::new(
+        store,
+        context_builder,
+        evaluator,
+        resolution_service,
+        cfg.maintainer.arbitration.clone(),
+        llm.model.clone(),
+        lease_base_duration(llm)?,
+        cfg.maintainer.id_mint_max_attempts(),
+        Arc::new(SystemArbitrationClock),
+    ))))
 }
 
 pub fn spawn_router_vector_worker(
@@ -856,6 +923,8 @@ mod tests {
                     mint_max_retries: crate::config::DEFAULT_ID_MINT_MAX_RETRIES,
                 },
                 auth: Default::default(),
+                arbitration: Default::default(),
+                llm: None,
             },
             agent: AgentConfig {
                 llm: LlmChatConfig {

@@ -125,16 +125,44 @@ pub(super) struct PreviewFile {
     pub(super) label: String,
 }
 
+/// 一批预览文件准备失败时，保留已经落盘的临时文件路径，交给 App 统一清理。
+#[derive(Debug)]
+pub(super) struct PreviewPreparationError {
+    pub(super) source: AttachmentError,
+    pub(super) temporary_paths: Vec<PathBuf>,
+}
+
+/// Ctrl+O 准备或拉起失败；临时路径即使跨 session 变为 stale 也必须登记清理。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PreviewFailure {
+    pub(super) message: String,
+    pub(super) temporary_paths: Vec<PathBuf>,
+}
+
 /// 把一组预览目标落成可供 Quick Look 打开的本地文件（任一失败整体报错）。
 /// 含文件系统访问与 base64 解码，**必须**在 `spawn_blocking` 中执行。
 pub(super) fn prepare_preview_files(
     targets: Vec<PreviewTarget>,
     workspace_root: &std::path::Path,
-) -> Result<Vec<PreviewFile>, AttachmentError> {
-    targets
-        .into_iter()
-        .map(|target| prepare_preview_file(target, workspace_root))
-        .collect()
+) -> Result<Vec<PreviewFile>, PreviewPreparationError> {
+    let mut files = Vec::with_capacity(targets.len());
+    for target in targets {
+        match prepare_preview_file(target, workspace_root) {
+            Ok(file) => files.push(file),
+            Err(source) => {
+                let temporary_paths = files
+                    .iter()
+                    .filter(|file| file.temporary)
+                    .map(|file| file.path.clone())
+                    .collect();
+                return Err(PreviewPreparationError {
+                    source,
+                    temporary_paths,
+                });
+            }
+        }
+    }
+    Ok(files)
 }
 
 fn prepare_preview_file(
@@ -678,7 +706,10 @@ mod tests {
                 }],
                 Path::new("."),
             ),
-            Err(AttachmentError::Metadata { .. })
+            Err(PreviewPreparationError {
+                source: AttachmentError::Metadata { .. },
+                ..
+            })
         ));
     }
 
@@ -731,6 +762,32 @@ mod tests {
             ),
             Err(AttachmentError::ClipboardImageInvalid(_))
         ));
+    }
+
+    #[test]
+    fn preview_batch_failure_preserves_prior_temp_path_for_cleanup() {
+        use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+        use base64::Engine as _;
+
+        let error = prepare_preview_files(
+            vec![
+                PreviewTarget::InlineImage {
+                    name: "[Image #1]".into(),
+                    media_type: "image/png".into(),
+                    data: BASE64_STANDARD.encode(b"temporary image"),
+                },
+                PreviewTarget::AtPath {
+                    raw_path: "/definitely/missing/acn-preview-file".into(),
+                },
+            ],
+            Path::new("."),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error.source, AttachmentError::Metadata { .. }));
+        assert_eq!(error.temporary_paths.len(), 1);
+        assert!(error.temporary_paths[0].exists());
+        std::fs::remove_file(&error.temporary_paths[0]).unwrap();
     }
 
     #[cfg(target_os = "macos")]

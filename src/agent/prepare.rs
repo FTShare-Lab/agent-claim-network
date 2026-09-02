@@ -147,7 +147,7 @@ pub(super) fn validate_visible_policy_sources(
 /// 失败（validate-before-I/O 不变量保证不留半写状态）。
 pub(super) fn prepare_claims(
     drafts: Vec<crate::api::ClaimDraft>,
-    allowed_source_claim_ids: &FxHashSet<ClaimId>,
+    allowed_source_claim_ids: Option<&FxHashSet<ClaimId>>,
     holder: &AgentId,
     now: DateTime<Utc>,
 ) -> anyhow::Result<Vec<Claim>> {
@@ -164,8 +164,8 @@ pub(super) fn prepare_claims(
                     "new_claims[{idx}].source_claim_ids[{j}]={raw:?} 解析失败 (期望 claim_/policy_ 前缀): {e}"
                 )
             })?;
-            if let SourceId::Claim(id) = &s {
-                if !allowed_source_claim_ids.contains(id) {
+            if let (Some(allowed), SourceId::Claim(id)) = (allowed_source_claim_ids, &s) {
+                if !allowed.contains(id) {
                     anyhow::bail!(
                         "new_claims[{idx}].source_claim_ids[{j}]={raw:?} 不在本次上下文/本批新生成中"
                     );
@@ -193,7 +193,7 @@ pub(super) fn prepare_claims(
 pub(super) fn prepare_claim_updates(
     drafts: Vec<crate::api::ClaimDraft>,
     local_by_id: &FxHashMap<ClaimId, Claim>,
-    allowed_source_claim_ids: &FxHashSet<ClaimId>,
+    allowed_source_claim_ids: Option<&FxHashSet<ClaimId>>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<Vec<Claim>> {
     let updated_at = truncate_to_second(now);
@@ -232,8 +232,8 @@ pub(super) fn prepare_claim_updates(
                     "updated_claims[{idx}].source_claim_ids[{j}]={raw:?} 解析失败 (期望 claim_/policy_ 前缀): {e}"
                 )
             })?;
-            if let SourceId::Claim(id) = &source {
-                if !allowed_source_claim_ids.contains(id) {
+            if let (Some(allowed), SourceId::Claim(id)) = (allowed_source_claim_ids, &source) {
+                if !allowed.contains(id) {
                     anyhow::bail!(
                         "updated_claims[{idx}].source_claim_ids[{j}]={raw:?} 不在本次上下文/本批新生成中"
                     );
@@ -265,7 +265,7 @@ pub(super) fn prepare_claim_updates(
 ///   生成的 ClaimId（同样已经被加入 `allowed_for_refs`）
 pub(super) fn prepare_disputes(
     drafts: Vec<crate::api::DisputeDraft>,
-    allowed_for_refs: &FxHashSet<ClaimId>,
+    allowed_for_refs: Option<&FxHashSet<ClaimId>>,
     reporter_agent_id: &AgentId,
     now: DateTime<Utc>,
 ) -> anyhow::Result<Vec<Dispute>> {
@@ -288,16 +288,18 @@ pub(super) fn prepare_disputes(
         if parsed.len() < 2 {
             anyhow::bail!("new_disputes[{idx}].claims 至少需要 2 条不同的 claim 引用");
         }
-        let invalid: Vec<String> = parsed
-            .iter()
-            .filter(|id| !allowed_for_refs.contains(*id))
-            .map(ToString::to_string)
-            .collect();
-        if !invalid.is_empty() {
-            anyhow::bail!(
-                "new_disputes[{idx}].claims 包含不在本次上下文/本批新生成中的 claim id: {}",
-                invalid.join(", ")
-            );
+        if let Some(allowed) = allowed_for_refs {
+            let invalid: Vec<String> = parsed
+                .iter()
+                .filter(|id| !allowed.contains(*id))
+                .map(ToString::to_string)
+                .collect();
+            if !invalid.is_empty() {
+                anyhow::bail!(
+                    "new_disputes[{idx}].claims 包含不在本次上下文/本批新生成中的 claim id: {}",
+                    invalid.join(", ")
+                );
+            }
         }
         let dispute_id = DisputeId::from_str(&d.id).map_err(|e| {
             anyhow::anyhow!("new_disputes[{idx}].id 解析失败 (期望真实 DisputeId): {e}")
@@ -360,7 +362,7 @@ mod tests {
                 id.into_string(),
                 Some("not-a-valid-status"),
             )],
-            &FxHashSet::default(),
+            Some(&FxHashSet::default()),
             &holder,
             now,
         )
@@ -403,7 +405,7 @@ mod tests {
         let err = prepare_claim_updates(
             vec![sample_claim_draft(existing.id.into_string(), None)],
             &local,
-            &FxHashSet::default(),
+            Some(&FxHashSet::default()),
             "2026-05-19T10:00:00Z".parse().unwrap(),
         )
         .unwrap_err();
@@ -421,7 +423,7 @@ mod tests {
                 Some("unknown"),
             )],
             &local,
-            &FxHashSet::default(),
+            Some(&FxHashSet::default()),
             "2026-05-19T10:00:00Z".parse().unwrap(),
         )
         .unwrap_err();
@@ -440,7 +442,7 @@ mod tests {
         let err = prepare_claim_updates(
             vec![draft],
             &local,
-            &FxHashSet::from_iter([existing.id]),
+            Some(&FxHashSet::from_iter([existing.id])),
             "2026-05-19T10:00:00Z".parse().unwrap(),
         )
         .unwrap_err();
@@ -464,7 +466,7 @@ mod tests {
         let updates = prepare_claim_updates(
             vec![draft],
             &local,
-            &FxHashSet::from_iter([replacement_claim.clone()]),
+            Some(&FxHashSet::from_iter([replacement_claim.clone()])),
             now,
         )
         .unwrap();
@@ -580,7 +582,7 @@ mod tests {
 
         let disputes = prepare_disputes(
             drafts,
-            &allowed_for_refs,
+            Some(&allowed_for_refs),
             &reporter,
             "2026-05-18T00:00:00Z".parse().unwrap(),
         )

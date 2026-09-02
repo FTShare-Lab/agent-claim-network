@@ -314,6 +314,8 @@ pub struct ProviderRequest {
     pub runtime_fallback_scope: Option<ProviderRuntimeFallbackScope>,
     /// 只阻止尚未开始的 retry、continuation 与 fallback；不能取消当前正常 request。
     pub recovery_interrupt: Option<ProviderRecoveryInterrupt>,
+    /// 是否允许 adapter 在 max-token partial 后自动发起 continuation 请求。
+    pub allow_continuation: bool,
     /// 覆盖 adapter 内部的额外 HTTP retry 次数；`None` 使用 provider 配置。
     pub retry_count_override: Option<u32>,
 }
@@ -354,6 +356,32 @@ pub enum ProviderStop {
 #[error("{message}")]
 pub(crate) struct ProviderTerminalFailure {
     message: String,
+}
+
+/// Provider 或其上游 transport 明确拒绝了过大的请求。Adapter 只负责统一分类，
+/// 是否能通过剥离媒体恢复由持有完整 provider-neutral history 的 turn loop 决定。
+#[derive(Debug, thiserror::Error)]
+#[error("LLM provider request exceeds the upstream size limit")]
+pub(crate) struct ProviderRequestTooLarge {
+    discard_visible_output: bool,
+}
+
+impl ProviderRequestTooLarge {
+    pub(crate) fn new() -> Self {
+        Self {
+            discard_visible_output: false,
+        }
+    }
+
+    pub(crate) fn after_visible_output() -> Self {
+        Self {
+            discard_visible_output: true,
+        }
+    }
+
+    pub(crate) fn should_discard_visible_output(&self) -> bool {
+        self.discard_visible_output
+    }
 }
 
 /// Provider request 尚未发送时，其 write-ahead 准备已失败。
@@ -567,6 +595,7 @@ pub fn assistant_text_from_message(message: &SessionTurnMessage) -> anyhow::Resu
                 anyhow::bail!("结构化文本响应不能包含附件 block");
             }
             SessionTurnContentBlock::ToolUse { .. }
+            | SessionTurnContentBlock::InvalidToolUse { .. }
             | SessionTurnContentBlock::ToolResult { .. } => {
                 anyhow::bail!("结构化文本响应只能包含 Text block");
             }

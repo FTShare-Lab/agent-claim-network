@@ -214,6 +214,48 @@ async fn parent_registry_exposes_delegation_tools_and_can_create_list() {
         .exists());
 }
 
+#[tokio::test]
+async fn releasing_session_runner_releases_its_idle_runtime_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent_home = dir.path().join("agents/agent-a");
+    let agent_id = AgentId::new("agent-a").unwrap();
+    let session_id = SessionId::from_str("session_1234abcd").unwrap();
+    let runtime_lock = dir.path().join("runtime.lock");
+    let owner_lease = crate::session::SessionRuntimeLease::acquire_for_test(&runtime_lock)
+        .await
+        .unwrap();
+    let registry = ToolRegistry::new(&test_tool_config(dir.path()))
+        .unwrap()
+        .with_delegation_executor(
+            agent_home,
+            agent_id,
+            Arc::new(ImmediateDelegationExecutor),
+            DelegationRunnerConfig::default(),
+        );
+
+    registry
+        .bind_delegation_runtime_lease_for_session(&session_id, owner_lease.clone_for_worker())
+        .await
+        .unwrap();
+    drop(owner_lease);
+    assert!(
+        crate::storage::FileLockGuard::try_lock_exclusive(&runtime_lock)
+            .await
+            .unwrap()
+            .is_none(),
+        "runner registry should retain the session lease"
+    );
+
+    registry.release_delegation_runtime_lease_for_session(&session_id);
+    let reacquired = crate::storage::FileLockGuard::try_lock_exclusive(&runtime_lock)
+        .await
+        .unwrap();
+    assert!(
+        reacquired.is_some(),
+        "releasing an idle session runner should release its lease"
+    );
+}
+
 #[test]
 fn wait_subagents_and_code_run_descriptions_use_runtime_limits() {
     let dir = tempfile::tempdir().unwrap();

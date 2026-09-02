@@ -14,7 +14,6 @@ type DetailDrawerProps = PropsWithChildren<{
   footer?: ReactNode
   backLabel?: string
   onBack?: () => void
-  size?: 'default' | 'wide'
   modal?: boolean
 }>
 
@@ -65,7 +64,6 @@ export function DetailDrawer({
   footer,
   backLabel,
   onBack,
-  size = 'wide',
   modal = true,
   children,
 }: DetailDrawerProps) {
@@ -145,9 +143,8 @@ export function DetailDrawer({
         aria-describedby={subtitle ? subtitleId : undefined}
         tabIndex={-1}
         className={cn(
-          'acn-sheet-enter pointer-events-auto absolute inset-y-0 right-0 z-10 w-full overflow-hidden rounded-l-2xl bg-white shadow-[var(--shadow-overlay)]',
+          'acn-detail-drawer acn-sheet-enter pointer-events-auto absolute inset-y-0 right-0 z-10 w-full max-w-[760px] overflow-hidden rounded-l-2xl bg-white shadow-[var(--shadow-overlay)]',
           !modal && 'acn-context-inspector ring-1 ring-slate-200/70',
-          size === 'wide' ? 'max-w-[760px]' : 'max-w-[440px]',
         )}
       >
         <div className="flex h-full flex-col">
@@ -165,11 +162,11 @@ export function DetailDrawer({
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
                 <div className="text-[11px] font-semibold uppercase tracking-[0.1em] text-[var(--accent)]">{label}</div>
-                <h3 id={titleId} className="mt-1 truncate text-lg font-[700] tracking-[-0.015em] text-slate-900">
+                <h3 id={titleId} className="mt-1 [overflow-wrap:anywhere] text-lg font-[700] tracking-[-0.015em] text-slate-900">
                   {title}
                 </h3>
                 {subtitle ? (
-                  <p id={subtitleId} className="mt-0.5 truncate font-mono text-xs text-slate-600">
+                  <p id={subtitleId} className="mt-0.5 [overflow-wrap:anywhere] font-mono text-xs text-slate-600">
                     {subtitle}
                   </p>
                 ) : null}

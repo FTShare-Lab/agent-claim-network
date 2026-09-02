@@ -99,6 +99,7 @@ impl SessionTurnEventRecorder for TurnJournalDurableEventRecorder {
             SessionTurnEvent::Warning { .. }
             | SessionTurnEvent::CompactionStarted { .. }
             | SessionTurnEvent::CompactionCompleted { .. }
+            | SessionTurnEvent::RecapRequested { .. }
             | SessionTurnEvent::CompactionSkipped { .. }
             | SessionTurnEvent::CompactionFailed { .. } => Ok(()),
             SessionTurnEvent::NonStreamingFallbackAttemptStarted {
@@ -115,6 +116,12 @@ impl SessionTurnEventRecorder for TurnJournalDurableEventRecorder {
                             previous_error,
                         },
                     )
+                    .await
+            }
+            SessionTurnEvent::AssistantOutputDiscarded => {
+                self.assistant_delta_flusher.flush();
+                self.sink
+                    .send_immediate_durable(TurnJournalEventKind::AssistantOutputDiscarded)
                     .await
             }
             SessionTurnEvent::NonStreamingFallbackAttemptFailed {

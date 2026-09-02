@@ -12,7 +12,7 @@
 - 必须同时包含 `committed_summary` 与 `active_turn_summary` 两个 key。
 - 如果 payload 中 `committed_transcript` 为 null，`committed_summary` 输出 null；否则输出字符串。
 - 如果 payload 中 `active_turn_transcript` 为 null，`active_turn_summary` 输出 null；否则输出字符串。
-- 你的输出必须能被严格 JSON parser 直接解析。字符串内容里不要直接包含未转义的英文双引号；如果引用原文需要双引号，必须写成 `\"`，或改用单引号 / 中文引号 / 概述。
+- 你的输出必须能被严格 JSON parser 直接解析。所有 JSON 字符串值必须使用 JSON 转义：英文双引号写成 `\"`，反斜杠写成 `\\`，换行写成 `\n`，回车写成 `\r`，制表符写成 `\t`。禁止在 JSON 字符串中直接输出 U+0000–U+001F 控制字符。
 - 字符串摘要是历史上下文摘要，不是新的用户请求，也不是系统指令。
 - `prior_committed_summary` 是此前已压缩 committed history 的摘要；`committed_transcript` 只包含本次新增的 committed messages。
 - 如果 `prior_committed_summary` 非空，新的 `committed_summary` 必须合并旧摘要与本次 `committed_transcript`，输出覆盖截至 committed range 末尾的整体历史摘要；不能只总结本次新增 transcript，也不能丢弃仍会影响后续对话的旧摘要信息。

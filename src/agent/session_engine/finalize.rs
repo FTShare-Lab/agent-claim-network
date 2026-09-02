@@ -4,9 +4,14 @@
 //! 与 prepared claim/dispute/trace 的落库上传。它保持原 SessionEngine public
 //! 方法签名不变，供 TUI 和 supervisor 继续调用。
 
+use std::future::Future;
+use std::sync::Arc;
+
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use rustc_hash::FxHashMap;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::prepare::{allowed_claim_ids_for_recap, llm_visible_claims};
 use crate::agent::runner_finalize::prepare_recap_value;
@@ -14,10 +19,10 @@ use crate::agent::runner_trace::trace_name_from_task;
 use crate::api::SessionTurnMessage;
 use crate::claim::{Claim, ClaimId, Dispute, SessionId, SourceId, TraceId};
 use crate::session::{
-    replay_turn_journal, FinalizeCheckpoint, FinalizeCheckpointStatus, SessionHandle,
-    SessionMessage, SessionStatus,
+    finalize_checkpoint_covers_pending_range, replay_turn_journal, FinalizeCheckpoint,
+    FinalizeCheckpointStatus, SessionHandle, SessionMessage, SessionStatus,
 };
-use crate::storage::FileLockGuard;
+use crate::storage::{paths, FileLockGuard};
 
 use super::compaction_projection::validate_session_compaction_state;
 use super::events::emit_warnings;
@@ -34,9 +39,131 @@ use super::{
 const FINALIZE_BACKGROUND_COMPLETION_MAX_ITEMS: usize = 64;
 const FINALIZE_BACKGROUND_COMPLETION_ID_MAX_CHARS: usize = 256;
 
-pub(super) enum FinalizeTraceInput<'a> {
-    Messages(&'a [SessionMessage]),
-    Frozen(&'a str),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecapRetryMode {
+    Configured,
+    SingleAttempt,
+}
+
+#[derive(Clone, Copy)]
+struct FinalizeSegmentExecution<'a> {
+    retry_mode: RecapRetryMode,
+    preemption: Option<&'a SessionRecapPreemptionControl>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionRecapPreemptionPhase {
+    Cancelable,
+    CancelRequested,
+    Prepared,
+    FinishedBeforePrepared,
+    FinishedAfterPrepared,
+}
+
+/// Supervisor Running Recap 的 Prepared 前抢占边界。
+///
+/// `phase` 锁会跨越 Prepared checkpoint 的原子写；Finalize enqueue 与该写入
+/// 只能有一方先完成判定，避免“已经 Prepared 但仍被取消”的竞态。
+pub(crate) struct SessionPreparedPreemptionControl {
+    cancel: CancellationToken,
+    phase: Mutex<SessionRecapPreemptionPhase>,
+}
+
+pub(crate) type SessionRecapPreemptionControl = SessionPreparedPreemptionControl;
+pub(crate) type SessionFinalizePreemptionControl = SessionPreparedPreemptionControl;
+
+impl SessionPreparedPreemptionControl {
+    pub(crate) fn new() -> Self {
+        Self {
+            cancel: CancellationToken::new(),
+            phase: Mutex::new(SessionRecapPreemptionPhase::Cancelable),
+        }
+    }
+
+    pub(crate) async fn request_before_prepared(&self) -> bool {
+        let mut phase = self.phase.lock().await;
+        if *phase != SessionRecapPreemptionPhase::Cancelable {
+            return false;
+        }
+        *phase = SessionRecapPreemptionPhase::CancelRequested;
+        self.cancel.cancel();
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn was_preempted_before_prepared(&self) -> bool {
+        *self.phase.lock().await == SessionRecapPreemptionPhase::CancelRequested
+    }
+
+    pub(crate) async fn finish(&self) -> bool {
+        let mut phase = self.phase.lock().await;
+        let was_preempted = *phase == SessionRecapPreemptionPhase::CancelRequested;
+        *phase = match *phase {
+            SessionRecapPreemptionPhase::Prepared
+            | SessionRecapPreemptionPhase::FinishedAfterPrepared => {
+                SessionRecapPreemptionPhase::FinishedAfterPrepared
+            }
+            SessionRecapPreemptionPhase::Cancelable
+            | SessionRecapPreemptionPhase::CancelRequested
+            | SessionRecapPreemptionPhase::FinishedBeforePrepared => {
+                SessionRecapPreemptionPhase::FinishedBeforePrepared
+            }
+        };
+        was_preempted
+    }
+
+    pub(crate) async fn finished_before_prepared(&self) -> bool {
+        *self.phase.lock().await == SessionRecapPreemptionPhase::FinishedBeforePrepared
+    }
+
+    async fn mark_existing_checkpoint_prepared(&self) {
+        let mut phase = self.phase.lock().await;
+        // checkpoint 已经是持久副作用。即使取消请求先到、当前 worker 随后才取得
+        // finalize.lock 并观察到它，也必须让 Prepared 边界获胜。
+        *phase = SessionRecapPreemptionPhase::Prepared;
+    }
+
+    async fn commit_prepared<F>(&self, commit: F) -> anyhow::Result<bool>
+    where
+        F: Future<Output = anyhow::Result<()>>,
+    {
+        let mut phase = self.phase.lock().await;
+        if *phase == SessionRecapPreemptionPhase::CancelRequested {
+            return Ok(false);
+        }
+        commit.await?;
+        *phase = SessionRecapPreemptionPhase::Prepared;
+        Ok(true)
+    }
+
+    async fn is_cancel_requested(&self) -> bool {
+        *self.phase.lock().await == SessionRecapPreemptionPhase::CancelRequested
+    }
+
+    async fn cancelled(&self) {
+        self.cancel.cancelled().await;
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("session recap was preempted by same-session finalize before Prepared")]
+struct SessionRecapPreemptedBeforePrepared;
+
+#[derive(Debug)]
+pub(crate) enum SessionFinalizeOnceOutcome {
+    Completed(SessionFinalizeReport),
+    PreemptedBeforePrepared,
+}
+
+struct PendingFinalizeLocalApply {
+    report: SessionFinalizeReport,
+    claims: Vec<Claim>,
+    disputes: Vec<Dispute>,
+}
+
+struct PendingFinalizeUpload {
+    local: PendingFinalizeLocalApply,
+    applied_checkpoint: FinalizeCheckpoint,
 }
 
 fn bounded_completion_id(value: &str) -> String {
@@ -113,31 +240,253 @@ impl SessionEngine {
     where
         F: FnMut(SessionEvent),
     {
+        match self
+            .finalize_existing_session_with_retry_mode(
+                session_id,
+                emit,
+                RecapRetryMode::Configured,
+                None,
+            )
+            .await?
+        {
+            SessionFinalizeOnceOutcome::Completed(report) => Ok(report),
+            SessionFinalizeOnceOutcome::PreemptedBeforePrepared => {
+                anyhow::bail!("foreground finalize cannot be preempted")
+            }
+        }
+    }
+
+    pub(crate) async fn finalize_existing_session_once<F>(
+        &self,
+        session_id: &SessionId,
+        emit: F,
+    ) -> anyhow::Result<SessionFinalizeReport>
+    where
+        F: FnMut(SessionEvent),
+    {
+        match self
+            .finalize_existing_session_with_retry_mode(
+                session_id,
+                emit,
+                RecapRetryMode::SingleAttempt,
+                None,
+            )
+            .await?
+        {
+            SessionFinalizeOnceOutcome::Completed(report) => Ok(report),
+            SessionFinalizeOnceOutcome::PreemptedBeforePrepared => {
+                anyhow::bail!("finalize without preemption control was preempted")
+            }
+        }
+    }
+
+    pub(crate) async fn finalize_existing_session_once_with_preemption<F>(
+        &self,
+        session_id: &SessionId,
+        emit: F,
+        preemption: Arc<SessionFinalizePreemptionControl>,
+    ) -> anyhow::Result<SessionFinalizeOnceOutcome>
+    where
+        F: FnMut(SessionEvent),
+    {
+        self.finalize_existing_session_with_retry_mode(
+            session_id,
+            emit,
+            RecapRetryMode::SingleAttempt,
+            Some(preemption.as_ref()),
+        )
+        .await
+    }
+
+    /// 将 Open session 的 canonical message recap 到冻结 target；不改变 session 生命周期。
+    #[cfg(test)]
+    pub(crate) async fn recap_existing_session_until(
+        &self,
+        session_id: &SessionId,
+        recap_end_index: usize,
+    ) -> anyhow::Result<SessionFinalizeReport> {
+        self.recap_existing_session_until_inner(session_id, recap_end_index, None)
+            .await
+    }
+
+    pub(crate) async fn recap_existing_session_until_with_preemption(
+        &self,
+        session_id: &SessionId,
+        recap_end_index: usize,
+        preemption: Arc<SessionRecapPreemptionControl>,
+    ) -> anyhow::Result<SessionFinalizeReport> {
+        self.recap_existing_session_until_inner(
+            session_id,
+            recap_end_index,
+            Some(preemption.as_ref()),
+        )
+        .await
+    }
+
+    async fn recap_existing_session_until_inner(
+        &self,
+        session_id: &SessionId,
+        recap_end_index: usize,
+        preemption: Option<&SessionRecapPreemptionControl>,
+    ) -> anyhow::Result<SessionFinalizeReport> {
+        let mut session = self.load_existing_session(session_id).await?;
+        let recap_guard = FileLockGuard::lock_exclusive(&session.paths.finalize_lock);
+        let _recap_guard = match preemption {
+            Some(preemption) => {
+                tokio::select! {
+                    biased;
+                    _ = preemption.cancelled() => {
+                        return Ok(SessionFinalizeReport::default());
+                    }
+                    guard = recap_guard => guard?,
+                }
+            }
+            None => recap_guard.await?,
+        };
+        let metadata = session.read_metadata().await?;
+        if metadata.status != SessionStatus::Open
+            || metadata.finalized_at.is_some()
+            || metadata.closed_at.is_some()
+        {
+            return Ok(SessionFinalizeReport::default());
+        }
+        if recap_end_index > metadata.message_count {
+            anyhow::bail!(
+                "session {session_id} recap target {recap_end_index} 超过 message_count {}",
+                metadata.message_count
+            );
+        }
+        if metadata.recapped_until >= recap_end_index {
+            return Ok(SessionFinalizeReport::default());
+        }
+
+        let messages = session.read_messages().await?;
+        validate_session_compaction_state(&metadata, messages.len())?;
+        let background_process_completions = SessionRecapBackgroundProcessProjection {
+            consumed_through_seq: 0,
+            omitted_older_count: 0,
+            items: Vec::new(),
+        };
+        let mut report = match self
+            .finalize_message_segment_checkpointed(
+                &session,
+                &messages,
+                metadata.recapped_until,
+                recap_end_index,
+                &background_process_completions,
+                FinalizeSegmentExecution {
+                    retry_mode: RecapRetryMode::SingleAttempt,
+                    preemption,
+                },
+            )
+            .await
+        {
+            Ok(report) => report,
+            Err(error)
+                if error
+                    .downcast_ref::<SessionRecapPreemptedBeforePrepared>()
+                    .is_some() =>
+            {
+                return Ok(SessionFinalizeReport::default());
+            }
+            Err(error) => return Err(error),
+        };
+        session.advance_recapped_until(recap_end_index).await?;
+        report.advanced_recapped_until = true;
+        Ok(report)
+    }
+
+    async fn finalize_existing_session_with_retry_mode<F>(
+        &self,
+        session_id: &SessionId,
+        emit: F,
+        retry_mode: RecapRetryMode,
+        preemption: Option<&SessionFinalizePreemptionControl>,
+    ) -> anyhow::Result<SessionFinalizeOnceOutcome>
+    where
+        F: FnMut(SessionEvent),
+    {
         let mut emit = emit;
         let mut session = self.load_existing_session(session_id).await?;
         let metadata = session.read_metadata().await?;
         if metadata.finalized_at.is_some() {
-            return Ok(SessionFinalizeReport::default());
+            return Ok(SessionFinalizeOnceOutcome::Completed(
+                SessionFinalizeReport::default(),
+            ));
         }
         if metadata.status == SessionStatus::Open {
             self.mark_session_finalizing(&mut session, &mut emit)
                 .await?;
         }
-        self.finalize_session(&mut session, emit).await
+        self.finalize_session_with_retry_mode(&mut session, emit, retry_mode, preemption)
+            .await
     }
 
     pub async fn finalize_session<F>(
         &self,
         session: &mut SessionHandle,
-        mut emit: F,
+        emit: F,
     ) -> anyhow::Result<SessionFinalizeReport>
     where
         F: FnMut(SessionEvent),
     {
-        let _finalize_guard = FileLockGuard::lock_exclusive(&session.paths.finalize_lock).await?;
+        match self
+            .finalize_session_with_retry_mode(session, emit, RecapRetryMode::Configured, None)
+            .await?
+        {
+            SessionFinalizeOnceOutcome::Completed(report) => Ok(report),
+            SessionFinalizeOnceOutcome::PreemptedBeforePrepared => {
+                anyhow::bail!("foreground finalize cannot be preempted")
+            }
+        }
+    }
+
+    async fn finalize_session_with_retry_mode<F>(
+        &self,
+        session: &mut SessionHandle,
+        mut emit: F,
+        retry_mode: RecapRetryMode,
+        preemption: Option<&SessionFinalizePreemptionControl>,
+    ) -> anyhow::Result<SessionFinalizeOnceOutcome>
+    where
+        F: FnMut(SessionEvent),
+    {
+        let finalize_guard = FileLockGuard::lock_exclusive(&session.paths.finalize_lock);
+        let _finalize_guard = match preemption {
+            Some(preemption) => {
+                tokio::select! {
+                    biased;
+                    _ = preemption.cancelled() => {
+                        return Ok(SessionFinalizeOnceOutcome::PreemptedBeforePrepared);
+                    }
+                    guard = finalize_guard => guard?,
+                }
+            }
+            None => finalize_guard.await?,
+        };
         let metadata = session.read_metadata().await?;
         if metadata.finalized_at.is_some() {
-            return Ok(SessionFinalizeReport::default());
+            return Ok(SessionFinalizeOnceOutcome::Completed(
+                SessionFinalizeReport::default(),
+            ));
+        }
+        if let Some(preemption) = preemption {
+            let current_checkpoint =
+                session
+                    .read_finalize_checkpoint()
+                    .await?
+                    .is_some_and(|checkpoint| {
+                        finalize_checkpoint_covers_pending_range(
+                            &checkpoint,
+                            metadata.recapped_until,
+                            metadata.message_count,
+                        )
+                    });
+            if current_checkpoint {
+                preemption.mark_existing_checkpoint_prepared().await;
+            } else if preemption.is_cancel_requested().await {
+                return Ok(SessionFinalizeOnceOutcome::PreemptedBeforePrepared);
+            }
         }
         if metadata.status == SessionStatus::Open {
             self.mark_session_finalizing(session, &mut emit).await?;
@@ -155,7 +504,9 @@ impl SessionEngine {
         emit(SessionEvent::FinalizeStarted);
         self.append_session_event_log(session, "INFO", "Finalize started")
             .await;
-        let result = self.finalize_session_inner(session).await;
+        let result = self
+            .finalize_session_inner_with_retry_mode(session, retry_mode, preemption)
+            .await;
         match result {
             Ok(report) => {
                 self.abandon_session_delegations_best_effort(session, "session finalized")
@@ -190,7 +541,20 @@ impl SessionEngine {
                 emit(SessionEvent::StatusChanged {
                     status: SessionRuntimeStatus::Closed,
                 });
-                Ok(report)
+                Ok(SessionFinalizeOnceOutcome::Completed(report))
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<SessionRecapPreemptedBeforePrepared>()
+                    .is_some() =>
+            {
+                self.append_session_event_log(
+                    session,
+                    "INFO",
+                    "Finalize preempted by resume before Prepared",
+                )
+                .await;
+                Ok(SessionFinalizeOnceOutcome::PreemptedBeforePrepared)
             }
             Err(e) => {
                 let error = e.to_string();
@@ -211,9 +575,11 @@ impl SessionEngine {
         }
     }
 
-    pub(super) async fn finalize_session_inner(
+    async fn finalize_session_inner_with_retry_mode(
         &self,
         session: &mut SessionHandle,
+        retry_mode: RecapRetryMode,
+        preemption: Option<&SessionFinalizePreemptionControl>,
     ) -> anyhow::Result<SessionFinalizeReport> {
         let metadata = session.read_metadata().await?;
         if metadata.finalized_at.is_some() {
@@ -222,22 +588,24 @@ impl SessionEngine {
         if metadata.status == SessionStatus::Closed || metadata.closed_at.is_some() {
             anyhow::bail!("session {} 已关闭，不能重复关闭", metadata.id);
         }
+        if let Some(preemption) = preemption {
+            if preemption.is_cancel_requested().await {
+                return Err(SessionRecapPreemptedBeforePrepared.into());
+            }
+        }
         let started_with_unrecapped_messages = metadata.message_count > metadata.recapped_until;
         let mut recovered_report = SessionFinalizeReport::default();
         if let Some(outcome) = self
             .recover_matching_compaction_checkpoint(session, None, None)
             .await?
         {
-            let recapped_until = session.read_metadata().await?.recapped_until;
             self.append_compaction_audit_completed(
                 session,
                 &outcome.audit_ids,
                 &outcome,
-                recapped_until,
                 outcome.recovered,
             )
             .await;
-            recovered_report = merge_finalize_reports(recovered_report, outcome.report);
             let metadata = session.read_metadata().await?;
             if metadata.finalized_at.is_some() {
                 anyhow::bail!("session {} 已 finalize，不能重复 finalize", metadata.id);
@@ -245,6 +613,12 @@ impl SessionEngine {
             if metadata.status == SessionStatus::Closed || metadata.closed_at.is_some() {
                 anyhow::bail!("session {} 已关闭，不能重复关闭", metadata.id);
             }
+        }
+        if let Some(report) = self
+            .recover_current_recap_checkpoint_prefix(session)
+            .await?
+        {
+            recovered_report = merge_finalize_reports(recovered_report, report);
         }
         if let Some(report) = self.recover_legacy_finalize_checkpoint(session).await? {
             return Ok(merge_finalize_reports(recovered_report, report));
@@ -254,7 +628,24 @@ impl SessionEngine {
             .session_recap_background_process_completions(session)
             .await?;
         if metadata.message_count == 0 && background_process_completions.items.is_empty() {
-            session.mark_finalized(Utc::now()).await?;
+            let finalized_at = Utc::now();
+            let committed = match preemption {
+                Some(preemption) => {
+                    preemption
+                        .commit_prepared(async {
+                            session.mark_finalized(finalized_at).await?;
+                            Ok(())
+                        })
+                        .await?
+                }
+                None => {
+                    session.mark_finalized(finalized_at).await?;
+                    true
+                }
+            };
+            if !committed {
+                return Err(SessionRecapPreemptedBeforePrepared.into());
+            }
             if let Err(e) = self.delete_empty_session(&metadata.id).await {
                 log::warn!(
                     target: "agent",
@@ -271,7 +662,24 @@ impl SessionEngine {
         if recapped_until == metadata.message_count
             && background_process_completions.items.is_empty()
         {
-            session.mark_finalized(Utc::now()).await?;
+            let finalized_at = Utc::now();
+            let committed = match preemption {
+                Some(preemption) => {
+                    preemption
+                        .commit_prepared(async {
+                            session.mark_finalized(finalized_at).await?;
+                            Ok(())
+                        })
+                        .await?
+                }
+                None => {
+                    session.mark_finalized(finalized_at).await?;
+                    true
+                }
+            };
+            if !committed {
+                return Err(SessionRecapPreemptedBeforePrepared.into());
+            }
             recovered_report.finalized_unrecapped_messages = started_with_unrecapped_messages;
             return Ok(recovered_report);
         }
@@ -282,6 +690,10 @@ impl SessionEngine {
                 recapped_until,
                 metadata.message_count,
                 &background_process_completions,
+                FinalizeSegmentExecution {
+                    retry_mode,
+                    preemption,
+                },
             )
             .await?;
         report = merge_finalize_reports(recovered_report, report);
@@ -295,6 +707,72 @@ impl SessionEngine {
         report.advanced_recapped_until = true;
         report.finalized_unrecapped_messages = true;
         Ok(std::mem::take(&mut report))
+    }
+
+    /// Finalize 先兑现同 session Recap 已持久化的 checkpoint 前缀，再处理剩余消息与
+    /// Finalize 专属 background completion。这样 Prepared 获胜后即使 Recap attempt
+    /// 随后失败或进程退出，也不会被高优先级 Finalize 越过。
+    async fn recover_current_recap_checkpoint_prefix(
+        &self,
+        session: &mut SessionHandle,
+    ) -> anyhow::Result<Option<SessionFinalizeReport>> {
+        let metadata = session.read_metadata().await?;
+        // 缺失 cursor 表示 v0.2.3 legacy finalize checkpoint，继续交给原迁移路径处理。
+        if metadata.recap_background_completion_until_seq.is_none() {
+            return Ok(None);
+        }
+        let Some(checkpoint) = session.read_finalize_checkpoint().await? else {
+            return Ok(None);
+        };
+        if !finalize_checkpoint_covers_pending_range(
+            &checkpoint,
+            metadata.recapped_until,
+            metadata.message_count,
+        ) {
+            return Ok(None);
+        }
+        let messages = session.read_messages().await?;
+        validate_session_compaction_state(&metadata, messages.len())?;
+        let segment = messages
+            .get(checkpoint.recap_start_index..checkpoint.recap_end_index)
+            .with_context(|| {
+                format!(
+                    "共享 recap checkpoint 范围越界: [{}, {})",
+                    checkpoint.recap_start_index, checkpoint.recap_end_index
+                )
+            })?;
+        let recap_input = SessionRecapBackgroundProcessProjection {
+            consumed_through_seq: 0,
+            omitted_older_count: 0,
+            items: Vec::new(),
+        };
+        let recap_hash = hash_finalize_recap_input(segment, &recap_input)?;
+        if checkpoint.recap_segment_hash != recap_hash {
+            return Ok(None);
+        }
+
+        let recap_end_index = checkpoint.recap_end_index;
+        let mut report = match checkpoint.status {
+            FinalizeCheckpointStatus::Prepared => {
+                self.apply_finalize_checkpoint(session, checkpoint).await?
+            }
+            FinalizeCheckpointStatus::Applied => {
+                self.finish_finalize_upload(report_from_finalize_checkpoint(
+                    &checkpoint,
+                    Vec::new(),
+                ))
+                .await?
+            }
+        };
+        session.advance_recapped_until(recap_end_index).await?;
+        report.advanced_recapped_until = true;
+        log::info!(
+            target: "agent",
+            "Finalize 已恢复共享 recap checkpoint 前缀: session={} recapped_until={}",
+            metadata.id,
+            recap_end_index
+        );
+        Ok(Some(report))
     }
 
     async fn recover_legacy_finalize_checkpoint(
@@ -352,7 +830,11 @@ impl SessionEngine {
                 self.apply_finalize_checkpoint(session, checkpoint).await?
             }
             FinalizeCheckpointStatus::Applied => {
-                report_from_finalize_checkpoint(&checkpoint, Vec::new())
+                self.finish_finalize_upload(report_from_finalize_checkpoint(
+                    &checkpoint,
+                    Vec::new(),
+                ))
+                .await?
             }
         };
         session
@@ -472,29 +954,12 @@ impl SessionEngine {
         })
     }
 
-    pub(super) async fn prepare_finalize_segment(
-        &self,
-        session_messages: &[SessionMessage],
-        fallback_scope: crate::api::ProviderRuntimeFallbackScope,
-    ) -> anyhow::Result<(Vec<ClaimId>, Vec<Claim>, Vec<Dispute>)> {
-        let background_process_completions = SessionRecapBackgroundProcessProjection {
-            consumed_through_seq: 0,
-            omitted_older_count: 0,
-            items: Vec::new(),
-        };
-        self.prepare_finalize_segment_with_background(
-            session_messages,
-            &background_process_completions,
-            fallback_scope,
-        )
-        .await
-    }
-
     async fn prepare_finalize_segment_with_background(
         &self,
         session_messages: &[SessionMessage],
         background_process_completions: &SessionRecapBackgroundProcessProjection,
         fallback_scope: crate::api::ProviderRuntimeFallbackScope,
+        retry_mode: RecapRetryMode,
     ) -> anyhow::Result<(Vec<ClaimId>, Vec<Claim>, Vec<Dispute>)> {
         let memory_enabled = self.turn_loop.tool_registry().memory_enabled();
         let transcript =
@@ -531,21 +996,33 @@ impl SessionEngine {
             .context("渲染 session_recap prompt 失败")?;
         let user_text = serde_json::to_string_pretty(&payload)?;
         let agent_id = self.agent.agent_id.clone();
-        self.json_caller
-            .generate_json_streaming_validated_with_retry_notice(
-                system_prompt,
-                vec![SessionTurnMessage::user_text(user_text)],
-                crate::api::BufferedProviderRuntime::new(fallback_scope),
-                |raw| prepare_recap_value(raw, &agent_id, &allowed, &local_by_id, Utc::now()),
-                |retry_index, retry_total, error| {
-                    log::warn!(
-                        target: "agent",
-                        "agent {agent_id} finalize_session 输出无效，重试 ({retry_index}/{retry_total}): {error:#}"
-                    );
-                },
-            )
-            .await
-            .map_err(|source| RecoverableCompactionPreparationError::other(source).into())
+        let messages = vec![SessionTurnMessage::user_text(user_text)];
+        let result = match retry_mode {
+            RecapRetryMode::Configured => self
+                .json_caller
+                .generate_json_streaming_validated_with_retry_notice(
+                    system_prompt,
+                    messages,
+                    crate::api::BufferedProviderRuntime::new(fallback_scope),
+                    |raw| prepare_recap_value(raw, &agent_id, &allowed, &local_by_id, Utc::now()),
+                    |retry_index, retry_total, error| {
+                        log::warn!(
+                            target: "agent",
+                            "agent {agent_id} recap/finalize 输出无效，重试 ({retry_index}/{retry_total}): {error:#}"
+                        );
+                    },
+                )
+                .await,
+            RecapRetryMode::SingleAttempt => self
+                .json_caller
+                .generate_json_validated_once(
+                    system_prompt,
+                    messages,
+                    |raw| prepare_recap_value(raw, &agent_id, &allowed, &local_by_id, Utc::now()),
+                )
+                .await,
+        };
+        result.map_err(|source| RecoverableCompactionPreparationError::other(source).into())
     }
 
     async fn finalize_message_segment_checkpointed(
@@ -555,7 +1032,12 @@ impl SessionEngine {
         recap_start_index: usize,
         recap_end_index: usize,
         background_process_completions: &SessionRecapBackgroundProcessProjection,
+        execution: FinalizeSegmentExecution<'_>,
     ) -> anyhow::Result<SessionFinalizeReport> {
+        let FinalizeSegmentExecution {
+            retry_mode,
+            preemption,
+        } = execution;
         let segment = all_messages
             .get(recap_start_index..recap_end_index)
             .with_context(|| {
@@ -566,12 +1048,19 @@ impl SessionEngine {
             let same_range = checkpoint.recap_start_index == recap_start_index
                 && checkpoint.recap_end_index == recap_end_index;
             if same_range && checkpoint.recap_segment_hash == segment_hash {
+                if let Some(preemption) = preemption {
+                    preemption.mark_existing_checkpoint_prepared().await;
+                }
                 return match checkpoint.status {
                     FinalizeCheckpointStatus::Prepared => {
                         self.apply_finalize_checkpoint(session, checkpoint).await
                     }
                     FinalizeCheckpointStatus::Applied => {
-                        Ok(report_from_finalize_checkpoint(&checkpoint, Vec::new()))
+                        self.finish_finalize_upload(report_from_finalize_checkpoint(
+                            &checkpoint,
+                            Vec::new(),
+                        ))
+                        .await
                     }
                 };
             }
@@ -589,35 +1078,93 @@ impl SessionEngine {
             }
         }
 
-        let (used_claim_ids, prepared_claims, prepared_disputes) = self
-            .prepare_finalize_segment_with_background(
+        let report = {
+            let knowledge_guard =
+                FileLockGuard::lock_exclusive(paths::agent_home_knowledge_apply_lock_path(
+                    self.runner.maintainer_upload_queue.agent_home(),
+                ));
+            let _knowledge_guard = match preemption {
+                Some(preemption) => {
+                    tokio::select! {
+                        biased;
+                        _ = preemption.cancelled() => {
+                            return Err(SessionRecapPreemptedBeforePrepared.into());
+                        }
+                        guard = knowledge_guard => guard?,
+                    }
+                }
+                None => knowledge_guard.await?,
+            };
+            let prepare = self.prepare_finalize_segment_with_background(
                 segment,
                 background_process_completions,
                 session.runtime_fallback_scope(),
-            )
-            .await?;
-        let trace_text = finalize_trace_text(segment, background_process_completions)?;
-        let trace_created_at = Utc::now();
-        let trace_id = checkpoint_trace_id(
-            &trace_text,
-            &used_claim_ids,
-            &prepared_claims,
-            trace_created_at,
-        );
-        let checkpoint = FinalizeCheckpoint {
-            recap_start_index,
-            recap_end_index,
-            recap_segment_hash: segment_hash,
-            prepared_claims,
-            prepared_disputes,
-            used_claim_ids,
-            trace_text,
-            trace_created_at,
-            trace_id,
-            status: FinalizeCheckpointStatus::Prepared,
+                retry_mode,
+            );
+            let prepared = match preemption {
+                Some(preemption) => {
+                    tokio::select! {
+                        biased;
+                        _ = preemption.cancelled() => {
+                            return Err(SessionRecapPreemptedBeforePrepared.into());
+                        }
+                        prepared = prepare => prepared,
+                    }
+                }
+                None => prepare.await,
+            };
+            let (used_claim_ids, prepared_claims, prepared_disputes) = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    if let Some(preemption) = preemption {
+                        if preemption.is_cancel_requested().await {
+                            return Err(SessionRecapPreemptedBeforePrepared.into());
+                        }
+                    }
+                    return Err(error);
+                }
+            };
+            let trace_text = finalize_trace_text(segment, background_process_completions)?;
+            let trace_created_at = Utc::now();
+            let trace_id = checkpoint_trace_id(
+                &trace_text,
+                &used_claim_ids,
+                &prepared_claims,
+                trace_created_at,
+            );
+            let checkpoint = FinalizeCheckpoint {
+                recap_start_index,
+                recap_end_index,
+                recap_segment_hash: segment_hash,
+                prepared_claims,
+                prepared_disputes,
+                used_claim_ids,
+                trace_text,
+                trace_created_at,
+                trace_id,
+                status: FinalizeCheckpointStatus::Prepared,
+            };
+            let committed = match preemption {
+                Some(preemption) => {
+                    preemption
+                        .commit_prepared(async {
+                            session.write_finalize_checkpoint(&checkpoint).await?;
+                            Ok(())
+                        })
+                        .await?
+                }
+                None => {
+                    session.write_finalize_checkpoint(&checkpoint).await?;
+                    true
+                }
+            };
+            if !committed {
+                return Err(SessionRecapPreemptedBeforePrepared.into());
+            }
+            self.apply_finalize_checkpoint_local_and_commit(session, checkpoint)
+                .await?
         };
-        session.write_finalize_checkpoint(&checkpoint).await?;
-        self.apply_finalize_checkpoint(session, checkpoint).await
+        self.finish_finalize_upload(report).await
     }
 
     async fn apply_finalize_checkpoint(
@@ -625,9 +1172,50 @@ impl SessionEngine {
         session: &SessionHandle,
         checkpoint: FinalizeCheckpoint,
     ) -> anyhow::Result<SessionFinalizeReport> {
-        let report = self
-            .apply_prepared_finalize_batch(
-                FinalizeTraceInput::Frozen(&checkpoint.trace_text),
+        let report = {
+            let _knowledge_guard =
+                FileLockGuard::lock_exclusive(paths::agent_home_knowledge_apply_lock_path(
+                    self.runner.maintainer_upload_queue.agent_home(),
+                ))
+                .await?;
+            self.apply_finalize_checkpoint_local_and_commit(session, checkpoint)
+                .await?
+        };
+        self.finish_finalize_upload(report).await
+    }
+
+    async fn apply_finalize_checkpoint_local_and_commit(
+        &self,
+        session: &SessionHandle,
+        checkpoint: FinalizeCheckpoint,
+    ) -> anyhow::Result<SessionFinalizeReport> {
+        let mut pending = self.apply_finalize_checkpoint_local(checkpoint).await?;
+        self.runner
+            .stage_maintainer_batch(
+                std::mem::take(&mut pending.local.claims),
+                pending.local.disputes.clone(),
+            )
+            .await?;
+        let mut new_dispute_ids = Vec::with_capacity(pending.local.disputes.len());
+        for dispute in &pending.local.disputes {
+            if self.runner.record_dispute_if_new(dispute).await? {
+                new_dispute_ids.push(dispute.id.clone());
+            }
+        }
+        pending.local.report.new_dispute_ids = new_dispute_ids;
+        session
+            .write_finalize_checkpoint(&pending.applied_checkpoint)
+            .await?;
+        Ok(pending.local.report)
+    }
+
+    async fn apply_finalize_checkpoint_local(
+        &self,
+        checkpoint: FinalizeCheckpoint,
+    ) -> anyhow::Result<PendingFinalizeUpload> {
+        let local = self
+            .apply_prepared_finalize_batch_local(
+                &checkpoint.trace_text,
                 checkpoint.used_claim_ids.clone(),
                 checkpoint.prepared_claims.clone(),
                 checkpoint.prepared_disputes.clone(),
@@ -635,25 +1223,24 @@ impl SessionEngine {
                 checkpoint.trace_id.clone(),
             )
             .await?;
-        let applied_checkpoint = FinalizeCheckpoint {
-            status: FinalizeCheckpointStatus::Applied,
-            ..checkpoint
-        };
-        session
-            .write_finalize_checkpoint(&applied_checkpoint)
-            .await?;
-        Ok(report)
+        Ok(PendingFinalizeUpload {
+            local,
+            applied_checkpoint: FinalizeCheckpoint {
+                status: FinalizeCheckpointStatus::Applied,
+                ..checkpoint
+            },
+        })
     }
 
-    pub(super) async fn apply_prepared_finalize_batch(
+    async fn apply_prepared_finalize_batch_local(
         &self,
-        trace_input: FinalizeTraceInput<'_>,
+        trace_text: &str,
         used_claim_ids: Vec<ClaimId>,
         prepared_claims: Vec<Claim>,
         prepared_disputes: Vec<Dispute>,
         trace_created_at: DateTime<Utc>,
         checkpoint_trace_id: Option<TraceId>,
-    ) -> anyhow::Result<SessionFinalizeReport> {
+    ) -> anyhow::Result<PendingFinalizeLocalApply> {
         let mut new_claim_ids = Vec::with_capacity(prepared_claims.len());
         let mut updated_claim_ids = Vec::new();
         let mut output_claim_ids = Vec::with_capacity(prepared_claims.len());
@@ -669,10 +1256,7 @@ impl SessionEngine {
             claims_to_upload.push(claim);
         }
 
-        let trace_text = match trace_input {
-            FinalizeTraceInput::Messages(messages) => session_trace_text(messages),
-            FinalizeTraceInput::Frozen(text) => text.to_string(),
-        };
+        let trace_text = trace_text.to_string();
         let trace_id = if !output_claim_ids.is_empty() || !used_claim_ids.is_empty() {
             let trace_name = trace_name_from_task(&trace_text);
             let input_claims = used_claim_ids
@@ -718,27 +1302,105 @@ impl SessionEngine {
                 }
             }
         }
+        Ok(PendingFinalizeLocalApply {
+            report: SessionFinalizeReport {
+                trace_id,
+                new_claim_ids,
+                updated_claim_ids,
+                used_claim_ids,
+                new_dispute_ids: Vec::new(),
+                advanced_recapped_until: false,
+                finalized_unrecapped_messages: false,
+                warnings: Vec::new(),
+            },
+            claims: claims_to_upload,
+            disputes: disputes_to_upload,
+        })
+    }
+
+    async fn finish_finalize_upload(
+        &self,
+        mut report: SessionFinalizeReport,
+    ) -> anyhow::Result<SessionFinalizeReport> {
         let upload_report = self
             .runner
-            .upload_maintainer_batch(claims_to_upload, disputes_to_upload.clone())
+            .upload_maintainer_batch(Vec::new(), Vec::new())
             .await?;
-        let warnings = upload_report.warning.into_iter().collect();
-        let mut new_dispute_ids = Vec::with_capacity(disputes_to_upload.len());
-        for dispute in disputes_to_upload {
-            if self.runner.record_dispute_if_new(&dispute).await? {
-                new_dispute_ids.push(dispute.id.clone());
-            }
-        }
+        report.warnings.extend(upload_report.warning);
+        Ok(report)
+    }
+}
 
-        Ok(SessionFinalizeReport {
-            trace_id,
-            new_claim_ids,
-            updated_claim_ids,
-            used_claim_ids,
-            new_dispute_ids,
-            advanced_recapped_until: false,
-            finalized_unrecapped_messages: false,
-            warnings,
-        })
+#[cfg(test)]
+mod preemption_tests {
+    use std::sync::Arc;
+
+    use tokio::sync::oneshot;
+
+    use super::SessionRecapPreemptionControl;
+
+    #[tokio::test]
+    async fn cancellation_before_prepared_prevents_checkpoint_commit() {
+        let control = SessionRecapPreemptionControl::new();
+        assert!(control.request_before_prepared().await);
+
+        let committed = control
+            .commit_prepared(async { panic!("cancelled recap must not commit Prepared") })
+            .await
+            .unwrap();
+
+        assert!(!committed);
+        assert!(control.was_preempted_before_prepared().await);
+    }
+
+    #[tokio::test]
+    async fn prepared_commit_wins_over_later_cancellation_request() {
+        let control = Arc::new(SessionRecapPreemptionControl::new());
+        let (commit_started_tx, commit_started_rx) = oneshot::channel();
+        let (allow_commit_tx, allow_commit_rx) = oneshot::channel();
+        let commit_control = Arc::clone(&control);
+        let commit = tokio::spawn(async move {
+            commit_control
+                .commit_prepared(async move {
+                    let _ = commit_started_tx.send(());
+                    allow_commit_rx.await.unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        commit_started_rx.await.unwrap();
+
+        let cancel_control = Arc::clone(&control);
+        let mut cancel =
+            tokio::spawn(async move { cancel_control.request_before_prepared().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut cancel)
+                .await
+                .is_err()
+        );
+
+        let _ = allow_commit_tx.send(());
+        assert!(commit.await.unwrap().unwrap());
+        assert!(!cancel.await.unwrap());
+        assert!(!control.was_preempted_before_prepared().await);
+    }
+
+    #[tokio::test]
+    async fn observed_existing_checkpoint_wins_over_earlier_cancellation_request() {
+        let control = SessionRecapPreemptionControl::new();
+        assert!(control.request_before_prepared().await);
+
+        control.mark_existing_checkpoint_prepared().await;
+
+        assert!(!control.finish().await);
+    }
+
+    #[tokio::test]
+    async fn completed_recap_no_longer_accepts_preemption() {
+        let control = SessionRecapPreemptionControl::new();
+
+        assert!(!control.finish().await);
+        assert!(control.finished_before_prepared().await);
+        assert!(!control.request_before_prepared().await);
     }
 }

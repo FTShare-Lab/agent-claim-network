@@ -57,6 +57,16 @@ type ConnectStart = (
 struct ConnectAttempt {
     cancellation: CancellationToken,
     release_fence: Arc<McpConnectReleaseFence>,
+    #[cfg(test)]
+    backoff_probe: Mutex<Option<Arc<ConnectBackoffProbe>>>,
+}
+
+/// 仅用于把 retry 测试稳定停在退避窗口，避免依赖 CI 调度速度猜测内部状态。
+#[cfg(test)]
+#[derive(Default)]
+struct ConnectBackoffProbe {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 impl ConnectAttempt {
@@ -64,6 +74,8 @@ impl ConnectAttempt {
         Arc::new(Self {
             cancellation: CancellationToken::new(),
             release_fence: McpConnectReleaseFence::new(),
+            #[cfg(test)]
+            backoff_probe: Mutex::new(None),
         })
     }
 
@@ -92,6 +104,24 @@ impl ConnectAttempt {
 
     fn release_fence(&self) -> Arc<McpConnectReleaseFence> {
         Arc::clone(&self.release_fence)
+    }
+
+    #[cfg(test)]
+    fn install_backoff_probe(&self, probe: Arc<ConnectBackoffProbe>) {
+        let mut slot = match self.backoff_probe.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *slot = Some(probe);
+    }
+
+    #[cfg(test)]
+    fn backoff_probe(&self) -> Option<Arc<ConnectBackoffProbe>> {
+        let slot = match self.backoff_probe.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        slot.clone()
     }
 }
 
@@ -1734,9 +1764,25 @@ async fn connect_server(
             MCP_RECONNECT_MAX_RETRIES,
             outcome.snapshot.last_error.as_deref().unwrap_or("<unknown>")
         );
+        let backoff = reconnect_backoff(retry_index);
+        #[cfg(test)]
+        let backoff_wait = {
+            let probe = attempt.backoff_probe();
+            async move {
+                if let Some(probe) = probe {
+                    probe.entered.notify_one();
+                    probe.release.notified().await;
+                } else {
+                    time::sleep(backoff).await;
+                }
+            }
+        };
+        #[cfg(not(test))]
+        let backoff_wait = time::sleep(backoff);
+        tokio::pin!(backoff_wait);
         tokio::select! {
             () = cancellation.cancelled() => return None,
-            () = time::sleep(reconnect_backoff(retry_index)) => {}
+            () = &mut backoff_wait => {}
         }
         retry_index = retry_index.saturating_add(1);
     }
@@ -4280,6 +4326,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let script_path = dir.path().join("always_fail_stdio_mock.sh");
         let attempts_path = dir.path().join("connection-attempts.txt");
+        let first_attempt_started_path = dir.path().join("first-attempt-started");
+        let release_first_attempt_path = dir.path().join("release-first-attempt");
         tokio::fs::write(&script_path, fail_once_stdio_mock_script())
             .await
             .unwrap();
@@ -4289,6 +4337,14 @@ mod tests {
         env.insert(
             "MCP_FIXTURE_ATTEMPTS".to_string(),
             attempts_path.display().to_string(),
+        );
+        env.insert(
+            "MCP_FIXTURE_FIRST_ATTEMPT_STARTED".to_string(),
+            first_attempt_started_path.display().to_string(),
+        );
+        env.insert(
+            "MCP_FIXTURE_RELEASE_FIRST_ATTEMPT".to_string(),
+            release_first_attempt_path.display().to_string(),
         );
         cfg.servers.insert(
             "retry_server".to_string(),
@@ -4307,21 +4363,30 @@ mod tests {
         ));
 
         let refresh_manager = Arc::clone(&manager);
-        let refresh = tokio::spawn(async move { refresh_manager.refresh_all().await });
-        time::timeout(Duration::from_secs(5), async {
-            while !tokio::fs::try_exists(&attempts_path).await.unwrap() {
-                time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("fixture 应先记录首次连接尝试");
+        let mut refresh = tokio::spawn(async move { refresh_manager.refresh_all().await });
+        wait_for_file(&first_attempt_started_path).await;
+        let probe = Arc::new(ConnectBackoffProbe::default());
+        {
+            let state = manager.lock_state();
+            state.connect_attempts["retry_server"].install_backoff_probe(Arc::clone(&probe));
+        }
+        tokio::fs::write(&release_first_attempt_path, b"release")
+            .await
+            .unwrap();
+        time::timeout(Duration::from_secs(5), probe.entered.notified())
+            .await
+            .expect("首次连接失败后必须进入内部退避窗口");
 
         manager.disable_server("retry_server").await.unwrap();
-        refresh.await.unwrap().unwrap();
-        time::sleep(Duration::from_millis(
-            MCP_RECONNECT_RETRY_BASE_DELAY_MS.saturating_add(100),
-        ))
-        .await;
+        match time::timeout(Duration::from_secs(5), &mut refresh).await {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => {
+                probe.release.notify_one();
+                refresh.abort();
+                let _ = refresh.await;
+                panic!("Disable 后旧 generation 的连接任务未通过 cancellation 分支及时退出");
+            }
+        }
 
         assert_eq!(
             tokio::fs::read_to_string(&attempts_path)
@@ -6198,6 +6263,12 @@ fi
 attempt=$((attempt + 1))
 printf '%s\n' "$attempt" > "$MCP_FIXTURE_ATTEMPTS"
 if [ "$attempt" -eq 1 ]; then
+  if [ -n "$MCP_FIXTURE_FIRST_ATTEMPT_STARTED" ]; then
+    : > "$MCP_FIXTURE_FIRST_ATTEMPT_STARTED"
+    while [ ! -f "$MCP_FIXTURE_RELEASE_FIRST_ATTEMPT" ]; do
+      sleep 0.01
+    done
+  fi
   exit 1
 fi
 response_id() {

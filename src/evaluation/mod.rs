@@ -22,7 +22,7 @@ use crate::agent::{LocalClaimStore, SessionEvent, SessionFinalizeReport};
 use crate::api::{with_evaluation_usage_recording, EvaluationUsage, EvaluationUsageRecorder};
 use crate::bootstrap::build_evaluation_session_engine;
 use crate::claim::Claim;
-use crate::claim::{AgentId, ClaimId, SessionId};
+use crate::claim::{AgentId, SessionId};
 use crate::config::{resolve_workspace_root, Config, LlmProvider};
 use crate::tool::EvaluationSubmission;
 
@@ -354,7 +354,6 @@ pub async fn run_attempt(config: EvaluationAttemptConfig) -> anyhow::Result<Eval
     };
     let deadline = std::time::Duration::from_secs(config.attempt_deadline_secs);
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-    let mut compaction_report = SessionFinalizeReport::default();
     let task_config = config.clone();
     let task_router = router.clone();
     let task_usage_recorder = usage_recorder.clone();
@@ -376,22 +375,14 @@ pub async fn run_attempt(config: EvaluationAttemptConfig) -> anyhow::Result<Eval
             ))
         }
     };
-    drain_buffered_events(
-        &mut event_rx,
-        &mut events,
-        &config.attempt_id,
-        &mut compaction_report,
-    );
+    drain_buffered_events(&mut event_rx, &mut events, &config.attempt_id);
     let agent_steps = usage_recorder.response_count();
     let router_evidence = router.take_evidence();
     let usage = record_model_request_events(&mut events, &config.attempt_id, &usage_recorder);
     let router_evidence_incomplete = router.audit_is_incomplete();
     let (report, run_error) = match attempt_outcome {
-        Ok(finalize_report) => (
-            merge_attempt_claim_reports(compaction_report, finalize_report),
-            None,
-        ),
-        Err(error) => (compaction_report, Some(error)),
+        Ok(finalize_report) => (finalize_report, None),
+        Err(error) => (SessionFinalizeReport::default(), Some(error)),
     };
     let snapshot_error = append_attempt_claim_snapshots(&config, &mut events, &report)
         .await
@@ -656,7 +647,6 @@ fn drain_buffered_events(
     event_rx: &mut mpsc::UnboundedReceiver<BufferedEvaluationEvent>,
     events: &mut Vec<EvaluationEvent>,
     attempt_id: &str,
-    compaction_report: &mut SessionFinalizeReport,
 ) {
     while let Ok(buffered) = event_rx.try_recv() {
         match buffered {
@@ -668,9 +658,7 @@ fn drain_buffered_events(
             BufferedEvaluationEvent::Session {
                 event,
                 timestamp_utc,
-            } => {
-                record_session_event_at(events, attempt_id, compaction_report, event, timestamp_utc)
-            }
+            } => record_session_event_at(events, attempt_id, event, timestamp_utc),
         }
     }
 }
@@ -894,7 +882,6 @@ fn apply_claim_attribution(result: &mut EvaluationResult, report: &SessionFinali
 fn record_session_event_at(
     events: &mut Vec<EvaluationEvent>,
     attempt_id: &str,
-    compaction_report: &mut SessionFinalizeReport,
     event: SessionEvent,
     timestamp_utc: DateTime<Utc>,
 ) {
@@ -919,78 +906,23 @@ fn record_session_event_at(
             "finalize_completed",
             json!({"new_claim_ids": new_claim_ids, "updated_claim_ids": updated_claim_ids}),
         ),
-        SessionEvent::CompactionCompleted {
-            new_claim_ids,
-            updated_claim_ids,
-            used_claim_ids,
-            ..
-        } => {
-            add_claim_attribution(
-                compaction_report,
-                &new_claim_ids,
-                &updated_claim_ids,
-                &used_claim_ids,
-            );
-            (
-                "compaction_completed",
-                json!({
-                    "new_claim_ids": new_claim_ids,
-                    "updated_claim_ids": updated_claim_ids,
-                    "used_claim_ids": used_claim_ids,
-                }),
-            )
-        }
+        SessionEvent::CompactionCompleted { compacted_until } => (
+            "compaction_completed",
+            json!({ "compacted_until": compacted_until }),
+        ),
+        SessionEvent::RecapRequested {
+            session_id,
+            recap_end_index,
+        } => (
+            "recap_requested",
+            json!({ "session_id": session_id, "recap_end_index": recap_end_index }),
+        ),
         SessionEvent::TurnFailed { error } | SessionEvent::FinalizeFailed { error } => {
             ("session_error", json!({ "error": error }))
         }
         _ => return,
     };
     record_event_at(events, attempt_id, kind, payload, timestamp_utc);
-}
-
-/// 评测只汇总本 attempt 的 claim 归因字段，不携带 report 的 trace、warning 或 recap 状态。
-fn merge_attempt_claim_reports(
-    compaction_report: SessionFinalizeReport,
-    finalize_report: SessionFinalizeReport,
-) -> SessionFinalizeReport {
-    let mut merged = SessionFinalizeReport::default();
-    add_claim_attribution(
-        &mut merged,
-        &compaction_report.new_claim_ids,
-        &compaction_report.updated_claim_ids,
-        &compaction_report.used_claim_ids,
-    );
-    add_claim_attribution(
-        &mut merged,
-        &finalize_report.new_claim_ids,
-        &finalize_report.updated_claim_ids,
-        &finalize_report.used_claim_ids,
-    );
-    merged
-}
-
-fn add_claim_attribution(
-    report: &mut SessionFinalizeReport,
-    new_claim_ids: &[ClaimId],
-    updated_claim_ids: &[ClaimId],
-    used_claim_ids: &[ClaimId],
-) {
-    extend_unique_claim_ids(&mut report.new_claim_ids, new_claim_ids);
-    for claim_id in updated_claim_ids {
-        if !report.new_claim_ids.contains(claim_id) && !report.updated_claim_ids.contains(claim_id)
-        {
-            report.updated_claim_ids.push(claim_id.clone());
-        }
-    }
-    extend_unique_claim_ids(&mut report.used_claim_ids, used_claim_ids);
-}
-
-fn extend_unique_claim_ids(target: &mut Vec<ClaimId>, source: &[ClaimId]) {
-    for claim_id in source {
-        if !target.contains(claim_id) {
-            target.push(claim_id.clone());
-        }
-    }
 }
 
 fn record_event(events: &mut Vec<EvaluationEvent>, attempt_id: &str, kind: &str, payload: Value) {
@@ -1118,6 +1050,7 @@ mod tests {
     use crate::api::evaluation_usage::{
         record_evaluation_request_started, record_evaluation_usage,
     };
+    use crate::claim::ClaimId;
     use serde_json::json;
 
     #[test]
@@ -1213,16 +1146,10 @@ harness_mode = "{raw_mode}"
     fn evaluation_completion_distinguishes_explicit_submission_from_normal_assistant_done() {
         let submission = EvaluationSubmission::new();
         let mut events = Vec::new();
-        let mut compaction_report = SessionFinalizeReport::default();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
         buffer_evaluation_completion(&event_tx, &submission);
-        drain_buffered_events(
-            &mut event_rx,
-            &mut events,
-            "attempt-001",
-            &mut compaction_report,
-        );
+        drain_buffered_events(&mut event_rx, &mut events, "attempt-001");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "evaluation_completion");
         assert_eq!(
@@ -1232,12 +1159,7 @@ harness_mode = "{raw_mode}"
 
         submission.mark_submitted();
         buffer_evaluation_completion(&event_tx, &submission);
-        drain_buffered_events(
-            &mut event_rx,
-            &mut events,
-            "attempt-001",
-            &mut compaction_report,
-        );
+        drain_buffered_events(&mut event_rx, &mut events, "attempt-001");
         assert_eq!(events.len(), 3);
         assert_eq!(events[1].event_type, "evaluation_completion");
         assert_eq!(events[1].payload, json!({"mode": "explicit_submit_task"}));
@@ -1248,18 +1170,12 @@ harness_mode = "{raw_mode}"
     #[test]
     fn outer_ledger_assigns_one_strictly_increasing_sequence_to_buffered_events() {
         let mut events = Vec::new();
-        let mut compaction_report = SessionFinalizeReport::default();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         record_event(&mut events, "attempt-001", "attempt_started", json!({}));
         buffer_direct_event(&event_tx, "forced_claim_context", json!({"claim_ids": []}));
         buffer_session_event(&event_tx, SessionEvent::TurnCommitted { message_count: 2 });
 
-        drain_buffered_events(
-            &mut event_rx,
-            &mut events,
-            "attempt-001",
-            &mut compaction_report,
-        );
+        drain_buffered_events(&mut event_rx, &mut events, "attempt-001");
         record_event(&mut events, "attempt-001", "attempt_finished", json!({}));
 
         assert_eq!(
@@ -1482,74 +1398,36 @@ harness_mode = "{raw_mode}"
     }
 
     #[test]
-    fn compaction_claim_attribution_is_merged_into_result_and_snapshots() {
-        let compaction_new = snapshot_claim("claim_11111111", "compaction-new");
-        let compaction_updated = snapshot_claim("claim_22222222", "compaction-updated");
-        let compaction_used: ClaimId = "claim_33333333".parse().unwrap();
-        let finalize_updated = snapshot_claim("claim_44444444", "finalize-updated");
-        let finalize_used: ClaimId = "claim_55555555".parse().unwrap();
-        let mut compaction_report = SessionFinalizeReport::default();
+    fn compaction_and_recap_events_record_frozen_progress_targets() {
         let mut events = Vec::new();
 
         record_session_event_at(
             &mut events,
             "attempt-001",
-            &mut compaction_report,
-            SessionEvent::CompactionCompleted {
-                compacted_until: 2,
-                recapped_until: 4,
-                new_claim_ids: vec![compaction_new.id.clone()],
-                updated_claim_ids: vec![compaction_updated.id.clone()],
-                used_claim_ids: vec![compaction_used.clone()],
-                new_dispute_ids: Vec::new(),
+            SessionEvent::CompactionCompleted { compacted_until: 2 },
+            Utc::now(),
+        );
+        record_session_event_at(
+            &mut events,
+            "attempt-001",
+            SessionEvent::RecapRequested {
+                session_id: "session_1234abcd".parse().unwrap(),
+                recap_end_index: 4,
             },
             Utc::now(),
         );
-        let merged = merge_attempt_claim_reports(
-            compaction_report,
-            SessionFinalizeReport {
-                updated_claim_ids: vec![compaction_new.id.clone(), finalize_updated.id.clone()],
-                used_claim_ids: vec![compaction_used.clone(), finalize_used.clone()],
-                ..Default::default()
-            },
-        );
 
-        assert_eq!(merged.new_claim_ids, vec![compaction_new.id.clone()]);
-        assert_eq!(
-            merged.updated_claim_ids,
-            vec![compaction_updated.id.clone(), finalize_updated.id.clone()]
-        );
-        assert_eq!(merged.used_claim_ids, vec![compaction_used, finalize_used]);
         assert_eq!(events[0].event_type, "compaction_completed");
-        append_claim_snapshot_events(
-            &mut events,
-            "attempt-001",
-            &merged,
-            vec![
-                compaction_new.clone(),
-                compaction_updated.clone(),
-                finalize_updated.clone(),
-                snapshot_claim("claim_66666666", "unrelated"),
-            ],
-        )
-        .unwrap();
-        let snapshot_ids = events
-            .iter()
-            .filter(|event| event.event_type == "claim_snapshot")
-            .map(|event| event.payload["claim"]["id"].as_str().unwrap().to_string())
-            .collect::<Vec<_>>();
+        assert_eq!(events[0].payload, json!({"compacted_until": 2}));
+        assert_eq!(events[1].event_type, "recap_requested");
         assert_eq!(
-            snapshot_ids,
-            vec![
-                compaction_new.id.to_string(),
-                compaction_updated.id.to_string(),
-                finalize_updated.id.to_string(),
-            ]
+            events[1].payload,
+            json!({"session_id": "session_1234abcd", "recap_end_index": 4})
         );
     }
 
     #[test]
-    fn failed_attempt_result_keeps_partial_compaction_claim_attribution() {
+    fn failed_attempt_result_keeps_available_finalize_claim_attribution() {
         let new_claim: ClaimId = "claim_11111111".parse().unwrap();
         let updated_claim: ClaimId = "claim_22222222".parse().unwrap();
         let used_claim: ClaimId = "claim_33333333".parse().unwrap();
@@ -1573,22 +1451,12 @@ harness_mode = "{raw_mode}"
     }
 
     #[tokio::test]
-    async fn timeout_cancellation_leaves_outer_compaction_attribution_available() {
-        let claim_id: ClaimId = "claim_11111111".parse().unwrap();
+    async fn timeout_cancellation_keeps_buffered_compaction_progress_available() {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let mut outer_report = SessionFinalizeReport::default();
-        let buffered_claim_id = claim_id.clone();
         let attempt_task = tokio::spawn(async move {
             buffer_session_event(
                 &event_tx,
-                SessionEvent::CompactionCompleted {
-                    compacted_until: 1,
-                    recapped_until: 1,
-                    new_claim_ids: vec![buffered_claim_id],
-                    updated_claim_ids: Vec::new(),
-                    used_claim_ids: Vec::new(),
-                    new_dispute_ids: Vec::new(),
-                },
+                SessionEvent::CompactionCompleted { compacted_until: 1 },
             );
             std::future::pending::<()>().await;
         });
@@ -1596,10 +1464,10 @@ harness_mode = "{raw_mode}"
         attempt_task.abort();
         let _ = attempt_task.await;
         let mut events = Vec::new();
-        drain_buffered_events(&mut event_rx, &mut events, "attempt-001", &mut outer_report);
+        drain_buffered_events(&mut event_rx, &mut events, "attempt-001");
 
-        assert_eq!(outer_report.new_claim_ids, vec![claim_id]);
         assert_eq!(events[0].event_type, "compaction_completed");
+        assert_eq!(events[0].payload, json!({"compacted_until": 1}));
     }
 
     fn snapshot_claim(id: &str, name: &str) -> Claim {
