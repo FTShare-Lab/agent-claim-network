@@ -155,6 +155,7 @@ fn is_elapsed_title_status(status: SessionRuntimeStatus) -> bool {
             | SessionRuntimeStatus::Running
             | SessionRuntimeStatus::SyncingInbox
             | SessionRuntimeStatus::Compacting
+            | SessionRuntimeStatus::Resuming
             | SessionRuntimeStatus::Finalizing
     )
 }
@@ -284,6 +285,10 @@ impl SessionTuiState {
                     }
                     SessionRuntimeStatus::Compacting => {
                         self.transcript.set_activity(None);
+                    }
+                    SessionRuntimeStatus::Resuming => {
+                        self.transcript
+                            .set_activity(Some("waiting for target finalization...".into()));
                     }
                     SessionRuntimeStatus::Finalizing => {
                         self.transcript
@@ -604,6 +609,7 @@ impl SessionTuiState {
             SessionRuntimeStatus::Running => "running",
             SessionRuntimeStatus::SyncingInbox => "syncing inbox",
             SessionRuntimeStatus::Compacting => "compacting",
+            SessionRuntimeStatus::Resuming => "resuming",
             SessionRuntimeStatus::Finalizing => "finalizing",
             SessionRuntimeStatus::Error => "error",
             SessionRuntimeStatus::Closed => "closed",
@@ -946,6 +952,7 @@ impl SessionTuiState {
                 SessionRuntimeStatus::Running
                     | SessionRuntimeStatus::SyncingInbox
                     | SessionRuntimeStatus::Compacting
+                    | SessionRuntimeStatus::Resuming
                     | SessionRuntimeStatus::Finalizing
             )
     }
@@ -1305,12 +1312,25 @@ impl SessionTuiState {
         self.transcript.push_system(message);
     }
 
-    pub(super) fn finish_resume_inbox_with_warning(&mut self, warning: impl Into<String>) {
+    pub(super) fn begin_target_resume_wait(&mut self, session_id: &str) {
+        self.apply_event(SessionEvent::StatusChanged {
+            status: SessionRuntimeStatus::Resuming,
+        });
+        self.transcript
+            .set_activity(Some(format!("Target resume {session_id} finalizing...")));
+    }
+
+    pub(super) fn finish_resume_inbox_with_warnings(&mut self, warnings: Vec<String>) {
         self.status = SessionRuntimeStatus::Open;
         self.foreground_task_started_at = None;
         self.transcript.set_activity(None);
+        if warnings.is_empty() {
+            return;
+        }
         self.transcript.push_system("");
-        self.transcript.push_warning(warning);
+        for warning in warnings {
+            self.transcript.push_warning(warning);
+        }
         self.transcript.push_system("");
     }
 
@@ -1727,6 +1747,14 @@ impl SessionTuiState {
     ) -> Vec<QueuedInput> {
         self.input_queue
             .drain_inputs_for_restore_before(restore_before)
+    }
+
+    pub(super) fn discard_queued_inputs_in_submission_range(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> usize {
+        self.input_queue.discard_submission_range(start, end)
     }
 
     pub(super) fn restore_latest_queued_input_to_composer(&mut self) -> bool {

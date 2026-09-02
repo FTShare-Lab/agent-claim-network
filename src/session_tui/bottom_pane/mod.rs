@@ -952,6 +952,12 @@ impl BottomPane {
                 format!("input will be queued · queued={queued_count}")
             }
             SessionRuntimeStatus::Compacting => "input will be queued".into(),
+            SessionRuntimeStatus::Resuming if queued_count > 0 => {
+                format!("waiting for target finalization... inputs queued={queued_count}")
+            }
+            SessionRuntimeStatus::Resuming => {
+                "waiting for target finalization... inputs will be queued".into()
+            }
             SessionRuntimeStatus::Finalizing => "finalizing session...".into(),
             SessionRuntimeStatus::Closed => "session closed".into(),
         }
@@ -1318,6 +1324,7 @@ pub(super) fn input_accepts_text(status: SessionRuntimeStatus) -> bool {
             | SessionRuntimeStatus::Running
             | SessionRuntimeStatus::SyncingInbox
             | SessionRuntimeStatus::Compacting
+            | SessionRuntimeStatus::Resuming
             | SessionRuntimeStatus::Error
     )
 }

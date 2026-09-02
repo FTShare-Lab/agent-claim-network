@@ -730,6 +730,7 @@ pub fn assistant_text_from_message(message: &SessionTurnMessage) -> anyhow::Resu
                 anyhow::bail!("结构化文本响应不能包含附件 block");
             }
             SessionTurnContentBlock::ToolUse { .. }
+            | SessionTurnContentBlock::InvalidToolUse { .. }
             | SessionTurnContentBlock::ToolResult { .. } => {
                 anyhow::bail!("结构化文本响应只能包含 Text block");
             }

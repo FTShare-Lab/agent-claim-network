@@ -371,7 +371,7 @@ pub enum McpClientError {
     OAuthCredentials { server: String, message: String },
     #[error("MCP server '{server}' 启动未在 {timeout_secs}s 内完成")]
     StartupTimeout { server: String, timeout_secs: u64 },
-    #[error("MCP server '{server}' 建连协商失败: {message}")]
+    #[error("MCP server '{server}' 连接初始化失败: {message}")]
     InitializeConnection { server: String, message: String },
     #[error("MCP server '{server}' MCP 协商失败: {message}")]
     Initialize { server: String, message: String },
@@ -2790,7 +2790,7 @@ async fn streamable_http_transport(
             message: error.to_string(),
         })?,
     };
-    // transport 准备和建连协商由 `McpClient::connect` 的统一 startup deadline 约束；
+    // transport 准备和连接初始化由 `McpClient::connect` 的统一 startup deadline 约束；
     // 不能把它设为 reqwest client 的默认 timeout，否则合法长 SSE tool call 会提前被截断。
     let client = crate::http_client_builder_for_endpoint(&url)
         .build()
@@ -2833,7 +2833,7 @@ async fn streamable_http_transport(
     })
 }
 
-/// 三种 transport 的建连协商只有静态类型不同，错误映射完全一致。
+/// 三种 transport 的连接初始化只有静态类型不同，错误映射完全一致。
 async fn serve_pending_transport<T>(
     handler: AcnMcpClientHandler,
     transport: PendingConnectTransport<T>,

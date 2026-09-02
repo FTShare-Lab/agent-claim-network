@@ -57,6 +57,9 @@ pub(super) fn flatten_turn_content(blocks: &[SessionTurnContentBlock]) -> String
             SessionTurnContentBlock::ToolUse { name, input, .. } => {
                 parts.push(format!("[tool_use {name} {input}]"));
             }
+            SessionTurnContentBlock::InvalidToolUse { name, error, .. } => {
+                parts.push(format!("[invalid_tool_use {name}: {error}]"));
+            }
             SessionTurnContentBlock::ToolResult { content, .. } => parts.push(content.clone()),
         }
     }
@@ -156,6 +159,7 @@ pub(super) fn session_text_from_blocks(blocks: &[SessionContentBlock]) -> String
             SessionContentBlock::Image { .. }
             | SessionContentBlock::Document { .. }
             | SessionContentBlock::ToolUse { .. }
+            | SessionContentBlock::InvalidToolUse { .. }
             | SessionContentBlock::ToolResult { .. } => None,
         })
         .collect::<Vec<_>>()
@@ -335,6 +339,9 @@ fn session_block_to_turn_with_policy(
         SessionContentBlock::ToolUse { id, name, input } => {
             SessionTurnContentBlock::ToolUse { id, name, input }
         }
+        SessionContentBlock::InvalidToolUse { id, name, error } => {
+            SessionTurnContentBlock::InvalidToolUse { id, name, error }
+        }
         SessionContentBlock::ToolResult {
             tool_use_id,
             content,
@@ -357,8 +364,12 @@ pub(super) fn session_messages_to_turn_transcript_with_memory_mode(
     let mut tool_names_by_id = FxHashMap::default();
     for message in messages {
         for block in &message.content {
-            if let SessionContentBlock::ToolUse { id, name, .. } = block {
-                tool_names_by_id.insert(id.as_str(), name.as_str());
+            match block {
+                SessionContentBlock::ToolUse { id, name, .. }
+                | SessionContentBlock::InvalidToolUse { id, name, .. } => {
+                    tool_names_by_id.insert(id.as_str(), name.as_str());
+                }
+                _ => {}
             }
         }
     }
@@ -426,6 +437,17 @@ fn flatten_session_content_with_memory_mode(
                     });
                 } else {
                     parts.push(format!("[tool_use {name} {input}]"));
+                }
+            }
+            SessionContentBlock::InvalidToolUse { name, error, .. } => {
+                if name == "memory" {
+                    parts.push(if memory_enabled {
+                        "[invalid memory tool_use input omitted from recap transcript]".into()
+                    } else {
+                        "[invalid private tool input omitted from recap transcript]".into()
+                    });
+                } else {
+                    parts.push(format!("[invalid_tool_use {name}: {error}]"));
                 }
             }
             SessionContentBlock::ToolResult {

@@ -209,7 +209,7 @@ acn mcp add / add-json / remove / enable / disable / login / logout / status
 acn update
 ```
 
-若启动时用了自定义 `--config` 或 `--upstream`，管理 supervisor 时带上同样参数。ACN 会按有效配置、upstream 和 finalize 所需凭据摘要识别 supervisor 运行环境；这些内容变化后，下次启动会安全接管旧 supervisor，并由新环境继续未完成的 finalize job。失败的 finalize 可优先按用户可见的 session ID 执行 `acn supervisor retry <session_id>`，也可使用 `jobs` 显示的 job ID。
+若启动时用了自定义 `--config` 或 `--upstream`，管理 supervisor 时带上同样参数。ACN 会按有效配置、upstream 和 finalize 所需凭据摘要识别 supervisor 运行环境；这些内容变化后，下次启动会安全接管旧 supervisor，并由新环境继续未完成的 finalize job。`Finalizing` session 通常也可以直接 Resume；如果仍由另一个前台进程收尾，请按提示稍后重试。`acn supervisor retry <session_id>` 作为运维命令，也可使用 `jobs` 显示的 job ID 指定重试。
 
 </details>
 

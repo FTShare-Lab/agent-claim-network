@@ -136,6 +136,7 @@ pub(crate) fn project_compaction_input_media(
             | SessionTurnContentBlock::ModelContext { .. }
             | SessionTurnContentBlock::SkillInstructions { .. }
             | SessionTurnContentBlock::ToolUse { .. }
+            | SessionTurnContentBlock::InvalidToolUse { .. }
             | SessionTurnContentBlock::ToolResult { .. } => None,
         };
         if let Some(omission) = omission {
@@ -264,7 +265,8 @@ pub fn provider_safe_segments(active_suffix: &[SessionTurnMessage]) -> Vec<Messa
                 .content
                 .iter()
                 .filter_map(|block| match block {
-                    SessionTurnContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                    SessionTurnContentBlock::ToolUse { id, .. }
+                    | SessionTurnContentBlock::InvalidToolUse { id, .. } => Some(id.as_str()),
                     SessionTurnContentBlock::Text { .. }
                     | SessionTurnContentBlock::ModelContext { .. }
                     | SessionTurnContentBlock::SkillInstructions { .. }

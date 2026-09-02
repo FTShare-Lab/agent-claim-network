@@ -228,6 +228,7 @@ pub enum SessionRuntimeStatus {
     Running,
     SyncingInbox,
     Compacting,
+    Resuming,
     Finalizing,
     Error,
     Closed,

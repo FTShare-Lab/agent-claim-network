@@ -17,12 +17,13 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{
-    SessionEngine, SessionEvent, SessionFinalizeReport, SessionRecapPreemptionControl,
+    SessionEngine, SessionEvent, SessionFinalizeOnceOutcome, SessionFinalizePreemptionControl,
+    SessionFinalizeReport, SessionRecapPreemptionControl,
 };
 use crate::build_info::BuildIdentity;
 use crate::claim::{AgentId, SessionId};
@@ -36,13 +37,19 @@ use crate::config::{
     DEFAULT_SUPERVISOR_LOCK_TIMEOUT_MS, DEFAULT_SUPERVISOR_STARTUP_TIMEOUT_MS,
     DEFAULT_SUPERVISOR_STOP_WAIT_TIMEOUT_MS, DEFAULT_SUPERVISOR_UPDATE_SHUTDOWN_TIMEOUT_MS,
 };
-use crate::session::{SessionMetadata, SessionPaths, SessionStatus};
+use crate::session::{
+    finalize_checkpoint_covers_pending_range, SessionHandle, SessionMetadata, SessionPaths,
+    SessionStatus,
+};
+#[cfg(test)]
+use crate::session::{FinalizeCheckpoint, FinalizeCheckpointStatus};
 #[cfg(target_os = "macos")]
 use crate::storage::write_text_atomic;
 use crate::storage::{mint_unique_id_in_dir, paths, read_yaml, write_yaml_atomic, FileLockGuard};
 
 const SUPERVISOR_RUNTIME_FINGERPRINT_SCHEMA: u32 = 1;
 const SUPERVISOR_STOPPING_MESSAGE: &str = "supervisor 正在停止，拒绝新 job";
+const RESUME_FINALIZE_LIVENESS_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupervisorRuntimeFingerprint {
@@ -228,6 +235,23 @@ pub enum FinalizingSessionDiagnostic {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum FinalizingResumeTakeover {
+    Opened {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job_id: Option<String>,
+    },
+    WaitForFinalize {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job_id: Option<String>,
+    },
+    ReopenClosed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "by", rename_all = "snake_case")]
 pub enum SupervisorRetryTarget {
     Session { session_id: SessionId },
@@ -284,6 +308,7 @@ struct SupervisorSharedState {
     stopping: Arc<AtomicBool>,
     lifecycle_gate: Arc<Mutex<()>>,
     running_recap: Arc<Mutex<Option<RunningRecap>>>,
+    running_finalize: Arc<Mutex<Option<RunningFinalize>>>,
 }
 
 #[derive(Clone)]
@@ -291,6 +316,30 @@ struct RunningRecap {
     job_id: String,
     session_id: SessionId,
     preemption: Arc<SessionRecapPreemptionControl>,
+}
+
+#[derive(Clone)]
+struct RunningFinalize {
+    job_id: String,
+    session_id: SessionId,
+    preemption: Arc<SessionFinalizePreemptionControl>,
+    resume_target: Arc<Mutex<Option<usize>>>,
+    resume_result_tx: watch::Sender<Option<RunningFinalizeResumeResult>>,
+}
+
+struct RunningJobControls {
+    recap_preemption: Option<Arc<SessionRecapPreemptionControl>>,
+    finalize_preemption: Option<Arc<SessionFinalizePreemptionControl>>,
+    finalize_resume_target: Option<Arc<Mutex<Option<usize>>>>,
+    finalize_result_tx: Option<watch::Sender<Option<RunningFinalizeResumeResult>>>,
+}
+
+#[derive(Debug, Clone)]
+enum RunningFinalizeResumeResult {
+    Opened,
+    WaitForFinalize,
+    AttemptFinishedBeforePrepared,
+    Failed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -319,6 +368,14 @@ enum SupervisorRequest {
         )]
         notify_on_completion: bool,
     },
+    ResumeFinalizing {
+        session_id: SessionId,
+        #[serde(
+            default = "default_notify_on_completion",
+            skip_serializing_if = "is_true"
+        )]
+        notify_on_completion: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,6 +398,9 @@ enum SupervisorResponse {
         job_id: String,
         previous_attempts: u32,
         manual_retries: u32,
+    },
+    ResumeTakeover {
+        outcome: FinalizingResumeTakeover,
     },
     Stopping,
     Error {
@@ -582,6 +642,141 @@ pub async fn retry_finalize(
         }),
         SupervisorResponse::Error { message } => anyhow::bail!(message),
         other => anyhow::bail!("supervisor 返回了非 retry 响应: {other:?}"),
+    }
+}
+
+pub async fn resume_finalizing_session(
+    config: &SupervisorLaunchConfig,
+    session_id: SessionId,
+) -> anyhow::Result<FinalizingResumeTakeover> {
+    ensure_supervisor_running(config).await?;
+    let paths = config.paths();
+    let outcome = request_resume_finalizing_takeover(config, &paths, session_id.clone()).await?;
+    match outcome {
+        FinalizingResumeTakeover::WaitForFinalize {
+            job_id: Some(job_id),
+        } => {
+            wait_for_resume_finalize_job(&paths, &session_id, &job_id).await?;
+            // Finalize 先提交 Closed，再提交 job Succeeded。等待观察到 Closed 后必须
+            // 回到 lifecycle gate 对账旧 job，才能允许下一轮 Open。
+            match request_resume_finalizing_takeover(config, &paths, session_id).await? {
+                FinalizingResumeTakeover::ReopenClosed {
+                    job_id: reconciled_job_id,
+                } => Ok(FinalizingResumeTakeover::ReopenClosed {
+                    job_id: reconciled_job_id.or(Some(job_id)),
+                }),
+                other => anyhow::bail!(
+                    "supervisor returned an unexpected post-finalize resume outcome: {other:?}"
+                ),
+            }
+        }
+        other => Ok(other),
+    }
+}
+
+/// Closed Resume 只在现有 Supervisor 可达时对账上一轮 Finalize job。
+/// 明确没有 Supervisor 时沿用原 reopen；旧 job 会在下次 Supervisor 启动时按
+/// 既有 Open/Closed stale recovery 收敛，不能反过来阻断普通 Closed Resume。
+pub async fn reconcile_closed_session_for_resume(
+    config: &SupervisorLaunchConfig,
+    session_id: SessionId,
+) -> anyhow::Result<()> {
+    let paths = config.paths();
+    let outcome = match request_resume_finalizing_takeover(config, &paths, session_id.clone()).await
+    {
+        Ok(outcome) => outcome,
+        Err(error) if ipc_error_indicates_unavailable(&error) => {
+            log::warn!(
+                target: "supervisor",
+                "Closed resume skipped stale Finalize reconciliation because Supervisor is unavailable: session={} error={error:#}",
+                session_id
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    match outcome {
+        FinalizingResumeTakeover::ReopenClosed { .. } => Ok(()),
+        other => {
+            anyhow::bail!("supervisor returned an unexpected Closed resume outcome: {other:?}")
+        }
+    }
+}
+
+async fn request_resume_finalizing_takeover(
+    config: &SupervisorLaunchConfig,
+    paths: &SupervisorPaths,
+    session_id: SessionId,
+) -> anyhow::Result<FinalizingResumeTakeover> {
+    // 该请求会原子改变 job/session，服务端不会随客户端 deadline 自动取消。必须等待同一
+    // 连接返回权威结果，不能套用普通 1.5 秒 IPC 超时后把成功接管误报成失败。
+    let outcome = match send_request_inner(
+        paths,
+        SupervisorRequest::ResumeFinalizing {
+            session_id,
+            notify_on_completion: config.notify_on_finalize_completion,
+        },
+    )
+    .await?
+    {
+        SupervisorResponse::ResumeTakeover { outcome } => outcome,
+        SupervisorResponse::Error { message } => anyhow::bail!(message),
+        other => anyhow::bail!("supervisor 返回了非 resume takeover 响应: {other:?}"),
+    };
+    Ok(outcome)
+}
+
+async fn wait_for_resume_finalize_job(
+    paths: &SupervisorPaths,
+    session_id: &SessionId,
+    job_id: &str,
+) -> anyhow::Result<()> {
+    let mut next_liveness_check = Instant::now() + RESUME_FINALIZE_LIVENESS_INTERVAL;
+    loop {
+        let session_paths = SessionPaths::new(&paths.agent_home, session_id);
+        let metadata = read_yaml::<SessionMetadata>(&session_paths.session_yaml).await?;
+        if metadata.status == SessionStatus::Closed
+            && metadata.closed_at.is_some()
+            && metadata.finalized_at.is_some()
+        {
+            return Ok(());
+        }
+        let jobs = read_jobs(paths).await?;
+        let job = jobs
+            .iter()
+            .find(|job| job.id == job_id)
+            .with_context(|| format!("resume recovery job {job_id} disappeared"))?;
+        match job.status {
+            SupervisorJobStatus::Queued | SupervisorJobStatus::Running => {
+                if Instant::now() >= next_liveness_check {
+                    let supervisor_alive = matches!(
+                        send_request(paths, SupervisorRequest::Status).await,
+                        Ok(SupervisorResponse::Status { .. })
+                    );
+                    if !supervisor_alive {
+                        log::warn!(
+                            target: "supervisor",
+                            "resume recovery wait lost supervisor: session={} job={}",
+                            session_id,
+                            job_id
+                        );
+                        anyhow::bail!(
+                            "This session is still finalizing; wait for finalization to complete before resuming."
+                        );
+                    }
+                    next_liveness_check = Instant::now() + RESUME_FINALIZE_LIVENESS_INTERVAL;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+            SupervisorJobStatus::Succeeded => {
+                anyhow::bail!(
+                    "resume recovery job {job_id} succeeded but session {session_id} is not Closed"
+                );
+            }
+            SupervisorJobStatus::Failed => anyhow::bail!(
+                "This session is still finalizing; wait for finalization to complete before resuming."
+            ),
+        }
     }
 }
 
@@ -921,6 +1116,7 @@ pub async fn run_supervisor(
     let stopping = Arc::new(AtomicBool::new(false));
     let lifecycle_gate = Arc::new(Mutex::new(()));
     let running_recap = Arc::new(Mutex::new(None));
+    let running_finalize = Arc::new(Mutex::new(None));
     let shared_state = SupervisorSharedState {
         agent_id,
         notify_tx,
@@ -931,6 +1127,7 @@ pub async fn run_supervisor(
         stopping: stopping.clone(),
         lifecycle_gate,
         running_recap,
+        running_finalize,
     };
 
     let accept_handle = tokio::spawn(accept_loop(
@@ -1130,6 +1327,19 @@ async fn handle_client(
                     }
                 }
             }
+            Ok(SupervisorRequest::ResumeFinalizing {
+                session_id,
+                notify_on_completion,
+            }) => {
+                match resume_finalizing_takeover(paths, shared, session_id, notify_on_completion)
+                    .await
+                {
+                    Ok(outcome) => SupervisorResponse::ResumeTakeover { outcome },
+                    Err(error) => SupervisorResponse::Error {
+                        message: format!("{error:#}"),
+                    },
+                }
+            }
             Err(err) => SupervisorResponse::Error {
                 message: format!("invalid supervisor request: {err}"),
             },
@@ -1146,6 +1356,402 @@ async fn handle_client(
     }
     write_result?;
     Ok(())
+}
+
+async fn resume_finalizing_takeover(
+    paths: &SupervisorPaths,
+    shared: &SupervisorSharedState,
+    session_id: SessionId,
+    notify_on_completion: bool,
+) -> anyhow::Result<FinalizingResumeTakeover> {
+    'takeover: loop {
+        let lifecycle_guard = shared.lifecycle_gate.lock().await;
+        if shared.stopping.load(Ordering::Acquire) || shared.stop_requested.is_cancelled() {
+            anyhow::bail!(SUPERVISOR_STOPPING_MESSAGE);
+        }
+        let session_paths = SessionPaths::new(&paths.agent_home, &session_id);
+        let metadata = read_yaml::<SessionMetadata>(&session_paths.session_yaml)
+            .await
+            .with_context(|| format!("读取 session {session_id} metadata 失败"))?;
+        if metadata.id != session_id || metadata.agent_id != shared.agent_id {
+            anyhow::bail!("session {session_id} does not belong to the current agent");
+        }
+        let jobs = read_jobs(paths).await?;
+        if metadata.status == SessionStatus::Closed
+            && metadata.closed_at.is_some()
+            && metadata.finalized_at.is_some()
+        {
+            let matching = unresolved_finalize_jobs(&jobs, &session_id);
+            ensure_unique_unresolved_job(&session_id, &matching)?;
+            let reconciled_job_id = if let Some(job) = matching.first() {
+                validate_job_agent(job, &shared.agent_id)?;
+                let mut reconciled = (**job).clone();
+                let previous_status = reconciled.status.clone();
+                let now = Utc::now();
+                reconciled.status = SupervisorJobStatus::Succeeded;
+                reconciled.finished_at = Some(now);
+                reconciled.updated_at = now;
+                reconciled.last_error = None;
+                write_job(paths, &reconciled).await?;
+                append_supervisor_log(
+                paths,
+                format!(
+                    "resume reconciled closed session finalize job {} session={} previous_status={}",
+                    reconciled.id,
+                    session_id,
+                    previous_status.as_str()
+                ),
+            )
+            .await;
+                Some(reconciled.id)
+            } else {
+                None
+            };
+            return Ok(FinalizingResumeTakeover::ReopenClosed {
+                job_id: reconciled_job_id,
+            });
+        }
+        if metadata.status == SessionStatus::Open
+            && metadata.closed_at.is_none()
+            && metadata.finalized_at.is_none()
+        {
+            return Ok(FinalizingResumeTakeover::Opened { job_id: None });
+        }
+        if metadata.status != SessionStatus::Finalizing
+            || metadata.closed_at.is_some()
+            || metadata.finalized_at.is_some()
+        {
+            anyhow::bail!("session {session_id} is not a resumable Finalizing session");
+        }
+        let recap_end_index = metadata.message_count;
+        let has_checkpoint = SessionHandle::new(metadata.clone(), session_paths.clone())
+            .read_finalize_checkpoint()
+            .await?
+            .is_some_and(|checkpoint| {
+                finalize_checkpoint_covers_pending_range(
+                    &checkpoint,
+                    metadata.recapped_until,
+                    metadata.message_count,
+                )
+            });
+        let matching = unresolved_finalize_jobs(&jobs, &session_id);
+        ensure_unique_unresolved_job(&session_id, &matching)?;
+
+        let Some(job) = matching.first().copied() else {
+            let Some(_finalize_guard) =
+                FileLockGuard::try_lock_exclusive(&session_paths.finalize_lock).await?
+            else {
+                drop(lifecycle_guard);
+                return Ok(FinalizingResumeTakeover::WaitForFinalize { job_id: None });
+            };
+            if has_checkpoint {
+                let recovery = create_resume_recovery_finalize_job(
+                    paths,
+                    &shared.agent_id,
+                    session_id.clone(),
+                    notify_on_completion,
+                )
+                .await?;
+                append_supervisor_log(
+                    paths,
+                    format!(
+                        "resume created orphan checkpoint recovery finalize job {} session={}",
+                        recovery.id, session_id
+                    ),
+                )
+                .await;
+                let _ = shared.notify_tx.send(());
+                return Ok(FinalizingResumeTakeover::WaitForFinalize {
+                    job_id: Some(recovery.id),
+                });
+            }
+
+            let recap_job = if metadata.recapped_until < recap_end_index {
+                Some(
+                    create_recap_job(paths, &shared.agent_id, session_id.clone(), recap_end_index)
+                        .await?,
+                )
+            } else {
+                None
+            };
+            if let Err(open_error) =
+                open_finalizing_session_for_resume(paths, &shared.agent_id, &session_id).await
+            {
+                if let Some(recap_job) = recap_job.as_ref() {
+                    let recovery = recap_job_as_finalize_recovery(
+                        recap_job,
+                        &session_id,
+                        notify_on_completion,
+                        Utc::now(),
+                    );
+                    write_job(paths, &recovery).await?;
+                }
+                return Err(open_error);
+            }
+            append_supervisor_log(
+                paths,
+                format!(
+                    "resume reopened orphan finalizing session {} target={} recap_job={}",
+                    session_id,
+                    recap_end_index,
+                    recap_job
+                        .as_ref()
+                        .map(|job| job.id.as_str())
+                        .unwrap_or("none")
+                ),
+            )
+            .await;
+            if recap_job.is_some() {
+                let _ = shared.notify_tx.send(());
+            }
+            return Ok(FinalizingResumeTakeover::Opened {
+                job_id: recap_job.map(|job| job.id),
+            });
+        };
+        validate_job_agent(job, &shared.agent_id)?;
+
+        // worker 在 lifecycle gate 内先登记 Running Finalize，随后才把 job YAML
+        // 从 Queued 改为 Running。这个极短窗口也必须由 worker 独占转换。
+        let running = shared
+            .running_finalize
+            .lock()
+            .await
+            .clone()
+            .filter(|running| running.job_id == job.id && running.session_id == session_id);
+        let recovered_running_job;
+        let recovered_unregistered_running =
+            job.status == SupervisorJobStatus::Running && running.is_none();
+        let job = if recovered_unregistered_running {
+            // 磁盘仍为 Running 但已无匹配进程内登记，只可能是 worker 在终态
+            // job 写入前后异常退出。此时不能返回 Wait：活着的 Supervisor 不会
+            // 再选择 Running job，等待方也就永远不会收敛。复用既有 stale-running
+            // attempt 语义后再继续本次接管。
+            recovered_running_job = recover_stale_running_job(
+            job,
+            metadata.status,
+            "recovered unregistered running finalize job during resume takeover".into(),
+            "unregistered running finalize job exhausted supervisor retry budget before resume takeover"
+                .into(),
+        );
+            write_job(paths, &recovered_running_job).await?;
+            append_supervisor_log(
+            paths,
+            format!(
+                "resume recovered unregistered running finalize job {} session={} status={} attempts={}",
+                recovered_running_job.id,
+                session_id,
+                recovered_running_job.status.as_str(),
+                recovered_running_job.attempts
+            ),
+        )
+        .await;
+            &recovered_running_job
+        } else {
+            job
+        };
+
+        if has_checkpoint {
+            if job.status == SupervisorJobStatus::Failed {
+                let recovered = reset_finalize_job_for_resume_recovery(job);
+                write_job(paths, &recovered).await?;
+                append_supervisor_log(
+                paths,
+                format!(
+                    "resume reset checkpoint recovery finalize job {} session={} previous_attempts={}",
+                    job.id, session_id, job.attempts
+                ),
+            )
+            .await;
+                let _ = shared.notify_tx.send(());
+            } else if recovered_unregistered_running && job.status == SupervisorJobStatus::Queued {
+                let _ = shared.notify_tx.send(());
+            }
+            return Ok(FinalizingResumeTakeover::WaitForFinalize {
+                job_id: Some(job.id.clone()),
+            });
+        }
+
+        if let Some(running) = running {
+            let mut result_rx = running.resume_result_tx.subscribe();
+            *running.resume_target.lock().await = Some(recap_end_index);
+            let preemption_requested = running.preemption.request_before_prepared().await;
+            if !preemption_requested && !running.preemption.finished_before_prepared().await {
+                return Ok(FinalizingResumeTakeover::WaitForFinalize {
+                    job_id: Some(job.id.clone()),
+                });
+            }
+            if preemption_requested {
+                append_supervisor_log(
+                paths,
+                format!(
+                    "finalize job {} preemption requested by same-session resume session={} before Prepared",
+                    job.id, session_id
+                ),
+            )
+            .await;
+            }
+            let job_id = job.id.clone();
+            // 等待方不能持有 Sender；worker 清除 running 登记后，异常退出至少会关闭
+            // channel，让 Resume 返回失败而不是永久停在 Resuming。
+            drop(running);
+            drop(lifecycle_guard);
+            result_rx
+                .changed()
+                .await
+                .context("running finalize ended without a resume takeover result")?;
+            let resume_result = result_rx.borrow().clone();
+            return match resume_result {
+                Some(RunningFinalizeResumeResult::Opened) => Ok(FinalizingResumeTakeover::Opened {
+                    job_id: Some(job_id),
+                }),
+                Some(RunningFinalizeResumeResult::WaitForFinalize) => {
+                    Ok(FinalizingResumeTakeover::WaitForFinalize {
+                        job_id: Some(job_id),
+                    })
+                }
+                Some(RunningFinalizeResumeResult::AttemptFinishedBeforePrepared) => {
+                    continue 'takeover;
+                }
+                Some(RunningFinalizeResumeResult::Failed(message)) => anyhow::bail!(message),
+                None => anyhow::bail!("running finalize returned an empty resume takeover result"),
+            };
+        }
+
+        return match job.status {
+            SupervisorJobStatus::Queued | SupervisorJobStatus::Failed => {
+                let job_id = job.id.clone();
+                convert_finalize_job_and_open(paths, &shared.agent_id, job, recap_end_index)
+                    .await?;
+                let _ = shared.notify_tx.send(());
+                Ok(FinalizingResumeTakeover::Opened {
+                    job_id: Some(job_id),
+                })
+            }
+            SupervisorJobStatus::Running => {
+                anyhow::bail!("unregistered finalize job {} remained running", job.id)
+            }
+            SupervisorJobStatus::Succeeded => {
+                anyhow::bail!(
+                    "unresolved finalize selection included succeeded job {}",
+                    job.id
+                )
+            }
+        };
+    }
+}
+
+fn converted_recap_job(
+    original: &SupervisorJob,
+    session_id: &SessionId,
+    recap_end_index: usize,
+    updated_at: DateTime<Utc>,
+) -> SupervisorJob {
+    SupervisorJob {
+        id: original.id.clone(),
+        agent_id: original.agent_id.clone(),
+        kind: SupervisorJobKind::Recap {
+            session_id: session_id.clone(),
+            recap_end_index,
+        },
+        status: SupervisorJobStatus::Queued,
+        attempts: 0,
+        manual_retries: 0,
+        created_at: original.created_at,
+        updated_at,
+        started_at: None,
+        finished_at: None,
+        last_error: None,
+        notify_on_completion: false,
+    }
+}
+
+fn reset_finalize_job_for_resume_recovery(original: &SupervisorJob) -> SupervisorJob {
+    SupervisorJob {
+        status: SupervisorJobStatus::Queued,
+        attempts: 0,
+        updated_at: Utc::now(),
+        started_at: None,
+        finished_at: None,
+        last_error: None,
+        ..original.clone()
+    }
+}
+
+fn recap_job_as_finalize_recovery(
+    original: &SupervisorJob,
+    session_id: &SessionId,
+    notify_on_completion: bool,
+    updated_at: DateTime<Utc>,
+) -> SupervisorJob {
+    SupervisorJob {
+        id: original.id.clone(),
+        agent_id: original.agent_id.clone(),
+        kind: SupervisorJobKind::Finalize {
+            session_id: session_id.clone(),
+        },
+        status: SupervisorJobStatus::Queued,
+        attempts: 0,
+        manual_retries: 0,
+        created_at: original.created_at,
+        updated_at,
+        started_at: None,
+        finished_at: None,
+        last_error: None,
+        notify_on_completion,
+    }
+}
+
+async fn open_finalizing_session_for_resume(
+    paths: &SupervisorPaths,
+    agent_id: &AgentId,
+    session_id: &SessionId,
+) -> anyhow::Result<()> {
+    let session_paths = SessionPaths::new(&paths.agent_home, session_id);
+    let metadata = read_yaml::<SessionMetadata>(&session_paths.session_yaml).await?;
+    if metadata.agent_id != *agent_id {
+        anyhow::bail!("session {session_id} belongs to a different agent");
+    }
+    let mut session = SessionHandle::new(metadata, session_paths);
+    session
+        .mark_open_after_finalize_takeover(Utc::now())
+        .await?;
+    Ok(())
+}
+
+async fn convert_finalize_job_and_open(
+    paths: &SupervisorPaths,
+    agent_id: &AgentId,
+    original: &SupervisorJob,
+    recap_end_index: usize,
+) -> anyhow::Result<SupervisorJob> {
+    let session_id = finalize_job_session_id(original)
+        .context("resume takeover target is not a finalize job")?
+        .clone();
+    let converted = converted_recap_job(original, &session_id, recap_end_index, Utc::now());
+    write_job(paths, &converted).await?;
+
+    if let Err(open_error) = open_finalizing_session_for_resume(paths, agent_id, &session_id).await
+    {
+        let restore_result = write_job(paths, original).await;
+        return match restore_result {
+            Ok(()) => Err(open_error),
+            Err(restore_error) => anyhow::bail!(
+                "opening session after recap conversion failed: {open_error}; restoring finalize job failed: {restore_error:#}"
+            ),
+        };
+    }
+    append_supervisor_log(
+        paths,
+        format!(
+            "finalize job {} session={} status={} target={} converted by resume before Prepared",
+            original.id,
+            session_id,
+            original.status.as_str(),
+            recap_end_index
+        ),
+    )
+    .await;
+    Ok(converted)
 }
 
 async fn request_same_session_recap_preemption(
@@ -1207,6 +1813,15 @@ async fn worker_loop(
             let job_id = job.id.clone();
             let recap_preemption = matches!(&job.kind, SupervisorJobKind::Recap { .. })
                 .then(|| Arc::new(SessionRecapPreemptionControl::new()));
+            let (finalize_preemption, finalize_resume_target, finalize_result_tx) =
+                if matches!(&job.kind, SupervisorJobKind::Finalize { .. }) {
+                    let preemption = Arc::new(SessionFinalizePreemptionControl::new());
+                    let resume_target = Arc::new(Mutex::new(None));
+                    let (result_tx, _result_rx) = watch::channel(None);
+                    (Some(preemption), Some(resume_target), Some(result_tx))
+                } else {
+                    (None, None, None)
+                };
             if let (SupervisorJobKind::Recap { session_id, .. }, Some(preemption)) =
                 (&job.kind, recap_preemption.as_ref())
             {
@@ -1216,17 +1831,60 @@ async fn worker_loop(
                     preemption: Arc::clone(preemption),
                 });
             }
+            if let (
+                SupervisorJobKind::Finalize { session_id },
+                Some(preemption),
+                Some(resume_target),
+                Some(result_tx),
+            ) = (
+                &job.kind,
+                finalize_preemption.as_ref(),
+                finalize_resume_target.as_ref(),
+                finalize_result_tx.as_ref(),
+            ) {
+                *shared.running_finalize.lock().await = Some(RunningFinalize {
+                    job_id: job_id.clone(),
+                    session_id: session_id.clone(),
+                    preemption: Arc::clone(preemption),
+                    resume_target: Arc::clone(resume_target),
+                    resume_result_tx: result_tx.clone(),
+                });
+            }
             running_job.store(true, Ordering::Relaxed);
             drop(_guard);
             shared.last_activity.store(now_millis(), Ordering::Relaxed);
-            let requeued =
-                if let Err(err) = run_job(&engine, &paths, job, recap_preemption.clone()).await {
+            let controls = RunningJobControls {
+                recap_preemption: recap_preemption.clone(),
+                finalize_preemption: finalize_preemption.clone(),
+                finalize_resume_target: finalize_resume_target.clone(),
+                finalize_result_tx: finalize_result_tx.clone(),
+            };
+            let runner_error = match run_job(&engine, &paths, job, controls, &shared).await {
+                Ok(()) => None,
+                Err(err) => {
                     append_supervisor_log(&paths, format!("job runner error: {err:#}")).await;
-                    false
-                } else {
-                    has_queued_jobs(&paths).await.unwrap_or(false)
-                };
+                    Some(err)
+                }
+            };
             let _guard = shared.lifecycle_gate.lock().await;
+            let requeued = if let Some(error) = runner_error.as_ref() {
+                match reconcile_running_job_after_runner_error(&paths, &job_id, error).await {
+                    Ok(requeued) => requeued,
+                    Err(recovery_error) => {
+                        append_supervisor_log(
+                            &paths,
+                            format!(
+                                "job {} runner error recovery failed: {recovery_error:#}",
+                                job_id
+                            ),
+                        )
+                        .await;
+                        false
+                    }
+                }
+            } else {
+                has_queued_jobs(&paths).await.unwrap_or(false)
+            };
             if recap_preemption.is_some() {
                 let mut running_recap = shared.running_recap.lock().await;
                 if running_recap
@@ -1235,6 +1893,22 @@ async fn worker_loop(
                 {
                     *running_recap = None;
                 }
+            }
+            if finalize_preemption.is_some() {
+                let mut running_finalize = shared.running_finalize.lock().await;
+                if running_finalize
+                    .as_ref()
+                    .is_some_and(|running| running.job_id == job_id)
+                {
+                    *running_finalize = None;
+                }
+            }
+            if let (Some(error), Some(result_tx)) =
+                (runner_error.as_ref(), finalize_result_tx.as_ref())
+            {
+                let _ = result_tx.send(Some(RunningFinalizeResumeResult::Failed(format!(
+                    "This session is still finalizing; wait for finalization to complete before resuming. ({error:#})"
+                ))));
             }
             running_job.store(false, Ordering::Relaxed);
             drop(_guard);
@@ -1253,8 +1927,15 @@ async fn run_job(
     engine: &SessionEngine,
     paths: &SupervisorPaths,
     mut job: SupervisorJob,
-    recap_preemption: Option<Arc<SessionRecapPreemptionControl>>,
+    controls: RunningJobControls,
+    shared: &SupervisorSharedState,
 ) -> anyhow::Result<()> {
+    let RunningJobControls {
+        recap_preemption,
+        finalize_preemption,
+        finalize_resume_target,
+        finalize_result_tx,
+    } = controls;
     job.status = SupervisorJobStatus::Running;
     job.attempts = job.attempts.saturating_add(1);
     job.started_at = Some(Utc::now());
@@ -1263,14 +1944,82 @@ async fn run_job(
     write_job(paths, &job).await?;
 
     let kind = job.kind.clone();
+    let mut finalize_finished_before_prepared = false;
     let result = match &kind {
         SupervisorJobKind::Finalize { session_id } => {
             append_supervisor_log(paths, format!("finalize job {} started", job.id)).await;
-            engine
-                .finalize_existing_session_once(session_id, |event| {
-                    log_supervisor_session_event(&job.id, &event);
-                })
-                .await
+            let preemption = finalize_preemption
+                .as_ref()
+                .context("Finalize job 缺少 Prepared 前抢占控制器")?;
+            let outcome = engine
+                .finalize_existing_session_once_with_preemption(
+                    session_id,
+                    |event| {
+                        log_supervisor_session_event(&job.id, &event);
+                    },
+                    Arc::clone(preemption),
+                )
+                .await;
+            let _ = preemption.finish().await;
+            finalize_finished_before_prepared = preemption.finished_before_prepared().await;
+            match outcome {
+                Ok(SessionFinalizeOnceOutcome::Completed(report)) => {
+                    if let Some(result_tx) = &finalize_result_tx {
+                        let _ = result_tx.send(Some(RunningFinalizeResumeResult::WaitForFinalize));
+                    }
+                    Ok(report)
+                }
+                Ok(SessionFinalizeOnceOutcome::PreemptedBeforePrepared) => {
+                    let _guard = shared.lifecycle_gate.lock().await;
+                    let recap_end_index = *finalize_resume_target
+                        .as_ref()
+                        .context("Finalize resume preemption target is unavailable")?
+                        .lock()
+                        .await;
+                    let recap_end_index = recap_end_index
+                        .context("Finalize resume preemption target was not frozen")?;
+                    match convert_finalize_job_and_open(
+                        paths,
+                        &shared.agent_id,
+                        &job,
+                        recap_end_index,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            if let Some(result_tx) = &finalize_result_tx {
+                                let _ = result_tx.send(Some(RunningFinalizeResumeResult::Opened));
+                            }
+                            let _ = shared.notify_tx.send(());
+                            return Ok(());
+                        }
+                        Err(convert_error) => {
+                            let message = format!(
+                                "This session is still finalizing; wait for finalization to complete before resuming. ({convert_error:#})"
+                            );
+                            if let Some(result_tx) = &finalize_result_tx {
+                                let _ = result_tx
+                                    .send(Some(RunningFinalizeResumeResult::Failed(message)));
+                            }
+                            append_supervisor_log(
+                                paths,
+                                format!(
+                                    "running finalize job {} resume conversion failed; continuing same attempt: {convert_error:#}",
+                                    job.id
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                    drop(_guard);
+                    engine
+                        .finalize_existing_session_once(session_id, |event| {
+                            log_supervisor_session_event(&job.id, &event);
+                        })
+                        .await
+                }
+                Err(error) => Err(error),
+            }
         }
         SupervisorJobKind::Recap {
             session_id,
@@ -1411,6 +2160,29 @@ async fn run_job(
                 )
                 .await;
             }
+            if let Some(result_tx) = finalize_result_tx.as_ref() {
+                // 转换失败已经向等待方发送了 authoritative Failed；随后继续执行的
+                // 原 Finalize 即使也失败，也不能把该结果覆盖成可重新接管。
+                if result_tx.borrow().is_none() {
+                    if finalize_finished_before_prepared {
+                        let _guard = shared.lifecycle_gate.lock().await;
+                        let mut running_finalize = shared.running_finalize.lock().await;
+                        if running_finalize
+                            .as_ref()
+                            .is_some_and(|running| running.job_id == job.id)
+                        {
+                            *running_finalize = None;
+                        }
+                        let _ = result_tx.send(Some(
+                            RunningFinalizeResumeResult::AttemptFinishedBeforePrepared,
+                        ));
+                    } else {
+                        let _ = result_tx.send(Some(RunningFinalizeResumeResult::Failed(format!(
+                            "This session is still finalizing; wait for finalization to complete before resuming. ({err:#})"
+                        ))));
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -1427,6 +2199,81 @@ fn apply_job_attempt_failure(job: &mut SupervisorJob, message: String) {
     }
     job.updated_at = now;
     job.last_error = Some(message);
+}
+
+fn recover_stale_running_job(
+    original: &SupervisorJob,
+    session_status: SessionStatus,
+    retry_message: String,
+    exhausted_message: String,
+) -> SupervisorJob {
+    let mut recovered = original.clone();
+    let now = Utc::now();
+    match (&recovered.kind, session_status) {
+        (SupervisorJobKind::Finalize { .. }, SessionStatus::Closed | SessionStatus::Open)
+        | (SupervisorJobKind::Recap { .. }, SessionStatus::Finalizing | SessionStatus::Closed) => {
+            recovered.status = SupervisorJobStatus::Succeeded;
+            recovered.finished_at = Some(now);
+            recovered.last_error = None;
+        }
+        (SupervisorJobKind::Finalize { .. }, SessionStatus::Finalizing)
+        | (SupervisorJobKind::Recap { .. }, SessionStatus::Open) => {
+            if recovered.attempts >= DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS {
+                recovered.status = SupervisorJobStatus::Failed;
+                recovered.finished_at = Some(now);
+                recovered.last_error = Some(exhausted_message);
+            } else {
+                recovered.status = SupervisorJobStatus::Queued;
+                recovered.finished_at = None;
+                recovered.last_error = Some(retry_message);
+            }
+        }
+    }
+    recovered.updated_at = now;
+    recovered
+}
+
+async fn reconcile_running_job_after_runner_error(
+    paths: &SupervisorPaths,
+    job_id: &str,
+    error: &anyhow::Error,
+) -> anyhow::Result<bool> {
+    let jobs = read_jobs(paths).await?;
+    let job = jobs
+        .iter()
+        .find(|job| job.id == job_id)
+        .with_context(|| format!("runner error recovery job {job_id} disappeared"))?;
+    if job.status != SupervisorJobStatus::Running {
+        return Ok(job.status == SupervisorJobStatus::Queued);
+    }
+
+    let session_id = job_session_id_ref(job);
+    let session_status = read_yaml::<SessionMetadata>(
+        &SessionPaths::new(&paths.agent_home, session_id).session_yaml,
+    )
+    .await
+    .with_context(|| {
+        format!("读取 runner error job {job_id} 的 session {session_id} metadata 失败")
+    })?
+    .status;
+    let recovered = recover_stale_running_job(
+        job,
+        session_status,
+        format!("recovered running job after runner error: {error:#}"),
+        format!("running job exhausted supervisor retry budget after runner error: {error:#}"),
+    );
+    write_job(paths, &recovered).await?;
+    append_supervisor_log(
+        paths,
+        format!(
+            "job {} runner error state reconciled status={} attempts={}",
+            recovered.id,
+            recovered.status.as_str(),
+            recovered.attempts
+        ),
+    )
+    .await;
+    Ok(recovered.status == SupervisorJobStatus::Queued)
 }
 
 fn recap_report_was_subsumed_by_finalize(
@@ -1778,6 +2625,27 @@ async fn create_recovery_finalize_job(
     .await
 }
 
+async fn create_resume_recovery_finalize_job(
+    paths: &SupervisorPaths,
+    agent_id: &AgentId,
+    session_id: SessionId,
+    notify_on_completion: bool,
+) -> anyhow::Result<SupervisorJob> {
+    create_finalize_job_record(
+        paths,
+        agent_id,
+        session_id,
+        FinalizeJobInitialState {
+            notify_on_completion,
+            manual_retries: 0,
+            last_error: None,
+        },
+        next_job_id,
+        default_id_mint_max_attempts(),
+    )
+    .await
+}
+
 /// 原子申领 job ID 后写入初始记录，避免首次持久化覆盖同 ID 的既有 job。
 #[cfg(test)]
 async fn create_finalize_job_with_id_factory<F>(
@@ -1892,7 +2760,6 @@ async fn reconcile_stale_running_jobs(paths: &SupervisorPaths) -> anyhow::Result
                 )
             })?
             .status;
-        let now = Utc::now();
         let recap_subsumed = matches!(
             (&job.kind, &session_status),
             (
@@ -1900,40 +2767,14 @@ async fn reconcile_stale_running_jobs(paths: &SupervisorPaths) -> anyhow::Result
                 SessionStatus::Finalizing | SessionStatus::Closed
             )
         );
-        match (&job.kind, session_status) {
-            (SupervisorJobKind::Finalize { .. }, SessionStatus::Closed | SessionStatus::Open) => {
-                // finalize 先提交 session，再提交 job。若进程在两次原子写之间退出，或
-                // session 已经被 resume，旧 Running job 不能再次关闭新的会话周期。
-                job.status = SupervisorJobStatus::Succeeded;
-                job.finished_at = Some(now);
-                job.last_error = None;
-            }
-            (SupervisorJobKind::Finalize { .. }, SessionStatus::Finalizing)
-            | (SupervisorJobKind::Recap { .. }, SessionStatus::Open) => {
-                if job.attempts >= DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS {
-                    job.status = SupervisorJobStatus::Failed;
-                    job.finished_at = Some(now);
-                    job.last_error = Some(
-                        "stale running job exhausted supervisor retry budget before recovery"
-                            .into(),
-                    );
-                } else {
-                    job.status = SupervisorJobStatus::Queued;
-                    job.finished_at = None;
-                    job.last_error =
-                        Some("recovered stale running job after supervisor start".into());
-                }
-            }
-            (
-                SupervisorJobKind::Recap { .. },
-                SessionStatus::Finalizing | SessionStatus::Closed,
-            ) => {
-                job.status = SupervisorJobStatus::Succeeded;
-                job.finished_at = Some(now);
-                job.last_error = None;
-            }
-        }
-        job.updated_at = now;
+        // finalize 先提交 session，再提交 job。若进程在两次原子写之间退出，或
+        // session 已经被 resume，旧 Running job 不能再次关闭新的会话周期。
+        *job = recover_stale_running_job(
+            job,
+            session_status,
+            "recovered stale running job after supervisor start".into(),
+            "stale running job exhausted supervisor retry budget before recovery".into(),
+        );
         write_job(paths, job).await?;
         if recap_subsumed {
             append_supervisor_log(
@@ -2976,6 +3817,41 @@ mod tests {
         )
     }
 
+    fn test_shared_state(agent_id: AgentId) -> SupervisorSharedState {
+        let (notify_tx, _notify_rx) = mpsc::unbounded_channel();
+        SupervisorSharedState {
+            agent_id,
+            notify_tx,
+            stop_requested: CancellationToken::new(),
+            last_activity: Arc::new(AtomicU64::new(now_millis())),
+            started_at: Utc::now(),
+            runtime_fingerprint: test_runtime_fingerprint("current"),
+            stopping: Arc::new(AtomicBool::new(false)),
+            lifecycle_gate: Arc::new(Mutex::new(())),
+            running_recap: Arc::new(Mutex::new(None)),
+            running_finalize: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn test_finalize_checkpoint(
+        recap_start_index: usize,
+        recap_end_index: usize,
+        status: FinalizeCheckpointStatus,
+    ) -> FinalizeCheckpoint {
+        FinalizeCheckpoint {
+            recap_start_index,
+            recap_end_index,
+            recap_segment_hash: "test-segment-hash".into(),
+            prepared_claims: Vec::new(),
+            prepared_disputes: Vec::new(),
+            used_claim_ids: Vec::new(),
+            trace_text: "test checkpoint".into(),
+            trace_created_at: Utc::now(),
+            trace_id: None,
+            status,
+        }
+    }
+
     #[test]
     fn runtime_fingerprint_covers_config_upstream_and_credentials() {
         let baseline = runtime_fingerprint_from_parts(
@@ -3147,6 +4023,717 @@ mod tests {
         Ok(())
     }
 
+    async fn set_test_session_message_count(
+        paths: &SupervisorPaths,
+        session_id: &SessionId,
+        message_count: usize,
+        recapped_until: usize,
+    ) -> anyhow::Result<()> {
+        let session_paths = SessionPaths::new(&paths.agent_home, session_id);
+        let mut metadata = read_yaml::<SessionMetadata>(&session_paths.session_yaml).await?;
+        metadata.message_count = message_count;
+        metadata.recapped_until = recapped_until;
+        write_yaml_atomic(&session_paths.session_yaml, &metadata).await?;
+        Ok(())
+    }
+
+    #[test]
+    fn resume_conversion_preserves_identity_and_resets_finalize_execution_fields() {
+        let now = Utc::now();
+        let original = SupervisorJob {
+            id: "job_original".into(),
+            agent_id: Some(AgentId::new("agent-a").unwrap()),
+            kind: SupervisorJobKind::Finalize {
+                session_id: "session_1234abcd".parse().unwrap(),
+            },
+            status: SupervisorJobStatus::Failed,
+            attempts: 5,
+            manual_retries: 2,
+            created_at: now,
+            updated_at: now,
+            started_at: Some(now),
+            finished_at: Some(now),
+            last_error: Some("failed".into()),
+            notify_on_completion: true,
+        };
+        let converted =
+            converted_recap_job(&original, &"session_1234abcd".parse().unwrap(), 17, now);
+
+        assert_eq!(converted.id, original.id);
+        assert_eq!(converted.agent_id, original.agent_id);
+        assert_eq!(converted.created_at, original.created_at);
+        assert!(matches!(
+            converted.kind,
+            SupervisorJobKind::Recap {
+                recap_end_index: 17,
+                ..
+            }
+        ));
+        assert_eq!(converted.status, SupervisorJobStatus::Queued);
+        assert_eq!(converted.attempts, 0);
+        assert_eq!(converted.manual_retries, 0);
+        assert_eq!(converted.started_at, None);
+        assert_eq!(converted.finished_at, None);
+        assert_eq!(converted.last_error, None);
+        assert!(!converted.notify_on_completion);
+    }
+
+    #[tokio::test]
+    async fn queued_finalize_resume_converts_same_job_and_opens_session() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id: SessionId = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        set_test_session_message_count(&paths, &session_id, 7, 2).await?;
+        let mut job = create_finalize_job(&paths, &agent_id, session_id.clone(), true).await?;
+        job.attempts = 3;
+        job.manual_retries = 1;
+        write_job(&paths, &job).await?;
+        let shared = test_shared_state(agent_id.clone());
+
+        let outcome = resume_finalizing_takeover(&paths, &shared, session_id.clone(), true).await?;
+
+        assert_eq!(
+            outcome,
+            FinalizingResumeTakeover::Opened {
+                job_id: Some(job.id.clone())
+            }
+        );
+        let jobs = read_jobs(&paths).await?;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, job.id);
+        assert!(matches!(
+            jobs[0].kind,
+            SupervisorJobKind::Recap {
+                recap_end_index: 7,
+                ..
+            }
+        ));
+        assert_eq!(jobs[0].attempts, 0);
+        assert!(!jobs[0].notify_on_completion);
+        let metadata = read_yaml::<SessionMetadata>(
+            &SessionPaths::new(&paths.agent_home, &session_id).session_yaml,
+        )
+        .await?;
+        assert_eq!(metadata.status, SessionStatus::Open);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_keeps_finalize_job_and_session_when_checkpoint_already_exists(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id: SessionId = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        set_test_session_message_count(&paths, &session_id, 7, 2).await?;
+        let job = create_finalize_job(&paths, &agent_id, session_id.clone(), true).await?;
+        let session_paths = SessionPaths::new(&paths.agent_home, &session_id);
+        write_yaml_atomic(
+            &session_paths.finalize_checkpoint_yaml,
+            &test_finalize_checkpoint(2, 7, FinalizeCheckpointStatus::Prepared),
+        )
+        .await?;
+        let shared = test_shared_state(agent_id);
+
+        let outcome = resume_finalizing_takeover(&paths, &shared, session_id.clone(), true).await?;
+
+        assert_eq!(
+            outcome,
+            FinalizingResumeTakeover::WaitForFinalize {
+                job_id: Some(job.id.clone())
+            }
+        );
+        assert_eq!(read_jobs(&paths).await?, vec![job]);
+        let metadata = read_yaml::<SessionMetadata>(&session_paths.session_yaml).await?;
+        assert_eq!(metadata.status, SessionStatus::Finalizing);
+        assert!(path_exists(&session_paths.finalize_checkpoint_yaml).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_requeues_unregistered_running_finalize_with_checkpoint_before_waiting(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id: SessionId = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        set_test_session_message_count(&paths, &session_id, 7, 2).await?;
+        let mut job = create_finalize_job(&paths, &agent_id, session_id.clone(), true).await?;
+        job.status = SupervisorJobStatus::Running;
+        job.attempts = 2;
+        job.started_at = Some(Utc::now());
+        write_job(&paths, &job).await?;
+        let session_paths = SessionPaths::new(&paths.agent_home, &session_id);
+        write_yaml_atomic(
+            &session_paths.finalize_checkpoint_yaml,
+            &test_finalize_checkpoint(2, 7, FinalizeCheckpointStatus::Prepared),
+        )
+        .await?;
+        let shared = test_shared_state(agent_id);
+
+        let outcome = resume_finalizing_takeover(&paths, &shared, session_id, true).await?;
+
+        assert_eq!(
+            outcome,
+            FinalizingResumeTakeover::WaitForFinalize {
+                job_id: Some(job.id.clone())
+            }
+        );
+        let recovered = read_jobs(&paths).await?.pop().unwrap();
+        assert_eq!(recovered.id, job.id);
+        assert_eq!(recovered.status, SupervisorJobStatus::Queued);
+        assert_eq!(recovered.attempts, 2);
+        assert!(recovered
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("unregistered running finalize")));
+        assert!(path_exists(&session_paths.finalize_checkpoint_yaml).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_finalize_with_checkpoint_is_reset_for_one_resume_recovery_round(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id: SessionId = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        let mut job = create_finalize_job(&paths, &agent_id, session_id.clone(), true).await?;
+        job.status = SupervisorJobStatus::Failed;
+        job.attempts = DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS;
+        job.manual_retries = 3;
+        job.finished_at = Some(Utc::now());
+        job.last_error = Some("checkpoint upload failed".into());
+        write_job(&paths, &job).await?;
+        let session_paths = SessionPaths::new(&paths.agent_home, &session_id);
+        write_yaml_atomic(
+            &session_paths.finalize_checkpoint_yaml,
+            &test_finalize_checkpoint(0, 0, FinalizeCheckpointStatus::Applied),
+        )
+        .await?;
+        let shared = test_shared_state(agent_id);
+
+        let outcome = resume_finalizing_takeover(&paths, &shared, session_id, true).await?;
+
+        assert_eq!(
+            outcome,
+            FinalizingResumeTakeover::WaitForFinalize {
+                job_id: Some(job.id.clone())
+            }
+        );
+        let recovered = read_jobs(&paths).await?.pop().unwrap();
+        assert_eq!(recovered.id, job.id);
+        assert_eq!(recovered.status, SupervisorJobStatus::Queued);
+        assert_eq!(recovered.attempts, 0);
+        assert_eq!(recovered.manual_retries, 3);
+        assert!(recovered.notify_on_completion);
+        assert_eq!(recovered.started_at, None);
+        assert_eq!(recovered.finished_at, None);
+        assert_eq!(recovered.last_error, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn consumed_applied_recap_checkpoint_does_not_block_finalize_conversion(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id: SessionId = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        set_test_session_message_count(&paths, &session_id, 4, 2).await?;
+        let mut job = create_finalize_job(&paths, &agent_id, session_id.clone(), true).await?;
+        job.status = SupervisorJobStatus::Failed;
+        job.attempts = DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS;
+        job.finished_at = Some(Utc::now());
+        job.last_error = Some("previous finalize failed".into());
+        write_job(&paths, &job).await?;
+        let session_paths = SessionPaths::new(&paths.agent_home, &session_id);
+        write_yaml_atomic(
+            &session_paths.finalize_checkpoint_yaml,
+            &test_finalize_checkpoint(0, 2, FinalizeCheckpointStatus::Applied),
+        )
+        .await?;
+        let shared = test_shared_state(agent_id);
+
+        let outcome = resume_finalizing_takeover(&paths, &shared, session_id.clone(), true).await?;
+
+        assert_eq!(
+            outcome,
+            FinalizingResumeTakeover::Opened {
+                job_id: Some(job.id.clone())
+            }
+        );
+        let converted = read_jobs(&paths).await?.pop().unwrap();
+        assert_eq!(converted.id, job.id);
+        assert!(matches!(
+            converted.kind,
+            SupervisorJobKind::Recap {
+                recap_end_index: 4,
+                ..
+            }
+        ));
+        let metadata = read_yaml::<SessionMetadata>(&session_paths.session_yaml).await?;
+        assert_eq!(metadata.status, SessionStatus::Open);
+        assert!(path_exists(&session_paths.finalize_checkpoint_yaml).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_checkpoint_wait_fails_when_supervisor_disappears() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id: SessionId = "session_1234abce".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        let job = create_finalize_job(&paths, &agent_id, session_id.clone(), true).await?;
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            wait_for_resume_finalize_job(&paths, &session_id, &job.id),
+        )
+        .await
+        .context("resume wait did not notice the stopped supervisor")?
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "This session is still finalizing; wait for finalization to complete before resuming."
+        );
+        let stored = read_jobs(&paths).await?.pop().unwrap();
+        assert_eq!(stored.id, job.id);
+        assert_eq!(stored.status, SupervisorJobStatus::Queued);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_reports_foreground_finalize_as_wait_without_job() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id: SessionId = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        let session_paths = SessionPaths::new(&paths.agent_home, &session_id);
+        let _finalize_guard = FileLockGuard::lock_exclusive(&session_paths.finalize_lock).await?;
+        let shared = test_shared_state(agent_id);
+
+        let outcome = resume_finalizing_takeover(&paths, &shared, session_id.clone(), true).await?;
+
+        assert_eq!(
+            outcome,
+            FinalizingResumeTakeover::WaitForFinalize { job_id: None }
+        );
+        assert!(read_jobs(&paths).await?.is_empty());
+        let metadata = read_yaml::<SessionMetadata>(&session_paths.session_yaml).await?;
+        assert_eq!(metadata.status, SessionStatus::Finalizing);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn orphan_checkpoint_resume_creates_finalize_recovery_job() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id: SessionId = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        let session_paths = SessionPaths::new(&paths.agent_home, &session_id);
+        write_yaml_atomic(
+            &session_paths.finalize_checkpoint_yaml,
+            &test_finalize_checkpoint(0, 0, FinalizeCheckpointStatus::Prepared),
+        )
+        .await?;
+        let shared = test_shared_state(agent_id);
+
+        let outcome = resume_finalizing_takeover(&paths, &shared, session_id.clone(), true).await?;
+
+        let FinalizingResumeTakeover::WaitForFinalize {
+            job_id: Some(job_id),
+        } = outcome
+        else {
+            anyhow::bail!("unexpected takeover outcome: {outcome:?}");
+        };
+        let job = read_jobs(&paths).await?.pop().unwrap();
+        assert_eq!(job.id, job_id);
+        assert!(matches!(
+            job.kind,
+            SupervisorJobKind::Finalize {
+                session_id: ref stored_session_id
+            } if stored_session_id == &session_id
+        ));
+        assert_eq!(job.status, SupervisorJobStatus::Queued);
+        assert_eq!(job.attempts, 0);
+        assert_eq!(job.manual_retries, 0);
+        assert!(job.notify_on_completion);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn orphan_without_checkpoint_opens_and_only_enqueues_real_recap_backlog(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let with_backlog: SessionId = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &with_backlog, SessionStatus::Finalizing).await?;
+        set_test_session_message_count(&paths, &with_backlog, 6, 2).await?;
+        let with_backlog_paths = SessionPaths::new(&paths.agent_home, &with_backlog);
+        let mut metadata = read_yaml::<SessionMetadata>(&with_backlog_paths.session_yaml).await?;
+        metadata.recap_background_completion_until_seq = Some(11);
+        write_yaml_atomic(&with_backlog_paths.session_yaml, &metadata).await?;
+        let shared = test_shared_state(agent_id.clone());
+
+        let outcome =
+            resume_finalizing_takeover(&paths, &shared, with_backlog.clone(), false).await?;
+
+        let FinalizingResumeTakeover::Opened {
+            job_id: Some(recap_job_id),
+        } = outcome
+        else {
+            anyhow::bail!("unexpected takeover outcome: {outcome:?}");
+        };
+        let jobs = read_jobs(&paths).await?;
+        let recap_job = jobs.iter().find(|job| job.id == recap_job_id).unwrap();
+        assert!(matches!(
+            recap_job.kind,
+            SupervisorJobKind::Recap {
+                recap_end_index: 6,
+                ..
+            }
+        ));
+        assert!(!recap_job.notify_on_completion);
+        let metadata = read_yaml::<SessionMetadata>(&with_backlog_paths.session_yaml).await?;
+        assert_eq!(metadata.status, SessionStatus::Open);
+        assert_eq!(metadata.recap_background_completion_until_seq, Some(11));
+
+        let without_backlog: SessionId = "session_8765dcba".parse()?;
+        write_test_session(
+            &paths,
+            &agent_id,
+            &without_backlog,
+            SessionStatus::Finalizing,
+        )
+        .await?;
+        set_test_session_message_count(&paths, &without_backlog, 4, 4).await?;
+        let outcome =
+            resume_finalizing_takeover(&paths, &shared, without_backlog.clone(), false).await?;
+        assert_eq!(outcome, FinalizingResumeTakeover::Opened { job_id: None });
+        assert_eq!(read_jobs(&paths).await?.len(), 1);
+        let metadata = read_yaml::<SessionMetadata>(
+            &SessionPaths::new(&paths.agent_home, &without_backlog).session_yaml,
+        )
+        .await?;
+        assert_eq!(metadata.status, SessionStatus::Open);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn running_resume_conversion_failure_preserves_same_finalize_attempt_for_requeue(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id: SessionId = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Open).await?;
+        let mut job = create_finalize_job(&paths, &agent_id, session_id.clone(), true).await?;
+        job.status = SupervisorJobStatus::Running;
+        job.attempts = 2;
+        job.started_at = Some(Utc::now());
+        write_job(&paths, &job).await?;
+
+        let error = convert_finalize_job_and_open(&paths, &agent_id, &job, 0)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("not closed") || error.to_string().contains("Open"));
+        let mut stored = read_jobs(&paths).await?.pop().unwrap();
+        assert_eq!(stored, job);
+        apply_job_attempt_failure(&mut stored, "original finalize failed".into());
+        assert_eq!(stored.attempts, 2);
+        assert_eq!(stored.status, SupervisorJobStatus::Queued);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_conversion_atomic_write_failure_keeps_finalize_bytes_and_session_state(
+    ) -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id: SessionId = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        let mut job = create_finalize_job(&paths, &agent_id, session_id.clone(), true).await?;
+        job.attempts = 2;
+        write_job(&paths, &job).await?;
+        let stored_path = job_path(&paths, &job.id);
+        let original_bytes = fs::read(&stored_path).await?;
+        let original_permissions = fs::metadata(&paths.jobs_dir).await?.permissions();
+        fs::set_permissions(&paths.jobs_dir, std::fs::Permissions::from_mode(0o500)).await?;
+
+        let result = convert_finalize_job_and_open(&paths, &agent_id, &job, 0).await;
+
+        fs::set_permissions(&paths.jobs_dir, original_permissions).await?;
+        assert!(result.is_err());
+        assert_eq!(fs::read(&stored_path).await?, original_bytes);
+        assert_eq!(read_jobs(&paths).await?, vec![job]);
+        let metadata = read_yaml::<SessionMetadata>(
+            &SessionPaths::new(&paths.agent_home, &session_id).session_yaml,
+        )
+        .await?;
+        assert_eq!(metadata.status, SessionStatus::Finalizing);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn closed_resume_reconciles_old_finalize_before_next_finalize_cycle() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id: SessionId = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Closed).await?;
+        let mut old_job = create_finalize_job(&paths, &agent_id, session_id.clone(), true).await?;
+        old_job.status = SupervisorJobStatus::Running;
+        old_job.attempts = 1;
+        old_job.started_at = Some(Utc::now());
+        write_job(&paths, &old_job).await?;
+        let shared = test_shared_state(agent_id.clone());
+
+        let outcome = resume_finalizing_takeover(&paths, &shared, session_id.clone(), true).await?;
+
+        assert_eq!(
+            outcome,
+            FinalizingResumeTakeover::ReopenClosed {
+                job_id: Some(old_job.id.clone())
+            }
+        );
+        let reconciled = read_jobs(&paths).await?.pop().unwrap();
+        assert_eq!(reconciled.status, SupervisorJobStatus::Succeeded);
+        assert_eq!(reconciled.last_error, None);
+
+        let session_paths = SessionPaths::new(&paths.agent_home, &session_id);
+        let metadata = read_yaml::<SessionMetadata>(&session_paths.session_yaml).await?;
+        let mut session = SessionHandle::new(metadata, session_paths);
+        session.mark_open(Utc::now()).await?;
+        session.mark_finalizing(Utc::now()).await?;
+        let next_job = enqueue_finalize_job(&paths, &agent_id, session_id, true).await?;
+        assert_ne!(next_job.id, old_job.id);
+        assert_eq!(next_job.status, SupervisorJobStatus::Queued);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn running_finalize_resume_is_converted_only_by_registered_worker() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id: SessionId = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        set_test_session_message_count(&paths, &session_id, 9, 1).await?;
+        let mut job = create_finalize_job(&paths, &agent_id, session_id.clone(), true).await?;
+        job.status = SupervisorJobStatus::Running;
+        job.attempts = 1;
+        write_job(&paths, &job).await?;
+
+        let shared = test_shared_state(agent_id.clone());
+        let preemption = Arc::new(SessionFinalizePreemptionControl::new());
+        let resume_target = Arc::new(Mutex::new(None));
+        let (result_tx, _result_rx) = watch::channel(None);
+        *shared.running_finalize.lock().await = Some(RunningFinalize {
+            job_id: job.id.clone(),
+            session_id: session_id.clone(),
+            preemption: Arc::clone(&preemption),
+            resume_target: Arc::clone(&resume_target),
+            resume_result_tx: result_tx.clone(),
+        });
+
+        let takeover_paths = paths.clone();
+        let takeover_shared = shared.clone();
+        let takeover_session_id = session_id.clone();
+        let takeover = tokio::spawn(async move {
+            resume_finalizing_takeover(&takeover_paths, &takeover_shared, takeover_session_id, true)
+                .await
+        });
+        while !preemption.was_preempted_before_prepared().await {
+            tokio::task::yield_now().await;
+        }
+        let _guard = shared.lifecycle_gate.lock().await;
+        let target = resume_target.lock().await.unwrap();
+        convert_finalize_job_and_open(&paths, &agent_id, &job, target).await?;
+        let _ = result_tx.send(Some(RunningFinalizeResumeResult::Opened));
+        drop(_guard);
+
+        assert_eq!(
+            takeover.await??,
+            FinalizingResumeTakeover::Opened {
+                job_id: Some(job.id.clone())
+            }
+        );
+        let stored = read_jobs(&paths).await?.pop().unwrap();
+        assert_eq!(stored.id, job.id);
+        assert!(matches!(stored.kind, SupervisorJobKind::Recap { .. }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn running_finalize_failure_before_prepared_is_rechecked_and_converted(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id: SessionId = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        set_test_session_message_count(&paths, &session_id, 9, 1).await?;
+        let mut job = create_finalize_job(&paths, &agent_id, session_id.clone(), true).await?;
+        job.status = SupervisorJobStatus::Running;
+        job.attempts = DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS;
+        job.started_at = Some(Utc::now());
+        write_job(&paths, &job).await?;
+
+        let shared = test_shared_state(agent_id);
+        let preemption = Arc::new(SessionFinalizePreemptionControl::new());
+        assert!(!preemption.finish().await);
+        assert!(preemption.finished_before_prepared().await);
+        let resume_target = Arc::new(Mutex::new(None));
+        let (result_tx, _result_rx) = watch::channel(None);
+        *shared.running_finalize.lock().await = Some(RunningFinalize {
+            job_id: job.id.clone(),
+            session_id: session_id.clone(),
+            preemption,
+            resume_target: Arc::clone(&resume_target),
+            resume_result_tx: result_tx.clone(),
+        });
+
+        let takeover_paths = paths.clone();
+        let takeover_shared = shared.clone();
+        let takeover_session_id = session_id.clone();
+        let takeover = tokio::spawn(async move {
+            resume_finalizing_takeover(&takeover_paths, &takeover_shared, takeover_session_id, true)
+                .await
+        });
+        while resume_target.lock().await.is_none() {
+            tokio::task::yield_now().await;
+        }
+
+        let _guard = shared.lifecycle_gate.lock().await;
+        let mut failed = job.clone();
+        apply_job_attempt_failure(&mut failed, "provider failed before Prepared".into());
+        write_job(&paths, &failed).await?;
+        *shared.running_finalize.lock().await = None;
+        let _ = result_tx.send(Some(
+            RunningFinalizeResumeResult::AttemptFinishedBeforePrepared,
+        ));
+        drop(_guard);
+
+        assert_eq!(
+            takeover.await??,
+            FinalizingResumeTakeover::Opened {
+                job_id: Some(job.id.clone())
+            }
+        );
+        let stored = read_jobs(&paths).await?.pop().unwrap();
+        assert_eq!(stored.id, job.id);
+        assert!(matches!(
+            stored.kind,
+            SupervisorJobKind::Recap {
+                recap_end_index: 9,
+                ..
+            }
+        ));
+        assert_eq!(stored.status, SupervisorJobStatus::Queued);
+        assert_eq!(stored.attempts, 0);
+        assert!(!stored.notify_on_completion);
+        let metadata = read_yaml::<SessionMetadata>(
+            &SessionPaths::new(&paths.agent_home, &session_id).session_yaml,
+        )
+        .await?;
+        assert_eq!(metadata.status, SessionStatus::Open);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_recovers_unregistered_running_finalize_instead_of_waiting_forever(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id: SessionId = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        set_test_session_message_count(&paths, &session_id, 9, 1).await?;
+        let mut job = create_finalize_job(&paths, &agent_id, session_id.clone(), true).await?;
+        job.status = SupervisorJobStatus::Running;
+        job.attempts = 2;
+        job.started_at = Some(Utc::now());
+        write_job(&paths, &job).await?;
+        let shared = test_shared_state(agent_id);
+
+        let outcome = resume_finalizing_takeover(&paths, &shared, session_id.clone(), true).await?;
+
+        assert_eq!(
+            outcome,
+            FinalizingResumeTakeover::Opened {
+                job_id: Some(job.id.clone())
+            }
+        );
+        let stored = read_jobs(&paths).await?.pop().unwrap();
+        assert_eq!(stored.id, job.id);
+        assert!(matches!(
+            stored.kind,
+            SupervisorJobKind::Recap {
+                recap_end_index: 9,
+                ..
+            }
+        ));
+        assert_eq!(stored.status, SupervisorJobStatus::Queued);
+        assert_eq!(stored.attempts, 0);
+        let metadata = read_yaml::<SessionMetadata>(
+            &SessionPaths::new(&paths.agent_home, &session_id).session_yaml,
+        )
+        .await?;
+        assert_eq!(metadata.status, SessionStatus::Open);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_error_reconciles_persisted_running_job_without_refunding_attempt(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id: SessionId = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        let mut job = create_finalize_job(&paths, &agent_id, session_id, true).await?;
+        job.status = SupervisorJobStatus::Running;
+        job.attempts = 2;
+        job.started_at = Some(Utc::now());
+        write_job(&paths, &job).await?;
+
+        let requeued = reconcile_running_job_after_runner_error(
+            &paths,
+            &job.id,
+            &anyhow::anyhow!("terminal job write failed"),
+        )
+        .await?;
+
+        assert!(requeued);
+        let stored = read_jobs(&paths).await?.pop().unwrap();
+        assert_eq!(stored.status, SupervisorJobStatus::Queued);
+        assert_eq!(stored.attempts, 2);
+        assert!(stored
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("terminal job write failed")));
+        Ok(())
+    }
+
     #[test]
     fn applescript_string_escapes_quotes_and_backslashes() {
         assert_eq!(applescript_string(r#"a "b" \ c"#), r#""a \"b\" \\ c""#);
@@ -3295,6 +4882,79 @@ mod tests {
                 request
             );
         }
+    }
+
+    #[tokio::test]
+    async fn resume_mutation_waits_past_the_generic_ipc_deadline_for_authoritative_response(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        remove_stale_socket(&paths.socket_path).await;
+        let listener = UnixListener::bind(&paths.socket_path)?;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let (read_half, mut write_half) = stream.into_split();
+            let line = BufReader::new(read_half)
+                .lines()
+                .next_line()
+                .await?
+                .context("missing resume request")?;
+            assert!(matches!(
+                serde_json::from_str::<SupervisorRequest>(&line)?,
+                SupervisorRequest::ResumeFinalizing { .. }
+            ));
+            sleep(Duration::from_millis(
+                DEFAULT_SUPERVISOR_IPC_TIMEOUT_MS + 200,
+            ))
+            .await;
+            let response = SupervisorResponse::ResumeTakeover {
+                outcome: FinalizingResumeTakeover::Opened {
+                    job_id: Some("job_delayed".into()),
+                },
+            };
+            let mut bytes = serde_json::to_vec(&response)?;
+            bytes.push(b'\n');
+            write_half.write_all(&bytes).await?;
+            anyhow::Ok(())
+        });
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(DEFAULT_SUPERVISOR_IPC_TIMEOUT_MS + 2_000),
+            send_request_inner(
+                &paths,
+                SupervisorRequest::ResumeFinalizing {
+                    session_id: "session_1234abcd".parse()?,
+                    notify_on_completion: true,
+                },
+            ),
+        )
+        .await
+        .context("resume mutation did not return its authoritative response")??;
+
+        assert_eq!(
+            response,
+            SupervisorResponse::ResumeTakeover {
+                outcome: FinalizingResumeTakeover::Opened {
+                    job_id: Some("job_delayed".into())
+                }
+            }
+        );
+        server.await??;
+        remove_stale_socket(&paths.socket_path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn closed_resume_reconciliation_allows_unavailable_supervisor() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = test_launch_config(
+            dir.path().to_path_buf(),
+            test_runtime_fingerprint("closed-resume"),
+        );
+
+        reconcile_closed_session_for_resume(&config, "session_1234abcd".parse()?).await?;
+
+        Ok(())
     }
 
     #[test]
@@ -3481,6 +5141,54 @@ mod tests {
             status.runtime_state,
             SupervisorRuntimeState::Stuck { .. }
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn running_finalize_resume_returns_if_worker_registration_disappears(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = SupervisorPaths::new(dir.path());
+        let agent_id = AgentId::new("agent-a")?;
+        let session_id: SessionId = "session_1234abcd".parse()?;
+        write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
+        set_test_session_message_count(&paths, &session_id, 9, 1).await?;
+        let mut job = create_finalize_job(&paths, &agent_id, session_id.clone(), true).await?;
+        job.status = SupervisorJobStatus::Running;
+        job.attempts = 1;
+        write_job(&paths, &job).await?;
+
+        let shared = test_shared_state(agent_id);
+        let preemption = Arc::new(SessionFinalizePreemptionControl::new());
+        let resume_target = Arc::new(Mutex::new(None));
+        let (result_tx, _result_rx) = watch::channel(None);
+        *shared.running_finalize.lock().await = Some(RunningFinalize {
+            job_id: job.id,
+            session_id: session_id.clone(),
+            preemption: Arc::clone(&preemption),
+            resume_target,
+            resume_result_tx: result_tx.clone(),
+        });
+
+        let takeover_paths = paths.clone();
+        let takeover_shared = shared.clone();
+        let takeover = tokio::spawn(async move {
+            resume_finalizing_takeover(&takeover_paths, &takeover_shared, session_id, true).await
+        });
+        while !preemption.was_preempted_before_prepared().await {
+            tokio::task::yield_now().await;
+        }
+        *shared.running_finalize.lock().await = None;
+        drop(result_tx);
+
+        let joined = tokio::time::timeout(Duration::from_secs(1), takeover)
+            .await
+            .context("Resume remained blocked after the Finalize worker disappeared")?;
+        let result = joined?;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("running finalize ended without a resume takeover result"));
         Ok(())
     }
 
@@ -3951,6 +5659,7 @@ mod tests {
             stopping: Arc::new(AtomicBool::new(true)),
             lifecycle_gate: Arc::new(Mutex::new(())),
             running_recap: Arc::new(Mutex::new(None)),
+            running_finalize: Arc::new(Mutex::new(None)),
         };
         let (client, server) = UnixStream::pair()?;
 
@@ -4004,6 +5713,7 @@ mod tests {
             stopping: Arc::new(AtomicBool::new(false)),
             lifecycle_gate: Arc::new(Mutex::new(())),
             running_recap: Arc::new(Mutex::new(None)),
+            running_finalize: Arc::new(Mutex::new(None)),
         };
         let running_job = Arc::new(AtomicBool::new(false));
         let enqueue_guard = shared.lifecycle_gate.lock().await;
@@ -4098,6 +5808,7 @@ mod tests {
                 session_id: recap_session.clone(),
                 preemption: Arc::clone(&preemption),
             }))),
+            running_finalize: Arc::new(Mutex::new(None)),
         };
 
         let other_finalize = queued_finalize_job("job_finalize_b", other_session);

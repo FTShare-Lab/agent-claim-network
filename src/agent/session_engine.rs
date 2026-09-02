@@ -78,7 +78,9 @@ mod turn_control;
 mod turn_journal;
 
 pub use events::{SessionEvent, SessionRuntimeStatus};
-pub(crate) use finalize::SessionRecapPreemptionControl;
+pub(crate) use finalize::{
+    SessionFinalizeOnceOutcome, SessionFinalizePreemptionControl, SessionRecapPreemptionControl,
+};
 pub use turn_control::{SessionTurnControl, SessionTurnControlReceiver};
 
 use compaction_assets::externalize_heavy_user_blocks;
@@ -2797,6 +2799,16 @@ impl SessionEngine {
             .await?)
     }
 
+    pub async fn resume_target_status(
+        &self,
+        session_id: &SessionId,
+    ) -> anyhow::Result<SessionStatus> {
+        Ok(self
+            .session_store
+            .read_existing_session_status(&self.agent.agent_id, session_id)
+            .await?)
+    }
+
     pub async fn reopen_existing_session(
         &self,
         session_id: &SessionId,
@@ -2807,18 +2819,76 @@ impl SessionEngine {
             .session_store
             .resume_runtime_session(&self.agent.agent_id, session_id)
             .await?;
-        self.abandon_session_delegations_best_effort(
-            &resumed.session,
-            "session restored after runtime exit",
-        )
-        .await;
+        if resumed.kind != SessionResumeKind::Finalizing {
+            self.abandon_session_delegations_best_effort(
+                &resumed.session,
+                "session restored after runtime exit",
+            )
+            .await;
+        }
         let event = match resumed.kind {
             SessionResumeKind::Closed => "Session resumed",
             SessionResumeKind::Interrupted => "Interrupted session resumed",
+            SessionResumeKind::Finalizing => "Finalizing session reserved for resume",
         };
         self.append_session_event_log(&resumed.session, "INFO", event)
             .await;
         Ok(resumed)
+    }
+
+    /// TUI Resume 先取得 runtime lease，但让 Closed session 保持 Closed，
+    /// 直到 Supervisor 已把上一轮未成功 Finalize job 对账完成。
+    pub async fn reserve_existing_session(
+        &self,
+        session_id: &SessionId,
+    ) -> anyhow::Result<ResumedRuntimeSession> {
+        self.turn_loop.clear_file_read_state(session_id).await;
+        let resumed = self
+            .session_store
+            .reserve_runtime_session(&self.agent.agent_id, session_id)
+            .await?;
+        if resumed.kind == SessionResumeKind::Interrupted {
+            self.abandon_session_delegations_best_effort(
+                &resumed.session,
+                "session restored after runtime exit",
+            )
+            .await;
+            self.append_session_event_log(&resumed.session, "INFO", "Interrupted session resumed")
+                .await;
+        }
+        Ok(resumed)
+    }
+
+    /// Supervisor 已完成 Closed 对账后，提交 reopen 并恢复普通 Resume 清理语义。
+    pub async fn complete_closed_resume(
+        &self,
+        mut session: SessionHandle,
+    ) -> anyhow::Result<SessionHandle> {
+        session.mark_open(Utc::now()).await?;
+        self.abandon_session_delegations_best_effort(
+            &session,
+            "session restored after runtime exit",
+        )
+        .await;
+        self.append_session_event_log(&session, "INFO", "Session resumed")
+            .await;
+        Ok(session)
+    }
+
+    /// Finalizing takeover 成功并提交 Open 后，才完成既有 Resume hydration 与 delegation 清理。
+    pub async fn complete_finalizing_resume(
+        &self,
+        session_id: &SessionId,
+    ) -> anyhow::Result<SessionHandle> {
+        let session = self.load_existing_session(session_id).await?;
+        self.abandon_session_delegations_best_effort(
+            &session,
+            "session restored after finalizing takeover",
+        )
+        .await;
+        self.append_session_event_log(&session, "INFO", "Finalizing session resumed")
+            .await;
+        Ok(session)
     }
 
     /// resume 时刷新 inbox；单人模式只处理本地 pending，不发起团队网络请求。
@@ -6070,6 +6140,7 @@ fn first_text_session_content(blocks: &[SessionContentBlock]) -> Option<&str> {
         SessionContentBlock::Image { .. }
         | SessionContentBlock::Document { .. }
         | SessionContentBlock::ToolUse { .. }
+        | SessionContentBlock::InvalidToolUse { .. }
         | SessionContentBlock::ToolResult { .. } => None,
     })
 }

@@ -2625,7 +2625,9 @@ fn resume_reset_drops_temporary_command_echo_before_restored_history() {
 fn resume_inbox_failure_warning_has_blank_line_on_both_sides() {
     let mut state = super::TuiState::new();
     state.push_system("history tail");
-    state.finish_resume_inbox_with_warning("Warning: Inbox sync failed; run /inbox to retry.");
+    state.finish_resume_inbox_with_warnings(vec![
+        "Warning: Inbox sync failed; run /inbox to retry.".into(),
+    ]);
     state.push_system("next entry");
 
     let transcript = state.transcript_text();
@@ -2638,6 +2640,40 @@ fn resume_inbox_failure_warning_has_blank_line_on_both_sides() {
     assert!(lines
         .get(warning_index.saturating_add(1))
         .is_some_and(|line| line.trim().is_empty()));
+    assert_eq!(state.status, SessionRuntimeStatus::Open);
+}
+
+#[test]
+fn direct_resume_startup_warning_follows_inbox_and_precedes_queued_input() {
+    let mut state = super::TuiState::new();
+    state.push_system("Inbox completed: processed=0");
+    state.finish_resume_inbox_with_warnings(vec![
+        "Warning: MCP server broken-startup failed: connection closed".into(),
+    ]);
+    state.push_command_echo("QUEUED-DIRECT-731".into());
+
+    let lines = state
+        .transcript_text()
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let inbox_index = lines
+        .iter()
+        .position(|line| line.contains("Inbox completed: processed=0"))
+        .expect("Inbox completion should render");
+    let warning_index = lines
+        .iter()
+        .position(|line| line.contains("Warning: MCP server broken-startup failed"))
+        .expect("deferred startup warning should render");
+    let queued_index = lines
+        .iter()
+        .position(|line| line.contains("QUEUED-DIRECT-731"))
+        .expect("queued input should render");
+
+    assert_eq!(warning_index, inbox_index + 2);
+    assert_eq!(queued_index, warning_index + 2);
+    assert!(lines[inbox_index + 1].trim().is_empty());
+    assert!(lines[warning_index + 1].trim().is_empty());
     assert_eq!(state.status, SessionRuntimeStatus::Open);
 }
 

@@ -518,6 +518,14 @@ pub enum SessionTurnContentBlock {
         name: String,
         input: Value,
     },
+    /// Provider 已给出可配对的工具调用，但 arguments 无法安全解析为 JSON object。
+    ///
+    /// 保留调用身份以生成对应的失败 tool_result；任何工具循环都不得实际派发此调用。
+    InvalidToolUse {
+        id: String,
+        name: String,
+        error: String,
+    },
     ToolResult {
         tool_use_id: String,
         content: String,

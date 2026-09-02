@@ -136,6 +136,16 @@ impl InputQueueState {
         restore
     }
 
+    pub(super) fn discard_submission_range(&mut self, start: u64, end: u64) -> usize {
+        let before = self.queued_inputs.len();
+        self.queued_inputs.retain(|input| {
+            !input
+                .submission_sequence()
+                .is_some_and(|sequence| (start..end).contains(&sequence))
+        });
+        before.saturating_sub(self.queued_inputs.len())
+    }
+
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.queued_inputs.len()
@@ -269,5 +279,19 @@ mod tests {
         );
         assert_eq!(queue.queued_count(), 1);
         assert_eq!(queue.pop_next().unwrap().text(), "after");
+    }
+
+    #[test]
+    fn discard_submission_range_only_removes_inputs_from_resume_wait() {
+        let mut queue = InputQueueState::default();
+        queue.enqueue(QueuedInput::from_text("before").with_submission_sequence(2));
+        queue.enqueue(QueuedInput::from_text("during one").with_submission_sequence(3));
+        queue.enqueue(QueuedInput::from_text("during two").with_submission_sequence(4));
+
+        assert_eq!(queue.discard_submission_range(3, 5), 2);
+        let restored = queue.drain_inputs_for_restore_before(5);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].text(), "before");
+        assert!(queue.is_empty());
     }
 }

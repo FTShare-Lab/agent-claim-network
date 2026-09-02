@@ -2,6 +2,8 @@
 
 > 状态：已实现。本文保留后台 finalize、checkpoint、IPC 与通知语义。
 
+> 后续范围说明（2026-09-01）：本文 direct resume 对 Finalizing 一律提示等待或手动 retry 的历史语义，由 `docs/PRDs/PRD_resume_finalizing_session.md` 覆盖；既有 Supervisor、checkpoint、通知和显式 retry 语义继续有效。
+
 ## 背景
 
 当前 TUI 在 `/exit` 或 Ctrl+C 退出时，会在前台 TUI 进程内执行session finalize。finalize 可能触发 LLM recap、claim/trace/dispute 落盘、maintainer upload，以及 session metadata 更新。用户已经表达退出意图后，终端仍会被 `finalizing` 占用，体验不够好。
