@@ -44,7 +44,8 @@ use super::{
     DelegationProjectionBaseline, MainModelContextAppender, ManualCompactionOutcome,
     PreflightCompactionRequest, PreflightCompactor, ProviderContextUsageAnchor,
     ProviderProjectionBudget, SessionCompactionNoopReason, SessionCompactionResult, SessionEngine,
-    SessionEvent, SessionRecapBackgroundProcessProjection, SessionRecapPreemptionControl,
+    SessionEvent, SessionFinalizeOnceOutcome, SessionFinalizePreemptionControl,
+    SessionRecapBackgroundProcessProjection, SessionRecapPreemptionControl,
     SessionTurnCommittedPostCommitError, TurnJournalEmitter, TurnJournalSink,
     COMPACTION_CHECKPOINT_SCHEMA_VERSION, DELEGATION_PROJECTION_MAX_CHARS,
     DELEGATION_PROJECTION_MAX_ITEMS, MEDIA_BLOCK_ESTIMATED_TOKENS,
@@ -7366,6 +7367,108 @@ async fn same_session_finalize_preempts_recap_before_prepared_and_takes_full_ran
     let finalize_payload = last_user_text(&requests[1]);
     assert!(finalize_payload.contains("first request"));
     assert!(finalize_payload.contains("final request"));
+    let metadata = session.read_metadata().await.unwrap();
+    assert_eq!(metadata.status, SessionStatus::Closed);
+    assert_eq!(metadata.recapped_until, metadata.message_count);
+}
+
+#[tokio::test]
+async fn resume_preempts_running_finalize_before_prepared_without_closing_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(PreemptibleRecapProvider::new());
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_face0023").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "resume target request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "resume target answer"),
+        ])
+        .await
+        .unwrap();
+    session.mark_finalizing(Utc::now()).await.unwrap();
+    let control = Arc::new(SessionFinalizePreemptionControl::new());
+    let finalize_engine = engine.clone();
+    let session_id = session.metadata.id.clone();
+    let finalize_control = Arc::clone(&control);
+    let finalize = tokio::spawn(async move {
+        finalize_engine
+            .finalize_existing_session_once_with_preemption(&session_id, |_| {}, finalize_control)
+            .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        provider.first_call_started.notified(),
+    )
+    .await
+    .unwrap();
+
+    assert!(control.request_before_prepared().await);
+    let outcome = tokio::time::timeout(Duration::from_secs(2), finalize)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        SessionFinalizeOnceOutcome::PreemptedBeforePrepared
+    ));
+    assert!(provider.first_call_dropped.load(Ordering::SeqCst));
+    assert!(session.read_finalize_checkpoint().await.unwrap().is_none());
+    let metadata = session.read_metadata().await.unwrap();
+    assert_eq!(metadata.status, SessionStatus::Finalizing);
+    assert_eq!(metadata.recapped_until, 0);
+}
+
+#[tokio::test]
+async fn finalize_recaps_invalid_tool_use_without_replaying_or_reconstructing_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
+        Vec::new(),
+    )]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_face0024").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "run the safe sibling tool"),
+            NewSessionMessage::new(
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::InvalidToolUse {
+                    id: "call_invalid".into(),
+                    name: "file_read".into(),
+                    error: "function_call.arguments was not a JSON object".into(),
+                }],
+            ),
+            NewSessionMessage::new(
+                SessionMessageRole::User,
+                vec![SessionContentBlock::tool_result(
+                    "call_invalid",
+                    r#"{"ok":false,"outcome":{"kind":"dispatch_failure"}}"#,
+                )],
+            ),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "continued safely"),
+        ])
+        .await
+        .unwrap();
+    let messages = session.read_messages().await.unwrap();
+    assert_eq!(
+        hash_session_segment(&messages).unwrap(),
+        hash_session_segment(&messages).unwrap()
+    );
+    session.mark_finalizing(Utc::now()).await.unwrap();
+
+    engine
+        .finalize_existing_session_once(&session.metadata.id, |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 1);
+    let payload = last_user_text(&requests[0]);
+    assert!(payload.contains("invalid_tool_use file_read"));
+    assert!(payload.contains("dispatch_failure"));
+    assert!(!payload.contains("raw invalid arguments"));
     let metadata = session.read_metadata().await.unwrap();
     assert_eq!(metadata.status, SessionStatus::Closed);
     assert_eq!(metadata.recapped_until, metadata.message_count);

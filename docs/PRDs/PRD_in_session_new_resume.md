@@ -2,6 +2,8 @@
 
 > 状态：已完成（2026-08-31；ND-1 至 ND-8 已实现并完成验证与外部复审）。
 
+> 后续范围说明（2026-09-01）：Finalizing 目标的候选、接管/等待和等待期 queued input 失败语义，由 `docs/PRDs/PRD_resume_finalizing_session.md` 扩展；本文其余 `/new`、`/resume` handoff 与目标启动顺序继续有效。
+
 ## 背景与问题
 
 当前 TUI 不支持 `/new`；`/resume` 只允许在启动后尚无真实内容的临时空 session 中使用。非空 session 中执行 `/resume` 会要求用户先 `/exit`，而 `/exit` 的 Finalize 成功投递 supervisor 后会直接结束整个 TUI。

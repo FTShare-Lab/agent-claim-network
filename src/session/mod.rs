@@ -227,6 +227,19 @@ pub struct FinalizeCheckpoint {
     pub status: FinalizeCheckpointStatus,
 }
 
+/// checkpoint 只有从当前 recap cursor 开始、且终点仍在 canonical 尾部内时，
+/// 才代表尚未兑现的本代 Recap/Finalize 输入。cursor 已越过起点的 Applied 文件
+/// 是上一代成功后的恢复残留，不能阻止新的 Prepared 前抢占。
+pub(crate) fn finalize_checkpoint_covers_pending_range(
+    checkpoint: &FinalizeCheckpoint,
+    recapped_until: usize,
+    message_count: usize,
+) -> bool {
+    checkpoint.recap_start_index == recapped_until
+        && checkpoint.recap_end_index >= checkpoint.recap_start_index
+        && checkpoint.recap_end_index <= message_count
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionCompactionState {
     pub committed_summary: String,
@@ -703,6 +716,7 @@ impl SessionRuntimeLease {
 pub enum SessionResumeKind {
     Closed,
     Interrupted,
+    Finalizing,
 }
 
 #[derive(Debug)]
@@ -1092,9 +1106,6 @@ impl SessionStore {
                 continue;
             };
             let paths = SessionPaths::new(&agent_home, &session_id);
-            let Some(_runtime_lease) = self.try_acquire_runtime_lease(&paths).await? else {
-                continue;
-            };
             let metadata: ResumableSessionMetadata = match read_yaml(&paths.session_yaml).await {
                 Ok(metadata) => metadata,
                 Err(StorageError::Io { source, .. }) if source.kind() == ErrorKind::NotFound => {
@@ -1112,11 +1123,23 @@ impl SessionStore {
                     metadata.closed_at.is_none() && metadata.finalized_at.is_none()
                 }
                 SessionStatus::Closed => true,
-                SessionStatus::Finalizing => false,
+                SessionStatus::Finalizing => {
+                    metadata.closed_at.is_none() && metadata.finalized_at.is_none()
+                }
             };
             if !resumable_status || metadata.agent_id != *agent_id {
                 continue;
             }
+            // Finalizing 可能仍由 Supervisor 或前台 Finalize 持有 runtime lease；它仍应进入
+            // picker，选择后再在最终预检中诊断。Open/Closed 则继续隐藏活跃占用者。
+            let _runtime_lease = if metadata.status == SessionStatus::Finalizing {
+                None
+            } else {
+                let Some(runtime_lease) = self.try_acquire_runtime_lease(&paths).await? else {
+                    continue;
+                };
+                Some(runtime_lease)
+            };
             let id = metadata.id;
             let status = metadata.status;
             let updated_at = metadata.updated_at;
@@ -1215,6 +1238,25 @@ impl SessionStore {
         Ok(handle)
     }
 
+    /// Resume 轻量预检只读取持久状态，不迁移历史或修补任何 cursor。
+    /// 最终一致性校验仍在取得目标 runtime lease 后由 `resume_runtime_session` 完成。
+    pub async fn read_existing_session_status(
+        &self,
+        agent_id: &AgentId,
+        session_id: &SessionId,
+    ) -> Result<SessionStatus, SessionStoreError> {
+        let agent_home = self.agents_root.join(agent_id.as_str());
+        let paths = SessionPaths::new(&agent_home, session_id);
+        let metadata: SessionMetadata = read_yaml(&paths.session_yaml).await?;
+        if metadata.agent_id != *agent_id {
+            return Err(SessionStoreError::WrongAgent {
+                session_id: session_id.to_string(),
+                agent_id: agent_id.to_string(),
+            });
+        }
+        Ok(metadata.status)
+    }
+
     pub async fn reopen_existing_session(
         &self,
         agent_id: &AgentId,
@@ -1234,6 +1276,26 @@ impl SessionStore {
         agent_id: &AgentId,
         session_id: &SessionId,
     ) -> Result<ResumedRuntimeSession, SessionStoreError> {
+        self.resume_runtime_session_inner(agent_id, session_id, true)
+            .await
+    }
+
+    /// TUI 切换先保留 Closed 状态，等 Supervisor 对账旧 Finalize job 后再 reopen。
+    pub async fn reserve_runtime_session(
+        &self,
+        agent_id: &AgentId,
+        session_id: &SessionId,
+    ) -> Result<ResumedRuntimeSession, SessionStoreError> {
+        self.resume_runtime_session_inner(agent_id, session_id, false)
+            .await
+    }
+
+    async fn resume_runtime_session_inner(
+        &self,
+        agent_id: &AgentId,
+        session_id: &SessionId,
+        open_closed: bool,
+    ) -> Result<ResumedRuntimeSession, SessionStoreError> {
         self.with_session_cleanup_lock(agent_id, || async {
             let agent_home = self.agents_root.join(agent_id.as_str());
             let paths = SessionPaths::new(&agent_home, session_id);
@@ -1243,7 +1305,23 @@ impl SessionStore {
                 .ok_or_else(|| SessionStoreError::RuntimeLocked {
                     session_id: session_id.to_string(),
                 })?;
-            let mut session = self.load_existing_session(agent_id, session_id).await?;
+            let metadata: SessionMetadata = read_yaml(&paths.session_yaml).await?;
+            if metadata.agent_id != *agent_id {
+                return Err(SessionStoreError::WrongAgent {
+                    session_id: session_id.to_string(),
+                    agent_id: agent_id.to_string(),
+                });
+            }
+            let mut session = if metadata.status == SessionStatus::Finalizing {
+                // Supervisor 接管成功前只校验 canonical history。provider history/cursor
+                // 迁移必须等 session 已经 Open，避免失败的 Resume 改变原 Finalize 输入。
+                let mut session = SessionHandle::new(metadata, paths);
+                let messages = session.read_messages().await?;
+                validate_and_reconcile_resume_metadata(&mut session, &messages).await?;
+                session
+            } else {
+                self.load_existing_session(agent_id, session_id).await?
+            };
             if resumable_last_user_text(&session.paths).await?.is_none() {
                 return Err(SessionStoreError::NoRealUserInput {
                     session_id: session_id.to_string(),
@@ -1251,7 +1329,9 @@ impl SessionStore {
             }
             let kind = match session.metadata.status {
                 SessionStatus::Closed => {
-                    session.mark_open(Utc::now()).await?;
+                    if open_closed {
+                        session.mark_open(Utc::now()).await?;
+                    }
                     SessionResumeKind::Closed
                 }
                 SessionStatus::Open
@@ -1259,6 +1339,14 @@ impl SessionStore {
                         && session.metadata.finalized_at.is_none() =>
                 {
                     SessionResumeKind::Interrupted
+                }
+                SessionStatus::Finalizing
+                    if session.metadata.closed_at.is_none()
+                        && session.metadata.finalized_at.is_none() =>
+                {
+                    // Finalizing reservation 只取得运行期所有权并重读/校验 metadata；真正的
+                    // takeover 与 Open 提交由 Supervisor 状态机完成。
+                    SessionResumeKind::Finalizing
                 }
                 status => {
                     return Err(SessionStoreError::NotClosed {
@@ -1498,14 +1586,15 @@ async fn validate_and_reconcile_resume_metadata(
     }
     validate_resume_metadata_bounds(&handle.metadata, actual_count)?;
     if handle.metadata.message_count < actual_count {
-        let mut metadata = handle.read_metadata().await?;
-        metadata.message_count = actual_count;
-        if let Some(last) = messages.last() {
-            metadata.model = last.model.clone();
-        }
-        metadata.updated_at = Utc::now();
-        write_yaml_atomic(&handle.paths.session_yaml, &metadata).await?;
-        handle.metadata = metadata;
+        let model = messages
+            .last()
+            .map(|message| message.model.clone())
+            .unwrap_or_else(|| handle.metadata.model.clone());
+        // Resume repair 也可能与 Supervisor 收尾并发；必须在 session lock 内重读后只改
+        // message commit 字段，不能用预检时的旧 metadata 覆盖 status/cursor。
+        handle
+            .repair_committed_message_metadata(actual_count, model)
+            .await?;
     }
     Ok(())
 }
@@ -1702,7 +1791,7 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
-    fn new(metadata: SessionMetadata, paths: SessionPaths) -> Self {
+    pub(crate) fn new(metadata: SessionMetadata, paths: SessionPaths) -> Self {
         let inbox_fallback_scope = ProviderRuntimeFallbackScope::new_root();
         let runtime_fallback_scope = inbox_fallback_scope.new_child();
         Self {
@@ -2399,6 +2488,31 @@ impl SessionHandle {
         Ok(())
     }
 
+    /// Resume takeover 已持久化 Recap job 后的单向状态提交。
+    ///
+    /// 它不删除共享 checkpoint；调用方必须先确认当前没有
+    /// Prepared/Applied checkpoint，否则应让原 Finalize 恢复并关闭。
+    pub(crate) async fn mark_open_after_finalize_takeover(
+        &mut self,
+        updated_at: DateTime<Utc>,
+    ) -> Result<(), SessionStoreError> {
+        let _guard = self.lock_session().await?;
+        self.metadata = self.read_metadata_light().await?;
+        if self.metadata.status != SessionStatus::Finalizing
+            || self.metadata.finalized_at.is_some()
+            || self.metadata.closed_at.is_some()
+        {
+            return Err(SessionStoreError::NotClosed {
+                session_id: self.metadata.id.to_string(),
+                status: self.metadata.status,
+            });
+        }
+        self.metadata.status = SessionStatus::Open;
+        self.metadata.updated_at = updated_at;
+        write_yaml_atomic(&self.paths.session_yaml, &self.metadata).await?;
+        Ok(())
+    }
+
     pub async fn mark_closed(&mut self, closed_at: DateTime<Utc>) -> Result<(), SessionStoreError> {
         let _guard = self.lock_session().await?;
         self.metadata = self.read_metadata_light().await?;
@@ -2576,6 +2690,47 @@ frontier:
             .compaction
             .and_then(|state| state.provider_history)
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn resume_status_preflight_does_not_mutate_legacy_session_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().join("agents"));
+        let agent = agent_id("agent-a");
+        let mut session = store
+            .create_with_id_factory(&agent, "system", || session_id("session_2222cccd"), 1)
+            .await
+            .unwrap();
+        session.metadata.status = SessionStatus::Finalizing;
+        session.metadata.provider_background_completion_until_seq = None;
+        session.metadata.recap_background_completion_until_seq = None;
+        write_yaml_atomic(&session.paths.session_yaml, &session.metadata)
+            .await
+            .unwrap();
+        write_text_atomic(&session.paths.provider_history_json, b"{broken")
+            .await
+            .unwrap();
+        let yaml_before = fs::read(&session.paths.session_yaml).await.unwrap();
+        let provider_history_before = fs::read(&session.paths.provider_history_json)
+            .await
+            .unwrap();
+
+        let status = store
+            .read_existing_session_status(&agent, &session.metadata.id)
+            .await
+            .unwrap();
+
+        assert_eq!(status, SessionStatus::Finalizing);
+        assert_eq!(
+            fs::read(&session.paths.session_yaml).await.unwrap(),
+            yaml_before
+        );
+        assert_eq!(
+            fs::read(&session.paths.provider_history_json)
+                .await
+                .unwrap(),
+            provider_history_before
+        );
     }
 
     #[tokio::test]
@@ -3408,7 +3563,7 @@ frontier:
     }
 
     #[tokio::test]
-    async fn list_resumable_sessions_includes_closed_and_interrupted_but_filters_empty_finalizing_other_agent(
+    async fn list_resumable_sessions_includes_closed_interrupted_and_finalizing_but_filters_empty_other_agent(
     ) {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path().to_path_buf());
@@ -3513,14 +3668,17 @@ frontier:
             session_ids,
             vec![
                 session_id("session_ffffffff"),
+                session_id("session_eeeeeeee"),
                 session_id("session_bbbbbbbb"),
                 session_id("session_aaaaaaaa")
             ]
         );
         assert_eq!(sessions[0].last_user_text.as_deref(), Some("finalized a"));
-        assert_eq!(sessions[1].last_user_text.as_deref(), Some("open a"));
-        assert_eq!(sessions[1].status, SessionStatus::Open);
-        assert_eq!(sessions[2].last_user_text.as_deref(), Some("closed a"));
+        assert_eq!(sessions[1].last_user_text.as_deref(), Some("finalizing a"));
+        assert_eq!(sessions[1].status, SessionStatus::Finalizing);
+        assert_eq!(sessions[2].last_user_text.as_deref(), Some("open a"));
+        assert_eq!(sessions[2].status, SessionStatus::Open);
+        assert_eq!(sessions[3].last_user_text.as_deref(), Some("closed a"));
         assert!(!session_ids
             .iter()
             .any(|id| id == &session_id("session_99999999")));
@@ -3852,7 +4010,41 @@ frontier:
     }
 
     #[tokio::test]
-    async fn resume_runtime_session_rejects_finalizing_without_holding_runtime_lock() {
+    async fn reserve_runtime_session_keeps_closed_until_supervisor_reconciliation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let agent = agent_id("agent-a");
+        let id = session_id("session_aaaaaaaa");
+        let session = create_session(
+            &store,
+            &agent,
+            id.clone(),
+            Utc::now(),
+            &[NewSessionMessage::text(SessionMessageRole::User, "closed")],
+            true,
+        )
+        .await;
+        write_text_atomic(
+            &session.paths.finalize_checkpoint_yaml,
+            b"checkpoint: old\n",
+        )
+        .await
+        .unwrap();
+
+        let reserved = store.reserve_runtime_session(&agent, &id).await.unwrap();
+
+        assert_eq!(reserved.kind, SessionResumeKind::Closed);
+        assert_eq!(reserved.session.metadata.status, SessionStatus::Closed);
+        assert_eq!(
+            fs::read_to_string(&reserved.session.paths.finalize_checkpoint_yaml)
+                .await
+                .unwrap(),
+            "checkpoint: old\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_runtime_session_reserves_finalizing_without_opening_or_clearing_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path().to_path_buf());
         let agent = agent_id("agent-a");
@@ -3870,16 +4062,48 @@ frontier:
         )
         .await;
         session.mark_finalizing(Utc::now()).await.unwrap();
+        session.metadata.provider_background_completion_until_seq = None;
+        session.metadata.recap_background_completion_until_seq = None;
+        write_yaml_atomic(&session.paths.session_yaml, &session.metadata)
+            .await
+            .unwrap();
+        write_text_atomic(&session.paths.provider_history_json, b"{broken")
+            .await
+            .unwrap();
+        write_text_atomic(
+            &session.paths.finalize_checkpoint_yaml,
+            b"checkpoint: keep\n",
+        )
+        .await
+        .unwrap();
+        let metadata_before = fs::read(&session.paths.session_yaml).await.unwrap();
+        let provider_history_before = fs::read(&session.paths.provider_history_json)
+            .await
+            .unwrap();
 
+        let resumed = store.resume_runtime_session(&agent, &id).await.unwrap();
+
+        assert_eq!(resumed.kind, SessionResumeKind::Finalizing);
+        assert_eq!(resumed.session.metadata.status, SessionStatus::Finalizing);
+        assert_eq!(
+            fs::read(&session.paths.session_yaml).await.unwrap(),
+            metadata_before
+        );
+        assert_eq!(
+            fs::read(&session.paths.provider_history_json)
+                .await
+                .unwrap(),
+            provider_history_before
+        );
+        assert_eq!(
+            fs::read_to_string(&resumed.session.paths.finalize_checkpoint_yaml)
+                .await
+                .unwrap(),
+            "checkpoint: keep\n"
+        );
         let error = store.resume_runtime_session(&agent, &id).await.unwrap_err();
-
-        assert!(matches!(
-            error,
-            SessionStoreError::NotClosed {
-                status: SessionStatus::Finalizing,
-                ..
-            }
-        ));
+        assert!(matches!(error, SessionStoreError::RuntimeLocked { .. }));
+        drop(resumed);
         assert!(
             FileLockGuard::try_lock_exclusive(&session.paths.runtime_lock)
                 .await

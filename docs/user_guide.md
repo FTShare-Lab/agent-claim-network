@@ -163,7 +163,7 @@ acn --config /path/to/config.toml --upstream team --cd /path/to/workspace
 acn --resume
 ```
 
-仍被其他 ACN 进程占用的 session 不会出现在 resume 列表中，`Finalizing` session 需等待 supervisor 完成后 resume，finalize 失败时使用 `acn supervisor retry <session_id>` 重试。
+仍被其他 ACN 进程占用的 session 不会出现在 resume 列表中。`Finalizing` session 通常可以直接 Resume；如果仍由另一个前台进程收尾，ACN 会提示稍后重试。如果希望单独重试失败的 finalize，可以执行 `acn supervisor retry <session_id>`。
 
 ## TUI 交互
 

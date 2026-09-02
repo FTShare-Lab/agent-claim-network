@@ -26,6 +26,7 @@ use crate::mcp::connection_manager::{
     McpConnectionManager, McpRuntimeState, McpRuntimeTransition, McpServerStatus,
 };
 use crate::mcp::redact::redact_mcp_sensitive_text;
+use crate::session::SessionResumeKind;
 use crate::skill::SkillSummary;
 use crate::supervisor::SupervisorLaunchConfig;
 
@@ -67,6 +68,12 @@ const DELEGATION_NOTICE_PREFIX: &str = "Subagent ";
 const SKILLS_NAME_COL_WIDTH: usize = 28;
 const SKILLS_DESC_COL_WIDTH: usize = 77;
 const RECAP_ENQUEUE_WARNING: &str = "Background recap could not be queued and will retry later.";
+const FINALIZING_RESUME_ERROR: &str =
+    "This session is still finalizing; wait for finalization to complete before resuming.";
+
+fn foreground_finalizing_resume_error(session_id: &SessionId) -> String {
+    format!("{session_id} is still finalizing foreground; Try again after its completion.")
+}
 
 pub(super) fn recap_enqueue_warning(result: &anyhow::Result<()>) -> Option<&'static str> {
     result.as_ref().err().map(|_| RECAP_ENQUEUE_WARNING)
@@ -189,9 +196,14 @@ struct SessionTuiApp {
     _runtime_lease: Option<crate::session::SessionRuntimeLease>,
     current_session_has_real_user_input: bool,
     resume_switch_pending: bool,
+    resume_input_boundary: Option<u64>,
+    discarded_resume_input_sequences: BTreeSet<u64>,
     finalize_continuation: Option<SessionFinalizeContinuation>,
     session_task: SessionTaskState,
     session_picker: Option<SessionPickerState>,
+    resume_picker_on_failure: Option<SessionPickerState>,
+    direct_resume_pending: bool,
+    deferred_direct_resume_startup_warnings: Vec<String>,
     mcp_manager: Option<Arc<McpConnectionManager>>,
     mcp_operation_tasks: JoinSet<()>,
     /// Ctrl+O 任务独立保留临时路径，确保 completion 尚未被事件循环消费时退出也能清理。
@@ -266,10 +278,12 @@ impl SessionTuiApp {
         supervisor: Option<SupervisorLaunchConfig>,
         cleanup_housekeeping: Option<SessionCleanupHousekeepingConfig>,
     ) -> anyhow::Result<Self> {
+        let direct_resume_pending = matches!(&startup_resume, StartupResume::Session(_));
         let tui = Tui::enter()?;
         let (app_event_tx, app_event_rx) = AppEventSender::channel();
         let cleanup_activity = SessionCleanupActivity::new();
         let mut chat_widget = ChatWidget::new(app_event_tx);
+        chat_widget.set_startup_scrollback_visible(!direct_resume_pending);
         chat_widget.set_tui_config(tui_config);
         chat_widget.state_mut().set_at_path_completion_config(
             engine.workspace_root().to_path_buf(),
@@ -291,6 +305,7 @@ impl SessionTuiApp {
                 .map(|skill| (skill.name.as_str(), skill.description.as_str())),
         );
         let mcp_manager = engine.mcp_manager();
+        let mut deferred_direct_resume_startup_warnings = Vec::new();
         if let Some(manager) = &mcp_manager {
             let snapshot = manager.snapshot_sync();
             let warnings = mcp_startup_warnings(&snapshot);
@@ -298,9 +313,11 @@ impl SessionTuiApp {
                 .state_mut()
                 .set_mcp_runtime(manager.config_path().to_path_buf(), snapshot);
             for warning in warnings {
-                chat_widget
-                    .state_mut()
-                    .push_system(format!("Warning: {warning}"));
+                let warning = format!("Warning: {warning}");
+                if direct_resume_pending {
+                    deferred_direct_resume_startup_warnings.push(warning.clone());
+                }
+                chat_widget.state_mut().push_system(warning);
             }
         }
         chat_widget.handle_session_event(SessionEvent::StartupProgress {
@@ -321,9 +338,14 @@ impl SessionTuiApp {
             _runtime_lease: None,
             current_session_has_real_user_input: false,
             resume_switch_pending: false,
+            resume_input_boundary: None,
+            discarded_resume_input_sequences: BTreeSet::new(),
             finalize_continuation: None,
             session_task: SessionTaskState::default(),
             session_picker: None,
+            resume_picker_on_failure: None,
+            direct_resume_pending,
+            deferred_direct_resume_startup_warnings,
             mcp_manager,
             mcp_operation_tasks: JoinSet::new(),
             preview_tasks: JoinSet::new(),
@@ -703,22 +725,83 @@ impl SessionTuiApp {
                 self.mark_pending_async_inputs_for_restore();
                 self.tui.render_requester().schedule_render();
             }
+            WorkerEvent::ResumeFinalizingStarted { session_id } => {
+                self.chat_widget
+                    .state_mut()
+                    .begin_target_resume_wait(session_id.as_str());
+                self.tui.render_requester().schedule_render();
+            }
             WorkerEvent::ResumeSessionReserved { result } => {
                 self.resume_handle = None;
                 let is_session_switch = std::mem::take(&mut self.resume_switch_pending);
+                let is_direct_resume = std::mem::take(&mut self.direct_resume_pending);
                 match result {
                     Ok(reservation) if is_session_switch => {
+                        self.resume_picker_on_failure = None;
+                        // A 已可接管但 B 尚未完成 handoff。保留 submission 边界到 A
+                        // 完成安装，让此前已经 Enter、仍在异步预处理的输入即使晚于
+                        // B 进入 Finalizing 返回，也只能进入目标 A 的既有队列。
                         self.continue_session_switch(SessionSwitchTarget::Resume(Box::new(
                             reservation,
                         )))?;
                     }
-                    Ok(reservation) => self.begin_resume_session_startup(reservation)?,
-                    Err(e) => {
+                    Ok(reservation) => {
+                        self.resume_picker_on_failure = None;
+                        self.resume_input_boundary = None;
+                        self.chat_widget.set_startup_scrollback_visible(true);
+                        self.begin_resume_session_startup(reservation)?;
+                    }
+                    Err(failure) if failure.finalizing_target => {
+                        log::warn!(
+                            target: "session_tui",
+                            "Finalizing session resume failed: {:#}",
+                            failure.error
+                        );
+                        self.discard_inputs_from_resume_wait();
+                        let message = if failure.foreground_finalizing {
+                            foreground_finalizing_resume_error(&failure.target_session_id)
+                        } else {
+                            FINALIZING_RESUME_ERROR.to_string()
+                        };
+                        if is_direct_resume {
+                            self.resume_picker_on_failure = None;
+                            self.restore_queued_inputs_after_resume_interrupted();
+                            if !failure.foreground_finalizing {
+                                self.chat_widget.set_startup_scrollback_visible(true);
+                                self.tui
+                                    .draw(&mut self.chat_widget, self.session_picker.as_ref())?;
+                            }
+                            anyhow::bail!(message);
+                        }
+                        let state = self.chat_widget.state_mut();
+                        if self.session.is_some() {
+                            state.apply_event(SessionEvent::StatusChanged {
+                                status: SessionRuntimeStatus::Open,
+                            });
+                        } else {
+                            state.status = SessionRuntimeStatus::Error;
+                        }
+                        if let Some(mut picker) = self.resume_picker_on_failure.take() {
+                            picker.set_selected_inline_error(message);
+                            self.session_picker = Some(picker);
+                        } else {
+                            state.push_error(message);
+                        }
+                        // 选择 Finalizing 目标前已经排队的 B 输入不属于等待期；恢复到
+                        // 当前 composer。边界后的输入已在上面清除，不会被恢复。
+                        self.restore_queued_inputs_after_resume_interrupted();
+                    }
+                    Err(failure) => {
+                        self.resume_picker_on_failure = None;
+                        self.resume_input_boundary = None;
+                        if is_direct_resume {
+                            self.chat_widget.set_startup_scrollback_visible(true);
+                        }
                         let state = self.chat_widget.state_mut();
                         if self.session.is_none() {
                             state.status = SessionRuntimeStatus::Error;
                         }
-                        state.push_error(format!("Resume failed: {e:#}"));
+                        state.push_error(format!("Resume failed: {:#}", failure.error));
                         self.restore_queued_inputs_after_resume_interrupted();
                         self.mark_pending_async_inputs_for_restore();
                     }
@@ -730,6 +813,7 @@ impl SessionTuiApp {
                 match result {
                     Ok(outcome) => self.install_resume_history_and_start_inbox(outcome)?,
                     Err(error) => {
+                        self.resume_input_boundary = None;
                         let state = self.chat_widget.state_mut();
                         state.status = SessionRuntimeStatus::Error;
                         state.push_error(format!("Resume failed: {error:#}"));
@@ -743,12 +827,23 @@ impl SessionTuiApp {
                 self.resume_handle = None;
                 self.session = Some(session);
                 self.current_session_has_real_user_input = true;
+                let mut warnings = Vec::new();
                 if let Err(error) = result {
                     log::warn!(target: "session_tui", "Resume inbox sync failed: {error:#}");
-                    let state = self.chat_widget.state_mut();
-                    state.finish_resume_inbox_with_warning(
-                        "Warning: Inbox sync failed; run /inbox to retry.",
-                    );
+                    warnings.push("Warning: Inbox sync failed; run /inbox to retry.".into());
+                }
+                warnings.append(&mut self.deferred_direct_resume_startup_warnings);
+                let has_warnings = !warnings.is_empty();
+                self.chat_widget
+                    .state_mut()
+                    .finish_resume_inbox_with_warnings(warnings);
+                // 目标 A 已安装且进入 Open；此后才返回的 submission 会自然按 A
+                // 的普通输入语义处理，不再需要 handoff 强制排队。
+                self.resume_input_boundary = None;
+                if has_warnings {
+                    // Direct Resume 的启动 warning 必须先实际绘制，再允许等待期输入进入 A。
+                    self.tui
+                        .draw(&mut self.chat_widget, self.session_picker.as_ref())?;
                 }
                 self.maybe_dispatch_next_queued_input()?;
                 self.tui.render_requester().schedule_render();
@@ -1146,12 +1241,16 @@ impl SessionTuiApp {
             AppEvent::ExitRequested => return self.request_exit(),
             AppEvent::InterruptRequested => return Ok(self.interrupt()),
             AppEvent::PickerSessionSelected(session_id) => {
-                self.session_picker = None;
+                self.resume_picker_on_failure = self.session_picker.take().map(|mut picker| {
+                    picker.clear_inline_error();
+                    picker
+                });
                 self.chat_widget.state_mut().bump_interaction_generation();
                 self.start_resume_open(session_id)?;
             }
             AppEvent::PickerCancelled => {
                 self.session_picker = None;
+                self.resume_picker_on_failure = None;
                 self.restore_queued_inputs_after_resume_interrupted();
                 self.tui.render_requester().schedule_render();
             }
@@ -1170,6 +1269,10 @@ impl SessionTuiApp {
         draft: InputDraft,
         result: Result<ResolvedAtPaths, String>,
     ) -> anyhow::Result<()> {
+        if self.discarded_resume_input_sequences.remove(&sequence) {
+            self.flush_ready_input_submissions()?;
+            return Ok(());
+        }
         let restore_to_composer = self.take_pending_async_input_restore(sequence);
         match result {
             Ok(resolved) => {
@@ -1217,6 +1320,10 @@ impl SessionTuiApp {
         sequence: u64,
         input: QueuedInput,
     ) -> anyhow::Result<()> {
+        if self.discarded_resume_input_sequences.remove(&sequence) {
+            self.flush_ready_input_submissions()?;
+            return Ok(());
+        }
         self.pending_input_submissions.insert(
             sequence,
             PendingInputSubmission::Ready {
@@ -1235,6 +1342,10 @@ impl SessionTuiApp {
         sequence: u64,
         input: QueuedInput,
     ) -> anyhow::Result<()> {
+        if self.discarded_resume_input_sequences.remove(&sequence) {
+            self.flush_ready_input_submissions()?;
+            return Ok(());
+        }
         if !input.attachments().is_empty() {
             let state = self.chat_widget.state_mut();
             state.set_status_notice(ATTACHMENT_STEER_QUEUE_NOTICE);
@@ -1447,6 +1558,16 @@ impl SessionTuiApp {
     fn submit_input(&mut self, input: QueuedInput) -> anyhow::Result<()> {
         let finalize_failed = self.chat_widget.state().finalize_failed();
         if finalize_failed {
+            return Ok(());
+        }
+        if resume_input_submission_forces_queue(
+            self.resume_handle.is_some(),
+            self.chat_widget.state().status,
+            self.resume_input_boundary,
+            input.submission_sequence(),
+        ) {
+            self.chat_widget.state_mut().queue_pending_turn(input);
+            self.tui.render_requester().schedule_render();
             return Ok(());
         }
         let dispatch_blocked = input_dispatch_is_blocked(
@@ -1848,6 +1969,28 @@ impl SessionTuiApp {
         self.mark_pending_async_inputs_for_restore();
     }
 
+    fn discard_inputs_from_resume_wait(&mut self) -> usize {
+        let Some(start) = self.resume_input_boundary.take() else {
+            return 0;
+        };
+        let end = self.chat_widget.state().current_input_submission_sequence();
+        if start >= end {
+            return 0;
+        }
+        self.chat_widget
+            .state_mut()
+            .discard_queued_inputs_in_submission_range(start, end);
+        self.pending_input_submissions
+            .retain(|sequence, _| !(start..end).contains(sequence));
+        self.deferred_input_restores
+            .retain(|sequence, _| !(start..end).contains(sequence));
+        for sequence in start..end {
+            self.discarded_resume_input_sequences.insert(sequence);
+            self.skip_input_submission_sequence(sequence);
+        }
+        usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX)
+    }
+
     fn start_turn(&mut self, input: QueuedInput) -> anyhow::Result<()> {
         let Some(session) = self.session.clone() else {
             return Ok(());
@@ -2148,10 +2291,13 @@ impl SessionTuiApp {
             })
             .map(|session| session.metadata.id.clone());
         self.resume_switch_pending = self.session.is_some();
+        self.resume_input_boundary =
+            Some(self.chat_widget.state().current_input_submission_sequence());
         self.resume_handle = Some(spawn_resume_preflight_worker(
             self.engine.clone(),
             session_id,
             temporary_session_id,
+            self.supervisor.clone(),
             self.worker_tx.clone(),
         ));
         self.tui.render_requester().schedule_render();
@@ -2312,8 +2458,15 @@ impl SessionTuiApp {
     fn restore_after_switch_finalize_failure(&mut self, target: SessionSwitchTarget) {
         match target {
             SessionSwitchTarget::New => {}
-            SessionSwitchTarget::Resume(_reservation) => {
+            SessionSwitchTarget::Resume(reservation) => {
                 // 薄 reservation 不回滚目标状态；drop lease 后它会按 Interrupted 再次可见。
+                if resume_handoff_failure_discards_waiting_input(reservation.resume_kind) {
+                    // D11 只覆盖 Finalizing 目标：确保已经排队和仍在异步预处理的输入
+                    // 都不会落入 A/B。普通 Closed/Open Resume 保留既有失败语义。
+                    self.discard_inputs_from_resume_wait();
+                } else {
+                    self.resume_input_boundary = None;
+                }
             }
         }
     }
@@ -2551,6 +2704,33 @@ async fn write_text_to_clipboard(text: String) -> Result<(), String> {
 
 fn input_can_be_queued(status: SessionRuntimeStatus) -> bool {
     input_accepts_text(status)
+}
+
+fn resume_wait_forces_queue(resume_running: bool, status: SessionRuntimeStatus) -> bool {
+    resume_running && input_can_be_queued(status)
+}
+
+fn resume_handoff_submission_forces_queue(
+    resume_input_boundary: Option<u64>,
+    submission_sequence: Option<u64>,
+) -> bool {
+    resume_input_boundary
+        .zip(submission_sequence)
+        .is_some_and(|(boundary, sequence)| sequence >= boundary)
+}
+
+fn resume_handoff_failure_discards_waiting_input(resume_kind: SessionResumeKind) -> bool {
+    resume_kind == SessionResumeKind::Finalizing
+}
+
+fn resume_input_submission_forces_queue(
+    resume_running: bool,
+    status: SessionRuntimeStatus,
+    resume_input_boundary: Option<u64>,
+    submission_sequence: Option<u64>,
+) -> bool {
+    resume_wait_forces_queue(resume_running, status)
+        || resume_handoff_submission_forces_queue(resume_input_boundary, submission_sequence)
 }
 
 fn input_dispatch_is_blocked(
@@ -2895,6 +3075,17 @@ mod tests {
     use crate::mcp::config::{
         read_mcp_json_config, write_mcp_json_config_atomic, McpJsonConfig, McpServerConfig,
     };
+
+    #[test]
+    fn foreground_finalizing_error_includes_target_session_id() -> anyhow::Result<()> {
+        let session_id: SessionId = "session_abcd1234".parse()?;
+
+        assert_eq!(
+            foreground_finalizing_resume_error(&session_id),
+            "session_abcd1234 is still finalizing foreground; Try again after its completion."
+        );
+        Ok(())
+    }
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
@@ -3296,6 +3487,7 @@ done
         assert!(input_can_be_queued(SessionRuntimeStatus::Running));
         assert!(input_can_be_queued(SessionRuntimeStatus::SyncingInbox));
         assert!(input_can_be_queued(SessionRuntimeStatus::Compacting));
+        assert!(input_can_be_queued(SessionRuntimeStatus::Resuming));
         assert!(input_can_be_queued(SessionRuntimeStatus::Open));
         assert!(!input_can_be_queued(SessionRuntimeStatus::Finalizing));
         assert!(!input_can_be_queued(SessionRuntimeStatus::Closed));
@@ -3307,6 +3499,63 @@ done
         assert!(input_dispatch_is_blocked(false, true, false));
         assert!(input_dispatch_is_blocked(true, false, false));
         assert!(!input_dispatch_is_blocked(false, false, false));
+    }
+
+    #[test]
+    fn resume_wait_queues_all_accepted_input_before_command_routing() {
+        assert!(resume_wait_forces_queue(
+            true,
+            SessionRuntimeStatus::Resuming
+        ));
+        assert!(!resume_wait_forces_queue(
+            false,
+            SessionRuntimeStatus::Resuming
+        ));
+        assert!(!resume_wait_forces_queue(
+            true,
+            SessionRuntimeStatus::Finalizing
+        ));
+    }
+
+    #[test]
+    fn resume_handoff_queues_late_preprocessed_input_after_b_starts_finalizing() {
+        assert!(resume_input_submission_forces_queue(
+            false,
+            SessionRuntimeStatus::Finalizing,
+            Some(7),
+            Some(7),
+        ));
+        assert!(resume_input_submission_forces_queue(
+            false,
+            SessionRuntimeStatus::Finalizing,
+            Some(7),
+            Some(8),
+        ));
+        assert!(!resume_input_submission_forces_queue(
+            false,
+            SessionRuntimeStatus::Finalizing,
+            Some(7),
+            Some(6),
+        ));
+        assert!(!resume_input_submission_forces_queue(
+            false,
+            SessionRuntimeStatus::Finalizing,
+            None,
+            Some(7),
+        ));
+    }
+
+    #[test]
+    fn resume_handoff_failure_discards_waiting_input_only_for_finalizing_target() {
+        assert!(resume_handoff_failure_discards_waiting_input(
+            SessionResumeKind::Finalizing
+        ));
+        assert!(!resume_handoff_failure_discards_waiting_input(
+            SessionResumeKind::Closed
+        ));
+        assert!(!resume_handoff_failure_discards_waiting_input(
+            SessionResumeKind::Interrupted
+        ));
     }
 
     #[test]
