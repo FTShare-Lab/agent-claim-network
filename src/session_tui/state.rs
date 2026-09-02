@@ -321,6 +321,9 @@ impl SessionTuiState {
                 self.transcript.set_activity(None);
                 self.transcript.push_assistant_delta(text);
             }
+            SessionEvent::AssistantOutputAccepted => {
+                self.transcript.accept_active_assistant_output();
+            }
             SessionEvent::AssistantOutputDiscarded => {
                 self.transcript.discard_active_assistant();
             }

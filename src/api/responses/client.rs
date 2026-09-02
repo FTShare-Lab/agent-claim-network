@@ -7,7 +7,9 @@ use rand::Rng;
 use super::protocol::{reduce_response_value, ReducedResponses, ResponsesRequest};
 use super::streaming::ResponsesSseDecoder;
 use super::websocket::{ResponsesWebSocketTransport, WebSocketSendOutcome};
-use super::{is_explicit_websocket_message_too_big, redact_responses_error_body};
+use super::{
+    is_explicit_websocket_message_too_big, is_transient_error_code, redact_responses_error_body,
+};
 use crate::api::endpoint::{resolve_llm_endpoint, LlmEndpointKind};
 use crate::api::llm_http::{read_llm_error_body, LlmHttpError, LlmHttpPhase};
 use crate::api::provider::ProviderTransport;
@@ -34,8 +36,11 @@ pub enum ResponsesError {
     OutputShape { reason: String },
     #[error("Responses streaming 响应损坏或未完整结束: {reason}")]
     StreamFailure { reason: String },
-    #[error("Responses upstream failed: {message}")]
-    Failed { message: String },
+    #[error("Responses upstream failed: code={code:?}, {message}")]
+    Failed {
+        code: Option<String>,
+        message: String,
+    },
     #[error("Responses 返回未完成终态: {reason}")]
     Incomplete { reason: String },
     #[error("Responses recovery interrupted")]
@@ -53,6 +58,12 @@ pub struct ResponsesClient {
     retry_max_delay: Duration,
     timeout: Duration,
     websocket: Option<Arc<ResponsesWebSocketTransport>>,
+}
+
+struct StreamingRetryOptions {
+    retry_count: u32,
+    retry_after_partial: bool,
+    initial_previous_attempt_ambiguous: bool,
 }
 
 impl ResponsesClient {
@@ -198,7 +209,7 @@ impl ResponsesClient {
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
     ) -> Result<(ReducedResponses, ProviderTransport), ResponsesError> {
-        let mut noop = || Ok(());
+        let mut noop = |_| Ok(());
         self.send_with_retry_count_for_runtime_scope_and_transport_and_start_hook(
             request,
             retry_count,
@@ -225,10 +236,11 @@ impl ResponsesClient {
         retry_after_partial: bool,
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
-        request_started: &mut (dyn FnMut() -> Result<(), ResponsesError> + Send),
+        request_started: &mut (dyn FnMut(bool) -> Result<(), ResponsesError> + Send),
     ) -> Result<(ReducedResponses, ProviderTransport), ResponsesError> {
         ensure_recovery_active(recovery_interrupt)?;
         if request.stream {
+            let mut previous_attempt_ambiguous = false;
             if let (Some(websocket), Some(runtime_chain_id)) = (&self.websocket, runtime_chain_id) {
                 match websocket
                     .send_with_retry_count_for_scope_and_start_hook(
@@ -248,15 +260,21 @@ impl ResponsesClient {
                     WebSocketSendOutcome::Response(response) => {
                         return Ok((response, ProviderTransport::ResponsesWebSocket));
                     }
-                    WebSocketSendOutcome::FallbackToHttp => {
+                    WebSocketSendOutcome::FallbackToHttp {
+                        previous_attempt_ambiguous: websocket_attempt_ambiguous,
+                    } => {
+                        previous_attempt_ambiguous = websocket_attempt_ambiguous;
                         ensure_recovery_active(recovery_interrupt)?;
                     }
                 }
             }
             self.send_streaming_with_retry(
                 request,
-                retry_count,
-                retry_after_partial,
+                StreamingRetryOptions {
+                    retry_count,
+                    retry_after_partial,
+                    initial_previous_attempt_ambiguous: previous_attempt_ambiguous,
+                },
                 recovery_interrupt,
                 emit,
                 request_started,
@@ -275,14 +293,19 @@ impl ResponsesClient {
         request: &ResponsesRequest,
         retry_count: u32,
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
-        request_started: &mut (dyn FnMut() -> Result<(), ResponsesError> + Send),
+        request_started: &mut (dyn FnMut(bool) -> Result<(), ResponsesError> + Send),
     ) -> Result<ReducedResponses, ResponsesError> {
         let mut last_retryable = None;
+        let mut previous_attempt_ambiguous = false;
         for attempt in 0..=retry_count {
             ensure_recovery_active(recovery_interrupt)?;
-            match self.send_json_once(request, request_started).await {
+            match self
+                .send_json_once(request, previous_attempt_ambiguous, request_started)
+                .await
+            {
                 Ok(value) => return Ok(value),
                 Err(error) if is_retryable(&error) && attempt < retry_count => {
+                    previous_attempt_ambiguous = response_attempt_ambiguous(&error);
                     let backoff =
                         compute_backoff(attempt, self.retry_base_delay, self.retry_max_delay);
                     log::warn!(
@@ -309,7 +332,8 @@ impl ResponsesClient {
     async fn send_json_once(
         &self,
         request: &ResponsesRequest,
-        request_started: &mut (dyn FnMut() -> Result<(), ResponsesError> + Send),
+        previous_attempt_ambiguous: bool,
+        request_started: &mut (dyn FnMut(bool) -> Result<(), ResponsesError> + Send),
     ) -> Result<ReducedResponses, ResponsesError> {
         let pending = self
             .http
@@ -317,7 +341,7 @@ impl ResponsesClient {
             .bearer_auth(self.api_key.as_str())
             .header("content-type", "application/json")
             .json(request);
-        request_started()?;
+        request_started(previous_attempt_ambiguous)?;
         let response = pending
             .send()
             .await
@@ -328,14 +352,14 @@ impl ResponsesClient {
     async fn send_streaming_with_retry(
         &self,
         request: &ResponsesRequest,
-        retry_count: u32,
-        retry_after_partial: bool,
+        options: StreamingRetryOptions,
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
-        request_started: &mut (dyn FnMut() -> Result<(), ResponsesError> + Send),
+        request_started: &mut (dyn FnMut(bool) -> Result<(), ResponsesError> + Send),
     ) -> Result<ReducedResponses, ResponsesError> {
         let mut last_retryable = None;
-        for attempt in 0..=retry_count {
+        let mut previous_attempt_ambiguous = options.initial_previous_attempt_ambiguous;
+        for attempt in 0..=options.retry_count {
             ensure_recovery_active(recovery_interrupt)?;
             let mut emitted_visible_text = false;
             let result = {
@@ -343,16 +367,22 @@ impl ResponsesClient {
                     emitted_visible_text = true;
                     emit(event);
                 };
-                self.send_streaming_once(request, &mut tracking_emit, request_started)
-                    .await
+                self.send_streaming_once(
+                    request,
+                    previous_attempt_ambiguous,
+                    &mut tracking_emit,
+                    request_started,
+                )
+                .await
             };
             match result {
                 Ok(value) => return Ok(value),
                 Err(error)
-                    if (!emitted_visible_text || retry_after_partial)
+                    if (!emitted_visible_text || options.retry_after_partial)
                         && is_retryable(&error)
-                        && attempt < retry_count =>
+                        && attempt < options.retry_count =>
                 {
+                    previous_attempt_ambiguous = response_attempt_ambiguous(&error);
                     let backoff =
                         compute_backoff(attempt, self.retry_base_delay, self.retry_max_delay);
                     log::warn!(
@@ -360,7 +390,7 @@ impl ResponsesClient {
                         "Responses stream 调用失败，{}ms 后重试 ({}/{}): {}",
                         backoff.as_millis(),
                         attempt + 1,
-                        retry_count,
+                        options.retry_count,
                         error
                     );
                     last_retryable = Some(error);
@@ -379,8 +409,9 @@ impl ResponsesClient {
     async fn send_streaming_once(
         &self,
         request: &ResponsesRequest,
+        previous_attempt_ambiguous: bool,
         emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
-        request_started: &mut (dyn FnMut() -> Result<(), ResponsesError> + Send),
+        request_started: &mut (dyn FnMut(bool) -> Result<(), ResponsesError> + Send),
     ) -> Result<ReducedResponses, ResponsesError> {
         let pending = self
             .http
@@ -389,7 +420,7 @@ impl ResponsesClient {
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
             .json(request);
-        request_started()?;
+        request_started(previous_attempt_ambiguous)?;
         let response = pending
             .send()
             .await
@@ -456,14 +487,24 @@ fn is_retryable(error: &ResponsesError) -> bool {
         ResponsesError::Http(error) => error.is_retryable(),
         ResponsesError::Status { status, .. } => *status == 429 || *status >= 500,
         ResponsesError::StreamFailure { .. } => true,
+        ResponsesError::Failed { code, .. } => code.as_deref().is_some_and(is_transient_error_code),
         ResponsesError::Auth(_)
         | ResponsesError::ResponseJson(_)
         | ResponsesError::InvalidEndpoint(_)
         | ResponsesError::OutputShape { .. }
-        | ResponsesError::Failed { .. }
         | ResponsesError::Incomplete { .. }
         | ResponsesError::RecoveryInterrupted
         | ResponsesError::RequestPreparation { .. } => false,
+    }
+}
+
+fn response_attempt_ambiguous(error: &ResponsesError) -> bool {
+    match error {
+        ResponsesError::Failed { code, .. } => code.as_deref().is_some_and(is_transient_error_code),
+        ResponsesError::Auth(_)
+        | ResponsesError::Status { .. }
+        | ResponsesError::Incomplete { .. } => false,
+        _ => true,
     }
 }
 
@@ -471,6 +512,8 @@ pub(crate) fn is_stream_recovery_failure(error: &ResponsesError) -> bool {
     matches!(error, ResponsesError::StreamFailure { .. })
         || matches!(error, ResponsesError::Http(error) if error.is_retryable())
         || matches!(error, ResponsesError::Status { status, .. } if *status == 429 || *status >= 500)
+        || matches!(error, ResponsesError::Failed { code, .. }
+            if code.as_deref().is_some_and(is_transient_error_code))
 }
 
 fn ensure_recovery_active(
@@ -526,6 +569,110 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    #[test]
+    fn transient_failed_terminal_is_retryable_and_ambiguous() {
+        let transient = ResponsesError::Failed {
+            code: Some("server_error".into()),
+            message: "temporary failure".into(),
+        };
+        assert!(is_retryable(&transient));
+        assert!(is_stream_recovery_failure(&transient));
+        assert!(response_attempt_ambiguous(&transient));
+
+        for code in [
+            Some("authentication_error".into()),
+            Some("model_not_found".into()),
+            Some("unknown_provider_error".into()),
+            None,
+        ] {
+            let error = ResponsesError::Failed {
+                code,
+                message: "redacted failure".into(),
+            };
+            assert!(!is_retryable(&error));
+            assert!(!is_stream_recovery_failure(&error));
+        }
+
+        let deterministic = ResponsesError::Failed {
+            code: Some("content_filter".into()),
+            message: "content policy".into(),
+        };
+        assert!(!is_retryable(&deterministic));
+        assert!(!is_stream_recovery_failure(&deterministic));
+    }
+
+    #[tokio::test]
+    async fn client_does_not_retry_context_window_failed_terminals() {
+        let cases = [
+            (
+                false,
+                json!({
+                    "status":"failed",
+                    "error":{
+                        "code":"context_length_exceeded",
+                        "message":"maximum context length exceeded"
+                    },
+                    "output":[]
+                })
+                .to_string(),
+            ),
+            (
+                true,
+                format!(
+                    "data: {}\n\n",
+                    json!({
+                        "type":"response.failed",
+                        "response":{
+                            "status":"failed",
+                            "error":{"message":"prompt is too long"}
+                        }
+                    })
+                ),
+            ),
+        ];
+
+        for (stream, body) in cases {
+            let content_type = if stream {
+                "text/event-stream"
+            } else {
+                "application/json"
+            };
+            let (endpoint, captured_request) = spawn_server(content_type, body).await;
+            let client = ResponsesClient::new(
+                endpoint,
+                "test-key".into(),
+                Duration::from_secs(5),
+                1,
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .unwrap();
+            let mut starts = 0usize;
+            let mut request_started = |_| {
+                starts += 1;
+                Ok(())
+            };
+
+            let error = client
+                .send_with_retry_count_for_runtime_scope_and_transport_and_start_hook(
+                    &request(stream),
+                    1,
+                    None,
+                    None,
+                    false,
+                    None,
+                    &mut |_| {},
+                    &mut request_started,
+                )
+                .await
+                .unwrap_err();
+
+            assert!(matches!(error, ResponsesError::Failed { .. }));
+            assert_eq!(starts, 1);
+            assert!(!captured_request.await.unwrap().is_empty());
+        }
+    }
 
     #[tokio::test]
     async fn client_parses_matching_json_and_sse_results() {
@@ -617,6 +764,36 @@ mod tests {
         .to_string();
         let (endpoint, requests) =
             spawn_status_sequence(vec![(500, "temporary".into()), (200, success)]).await;
+        let client = ResponsesClient::new(
+            endpoint,
+            "test-key".into(),
+            Duration::from_secs(5),
+            1,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        let response = client.send(&request(false), &mut |_| {}).await.unwrap();
+
+        assert_eq!(response.output_text, "ok");
+        assert_eq!(requests.await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn client_retries_transient_failed_json_terminal() {
+        let failed = json!({
+            "status":"failed",
+            "error":{"code":"server_error","message":"temporary failure"},
+            "output":[]
+        })
+        .to_string();
+        let success = json!({
+            "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]
+        })
+        .to_string();
+        let (endpoint, requests) = spawn_status_sequence(vec![(200, failed), (200, success)]).await;
         let client = ResponsesClient::new(
             endpoint,
             "test-key".into(),

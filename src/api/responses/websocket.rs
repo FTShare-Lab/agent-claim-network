@@ -17,8 +17,8 @@ use super::client::compute_backoff;
 use super::protocol::{ReducedResponses, ResponsesRequest};
 use super::streaming::ResponsesEventDecoder;
 use super::{
-    is_explicit_websocket_message_too_big, redact_responses_error_body, ResponsesError,
-    ResponsesStreamEvent,
+    is_explicit_websocket_message_too_big, is_transient_error_code, redact_responses_error_body,
+    ResponsesError, ResponsesStreamEvent,
 };
 use crate::api::llm_http::read_llm_error_body;
 use crate::api::{ProviderRecoveryInterrupt, ProviderRuntimeChainId, ProviderRuntimeFallbackScope};
@@ -29,7 +29,7 @@ const MAX_CONNECTION_AGE: Duration = Duration::from_secs(55 * 60);
 #[derive(Debug)]
 pub(super) enum WebSocketSendOutcome {
     Response(ReducedResponses),
-    FallbackToHttp,
+    FallbackToHttp { previous_attempt_ambiguous: bool },
 }
 
 pub(super) struct ResponsesWebSocketTransport {
@@ -117,7 +117,7 @@ impl ResponsesWebSocketTransport {
         retry_after_partial: bool,
         emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
     ) -> Result<WebSocketSendOutcome, ResponsesError> {
-        let mut noop = || Ok(());
+        let mut noop = |_| Ok(());
         self.send_with_retry_count_for_scope_and_start_hook(
             request,
             chain_id,
@@ -148,16 +148,19 @@ impl ResponsesWebSocketTransport {
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         retry_after_partial: bool,
         emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
-        request_started: &mut (dyn FnMut() -> Result<(), ResponsesError> + Send),
+        request_started: &mut (dyn FnMut(bool) -> Result<(), ResponsesError> + Send),
     ) -> Result<WebSocketSendOutcome, ResponsesError> {
         ensure_recovery_active(recovery_interrupt)?;
         if self.websocket_sticky(chain_id, fallback_scope).await {
-            return Ok(WebSocketSendOutcome::FallbackToHttp);
+            return Ok(WebSocketSendOutcome::FallbackToHttp {
+                previous_attempt_ambiguous: false,
+            });
         }
         let snapshot = RequestSnapshot::new(request)?;
         let mut attempt = 0u32;
         let mut force_full_history = false;
         let mut previous_state_recovery_used = false;
+        let mut previous_attempt_ambiguous = false;
 
         loop {
             ensure_recovery_active(recovery_interrupt)?;
@@ -198,13 +201,21 @@ impl ResponsesWebSocketTransport {
             ensure_recovery_active(recovery_interrupt)?;
             let (mut connection, selection) = match acquired {
                 Ok(Some(acquired)) => acquired,
-                Ok(None) => return Ok(WebSocketSendOutcome::FallbackToHttp),
+                Ok(None) => {
+                    return Ok(WebSocketSendOutcome::FallbackToHttp {
+                        previous_attempt_ambiguous,
+                    })
+                }
                 Err(ConnectFailure::ImmediateDowngrade) => {
                     self.mark_websocket_sticky(chain_id, fallback_scope).await;
-                    return Ok(WebSocketSendOutcome::FallbackToHttp);
+                    return Ok(WebSocketSendOutcome::FallbackToHttp {
+                        previous_attempt_ambiguous,
+                    });
                 }
                 Err(ConnectFailure::PoolTimeout(_)) => {
-                    return Ok(WebSocketSendOutcome::FallbackToHttp);
+                    return Ok(WebSocketSendOutcome::FallbackToHttp {
+                        previous_attempt_ambiguous,
+                    });
                 }
                 Err(ConnectFailure::Deterministic(error)) => return Err(error),
                 Err(ConnectFailure::Retryable(error)) if attempt < retry_count => {
@@ -237,13 +248,17 @@ impl ResponsesWebSocketTransport {
                 }
                 Err(ConnectFailure::Retryable(_)) => {
                     self.mark_websocket_sticky(chain_id, fallback_scope).await;
-                    return Ok(WebSocketSendOutcome::FallbackToHttp);
+                    return Ok(WebSocketSendOutcome::FallbackToHttp {
+                        previous_attempt_ambiguous,
+                    });
                 }
                 Err(ConnectFailure::TransientStatus(_)) => {
                     // 429/5xx 只说明当前握手暂时失败，不能据此断定这个 endpoint
                     // 在后续请求中不支持 WebSocket。
                     self.pool.clear_chain(chain_id).await;
-                    return Ok(WebSocketSendOutcome::FallbackToHttp);
+                    return Ok(WebSocketSendOutcome::FallbackToHttp {
+                        previous_attempt_ambiguous,
+                    });
                 }
             };
 
@@ -258,7 +273,12 @@ impl ResponsesWebSocketTransport {
                     emit(event);
                 };
                 connection
-                    .run_response(payload, &mut tracking_emit, request_started)
+                    .run_response(
+                        payload,
+                        previous_attempt_ambiguous,
+                        &mut tracking_emit,
+                        request_started,
+                    )
                     .await
             })
             .await
@@ -298,15 +318,19 @@ impl ResponsesWebSocketTransport {
                 Err(WebSocketRequestFailure::PreviousResponseNotFound)
                     if !previous_state_recovery_used =>
                 {
+                    previous_attempt_ambiguous = false;
                     previous_state_recovery_used = true;
                     force_full_history = true;
                     self.pool.clear_chain(chain_id).await;
                 }
                 Err(WebSocketRequestFailure::PreviousResponseNotFound) => {
                     self.pool.clear_chain(chain_id).await;
-                    return Ok(WebSocketSendOutcome::FallbackToHttp);
+                    return Ok(WebSocketSendOutcome::FallbackToHttp {
+                        previous_attempt_ambiguous: false,
+                    });
                 }
                 Err(WebSocketRequestFailure::ConnectionLimit) if attempt < retry_count => {
+                    previous_attempt_ambiguous = false;
                     wait_before_retry(
                         attempt,
                         retry_count,
@@ -321,7 +345,9 @@ impl ResponsesWebSocketTransport {
                 }
                 Err(WebSocketRequestFailure::ConnectionLimit) => {
                     self.pool.clear_chain(chain_id).await;
-                    return Ok(WebSocketSendOutcome::FallbackToHttp);
+                    return Ok(WebSocketSendOutcome::FallbackToHttp {
+                        previous_attempt_ambiguous: false,
+                    });
                 }
                 Err(WebSocketRequestFailure::Response(error))
                     if is_explicit_websocket_message_too_big(&error) =>
@@ -332,7 +358,9 @@ impl ResponsesWebSocketTransport {
                     if emitted_visible_text && !retry_after_partial {
                         return Err(error);
                     }
-                    return Ok(WebSocketSendOutcome::FallbackToHttp);
+                    return Ok(WebSocketSendOutcome::FallbackToHttp {
+                        previous_attempt_ambiguous: false,
+                    });
                 }
                 Err(WebSocketRequestFailure::Response(error))
                     if emitted_visible_text && !retry_after_partial =>
@@ -351,6 +379,7 @@ impl ResponsesWebSocketTransport {
                 Err(WebSocketRequestFailure::Response(error))
                     if websocket_error_is_retryable(&error) && attempt < retry_count =>
                 {
+                    previous_attempt_ambiguous = websocket_response_attempt_ambiguous(&error);
                     wait_before_retry(
                         attempt,
                         retry_count,
@@ -373,7 +402,9 @@ impl ResponsesWebSocketTransport {
                         // WebSocket transport 不可用；只废弃本次 continuation。
                         self.pool.clear_chain(chain_id).await;
                     }
-                    return Ok(WebSocketSendOutcome::FallbackToHttp);
+                    return Ok(WebSocketSendOutcome::FallbackToHttp {
+                        previous_attempt_ambiguous: websocket_response_attempt_ambiguous(&error),
+                    });
                 }
                 Err(WebSocketRequestFailure::Response(error)) => {
                     self.pool.clear_chain(chain_id).await;
@@ -590,6 +621,16 @@ fn ensure_recovery_active(
 fn websocket_error_is_retryable(error: &ResponsesError) -> bool {
     matches!(error, ResponsesError::StreamFailure { .. })
         || matches!(error, ResponsesError::Status { status, .. } if *status == 429 || *status >= 500)
+        || matches!(error, ResponsesError::Failed { code, .. }
+            if code.as_deref().is_some_and(is_transient_error_code))
+}
+
+fn websocket_response_attempt_ambiguous(error: &ResponsesError) -> bool {
+    matches!(
+        error,
+        ResponsesError::StreamFailure { .. } | ResponsesError::Http(_)
+    ) || matches!(error, ResponsesError::Failed { code, .. }
+        if code.as_deref().is_some_and(is_transient_error_code))
 }
 
 fn websocket_error_triggers_sticky_downgrade(error: &ResponsesError) -> bool {
@@ -884,8 +925,9 @@ impl WebSocketConnection {
     async fn run_response(
         &mut self,
         payload: String,
+        previous_attempt_ambiguous: bool,
         emit: &mut (dyn FnMut(ResponsesStreamEvent) + Send),
-        request_started: &mut (dyn FnMut() -> Result<(), ResponsesError> + Send),
+        request_started: &mut (dyn FnMut(bool) -> Result<(), ResponsesError> + Send),
     ) -> Result<ReducedResponses, WebSocketRequestFailure> {
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -901,7 +943,7 @@ impl WebSocketConnection {
         let send_permission = ready_rx
             .await
             .map_err(|_| stream_failure("WebSocket request 发送就绪确认丢失"))?;
-        if let Err(error) = request_started() {
+        if let Err(error) = request_started(previous_attempt_ambiguous) {
             let _ = send_permission.send(false);
             return Err(error.into());
         }
@@ -935,8 +977,21 @@ impl WebSocketConnection {
                         "Responses WebSocket 收到不支持的 binary frame",
                     ))
                 }
-                IncomingMessage::Closed => {
-                    return Err(stream_failure("Responses WebSocket 在完整终态前关闭"))
+                IncomingMessage::Closed { code: Some(1009) } => {
+                    return Err(WebSocketRequestFailure::Response(ResponsesError::Status {
+                        status: 502,
+                        body: serde_json::json!({
+                            "error": { "code": "websocket_message_too_big" }
+                        })
+                        .to_string(),
+                    }))
+                }
+                IncomingMessage::Closed { code } => {
+                    let reason = code.map_or_else(
+                        || "Responses WebSocket 在完整终态前关闭".to_string(),
+                        |code| format!("Responses WebSocket 在完整终态前关闭 (code={code})"),
+                    );
+                    return Err(stream_failure(reason));
                 }
                 IncomingMessage::TransportFailure => {
                     return Err(stream_failure("Responses WebSocket 接收失败"))
@@ -968,7 +1023,7 @@ enum ConnectionCommand {
 enum IncomingMessage {
     Text(String),
     Binary,
-    Closed,
+    Closed { code: Option<u16> },
     TransportFailure,
 }
 
@@ -1011,8 +1066,13 @@ async fn run_connection_actor(
                     invalid.store(true, Ordering::Release);
                     break;
                 }
-                Some(Ok(Message::Close { .. })) => {
-                    notify_active(&active, IncomingMessage::Closed);
+                Some(Ok(Message::Close { code, .. })) => {
+                    notify_active(
+                        &active,
+                        IncomingMessage::Closed {
+                            code: Some(u16::from(code)),
+                        },
+                    );
                     invalid.store(true, Ordering::Release);
                     break;
                 }
@@ -1022,7 +1082,7 @@ async fn run_connection_actor(
                     break;
                 }
                 None => {
-                    notify_active(&active, IncomingMessage::Closed);
+                    notify_active(&active, IncomingMessage::Closed { code: None });
                     invalid.store(true, Ordering::Release);
                     break;
                 }
@@ -1162,7 +1222,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use axum::extract::ws::{Message as AxumMessage, WebSocket as AxumWebSocket, WebSocketUpgrade};
+    use axum::extract::ws::{
+        CloseFrame as AxumCloseFrame, Message as AxumMessage, WebSocket as AxumWebSocket,
+        WebSocketUpgrade,
+    };
     use axum::extract::State;
     use axum::http::header::{CONTENT_TYPE, LOCATION};
     use axum::http::StatusCode;
@@ -1182,10 +1245,12 @@ mod tests {
         ServerErrorStatusCodeOnce,
         WebSocketMessageTooBigHttpSuccess,
         WebSocketMessageTooBigThenHttpMessageTooBigThenSuccess,
+        NativeWebSocketMessageTooBigThenHttp413ThenSuccess,
         UnauthorizedError,
         PingBetweenRequests,
         TrailingEventAfterTerminal,
         PreviousNotFoundOnce,
+        PreviousNotFoundThenContentFilter,
         ConnectionLimitOnce,
         MissingTerminalId,
         CloseBeforeEvents,
@@ -1215,6 +1280,18 @@ mod tests {
         http_requests: AtomicUsize,
         requests: Mutex<Vec<Value>>,
         special_used: AtomicBool,
+    }
+
+    #[test]
+    fn code_only_transient_terminal_is_retryable_and_ambiguous() {
+        let error = ResponsesError::Failed {
+            code: Some("server_error".into()),
+            message: "retry later".into(),
+        };
+
+        assert!(websocket_error_is_retryable(&error));
+        assert!(websocket_response_attempt_ambiguous(&error));
+        assert!(!websocket_error_triggers_sticky_downgrade(&error));
     }
 
     struct TestServer {
@@ -1350,6 +1427,22 @@ mod tests {
             )
                 .into_response();
         }
+        if matches!(
+            &state.behavior,
+            FakeBehavior::NativeWebSocketMessageTooBigThenHttp413ThenSuccess
+        ) && request_number == 1
+        {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({
+                    "error": {
+                        "type": "request_too_large",
+                        "message": "payload too large"
+                    }
+                })),
+            )
+                .into_response();
+        }
         if matches!(&state.behavior, FakeBehavior::VisibleThenClose)
             && request.get("stream").and_then(Value::as_bool) != Some(true)
         {
@@ -1398,6 +1491,7 @@ mod tests {
 
             match &state.behavior {
                 FakeBehavior::PreviousNotFoundOnce
+                | FakeBehavior::PreviousNotFoundThenContentFilter
                     if request.get("previous_response_id").is_some()
                         && !state.special_used.swap(true, Ordering::SeqCst) =>
                 {
@@ -1407,6 +1501,25 @@ mod tests {
                             "type":"error",
                             "code":"previous_response_not_found",
                             "message":"expired"
+                        }),
+                    )
+                    .await;
+                    return;
+                }
+                FakeBehavior::PreviousNotFoundThenContentFilter
+                    if state.special_used.load(Ordering::SeqCst) =>
+                {
+                    send_json_frame(
+                        &mut socket,
+                        json!({
+                            "type":"response.failed",
+                            "response":{
+                                "status":"failed",
+                                "error":{
+                                    "code":"content_filter",
+                                    "message":"blocked"
+                                }
+                            }
                         }),
                     )
                     .await;
@@ -1506,6 +1619,17 @@ mod tests {
                         }),
                     )
                     .await;
+                    return;
+                }
+                FakeBehavior::NativeWebSocketMessageTooBigThenHttp413ThenSuccess
+                    if request_count == 1 =>
+                {
+                    let _ = socket
+                        .send(AxumMessage::Close(Some(AxumCloseFrame {
+                            code: 1009,
+                            reason: "message too big".into(),
+                        })))
+                        .await;
                     return;
                 }
                 FakeBehavior::UnauthorizedError => {
@@ -1648,12 +1772,14 @@ mod tests {
                 }
                 FakeBehavior::Success
                 | FakeBehavior::PreviousNotFoundOnce
+                | FakeBehavior::PreviousNotFoundThenContentFilter
                 | FakeBehavior::ConnectionLimitOnce
                 | FakeBehavior::MaxOutputThenSuccess
                 | FakeBehavior::MaxOutputThenRateLimitThenSuccess
                 | FakeBehavior::ServerErrorStatusCodeOnce
                 | FakeBehavior::WebSocketMessageTooBigHttpSuccess
                 | FakeBehavior::WebSocketMessageTooBigThenHttpMessageTooBigThenSuccess
+                | FakeBehavior::NativeWebSocketMessageTooBigThenHttp413ThenSuccess
                 | FakeBehavior::BlockFirst(_)
                 | FakeBehavior::GateFirst { .. }
                 | FakeBehavior::CloseAfterSignal { .. } => {
@@ -2012,7 +2138,7 @@ mod tests {
                 None,
                 false,
                 &mut |_| {},
-                &mut || {
+                &mut |_| {
                     started_calls = started_calls.saturating_add(1);
                     Err(ResponsesError::RequestPreparation {
                         reason: "test WAL start failure".into(),
@@ -2161,15 +2287,28 @@ mod tests {
     async fn wrapped_status_code_server_error_is_retried() {
         let (server, state) = start_websocket_server(FakeBehavior::ServerErrorStatusCodeOnce).await;
         let transport = transport(&server.endpoint, 1);
-        let (outcome, _) = send_transport(
-            &transport,
-            &request(vec![json!({"type":"message","n":1})]),
-            ProviderRuntimeChainId::new(),
-            1,
-        )
-        .await;
+        let mut starts = Vec::new();
+        let outcome = transport
+            .send_with_retry_count_for_scope_and_start_hook(
+                &request(vec![json!({"type":"message","n":1})]),
+                ProviderRuntimeChainId::new(),
+                None,
+                1,
+                Duration::ZERO,
+                Duration::ZERO,
+                None,
+                false,
+                &mut |_| {},
+                &mut |previous_attempt_ambiguous| {
+                    starts.push(previous_attempt_ambiguous);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
 
         assert!(matches!(outcome, WebSocketSendOutcome::Response(_)));
+        assert_eq!(starts, vec![false, true]);
         assert_eq!(state.connections.load(Ordering::SeqCst), 2);
         assert_eq!(state.http_requests.load(Ordering::SeqCst), 0);
     }
@@ -2226,78 +2365,80 @@ mod tests {
         use crate::config::ToolConfig;
         use crate::tool::ToolRegistry;
 
-        let (server, state) = start_websocket_server(
+        for behavior in [
             FakeBehavior::WebSocketMessageTooBigThenHttpMessageTooBigThenSuccess,
-        )
-        .await;
-        let adapter = Arc::new(
-            OpenAiCompatibleResponsesProviderAdapter::new(
-                "test-key".into(),
-                server.endpoint.clone(),
-                "test-model".into(),
-                Duration::from_secs(2),
-                3,
-                Duration::ZERO,
-                Duration::ZERO,
-            )
-            .unwrap()
-            .with_websockets(true, 1)
-            .unwrap(),
-        );
-        let tools = Arc::new(ToolRegistry::new(&ToolConfig::default()).unwrap());
-        let turn_loop = AgentTurnLoop::new(adapter, tools, 32);
-        let mut png = Vec::new();
-        image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2))
-            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-            .unwrap();
-        let mut events = Vec::new();
+            FakeBehavior::NativeWebSocketMessageTooBigThenHttp413ThenSuccess,
+        ] {
+            let (server, state) = start_websocket_server(behavior).await;
+            let adapter = Arc::new(
+                OpenAiCompatibleResponsesProviderAdapter::new(
+                    "test-key".into(),
+                    server.endpoint.clone(),
+                    "test-model".into(),
+                    Duration::from_secs(2),
+                    3,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )
+                .unwrap()
+                .with_websockets(true, 1)
+                .unwrap(),
+            );
+            let tools = Arc::new(ToolRegistry::new(&ToolConfig::default()).unwrap());
+            let turn_loop = AgentTurnLoop::new(adapter, tools, 32);
+            let mut png = Vec::new();
+            image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2))
+                .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                .unwrap();
+            let mut events = Vec::new();
 
-        let turn = turn_loop
-            .run_session_turn_with_runtime_chain_hooks(
-                SessionTurnRequest {
-                    current_session_id: None,
-                    current_turn_id: None,
-                    system_prompt: "system".into(),
-                    history: Vec::new(),
-                    user_text: "inspect media".into(),
-                    user_attachments: vec![SessionAttachment::InlineImage {
-                        media_type: "image/png".into(),
-                        data: base64::engine::general_purpose::STANDARD.encode(png),
-                    }],
-                    skill_instructions: Vec::new(),
-                },
-                ProviderRuntimeChainId::new(),
-                &mut |event| events.push(event),
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
+            let turn = turn_loop
+                .run_session_turn_with_runtime_chain_hooks(
+                    SessionTurnRequest {
+                        current_session_id: None,
+                        current_turn_id: None,
+                        system_prompt: "system".into(),
+                        history: Vec::new(),
+                        user_text: "inspect media".into(),
+                        user_attachments: vec![SessionAttachment::InlineImage {
+                            media_type: "image/png".into(),
+                            data: base64::engine::general_purpose::STANDARD.encode(&png),
+                        }],
+                        skill_instructions: Vec::new(),
+                    },
+                    ProviderRuntimeChainId::new(),
+                    &mut |event| events.push(event),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
 
-        assert!(turn.messages.iter().any(|message| {
-            message.content.iter().any(
-                |block| matches!(block, SessionTurnContentBlock::Text { text } if text == "ok"),
-            )
-        }));
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(
-                    event,
-                    SessionTurnEvent::Warning { message }
-                        if message == "上游拒绝了过大的请求；已从上下文中移除图片 / PDF 并重试。"
-                ))
-                .count(),
-            1
-        );
-        assert_eq!(state.connections.load(Ordering::SeqCst), 2);
-        assert_eq!(state.http_requests.load(Ordering::SeqCst), 1);
-        let requests = state.requests.lock().await;
-        assert_eq!(requests.len(), 2);
-        assert!(requests[0].to_string().contains("input_image"));
-        assert!(!requests[1].to_string().contains("input_image"));
-        assert!(requests[1].to_string().contains("request_size_recovery"));
+            assert!(turn.messages.iter().any(|message| {
+                message.content.iter().any(
+                    |block| matches!(block, SessionTurnContentBlock::Text { text } if text == "ok"),
+                )
+            }));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        SessionTurnEvent::Warning { message }
+                            if message == "上游拒绝了过大的请求；已从上下文中移除图片 / PDF 并重试。"
+                    ))
+                    .count(),
+                1
+            );
+            assert_eq!(state.connections.load(Ordering::SeqCst), 2);
+            assert_eq!(state.http_requests.load(Ordering::SeqCst), 1);
+            let requests = state.requests.lock().await;
+            assert_eq!(requests.len(), 2);
+            assert!(requests[0].to_string().contains("input_image"));
+            assert!(!requests[1].to_string().contains("input_image"));
+            assert!(requests[1].to_string().contains("request_size_recovery"));
+        }
     }
 
     #[tokio::test]
@@ -2314,7 +2455,10 @@ mod tests {
                 0,
             )
             .await;
-            assert!(matches!(outcome, WebSocketSendOutcome::FallbackToHttp));
+            assert!(matches!(
+                outcome,
+                WebSocketSendOutcome::FallbackToHttp { .. }
+            ));
             assert!(events.is_empty());
             assert!(!transport.pool.is_sticky(chain).await);
         }
@@ -2509,6 +2653,49 @@ mod tests {
         assert!(requests[1].get("previous_response_id").is_some());
         assert!(requests[2].get("previous_response_id").is_none());
         assert_eq!(requests[2]["input"], Value::Array(history));
+    }
+
+    #[tokio::test]
+    async fn previous_response_not_found_marks_full_retry_as_unambiguous() {
+        let (server, _) =
+            start_websocket_server(FakeBehavior::PreviousNotFoundThenContentFilter).await;
+        let transport = transport(&server.endpoint, 2);
+        let chain = ProviderRuntimeChainId::new();
+        let first_input = json!({"type":"message","n":1});
+        let (first, _) =
+            send_transport(&transport, &request(vec![first_input.clone()]), chain, 0).await;
+        let WebSocketSendOutcome::Response(first) = first else {
+            panic!("expected first websocket response");
+        };
+        let mut history = vec![first_input];
+        history.extend(first.output_items);
+        history.push(json!({"type":"message","n":2}));
+        let mut starts = Vec::new();
+
+        let error = transport
+            .send_with_retry_count_for_scope_and_start_hook(
+                &request(history),
+                chain,
+                None,
+                0,
+                Duration::ZERO,
+                Duration::ZERO,
+                None,
+                false,
+                &mut |_| {},
+                &mut |previous_attempt_ambiguous| {
+                    starts.push(previous_attempt_ambiguous);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ResponsesError::Failed { code: Some(code), .. } if code == "content_filter"
+        ));
+        assert_eq!(starts, vec![false, false]);
     }
 
     #[tokio::test]
@@ -2826,7 +3013,10 @@ mod tests {
             0,
         )
         .await;
-        assert!(matches!(timed_out, WebSocketSendOutcome::FallbackToHttp));
+        assert!(matches!(
+            timed_out,
+            WebSocketSendOutcome::FallbackToHttp { .. }
+        ));
         assert!(events.is_empty());
         assert_eq!(state.connections.load(Ordering::SeqCst), 1);
 
@@ -3112,6 +3302,9 @@ mod tests {
             event,
             SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
         )));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, SessionTurnEvent::AssistantOutputDiscarded)));
         assert_eq!(state.connections.load(Ordering::SeqCst), 1);
         assert_eq!(state.http_requests.load(Ordering::SeqCst), 2);
     }
@@ -3218,7 +3411,7 @@ mod tests {
             3,
         )
         .await;
-        assert!(matches!(next, WebSocketSendOutcome::FallbackToHttp));
+        assert!(matches!(next, WebSocketSendOutcome::FallbackToHttp { .. }));
         assert!(next_events.is_empty());
         assert_eq!(state.connections.load(Ordering::SeqCst), 1);
     }
@@ -3243,7 +3436,11 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
-            assert!(matches!(error, ResponsesError::Status { status: 429, .. }));
+            assert!(matches!(
+                error,
+                ResponsesError::Failed { code: Some(code), .. }
+                    if code == "rate_limit_error"
+            ));
             assert_eq!(events.len(), 1);
             assert!(!transport.pool.is_sticky(chain).await);
         }
@@ -3263,7 +3460,7 @@ mod tests {
             1,
         )
         .await;
-        assert!(matches!(first, WebSocketSendOutcome::FallbackToHttp));
+        assert!(matches!(first, WebSocketSendOutcome::FallbackToHttp { .. }));
         assert!(events.is_empty());
         assert_eq!(state.connections.load(Ordering::SeqCst), 2);
 
@@ -3274,7 +3471,10 @@ mod tests {
             1,
         )
         .await;
-        assert!(matches!(second, WebSocketSendOutcome::FallbackToHttp));
+        assert!(matches!(
+            second,
+            WebSocketSendOutcome::FallbackToHttp { .. }
+        ));
         assert_eq!(state.connections.load(Ordering::SeqCst), 2);
     }
 
@@ -3289,7 +3489,10 @@ mod tests {
             0,
         )
         .await;
-        assert!(matches!(outcome, WebSocketSendOutcome::FallbackToHttp));
+        assert!(matches!(
+            outcome,
+            WebSocketSendOutcome::FallbackToHttp { .. }
+        ));
         assert!(events.is_empty());
     }
 
@@ -3309,7 +3512,10 @@ mod tests {
                 0,
             )
             .await;
-            assert!(matches!(outcome, WebSocketSendOutcome::FallbackToHttp));
+            assert!(matches!(
+                outcome,
+                WebSocketSendOutcome::FallbackToHttp { .. }
+            ));
             assert!(events.is_empty());
         }
     }

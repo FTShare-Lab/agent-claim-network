@@ -10,24 +10,25 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::chat_completions::{
-    is_stream_failure, ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest,
-    ChatCompletionResponse, ChatCompletionsClient, ChatCompletionsError, ChatContentPart,
-    ChatFinishReason, ChatMessage, ChatMessageContent, ChatStreamEvent, ChatStreamOptions,
-    ChatTool, ChatToolCall,
+    is_stream_failure, redact_chat_error_body, ChatCompletionChoice, ChatCompletionMessage,
+    ChatCompletionRequest, ChatCompletionResponse, ChatCompletionsClient, ChatCompletionsError,
+    ChatContentPart, ChatFinishReason, ChatMessage, ChatMessageContent, ChatStreamEvent,
+    ChatStreamOptions, ChatTool, ChatToolCall,
 };
 use super::context_usage_from_openai_usage;
 use super::continuation::{
     append_with_overlap_dedupe, CONTINUATION_TRIGGER, MAX_CONTINUATION_TURNS,
 };
 use super::provider::{
-    NoopProviderRequestObserver, ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy,
-    ProviderNoConsumableOutput, ProviderRecoveryInterrupt, ProviderReplayIdentity,
-    ProviderReplayProtocol, ProviderRequest, ProviderRequestObserver,
-    ProviderRequestPreparationFailure, ProviderRequestTooLarge, ProviderResponse, ProviderStop,
-    ProviderStreamFailure, ProviderTerminalFailure, ProviderTransport, ToolSpec,
+    NoopProviderRequestObserver, ProviderAdapter, ProviderContextWindowExceeded, ProviderEvent,
+    ProviderHistoryMediaPolicy, ProviderMediaRejected, ProviderNoConsumableOutput,
+    ProviderRecoveryInterrupt, ProviderReplayIdentity, ProviderReplayProtocol, ProviderRequest,
+    ProviderRequestObserver, ProviderRequestPreparationFailure, ProviderRequestRejected,
+    ProviderRequestTooLarge, ProviderResponse, ProviderStop, ProviderStreamFailure,
+    ProviderTerminalFailure, ProviderTransport, ToolSpec,
 };
-use super::redact_media_error_body;
 use super::types::{ProviderReplayState, SessionTurnContentBlock, SessionTurnMessage};
+use super::{is_content_policy_error_body, is_context_window_error_body};
 use crate::api::SessionTurnInterrupted;
 use crate::config::ReasoningEffort;
 
@@ -41,6 +42,10 @@ pub enum OpenAiCompatibleChatError {
     NoConsumableOutput { reason: String },
     #[error("Chat Completions 返回确定性终态: {reason}")]
     TerminalFailure { reason: String },
+    #[error("Chat Completions 内容过滤终态: {reason}")]
+    ContentFiltered { reason: String },
+    #[error("Chat Completions 模型拒绝了本次请求")]
+    Refused,
     #[error("准备 Chat continuation request 失败: {reason}")]
     RequestPreparation { reason: String },
     #[error(
@@ -211,17 +216,18 @@ impl OpenAiCompatibleChatProviderAdapter {
             );
             let mut request_start_recorded = false;
             let response_result = {
-                let mut request_started = || {
-                    if request_start_recorded {
-                        return Ok(());
-                    }
+                let mut request_started = |previous_attempt_ambiguous| {
+                    let first_start = !request_start_recorded;
                     observer
-                        .provider_request_started(&provider_messages)
+                        .provider_request_started_after(
+                            &provider_messages,
+                            previous_attempt_ambiguous,
+                        )
                         .map_err(|error| ChatCompletionsError::RequestPreparation {
                             reason: format!("{error:#}"),
                         })?;
                     request_start_recorded = true;
-                    if round > 0 {
+                    if first_start && round > 0 {
                         continuation_requests_started =
                             continuation_requests_started.saturating_add(1);
                     }
@@ -258,7 +264,14 @@ impl OpenAiCompatibleChatProviderAdapter {
                 }
             };
             let response = match response_result {
-                Ok(response) => response,
+                Ok(response) => {
+                    observer
+                        .provider_request_outcome_resolved(&provider_messages)
+                        .map_err(|error| OpenAiCompatibleChatError::RequestPreparation {
+                            reason: format!("{error:#}"),
+                        })?;
+                    response
+                }
                 Err(ChatCompletionsError::RecoveryInterrupted)
                     if !request_start_recorded
                         && last_finish_reason == Some(ChatFinishReason::Length)
@@ -277,7 +290,16 @@ impl OpenAiCompatibleChatProviderAdapter {
                     last_finish_reason = Some(ChatFinishReason::Stop);
                     break;
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    if chat_client_outcome_resolved(&error) {
+                        observer
+                            .provider_request_outcome_resolved(&provider_messages)
+                            .map_err(|error| OpenAiCompatibleChatError::RequestPreparation {
+                                reason: format!("{error:#}"),
+                            })?;
+                    }
+                    return Err(error.into());
+                }
             };
             if let Some(usage) = response
                 .usage
@@ -290,6 +312,19 @@ impl OpenAiCompatibleChatProviderAdapter {
             let assistant = choice.message;
             let finish_reason = require_finish_reason(choice.finish_reason)?;
             reject_unsupported_finish_reason(&finish_reason)?;
+            if assistant
+                .refusal
+                .as_deref()
+                .is_some_and(|refusal| !refusal.trim().is_empty())
+            {
+                return Err(OpenAiCompatibleChatError::Refused);
+            }
+            observer
+                .provider_response_accepted(&provider_messages)
+                .await
+                .map_err(|error| OpenAiCompatibleChatError::RequestPreparation {
+                    reason: format!("{error:#}"),
+                })?;
             if let Some(text) = assistant.content.as_deref() {
                 append_with_overlap_dedupe(&mut merged_text, text);
             }
@@ -479,13 +514,29 @@ impl OpenAiCompatibleChatProviderAdapter {
                 if let Some(error) = classify_request_too_large(&error) {
                     return Err(error.into());
                 }
+                if classify_context_window_exceeded(&error) {
+                    return Err(ProviderContextWindowExceeded::new().into());
+                }
                 if request.stream && chat_adapter_stream_failure(&error) {
                     return Err(ProviderStreamFailure::new(error.to_string()).into());
+                }
+                if let OpenAiCompatibleChatError::ContentFiltered { reason } = &error {
+                    return Err(ProviderRequestRejected::new(reason.clone()).into());
+                }
+                if matches!(&error, OpenAiCompatibleChatError::Refused) {
+                    return Err(ProviderRequestRejected::new(error.to_string()).into());
                 }
                 if let OpenAiCompatibleChatError::TerminalFailure { reason } = &error {
                     return Err(ProviderTerminalFailure::new(reason.clone()).into());
                 }
-                return Err(wrap_media_rejection(error, request_has_media).into());
+                let error = wrap_media_rejection(error, request_has_media);
+                if matches!(&error, OpenAiCompatibleChatError::MediaRejected { .. }) {
+                    return Err(ProviderMediaRejected::new(error.to_string()).into());
+                }
+                if chat_adapter_request_rejected(&error) {
+                    return Err(ProviderRequestRejected::new(error.to_string()).into());
+                }
+                return Err(error.into());
             }
         };
         if !turn.merged_text.trim().is_empty() {
@@ -505,6 +556,28 @@ impl OpenAiCompatibleChatProviderAdapter {
 
 fn chat_adapter_stream_failure(error: &OpenAiCompatibleChatError) -> bool {
     matches!(error, OpenAiCompatibleChatError::Client(error) if is_stream_failure(error))
+}
+
+fn chat_client_outcome_resolved(error: &ChatCompletionsError) -> bool {
+    match error {
+        ChatCompletionsError::Failed { .. } => !is_stream_failure(error),
+        ChatCompletionsError::Auth(_) | ChatCompletionsError::Status { .. } => true,
+        _ => false,
+    }
+}
+
+fn chat_adapter_request_rejected(error: &OpenAiCompatibleChatError) -> bool {
+    match error {
+        OpenAiCompatibleChatError::Client(ChatCompletionsError::Status { status, body }) => {
+            crate::api::is_provider_request_error(*status, body)
+        }
+        OpenAiCompatibleChatError::Client(ChatCompletionsError::Failed { code, message }) => {
+            code.as_deref()
+                .is_some_and(crate::api::is_provider_deterministic_request_error_code)
+                || crate::api::is_provider_deterministic_request_error_code(message)
+        }
+        _ => false,
+    }
 }
 
 struct ContinuedChatTurn {
@@ -694,7 +767,7 @@ fn messages_contain_media(messages: &[ChatMessage]) -> bool {
     })
 }
 
-/// 请求携带媒体 parts 时，上游 4xx（鉴权 / 限流除外）大概率是模型不支持多模态：
+/// 请求携带媒体 parts 时，上游明确的请求格式错误可能表示模型不支持多模态：
 /// 不支持多模态的网关常报"参数 / 格式不对"之类的误导性文案，这里补上明确提示，
 /// 同时在 Display 中保留上游核心错误信息（PRD 要求不静默降级）。
 fn wrap_media_rejection(
@@ -706,13 +779,32 @@ fn wrap_media_rejection(
     }
     match error {
         OpenAiCompatibleChatError::Client(ChatCompletionsError::Status { status, body })
-            if (400..500).contains(&status) && status != 401 && status != 429 =>
+            if crate::api::is_provider_request_error(status, &body) =>
         {
-            OpenAiCompatibleChatError::MediaRejected {
-                source: ChatCompletionsError::Status {
-                    status,
-                    body: redact_media_error_body(&body),
-                },
+            let content_policy = is_content_policy_error_body(&body);
+            let body = redact_chat_error_body(&body);
+            if content_policy {
+                OpenAiCompatibleChatError::Client(ChatCompletionsError::Status { status, body })
+            } else {
+                OpenAiCompatibleChatError::MediaRejected {
+                    source: ChatCompletionsError::Status { status, body },
+                }
+            }
+        }
+        OpenAiCompatibleChatError::Client(ChatCompletionsError::Failed { code, message })
+            if code
+                .as_deref()
+                .is_some_and(crate::api::is_provider_deterministic_request_error_code)
+                || crate::api::is_provider_deterministic_request_error_code(&message) =>
+        {
+            let content_policy = code.as_deref().is_some_and(is_content_policy_error_body)
+                || is_content_policy_error_body(&message);
+            if content_policy {
+                OpenAiCompatibleChatError::Client(ChatCompletionsError::Failed { code, message })
+            } else {
+                OpenAiCompatibleChatError::MediaRejected {
+                    source: ChatCompletionsError::Failed { code, message },
+                }
             }
         }
         other => other,
@@ -722,11 +814,24 @@ fn wrap_media_rejection(
 fn classify_request_too_large(
     error: &OpenAiCompatibleChatError,
 ) -> Option<ProviderRequestTooLarge> {
-    let OpenAiCompatibleChatError::Client(ChatCompletionsError::Status { status: 413, .. }) = error
+    let OpenAiCompatibleChatError::Client(ChatCompletionsError::Status { status, body }) = error
     else {
         return None;
     };
-    Some(ProviderRequestTooLarge::new())
+    crate::api::is_provider_request_too_large(*status, body).then(ProviderRequestTooLarge::new)
+}
+
+fn classify_context_window_exceeded(error: &OpenAiCompatibleChatError) -> bool {
+    match error {
+        OpenAiCompatibleChatError::Client(ChatCompletionsError::Status { body, .. }) => {
+            is_context_window_error_body(body)
+        }
+        OpenAiCompatibleChatError::Client(ChatCompletionsError::Failed { code, message }) => {
+            code.as_deref().is_some_and(is_context_window_error_body)
+                || is_context_window_error_body(message)
+        }
+        _ => false,
+    }
 }
 
 fn first_choice(
@@ -795,7 +900,7 @@ fn reject_unsupported_finish_reason(
         | ChatFinishReason::ToolCalls
         | ChatFinishReason::Length
         | ChatFinishReason::FunctionCall => Ok(()),
-        ChatFinishReason::ContentFilter => Err(OpenAiCompatibleChatError::TerminalFailure {
+        ChatFinishReason::ContentFilter => Err(OpenAiCompatibleChatError::ContentFiltered {
             reason: "finish_reason=content_filter，拒绝把被过滤输出当作完整 assistant 回合".into(),
         }),
         ChatFinishReason::Other => Err(OpenAiCompatibleChatError::TerminalFailure {
@@ -1473,6 +1578,7 @@ mod tests {
             message: ChatCompletionMessage {
                 role: Some("assistant".into()),
                 content: Some("准备调用".into()),
+                refusal: None,
                 tool_calls: vec![ChatToolCall::function(
                     "call_1",
                     "workspace_read",
@@ -1551,6 +1657,7 @@ mod tests {
             message: ChatCompletionMessage {
                 role: Some("assistant".into()),
                 content: Some("cut".into()),
+                refusal: None,
                 tool_calls: Vec::new(),
             },
             finish_reason: Some(ChatFinishReason::Length),
@@ -1566,9 +1673,104 @@ mod tests {
 
         assert!(matches!(
             err,
-            OpenAiCompatibleChatError::TerminalFailure { .. }
+            OpenAiCompatibleChatError::ContentFiltered { .. }
         ));
         assert!(err.to_string().contains("content_filter"));
+    }
+
+    #[tokio::test]
+    async fn explicit_refusal_is_a_request_rejection_without_assistant_commit() {
+        let (endpoint, captured) = spawn_chat_json_sequence(vec![json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "refusal": "cannot comply"
+                },
+                "finish_reason": "stop"
+            }]
+        })])
+        .await;
+        let adapter = OpenAiCompatibleChatProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            Duration::from_secs(5),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let mut events = Vec::new();
+
+        let error = adapter
+            .send(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 32,
+                    stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: None,
+                    allow_continuation: false,
+                    retry_count_override: None,
+                },
+                &mut |event| events.push(event),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<ProviderRequestRejected>().is_some());
+        assert!(events.is_empty());
+        assert_eq!(captured.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_finish_reason_is_terminal_without_clearing_request_history() {
+        let (endpoint, captured) = spawn_chat_json_sequence(vec![json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "future terminal"},
+                "finish_reason": "new_terminal_reason"
+            }]
+        })])
+        .await;
+        let adapter = OpenAiCompatibleChatProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            Duration::from_secs(5),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        let error = adapter
+            .send(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("request")],
+                    tools: Vec::new(),
+                    max_tokens: 32,
+                    stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: None,
+                    allow_continuation: false,
+                    retry_count_override: None,
+                },
+                &mut |_| {},
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<ProviderTerminalFailure>().is_some());
+        assert!(error.downcast_ref::<ProviderRequestRejected>().is_none());
+        assert_eq!(captured.await.unwrap().len(), 1);
     }
 
     #[test]
@@ -1593,6 +1795,7 @@ mod tests {
             message: ChatCompletionMessage {
                 role: Some("assistant".into()),
                 content: None,
+                refusal: None,
                 tool_calls: Vec::new(),
             },
             finish_reason: Some(ChatFinishReason::Stop),
@@ -1614,6 +1817,7 @@ mod tests {
             message: ChatCompletionMessage {
                 role: Some("assistant".into()),
                 content: None,
+                refusal: None,
                 tool_calls: Vec::new(),
             },
             finish_reason: Some(ChatFinishReason::ToolCalls),
@@ -1635,6 +1839,7 @@ mod tests {
             message: ChatCompletionMessage {
                 role: Some("assistant".into()),
                 content: Some("我来查询".into()),
+                refusal: None,
                 tool_calls: Vec::new(),
             },
             finish_reason: Some(ChatFinishReason::ToolCalls),
@@ -1658,7 +1863,7 @@ mod tests {
     }
 
     #[test]
-    fn media_request_4xx_wraps_hint_and_preserves_upstream_body() {
+    fn media_request_4xx_wraps_hint_and_redacts_upstream_body() {
         let error = wrap_media_rejection(
             OpenAiCompatibleChatError::Client(ChatCompletionsError::Status {
                 status: 400,
@@ -1668,9 +1873,54 @@ mod tests {
         );
         let text = error.to_string();
         assert!(text.contains("可能不支持图片 / PDF 附件"));
-        // 上游核心错误信息必须保留
-        assert!(text.contains("1210: 文件格式不正确"));
+        assert!(text.contains("redacted Chat Completions request/replay payload"));
+        assert!(!text.contains("1210: 文件格式不正确"));
         assert!(text.contains("HTTP 400"));
+    }
+
+    #[test]
+    fn media_request_content_policy_error_is_not_rewritten_as_media_rejection() {
+        let media_secret = "A".repeat(300);
+        let system_secret = "private-system-prompt";
+        let user_secret = "private-user-prompt";
+        let tool_secret = "private-tool-argument";
+        for code in [
+            "content_filter",
+            "content_policy_violation",
+            "safety_violation",
+        ] {
+            let error = wrap_media_rejection(
+                OpenAiCompatibleChatError::Client(ChatCompletionsError::Status {
+                    status: 400,
+                    body: json!({
+                        "error":{"code":code},
+                        "request": {
+                            "messages": [
+                                {"role":"system", "content":system_secret},
+                                {"role":"user", "content":user_secret},
+                                {"role":"assistant", "tool_calls":[{
+                                    "function":{"arguments":tool_secret}
+                                }]}
+                            ]
+                        },
+                        "image":format!("data:image/png;base64,{media_secret}")
+                    })
+                    .to_string(),
+                }),
+                true,
+            );
+
+            assert!(matches!(
+                &error,
+                OpenAiCompatibleChatError::Client(ChatCompletionsError::Status { status: 400, .. })
+            ));
+            assert!(chat_adapter_request_rejected(&error));
+            let text = error.to_string();
+            assert!(!text.contains(&media_secret));
+            assert!(!text.contains(system_secret));
+            assert!(!text.contains(user_secret));
+            assert!(!text.contains(tool_secret));
+        }
     }
 
     #[test]
@@ -1711,6 +1961,158 @@ mod tests {
             ))
             .is_none()
         );
+        for code in [
+            "authentication_error",
+            "model_not_found",
+            "rate_limit_error",
+            "future_error",
+            "content_length_exceeded",
+        ] {
+            assert!(
+                classify_request_too_large(&OpenAiCompatibleChatError::Client(
+                    ChatCompletionsError::Status {
+                        status: 413,
+                        body: json!({"error":{"code":code}}).to_string(),
+                    }
+                ))
+                .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn http_400_context_limit_precedes_media_rejection() {
+        let error = OpenAiCompatibleChatError::Client(ChatCompletionsError::Status {
+            status: 400,
+            body: "prompt is too long".into(),
+        });
+
+        assert!(classify_context_window_exceeded(&error));
+        assert!(chat_adapter_request_rejected(&error));
+    }
+
+    #[test]
+    fn deterministic_chat_4xx_is_a_request_rejection() {
+        let error = OpenAiCompatibleChatError::Client(ChatCompletionsError::Status {
+            status: 422,
+            body: "invalid historical block".into(),
+        });
+
+        assert!(chat_adapter_request_rejected(&error));
+
+        for status in [408, 409, 423, 425, 499] {
+            let ambiguous = OpenAiCompatibleChatError::Client(ChatCompletionsError::Status {
+                status,
+                body: "request outcome unknown".into(),
+            });
+            assert!(!chat_adapter_request_rejected(&ambiguous));
+        }
+    }
+
+    #[test]
+    fn structured_chat_codes_override_status_only_classification() {
+        let auth = OpenAiCompatibleChatError::Client(ChatCompletionsError::Status {
+            status: 400,
+            body: redact_chat_error_body(
+                r#"{"error":{"code":"authentication_error","message":"bad key"}}"#,
+            ),
+        });
+        assert!(!chat_adapter_request_rejected(&auth));
+        assert!(!classify_context_window_exceeded(&auth));
+
+        let context = OpenAiCompatibleChatError::Client(ChatCompletionsError::Status {
+            status: 403,
+            body: redact_chat_error_body(
+                r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#,
+            ),
+        });
+        assert!(classify_context_window_exceeded(&context));
+        assert!(chat_adapter_request_rejected(&context));
+
+        let media = wrap_media_rejection(
+            OpenAiCompatibleChatError::Client(ChatCompletionsError::Status {
+                status: 403,
+                body: redact_chat_error_body(
+                    r#"{"error":{"code":"unsupported_media_type","message":"bad image"}}"#,
+                ),
+            }),
+            true,
+        );
+        assert!(matches!(
+            media,
+            OpenAiCompatibleChatError::MediaRejected { .. }
+        ));
+
+        for code in [
+            "invalid_api_key",
+            "model_not_found",
+            "unknown_provider_error",
+        ] {
+            let error = OpenAiCompatibleChatError::Client(ChatCompletionsError::Status {
+                status: 400,
+                body: redact_chat_error_body(
+                    &json!({"error":{"code":code,"message":"configuration error"}}).to_string(),
+                ),
+            });
+            assert!(!chat_adapter_request_rejected(&error), "code={code}");
+        }
+
+        let invalid_prompt = OpenAiCompatibleChatError::Client(ChatCompletionsError::Status {
+            status: 404,
+            body: redact_chat_error_body(
+                r#"{"error":{"code":"invalid_prompt","message":"invalid history"}}"#,
+            ),
+        });
+        assert!(chat_adapter_request_rejected(&invalid_prompt));
+    }
+
+    #[test]
+    fn structured_chat_stream_errors_keep_deterministic_semantics() {
+        let context = OpenAiCompatibleChatError::Client(ChatCompletionsError::Failed {
+            code: Some("context_length_exceeded".into()),
+            message: "context_length_exceeded: redacted".into(),
+        });
+        assert!(classify_context_window_exceeded(&context));
+        assert!(chat_adapter_request_rejected(&context));
+
+        let media = wrap_media_rejection(
+            OpenAiCompatibleChatError::Client(ChatCompletionsError::Failed {
+                code: Some("unsupported_media_type".into()),
+                message: "unsupported_media_type: redacted".into(),
+            }),
+            true,
+        );
+        assert!(matches!(
+            media,
+            OpenAiCompatibleChatError::MediaRejected { .. }
+        ));
+
+        let rate_limit = ChatCompletionsError::Failed {
+            code: Some("rate_limit_error".into()),
+            message: "rate_limit_error: redacted".into(),
+        };
+        assert!(!chat_client_outcome_resolved(&rate_limit));
+        let rate_limit = OpenAiCompatibleChatError::Client(rate_limit);
+        assert!(!chat_adapter_request_rejected(&rate_limit));
+        assert!(chat_adapter_stream_failure(&rate_limit));
+    }
+
+    #[test]
+    fn chat_stream_policy_message_is_not_rewritten_as_media_rejection() {
+        for code in [Some("invalid_request_error".into()), None] {
+            let error = OpenAiCompatibleChatError::Client(ChatCompletionsError::Failed {
+                code,
+                message: redact_chat_error_body(
+                    r#"{"error":{"message":"content_policy_violation"}}"#,
+                ),
+            });
+
+            assert!(chat_adapter_request_rejected(&error));
+            assert!(!matches!(
+                wrap_media_rejection(error, true),
+                OpenAiCompatibleChatError::MediaRejected { .. }
+            ));
+        }
     }
 
     #[test]
@@ -1723,7 +2125,8 @@ mod tests {
             true,
         );
         let text = error.to_string();
-        assert!(text.contains("data:image/png;base64,[redacted media payload]"));
+        assert!(text.contains("redacted Chat Completions request/replay payload"));
+        assert!(!text.contains("data:image/png;base64"));
         assert!(!text.contains(&"A".repeat(300)));
     }
 
@@ -1738,8 +2141,8 @@ mod tests {
             false,
         );
         assert!(!error.to_string().contains("可能不支持图片"));
-        // 401 / 429 与多模态无关：原样透传
-        for status in [401u16, 429] {
+        // 鉴权、结果不确定的超时和限流与多模态无关：原样透传
+        for status in [401u16, 408, 429] {
             let error = wrap_media_rejection(
                 OpenAiCompatibleChatError::Client(ChatCompletionsError::Status {
                     status,

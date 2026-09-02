@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::context::AgentContext;
 use super::inbox::{
@@ -31,8 +31,9 @@ use crate::api::{
     project_turn_message_for_safe_transcript, trailing_model_context_segments, AgentTurnLoop,
     ClaimAttributeUpdateInternalizeRequest, CompletedSessionTurnMessage, ContextUsageSnapshot,
     ContextUsageSource, InboxInternalizeKind, InternalizeRequest, MemoryReviewLoop,
-    ModelContextSource, ProviderReplayIdentity, SessionAttachment, SessionCompactionOutcome,
-    SessionTurn, SessionTurnContentBlock, SessionTurnContextAppender, SessionTurnEvent,
+    ModelContextSource, ProviderRejectedRequestRecovery, ProviderReplayIdentity,
+    ProviderRequestRejected, SessionAttachment, SessionCompactionOutcome, SessionTurn,
+    SessionTurnContentBlock, SessionTurnContextAppender, SessionTurnEvent,
     SessionTurnEventRecorder, SessionTurnHooks, SessionTurnInterrupted, SessionTurnMessage,
     SessionTurnPreflight, SessionTurnRequest, StructuredJsonAttemptRequest, StructuredJsonCaller,
     ToolBoundaryControl, TurnMessage,
@@ -57,6 +58,7 @@ use crate::session::{
     TurnJournalEventKind, TurnJournalFlush, TurnJournalStatus, TurnJournalTurn,
 };
 use crate::skill::{resolve_explicit_skill_instructions, SkillInjectionLimits, SkillInstructions};
+use crate::storage::write_text_atomic;
 use crate::storage::FileLockGuard;
 use crate::tool::{BackgroundProcessEvent, ProcessCompletion, ToolRegistry};
 use tokio::io::AsyncWriteExt;
@@ -363,8 +365,129 @@ struct PreflightCompactor<'a> {
     capture_provider_history: bool,
     last_compacted_provider_history: Option<Vec<SessionTurnMessage>>,
     provider_compaction_before_pending_request: Option<Option<SessionCompactionState>>,
+    provider_compaction_before_started_request: Option<Option<SessionCompactionState>>,
+    provider_compaction_before_turn: Option<Option<SessionCompactionState>>,
+    provider_compaction_before_clean_retry: Option<Option<SessionCompactionState>>,
+    provider_response_accepted_in_turn: bool,
     background_completion_delivery_seq: Arc<AtomicU64>,
     provider_replay_identity: Option<ProviderReplayIdentity>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProviderRejectionRecoveryRecord {
+    turn_id: String,
+    rejection_id: u64,
+    discard_turn: bool,
+    #[serde(default)]
+    cleaned_request: bool,
+    previous_compaction: Option<SessionCompactionState>,
+    previous_provider_history: Option<Box<CompactedProviderHistory>>,
+}
+
+impl ProviderRejectionRecoveryRecord {
+    fn new(
+        turn_id: String,
+        rejection_id: u64,
+        recovery: ProviderRejectedRequestRecovery,
+        mut previous_compaction: Option<SessionCompactionState>,
+    ) -> Self {
+        let previous_provider_history = previous_compaction
+            .as_mut()
+            .and_then(|compaction| compaction.provider_history.take());
+        Self {
+            turn_id,
+            rejection_id,
+            discard_turn: recovery == ProviderRejectedRequestRecovery::DiscardTurn,
+            cleaned_request: false,
+            previous_compaction,
+            previous_provider_history,
+        }
+    }
+
+    fn cleaned_request(
+        turn_id: String,
+        mut cleaned_compaction: Option<SessionCompactionState>,
+    ) -> Self {
+        let previous_provider_history = cleaned_compaction
+            .as_mut()
+            .and_then(|compaction| compaction.provider_history.take());
+        Self {
+            turn_id,
+            rejection_id: 0,
+            discard_turn: false,
+            cleaned_request: true,
+            previous_compaction: cleaned_compaction,
+            previous_provider_history,
+        }
+    }
+
+    fn recovery(&self) -> ProviderRejectedRequestRecovery {
+        if self.discard_turn {
+            ProviderRejectedRequestRecovery::DiscardTurn
+        } else {
+            ProviderRejectedRequestRecovery::PreserveTurnProgress
+        }
+    }
+
+    fn into_recovery_compaction(mut self) -> Option<SessionCompactionState> {
+        if let Some(compaction) = self.previous_compaction.as_mut() {
+            compaction.provider_history = self.previous_provider_history.take();
+        }
+        self.previous_compaction
+    }
+}
+
+async fn write_provider_rejection_recovery(
+    path: &Path,
+    recovery: &ProviderRejectionRecoveryRecord,
+) -> anyhow::Result<()> {
+    let encoded = serde_json::to_vec(recovery).context("序列化 Provider 拒绝恢复记录失败")?;
+    write_text_atomic(path, &encoded)
+        .await
+        .context("持久化 Provider 拒绝恢复记录失败")?;
+    sync_parent_directory(path).await
+}
+
+async fn read_provider_rejection_recovery(
+    path: &Path,
+) -> anyhow::Result<Option<ProviderRejectionRecoveryRecord>> {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("读取 Provider 拒绝恢复记录失败: {path:?}"));
+        }
+    };
+    serde_json::from_slice(&bytes)
+        .context("解析 Provider 拒绝恢复记录失败")
+        .map(Some)
+}
+
+async fn clear_provider_rejection_recovery(path: &Path) -> anyhow::Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => sync_parent_directory(path).await,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("删除 Provider 拒绝恢复记录失败: {path:?}"))
+        }
+    }
+}
+
+async fn sync_parent_directory(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path.parent().context("持久化 session 文件时缺少父目录")?;
+        let directory = tokio::fs::File::open(parent)
+            .await
+            .with_context(|| format!("打开 session 目录以执行 fsync 失败: {parent:?}"))?;
+        directory
+            .sync_all()
+            .await
+            .with_context(|| format!("fsync session 目录失败: {parent:?}"))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 struct MainModelContextAppender {
@@ -675,7 +798,10 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
                 }
                 None => 0,
             };
-        if forced_context_recovery && recovery_protected_tail_segments == 0 {
+        if forced_context_recovery
+            && self.context_window_recovery_tail_marker.is_some()
+            && recovery_protected_tail_segments == 0
+        {
             anyhow::bail!("上下文续写状态异常，无法自动恢复");
         }
         let protected_active_tail_segments = recovery_protected_tail_segments
@@ -701,7 +827,7 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
             Ok(Some(projection)) => projection,
             Ok(None) => {
                 if forced_context_recovery {
-                    anyhow::bail!("模型上下文已满，但没有可安全压缩的历史。请简化任务后重试。");
+                    anyhow::bail!("模型上下文已满，但没有可安全压缩的历史。请新建会话后重试。");
                 }
                 return Ok(());
             }
@@ -750,7 +876,7 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
                     target: "agent",
                     "context recovery compaction 未缩小请求：压缩前估算 {trigger_tokens} tokens，压缩后估算 {projected_tokens} tokens"
                 );
-                anyhow::bail!("自动压缩未能释放上下文空间。请简化任务或新建会话。");
+                anyhow::bail!("自动压缩未能释放上下文空间。请新建会话后重试。");
             }
         }
         Ok(())
@@ -765,6 +891,18 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
         }
         self.context_window_recovery_tail_marker
             .get_or_insert_with(|| assistant_marker.clone());
+        self.context_window_recovery_requested = true;
+        Ok(())
+    }
+
+    fn request_context_window_recovery_for_rejected_request(
+        &mut self,
+        _provider_messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<()> {
+        if self.engine.compaction.auto_compact_ctx_ratio == 0.0 {
+            anyhow::bail!("模型上下文已满，但自动压缩已关闭。请启用自动压缩或新建会话。");
+        }
+        self.context_window_recovery_tail_marker = None;
         self.context_window_recovery_requested = true;
         Ok(())
     }
@@ -784,6 +922,10 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
 
     fn clear_provider_context_usage(&mut self) {
         self.provider_context_anchor = None;
+    }
+
+    fn provider_response_accepted(&mut self) {
+        self.provider_response_accepted_in_turn = true;
     }
 
     fn history_replacement_expected(
@@ -859,7 +1001,10 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
         _provider_messages: &[SessionTurnMessage],
     ) -> anyhow::Result<()> {
         // 网络发送一旦开始，结果在 crash/cancel 下就可能已被上游接受；保守保留 WAL。
-        self.provider_compaction_before_pending_request = None;
+        if self.provider_compaction_before_pending_request.is_some() {
+            self.provider_compaction_before_started_request =
+                self.provider_compaction_before_pending_request.take();
+        }
         Ok(())
     }
 
@@ -871,6 +1016,7 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
             Some(compaction) => self.session.update_compaction(compaction).await?,
             None => self.session.clear_compaction().await?,
         }
+        sync_parent_directory(&self.session.paths.provider_rejection_recovery_json).await?;
         self.last_compacted_provider_history = self
             .session
             .read_metadata()
@@ -881,7 +1027,170 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
         Ok(())
     }
 
+    async fn provider_request_cleaned_for_retry(
+        &mut self,
+        provider_messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<()> {
+        let mut previous = self
+            .provider_compaction_before_started_request
+            .clone()
+            .context("Provider 媒体恢复缺少本次发送前的 compaction 快照")?;
+        if let Some(history) = previous
+            .as_mut()
+            .and_then(|compaction| compaction.provider_history.as_mut())
+        {
+            let previous_len = history.messages.len();
+            let cleaned_prefix = provider_messages
+                .get(..previous_len)
+                .context("清理后的 Provider history 短于发送前快照")?;
+            history.messages = cleaned_prefix.to_vec();
+        }
+        let metadata = self.session.read_metadata().await?;
+        let mut cleaned_compaction = metadata
+            .compaction
+            .context("Provider 媒体恢复缺少当前 request WAL")?;
+        let cleaned_history = cleaned_compaction
+            .provider_history
+            .as_mut()
+            .context("Provider 媒体恢复缺少 provider history")?;
+        let pending = cleaned_history
+            .pending_turn
+            .as_ref()
+            .filter(|pending| pending.turn_id == self.turn_id)
+            .context("Provider 媒体恢复的 request WAL 不属于当前 turn")?;
+        if pending
+            .provider_request_message_count
+            .unwrap_or(cleaned_history.messages.len())
+            != provider_messages.len()
+        {
+            anyhow::bail!("清理后的 Provider request 与当前 WAL 长度不一致");
+        }
+        cleaned_history.messages = provider_messages.to_vec();
+        let record = ProviderRejectionRecoveryRecord::cleaned_request(
+            self.turn_id.clone(),
+            Some(cleaned_compaction.clone()),
+        );
+        write_provider_rejection_recovery(
+            &self.session.paths.provider_rejection_recovery_json,
+            &record,
+        )
+        .await?;
+        self.session.update_compaction(cleaned_compaction).await?;
+        sync_parent_directory(&self.session.paths.provider_rejection_recovery_json).await?;
+        clear_provider_rejection_recovery(&self.session.paths.provider_rejection_recovery_json)
+            .await?;
+        self.last_compacted_provider_history = Some(provider_messages.to_vec());
+        self.provider_compaction_before_clean_retry = Some(previous);
+        Ok(())
+    }
+
+    async fn prepare_provider_request_rejection(
+        &mut self,
+        rejection_id: u64,
+    ) -> anyhow::Result<ProviderRejectedRequestRecovery> {
+        let metadata = self.session.read_metadata().await?;
+        let Some(compaction) = metadata.compaction else {
+            anyhow::bail!("Provider 已拒绝请求，但 session 缺少 request WAL");
+        };
+        let pending_turn = compaction
+            .provider_history
+            .as_ref()
+            .and_then(|history| history.pending_turn.as_ref())
+            .context("Provider 已拒绝请求，但 session 缺少 pending request WAL")?;
+        if pending_turn.turn_id != self.turn_id {
+            anyhow::bail!(
+                "Provider 拒绝的 request WAL 不属于当前 turn: expected={}, actual={}",
+                self.turn_id,
+                pending_turn.turn_id
+            );
+        }
+        let (previous, recovery) = if self.provider_response_accepted_in_turn {
+            (
+                self.provider_compaction_before_started_request
+                    .as_ref()
+                    .context("Provider 已拒绝请求，但缺少本次发送前的 compaction 快照")?,
+                ProviderRejectedRequestRecovery::PreserveTurnProgress,
+            )
+        } else {
+            (
+                self.provider_compaction_before_turn
+                    .as_ref()
+                    .context("Provider 已拒绝请求，但缺少当前 turn 写入前的 compaction 快照")?,
+                ProviderRejectedRequestRecovery::DiscardTurn,
+            )
+        };
+        let record = ProviderRejectionRecoveryRecord::new(
+            self.turn_id.clone(),
+            rejection_id,
+            recovery,
+            previous.clone(),
+        );
+        write_provider_rejection_recovery(
+            &self.session.paths.provider_rejection_recovery_json,
+            &record,
+        )
+        .await?;
+        Ok(recovery)
+    }
+
+    async fn apply_provider_request_rejection(&mut self, rejection_id: u64) -> anyhow::Result<()> {
+        let record =
+            read_provider_rejection_recovery(&self.session.paths.provider_rejection_recovery_json)
+                .await?
+                .context("Provider 拒绝恢复记录缺失")?;
+        if record.turn_id != self.turn_id || record.rejection_id != rejection_id {
+            anyhow::bail!(
+                "Provider 拒绝恢复记录不属于当前拒绝: expected={}/{}, actual={}/{}",
+                self.turn_id,
+                rejection_id,
+                record.turn_id,
+                record.rejection_id
+            );
+        }
+        match record.into_recovery_compaction() {
+            Some(compaction) => self.session.update_compaction(compaction).await?,
+            None => self.session.clear_compaction().await?,
+        }
+        sync_parent_directory(&self.session.paths.provider_rejection_recovery_json).await?;
+        self.last_compacted_provider_history = self
+            .session
+            .read_metadata()
+            .await?
+            .compaction
+            .and_then(|state| state.provider_history)
+            .map(|history| history.messages);
+        self.provider_compaction_before_pending_request = None;
+        self.provider_compaction_before_started_request = None;
+        self.provider_compaction_before_clean_retry = None;
+        Ok(())
+    }
+
+    async fn finish_provider_request_retry_after_rejection(
+        &mut self,
+        rejection_id: u64,
+    ) -> anyhow::Result<()> {
+        let record =
+            read_provider_rejection_recovery(&self.session.paths.provider_rejection_recovery_json)
+                .await?
+                .context("Provider 自动恢复完成时拒绝恢复记录缺失")?;
+        if record.cleaned_request
+            || record.turn_id != self.turn_id
+            || record.rejection_id != rejection_id
+        {
+            anyhow::bail!(
+                "Provider 自动恢复完成时拒绝记录不匹配: expected={}/{}, actual={}/{}",
+                self.turn_id,
+                rejection_id,
+                record.turn_id,
+                record.rejection_id
+            );
+        }
+        clear_provider_rejection_recovery(&self.session.paths.provider_rejection_recovery_json)
+            .await
+    }
+
     async fn after_provider_response_success(&mut self) -> anyhow::Result<()> {
+        self.provider_response_accepted();
         let delivered_through = self
             .background_completion_delivery_seq
             .load(Ordering::Acquire);
@@ -920,7 +1229,14 @@ impl PreflightCompactor<'_> {
         // “是否曾发生过语义 compaction”当成恢复正确性的开关。
         // 尚无 compaction state 时复用空 summary 的同一有界窗口，
         // 不建立另一个持久化事实源。
-        self.provider_compaction_before_pending_request = Some(metadata.compaction.clone());
+        if self.provider_compaction_before_turn.is_none() {
+            self.provider_compaction_before_turn = Some(metadata.compaction.clone());
+        }
+        let previous = self
+            .provider_compaction_before_clean_retry
+            .take()
+            .unwrap_or_else(|| metadata.compaction.clone());
+        self.provider_compaction_before_pending_request = Some(previous);
         let mut compaction = metadata.compaction.unwrap_or_else(|| {
             SessionCompactionState::from_committed_summary(0, String::new(), Utc::now())
         });
@@ -936,6 +1252,7 @@ impl PreflightCompactor<'_> {
             messages: messages.clone(),
         }));
         self.session.update_compaction(compaction).await?;
+        sync_parent_directory(&self.session.paths.provider_rejection_recovery_json).await?;
         self.last_compacted_provider_history = Some(messages);
         Ok(())
     }
@@ -2078,6 +2395,14 @@ impl SessionEngine {
                 warning.message
             );
         }
+        let journal_changed = self
+            .recover_provider_rejection(session, &journal_read)
+            .await?;
+        let journal_read = if journal_changed {
+            session.read_turn_journal().await
+        } else {
+            journal_read
+        };
         let projection = replay_turn_journal(journal_read);
         let turn_id = next_turn_journal_turn_id(&projection);
         let canonical_messages = session.read_messages().await?;
@@ -2139,6 +2464,97 @@ impl SessionEngine {
             emitter,
             writer,
         ))
+    }
+
+    async fn recover_provider_rejection(
+        &self,
+        session: &mut SessionHandle,
+        journal: &crate::session::TurnJournalRead,
+    ) -> anyhow::Result<bool> {
+        let path = session.paths.provider_rejection_recovery_json.clone();
+        let Some(record) = read_provider_rejection_recovery(&path).await? else {
+            return Ok(false);
+        };
+        if record.cleaned_request {
+            let turn_finished = journal.events.iter().any(|event| {
+                event.turn_id == record.turn_id
+                    && matches!(event.kind, TurnJournalEventKind::TurnFinished { .. })
+            });
+            if turn_finished {
+                clear_provider_rejection_recovery(&path).await?;
+                return Ok(false);
+            }
+            match record.into_recovery_compaction() {
+                Some(compaction) => session.update_compaction(compaction).await?,
+                None => session.clear_compaction().await?,
+            }
+            sync_parent_directory(&path).await?;
+            clear_provider_rejection_recovery(&path).await?;
+            log::warn!(
+                target: "agent",
+                "恢复 Provider 媒体清理后的 request WAL (session={})",
+                session.metadata.id
+            );
+            return Ok(false);
+        }
+        let rejection_seq = journal
+            .events
+            .iter()
+            .filter(|event| event.turn_id == record.turn_id)
+            .filter_map(|event| match &event.kind {
+                TurnJournalEventKind::ProviderRequestRejected {
+                    rejection_id,
+                    discard_turn,
+                } if *rejection_id == record.rejection_id
+                    && *discard_turn == record.discard_turn =>
+                {
+                    Some(event.seq)
+                }
+                _ => None,
+            })
+            .max();
+        let superseded = rejection_seq.is_some_and(|rejection_seq| {
+            journal.events.iter().any(|event| {
+                event.turn_id == record.turn_id
+                    && event.seq > rejection_seq
+                    && matches!(
+                        event.kind,
+                        TurnJournalEventKind::ProviderRequestRetriedAfterRejection { rejection_id }
+                            if rejection_id == record.rejection_id
+                    )
+            })
+        });
+        if superseded {
+            clear_provider_rejection_recovery(&path).await?;
+            return Ok(false);
+        }
+        if rejection_seq.is_none() {
+            let mut writer = session.open_turn_journal_writer().await?;
+            writer
+                .append(
+                    record.turn_id.clone(),
+                    Utc::now(),
+                    TurnJournalEventKind::ProviderRequestRejected {
+                        rejection_id: record.rejection_id,
+                        discard_turn: record.discard_turn,
+                    },
+                    TurnJournalFlush::Immediate,
+                )
+                .await?;
+        }
+        let recovery = record.recovery();
+        match record.into_recovery_compaction() {
+            Some(compaction) => session.update_compaction(compaction).await?,
+            None => session.clear_compaction().await?,
+        }
+        sync_parent_directory(&path).await?;
+        clear_provider_rejection_recovery(&path).await?;
+        log::warn!(
+            target: "agent",
+            "恢复 Provider 拒绝后的 WAL 回滚 (session={}, recovery={recovery:?})",
+            session.metadata.id
+        );
+        Ok(rejection_seq.is_none())
     }
 
     /// 在新 turn 建立前，把上一 turn 的 provider-history WAL 游标与 journal/canonical
@@ -2740,6 +3156,10 @@ impl SessionEngine {
                     journal_emitter.assistant_delta(text.clone());
                     emit(SessionEvent::AssistantTextDelta { text });
                 }
+                SessionTurnEvent::AssistantOutputAccepted => {
+                    emit(SessionEvent::AssistantOutputAccepted);
+                }
+                SessionTurnEvent::AssistantOutputPreservedForFallback => {}
                 SessionTurnEvent::AssistantOutputDiscarded => {
                     emit(SessionEvent::AssistantOutputDiscarded);
                 }
@@ -2863,6 +3283,11 @@ impl SessionEngine {
             .as_ref()
             .err()
             .is_some_and(is_canonical_messages_committed_error);
+        let provider_rejected = result.as_ref().err().is_some_and(|error| {
+            error
+                .downcast_ref::<ProviderRequestRejected>()
+                .is_some_and(ProviderRequestRejected::should_discard_turn)
+        });
         if result.is_err() && !canonical_messages_committed_error {
             self.turn_loop.discard_runtime_chain(runtime_chain_id).await;
         }
@@ -2876,6 +3301,8 @@ impl SessionEngine {
         };
         let journal_status = if result.is_ok() || canonical_messages_committed_error {
             TurnJournalStatus::Committed
+        } else if provider_rejected {
+            TurnJournalStatus::RejectedByProvider
         } else if turn_interrupted {
             interrupted_status
         } else {
@@ -3392,6 +3819,10 @@ impl SessionEngine {
             capture_provider_history,
             last_compacted_provider_history: None,
             provider_compaction_before_pending_request: None,
+            provider_compaction_before_started_request: None,
+            provider_compaction_before_turn: Some(metadata.compaction.clone()),
+            provider_compaction_before_clean_retry: None,
+            provider_response_accepted_in_turn: false,
             background_completion_delivery_seq,
             provider_replay_identity: provider_replay_identity.clone(),
         };
@@ -5463,7 +5894,10 @@ fn recovery_turn_chain<'a>(
         .enumerate()
         .filter(|(index, turn)| {
             last_resolved_index.is_none_or(|resolved| *index > resolved)
-                && turn.status != Some(TurnJournalStatus::Committed)
+                && !matches!(
+                    turn.status,
+                    Some(TurnJournalStatus::Committed | TurnJournalStatus::RejectedByProvider)
+                )
         })
         .map(|(_, turn)| turn)
         .collect()
@@ -5532,11 +5966,7 @@ fn is_canonical_messages_committed_error(error: &anyhow::Error) -> bool {
 fn journal_turn_is_already_canonical(turn: &TurnJournalTurn, messages: &[SessionMessage]) -> bool {
     if matches!(
         turn.status,
-        Some(
-            TurnJournalStatus::Failed
-                | TurnJournalStatus::Cancelled
-                | TurnJournalStatus::InterruptedByUser
-        )
+        Some(TurnJournalStatus::Cancelled | TurnJournalStatus::InterruptedByUser)
     ) {
         return false;
     }

@@ -184,12 +184,9 @@ impl AnthropicMessagesClient {
             );
             let mut request_start_recorded = false;
             let response_result = {
-                let mut request_started = || {
-                    if request_start_recorded {
-                        return Ok(());
-                    }
+                let mut request_started = |previous_attempt_ambiguous| {
                     if let Some(observer) = request_observer.as_deref_mut() {
-                        observer.request_started()?;
+                        observer.request_started(previous_attempt_ambiguous)?;
                     }
                     request_start_recorded = true;
                     Ok(())
@@ -228,6 +225,13 @@ impl AnthropicMessagesClient {
                 }
                 Err(error) => return Err(error),
             };
+            if let Some(observer) = request_observer.as_deref_mut() {
+                if response_turn.final_stop_reason == "refusal" {
+                    observer.request_outcome_resolved()?;
+                } else {
+                    observer.response_accepted().await?;
+                }
+            }
             let assistant_replay = json!({
                 "role": "assistant",
                 "content": response_turn.final_blocks.clone(),
@@ -288,8 +292,9 @@ impl AnthropicMessagesClient {
     async fn send_stream_once(
         &self,
         body: &CreateMessageRequest,
+        previous_attempt_ambiguous: bool,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
-        request_started: &mut (dyn FnMut() -> Result<(), AnthropicError> + Send),
+        request_started: &mut (dyn FnMut(bool) -> Result<(), AnthropicError> + Send),
     ) -> Result<ContinuedAssistantTurn, AnthropicError> {
         let pending = self
             .http
@@ -299,7 +304,7 @@ impl AnthropicMessagesClient {
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
             .json(body);
-        request_started()?;
+        request_started(previous_attempt_ambiguous)?;
         let resp = pending
             .send()
             .await
@@ -369,9 +374,10 @@ impl AnthropicMessagesClient {
         retry_after_partial: bool,
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
-        request_started: &mut (dyn FnMut() -> Result<(), AnthropicError> + Send),
+        request_started: &mut (dyn FnMut(bool) -> Result<(), AnthropicError> + Send),
     ) -> Result<ContinuedAssistantTurn, AnthropicError> {
         let mut last_retryable: Option<AnthropicError> = None;
+        let mut previous_attempt_ambiguous = false;
         for attempt in 0..=retry_count {
             super::ensure_anthropic_recovery_active(recovery_interrupt)?;
             let mut replay_blocking_event_emitted = false;
@@ -382,8 +388,13 @@ impl AnthropicMessagesClient {
                     }
                     emit(event);
                 };
-                self.send_stream_once(body, &mut tracking_emit, request_started)
-                    .await
+                self.send_stream_once(
+                    body,
+                    previous_attempt_ambiguous,
+                    &mut tracking_emit,
+                    request_started,
+                )
+                .await
             };
             match result {
                 Ok(turn) => return Ok(turn),
@@ -392,6 +403,8 @@ impl AnthropicMessagesClient {
                         && is_stream_retryable(&e)
                         && attempt < retry_count =>
                 {
+                    previous_attempt_ambiguous =
+                        !matches!(&e, AnthropicError::Auth(_) | AnthropicError::Status { .. });
                     let backoff =
                         compute_backoff(attempt, self.retry_base_delay, self.retry_max_delay);
                     log::warn!(
@@ -693,28 +706,41 @@ impl StreamingAssistantTurn {
 
 fn anthropic_stream_error_event(event: &Value) -> AnthropicError {
     let error = event.get("error").and_then(Value::as_object);
-    let error_type = error
-        .and_then(|error| error.get("type").or_else(|| error.get("code")))
-        .and_then(Value::as_str);
+    let error_type = error.and_then(|error| {
+        error
+            .get("type")
+            .and_then(Value::as_str)
+            .or_else(|| error.get("code").and_then(Value::as_str))
+    });
     let message = error
         .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
         .unwrap_or("upstream stream failed");
+    let safe_error_type = error_type.and_then(super::safe_anthropic_error_type);
     let reason = format!(
         "Anthropic stream 返回 error event: type={} message={}",
-        error_type.unwrap_or("unknown"),
+        safe_error_type.unwrap_or("unknown"),
         super::redact_anthropic_error_body(message)
     );
-    if matches!(
-        error_type,
-        Some("rate_limit_error" | "api_error" | "overloaded_error" | "server_error")
-    ) {
-        AnthropicError::StreamFailure {
-            reason,
-            raw: String::new(),
+    match safe_error_type {
+        Some("rate_limit_error" | "api_error" | "overloaded_error" | "server_error") => {
+            AnthropicError::TransientFailure { reason }
         }
-    } else {
-        AnthropicError::TerminalFailure { reason }
+        Some(error_type) if crate::api::responses::is_media_rejection_error_code(error_type) => {
+            AnthropicError::MediaRejected {
+                source: Box::new(AnthropicError::RequestRejected { reason }),
+            }
+        }
+        Some(
+            "invalid_request"
+            | "invalid_request_error"
+            | "invalid_prompt"
+            | "context_length_exceeded"
+            | "content_filter"
+            | "content_policy_violation"
+            | "safety_violation",
+        ) => AnthropicError::RequestRejected { reason },
+        _ => AnthropicError::TerminalFailure { reason },
     }
 }
 
@@ -842,11 +868,18 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
-    use crate::api::{ProviderRequestObserver, SessionTurnMessage};
+    use crate::api::provider::{ProviderRequestRejected, ProviderTerminalFailure};
+    use crate::api::{
+        AnthropicProviderAdapter, ProviderAdapter, ProviderRequest, ProviderRequestObserver,
+        SessionTurnMessage,
+    };
 
     #[derive(Default)]
     struct RecordingRequestObserver {
         requests: Vec<Vec<SessionTurnMessage>>,
+        previous_attempt_ambiguity: Vec<bool>,
+        resolved: usize,
+        accepted: usize,
     }
 
     struct CancellingContinuationPreflightObserver {
@@ -863,6 +896,32 @@ mod tests {
             messages: &[SessionTurnMessage],
         ) -> anyhow::Result<()> {
             self.requests.push(messages.to_vec());
+            Ok(())
+        }
+
+        fn provider_request_started_after(
+            &mut self,
+            _messages: &[SessionTurnMessage],
+            previous_attempt_ambiguous: bool,
+        ) -> anyhow::Result<()> {
+            self.previous_attempt_ambiguity
+                .push(previous_attempt_ambiguous);
+            Ok(())
+        }
+
+        async fn provider_response_accepted(
+            &mut self,
+            _messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            self.accepted += 1;
+            Ok(())
+        }
+
+        fn provider_request_outcome_resolved(
+            &mut self,
+            _messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            self.resolved += 1;
             Ok(())
         }
     }
@@ -922,7 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_error_event_is_terminal() {
+    fn deterministic_request_error_event_is_rejected() {
         let mut turn = StreamingAssistantTurn::default();
         let error = turn
             .apply_event(
@@ -934,11 +993,93 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(matches!(error, AnthropicError::TerminalFailure { .. }));
+        assert!(matches!(error, AnthropicError::RequestRejected { .. }));
     }
 
     #[test]
-    fn transient_error_events_are_stream_failures_without_secret_leakage() {
+    fn stream_error_classifies_context_media_and_invalid_request() {
+        for error_type in ["context_length_exceeded", "invalid_request"] {
+            let error = anthropic_stream_error_event(&json!({
+                "type":"error",
+                "error":{"type":error_type,"message":"rejected"}
+            }));
+            assert!(
+                matches!(error, AnthropicError::RequestRejected { .. }),
+                "type={error_type}"
+            );
+        }
+
+        let media = anthropic_stream_error_event(&json!({
+            "type":"error",
+            "error":{"type":"unsupported_media_type","message":"rejected"}
+        }));
+        assert!(matches!(media, AnthropicError::MediaRejected { .. }));
+    }
+
+    #[test]
+    fn stream_error_redacts_unknown_type_and_free_text_message() {
+        let error = anthropic_stream_error_event(&json!({
+            "type":"error",
+            "error":{
+                "type":"private-tool-output",
+                "message":"private prompt copied by upstream"
+            }
+        }));
+        let display = error.to_string();
+
+        assert!(matches!(error, AnthropicError::TerminalFailure { .. }));
+        assert!(display.contains("type=unknown"));
+        assert!(display.contains("redacted Anthropic request/replay payload"));
+        assert!(!display.contains("private-tool-output"));
+        assert!(!display.contains("private prompt copied by upstream"));
+    }
+
+    #[tokio::test]
+    async fn unknown_stream_error_preserves_provider_request_history() {
+        let body = sse_response(vec![json!({
+            "type":"error",
+            "error":{"message":"future provider failure"}
+        })]);
+        let (endpoint, requests) = spawn_sse_server(vec![body]).await;
+        let adapter = AnthropicProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            128,
+            Duration::from_secs(2),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        let error = adapter
+            .send(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 128,
+                    stream: true,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: None,
+                    allow_continuation: false,
+                    retry_count_override: Some(0),
+                },
+                &mut |_| {},
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<ProviderTerminalFailure>().is_some());
+        assert!(error.downcast_ref::<ProviderRequestRejected>().is_none());
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn transient_error_events_are_resolved_failures_without_secret_leakage() {
         for error_type in ["rate_limit_error", "api_error", "overloaded_error"] {
             let mut turn = StreamingAssistantTurn::default();
             let error = turn
@@ -955,9 +1096,25 @@ mod tests {
                 )
                 .unwrap_err();
 
-            assert!(matches!(error, AnthropicError::StreamFailure { .. }));
+            assert!(matches!(error, AnthropicError::TransientFailure { .. }));
             assert!(!error.to_string().contains("secret-value"));
         }
+
+        let mut turn = StreamingAssistantTurn::default();
+        let null_type = turn
+            .apply_event(
+                &json!({
+                    "type":"error",
+                    "error":{
+                        "type":null,
+                        "code":"rate_limit_error",
+                        "message":"retry later"
+                    }
+                }),
+                &mut |_| {},
+            )
+            .unwrap_err();
+        assert!(matches!(null_type, AnthropicError::TransientFailure { .. }));
     }
 
     #[test]
@@ -1460,6 +1617,7 @@ mod tests {
         assert!(replayed_messages.to_string().contains("private-one"));
         assert!(replayed_messages.to_string().contains(CONTINUATION_TRIGGER));
         assert_eq!(recording.requests.len(), 2);
+        assert_eq!(recording.accepted, 2);
         assert!(recording.requests[1].starts_with(&recording.requests[0]));
         let observed_second = serde_json::to_value(super::super::session_turn_messages_to_api(
             recording.requests[1].clone(),
@@ -1477,6 +1635,134 @@ mod tests {
             observed_second, captured_second["messages"],
             "streaming observer 必须映射为同一份 Anthropic messages"
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_continuation_rejection_preserves_the_accepted_first_round() {
+        let first = sse_response(vec![
+            json!({"type":"message_start", "message":{"usage":{"input_tokens":1}}}),
+            json!({
+                "type":"content_block_start", "index":0,
+                "content_block":{"type":"text", "text":""}
+            }),
+            json!({
+                "type":"content_block_delta", "index":0,
+                "delta":{"type":"text_delta", "text":"kept"}
+            }),
+            json!({"type":"content_block_stop", "index":0}),
+            json!({"type":"message_delta", "delta":{"stop_reason":"max_tokens"}}),
+            json!({"type":"message_stop"}),
+        ]);
+        let second = json!({
+            "type":"error",
+            "error":{"type":"invalid_request_error", "message":"continuation rejected"}
+        })
+        .to_string();
+        let (endpoint, requests) = spawn_http_responses(vec![
+            (200, "text/event-stream", first),
+            (400, "application/json", second),
+        ])
+        .await;
+        let adapter = AnthropicProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            128,
+            Duration::from_secs(2),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let mut observer = RecordingRequestObserver::default();
+
+        let error = adapter
+            .send_with_request_observer(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 128,
+                    stream: true,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: None,
+                    allow_continuation: true,
+                    retry_count_override: None,
+                },
+                &mut |_| {},
+                &mut observer,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<ProviderRequestRejected>().is_some());
+        assert_eq!(observer.accepted, 1);
+        assert_eq!(observer.resolved, 1);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn transient_error_event_marks_the_retry_ambiguous() {
+        let first = sse_response(vec![json!({
+            "type":"error",
+            "error":{
+                "type":"rate_limit_error",
+                "message":"retry later"
+            }
+        })]);
+        let second = json!({
+            "type":"error",
+            "error":{
+                "type":"invalid_request_error",
+                "message":"invalid input"
+            }
+        })
+        .to_string();
+        let (endpoint, requests) = spawn_http_responses(vec![
+            (200, "text/event-stream", first),
+            (400, "application/json", second),
+        ])
+        .await;
+        let adapter = AnthropicProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            128,
+            Duration::from_secs(2),
+            1,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let mut observer = RecordingRequestObserver::default();
+
+        let error = adapter
+            .send_with_request_observer(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 128,
+                    stream: true,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: None,
+                    allow_continuation: false,
+                    retry_count_override: None,
+                },
+                &mut |_| {},
+                &mut observer,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<ProviderRequestRejected>().is_some());
+        assert_eq!(observer.previous_attempt_ambiguity, vec![false, true]);
+        assert_eq!(observer.resolved, 1);
+        assert_eq!(requests.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -1631,6 +1917,33 @@ mod tests {
                     "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
                     body.len(),
                     body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    async fn spawn_http_responses(
+        responses: Vec<(u16, &'static str, String)>,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_task = Arc::clone(&requests);
+        tokio::spawn(async move {
+            for (status, content_type, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = vec![0; 8192];
+                let read = socket.read(&mut buffer).await.unwrap();
+                requests_for_task
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buffer[..read]).to_string());
+                let reason = if status == 200 { "OK" } else { "Bad Request" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
                 );
                 socket.write_all(response.as_bytes()).await.unwrap();
             }
