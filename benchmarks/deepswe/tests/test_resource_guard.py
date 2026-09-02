@@ -80,6 +80,7 @@ class ResourceGuardTests(unittest.TestCase):
             disk.assert_called_once_with((root / "output", root), 70)
 
             with (
+                patch("acn_deepswe.resource_guard._PROC_MEMINFO", root),
                 patch(
                     "acn_deepswe.resource_guard._host_available_memory_bytes", return_value=99 * MIB
                 ),

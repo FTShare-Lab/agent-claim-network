@@ -12,7 +12,6 @@ from unittest.mock import patch
 from acn_deepswe.assets import frozen_coding_benchmark_skill
 from acn_deepswe.dataset import FrozenDatasetManifest
 from acn_deepswe.host_runner import (
-    AttemptProgressMonitor,
     COMPACT_HARNESS_CODE_RUN_MAX_OUTPUT_CHARS,
     CONTAINER_MODEL_KEY_ENV,
     EVALUATION_AUTO_COMPACT_CTX_RATIO,
@@ -21,6 +20,8 @@ from acn_deepswe.host_runner import (
     EVALUATION_FILE_READ_MAX_CHARS,
     EVALUATION_MAX_PARALLEL_TOOL_CALLS,
     HOST_MODEL_KEY_ENV,
+    OPERATOR_INTERRUPT,
+    AttemptProgressMonitor,
     HostArtifacts,
     Task1ExecutionConfig,
     Task1HostRunner,
@@ -471,6 +472,31 @@ class RealExecutionTests(unittest.TestCase):
                 )
 
         self.assertEqual(result.status, "passed")
+
+    def test_pier_exit_after_operator_interrupt_is_not_infrastructure_failure(self) -> None:
+        """wave 线程收不到 KeyboardInterrupt，只能看到 Pier 因 SIGINT 非零退出。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = build_attempt_plan(DATASET, root / "run", seed=2)
+            experiment = build_experiment_manifest("experiment-1", plan, "b" * 64, provenance())
+            artifacts = _artifacts(root, claim_bundle=root / "claims.json")
+            execution = _execution(root, artifacts)
+
+            def run(*_args: object, **_kwargs: object) -> FakeCompleted:
+                OPERATOR_INTERRUPT.set()
+                return FakeCompleted(130)
+
+            self.addCleanup(OPERATOR_INTERRUPT.clear)
+            with (
+                patch.dict("os.environ", {HOST_MODEL_KEY_ENV: "upstream-secret"}, clear=True),
+                self.assertRaisesRegex(TaskExecutionError, "INTERRUPTED_BY_OPERATOR"),
+            ):
+                Task1HostRunner(experiment, root / "jobs", execution, run=run).run_task1(
+                    execute=True
+                )
+            manifest = json.loads(execution.manifest_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest["attempt_results"][0]["reason"], "INTERRUPTED_BY_OPERATOR")
 
     def test_operator_interruption_preserves_progress_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1072,7 +1098,7 @@ class ProvenanceTests(unittest.TestCase):
         self.assertEqual(manifest["execution"]["phase_mode"], "b_only_from_a")
         self.assertEqual(
             manifest["execution"]["a_only_source_manifest"],
-            str(source_execution.manifest_path),
+            str(source_execution.manifest_path.resolve()),
         )
         self.assertRegex(manifest["execution"]["a_only_source_manifest_hash"], r"^[0-9a-f]{64}$")
 

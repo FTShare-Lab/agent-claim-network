@@ -213,7 +213,7 @@ impl RouterClient for FrozenClaimBundleRouter {
     async fn query(&self, agent_query: &AgentQuery) -> anyhow::Result<RouterQueryResult> {
         match self.delivery_policy {
             FrozenClaimDeliveryPolicy::Disabled => {
-                anyhow::bail!("stage=router 当前 attempt 禁止 claim 查询")
+                anyhow::bail!("stage=router 当前 attempt 没有可用的 claim 路由")
             }
             FrozenClaimDeliveryPolicy::ForcedOnce => {
                 anyhow::bail!("stage=router frozen claims 已由 harness 完整交付，禁止重复查询")

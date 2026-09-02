@@ -7,10 +7,11 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from acn_deepswe.presmoke import PresmokeTaskResult
 from acn_deepswe.presmoke_cli import (
     PresmokeCliError,
-    _ensure_frozen_task_images_available,
     _effective_config_hash,
+    _ensure_frozen_task_images_available,
     _task_has_partial_artifacts,
     _verify_acn_eval_build_info,
     build_task_specs,
@@ -22,7 +23,6 @@ from acn_deepswe.presmoke_cli import (
     verify_checkout_revision,
     verify_pier_executable_binding,
 )
-from acn_deepswe.presmoke import PresmokeTaskResult
 from acn_deepswe.provenance import TASK_DIRECTORY_HASH_ALGORITHM, sha256_directory_tree
 from acn_deepswe.resource_guard import CleanupSummary
 
@@ -293,7 +293,7 @@ class PresmokeCliTests(unittest.TestCase):
 
         spec = specs[0]
         assert spec.execution is not None
-        selected_task_source = source_output / "resumes" / "resume-001"
+        selected_task_source = (source_output / "resumes" / "resume-001").resolve()
         self.assertEqual(spec.execution.claim_producer_variant, "B_empty")
         self.assertEqual(
             spec.execution.artifacts.claim_bundle,

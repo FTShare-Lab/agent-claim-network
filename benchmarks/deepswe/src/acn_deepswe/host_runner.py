@@ -52,6 +52,9 @@ EVALUATION_MAX_PARALLEL_TOOL_CALLS = 5
 # 与 MiniSWE Responses 对照请求对齐：temperature=1.0、top_p=0.95。
 EVALUATION_TEMPERATURE = 1.0
 EVALUATION_TOP_P = 0.95
+# 由 CLI 主线程的 SIGINT handler 置位。KeyboardInterrupt 只投递到主线程，wave 中的
+# attempt 线程只能看到 Pier 子进程因同一信号退出，需要据此把失败标为操作者中断。
+OPERATOR_INTERRUPT = threading.Event()
 CLAIM_BUNDLE_VARIANTS = frozenset(("B_claim", "B_forced_claim"))
 CLAIM_PRODUCER_VARIANTS = frozenset(("A", "B_empty"))
 DEFAULT_PROGRESS_POLL_SECS = 30
@@ -586,9 +589,9 @@ def build_pier_job_config(
             # 结束 trial 时只拆 Compose 容器，不 --rmi。Pier 的 delete=True 会
             # `down --rmi all`，把已预构建的官方题面镜像一并删掉，随后重复拉取，撑爆磁盘。
             "delete": False,
-            "override_cpus": resources.get("cpus"),
-            "override_memory_mb": resources.get("memory_mb"),
-            "override_storage_mb": resources.get("storage_mb"),
+            "override_cpus": _positive_int(resources, "cpus"),
+            "override_memory_mb": _positive_int(resources, "memory_mb"),
+            "override_storage_mb": _positive_int(resources, "storage_mb"),
             "env": {},
         },
         "verifier": {
@@ -652,9 +655,9 @@ def build_verifier_regrade_job_config(
         "environment": {
             "force_build": False,
             "delete": False,
-            "override_cpus": resources.get("cpus"),
-            "override_memory_mb": resources.get("memory_mb"),
-            "override_storage_mb": resources.get("storage_mb"),
+            "override_cpus": _positive_int(resources, "cpus"),
+            "override_memory_mb": _positive_int(resources, "memory_mb"),
+            "override_storage_mb": _positive_int(resources, "storage_mb"),
             "env": {},
         },
         "verifier": {
@@ -1011,6 +1014,12 @@ class Task1HostRunner:
                 stderr_path=attempt_dir / "pier.stderr.log",
             )
             if completed.returncode != 0:
+                if OPERATOR_INTERRUPT.is_set():
+                    reason = "INTERRUPTED_BY_OPERATOR"
+                    progress.finish("interrupted", reason=reason)
+                    return self._write_failed_attempt(
+                        attempt, attempt_dir, reason, progress.progress_path
+                    )
                 reason = "PIER_INFRASTRUCTURE_FAILURE"
                 progress.finish("pier_failed", reason=reason, pier_return_code=completed.returncode)
                 return self._write_failed_attempt(
@@ -1194,6 +1203,12 @@ class Task1HostRunner:
             frozen_bundle_sha256, frozen_claim_content_hashes = None, {}
         isolation_checks = self._isolation_checks(attempt, execution, trial_dir, pier)
         verifier = verifier_evidence.verifier_for(attempt.attempt_id)
+        claim_observation = _claim_observation(
+            attempt.variant,
+            rust_result.router_evidence,
+            rust_result.claim_used_ids,
+            frozen_claim_content_hashes,
+        )
         gate = GateValidator().validate(
             AttemptGateInput.from_rust_result(
                 rust_result,
@@ -1243,14 +1258,10 @@ class Task1HostRunner:
                 "frozen_claim_bundle_hash": (
                     frozen_bundle_sha256 if attempt.variant in CLAIM_BUNDLE_VARIANTS else None
                 ),
-                "claim_observation": _claim_observation(
-                    attempt.variant,
-                    rust_result.router_evidence,
-                    rust_result.claim_used_ids,
-                    frozen_claim_content_hashes,
-                ),
+                "claim_observation": claim_observation,
                 "rust_exit_type": rust_result.exit_type,
                 "failure_kind": rust_result.failure_kind,
+                "agent_error": rust_result.error,
                 "agent_steps": rust_result.agent_steps,
                 "usage": rust_result.usage.to_dict(),
                 "model": self.experiment.provenance.model,
@@ -1278,12 +1289,7 @@ class Task1HostRunner:
             str(result_path),
             str(gate_path),
             verifier.passed,
-            _claim_observation(
-                attempt.variant,
-                rust_result.router_evidence,
-                rust_result.claim_used_ids,
-                frozen_claim_content_hashes,
-            ),
+            claim_observation,
             str(progress_path.resolve()),
         ), tuple(trial_names)
 
@@ -2289,13 +2295,22 @@ def _validate_producer_selection(
         raise TaskExecutionError("producer selection task source 越出原始或 resume 根")
     task_sources = selection.get("task_sources")
     task_source = task_sources.get(task_id) if isinstance(task_sources, Mapping) else None
+    if not isinstance(task_source, Mapping) or set(task_source) != {
+        "source_output_dir",
+        "task_manifest_path",
+        "task_manifest_sha256",
+    }:
+        raise TaskExecutionError("producer selection task source 绑定无效")
+    bound_output = task_source["source_output_dir"]
+    bound_manifest = task_source["task_manifest_path"]
+    # selection 记录的是操作者给定的路径；符号链接（macOS /var、数据盘挂载）会让字符串
+    # 与 resolve 后的路径不同，绑定必须按真实路径比较。
     if (
-        not isinstance(task_source, Mapping)
-        or set(task_source)
-        != {"source_output_dir", "task_manifest_path", "task_manifest_sha256"}
-        or task_source.get("source_output_dir") != str(source_output)
-        or task_source.get("task_manifest_path") != str(source_manifest)
-        or task_source.get("task_manifest_sha256") != _sha256_file(source_manifest)
+        not isinstance(bound_output, str)
+        or not isinstance(bound_manifest, str)
+        or Path(bound_output).resolve() != source_output
+        or Path(bound_manifest).resolve() != source_manifest
+        or task_source["task_manifest_sha256"] != _sha256_file(source_manifest)
     ):
         raise TaskExecutionError("producer selection task source 绑定无效")
     task_order = selection.get("task_order")

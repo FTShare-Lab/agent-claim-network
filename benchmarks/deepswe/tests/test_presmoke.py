@@ -11,11 +11,12 @@ from acn_deepswe.dataset import FrozenDatasetManifest
 from acn_deepswe.host_runner import TaskExecutionError, TaskExecutionResult
 from acn_deepswe.plan import build_attempt_plan
 from acn_deepswe.presmoke import (
-    _cohort_metrics,
     PresmokeExecutionError,
     PresmokeHostRunner,
     PresmokeTaskResult,
     PresmokeTaskSpec,
+    _cohort_metrics,
+    exact_mcnemar_p,
     load_completed_task_results,
     load_presmoke_task_ids,
     load_terminal_task_results,
@@ -91,6 +92,9 @@ def _write_metric_manifest(
                 "result_hash": hashlib.sha256(result_path.read_bytes()).hexdigest(),
                 "gate_hash": hashlib.sha256(gate_path.read_bytes()).hexdigest(),
                 "verifier_passed": passed,
+                "claim_observation": (
+                    {"bundle_available": True} if variant.endswith("claim") else None
+                ),
             }
         )
     manifest.write_text(
@@ -118,16 +122,16 @@ class PresmokeRunnerTests(unittest.TestCase):
             manifest = _write_metric_manifest(root)
             metrics = _cohort_metrics(
                 (PresmokeTaskResult("task-a", "passed", str(manifest), None),)
-            )["success_efficiency"]
+            ).rows["success_efficiency"]
 
         self.assertEqual(metrics["task_count"], 1)
         self.assertEqual(metrics["variants"]["B_claim"]["verifier_pass_rate"], 1.0)
         self.assertEqual(
-            metrics["paired_against_a"]["B_claim"]["usage_delta_totals"]["model_requests"],
+            metrics["paired_against_producer"]["B_claim"]["usage_delta_totals"]["model_requests"],
             -3,
         )
         self.assertEqual(
-            metrics["paired_against_a"]["B_forced_claim"]["usage_delta_totals"]["input_tokens"],
+            metrics["paired_against_producer"]["B_forced_claim"]["usage_delta_totals"]["input_tokens"],
             -400,
         )
 
@@ -136,15 +140,15 @@ class PresmokeRunnerTests(unittest.TestCase):
             manifest = _write_metric_manifest(Path(directory), claim_producer_variant="B_empty")
             metrics = _cohort_metrics(
                 (PresmokeTaskResult("task-a", "passed", str(manifest), None),)
-            )["failure_recovery"]
+            ).rows["failure_recovery"]
 
         self.assertEqual(metrics["claim_producer_variant"], "B_empty")
         self.assertEqual(
-            metrics["paired_against_b_empty"]["B_claim"]["verifier_passed_delta"],
+            metrics["paired_against_producer"]["B_claim"]["verifier_passed_delta"],
             1,
         )
         self.assertEqual(
-            metrics["paired_against_b_empty"]["B_claim"]["usage_delta_totals"]["model_requests"],
+            metrics["paired_against_producer"]["B_claim"]["usage_delta_totals"]["model_requests"],
             -2,
         )
 
@@ -162,13 +166,13 @@ class PresmokeRunnerTests(unittest.TestCase):
             )
             metrics = _cohort_metrics(
                 (PresmokeTaskResult("task-a", "passed", str(manifest), None),)
-            )["failure_recovery"]
+            ).rows["failure_recovery"]
 
         self.assertEqual(metrics["claim_producer_variant"], "A")
         self.assertEqual(metrics["variants"]["A"]["verifier_pass_rate"], 0.0)
         self.assertEqual(metrics["variants"]["B_empty"]["verifier_pass_rate"], 1.0)
         self.assertEqual(
-            metrics["paired_against_a"]["B_claim"]["usage_delta_totals"]["model_requests"],
+            metrics["paired_against_producer"]["B_claim"]["usage_delta_totals"]["model_requests"],
             -2,
         )
 
@@ -179,17 +183,52 @@ class PresmokeRunnerTests(unittest.TestCase):
                 (PresmokeTaskResult("task-a", "failed", str(manifest), "CLAIM_DELIVERY_REPEATED"),)
             )
 
-        self.assertEqual(metrics, {})
+        self.assertEqual(metrics.rows, {})
+        self.assertEqual(metrics.excluded_tasks, {"task-a": "task_status=failed"})
+        self.assertEqual(
+            metrics.coverage_dict(("task-a", "task-b")),
+            {
+                "planned_task_count": 2,
+                "included_task_count": 0,
+                "excluded_task_count": 1,
+                "excluded_tasks": {"task-a": "task_status=failed"},
+            },
+        )
+
+    def test_cohort_metrics_pair_claim_arms_against_no_claim_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = _write_metric_manifest(Path(directory))
+            metrics = _cohort_metrics(
+                (PresmokeTaskResult("task-a", "passed", str(manifest), None),)
+            )
+
+        row = metrics.rows["success_efficiency"]
+        self.assertEqual(row["task_ids"], ["task-a"])
+        self.assertEqual(row["no_claim_baseline_variant"], "B_empty")
+        pair = row["paired_against_no_claim_baseline"]["B_claim"]
+        self.assertEqual((pair["pairs"], pair["wins"], pair["losses"]), (1, 1, 0))
+        self.assertEqual(pair["verifier_passed_delta"], 1)
+        self.assertEqual(pair["exact_mcnemar_p"], 1.0)
+        self.assertEqual(pair["usage_delta_totals"]["model_requests"], -2)
+        self.assertEqual(row["variants"]["B_claim"]["empty_claim_bundle_attempts"], 0)
+        self.assertEqual(metrics.excluded_tasks, {})
+
+    def test_exact_mcnemar_p_matches_two_sided_binomial_on_discordant_pairs(self) -> None:
+        self.assertIsNone(exact_mcnemar_p(0, 0))
+        self.assertEqual(exact_mcnemar_p(3, 3), 1.0)
+        # 报告口径：B_claim 对 B_empty 赢 4 输 17，exact p = 0.0072。
+        self.assertAlmostEqual(exact_mcnemar_p(4, 17), 0.0072, places=4)
+        self.assertAlmostEqual(exact_mcnemar_p(11, 5), 0.210, places=3)
 
     def test_cohort_metrics_mark_recovered_incomplete_usage_as_token_lower_bound(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manifest = _write_metric_manifest(Path(directory), incomplete_variant="B_claim")
             metrics = _cohort_metrics(
                 (PresmokeTaskResult("task-a", "passed", str(manifest), None),)
-            )["success_efficiency"]
+            ).rows["success_efficiency"]
 
         claim = metrics["variants"]["B_claim"]
-        pair = metrics["paired_against_a"]["B_claim"]
+        pair = metrics["paired_against_producer"]["B_claim"]
         self.assertEqual(claim["incomplete_usage_attempts"], 1)
         self.assertEqual(claim["incomplete_usage_attempt_rate"], 1.0)
         self.assertTrue(claim["token_values_are_observed_lower_bound"])

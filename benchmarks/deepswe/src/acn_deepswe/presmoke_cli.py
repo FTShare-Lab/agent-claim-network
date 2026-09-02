@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -27,6 +28,7 @@ from .host_runner import (
     EVALUATION_AUTO_COMPACT_CTX_RATIO,
     EVALUATION_CODE_RUN_MAX_OUTPUT_CHARS,
     EVALUATION_FILE_READ_MAX_CHARS,
+    OPERATOR_INTERRUPT,
     HostArtifacts,
     Task1ExecutionConfig,
     Task1HostRunner,
@@ -45,8 +47,6 @@ from .provenance import (
     EvaluationProvenance,
     sha256_directory_tree,
 )
-from .runner import build_experiment_manifest
-from .run_lock import exclusive_run_lock
 from .resource_guard import (
     GLOBAL_DOCKER_LOCK,
     ResourceGuardError,
@@ -55,6 +55,8 @@ from .resource_guard import (
     verify_capacity,
     verify_disk_headroom,
 )
+from .run_lock import exclusive_run_lock
+from .runner import build_experiment_manifest
 from .schemas import AttemptManifest
 
 
@@ -179,6 +181,12 @@ class FrozenPythonRuntime:
     acn_binary_hash: str
     acn_package_tree_hash: str
     pier_package_tree_hash: str
+
+
+def _mark_operator_interrupt(signum: int, frame: object) -> None:
+    """让 wave 线程里的 attempt 把随后 Pier 子进程的退出归为操作者中断，而不是基础设施故障。"""
+    OPERATOR_INTERRUPT.set()
+    raise KeyboardInterrupt
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -312,6 +320,7 @@ def main(argv: list[str] | None = None) -> int:
                     completed_task_results=completed,
                     completion_manifest_path=completion_manifest_path,
                 )
+                signal.signal(signal.SIGINT, _mark_operator_interrupt)
                 results = runner.run(execute=True)
                 status = (
                     "completed_with_no_eligible_claim"

@@ -695,7 +695,7 @@ def _prepare_phase(
     # 绝对路径必须预先指向发布后的目录，不能保留会被 rename 掉的 staging 路径。
     published_phase_root = config.run_root / phase
     manifest_path = phase_root / "frozen-manifest.json"
-    manifest = _subset_manifest(all_manifest, task_ids, plan_seed)
+    manifest = _subset_manifest(all_manifest, task_ids)
     _atomic_write_json(manifest_path, manifest)
     dataset = FrozenDatasetManifest.from_dict(manifest)
     # 计划会在 staging 中生成后随目录原子发布；attempt 的运行输出必须直接
@@ -764,7 +764,7 @@ def _prepare_phase(
 
 
 def _subset_manifest(
-    full: Mapping[str, object], task_ids: tuple[str, ...], seed: int
+    full: Mapping[str, object], task_ids: tuple[str, ...]
 ) -> dict[str, object]:
     source_ids = full.get("task_ids")
     hashes = full.get("task_toml_hashes")
@@ -781,7 +781,7 @@ def _subset_manifest(
     ):
         raise AutomatedRunError("阶段 task 不属于全量冻结 manifest")
     copied = dict(full)
-    copied["seed"] = seed
+    # seed 是数据集抽样 seed，必须原样继承；阶段计划 seed 单独记录在 attempt-plan.json。
     copied["task_ids"] = list(task_ids)
     copied["task_toml_hashes"] = {task_id: hashes[task_id] for task_id in task_ids}
     copied["task_directory_hashes"] = {task_id: directory_hashes[task_id] for task_id in task_ids}

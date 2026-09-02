@@ -73,6 +73,9 @@ def build_attempt_plan(
 
 
 def _attempt(task_id: str, variant: str, output_root: Path) -> AttemptManifest:
+    # 宿主 runner 以 resolve 后的路径写 attempt-result / gate；计划里的 output_path
+    # 必须与之一致，否则符号链接路径下二者无法对接。
+    output_root = output_root.resolve()
     digest = hashlib.sha256(f"{task_id}:{variant}".encode()).hexdigest()[:12]
     attempt_id = f"{task_id}-{variant.lower()}-{digest}"
     base = output_root / "attempts" / attempt_id

@@ -9,12 +9,12 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from acn_deepswe.assets import frozen_coding_benchmark_skill
 from acn_deepswe.pier_adapter import (
-    AcnEvalPierAgent,
-    AcnPatchReplayPierAgent,
-    AcnPierAdapter,
     CONTAINER_MODEL_EGRESS_ENV,
     CONTAINER_MODEL_KEY_FILE,
     CONTAINER_MODEL_PROXY_ENV,
+    AcnEvalPierAgent,
+    AcnPatchReplayPierAgent,
+    AcnPierAdapter,
     upstream_host,
 )
 

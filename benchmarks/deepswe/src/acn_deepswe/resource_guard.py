@@ -68,7 +68,11 @@ def verify_capacity(
     required_cpus = workers * resources["cpus"]
     required_memory = workers * resources["memory_mb"] * MIB
     memory_reserve = host_capacity["memory_reserve_mb"] * MIB
-    available_memory = min(docker_memory, _host_available_memory_bytes())
+    # Docker Desktop / 远程 daemon 时 Docker info.MemTotal 已是 VM 的内存，宿主
+    # /proc/meminfo 不存在或描述的是另一台机器；只有原生 Linux daemon 才叠加 MemAvailable。
+    available_memory = docker_memory
+    if _PROC_MEMINFO.exists():
+        available_memory = min(docker_memory, _host_available_memory_bytes())
     if cpus < required_cpus or available_memory < required_memory + memory_reserve:
         raise ResourceGuardError(
             "宿主资源不足，拒绝静默降低 task_workers: "
@@ -260,9 +264,12 @@ def _docker(arguments: list[str]) -> subprocess.CompletedProcess[str]:
     return completed
 
 
+_PROC_MEMINFO = Path("/proc/meminfo")
+
+
 def _host_available_memory_bytes() -> int:
     try:
-        lines = Path("/proc/meminfo").read_text(encoding="utf-8").splitlines()
+        lines = _PROC_MEMINFO.read_text(encoding="utf-8").splitlines()
     except OSError as error:
         raise ResourceGuardError("无法读取 /proc/meminfo") from error
     for line in lines:

@@ -18,7 +18,6 @@ from acn_deepswe.auto_run import (
 from acn_deepswe.dataset import FrozenDatasetManifest
 from acn_deepswe.run_lock import RunLockError
 
-
 TASK_IDS = tuple(f"task-{index}" for index in range(6))
 
 

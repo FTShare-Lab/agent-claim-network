@@ -222,6 +222,12 @@ Gate 只验证基础设施、claim 归因与隔离：artifact hash、verifier �
 在 `run_all_variants_without_claims=true` 的四臂模式下，没有 claim 的任务会执行四臂并显式标为
 `EMPTY_CLAIM_BUNDLE`，不可与成功注入 claim 的结果混同。`presmoke-aggregate.json` 会单列 `claim_funnel`：每臂的
 bundle 可用、router 检索、内容注入、模型报告使用及对应 claim 数，不能用“挂载成功”代替这些证据。
+`cohort_metrics` 按 producer verifier 分层，每层给出各臂通过数、用量总和 / 均值、`empty_claim_bundle_attempts`，
+以及两组同题配对：`paired_against_producer`（consumer 减 producer）和 `paired_against_no_claim_baseline`
+（claim 臂减同题未拿到 claim 的非 producer 臂，含不一致配对的 `wins` / `losses` 与双侧精确二项检验
+`exact_mcnemar_p`）。分母固定为冻结 task 集：`cohort_coverage` 记录 planned / included / excluded 数量与每个被排除
+task 的原因，不得把缺失或失败的 task 从分母里静默删掉。attempt 级 `attempt-result.json` 的 `agent_error` 保留
+Rust 侧带 `stage=` 前缀的失败摘要，用于区分 turn 阶段与 finalize 阶段的 agent 失败。
 
 **verifier 判 0 分与 agent 自身失败都是有效实验结果，不是 Gate 失败**，按未通过计分，不得
 重跑刷分。checkpoint 会持久化所有 task 终态（含 Gate、协议与基础设施失败）；普通 `--resume` 遇到任何

@@ -93,6 +93,8 @@ class RustEvaluationResult:
     usage: RustUsage
     event_ledger_path: str
     failure_kind: str | None
+    # Rust 侧失败时带 stage= 前缀的错误摘要；成功 attempt 为 None。
+    error: str | None
 
 
 def read_rust_event_ledger(path: Path) -> tuple[EventLedger, ...]:
@@ -137,6 +139,7 @@ def read_rust_result(path: Path) -> RustEvaluationResult:
             usage=_usage(raw),
             event_ledger_path=_absolute(_string(raw, "event_ledger_path")),
             failure_kind=_failure_kind(raw),
+            error=_optional_string(raw, "error"),
         )
     except ValueError as error:
         raise RustContractError(f"Rust result 无效: {error}") from error
@@ -206,6 +209,15 @@ def _failure_kind(data: Mapping[str, object]) -> str | None:
         return None
     if value != "upstream_concurrency_exhausted":
         raise RustContractError("failure_kind 不支持")
+    return value
+
+
+def _optional_string(data: Mapping[str, object], field: str) -> str | None:
+    value = data.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise RustContractError(f"{field} 必须是非空字符串或缺省")
     return value
 
 
