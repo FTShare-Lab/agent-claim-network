@@ -1086,6 +1086,7 @@ impl TurnAccumulator {
             && !matches!(
                 &kind,
                 TurnJournalEventKind::BackgroundProcessCompleted { .. }
+                    | TurnJournalEventKind::CompactionAssetsExternalized { .. }
             )
         {
             return;

@@ -32,8 +32,9 @@ use super::{
     estimated_session_message_tokens_projected, finish_cancelled_turn_journal,
     hash_session_segment, is_canonical_messages_committed_error,
     journal_failure_overrides_turn_result, latest_model_context_matches,
-    parse_compaction_summary_outcome, persist_main_background_process_completions,
-    project_provider_context, select_compaction_summary_end_index,
+    manual_pending_provider_turn, parse_compaction_summary_outcome,
+    persist_main_background_process_completions, project_provider_context,
+    provider_recovery_suffix, recovery_turn_chain, select_compaction_summary_end_index,
     session_compaction_transcript_projection,
     session_compaction_transcript_projection_with_memory_mode,
     session_messages_to_provider_turn_messages, session_messages_to_turn_messages,
@@ -4147,6 +4148,8 @@ async fn failed_turn_after_stable_compaction_replays_latest_write_ahead_provider
         SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
     compaction.provider_history = Some(Box::new(CompactedProviderHistory {
         replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
         pending_turn: None,
         canonical_message_until: 0,
         messages: vec![SessionTurnMessage::user_text("STABLE_COMPACTED_BASELINE")],
@@ -4358,6 +4361,8 @@ async fn cancelled_turn_after_stable_compaction_replays_write_ahead_provider_win
         SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
     compaction.provider_history = Some(Box::new(CompactedProviderHistory {
         replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
         pending_turn: None,
         canonical_message_until: 0,
         messages: vec![SessionTurnMessage::user_text("STABLE_CANCEL_BASELINE")],
@@ -4527,6 +4532,7 @@ async fn preflight_compaction_summarizes_oversized_previous_turn_instead_of_fail
             &mut session,
             PreflightCompactionRequest {
                 base_system_prompt: "system",
+                provider_messages: &[],
                 active_suffix: vec![SessionTurnMessage::user_text("small current request")],
                 turn_id: "turn_1",
                 base_message_count: 4,
@@ -4632,6 +4638,7 @@ async fn preflight_externalizes_skill_and_attachment_only_after_full_projection_
             &mut session,
             PreflightCompactionRequest {
                 base_system_prompt: "system",
+                provider_messages: &[],
                 active_suffix,
                 turn_id: "turn_1",
                 base_message_count: 0,
@@ -4810,6 +4817,7 @@ async fn preflight_retries_once_with_half_summary_limit_after_reference_projecti
             &mut session,
             PreflightCompactionRequest {
                 base_system_prompt: "system",
+                provider_messages: &[],
                 active_suffix,
                 turn_id: "turn_1",
                 base_message_count: 0,
@@ -5147,6 +5155,7 @@ async fn preflight_errors_after_single_retry_when_plain_user_text_remains_over_h
             &mut session,
             PreflightCompactionRequest {
                 base_system_prompt: "system",
+                provider_messages: &[],
                 active_suffix,
                 turn_id: "turn_1",
                 base_message_count: 0,
@@ -6814,6 +6823,7 @@ async fn finalize_recovered_summary_checkpoint_still_runs_recap() {
             safe_until_event_seq: 10,
             source_hash: "stale_hash".into(),
         }),
+        preserve_provider_history: false,
         status: CompactionCheckpointStatus::Applied,
     };
     session
@@ -6847,6 +6857,683 @@ async fn manual_compact_noop_reports_nothing_new_for_empty_session() {
         outcome,
         SessionCompactionResult::Noop(SessionCompactionNoopReason::NothingNew)
     ));
+}
+
+#[tokio::test]
+async fn manual_compact_summarizes_pending_failed_turn_without_changing_authorities() {
+    const FULL_ONLY_MARKER: &str = "FULL-PENDING-WAL-ONLY-MARKER";
+    const RECOVERY_SUMMARY: &str = "failed file read summarized for recovery";
+    const LATEST_PARTIAL: &str = "latest provider partial after the compactable request";
+    const POST_COMPACT_CANONICAL_MARKER: &str = "POST-COMPACT-CANONICAL-MARKER";
+
+    let dir = tempfile::tempdir().unwrap();
+    tokio::fs::write(
+        dir.path().join("large-note.txt"),
+        format!("{}{FULL_ONLY_MARKER}", "x".repeat(12_000)),
+    )
+    .await
+    .unwrap();
+    let mut provider_steps = vec![tool_use_step(
+        "toolu_manual_recovery",
+        "file_read",
+        json!({"path": "large-note.txt", "show_linenos": false}),
+    )];
+    provider_steps.extend(exhausted_stream_failure_steps(
+        "provider failed after file read",
+        LATEST_PARTIAL,
+    ));
+    provider_steps.extend([
+        json_by_request_kind_responses(
+            &[
+                r#"{"committed_summary":null,"active_turn_summary":"failed file read summarized for recovery"}"#,
+            ],
+            &[],
+        ),
+        response_step("continued from compacted recovery", Vec::new()),
+    ]);
+    let provider = Arc::new(RecordingProvider::new(provider_steps));
+    let tools = Arc::new(
+        ToolRegistry::new(&ToolConfig {
+            workspace_root: dir.path().to_path_buf(),
+            ..ToolConfig::default()
+        })
+        .unwrap(),
+    );
+    let (mut engine, store) =
+        build_test_engine_with_tools(&dir, provider.clone(), Arc::clone(&tools));
+    engine.compaction.auto_compact_ctx_ratio = 0.0;
+    engine.compaction.tail_target_ctx_ratio = 0.00001;
+    let mut session = create_test_session(&store, "session_face0019").await;
+
+    engine
+        .run_turn(&mut session, "read the large note and continue", |_| {})
+        .await
+        .expect_err("the provider must fail after receiving the full tool result");
+    assert!(session.read_messages().await.unwrap().is_empty());
+    let before = session.read_metadata().await.unwrap().compaction.unwrap();
+    let provider_history_before = before.provider_history.clone().unwrap();
+    assert!(provider_history_before.pending_turn.is_some());
+    assert!(serde_json::to_string(&provider_history_before.messages)
+        .unwrap()
+        .contains(FULL_ONLY_MARKER));
+
+    assert!(matches!(
+        engine
+            .compact_session_checkpoint(&mut session, |_| {})
+            .await
+            .unwrap(),
+        SessionCompactionResult::Compacted(_)
+    ));
+    let after = session.read_metadata().await.unwrap().compaction.unwrap();
+    assert!(after.committed_summary.is_empty());
+    assert_eq!(after.frontier.committed_message_until, 0);
+    assert_eq!(after.active_turn_summary.as_deref(), Some(RECOVERY_SUMMARY));
+    assert!(after.frontier.active_turn.is_some());
+    let compacted_wal = serde_json::to_string(&after.provider_history.unwrap()).unwrap();
+    assert!(compacted_wal.contains(RECOVERY_SUMMARY));
+    assert!(!compacted_wal.contains(FULL_ONLY_MARKER));
+    assert!(!compacted_wal.contains(LATEST_PARTIAL));
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "record local follow-up"),
+            NewSessionMessage::text(
+                SessionMessageRole::Assistant,
+                format!("{}{POST_COMPACT_CANONICAL_MARKER}", "z".repeat(12_000)),
+            ),
+        ])
+        .await
+        .unwrap();
+    let requests_after_first_compact = provider.requests().await.len();
+    engine
+        .compact_session_checkpoint(&mut session, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(
+        provider.requests().await.len(),
+        requests_after_first_compact
+    );
+    let after_second_compact = session.read_metadata().await.unwrap().compaction.unwrap();
+    assert_eq!(
+        after_second_compact.active_turn_summary.as_deref(),
+        Some(RECOVERY_SUMMARY)
+    );
+    assert!(after_second_compact.frontier.active_turn.is_some());
+    assert!(
+        serde_json::to_string(&after_second_compact.provider_history)
+            .unwrap()
+            .contains(RECOVERY_SUMMARY)
+    );
+
+    engine
+        .run_turn(&mut session, "continue from the recovered state", |_| {})
+        .await
+        .unwrap();
+    let requests = provider.requests().await;
+    let continuation = requests.last().unwrap();
+    let continuation_json = serde_json::to_string(&continuation.messages).unwrap();
+    assert!(continuation_json.contains(RECOVERY_SUMMARY));
+    assert!(continuation_json.contains(LATEST_PARTIAL));
+    assert!(continuation_json.contains(POST_COMPACT_CANONICAL_MARKER));
+    assert!(!continuation_json.contains(FULL_ONLY_MARKER));
+    let final_state = session.read_metadata().await.unwrap().compaction.unwrap();
+    assert!(final_state.committed_summary.is_empty());
+    assert_eq!(final_state.frontier.committed_message_until, 0);
+    assert!(final_state.active_turn_summary.is_none());
+    assert!(final_state.frontier.active_turn.is_none());
+    assert!(final_state
+        .provider_history
+        .as_ref()
+        .is_some_and(|history| history.recovery_turn_id.is_none()));
+}
+
+#[tokio::test]
+async fn manual_compact_projects_committed_and_failed_turn_summaries_together() {
+    const COMMITTED_MARKER: &str = "FULL-COMMITTED-HISTORY-MARKER";
+    const ACTIVE_MARKER: &str = "FULL-ACTIVE-RECOVERY-MARKER";
+    const COMMITTED_SUMMARY: &str = "earlier committed work summarized";
+    const ACTIVE_SUMMARY: &str = "failed active work summarized";
+    const POST_FAILURE_MARKER: &str = "POST-FAILURE-CANONICAL-MARKER";
+    const NEXT_REQUEST: &str = "continue from the mixed recovered state";
+
+    let dir = tempfile::tempdir().unwrap();
+    tokio::fs::write(
+        dir.path().join("active-note.txt"),
+        format!("{}{ACTIVE_MARKER}", "a".repeat(12_000)),
+    )
+    .await
+    .unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        tool_use_step(
+            "toolu_manual_mixed",
+            "file_read",
+            json!({"path": "active-note.txt", "show_linenos": false}),
+        ),
+        error_step("provider failed after mixed history", Vec::new()),
+        json_by_request_kind_responses(
+            &[
+                r#"{"committed_summary":"earlier committed work summarized","active_turn_summary":"failed active work summarized"}"#,
+            ],
+            &[],
+        ),
+        response_step("continued from both summaries", Vec::new()),
+    ]));
+    let tools = Arc::new(
+        ToolRegistry::new(&ToolConfig {
+            workspace_root: dir.path().to_path_buf(),
+            ..ToolConfig::default()
+        })
+        .unwrap(),
+    );
+    let (mut engine, store) =
+        build_test_engine_with_tools(&dir, provider.clone(), Arc::clone(&tools));
+    engine.compaction.auto_compact_ctx_ratio = 0.0;
+    engine.compaction.tail_target_ctx_ratio = 0.00001;
+    let mut session = create_test_session(&store, "session_face0021").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "earlier request"),
+            NewSessionMessage::text(
+                SessionMessageRole::Assistant,
+                format!("{}{COMMITTED_MARKER}", "c".repeat(12_000)),
+            ),
+        ])
+        .await
+        .unwrap();
+
+    engine
+        .run_turn(&mut session, "read the active note and continue", |_| {})
+        .await
+        .expect_err("the second main request must fail");
+    let provider_history_before = session
+        .read_metadata()
+        .await
+        .unwrap()
+        .compaction
+        .as_ref()
+        .and_then(|state| state.provider_history.clone())
+        .expect("failed turn must retain its exact request WAL");
+    let raw_wal = serde_json::to_string(&provider_history_before).unwrap();
+    assert!(raw_wal.contains(COMMITTED_MARKER));
+    assert!(raw_wal.contains(ACTIVE_MARKER));
+    session
+        .append_messages(&[NewSessionMessage::text(
+            SessionMessageRole::User,
+            POST_FAILURE_MARKER,
+        )])
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        engine
+            .compact_session_checkpoint(&mut session, |_| {})
+            .await
+            .unwrap(),
+        SessionCompactionResult::Compacted(_)
+    ));
+    let after = session.read_metadata().await.unwrap().compaction.unwrap();
+    assert_eq!(after.committed_summary, COMMITTED_SUMMARY);
+    assert_eq!(after.frontier.committed_message_until, 2);
+    assert_eq!(after.active_turn_summary.as_deref(), Some(ACTIVE_SUMMARY));
+    assert!(after.frontier.active_turn.is_some());
+    let compacted_wal = serde_json::to_string(&after.provider_history.unwrap()).unwrap();
+    assert!(compacted_wal.contains(COMMITTED_SUMMARY));
+    assert!(compacted_wal.contains(ACTIVE_SUMMARY));
+    assert!(!compacted_wal.contains(COMMITTED_MARKER));
+    assert!(!compacted_wal.contains(ACTIVE_MARKER));
+
+    let requests = provider.requests().await;
+    let summary_request = requests
+        .iter()
+        .find(|request| request.system_prompt.contains("committed_summary"))
+        .expect("manual mixed compact must call the shared summarizer");
+    let summary_json = serde_json::to_string(&summary_request.messages).unwrap();
+    assert!(summary_json.contains(COMMITTED_MARKER));
+    assert!(summary_json.contains(ACTIVE_MARKER));
+
+    engine
+        .run_turn(&mut session, NEXT_REQUEST, |_| {})
+        .await
+        .unwrap();
+    let requests = provider.requests().await;
+    let continuation_json = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
+    assert!(continuation_json.contains(COMMITTED_SUMMARY));
+    assert!(continuation_json.contains(ACTIVE_SUMMARY));
+    assert!(!continuation_json.contains(COMMITTED_MARKER));
+    assert!(!continuation_json.contains(ACTIVE_MARKER));
+    let summary_at = continuation_json.find(ACTIVE_SUMMARY).unwrap();
+    let post_failure_at = continuation_json.find(POST_FAILURE_MARKER).unwrap();
+    let next_request_at = continuation_json.rfind(NEXT_REQUEST).unwrap();
+    assert!(summary_at < post_failure_at);
+    assert!(post_failure_at < next_request_at);
+}
+
+#[tokio::test]
+async fn manual_compact_does_not_duplicate_canonical_records_between_failed_turns() {
+    const FIRST_REQUEST: &str = "first failed request";
+    const SECOND_REQUEST: &str = "second failed request";
+    const THIRD_REQUEST: &str = "third failed request";
+    const SHELL_MARKER: &str = "INTERLEAVED-SHELL-MARKER";
+    const ACTIVE_SUMMARY: &str = "failed turns and interleaved shell record summarized in order";
+    const UPDATED_ACTIVE_SUMMARY: &str = "later failure merged into the recovery summary";
+
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        error_step("first provider failure", Vec::new()),
+        error_step("second provider failure", Vec::new()),
+        json_by_request_kind_responses(
+            &[
+                r#"{"committed_summary":null,"active_turn_summary":"failed turns and interleaved shell record summarized in order"}"#,
+            ],
+            &[],
+        ),
+        error_step("third provider failure", Vec::new()),
+        json_by_request_kind_responses(
+            &[
+                r#"{"committed_summary":null,"active_turn_summary":"later failure merged into the recovery summary"}"#,
+            ],
+            &[],
+        ),
+        json_by_request_kind_responses(
+            &[
+                r#"{"committed_summary":null,"active_turn_summary":"live turn merged with recovery"}"#,
+            ],
+            &[],
+        ),
+    ]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.compaction.auto_compact_ctx_ratio = 0.0;
+    engine.compaction.tail_target_ctx_ratio = 0.00001;
+    let mut session = create_test_session(&store, "session_face0023").await;
+    let encoded_shell_marker = SHELL_MARKER
+        .bytes()
+        .map(|byte| format!("\\{byte:03o}"))
+        .collect::<String>();
+
+    engine
+        .run_turn(&mut session, FIRST_REQUEST, |_| {})
+        .await
+        .expect_err("the first turn must fail");
+    engine
+        .run_user_shell_command(
+            &mut session,
+            format!("printf '{encoded_shell_marker}'"),
+            CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+    engine
+        .run_turn(&mut session, SECOND_REQUEST, |_| {})
+        .await
+        .expect_err("the second turn must fail");
+    let before_compact = session.read_metadata().await.unwrap().compaction.unwrap();
+    let before_compact_history = before_compact.provider_history.unwrap();
+    assert_eq!(before_compact_history.recovery_base_message_count, Some(0));
+
+    assert!(matches!(
+        engine
+            .compact_session_checkpoint(&mut session, |_| {})
+            .await
+            .unwrap(),
+        SessionCompactionResult::Compacted(_)
+    ));
+    let requests = provider.requests().await;
+    let summary_request = requests
+        .iter()
+        .find(|request| request.system_prompt.contains("committed_summary"))
+        .expect("manual recovery compact must call the shared summarizer");
+    let summary_json = serde_json::to_string(&summary_request.messages).unwrap();
+    assert_eq!(summary_json.matches(SHELL_MARKER).count(), 1);
+
+    let state = session.read_metadata().await.unwrap().compaction.unwrap();
+    assert!(state.committed_summary.is_empty());
+    assert_eq!(state.frontier.committed_message_until, 0);
+    assert_eq!(state.active_turn_summary.as_deref(), Some(ACTIVE_SUMMARY));
+    assert_eq!(
+        state
+            .provider_history
+            .as_deref()
+            .and_then(|history| history.recovery_base_message_count),
+        Some(0)
+    );
+
+    engine
+        .run_turn(&mut session, THIRD_REQUEST, |_| {})
+        .await
+        .expect_err("the third turn must fail");
+    assert!(matches!(
+        engine
+            .compact_session_checkpoint(&mut session, |_| {})
+            .await
+            .unwrap(),
+        SessionCompactionResult::Compacted(_)
+    ));
+    let state = session.read_metadata().await.unwrap().compaction.unwrap();
+    assert!(state.committed_summary.is_empty());
+    assert_eq!(state.frontier.committed_message_until, 0);
+    assert_eq!(
+        state.active_turn_summary.as_deref(),
+        Some(UPDATED_ACTIVE_SUMMARY)
+    );
+
+    let mut live_provider_messages = state
+        .provider_history
+        .as_deref()
+        .expect("manual recovery compact should persist its Provider projection")
+        .messages
+        .clone();
+    let mut writer = session.open_turn_journal_writer().await.unwrap();
+    let live_started_at = Utc::now();
+    writer
+        .append(
+            "turn_live",
+            live_started_at,
+            TurnJournalEventKind::TurnStarted,
+            TurnJournalFlush::Immediate,
+        )
+        .await
+        .unwrap();
+    writer
+        .append(
+            "turn_live",
+            live_started_at,
+            TurnJournalEventKind::UserInputAccepted {
+                text: "live request".into(),
+            },
+            TurnJournalFlush::Immediate,
+        )
+        .await
+        .unwrap();
+    drop(writer);
+    let live_active_suffix = oversized_active_suffix("live request".into(), None, None);
+    live_provider_messages.extend(live_active_suffix.iter().cloned());
+    let base_message_count = session.read_metadata().await.unwrap().message_count;
+    let live_projection = engine
+        .compact_provider_preflight(
+            &mut session,
+            PreflightCompactionRequest {
+                base_system_prompt: "system",
+                provider_messages: &live_provider_messages,
+                active_suffix: live_active_suffix,
+                turn_id: "turn_live",
+                base_message_count,
+                active_projection_compacted: false,
+                runtime_projection_tokens: 0,
+                protected_active_tail_segments: 0,
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap()
+        .expect("live preflight should compact the active tool history");
+    let live_projection_json = serde_json::to_string(&live_projection.messages).unwrap();
+    assert!(
+        live_projection_json.contains("live request"),
+        "live preflight must retain the current user request as the raw anchor"
+    );
+    let live_request_at = live_projection_json.find("live request").unwrap();
+    let live_summary_at = live_projection_json
+        .find("live turn merged with recovery")
+        .unwrap();
+    assert!(
+        live_request_at < live_summary_at,
+        "the replacement WAL must place the current raw anchor before the recovery summary"
+    );
+    let live_state = session.read_metadata().await.unwrap().compaction.unwrap();
+    assert_eq!(
+        live_state
+            .provider_history
+            .as_deref()
+            .and_then(|history| history.recovery_turn_id.as_deref()),
+        Some("turn_live")
+    );
+    let journal_projection = replay_turn_journal(session.read_turn_journal().await);
+    let canonical_messages = session.read_messages().await.unwrap();
+    let recovery_turns = recovery_turn_chain(&journal_projection, &canonical_messages);
+    let recovery_suffix = provider_recovery_suffix(&live_projection.messages, &recovery_turns)
+        .expect("the replacement WAL must remain recoverable from the current raw anchor");
+    let recovery_suffix_json = serde_json::to_string(&recovery_suffix).unwrap();
+    assert!(recovery_suffix_json.contains("live request"));
+    assert!(recovery_suffix_json.contains("live turn merged with recovery"));
+    let requests = provider.requests().await;
+    let live_summary_request = requests
+        .last()
+        .expect("live preflight should call the shared summarizer");
+    assert!(
+        serde_json::to_string(&live_summary_request.messages)
+            .unwrap()
+            .contains(UPDATED_ACTIVE_SUMMARY),
+        "live preflight must carry the unresolved recovery summary into its replacement"
+    );
+}
+
+#[test]
+fn manual_recovery_keeps_repeated_failed_turns_across_provider_identity_change() {
+    fn failed_turn(turn_id: &str, original_user_request: &str) -> TurnJournalTurn {
+        TurnJournalTurn {
+            turn_id: turn_id.into(),
+            started_at: None,
+            accepted_at: None,
+            finished_at: None,
+            status: Some(TurnJournalStatus::Failed),
+            original_user_request: Some(original_user_request.into()),
+            canonical_user_content_hash: None,
+            canonical_user_first_text: None,
+            model_context: Vec::new(),
+            skill_instructions: Vec::new(),
+            compaction_assets: Vec::new(),
+            assistant_text: String::new(),
+            assistant_completed: false,
+            tool_calls: Vec::new(),
+            timeline_items: Vec::new(),
+            user_steers: Vec::new(),
+            non_streaming_fallbacks: Vec::new(),
+        }
+    }
+
+    let first = failed_turn("turn_first", "continue");
+    let latest = failed_turn("turn_latest", "continue");
+    let recovery_turns = vec![&first, &latest];
+    let old_identity = ProviderReplayIdentity {
+        protocol: ProviderReplayProtocol::OpenAiResponses,
+        model: "old-model".into(),
+    };
+    let current_identity = ProviderReplayIdentity {
+        protocol: ProviderReplayProtocol::AnthropicMessages,
+        model: "current-model".into(),
+    };
+    let history = CompactedProviderHistory {
+        replay_identity: Some(old_identity),
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
+        pending_turn: Some(PendingProviderHistoryTurn {
+            turn_id: latest.turn_id.clone(),
+            base_message_count: 0,
+            provider_request_message_count: Some(4),
+        }),
+        canonical_message_until: 0,
+        messages: vec![
+            SessionTurnMessage::user_text("continue"),
+            SessionTurnMessage {
+                role: "assistant".into(),
+                content: vec![SessionTurnContentBlock::ToolUse {
+                    id: "toolu_first".into(),
+                    name: "working_note".into(),
+                    input: json!({"action": "add", "note": "keep neutral tool input"}),
+                }],
+                provider_replay: Some(ProviderReplayState::OpenAiResponses {
+                    model: Some("old-model".into()),
+                    items: vec![json!({"opaque": "PRIVATE-REPLAY-MARKER"})],
+                }),
+            },
+            SessionTurnMessage {
+                role: "user".into(),
+                content: vec![SessionTurnContentBlock::ToolResult {
+                    tool_use_id: "toolu_first".into(),
+                    content: "FIRST-TOOL-RESULT".into(),
+                }],
+                provider_replay: None,
+            },
+            SessionTurnMessage::user_text("continue"),
+        ],
+    };
+
+    let recovered = manual_pending_provider_turn(
+        Some(&history),
+        &recovery_turns,
+        Some(&current_identity),
+        &[],
+        ProviderHistoryMediaPolicy::Placeholder,
+    )
+    .unwrap()
+    .expect("the provider-neutral WAL suffix should survive an identity change");
+
+    assert_eq!(recovered.base_message_count, 0);
+    assert_eq!(recovered.turn_id, "turn_latest");
+    assert_eq!(recovered.protected_tail_segments, 0);
+    assert!(recovered
+        .active_suffix
+        .iter()
+        .all(|message| message.provider_replay.is_none()));
+    let recovered_json = serde_json::to_string(&recovered.active_suffix).unwrap();
+    assert!(recovered_json.contains("toolu_first"));
+    assert!(recovered_json.contains("FIRST-TOOL-RESULT"));
+    assert_eq!(recovered_json.matches("continue").count(), 2);
+    assert!(!recovered_json.contains("PRIVATE-REPLAY-MARKER"));
+
+    let stable_history = CompactedProviderHistory {
+        replay_identity: history.replay_identity.clone(),
+        recovery_turn_id: Some(first.turn_id.clone()),
+        recovery_base_message_count: Some(0),
+        pending_turn: None,
+        canonical_message_until: 0,
+        messages: history.messages[..3].to_vec(),
+    };
+    let recovered = manual_pending_provider_turn(
+        Some(&stable_history),
+        &recovery_turns,
+        Some(&current_identity),
+        &[],
+        ProviderHistoryMediaPolicy::Placeholder,
+    )
+    .unwrap()
+    .expect("stable unresolved WAL should remain manually compactable");
+    assert_eq!(recovered.turn_id, "turn_first");
+    let recovered_json = serde_json::to_string(&recovered.active_suffix).unwrap();
+    assert!(recovered_json.contains("toolu_first"));
+    assert!(recovered_json.contains("FIRST-TOOL-RESULT"));
+    assert_eq!(recovered_json.matches("continue").count(), 1);
+}
+
+#[tokio::test]
+async fn manual_compact_keeps_short_pending_turn_as_raw_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![error_step(
+        "provider failed before any progress",
+        Vec::new(),
+    )]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.compaction.auto_compact_ctx_ratio = 0.0;
+    engine.compaction.tail_target_ctx_ratio = 0.6;
+    let mut session = create_test_session(&store, "session_face0020").await;
+
+    engine
+        .run_turn(&mut session, "short request", |_| {})
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        engine
+            .compact_session_checkpoint(&mut session, |_| {})
+            .await
+            .unwrap(),
+        SessionCompactionResult::Noop(SessionCompactionNoopReason::NothingNew)
+    ));
+    assert_eq!(provider.requests().await.len(), 1);
+}
+
+#[tokio::test]
+async fn manual_compact_preserves_stable_raw_recovery_without_pending_turn() {
+    const COMMITTED_MARKER: &str = "COMMITTED-BEFORE-FAILED-TURN";
+    const COMMITTED_SUMMARY: &str = "committed history summarized";
+    const FAILED_REQUEST: &str = "continue after the committed work";
+
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        error_step("provider failed before any progress", Vec::new()),
+        json_by_request_kind_responses(
+            &[r#"{"committed_summary":"committed history summarized","active_turn_summary":null}"#],
+            &[],
+        ),
+    ]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.compaction.auto_compact_ctx_ratio = 0.0;
+    engine.compaction.tail_target_ctx_ratio = 0.00001;
+    let mut session = create_test_session(&store, "session_face0022").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "earlier request"),
+            NewSessionMessage::text(
+                SessionMessageRole::Assistant,
+                format!("{}{COMMITTED_MARKER}", "c".repeat(12_000)),
+            ),
+        ])
+        .await
+        .unwrap();
+
+    engine
+        .run_turn(&mut session, FAILED_REQUEST, |_| {})
+        .await
+        .unwrap_err();
+    let projection = replay_turn_journal(session.read_turn_journal().await);
+    let canonical_messages = session.read_messages().await.unwrap();
+    engine
+        .reconcile_pending_provider_history(&mut session, &projection, &canonical_messages)
+        .await
+        .unwrap();
+    let stable = session.read_metadata().await.unwrap().compaction.unwrap();
+    let stable_history = stable.provider_history.unwrap();
+    assert!(stable_history.pending_turn.is_none());
+    assert!(stable_history.recovery_turn_id.is_some());
+
+    assert!(matches!(
+        engine
+            .compact_session_checkpoint(&mut session, |_| {})
+            .await
+            .unwrap(),
+        SessionCompactionResult::Compacted(_)
+    ));
+    let compacted = session.read_metadata().await.unwrap().compaction.unwrap();
+    assert_eq!(compacted.committed_summary, COMMITTED_SUMMARY);
+    assert!(compacted.active_turn_summary.is_none());
+    let compacted_history = compacted.provider_history.unwrap();
+    assert!(compacted_history.pending_turn.is_none());
+    assert!(compacted_history.recovery_turn_id.is_some());
+    let compacted_wal = serde_json::to_string(&compacted_history.messages).unwrap();
+    assert!(compacted_wal.contains(COMMITTED_SUMMARY));
+    assert!(compacted_wal.contains(FAILED_REQUEST));
+    assert!(!compacted_wal.contains(COMMITTED_MARKER));
+
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "later local record"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "l".repeat(12_000)),
+        ])
+        .await
+        .unwrap();
+    let requests_before_second_compact = provider.requests().await.len();
+    engine
+        .compact_session_checkpoint(&mut session, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(
+        provider.requests().await.len(),
+        requests_before_second_compact
+    );
+    let after_second = session.read_metadata().await.unwrap().compaction.unwrap();
+    let after_second_history = after_second.provider_history.unwrap();
+    assert!(after_second_history.recovery_turn_id.is_some());
+    let after_second_wal = serde_json::to_string(&after_second_history.messages).unwrap();
+    assert!(after_second_wal.contains(FAILED_REQUEST));
 }
 
 #[test]
@@ -6976,6 +7663,7 @@ async fn preflight_compact_skips_context_only_committed_projection_without_provi
             &mut session,
             PreflightCompactionRequest {
                 base_system_prompt: "system",
+                provider_messages: &[],
                 active_suffix: vec![SessionTurnMessage::user_text("current request")],
                 turn_id: "turn_1",
                 base_message_count: 4,
@@ -7103,6 +7791,7 @@ async fn preflight_compact_keeps_active_scope_when_committed_projection_is_empty
             &mut session,
             PreflightCompactionRequest {
                 base_system_prompt: "system",
+                provider_messages: &[],
                 active_suffix,
                 turn_id: "turn_1",
                 base_message_count: 2,
@@ -7672,6 +8361,7 @@ async fn manual_compact_applied_summary_checkpoint_clears_file_read_state() {
         summary: "checkpointed summary".into(),
         active_turn_summary: None,
         active_turn: None,
+        preserve_provider_history: false,
         status: CompactionCheckpointStatus::Applied,
     };
     session
@@ -7928,6 +8618,7 @@ async fn manual_compact_bad_checkpoint_range_writes_failed_audit() {
         summary: "bad range summary".into(),
         active_turn_summary: None,
         active_turn: None,
+        preserve_provider_history: false,
         status: CompactionCheckpointStatus::Applied,
     };
     session
@@ -7985,6 +8676,7 @@ async fn finalize_ignores_legacy_v2_compaction_checkpoint() {
         summary: String::new(),
         active_turn_summary: None,
         active_turn: None,
+        preserve_provider_history: false,
         status: CompactionCheckpointStatus::Applied,
     };
     session
@@ -10822,6 +11514,8 @@ async fn persisted_provider_window_replays_new_canonical_tail_without_reprojecti
         SessionCompactionState::from_committed_summary(2, "covered summary".into(), Utc::now());
     compaction.provider_history = Some(Box::new(CompactedProviderHistory {
         replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
         pending_turn: None,
         canonical_message_until: 2,
         messages: vec![SessionTurnMessage::user_text("STABLE_COMPACT_WINDOW")],
@@ -10853,6 +11547,96 @@ async fn persisted_provider_window_replays_new_canonical_tail_without_reprojecti
 }
 
 #[tokio::test]
+async fn recovery_provider_window_projects_safely_across_identity_change() {
+    const RECOVERY_MARKER: &str = "RECOVERY-NEUTRAL-MARKER";
+    const PRIVATE_REPLAY_MARKER: &str = "PRIVATE-REPLAY-MARKER";
+    const CANONICAL_TAIL_MARKER: &str = "CANONICAL-TAIL-MARKER";
+
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (_engine, store) = build_test_engine(&dir, provider);
+    let mut session = create_test_session(&store, "session_c0ffee2b").await;
+    session
+        .append_messages(&[NewSessionMessage::text(
+            SessionMessageRole::Assistant,
+            CANONICAL_TAIL_MARKER,
+        )])
+        .await
+        .unwrap();
+    let old_identity = ProviderReplayIdentity {
+        protocol: ProviderReplayProtocol::OpenAiResponses,
+        model: "old-model".into(),
+    };
+    let current_identity = ProviderReplayIdentity {
+        protocol: ProviderReplayProtocol::AnthropicMessages,
+        model: "current-model".into(),
+    };
+    let mut compaction =
+        SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
+    compaction.provider_history = Some(Box::new(CompactedProviderHistory {
+        replay_identity: Some(old_identity),
+        recovery_turn_id: Some("turn_failed".into()),
+        recovery_base_message_count: Some(0),
+        pending_turn: None,
+        canonical_message_until: 0,
+        messages: vec![SessionTurnMessage {
+            role: "assistant".into(),
+            content: vec![SessionTurnContentBlock::text(RECOVERY_MARKER)],
+            provider_replay: Some(ProviderReplayState::OpenAiResponses {
+                model: Some("old-model".into()),
+                items: vec![json!({"opaque": PRIVATE_REPLAY_MARKER})],
+            }),
+        }],
+    }));
+    session.update_compaction(compaction).await.unwrap();
+    let metadata = session.read_metadata().await.unwrap();
+    let messages = session.read_messages().await.unwrap();
+
+    let (_, history) = compacted_context_for_turn(
+        "system",
+        &metadata,
+        messages.clone(),
+        usize::MAX,
+        usize::MAX,
+        4,
+        4096,
+        ProviderHistoryMediaPolicy::Placeholder,
+        Some(current_identity.clone()),
+        true,
+    )
+    .unwrap();
+    let rendered = serde_json::to_string(&history).unwrap();
+    assert!(rendered.contains(RECOVERY_MARKER));
+    assert!(rendered.contains(CANONICAL_TAIL_MARKER));
+    assert!(!rendered.contains(PRIVATE_REPLAY_MARKER));
+
+    let projection = project_provider_context(
+        "system",
+        metadata.compaction.as_ref().unwrap(),
+        &messages,
+        vec![SessionTurnMessage::user_text("next request")],
+        ActiveProjectionContext {
+            turn_id: "turn_next",
+            base_message_count: messages.len(),
+        },
+        ProviderProjectionBudget {
+            tail_token_limit: usize::MAX,
+            tail_hard_token_limit: usize::MAX,
+            tail_previous_real_user_turns: 4,
+            tool_result_raw_max_chars: 4096,
+        },
+        ProviderHistoryMediaPolicy::Placeholder,
+        Some(current_identity),
+        0,
+        true,
+    );
+    let rendered = serde_json::to_string(&projection.messages).unwrap();
+    assert!(rendered.contains(RECOVERY_MARKER));
+    assert!(rendered.contains(CANONICAL_TAIL_MARKER));
+    assert!(!rendered.contains(PRIVATE_REPLAY_MARKER));
+}
+
+#[tokio::test]
 async fn disabled_authority_filters_historical_compaction_notice_without_rewriting_wal() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(Vec::new()));
@@ -10863,6 +11647,8 @@ async fn disabled_authority_filters_historical_compaction_notice_without_rewriti
         SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
     compaction.provider_history = Some(Box::new(CompactedProviderHistory {
         replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
         pending_turn: None,
         canonical_message_until: 0,
         messages: vec![historical],
@@ -11001,6 +11787,8 @@ async fn pending_provider_window_reconciles_canonical_tail_after_post_commit_fai
         SessionCompactionState::from_committed_summary(1, "covered summary".into(), Utc::now());
     compaction.provider_history = Some(Box::new(CompactedProviderHistory {
         replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
         pending_turn: Some(PendingProviderHistoryTurn {
             turn_id: "turn_1".into(),
             base_message_count: 0,
@@ -11046,6 +11834,8 @@ async fn uncommitted_pending_provider_window_discards_unaccepted_response_suffix
         SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
     compaction.provider_history = Some(Box::new(CompactedProviderHistory {
         replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
         pending_turn: Some(PendingProviderHistoryTurn {
             turn_id: "turn_1".into(),
             base_message_count: 0,
@@ -11090,6 +11880,7 @@ async fn uncommitted_pending_provider_window_discards_unaccepted_response_suffix
         .and_then(|compaction| compaction.provider_history.as_ref())
         .unwrap();
     assert!(provider_history.pending_turn.is_none());
+    assert_eq!(provider_history.recovery_turn_id.as_deref(), Some("turn_1"));
     assert_eq!(provider_history.canonical_message_until, 0);
     assert_eq!(provider_history.messages, vec![exact_request.clone()]);
     let (_, projected) = compacted_context_for_turn(
@@ -11129,6 +11920,8 @@ async fn committed_pending_provider_window_preserves_later_shell_tail() {
         SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
     compaction.provider_history = Some(Box::new(CompactedProviderHistory {
         replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
         pending_turn: Some(PendingProviderHistoryTurn {
             turn_id: "turn_1".into(),
             base_message_count: 0,
@@ -11177,6 +11970,7 @@ async fn committed_pending_provider_window_preserves_later_shell_tail() {
         .and_then(|compaction| compaction.provider_history.as_ref())
         .unwrap();
     assert!(provider_history.pending_turn.is_none());
+    assert!(provider_history.recovery_turn_id.is_none());
     assert_eq!(provider_history.canonical_message_until, 2);
     let (_, projected) = compacted_context_for_turn(
         "system",
@@ -11542,6 +12336,7 @@ async fn preflight_recovers_matching_compaction_checkpoint_before_replanning() {
         summary: "recovered committed summary".into(),
         active_turn_summary: None,
         active_turn: None,
+        preserve_provider_history: false,
         status: CompactionCheckpointStatus::Applied,
     };
     session
@@ -11555,6 +12350,7 @@ async fn preflight_recovers_matching_compaction_checkpoint_before_replanning() {
             &mut session,
             PreflightCompactionRequest {
                 base_system_prompt: "system",
+                provider_messages: &[],
                 active_suffix: vec![SessionTurnMessage::user_text("continue")],
                 turn_id: "turn_1",
                 base_message_count: messages.len(),
@@ -11613,6 +12409,7 @@ async fn preflight_checkpoint_recovery_validation_failure_writes_failed_audit() 
         summary: "recovered committed summary".into(),
         active_turn_summary: None,
         active_turn: None,
+        preserve_provider_history: false,
         status: CompactionCheckpointStatus::Applied,
     };
     session
@@ -11625,6 +12422,7 @@ async fn preflight_checkpoint_recovery_validation_failure_writes_failed_audit() 
             &mut session,
             PreflightCompactionRequest {
                 base_system_prompt: "system",
+                provider_messages: &[],
                 active_suffix: vec![SessionTurnMessage::user_text("continue")],
                 turn_id: "turn_1",
                 base_message_count: messages.len(),
