@@ -2,6 +2,10 @@
 
 > 状态：已完成（2026-09-02，追加 ND-1、ND-2、ND-3、ND-4 并完成复验与外部复审）。
 
+> 后续范围说明（2026-09-03）：Resume inbox 的失败分类、用户提示和统一恢复 `Open`
+> 语义由 `docs/PRDs/PRD_inbox_failure_and_startup_recovery.md` 扩展；本文的 Finalizing
+> 接管顺序、历史恢复、输入归属及 notice 前后空行语义继续有效。
+
 ## 背景
 
 ACN 当前允许恢复未被占用的一致 `Open` session 和已经完成收尾的 `Closed`

@@ -1305,6 +1305,10 @@ impl SessionTuiState {
         self.transcript.push_error(message);
     }
 
+    pub(super) fn push_startup_error(&mut self, message: impl Into<String>) {
+        self.transcript.push_startup_error(message);
+    }
+
     pub fn push_system(&mut self, message: impl Into<String>) {
         self.transcript.push_system(message);
     }
@@ -1327,6 +1331,21 @@ impl SessionTuiState {
         self.transcript.push_system("");
         for warning in warnings {
             self.transcript.push_warning(warning);
+        }
+        self.transcript.push_system("");
+    }
+
+    pub(super) fn push_resume_inbox_notices(&mut self, events: Vec<SessionEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        debug_assert!(events.iter().all(|event| matches!(
+            event,
+            SessionEvent::Warning { .. } | SessionEvent::InboxFailed { .. }
+        )));
+        self.transcript.push_system("");
+        for event in events {
+            self.apply_event(event);
         }
         self.transcript.push_system("");
     }

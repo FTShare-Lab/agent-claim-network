@@ -52,7 +52,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         command: "/inbox",
-        description: "同步 maintainer inbox",
+        description: "同步并处理 inbox",
         action: SlashCommandAction::Inbox,
     },
     SlashCommandSpec {

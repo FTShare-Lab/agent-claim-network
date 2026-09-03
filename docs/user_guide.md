@@ -175,7 +175,7 @@ acn --resume
 - `/compact`：手动压缩上下文；有未 recap 的 committed history 时会静默投递后台 Recap
 - `/copy`：复制最近一条 assistant 回复
 - `/exit`：结束当前 session，并把 finalize 交给后台 supervisor
-- `/inbox`：同步团队消息；单人模式会明确提示团队服务未配置
+- `/inbox`：同步并处理 inbox
 - `/mcp`：查看 MCP server、连接状态和工具
 - `/new`：先收尾当前 session，再刷新欢迎页并按正常启动流程创建新 session
 - `/ps`：查看、选择和终止当前 session 可见的受管进程
@@ -185,9 +185,9 @@ acn --resume
 - `!cmd`：运行本地 shell 命令
 - `@path`：把文本、图片或 PDF 加入当前输入
 
-`/new` 与 `/resume` 都可以在非空的空闲 session 中使用。
+`/new` 会显示正常欢迎页，并执行与直接启动相同的 `inbox → prompt → create session → Open`；`/resume` 会先加载并显示目标既有历史、context 与 local claims，再在历史页面可见地同步 inbox；恢复过程不会替换已有历史消息或 system prompt。
 
-handoff 成功后才清空旧页面。`/new` 会显示正常欢迎页，并执行与直接启动相同的 `inbox → prompt → create session → Open`；`/resume` 会先加载并显示目标既有历史、context 与 local claims，再在历史页面可见地同步 inbox；恢复过程不会替换已有历史消息或 system prompt。Resume inbox 失败时显示 `Warning: Inbox sync failed; run /inbox to retry.`，可以继续对话或稍后手动 `/inbox`。
+如果 inbox 之后的 system prompt 或 session runtime 创建失败，TUI 会明确显示没有 active session。此时只支持 `/new`、`/resume`、`/help` 和 `/exit`；其他输入会被拒绝且不会进入队列。初始化期间已经排队的草稿会恢复到输入框。
 
 handoff 成功后的目标 startup、历史加载和 inbox 期间允许继续输入，但内容只进入既有队列，在目标 `Open` 后按顺序发送。切换决定之前已经发起的旧 `/copy`、附件预览或剪贴板图片读取即使稍后完成，也不会把结果提示写进目标 transcript。
 

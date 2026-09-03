@@ -25,7 +25,7 @@
 
 两个 endpoint 必须成对配置。单项配置会在启动校验阶段报错。
 
-团队服务失败不会中止本地 session。ACN 会显示 warning，将对应连接状态记为失败，并继续处理已持久化的本地 inbox 与本地任务。
+团队服务失败不会中止本地 session。ACN 会显示 warning，将对应连接状态记为失败，并继续处理已持久化的本地 inbox 与本地任务。Inbox 的 LLM 内化失败同样以 warning 放行；本地持久化或应用失败显示 error 和可能部分副作用提示，但 Fresh、`/new`、`/resume` 与会话内 `/inbox` 最终仍回到 `Open`。只有后续 system prompt 或 session runtime 创建失败时才会留下无 active session 的受限 Error 恢复界面。
 
 ## 组件职责
 

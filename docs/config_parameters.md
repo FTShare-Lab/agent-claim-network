@@ -30,7 +30,7 @@
 
 - `upstream`：Agent 默认使用的运行与团队连接配置名称，例如 `dev`。如果启动时传了 `--upstream <name>`，则 CLI 参数优先生效；缺省时必须通过 CLI 指定。自动生成的配置使用 `default`。
 - `agent_id`：当前 agent 的唯一标识，不能为空且必须匹配 `^[a-z0-9_-]+$`。交互式 `acn` 不再接受 `--agent`，agent 身份只来自选中的 upstream。自动生成配置中的空值必须填写。
-- `maintainer_endpoint`：访问 maintainer daemon 的 base URL。与 `router_endpoint` 同时配置时启用团队模式；两者同时留空或省略时进入单人模式，不连接 maintainer、不同步 inbox/claim/dispute，也不维护待补传队列。
+- `maintainer_endpoint`：访问 maintainer daemon 的 base URL。与 `router_endpoint` 同时配置时启用团队模式；两者同时留空或省略时进入单人模式，不连接 maintainer、不拉取远端 inbox、不同步 claim/dispute，也不维护待补传队列。启动、Resume 与手动 `/inbox` 仍会处理已经存在的本地 pending inbox。
 - `router_endpoint`：访问 router daemon 的 base URL。与 `maintainer_endpoint` 必须同时配置或同时留空；单人模式不获取 router overview，也不暴露 `consult_router` 工具。
 - `acn_key_env`：唯一支持的 upstream 团队鉴权 key 配置字段，值为环境变量名，可以留空或省略。这是由团队管理员提供的服务访问凭据，与主 LLM key 和 Web Search key 无关。对应环境变量不存在/为空时，agent 不阻塞启动；团队模式请求仍会带鉴权信封，但鉴权值为空字符串，启用鉴权的服务会拒绝该请求。
 

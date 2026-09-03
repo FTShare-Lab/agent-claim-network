@@ -230,6 +230,15 @@ impl TranscriptState {
         self.history.push(HistoryEntry::Error(ErrorCell {
             text: message.into(),
             leading_gap_after_flushed_user: true,
+            indent_continuations: true,
+        }));
+    }
+
+    pub(super) fn push_startup_error(&mut self, message: impl Into<String>) {
+        self.history.push(HistoryEntry::Error(ErrorCell {
+            text: message.into(),
+            leading_gap_after_flushed_user: true,
+            indent_continuations: false,
         }));
     }
 
@@ -238,6 +247,7 @@ impl TranscriptState {
             text: message.into(),
             // 活动 User flush 时已经保留一行；Turn failed 在下一批不能再补第二行。
             leading_gap_after_flushed_user: false,
+            indent_continuations: true,
         }));
     }
 

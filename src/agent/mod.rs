@@ -23,7 +23,8 @@ mod user_shell;
 pub use context::AgentContext;
 pub(crate) use inbox::PromptInboxJsonGenerator;
 pub use runner::{
-    AgentRunner, InboxProcessReport, TeamServiceConnectionStatus, TeamServicesConnectionStatus,
+    AgentRunner, InboxProcessFailure, InboxProcessFailureKind, InboxProcessReport,
+    TeamServiceConnectionStatus, TeamServicesConnectionStatus,
 };
 pub use session_engine::{
     SessionCompactionNoopReason, SessionCompactionResult, SessionEngine, SessionEngineOptions,

@@ -453,8 +453,12 @@ impl ChatWidget {
             self.app_event_tx.request_render();
         }
         let sequence = self.state.next_input_submission_sequence();
+        let submitted_during_startup_recovery = self.state.status == SessionRuntimeStatus::Error
+            && self.state.session_id.is_none()
+            && !self.state.finalize_failed();
         if !wants_at_paths {
-            let input = QueuedInput::new(expanded_input, draft);
+            let input = QueuedInput::new(expanded_input, draft)
+                .submitted_during_startup_recovery(submitted_during_startup_recovery);
             if steer_running_turn
                 && !force_queue_for_attachments
                 && !force_queue_for_slash_command
@@ -488,7 +492,13 @@ impl ChatWidget {
             })
             .await
             .unwrap_or_else(|e| Err(format!("附件解析任务失败: {e}")));
-            tx.at_path_resolved(sequence, expanded_input, draft, result);
+            tx.at_path_resolved(
+                sequence,
+                submitted_during_startup_recovery,
+                expanded_input,
+                draft,
+                result,
+            );
         });
     }
 
@@ -1125,6 +1135,9 @@ fn live_box_title(state: &SessionTuiState) -> String {
             state.foreground_task_elapsed_secs()
         ),
         SessionRuntimeStatus::Open => "Idle".into(),
+        SessionRuntimeStatus::Error if state.session_id.is_none() && !state.finalize_failed() => {
+            "Attention · Session startup failed".into()
+        }
         SessionRuntimeStatus::Error => "Attention · Last turn failed".into(),
         SessionRuntimeStatus::Closed => "Session closed".into(),
     }
@@ -1152,6 +1165,15 @@ fn idle_box_content(state: &SessionTuiState) -> Option<IdleBoxContent> {
                 lines
             },
         }),
+        SessionRuntimeStatus::Error if state.session_id.is_none() && !state.finalize_failed() => {
+            Some(IdleBoxContent {
+                title: "Attention · Session startup failed",
+                lines: vec![Line::styled(
+                    "No active session · /new · /resume · /help · /exit",
+                    Style::default().fg(Color::DarkGray),
+                )],
+            })
+        }
         SessionRuntimeStatus::Error => Some(IdleBoxContent {
             title: "Attention · Last turn failed",
             lines: vec![Line::styled(
@@ -2463,6 +2485,23 @@ mod tests {
     }
 
     #[test]
+    fn startup_recovery_context_is_attached_when_input_is_submitted() {
+        let (sender, mut rx) = AppEventSender::channel();
+        let mut chat = ChatWidget::new(sender);
+        chat.state_mut().apply_event(SessionEvent::StatusChanged {
+            status: SessionRuntimeStatus::Error,
+        });
+        chat.state_mut().push_input_text("!echo must-not-run");
+
+        chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let AppEvent::SubmitInput { input, .. } = rx.try_recv().unwrap() else {
+            panic!("expected submitted input");
+        };
+        assert!(input.was_submitted_during_startup_recovery());
+    }
+
+    #[test]
     fn mcp_slash_command_enter_while_running_is_submitted_as_immediate_panel_action() {
         let (sender, mut rx) = AppEventSender::channel();
         let mut chat = ChatWidget::new(sender);
@@ -2688,6 +2727,31 @@ mod tests {
         );
         // 解析期间输入框已清空，等待回灌提交
         assert_eq!(chat.state().input(), "");
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_context_survives_at_path_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        std::fs::write(&path, "must not be submitted after recovery").unwrap();
+        let (sender, mut rx) = AppEventSender::channel();
+        let mut chat = ChatWidget::new(sender);
+        chat.state_mut().apply_event(SessionEvent::StatusChanged {
+            status: SessionRuntimeStatus::Error,
+        });
+        chat.state_mut()
+            .push_input_text(&format!("总结一下 @{}", path.display()));
+
+        chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let AppEvent::AtPathResolved {
+            submitted_during_startup_recovery,
+            ..
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("expected async at-path resolution");
+        };
+        assert!(submitted_during_startup_recovery);
     }
 
     #[tokio::test]

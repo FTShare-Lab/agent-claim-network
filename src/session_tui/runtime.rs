@@ -46,9 +46,12 @@ pub(super) enum WorkerEvent {
     ResumeHistoryLoaded {
         result: anyhow::Result<ResumeHistoryOutcome>,
     },
+    ResumeInboxNotices {
+        events: Vec<SessionEvent>,
+    },
     ResumeInboxFinished {
         session: crate::session::SessionHandle,
-        result: anyhow::Result<crate::agent::InboxProcessReport>,
+        had_notices: bool,
     },
     TurnFinished {
         turn_id: u64,
@@ -803,8 +806,8 @@ pub(super) fn spawn_resume_history_worker(
     })
 }
 
-/// 目标历史已经可见后执行 Resume inbox。沿用 resume 专用的单人/团队语义，成功时
-/// 补发可见进度；失败不发送 Error 事件，最终由 App 降级成固定 warning 并恢复 Open。
+/// 目标历史已经可见后执行 Resume inbox。失败提示交给 App 成组写入 transcript，
+/// 以保留 Resume 历史与 inbox notice 之间的可见空行；流程最终恢复 Open。
 pub(super) fn spawn_resume_inbox_worker(
     engine: SessionEngine,
     session: crate::session::SessionHandle,
@@ -821,16 +824,26 @@ pub(super) fn spawn_resume_inbox_worker(
             status: crate::agent::SessionRuntimeStatus::SyncingInbox,
         });
         send_event(SessionEvent::InboxStarted);
-        let result = engine.process_inbox_for_resume(&session).await;
-        if let Ok(report) = &result {
-            send_event(SessionEvent::TeamServicesConnectionUpdated {
-                status: report.team_services,
+        let mut notice_events = Vec::new();
+        let report = engine
+            .process_inbox_for_resume(&session, |event| {
+                if matches!(
+                    event,
+                    SessionEvent::Warning { .. } | SessionEvent::InboxFailed { .. }
+                ) {
+                    notice_events.push(event);
+                } else {
+                    send_event(event);
+                }
+            })
+            .await;
+        let had_notices = !notice_events.is_empty();
+        if had_notices {
+            let _ = worker_tx.send(WorkerEvent::ResumeInboxNotices {
+                events: notice_events,
             });
-            for warning in &report.warnings {
-                send_event(SessionEvent::Warning {
-                    message: warning.clone(),
-                });
-            }
+        }
+        if report.failures.is_empty() {
             send_event(SessionEvent::InboxCompleted {
                 processed: report.total,
                 new_claim_ids: report.new_claim_ids.clone(),
@@ -838,18 +851,21 @@ pub(super) fn spawn_resume_inbox_worker(
                 new_dispute_ids: report.new_dispute_ids.clone(),
                 deprecated_claim_ids: report.deprecated_claim_ids.clone(),
             });
-            match engine.local_claim_count().await {
-                Ok(total) => send_event(SessionEvent::LocalClaimsUpdated { total }),
-                Err(error) => log::warn!(
-                    target: "session_tui",
-                    "Resume inbox 后刷新 local claim 计数失败: {error:#}"
-                ),
-            }
-            send_event(SessionEvent::StatusChanged {
-                status: crate::agent::SessionRuntimeStatus::Open,
-            });
         }
-        let _ = worker_tx.send(WorkerEvent::ResumeInboxFinished { session, result });
+        match engine.local_claim_count().await {
+            Ok(total) => send_event(SessionEvent::LocalClaimsUpdated { total }),
+            Err(error) => log::warn!(
+                target: "session_tui",
+                "Resume inbox 后刷新 local claim 计数失败: {error:#}"
+            ),
+        }
+        send_event(SessionEvent::StatusChanged {
+            status: crate::agent::SessionRuntimeStatus::Open,
+        });
+        let _ = worker_tx.send(WorkerEvent::ResumeInboxFinished {
+            session,
+            had_notices,
+        });
     })
 }
 

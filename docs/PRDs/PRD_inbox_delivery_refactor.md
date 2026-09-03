@@ -2,6 +2,11 @@
 
 > 状态：已实现。本文描述 Maintainer 向 Agent 投递 inbox 消息的当前产品语义、可靠性边界与验收标准。
 
+> 后续范围说明（2026-09-03）：Inbox 第 1 至 6 类失败的统一降级、手动 `/inbox`
+> 在单人模式下处理本地 pending，以及无 active session 的启动恢复语义，由
+> `docs/PRDs/PRD_inbox_failure_and_startup_recovery.md` 扩展；本文的远端投递协议、
+> receipt ACK 与本地 done ACK 边界继续有效。
+
 ## 背景
 
 Maintainer 会通过 Policy Update 和 Claim Attribute Update 向 agent 下发团队侧变更。投递需要同时满足：
@@ -260,8 +265,9 @@ Maintainer 只拥有前一种事实，不读取也不控制 agent 的本地 done
 
 ### 手动 `/inbox`
 
-- 在当前 open session 中立即运行一次团队 inbox 同步与本地处理。
-- 团队服务未配置时明确报错，并提示参考 `docs/config_parameters.md` 配置两个 endpoint。
+- 在当前 open session 中立即运行一次 inbox 同步与本地处理。
+- 团队模式先拉取远端消息再处理本地 pending；团队服务未配置时只处理本地 pending，
+  不发起网络请求。
 - 远端访问结果会更新本会话记录的 Maintainer/Router 最近连接状态。
 
 ## 失败与降级

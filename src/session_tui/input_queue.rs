@@ -26,6 +26,8 @@ pub(super) struct QueuedInput {
     draft: InputDraft,
     attachments: Vec<SessionAttachment>,
     submission_sequence: Option<u64>,
+    // 异步 @path/按序回灌不能用消费时状态覆盖用户提交时的 startup 白名单。
+    submitted_during_startup_recovery: bool,
 }
 
 impl QueuedInput {
@@ -46,6 +48,7 @@ impl QueuedInput {
             draft,
             attachments,
             submission_sequence: None,
+            submitted_during_startup_recovery: false,
         }
     }
 
@@ -56,11 +59,17 @@ impl QueuedInput {
             draft: InputDraft::new(text),
             attachments: Vec::new(),
             submission_sequence: None,
+            submitted_during_startup_recovery: false,
         }
     }
 
     pub(super) fn with_submission_sequence(mut self, sequence: u64) -> Self {
         self.submission_sequence = Some(sequence);
+        self
+    }
+
+    pub(super) fn submitted_during_startup_recovery(mut self, submitted: bool) -> Self {
+        self.submitted_during_startup_recovery = submitted;
         self
     }
 
@@ -83,6 +92,10 @@ impl QueuedInput {
 
     pub(super) fn submission_sequence(&self) -> Option<u64> {
         self.submission_sequence
+    }
+
+    pub(super) fn was_submitted_during_startup_recovery(&self) -> bool {
+        self.submitted_during_startup_recovery
     }
 
     pub(super) fn into_draft(self) -> InputDraft {

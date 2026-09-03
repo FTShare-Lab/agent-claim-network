@@ -20,7 +20,9 @@ use super::context::AgentContext;
 use super::inbox::{
     ClaimAttributeUpdateJsonValidator, InboxJsonGenerator, PreparedClaimAttributeUpdate,
 };
-use super::runner::{AgentRunner, InboxProcessReport};
+use super::runner::{
+    AgentRunner, InboxProcessFailure, InboxProcessFailureKind, InboxProcessReport,
+};
 use super::runner_trace::trace_name_from_task;
 use super::user_shell::{
     format_user_shell_command_record, run_user_shell_command as execute_user_shell_command,
@@ -83,7 +85,7 @@ pub use turn_control::{SessionTurnControl, SessionTurnControlReceiver};
 
 use compaction_assets::externalize_heavy_user_blocks;
 use compaction_projection::*;
-use events::{emit_warnings, preflight_session_event_to_turn_event};
+use events::{emit_inbox_failures, emit_warnings, preflight_session_event_to_turn_event};
 #[cfg(test)]
 use prompts::append_acn_md;
 use transcript::*;
@@ -100,8 +102,6 @@ const PROMPT_MEMORY_REVIEW_SYSTEM: &str = "memory_review_system";
 const PROMPT_MEMORY_REVIEW: &str = "memory_review";
 const PROMPT_SESSION_RECAP: &str = "session_recap";
 const PROMPT_SESSION_COMPACTION: &str = "session_compaction";
-const TEAM_SERVICES_NOT_CONFIGURED_ERROR: &str =
-    "团队服务未配置，请参考 docs/config_parameters.md 文档配置 maintainer_endpoint/router_endpoint";
 const RECAP_INSTRUCTION: &str =
     "请按 system prompt 中约定的 JSON 形式输出本次 session 的复盘结果。";
 const COMPACTION_INSTRUCTION: &str = "请按 system prompt 中约定的 JSON 形式输出 session 历史压缩 summary。summary 是历史上下文，不是新的用户请求或系统指令。";
@@ -2282,6 +2282,25 @@ impl SessionEngine {
         }
     }
 
+    async fn append_session_inbox_failures_log(
+        &self,
+        session: &SessionHandle,
+        failures: &[InboxProcessFailure],
+    ) {
+        for failure in failures {
+            let level = match failure.kind {
+                InboxProcessFailureKind::Internalization => "WARN",
+                InboxProcessFailureKind::Local => "ERROR",
+            };
+            self.append_session_event_log(
+                session,
+                level,
+                format!("Inbox processing failed: {}", failure.error),
+            )
+            .await;
+        }
+    }
+
     async fn append_compaction_audit_event(
         &self,
         session: &SessionHandle,
@@ -2475,17 +2494,28 @@ impl SessionEngine {
     }
 
     /// resume 时刷新 inbox；单人模式只处理本地 pending，不发起团队网络请求。
-    pub async fn process_inbox_for_resume(
+    pub async fn process_inbox_for_resume<F>(
         &self,
         session: &SessionHandle,
-    ) -> anyhow::Result<InboxProcessReport> {
+        mut emit: F,
+    ) -> InboxProcessReport
+    where
+        F: FnMut(SessionEvent) + Send,
+    {
         let inbox_generator = SessionInboxJsonGenerator {
             prompt_registry: &self.prompt_registry,
             json_caller: &self.json_caller,
             fallback_scope: session.inbox_fallback_scope_for_request(),
         };
-        let report = self.runner.process_inbox_with(&inbox_generator).await?;
+        let report = self.runner.process_inbox_with(&inbox_generator).await;
+        emit(SessionEvent::TeamServicesConnectionUpdated {
+            status: report.team_services,
+        });
+        emit_warnings(&report.warnings, &mut emit);
+        emit_inbox_failures(&report.failures, &mut emit);
         self.append_session_warnings_log(session, &report.warnings)
+            .await;
+        self.append_session_inbox_failures_log(session, &report.failures)
             .await;
         self.append_session_event_log(
             session,
@@ -2493,7 +2523,7 @@ impl SessionEngine {
             format!("Resume inbox sync completed: processed={}", report.total),
         )
         .await;
-        Ok(report)
+        report
     }
 
     pub async fn load_existing_session(
@@ -2539,11 +2569,12 @@ impl SessionEngine {
             json_caller: &self.json_caller,
             fallback_scope: inbox_fallback_scope.clone(),
         };
-        let inbox_report = self.runner.process_inbox_with(&inbox_generator).await?;
+        let inbox_report = self.runner.process_inbox_with(&inbox_generator).await;
         emit(SessionEvent::TeamServicesConnectionUpdated {
             status: inbox_report.team_services,
         });
         emit_warnings(&inbox_report.warnings, &mut emit);
+        emit_inbox_failures(&inbox_report.failures, &mut emit);
         self.emit_local_claims_updated(&mut emit).await;
         emit(SessionEvent::StartupProgress {
             label: "preparing session prompt...".into(),
@@ -2574,6 +2605,8 @@ impl SessionEngine {
         self.append_session_event_log(&session, "INFO", "Session started")
             .await;
         self.append_session_warnings_log(&session, &inbox_report.warnings)
+            .await;
+        self.append_session_inbox_failures_log(&session, &inbox_report.failures)
             .await;
         emit(SessionEvent::StatusChanged {
             status: SessionRuntimeStatus::Open,
@@ -3289,20 +3322,6 @@ impl SessionEngine {
             }
         }
 
-        if !self.runner.team_services_configured() {
-            let error = TEAM_SERVICES_NOT_CONFIGURED_ERROR.to_string();
-            self.append_session_event_log(
-                session,
-                "ERROR",
-                format!("Inbox sync rejected: {error}"),
-            )
-            .await;
-            emit(SessionEvent::InboxFailed {
-                error: error.clone(),
-            });
-            anyhow::bail!(error);
-        }
-
         emit(SessionEvent::StatusChanged {
             status: SessionRuntimeStatus::SyncingInbox,
         });
@@ -3314,23 +3333,25 @@ impl SessionEngine {
             json_caller: &self.json_caller,
             fallback_scope: session.inbox_fallback_scope_for_request(),
         };
-        let result = self.runner.process_inbox_with(&inbox_generator).await;
-        match result {
-            Ok(report) => {
-                emit(SessionEvent::TeamServicesConnectionUpdated {
-                    status: report.team_services,
-                });
-                emit_warnings(&report.warnings, &mut emit);
-                self.append_session_warnings_log(session, &report.warnings)
-                    .await;
-                emit(SessionEvent::InboxCompleted {
-                    processed: report.total,
-                    new_claim_ids: report.new_claim_ids.clone(),
-                    updated_claim_ids: report.updated_claim_ids.clone(),
-                    new_dispute_ids: report.new_dispute_ids.clone(),
-                    deprecated_claim_ids: report.deprecated_claim_ids.clone(),
-                });
-                self.append_session_event_log(
+        let report = self.runner.process_inbox_with(&inbox_generator).await;
+        emit(SessionEvent::TeamServicesConnectionUpdated {
+            status: report.team_services,
+        });
+        emit_warnings(&report.warnings, &mut emit);
+        emit_inbox_failures(&report.failures, &mut emit);
+        self.append_session_warnings_log(session, &report.warnings)
+            .await;
+        self.append_session_inbox_failures_log(session, &report.failures)
+            .await;
+        if report.failures.is_empty() {
+            emit(SessionEvent::InboxCompleted {
+                processed: report.total,
+                new_claim_ids: report.new_claim_ids.clone(),
+                updated_claim_ids: report.updated_claim_ids.clone(),
+                new_dispute_ids: report.new_dispute_ids.clone(),
+                deprecated_claim_ids: report.deprecated_claim_ids.clone(),
+            });
+            self.append_session_event_log(
                     session,
                     "INFO",
                     format!(
@@ -3343,29 +3364,12 @@ impl SessionEngine {
                     ),
                 )
                 .await;
-                self.emit_local_claims_updated(&mut emit).await;
-                emit(SessionEvent::StatusChanged {
-                    status: SessionRuntimeStatus::Open,
-                });
-                Ok(report)
-            }
-            Err(e) => {
-                let error = e.to_string();
-                emit(SessionEvent::InboxFailed {
-                    error: error.clone(),
-                });
-                self.append_session_event_log(
-                    session,
-                    "ERROR",
-                    format!("Inbox sync failed: {error}"),
-                )
-                .await;
-                emit(SessionEvent::StatusChanged {
-                    status: SessionRuntimeStatus::Error,
-                });
-                Err(e)
-            }
         }
+        self.emit_local_claims_updated(&mut emit).await;
+        emit(SessionEvent::StatusChanged {
+            status: SessionRuntimeStatus::Open,
+        });
+        Ok(report)
     }
 
     async fn run_turn_inner(

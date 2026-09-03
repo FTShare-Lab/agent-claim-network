@@ -66,7 +66,7 @@ use crate::api::{
 };
 use crate::claim::{
     AgentId, Claim, ClaimId, ClaimStatus, Confidence, Dispute, DisputeId, InboxId, InboxMessage,
-    SessionId,
+    InboxMessageKind, Policy, PolicyId, PolicyMessageType, PolicyStatus, SessionId,
 };
 use crate::config::{
     AgentSessionTurnJournalConfig, SessionCompactionConfig, ToolConfig, UserShellConfig,
@@ -1467,6 +1467,26 @@ async fn create_test_session(store: &SessionStore, id: &str) -> crate::session::
         .unwrap()
 }
 
+fn active_policy_inbox_message() -> InboxMessage {
+    InboxMessage {
+        id: InboxId::random(),
+        kind: InboxMessageKind::PolicyUpdate {
+            policy: Policy {
+                id: PolicyId::random(),
+                message_type: PolicyMessageType::PolicyUpdate,
+                name: "startup-inbox-policy".into(),
+                statement: "internalize this policy".into(),
+                scope: "tests / startup inbox".into(),
+                status: PolicyStatus::Active,
+                created_at: Utc::now(),
+                updated_at: None,
+                target_agents: None,
+            },
+        },
+        handled_at: None,
+    }
+}
+
 #[tokio::test]
 #[cfg(unix)]
 async fn finalize_journals_queued_and_live_background_process_completions() {
@@ -2232,33 +2252,44 @@ async fn resumed_runtime_delivers_interrupted_turn_background_completion_once() 
 }
 
 #[tokio::test]
-async fn manual_inbox_rejects_solo_mode_without_changing_session_to_error() {
+async fn manual_inbox_processes_local_pending_in_solo_mode() {
     let dir = tempfile::tempdir().unwrap();
-    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        r#"{"new_claims":[],"updated_claims":[],"new_disputes":[]}"#,
+        Vec::new(),
+    )]));
     let (engine, store) = build_local_test_engine(&dir, provider);
     let session = create_test_session(&store, "session_1234abcd").await;
+    let inbox = LocalFsInboxReader::new(dir.path().join("agents").join("agent-a"));
+    inbox
+        .accept_pulled(&active_policy_inbox_message())
+        .await
+        .unwrap();
     let mut events = Vec::new();
 
-    let error = engine
+    let report = engine
         .process_inbox_during_session(&session, |event| events.push(event))
         .await
-        .unwrap_err();
+        .unwrap();
 
-    assert_eq!(
-        error.to_string(),
-        "团队服务未配置，请参考 docs/config_parameters.md 文档配置 maintainer_endpoint/router_endpoint"
-    );
-    assert!(events.iter().any(|event| matches!(
-        event,
-        SessionEvent::InboxFailed { error }
-            if error.contains("团队服务未配置")
-    )));
+    assert_eq!(report.total, 1);
+    assert_eq!(report.team_services, Default::default());
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, SessionEvent::InboxStarted)));
     assert!(!events.iter().any(|event| matches!(
         event,
-        SessionEvent::StatusChanged {
-            status: SessionRuntimeStatus::Error
-        } | SessionEvent::InboxStarted
+        SessionEvent::InboxFailed { .. }
+            | SessionEvent::StatusChanged {
+                status: SessionRuntimeStatus::Error
+            }
     )));
+    assert!(matches!(
+        events.last(),
+        Some(SessionEvent::StatusChanged {
+            status: SessionRuntimeStatus::Open
+        })
+    ));
     assert_eq!(
         session.read_metadata().await.unwrap().status,
         SessionStatus::Open
@@ -2294,13 +2325,158 @@ async fn solo_mode_session_start_reports_unknown_team_status() {
 }
 
 #[tokio::test]
+async fn fresh_start_continues_open_when_inbox_internalization_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        "not valid inbox json",
+        Vec::new(),
+    )]));
+    let (engine, _) = build_test_engine(&dir, provider);
+    let inbox = LocalFsInboxReader::new(dir.path().join("agents").join("agent-a"));
+    let message = active_policy_inbox_message();
+    inbox.accept_pulled(&message).await.unwrap();
+    let mut events = Vec::new();
+
+    let report = engine
+        .start_session(1, |event| events.push(event))
+        .await
+        .expect("inbox internalization failure must not block session startup");
+
+    assert_eq!(report.inbox_report.total, 0);
+    assert!(report
+        .inbox_report
+        .failures
+        .iter()
+        .any(|failure| failure.kind == crate::agent::InboxProcessFailureKind::Internalization));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::Warning { message }
+            if message == super::events::INBOX_INTERNALIZATION_WARNING
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        SessionEvent::InboxFailed { .. }
+            | SessionEvent::StatusChanged {
+                status: SessionRuntimeStatus::Error
+            }
+    )));
+    assert!(matches!(
+        events.last(),
+        Some(SessionEvent::StatusChanged {
+            status: SessionRuntimeStatus::Open
+        })
+    ));
+    assert_eq!(
+        report.session.read_metadata().await.unwrap().status,
+        SessionStatus::Open
+    );
+    assert_eq!(inbox.list_pending().await.unwrap(), vec![message]);
+}
+
+#[tokio::test]
+async fn fresh_start_continues_open_when_local_inbox_read_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (engine, _) = build_test_engine(&dir, provider);
+    let agent_home = dir.path().join("agents").join("agent-a");
+    tokio::fs::create_dir_all(&agent_home).await.unwrap();
+    tokio::fs::write(paths::agent_home_inbox_dir(&agent_home), b"not a directory")
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+
+    let report = engine
+        .start_session(1, |event| events.push(event))
+        .await
+        .expect("local inbox failure must not block session startup");
+
+    assert!(report
+        .inbox_report
+        .failures
+        .iter()
+        .any(|failure| failure.kind == crate::agent::InboxProcessFailureKind::Local));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::InboxFailed { error }
+            if error.contains("Some local changes may already have been applied")
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        SessionEvent::StatusChanged {
+            status: SessionRuntimeStatus::Error
+        }
+    )));
+    assert!(matches!(
+        events.last(),
+        Some(SessionEvent::StatusChanged {
+            status: SessionRuntimeStatus::Open
+        })
+    ));
+    assert_eq!(
+        report.session.read_metadata().await.unwrap().status,
+        SessionStatus::Open
+    );
+}
+
+#[tokio::test]
+async fn manual_inbox_internalization_failure_warns_and_returns_to_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        "not valid inbox json",
+        Vec::new(),
+    )]));
+    let (engine, store) = build_test_engine(&dir, provider);
+    let session = create_test_session(&store, "session_1234abcd").await;
+    let inbox = LocalFsInboxReader::new(dir.path().join("agents").join("agent-a"));
+    inbox
+        .accept_pulled(&active_policy_inbox_message())
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+
+    let report = engine
+        .process_inbox_during_session(&session, |event| events.push(event))
+        .await
+        .expect("manual inbox internalization failure must be recoverable");
+
+    assert!(report
+        .failures
+        .iter()
+        .any(|failure| failure.kind == crate::agent::InboxProcessFailureKind::Internalization));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::Warning { message }
+            if message == super::events::INBOX_INTERNALIZATION_WARNING
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        SessionEvent::StatusChanged {
+            status: SessionRuntimeStatus::Error
+        }
+    )));
+    assert!(matches!(
+        events.last(),
+        Some(SessionEvent::StatusChanged {
+            status: SessionRuntimeStatus::Open
+        })
+    ));
+    assert_eq!(
+        session.read_metadata().await.unwrap().status,
+        SessionStatus::Open
+    );
+}
+
+#[tokio::test]
 async fn resume_inbox_refresh_reports_configured_team_status() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(Vec::new()));
     let (engine, store) = build_test_engine(&dir, provider);
     let session = create_test_session(&store, "session_1234abcd").await;
 
-    let report = engine.process_inbox_for_resume(&session).await.unwrap();
+    let mut events = Vec::new();
+    let report = engine
+        .process_inbox_for_resume(&session, |event| events.push(event))
+        .await;
 
     assert_eq!(
         report.team_services,
@@ -2309,6 +2485,11 @@ async fn resume_inbox_refresh_reports_configured_team_status() {
             router: crate::agent::TeamServiceConnectionStatus::Connected,
         }
     );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::TeamServicesConnectionUpdated { status }
+            if *status == report.team_services
+    )));
 }
 
 fn test_message(
