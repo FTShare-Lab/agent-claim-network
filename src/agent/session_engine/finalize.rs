@@ -1015,9 +1015,10 @@ impl SessionEngine {
                 .await,
             RecapRetryMode::SingleAttempt => self
                 .json_caller
-                .generate_json_validated_once(
+                .generate_json_streaming_validated_once(
                     system_prompt,
                     messages,
+                    crate::api::BufferedProviderRuntime::new(fallback_scope),
                     |raw| prepare_recap_value(raw, &agent_id, &allowed, &local_by_id, Utc::now()),
                 )
                 .await,

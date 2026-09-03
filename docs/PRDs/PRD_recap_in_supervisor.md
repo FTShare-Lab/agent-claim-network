@@ -87,6 +87,14 @@
 - TUI 前台 fallback finalize 不属于 supervisor job，继续使用配置的结构化业务 retry。
 - Compaction summary 继续使用 `[agent.llm].retry_count`，不受本决策影响。
 
+> 后续语义更新（2026-09-03）：[`PRD_cau_supervisor_buffered_streaming.md`](PRD_cau_supervisor_buffered_streaming.md)
+> 将“单个 job attempt 只允许一次真实模型请求”替换为“单个 job attempt 表示一次逻辑 recap
+> 生成”。Supervisor 仍最多五个外层 attempt、不叠加 `[agent.llm].retry_count`、不启用
+> max-token continuation；但每个 attempt 改为 Buffered streaming，并允许 transport failure
+> 触发一次有限的流式 transport 恢复及 non-streaming fallback。非法 JSON、shape、引用和业务
+> 校验失败仍直接结束当前 attempt。D6 的 checkpoint 恢复、前台 fallback finalize 与 compact
+> summary 语义不变。
+
 ### D7：复用共享 Recap/Finalize checkpoint
 
 - 继续使用物理文件 `finalize_checkpoint.yaml` 和现有 Prepared/Applied 数据形状。

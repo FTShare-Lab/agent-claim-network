@@ -60,9 +60,9 @@ use crate::api::{
     InternalizeRequest, MemoryReviewLoop, ModelContextSource, ProviderAdapter, ProviderEvent,
     ProviderHistoryMediaPolicy, ProviderReplayIdentity, ProviderReplayProtocol,
     ProviderReplayState, ProviderRequest, ProviderRequestObserver, ProviderResponse, ProviderStop,
-    SessionAttachment, SessionTurnContentBlock, SessionTurnContextAppender, SessionTurnEvent,
-    SessionTurnHooks, SessionTurnMessage, SessionTurnPreflight, SessionTurnRequest,
-    StructuredJsonCaller, ToolCallSkipReason, TurnMessage,
+    ProviderStreamFailure, SessionAttachment, SessionTurnContentBlock, SessionTurnContextAppender,
+    SessionTurnEvent, SessionTurnHooks, SessionTurnMessage, SessionTurnPreflight,
+    SessionTurnRequest, StructuredJsonCaller, ToolCallSkipReason, TurnMessage,
 };
 use crate::claim::{
     AgentId, Claim, ClaimId, ClaimStatus, Confidence, Dispute, DisputeId, InboxId, InboxMessage,
@@ -127,6 +127,7 @@ enum ProviderStep {
         message: &'static str,
         events: Vec<ProviderEvent>,
     },
+    StreamFailure(&'static str),
     RequestTooLarge,
 }
 
@@ -281,6 +282,9 @@ impl ProviderAdapter for RecordingProvider {
                     emit(event);
                 }
                 anyhow::bail!(message)
+            }
+            Some(ProviderStep::StreamFailure(message)) => {
+                Err(ProviderStreamFailure::new(message).into())
             }
             Some(ProviderStep::RequestTooLarge) => {
                 Err(crate::api::ProviderRequestTooLarge::new().into())
@@ -7681,7 +7685,67 @@ async fn finalize_continues_from_background_recap_cursor() {
 }
 
 #[tokio::test]
-async fn supervisor_finalize_attempt_uses_one_model_request() {
+async fn supervisor_recap_and_finalize_use_buffered_transport_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        ProviderStep::StreamFailure("recap stream failed"),
+        response_step(
+            r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
+            Vec::new(),
+        ),
+        ProviderStep::StreamFailure("finalize stream failed"),
+        response_step(
+            r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
+            Vec::new(),
+        ),
+    ]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_face0025").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "recap request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "recap answer"),
+        ])
+        .await
+        .unwrap();
+
+    engine
+        .recap_existing_session_until(&session.metadata.id, 2)
+        .await
+        .unwrap();
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "final request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "final answer"),
+        ])
+        .await
+        .unwrap();
+    session.mark_finalizing(Utc::now()).await.unwrap();
+    engine
+        .finalize_existing_session_once(&session.metadata.id, |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 4);
+    for pair in requests.chunks_exact(2) {
+        assert!(pair[0].stream);
+        assert!(!pair[1].stream);
+        assert!(pair.iter().all(|request| {
+            request.stream_output_mode == crate::api::ProviderStreamOutputMode::Buffered
+                && request.retry_count_override == Some(0)
+                && !request.allow_continuation
+        }));
+        assert!(pair[0].runtime_chain_id.is_some());
+        assert!(pair[0].runtime_fallback_scope.is_some());
+        assert!(pair[1].runtime_chain_id.is_none());
+        assert!(pair[1].runtime_fallback_scope.is_none());
+        assert_eq!(pair[0].messages, pair[1].messages);
+    }
+}
+
+#[tokio::test]
+async fn supervisor_finalize_attempt_uses_one_logical_generation() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(vec![
         response_step("{not json", Vec::new()),
@@ -7711,13 +7775,24 @@ async fn supervisor_finalize_attempt_uses_one_model_request() {
         .finalize_existing_session_once(&session.metadata.id, |_| {})
         .await
         .expect_err("first supervisor attempt should expose invalid JSON to the job retry");
-    assert_eq!(provider.requests().await.len(), 1);
+    let first_requests = provider.requests().await;
+    assert_eq!(first_requests.len(), 1);
+    assert!(first_requests[0].stream);
+    assert_eq!(first_requests[0].retry_count_override, Some(0));
+    assert!(!first_requests[0].allow_continuation);
 
     engine
         .finalize_existing_session_once(&session.metadata.id, |_| {})
         .await
         .unwrap();
-    assert_eq!(provider.requests().await.len(), 2);
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|request| {
+        request.stream
+            && request.stream_output_mode == crate::api::ProviderStreamOutputMode::Buffered
+            && request.retry_count_override == Some(0)
+            && !request.allow_continuation
+    }));
     let metadata = session.read_metadata().await.unwrap();
     assert_eq!(metadata.status, SessionStatus::Closed);
 }

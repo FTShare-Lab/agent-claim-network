@@ -77,7 +77,6 @@ pub(crate) struct StructuredJsonAttemptRequest {
     provider_retry_count_override: Option<u32>,
     allow_continuation: bool,
     buffered_runtime: Option<BufferedProviderRuntime>,
-    enforce_request_timeout: bool,
 }
 
 impl StructuredJsonAttemptRequest {
@@ -88,7 +87,6 @@ impl StructuredJsonAttemptRequest {
             provider_retry_count_override: None,
             allow_continuation: true,
             buffered_runtime: None,
-            enforce_request_timeout: false,
         }
     }
 
@@ -100,7 +98,6 @@ impl StructuredJsonAttemptRequest {
             provider_retry_count_override: Some(0),
             allow_continuation: true,
             buffered_runtime: None,
-            enforce_request_timeout: false,
         }
     }
 
@@ -115,7 +112,6 @@ impl StructuredJsonAttemptRequest {
             provider_retry_count_override: None,
             allow_continuation: true,
             buffered_runtime: Some(runtime),
-            enforce_request_timeout: false,
         }
     }
 
@@ -130,41 +126,21 @@ impl StructuredJsonAttemptRequest {
             provider_retry_count_override: None,
             allow_continuation: true,
             buffered_runtime: Some(runtime),
-            enforce_request_timeout: false,
         }
     }
 
-    fn single_attempt(system_prompt: String, messages: Vec<SessionTurnMessage>) -> Self {
+    fn streaming_single_attempt(
+        system_prompt: String,
+        messages: Vec<SessionTurnMessage>,
+        runtime: BufferedProviderRuntime,
+    ) -> Self {
         Self {
             system_prompt,
             messages,
             provider_retry_count_override: Some(0),
             allow_continuation: false,
-            buffered_runtime: None,
-            enforce_request_timeout: false,
+            buffered_runtime: Some(runtime),
         }
-    }
-
-    fn guarded_with_request_timeout(
-        system_prompt: String,
-        messages: Vec<SessionTurnMessage>,
-    ) -> Self {
-        Self {
-            system_prompt,
-            messages,
-            provider_retry_count_override: Some(0),
-            allow_continuation: true,
-            buffered_runtime: None,
-            enforce_request_timeout: true,
-        }
-    }
-
-    /// CAU 单消息内化共享一个 provider/解析/业务校验预算，并限制每次真实请求时长。
-    pub(crate) fn claim_attribute_update(
-        system_prompt: String,
-        messages: Vec<SessionTurnMessage>,
-    ) -> Self {
-        Self::guarded_with_request_timeout(system_prompt, messages)
     }
 }
 
@@ -230,7 +206,6 @@ impl StructuredJsonCaller {
                 true,
                 Some(&runtime),
                 preferred_transport,
-                false,
             )
             .await
         {
@@ -280,11 +255,13 @@ impl StructuredJsonCaller {
         .await
     }
 
-    /// 只执行一次结构化业务 attempt，并同时关闭 provider adapter 内层重试。
-    pub(crate) async fn generate_json_validated_once<T, V>(
+    /// 执行一次结构化业务 attempt；允许 Buffered transport fallback，但同一
+    /// transport 不重试，也不发送 max-token continuation。
+    pub(crate) async fn generate_json_streaming_validated_once<T, V>(
         &self,
         system_prompt: String,
         messages: Vec<SessionTurnMessage>,
+        runtime: BufferedProviderRuntime,
         validate: V,
     ) -> anyhow::Result<T>
     where
@@ -299,7 +276,11 @@ impl StructuredJsonCaller {
         };
         caller
             .generate_json_validated_with_guarded_attempts(
-                StructuredJsonAttemptRequest::single_attempt(system_prompt, messages),
+                StructuredJsonAttemptRequest::streaming_single_attempt(
+                    system_prompt,
+                    messages,
+                    runtime,
+                ),
                 validate,
                 |_, _, _| {},
                 |_| std::future::ready(()),
@@ -457,7 +438,6 @@ impl StructuredJsonCaller {
             provider_retry_count_override,
             allow_continuation,
             buffered_runtime,
-            enforce_request_timeout,
         } = request;
         let mut attempt = 0;
         let base_messages = messages;
@@ -473,7 +453,6 @@ impl StructuredJsonCaller {
                     allow_continuation,
                     buffered_runtime.as_ref(),
                     preferred_transport,
-                    enforce_request_timeout,
                 )
                 .await
             {
@@ -627,10 +606,6 @@ impl StructuredJsonCaller {
         parse_structured_response(response)
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "结构化请求需显式携带 retry、continuation、transport 与 timeout 策略"
-    )]
     async fn generate_json_once_observed(
         &self,
         system_prompt: String,
@@ -639,7 +614,6 @@ impl StructuredJsonCaller {
         allow_continuation: bool,
         buffered_runtime: Option<&BufferedProviderRuntime>,
         preferred_transport: Option<ProviderTransport>,
-        enforce_request_timeout: bool,
     ) -> Result<JsonCallParsed, JsonCallFailure> {
         let stream = buffered_runtime.is_some()
             && preferred_transport.is_none_or(ProviderTransport::is_streaming);
@@ -671,35 +645,6 @@ impl StructuredJsonCaller {
             send_buffered_with_fallback(&self.provider, request)
                 .await
                 .map_err(|error| JsonCallFailure::new(JsonCallError::Provider(error), None, None))?
-        } else if enforce_request_timeout {
-            let mut emit = |_event: ProviderEvent| {};
-            match self.provider.request_timeout() {
-                Some(timeout) => {
-                    match tokio::time::timeout(timeout, self.provider.send(request, &mut emit))
-                        .await
-                    {
-                        Ok(response) => response.map_err(|error| {
-                            JsonCallFailure::new(JsonCallError::Provider(error), None, None)
-                        })?,
-                        Err(_) => {
-                            return Err(JsonCallFailure::new(
-                                JsonCallError::Provider(anyhow::anyhow!(
-                                    "结构化 JSON provider request 超时: {timeout:?}"
-                                )),
-                                None,
-                                None,
-                            ));
-                        }
-                    }
-                }
-                None => self
-                    .provider
-                    .send(request, &mut emit)
-                    .await
-                    .map_err(|error| {
-                        JsonCallFailure::new(JsonCallError::Provider(error), None, None)
-                    })?,
-            }
         } else {
             let mut emit = |_event: ProviderEvent| {};
             self.provider
@@ -1165,21 +1110,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_request_timeout_bounds_claim_attribute_update_attempts() {
+    async fn provider_request_timeout_does_not_wrap_buffered_streaming_call() {
         let caller = caller(Arc::new(SlowProvider));
 
-        let error = caller
-            .generate_json_validated_with_guarded_attempts(
-                StructuredJsonAttemptRequest::claim_attribute_update("system".into(), Vec::new()),
+        let value = caller
+            .generate_json_streaming_validated_with_retry_notice(
+                "system".into(),
+                Vec::new(),
+                BufferedProviderRuntime::new(ProviderRuntimeFallbackScope::new_root()),
                 Ok,
                 |_, _, _| {},
-                |_| std::future::ready(()),
-                |_, _| Ok(()),
             )
             .await
-            .expect_err("CAU provider attempts must use request_timeout");
+            .expect("buffered calls must preserve adapter-owned timeout semantics");
 
-        assert!(error.to_string().contains("provider request 超时"));
+        assert_eq!(value, json!({"ok": true}));
     }
 
     #[tokio::test]
@@ -1438,7 +1383,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validated_once_disables_business_and_provider_retries() {
+    async fn streaming_validated_once_allows_one_buffered_transport_fallback() {
+        let provider = Arc::new(FakeProvider::new(vec![
+            Err(ProviderStreamFailure::new("broken stream").into()),
+            text_response(r#"{"ok":true}"#),
+        ]));
+        let caller =
+            StructuredJsonCaller::new(provider.clone(), 512, 3, Duration::ZERO, Duration::ZERO);
+
+        let value = caller
+            .generate_json_streaming_validated_once(
+                "system".into(),
+                vec![SessionTurnMessage::user_text("payload")],
+                BufferedProviderRuntime::new(ProviderRuntimeFallbackScope::new_root()),
+                Ok,
+            )
+            .await
+            .expect("stream failure should use the buffered non-streaming fallback");
+
+        assert_eq!(value, json!({"ok": true}));
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].stream);
+        assert!(!requests[1].stream);
+        assert!(requests.iter().all(|request| {
+            request.stream_output_mode == crate::api::ProviderStreamOutputMode::Buffered
+                && request.retry_count_override == Some(0)
+                && !request.allow_continuation
+        }));
+        assert!(requests[0].runtime_chain_id.is_some());
+        assert!(requests[0].runtime_fallback_scope.is_some());
+        assert!(requests[1].runtime_chain_id.is_none());
+        assert!(requests[1].runtime_fallback_scope.is_none());
+        assert_eq!(requests[0].messages, requests[1].messages);
+        assert_eq!(provider.discarded_chains.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_validated_once_does_not_fallback_for_invalid_json() {
         let provider = Arc::new(FakeProvider::new(vec![
             text_response("{not json"),
             text_response(r#"{"ok":true}"#),
@@ -1447,19 +1429,25 @@ mod tests {
             StructuredJsonCaller::new(provider.clone(), 512, 3, Duration::ZERO, Duration::ZERO);
 
         caller
-            .generate_json_validated_once(
+            .generate_json_streaming_validated_once(
                 "system".into(),
                 vec![SessionTurnMessage::user_text("payload")],
+                BufferedProviderRuntime::new(ProviderRuntimeFallbackScope::new_root()),
                 Ok,
             )
             .await
-            .expect_err("single attempt must not consume the configured retry budget");
+            .expect_err("invalid JSON must fail the business attempt without transport fallback");
 
         let requests = provider.requests.lock().await;
         assert_eq!(requests.len(), 1);
+        assert!(requests[0].stream);
+        assert_eq!(
+            requests[0].stream_output_mode,
+            crate::api::ProviderStreamOutputMode::Buffered
+        );
         assert_eq!(requests[0].retry_count_override, Some(0));
         assert!(!requests[0].allow_continuation);
-        assert!(!requests[0].stream);
+        assert!(provider.discarded_chains.lock().await.is_empty());
     }
 
     #[tokio::test]

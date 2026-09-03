@@ -1302,9 +1302,11 @@ impl InboxJsonGenerator for SessionInboxJsonGenerator<'_> {
             .context("渲染 inbox_claim_attribute_update_internalize prompt 失败")?;
         let user_text = serde_json::to_string_pretty(&request)?;
         self.json_caller
-            .generate_json(
+            .generate_json_streaming_once(
                 system_prompt,
                 vec![SessionTurnMessage::user_text(user_text)],
+                crate::api::BufferedProviderRuntime::new(self.fallback_scope.clone()),
+                None,
             )
             .await
     }
@@ -1321,11 +1323,10 @@ impl InboxJsonGenerator for SessionInboxJsonGenerator<'_> {
             .context("渲染 inbox_claim_attribute_update_internalize prompt 失败")?;
         let user_text = serde_json::to_string_pretty(&request)?;
         self.json_caller
-            .generate_json_validated_with_guarded_attempts(
-                StructuredJsonAttemptRequest::claim_attribute_update(
-                    system_prompt,
-                    vec![SessionTurnMessage::user_text(user_text)],
-                ),
+            .generate_json_streaming_validated_with_retry_notice(
+                system_prompt,
+                vec![SessionTurnMessage::user_text(user_text)],
+                crate::api::BufferedProviderRuntime::new(self.fallback_scope.clone()),
                 validator,
                 |retry, total, error| {
                     log::warn!(
@@ -1334,8 +1335,6 @@ impl InboxJsonGenerator for SessionInboxJsonGenerator<'_> {
                         agent_id
                     );
                 },
-                |_| std::future::ready(()),
-                |_, _| Ok(()),
             )
             .await
     }

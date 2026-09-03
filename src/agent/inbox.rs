@@ -24,7 +24,7 @@ use crate::api::{
     resolve_placeholders, BufferedProviderRuntime, ClaimAttributeUpdateInternalizeItem,
     ClaimAttributeUpdateInternalizeRequest, InboxInternalizeKind, InternalizeOutcome,
     InternalizeRequest, ProviderRuntimeFallbackScope, ProviderTransport, SessionTurnMessage,
-    StructuredJsonAttemptRequest, StructuredJsonCaller,
+    StructuredJsonCaller,
 };
 use crate::claim::{
     ArbitrationResolutionContext, ArbitrationResolutionId, Claim, ClaimId, ClaimStatus, Dispute,
@@ -136,9 +136,11 @@ impl InboxJsonGenerator for PromptInboxJsonGenerator {
             .map_err(anyhow::Error::from)?;
         let user_text = serde_json::to_string_pretty(&request)?;
         self.json_caller
-            .generate_json(
+            .generate_json_streaming_once(
                 system_prompt,
                 vec![SessionTurnMessage::user_text(user_text)],
+                BufferedProviderRuntime::new(self.fallback_scope.clone()),
+                None,
             )
             .await
     }
@@ -155,11 +157,10 @@ impl InboxJsonGenerator for PromptInboxJsonGenerator {
             .map_err(anyhow::Error::from)?;
         let user_text = serde_json::to_string_pretty(&request)?;
         self.json_caller
-            .generate_json_validated_with_guarded_attempts(
-                StructuredJsonAttemptRequest::claim_attribute_update(
-                    system_prompt,
-                    vec![SessionTurnMessage::user_text(user_text)],
-                ),
+            .generate_json_streaming_validated_with_retry_notice(
+                system_prompt,
+                vec![SessionTurnMessage::user_text(user_text)],
+                BufferedProviderRuntime::new(self.fallback_scope.clone()),
                 validator,
                 |retry, total, error| {
                     log::warn!(
@@ -168,8 +169,6 @@ impl InboxJsonGenerator for PromptInboxJsonGenerator {
                         agent_id
                     );
                 },
-                |_| std::future::ready(()),
-                |_, _| Ok(()),
             )
             .await
     }
@@ -2124,6 +2123,7 @@ mod tests {
     };
     use crate::api::{
         ProviderAdapter, ProviderEvent, ProviderRequest, ProviderResponse, ProviderStop,
+        ProviderStreamFailure,
     };
     use crate::claim::{
         AgentId, ClaimStatus, Confidence, InboxId, InboxMessageKind, Policy, PolicyId,
@@ -3024,7 +3024,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn arbitration_retry_budget_business_validation_can_recover_within_total_budget() {
+    async fn arbitration_business_validation_retries_without_transport_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let local = arbitration_claim("agent-a", "local", ClaimStatus::Active);
         let remote = arbitration_claim("agent-b", "remote", ClaimStatus::Active);
@@ -3073,13 +3073,60 @@ mod tests {
 
         let requests = provider.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert!(requests
-            .iter()
-            .all(|request| request.retry_count_override == Some(0)));
+        assert!(requests.iter().all(|request| {
+            request.stream
+                && request.stream_output_mode == crate::api::ProviderStreamOutputMode::Buffered
+                && request.retry_count_override.is_none()
+                && request.allow_continuation
+                && request.runtime_chain_id.is_some()
+                && request.runtime_fallback_scope.is_some()
+        }));
     }
 
     #[tokio::test]
-    async fn arbitration_retry_budget_never_exceeds_configured_total_attempts() {
+    async fn arbitration_transport_failure_uses_buffered_non_streaming_fallback() {
+        let provider = Arc::new(CountingArbitrationProvider::new(vec![
+            Err(ProviderStreamFailure::new("broken stream").into()),
+            arbitration_provider_response(
+                json!({
+                    "new_claims": [],
+                    "updated_claims": [],
+                    "new_disputes": []
+                })
+                .to_string(),
+            ),
+        ]));
+        let generator = prompt_arbitration_generator(provider.clone(), 1);
+        let request = ClaimAttributeUpdateInternalizeRequest {
+            agent_id: AgentId::new("agent-a").unwrap(),
+            claim_attribute_updates: Vec::new(),
+            local_claims: Vec::new(),
+        };
+        let mut validator = |_| Ok((Utc::now(), Vec::new(), Vec::new(), Vec::new()));
+
+        generator
+            .generate_validated_claim_attribute_update_json(request, &mut validator)
+            .await
+            .expect("CAU transport failure should use the common buffered fallback");
+
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].stream);
+        assert!(!requests[1].stream);
+        assert!(requests.iter().all(|request| {
+            request.stream_output_mode == crate::api::ProviderStreamOutputMode::Buffered
+                && request.retry_count_override.is_none()
+                && request.allow_continuation
+        }));
+        assert!(requests[0].runtime_chain_id.is_some());
+        assert!(requests[0].runtime_fallback_scope.is_some());
+        assert!(requests[1].runtime_chain_id.is_none());
+        assert!(requests[1].runtime_fallback_scope.is_none());
+        assert_eq!(requests[0].messages, requests[1].messages);
+    }
+
+    #[tokio::test]
+    async fn arbitration_structured_retry_budget_limits_business_attempts() {
         let dir = tempfile::tempdir().unwrap();
         let local = arbitration_claim("agent-a", "local", ClaimStatus::Active);
         let remote = arbitration_claim("agent-b", "remote", ClaimStatus::Active);
@@ -3127,9 +3174,12 @@ mod tests {
         assert!(error.to_string().contains("JSON"));
         let requests = provider.requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
-        assert!(requests
-            .iter()
-            .all(|request| request.retry_count_override == Some(0)));
+        assert!(requests.iter().all(|request| {
+            request.stream
+                && request.stream_output_mode == crate::api::ProviderStreamOutputMode::Buffered
+                && request.retry_count_override.is_none()
+                && request.allow_continuation
+        }));
     }
 
     #[tokio::test]
