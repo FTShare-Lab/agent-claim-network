@@ -23,13 +23,16 @@ mod user_shell;
 pub use context::AgentContext;
 pub(crate) use inbox::PromptInboxJsonGenerator;
 pub use runner::{
-    AgentRunner, InboxProcessReport, TeamServiceConnectionStatus, TeamServicesConnectionStatus,
+    AgentRunner, InboxProcessFailure, InboxProcessFailureKind, InboxProcessReport,
+    TeamServiceConnectionStatus, TeamServicesConnectionStatus,
 };
-pub(crate) use session_engine::SessionRecapPreemptionControl;
 pub use session_engine::{
     SessionCompactionNoopReason, SessionCompactionResult, SessionEngine, SessionEngineOptions,
     SessionEvent, SessionFinalizeReport, SessionRuntimeStatus, SessionStartReport,
     SessionTurnControl, SessionTurnControlReceiver,
+};
+pub(crate) use session_engine::{
+    SessionFinalizeOnceOutcome, SessionFinalizePreemptionControl, SessionRecapPreemptionControl,
 };
 pub use traits::{InboxReader, LocalClaimStore, MemoryStore, ReportedDisputeClaimSetStore};
 pub use user_shell::{UserShellCommandOutput, UserShellCommandStatus};

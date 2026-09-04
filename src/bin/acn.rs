@@ -25,9 +25,7 @@ use agent_claim_network::session::{
 };
 use agent_claim_network::session_tui::{self, StartupResume};
 use agent_claim_network::storage::{paths, read_yaml, FileLockGuard};
-use agent_claim_network::supervisor::{
-    self, FinalizingSessionDiagnostic, SupervisorLaunchConfig, SupervisorRetryTarget,
-};
+use agent_claim_network::supervisor::{self, SupervisorLaunchConfig, SupervisorRetryTarget};
 use agent_claim_network::update::{
     self, UpdateOptions, DEFAULT_UPDATE_BRANCH, DEFAULT_UPDATE_REPOSITORY_URL,
 };
@@ -414,16 +412,6 @@ async fn direct_resume_preflight_failure(
         Ok(metadata) => metadata,
         Err(error) => return Some(format!("Resume failed: {error:#}\n")),
     };
-    if metadata.agent_id == *agent_id && metadata.status == SessionStatus::Finalizing {
-        let diagnostic =
-            supervisor::diagnose_finalizing_session(&cfg.agent_home(agent_id), session_id).await;
-        return Some(match diagnostic {
-            Ok(diagnostic) => direct_resume_finalizing_message(session_id, &diagnostic),
-            Err(error) => {
-                format!("Resume failed: session {session_id} 的 finalize 状态检查失败：{error:#}\n")
-            }
-        });
-    }
     direct_resume_metadata_failure(agent_id, session_id, &metadata)
 }
 
@@ -445,51 +433,7 @@ fn direct_resume_metadata_failure(
             "Resume failed: Session {session_id} has inconsistent Open metadata.\n"
         ));
     }
-    if !matches!(metadata.status, SessionStatus::Open | SessionStatus::Closed) {
-        return Some(direct_resume_not_closed_message(
-            session_id,
-            metadata.status,
-        ));
-    }
     None
-}
-
-fn direct_resume_not_closed_message(session_id: &SessionId, status: SessionStatus) -> String {
-    format!(
-        "Resume failed: You can only resume Open or Closed sessions.\nSession {session_id} current status: {}.\n",
-        session_status_label(status)
-    )
-}
-
-fn direct_resume_finalizing_message(
-    session_id: &SessionId,
-    diagnostic: &FinalizingSessionDiagnostic,
-) -> String {
-    match diagnostic {
-        FinalizingSessionDiagnostic::Queued { job_id } => format!(
-            "Resume failed: session {session_id} 正在等待 finalize（job {job_id}）。请稍后重试。\n"
-        ),
-        FinalizingSessionDiagnostic::Running { job_id } => format!(
-            "Resume failed: session {session_id} 正在 finalize（job {job_id}）。请稍后重试。\n"
-        ),
-        FinalizingSessionDiagnostic::Failed { job_id } => format!(
-            "Resume failed: session {session_id} 的 finalize 失败。\nJob: {job_id}\n\n请运行：\nacn supervisor retry {session_id}\n"
-        ),
-        FinalizingSessionDiagnostic::RunningWithoutJob => format!(
-            "Resume failed: session {session_id} 正在 finalize。请稍后重试。\n"
-        ),
-        FinalizingSessionDiagnostic::Orphaned => format!(
-            "Resume failed: session {session_id} 的 finalize 未完成。\n\n请运行：\nacn supervisor retry {session_id}\n"
-        ),
-    }
-}
-
-fn session_status_label(status: SessionStatus) -> &'static str {
-    match status {
-        SessionStatus::Open => "Open",
-        SessionStatus::Finalizing => "Finalizing",
-        SessionStatus::Closed => "Closed",
-    }
 }
 
 async fn run_mcp_cli(args: Vec<String>) -> anyhow::Result<()> {
@@ -2275,8 +2219,8 @@ mod tests {
         SessionStatus,
     };
     use agent_claim_network::supervisor::{
-        FinalizingSessionDiagnostic, SupervisorJobView, SupervisorQueueSummary,
-        SupervisorRuntimeState, SupervisorStatusSnapshot, SupervisorStopReport,
+        SupervisorJobView, SupervisorQueueSummary, SupervisorRuntimeState,
+        SupervisorStatusSnapshot, SupervisorStopReport,
     };
     use chrono::{DateTime, Utc};
     use std::path::PathBuf;
@@ -2683,48 +2627,7 @@ api_key_env = "UNUSED_TEST_LLM_KEY"
     }
 
     #[test]
-    fn direct_resume_rejects_finalizing_session_with_terminal_message() {
-        let session_id = SessionId::from_str("session_1234abcd").unwrap();
-
-        assert_eq!(
-            super::direct_resume_not_closed_message(&session_id, SessionStatus::Finalizing),
-            "Resume failed: You can only resume Open or Closed sessions.\nSession session_1234abcd current status: Finalizing.\n"
-        );
-    }
-
-    #[test]
-    fn direct_resume_finalizing_message_explains_job_state_and_retry_command() {
-        let session_id = SessionId::from_str("session_1234abcd").unwrap();
-
-        assert_eq!(
-            super::direct_resume_finalizing_message(
-                &session_id,
-                &FinalizingSessionDiagnostic::Queued {
-                    job_id: "job_queued".into(),
-                },
-            ),
-            "Resume failed: session session_1234abcd 正在等待 finalize（job job_queued）。请稍后重试。\n"
-        );
-        assert_eq!(
-            super::direct_resume_finalizing_message(
-                &session_id,
-                &FinalizingSessionDiagnostic::Failed {
-                    job_id: "job_failed".into(),
-                },
-            ),
-            "Resume failed: session session_1234abcd 的 finalize 失败。\nJob: job_failed\n\n请运行：\nacn supervisor retry session_1234abcd\n"
-        );
-        assert_eq!(
-            super::direct_resume_finalizing_message(
-                &session_id,
-                &FinalizingSessionDiagnostic::Orphaned,
-            ),
-            "Resume failed: session session_1234abcd 的 finalize 未完成。\n\n请运行：\nacn supervisor retry session_1234abcd\n"
-        );
-    }
-
-    #[test]
-    fn direct_resume_metadata_failure_allows_consistent_open_and_closed_sessions() {
+    fn direct_resume_metadata_failure_allows_consistent_open_closed_and_finalizing_sessions() {
         let agent = AgentId::new("agent-a").unwrap();
         let session_id = SessionId::from_str("session_1234abcd").unwrap();
         let metadata =
@@ -2738,9 +2641,7 @@ api_key_env = "UNUSED_TEST_LLM_KEY"
 
         let metadata =
             test_session_metadata(agent.clone(), session_id.clone(), SessionStatus::Finalizing);
-        let failure = super::direct_resume_metadata_failure(&agent, &session_id, &metadata)
-            .expect("finalizing direct resume should be rejected");
-        assert!(failure.contains("You can only resume Open or Closed sessions"));
+        assert!(super::direct_resume_metadata_failure(&agent, &session_id, &metadata).is_none());
         let mut metadata =
             test_session_metadata(agent.clone(), session_id.clone(), SessionStatus::Closed);
         metadata.finalized_at = Some(metadata.updated_at);

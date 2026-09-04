@@ -46,6 +46,7 @@ use super::{
     ManualCompactionOutcome, PreflightCompactionRequest, PreflightCompactor,
     ProviderContextUsageAnchor, ProviderProjectionBudget, ProviderRejectionRecoveryRecord,
     SessionCompactionNoopReason, SessionCompactionResult, SessionEngine, SessionEvent,
+    SessionFinalizeOnceOutcome, SessionFinalizePreemptionControl,
     SessionRecapBackgroundProcessProjection, SessionRecapPreemptionControl,
     SessionTurnCommittedPostCommitError, TurnJournalEmitter, TurnJournalSink,
     COMPACTION_CHECKPOINT_SCHEMA_VERSION, DELEGATION_PROJECTION_MAX_CHARS,
@@ -61,14 +62,14 @@ use crate::api::{
     InternalizeRequest, MemoryReviewLoop, ModelContextSource, ProviderAdapter, ProviderEvent,
     ProviderHistoryMediaPolicy, ProviderRejectedRequestRecovery, ProviderReplayIdentity,
     ProviderReplayProtocol, ProviderReplayState, ProviderRequest, ProviderRequestObserver,
-    ProviderRequestRejected, ProviderResponse, ProviderStop, SessionAttachment,
-    SessionTurnContentBlock, SessionTurnContextAppender, SessionTurnEvent, SessionTurnHooks,
-    SessionTurnMessage, SessionTurnPreflight, SessionTurnRequest, StructuredJsonCaller,
-    ToolCallSkipReason, TurnMessage,
+    ProviderRequestRejected, ProviderResponse, ProviderStop, ProviderStreamFailure,
+    SessionAttachment, SessionTurnContentBlock, SessionTurnContextAppender, SessionTurnEvent,
+    SessionTurnHooks, SessionTurnMessage, SessionTurnPreflight, SessionTurnRequest,
+    StructuredJsonCaller, ToolCallSkipReason, TurnMessage,
 };
 use crate::claim::{
     AgentId, Claim, ClaimId, ClaimStatus, Confidence, Dispute, DisputeId, InboxId, InboxMessage,
-    SessionId,
+    InboxMessageKind, Policy, PolicyId, PolicyMessageType, PolicyStatus, SessionId,
 };
 use crate::config::{
     AgentSessionTurnJournalConfig, SessionCompactionConfig, ToolConfig, UserShellConfig,
@@ -137,6 +138,7 @@ enum ProviderStep {
     },
     ContextWindowRejected,
     MediaRejected,
+    StreamFailure(&'static str),
     RequestTooLarge,
 }
 
@@ -337,6 +339,9 @@ impl ProviderAdapter for RecordingProvider {
             }
             Some(ProviderStep::MediaRejected) => {
                 Err(crate::api::ProviderMediaRejected::new("provider rejected media input").into())
+            }
+            Some(ProviderStep::StreamFailure(message)) => {
+                Err(ProviderStreamFailure::new(message).into())
             }
             Some(ProviderStep::RequestTooLarge) => {
                 Err(crate::api::ProviderRequestTooLarge::new().into())
@@ -1126,6 +1131,7 @@ fn last_user_text(request: &ProviderRequest) -> String {
                     SessionTurnContentBlock::Image { .. }
                     | SessionTurnContentBlock::Document { .. }
                     | SessionTurnContentBlock::ToolUse { .. }
+                    | SessionTurnContentBlock::InvalidToolUse { .. }
                     | SessionTurnContentBlock::ToolResult { .. } => None,
                 })
                 .collect::<Vec<_>>()
@@ -1145,6 +1151,7 @@ fn text_content(message: &SessionMessage) -> String {
             SessionContentBlock::Image { .. }
             | SessionContentBlock::Document { .. }
             | SessionContentBlock::ToolUse { .. }
+            | SessionContentBlock::InvalidToolUse { .. }
             | SessionContentBlock::ToolResult { .. } => None,
         })
         .collect::<Vec<_>>()
@@ -1655,6 +1662,26 @@ async fn create_test_session(store: &SessionStore, id: &str) -> crate::session::
         .create_with_id_factory(&agent, "system prompt", || session_id.clone(), 1)
         .await
         .unwrap()
+}
+
+fn active_policy_inbox_message() -> InboxMessage {
+    InboxMessage {
+        id: InboxId::random(),
+        kind: InboxMessageKind::PolicyUpdate {
+            policy: Policy {
+                id: PolicyId::random(),
+                message_type: PolicyMessageType::PolicyUpdate,
+                name: "startup-inbox-policy".into(),
+                statement: "internalize this policy".into(),
+                scope: "tests / startup inbox".into(),
+                status: PolicyStatus::Active,
+                created_at: Utc::now(),
+                updated_at: None,
+                target_agents: None,
+            },
+        },
+        handled_at: None,
+    }
 }
 
 #[tokio::test]
@@ -2422,33 +2449,44 @@ async fn resumed_runtime_delivers_interrupted_turn_background_completion_once() 
 }
 
 #[tokio::test]
-async fn manual_inbox_rejects_solo_mode_without_changing_session_to_error() {
+async fn manual_inbox_processes_local_pending_in_solo_mode() {
     let dir = tempfile::tempdir().unwrap();
-    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        r#"{"new_claims":[],"updated_claims":[],"new_disputes":[]}"#,
+        Vec::new(),
+    )]));
     let (engine, store) = build_local_test_engine(&dir, provider);
     let session = create_test_session(&store, "session_1234abcd").await;
+    let inbox = LocalFsInboxReader::new(dir.path().join("agents").join("agent-a"));
+    inbox
+        .accept_pulled(&active_policy_inbox_message())
+        .await
+        .unwrap();
     let mut events = Vec::new();
 
-    let error = engine
+    let report = engine
         .process_inbox_during_session(&session, |event| events.push(event))
         .await
-        .unwrap_err();
+        .unwrap();
 
-    assert_eq!(
-        error.to_string(),
-        "团队服务未配置，请参考 docs/config_parameters.md 文档配置 maintainer_endpoint/router_endpoint"
-    );
-    assert!(events.iter().any(|event| matches!(
-        event,
-        SessionEvent::InboxFailed { error }
-            if error.contains("团队服务未配置")
-    )));
+    assert_eq!(report.total, 1);
+    assert_eq!(report.team_services, Default::default());
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, SessionEvent::InboxStarted)));
     assert!(!events.iter().any(|event| matches!(
         event,
-        SessionEvent::StatusChanged {
-            status: SessionRuntimeStatus::Error
-        } | SessionEvent::InboxStarted
+        SessionEvent::InboxFailed { .. }
+            | SessionEvent::StatusChanged {
+                status: SessionRuntimeStatus::Error
+            }
     )));
+    assert!(matches!(
+        events.last(),
+        Some(SessionEvent::StatusChanged {
+            status: SessionRuntimeStatus::Open
+        })
+    ));
     assert_eq!(
         session.read_metadata().await.unwrap().status,
         SessionStatus::Open
@@ -2484,13 +2522,158 @@ async fn solo_mode_session_start_reports_unknown_team_status() {
 }
 
 #[tokio::test]
+async fn fresh_start_continues_open_when_inbox_internalization_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        "not valid inbox json",
+        Vec::new(),
+    )]));
+    let (engine, _) = build_test_engine(&dir, provider);
+    let inbox = LocalFsInboxReader::new(dir.path().join("agents").join("agent-a"));
+    let message = active_policy_inbox_message();
+    inbox.accept_pulled(&message).await.unwrap();
+    let mut events = Vec::new();
+
+    let report = engine
+        .start_session(1, |event| events.push(event))
+        .await
+        .expect("inbox internalization failure must not block session startup");
+
+    assert_eq!(report.inbox_report.total, 0);
+    assert!(report
+        .inbox_report
+        .failures
+        .iter()
+        .any(|failure| failure.kind == crate::agent::InboxProcessFailureKind::Internalization));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::Warning { message }
+            if message == super::events::INBOX_INTERNALIZATION_WARNING
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        SessionEvent::InboxFailed { .. }
+            | SessionEvent::StatusChanged {
+                status: SessionRuntimeStatus::Error
+            }
+    )));
+    assert!(matches!(
+        events.last(),
+        Some(SessionEvent::StatusChanged {
+            status: SessionRuntimeStatus::Open
+        })
+    ));
+    assert_eq!(
+        report.session.read_metadata().await.unwrap().status,
+        SessionStatus::Open
+    );
+    assert_eq!(inbox.list_pending().await.unwrap(), vec![message]);
+}
+
+#[tokio::test]
+async fn fresh_start_continues_open_when_local_inbox_read_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (engine, _) = build_test_engine(&dir, provider);
+    let agent_home = dir.path().join("agents").join("agent-a");
+    tokio::fs::create_dir_all(&agent_home).await.unwrap();
+    tokio::fs::write(paths::agent_home_inbox_dir(&agent_home), b"not a directory")
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+
+    let report = engine
+        .start_session(1, |event| events.push(event))
+        .await
+        .expect("local inbox failure must not block session startup");
+
+    assert!(report
+        .inbox_report
+        .failures
+        .iter()
+        .any(|failure| failure.kind == crate::agent::InboxProcessFailureKind::Local));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::InboxFailed { error }
+            if error.contains("Some local changes may already have been applied")
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        SessionEvent::StatusChanged {
+            status: SessionRuntimeStatus::Error
+        }
+    )));
+    assert!(matches!(
+        events.last(),
+        Some(SessionEvent::StatusChanged {
+            status: SessionRuntimeStatus::Open
+        })
+    ));
+    assert_eq!(
+        report.session.read_metadata().await.unwrap().status,
+        SessionStatus::Open
+    );
+}
+
+#[tokio::test]
+async fn manual_inbox_internalization_failure_warns_and_returns_to_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        "not valid inbox json",
+        Vec::new(),
+    )]));
+    let (engine, store) = build_test_engine(&dir, provider);
+    let session = create_test_session(&store, "session_1234abcd").await;
+    let inbox = LocalFsInboxReader::new(dir.path().join("agents").join("agent-a"));
+    inbox
+        .accept_pulled(&active_policy_inbox_message())
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+
+    let report = engine
+        .process_inbox_during_session(&session, |event| events.push(event))
+        .await
+        .expect("manual inbox internalization failure must be recoverable");
+
+    assert!(report
+        .failures
+        .iter()
+        .any(|failure| failure.kind == crate::agent::InboxProcessFailureKind::Internalization));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::Warning { message }
+            if message == super::events::INBOX_INTERNALIZATION_WARNING
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        SessionEvent::StatusChanged {
+            status: SessionRuntimeStatus::Error
+        }
+    )));
+    assert!(matches!(
+        events.last(),
+        Some(SessionEvent::StatusChanged {
+            status: SessionRuntimeStatus::Open
+        })
+    ));
+    assert_eq!(
+        session.read_metadata().await.unwrap().status,
+        SessionStatus::Open
+    );
+}
+
+#[tokio::test]
 async fn resume_inbox_refresh_reports_configured_team_status() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(Vec::new()));
     let (engine, store) = build_test_engine(&dir, provider);
     let session = create_test_session(&store, "session_1234abcd").await;
 
-    let report = engine.process_inbox_for_resume(&session).await.unwrap();
+    let mut events = Vec::new();
+    let report = engine
+        .process_inbox_for_resume(&session, |event| events.push(event))
+        .await;
 
     assert_eq!(
         report.team_services,
@@ -2499,6 +2682,11 @@ async fn resume_inbox_refresh_reports_configured_team_status() {
             router: crate::agent::TeamServiceConnectionStatus::Connected,
         }
     );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::TeamServicesConnectionUpdated { status }
+            if *status == report.team_services
+    )));
 }
 
 fn test_message(
@@ -10208,6 +10396,108 @@ async fn same_session_finalize_preempts_recap_before_prepared_and_takes_full_ran
 }
 
 #[tokio::test]
+async fn resume_preempts_running_finalize_before_prepared_without_closing_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(PreemptibleRecapProvider::new());
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_face0023").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "resume target request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "resume target answer"),
+        ])
+        .await
+        .unwrap();
+    session.mark_finalizing(Utc::now()).await.unwrap();
+    let control = Arc::new(SessionFinalizePreemptionControl::new());
+    let finalize_engine = engine.clone();
+    let session_id = session.metadata.id.clone();
+    let finalize_control = Arc::clone(&control);
+    let finalize = tokio::spawn(async move {
+        finalize_engine
+            .finalize_existing_session_once_with_preemption(&session_id, |_| {}, finalize_control)
+            .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        provider.first_call_started.notified(),
+    )
+    .await
+    .unwrap();
+
+    assert!(control.request_before_prepared().await);
+    let outcome = tokio::time::timeout(Duration::from_secs(2), finalize)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        SessionFinalizeOnceOutcome::PreemptedBeforePrepared
+    ));
+    assert!(provider.first_call_dropped.load(Ordering::SeqCst));
+    assert!(session.read_finalize_checkpoint().await.unwrap().is_none());
+    let metadata = session.read_metadata().await.unwrap();
+    assert_eq!(metadata.status, SessionStatus::Finalizing);
+    assert_eq!(metadata.recapped_until, 0);
+}
+
+#[tokio::test]
+async fn finalize_recaps_invalid_tool_use_without_replaying_or_reconstructing_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
+        Vec::new(),
+    )]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_face0024").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "run the safe sibling tool"),
+            NewSessionMessage::new(
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::InvalidToolUse {
+                    id: "call_invalid".into(),
+                    name: "file_read".into(),
+                    error: "function_call.arguments was not a JSON object".into(),
+                }],
+            ),
+            NewSessionMessage::new(
+                SessionMessageRole::User,
+                vec![SessionContentBlock::tool_result(
+                    "call_invalid",
+                    r#"{"ok":false,"outcome":{"kind":"dispatch_failure"}}"#,
+                )],
+            ),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "continued safely"),
+        ])
+        .await
+        .unwrap();
+    let messages = session.read_messages().await.unwrap();
+    assert_eq!(
+        hash_session_segment(&messages).unwrap(),
+        hash_session_segment(&messages).unwrap()
+    );
+    session.mark_finalizing(Utc::now()).await.unwrap();
+
+    engine
+        .finalize_existing_session_once(&session.metadata.id, |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 1);
+    let payload = last_user_text(&requests[0]);
+    assert!(payload.contains("invalid_tool_use file_read"));
+    assert!(payload.contains("dispatch_failure"));
+    assert!(!payload.contains("raw invalid arguments"));
+    let metadata = session.read_metadata().await.unwrap();
+    assert_eq!(metadata.status, SessionStatus::Closed);
+    assert_eq!(metadata.recapped_until, metadata.message_count);
+}
+
+#[tokio::test]
 async fn finalize_recovers_prepared_recap_prefix_before_processing_remaining_messages() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(vec![response_step(
@@ -10414,7 +10704,67 @@ async fn finalize_continues_from_background_recap_cursor() {
 }
 
 #[tokio::test]
-async fn supervisor_finalize_attempt_uses_one_model_request() {
+async fn supervisor_recap_and_finalize_use_buffered_transport_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        ProviderStep::StreamFailure("recap stream failed"),
+        response_step(
+            r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
+            Vec::new(),
+        ),
+        ProviderStep::StreamFailure("finalize stream failed"),
+        response_step(
+            r#"{"new_claims":[],"used_claim_ids":[],"new_disputes":[]}"#,
+            Vec::new(),
+        ),
+    ]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_face0025").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "recap request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "recap answer"),
+        ])
+        .await
+        .unwrap();
+
+    engine
+        .recap_existing_session_until(&session.metadata.id, 2)
+        .await
+        .unwrap();
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "final request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "final answer"),
+        ])
+        .await
+        .unwrap();
+    session.mark_finalizing(Utc::now()).await.unwrap();
+    engine
+        .finalize_existing_session_once(&session.metadata.id, |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 4);
+    for pair in requests.chunks_exact(2) {
+        assert!(pair[0].stream);
+        assert!(!pair[1].stream);
+        assert!(pair.iter().all(|request| {
+            request.stream_output_mode == crate::api::ProviderStreamOutputMode::Buffered
+                && request.retry_count_override == Some(0)
+                && !request.allow_continuation
+        }));
+        assert!(pair[0].runtime_chain_id.is_some());
+        assert!(pair[0].runtime_fallback_scope.is_some());
+        assert!(pair[1].runtime_chain_id.is_none());
+        assert!(pair[1].runtime_fallback_scope.is_none());
+        assert_eq!(pair[0].messages, pair[1].messages);
+    }
+}
+
+#[tokio::test]
+async fn supervisor_finalize_attempt_uses_one_logical_generation() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(vec![
         response_step("{not json", Vec::new()),
@@ -10444,13 +10794,24 @@ async fn supervisor_finalize_attempt_uses_one_model_request() {
         .finalize_existing_session_once(&session.metadata.id, |_| {})
         .await
         .expect_err("first supervisor attempt should expose invalid JSON to the job retry");
-    assert_eq!(provider.requests().await.len(), 1);
+    let first_requests = provider.requests().await;
+    assert_eq!(first_requests.len(), 1);
+    assert!(first_requests[0].stream);
+    assert_eq!(first_requests[0].retry_count_override, Some(0));
+    assert!(!first_requests[0].allow_continuation);
 
     engine
         .finalize_existing_session_once(&session.metadata.id, |_| {})
         .await
         .unwrap();
-    assert_eq!(provider.requests().await.len(), 2);
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|request| {
+        request.stream
+            && request.stream_output_mode == crate::api::ProviderStreamOutputMode::Buffered
+            && request.retry_count_override == Some(0)
+            && !request.allow_continuation
+    }));
     let metadata = session.read_metadata().await.unwrap();
     assert_eq!(metadata.status, SessionStatus::Closed);
 }
@@ -15724,6 +16085,7 @@ fn historical_provider_context_flattens_media_blocks_without_base64() {
             SessionTurnContentBlock::Image { .. }
             | SessionTurnContentBlock::Document { .. }
             | SessionTurnContentBlock::ToolUse { .. }
+            | SessionTurnContentBlock::InvalidToolUse { .. }
             | SessionTurnContentBlock::ToolResult { .. } => "",
         })
         .collect::<Vec<_>>()

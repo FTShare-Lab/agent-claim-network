@@ -15,6 +15,10 @@ use crate::agent::{
 use crate::claim::SessionId;
 use crate::mcp::connection_manager::McpRuntimeState;
 use crate::session::TurnJournalEventKind;
+use crate::session::{SessionResumeKind, SessionStoreError};
+use crate::supervisor::{
+    self, FinalizingResumeTakeover, FinalizingSessionDiagnostic, SupervisorLaunchConfig,
+};
 
 use super::input_queue::QueuedInput;
 
@@ -34,15 +38,21 @@ pub(super) enum WorkerEvent {
         sessions: Vec<crate::session::ResumedSessionSummary>,
     },
     ResumeListFailed(anyhow::Error),
+    ResumeFinalizingStarted {
+        session_id: SessionId,
+    },
     ResumeSessionReserved {
-        result: anyhow::Result<ResumeSessionReservation>,
+        result: Result<ResumeSessionReservation, ResumePreflightFailure>,
     },
     ResumeHistoryLoaded {
         result: anyhow::Result<ResumeHistoryOutcome>,
     },
+    ResumeInboxNotices {
+        events: Vec<SessionEvent>,
+    },
     ResumeInboxFinished {
         session: crate::session::SessionHandle,
-        result: anyhow::Result<crate::agent::InboxProcessReport>,
+        had_notices: bool,
     },
     TurnFinished {
         turn_id: u64,
@@ -88,6 +98,14 @@ pub(super) struct ResumeSessionReservation {
     pub(super) session: crate::session::SessionHandle,
     pub(super) runtime_lease: crate::session::SessionRuntimeLease,
     pub(super) temporary_session_id: Option<SessionId>,
+    pub(super) resume_kind: SessionResumeKind,
+}
+
+pub(super) struct ResumePreflightFailure {
+    pub(super) error: anyhow::Error,
+    pub(super) finalizing_target: bool,
+    pub(super) foreground_finalizing: bool,
+    pub(super) target_session_id: SessionId,
 }
 
 pub(super) struct ResumeHistoryOutcome {
@@ -634,18 +652,110 @@ pub(super) fn spawn_resume_preflight_worker(
     engine: SessionEngine,
     session_id: SessionId,
     temporary_session_id: Option<SessionId>,
+    supervisor: Option<SupervisorLaunchConfig>,
     worker_tx: mpsc::UnboundedSender<WorkerEvent>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let result = async {
-            let resumed = engine.reopen_existing_session(&session_id).await?;
+        let target_was_finalizing = engine
+            .resume_target_status(&session_id)
+            .await
+            .is_ok_and(|status| status == crate::session::SessionStatus::Finalizing);
+        if target_was_finalizing {
+            let _ = worker_tx.send(WorkerEvent::ResumeFinalizingStarted {
+                session_id: session_id.clone(),
+            });
+        }
+        let mut finalizing_target = target_was_finalizing;
+        let mut foreground_finalizing = false;
+        let result: Result<ResumeSessionReservation, ResumePreflightFailure> = async {
+            let resumed = match engine.reserve_existing_session(&session_id).await {
+                Ok(resumed) => resumed,
+                Err(error) => {
+                    let runtime_locked = error
+                        .downcast_ref::<SessionStoreError>()
+                        .is_some_and(|error| {
+                            matches!(error, SessionStoreError::RuntimeLocked { .. })
+                        });
+                    let foreground_finalize = target_was_finalizing
+                        && runtime_locked
+                        && if let Some(supervisor) = supervisor.as_ref() {
+                            matches!(
+                                supervisor::diagnose_finalizing_session(
+                                    &supervisor.agent_home,
+                                    &session_id,
+                                )
+                                .await,
+                                Ok(FinalizingSessionDiagnostic::RunningWithoutJob)
+                            )
+                        } else {
+                            false
+                        };
+                    if foreground_finalize {
+                        foreground_finalizing = true;
+                        anyhow::bail!(
+                            "target session is finalizing in another foreground process"
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            let resume_kind = resumed.kind;
+            finalizing_target =
+                target_was_finalizing || resumed.kind == SessionResumeKind::Finalizing;
+            if finalizing_target && !target_was_finalizing {
+                let _ = worker_tx.send(WorkerEvent::ResumeFinalizingStarted {
+                    session_id: session_id.clone(),
+                });
+            }
+            let mut session = resumed.session;
+            if resumed.kind == SessionResumeKind::Closed {
+                if let Some(supervisor) = supervisor.as_ref() {
+                    supervisor::reconcile_closed_session_for_resume(
+                        supervisor,
+                        session_id.clone(),
+                    )
+                    .await?;
+                }
+                session = engine.complete_closed_resume(session).await?;
+            } else if resumed.kind == SessionResumeKind::Finalizing {
+                let supervisor = supervisor.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "This session is still finalizing; wait for finalization to complete before resuming."
+                    )
+                })?;
+                match supervisor::resume_finalizing_session(supervisor, session_id.clone()).await? {
+                    FinalizingResumeTakeover::Opened { .. } => {}
+                    FinalizingResumeTakeover::ReopenClosed { .. } => {
+                        session.mark_open(chrono::Utc::now()).await?;
+                    }
+                    FinalizingResumeTakeover::WaitForFinalize { job_id: None } => {
+                        foreground_finalizing = true;
+                        anyhow::bail!("target session is finalizing in another foreground process")
+                    }
+                    FinalizingResumeTakeover::WaitForFinalize { job_id: Some(_) } => {
+                        anyhow::bail!("Supervisor returned an unresolved Finalize wait")
+                    }
+                }
+                session = engine.complete_finalizing_resume(&session_id).await?;
+                anyhow::ensure!(
+                    session.metadata.status == crate::session::SessionStatus::Open,
+                    "resume takeover completed without opening the target session"
+                );
+            }
             anyhow::Ok(ResumeSessionReservation {
-                session: resumed.session,
+                session,
                 runtime_lease: resumed.runtime_lease,
                 temporary_session_id,
+                resume_kind,
             })
         }
-        .await;
+        .await
+        .map_err(|error| ResumePreflightFailure {
+            error,
+            finalizing_target,
+            foreground_finalizing,
+            target_session_id: session_id,
+        });
         let _ = worker_tx.send(WorkerEvent::ResumeSessionReserved { result });
     })
 }
@@ -697,8 +807,8 @@ pub(super) fn spawn_resume_history_worker(
     })
 }
 
-/// 目标历史已经可见后执行 Resume inbox。沿用 resume 专用的单人/团队语义，成功时
-/// 补发可见进度；失败不发送 Error 事件，最终由 App 降级成固定 warning 并恢复 Open。
+/// 目标历史已经可见后执行 Resume inbox。失败提示交给 App 成组写入 transcript，
+/// 以保留 Resume 历史与 inbox notice 之间的可见空行；流程最终恢复 Open。
 pub(super) fn spawn_resume_inbox_worker(
     engine: SessionEngine,
     session: crate::session::SessionHandle,
@@ -715,16 +825,26 @@ pub(super) fn spawn_resume_inbox_worker(
             status: crate::agent::SessionRuntimeStatus::SyncingInbox,
         });
         send_event(SessionEvent::InboxStarted);
-        let result = engine.process_inbox_for_resume(&session).await;
-        if let Ok(report) = &result {
-            send_event(SessionEvent::TeamServicesConnectionUpdated {
-                status: report.team_services,
+        let mut notice_events = Vec::new();
+        let report = engine
+            .process_inbox_for_resume(&session, |event| {
+                if matches!(
+                    event,
+                    SessionEvent::Warning { .. } | SessionEvent::InboxFailed { .. }
+                ) {
+                    notice_events.push(event);
+                } else {
+                    send_event(event);
+                }
+            })
+            .await;
+        let had_notices = !notice_events.is_empty();
+        if had_notices {
+            let _ = worker_tx.send(WorkerEvent::ResumeInboxNotices {
+                events: notice_events,
             });
-            for warning in &report.warnings {
-                send_event(SessionEvent::Warning {
-                    message: warning.clone(),
-                });
-            }
+        }
+        if report.failures.is_empty() {
             send_event(SessionEvent::InboxCompleted {
                 processed: report.total,
                 new_claim_ids: report.new_claim_ids.clone(),
@@ -732,18 +852,21 @@ pub(super) fn spawn_resume_inbox_worker(
                 new_dispute_ids: report.new_dispute_ids.clone(),
                 deprecated_claim_ids: report.deprecated_claim_ids.clone(),
             });
-            match engine.local_claim_count().await {
-                Ok(total) => send_event(SessionEvent::LocalClaimsUpdated { total }),
-                Err(error) => log::warn!(
-                    target: "session_tui",
-                    "Resume inbox 后刷新 local claim 计数失败: {error:#}"
-                ),
-            }
-            send_event(SessionEvent::StatusChanged {
-                status: crate::agent::SessionRuntimeStatus::Open,
-            });
         }
-        let _ = worker_tx.send(WorkerEvent::ResumeInboxFinished { session, result });
+        match engine.local_claim_count().await {
+            Ok(total) => send_event(SessionEvent::LocalClaimsUpdated { total }),
+            Err(error) => log::warn!(
+                target: "session_tui",
+                "Resume inbox 后刷新 local claim 计数失败: {error:#}"
+            ),
+        }
+        send_event(SessionEvent::StatusChanged {
+            status: crate::agent::SessionRuntimeStatus::Open,
+        });
+        let _ = worker_tx.send(WorkerEvent::ResumeInboxFinished {
+            session,
+            had_notices,
+        });
     })
 }
 

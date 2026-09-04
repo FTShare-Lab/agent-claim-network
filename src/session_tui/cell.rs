@@ -101,6 +101,8 @@ pub(super) struct ErrorCell {
     pub(super) text: String,
     /// 前一条 User 已单独 flush 且未保留间隔时，是否需要在本错误前补一行。
     pub(super) leading_gap_after_flushed_user: bool,
+    /// 普通错误的续行与 `Error` 后的正文对齐；启动失败恢复文案与 `Error` 标签起始列对齐。
+    pub(super) indent_continuations: bool,
 }
 
 impl HistoryEntry {
@@ -128,7 +130,16 @@ impl HistoryEntry {
                 push_prefixed_plain(&mut lines, "  └ ", "    ", &cell.detail_text());
             }
             HistoryEntry::Status(cell) => push_prefixed_plain(&mut lines, "  ", "  ", &cell.text),
-            HistoryEntry::Error(cell) => lines.push(format!("  Error {}", cell.text)),
+            HistoryEntry::Error(cell) => push_prefixed_plain(
+                &mut lines,
+                "  Error ",
+                if cell.indent_continuations {
+                    "        "
+                } else {
+                    "  "
+                },
+                &cell.text,
+            ),
         }
         lines
     }
@@ -230,14 +241,7 @@ impl HistoryCell for HistoryEntry {
                     );
                 }
             }
-            HistoryEntry::Error(cell) => push_prefixed_render_wrapped(
-                &mut lines,
-                "  Error ",
-                "        ",
-                &cell.text,
-                width,
-                Style::default().fg(Color::Red),
-            ),
+            HistoryEntry::Error(cell) => push_error_render_wrapped(&mut lines, cell, width),
         }
         lines
     }
@@ -249,7 +253,7 @@ const HELP_ENTRIES: &[(&str, &str)] = &[
     ("/copy", "copy the last Assistant response"),
     ("/exit", "finalize and exit"),
     ("/help", "show this help"),
-    ("/inbox", "sync maintainer messages"),
+    ("/inbox", "sync and process inbox"),
     ("/mcp", "inspect MCP servers and tools"),
     ("/new", "create and switch to a new session"),
     ("/ps", "inspect and manage background processes"),
@@ -989,6 +993,20 @@ fn push_prefixed_render_wrapped(
         wrapped.push(Line::styled(format!("{prefix}{body}"), style));
     }
     out.extend(hard_wrap_styled_lines(wrapped, usize::from(width.max(1))));
+}
+
+fn push_error_render_wrapped(out: &mut Vec<Line<'static>>, cell: &ErrorCell, width: u16) {
+    let style = Style::default().fg(Color::Red);
+    if cell.indent_continuations {
+        push_prefixed_render_wrapped(out, "  Error ", "        ", &cell.text, width, style);
+        return;
+    }
+
+    let (summary, details) = cell.text.split_once('\n').unwrap_or((&cell.text, ""));
+    push_prefixed_render_wrapped(out, "  Error ", "  ", summary, width, style);
+    if !details.is_empty() {
+        push_prefixed_render_wrapped(out, "  ", "  ", details, width, style);
+    }
 }
 
 /// 用户气泡渲染：折行 + 前缀，并把 `@path` 片段单独上高亮样式。
@@ -1825,11 +1843,38 @@ mod tests {
         let error_lines = HistoryEntry::Error(super::ErrorCell {
             text: "x".into(),
             leading_gap_after_flushed_user: true,
+            indent_continuations: true,
         })
         .display_lines_with_width(Some(8));
 
         assert!(status_lines.iter().all(|line| line.width() <= 2));
         assert!(error_lines.iter().all(|line| line.width() <= 8));
+    }
+
+    #[test]
+    fn startup_error_details_align_with_error_label() {
+        let lines = HistoryEntry::Error(super::ErrorCell {
+            text: "Session startup failed:\n读取 ACN.md 失败\n\nNo active session.\nUse /new to try again."
+                .into(),
+            leading_gap_after_flushed_user: true,
+            indent_continuations: false,
+        })
+        .display_lines_with_width(Some(80));
+        let rendered = lines
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered,
+            vec![
+                "  Error Session startup failed:",
+                "  读取 ACN.md 失败",
+                "  ",
+                "  No active session.",
+                "  Use /new to try again.",
+            ]
+        );
     }
 
     #[test]

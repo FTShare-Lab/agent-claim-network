@@ -753,8 +753,9 @@ fn push_user_items(
                 "call_id":tool_use_id,
                 "output":content,
             })),
-            SessionTurnContentBlock::ToolUse { .. } => {
-                return Err(output_shape("user message 不允许包含 ToolUse"));
+            SessionTurnContentBlock::ToolUse { .. }
+            | SessionTurnContentBlock::InvalidToolUse { .. } => {
+                return Err(output_shape("user message 不允许包含 tool call"));
             }
         }
     }
@@ -797,6 +798,15 @@ fn push_assistant_items(
                     "call_id":id,
                     "name":name,
                     "arguments":input.to_string(),
+                }));
+            }
+            SessionTurnContentBlock::InvalidToolUse { id, name, .. } => {
+                flush_assistant_text(items, &mut text_parts);
+                items.push(json!({
+                    "type":"function_call",
+                    "call_id":id,
+                    "name":name,
+                    "arguments":"{}",
                 }));
             }
             SessionTurnContentBlock::SkillInstructions { .. } => {
@@ -857,11 +867,19 @@ fn provider_response_from_turn(
         content.push(SessionTurnContentBlock::text(turn.merged_text));
     }
     for call in turn.function_calls {
-        content.push(SessionTurnContentBlock::ToolUse {
-            id: call.call_id,
-            name: call.name,
-            input: parse_tool_arguments(&call.arguments)?,
-        });
+        let block = match parse_tool_arguments(&call.arguments) {
+            Ok(input) => SessionTurnContentBlock::ToolUse {
+                id: call.call_id,
+                name: call.name,
+                input,
+            },
+            Err(error) => SessionTurnContentBlock::InvalidToolUse {
+                id: call.call_id,
+                name: call.name,
+                error,
+            },
+        };
+        content.push(block);
     }
     if content.is_empty() {
         let item_types = replay_item_types(&turn.replay_items);
@@ -895,17 +913,20 @@ fn provider_response_from_turn(
 }
 
 fn is_tool_use(block: &SessionTurnContentBlock) -> bool {
-    matches!(block, SessionTurnContentBlock::ToolUse { .. })
+    matches!(
+        block,
+        SessionTurnContentBlock::ToolUse { .. } | SessionTurnContentBlock::InvalidToolUse { .. }
+    )
 }
 
-fn parse_tool_arguments(raw: &str) -> Result<Value, OpenAiCompatibleResponsesError> {
+fn parse_tool_arguments(raw: &str) -> Result<Value, String> {
     if raw.trim().is_empty() {
         return Ok(json!({}));
     }
     let value = serde_json::from_str::<Value>(raw)
-        .map_err(|error| output_shape(format!("function_call.arguments 不是合法 JSON: {error}")))?;
+        .map_err(|error| format!("function_call.arguments 不是合法 JSON: {error}"))?;
     if !value.is_object() {
-        return Err(output_shape("function_call.arguments 必须是 JSON object"));
+        return Err("function_call.arguments 必须是 JSON object".into());
     }
     Ok(value)
 }
@@ -1717,6 +1738,108 @@ mod tests {
         let error = parse_tool_arguments(&raw).unwrap_err();
 
         assert!(!error.to_string().contains(&"A".repeat(400)));
+    }
+
+    #[test]
+    fn malformed_and_non_object_function_arguments_become_recoverable_tool_calls() {
+        for (arguments, expected_error) in [
+            (r#"{"path":"unfinished""#, "不是合法 JSON"),
+            (r#"["not", "an", "object"]"#, "必须是 JSON object"),
+        ] {
+            let response = provider_response_from_turn(
+                ContinuedResponsesTurn {
+                    merged_text: String::new(),
+                    replay_items: vec![json!({
+                        "type": "function_call",
+                        "call_id": "call_bad",
+                        "name": "file_read",
+                        "arguments": arguments,
+                    })],
+                    function_calls: vec![super::super::responses::ResponsesFunctionCall {
+                        call_id: "call_bad".into(),
+                        name: "file_read".into(),
+                        arguments: arguments.into(),
+                    }],
+                    terminal: ResponsesTerminal::Completed,
+                    transport: ProviderTransport::ResponsesSse,
+                },
+                "test-model",
+            )
+            .unwrap();
+
+            assert_eq!(response.stop, ProviderStop::ToolUse);
+            assert!(matches!(
+                response.assistant_message.content.as_slice(),
+                [SessionTurnContentBlock::InvalidToolUse { id, name, error }]
+                    if id == "call_bad" && name == "file_read" && error.contains(expected_error)
+            ));
+            assert!(matches!(
+                response.assistant_message.provider_replay.as_ref(),
+                Some(ProviderReplayState::OpenAiResponses { items, .. })
+                    if items[0]["arguments"] == arguments
+            ));
+        }
+    }
+
+    #[test]
+    fn max_output_tokens_preserves_invalid_and_valid_function_calls_for_recovery() {
+        let malformed = r#"{"path":"unfinished""#;
+        let response = provider_response_from_turn(
+            ContinuedResponsesTurn {
+                merged_text: String::new(),
+                replay_items: vec![
+                    json!({
+                        "type": "function_call",
+                        "call_id": "call_bad",
+                        "name": "file_read",
+                        "arguments": malformed,
+                    }),
+                    json!({
+                        "type": "function_call",
+                        "call_id": "call_good",
+                        "name": "file_read",
+                        "arguments": r#"{"path":"README.md"}"#,
+                    }),
+                ],
+                function_calls: vec![
+                    super::super::responses::ResponsesFunctionCall {
+                        call_id: "call_bad".into(),
+                        name: "file_read".into(),
+                        arguments: malformed.into(),
+                    },
+                    super::super::responses::ResponsesFunctionCall {
+                        call_id: "call_good".into(),
+                        name: "file_read".into(),
+                        arguments: r#"{"path":"README.md"}"#.into(),
+                    },
+                ],
+                terminal: ResponsesTerminal::MaxOutputTokens,
+                transport: ProviderTransport::ResponsesSse,
+            },
+            "test-model",
+        )
+        .unwrap();
+
+        assert_eq!(response.stop, ProviderStop::MaxTokens);
+        assert!(matches!(
+            response.assistant_message.content.as_slice(),
+            [
+                SessionTurnContentBlock::InvalidToolUse {
+                    id: bad_id, error, ..
+                },
+                SessionTurnContentBlock::ToolUse {
+                    id: good_id, input, ..
+                }
+            ] if bad_id == "call_bad"
+                && good_id == "call_good"
+                && error.contains("line 1 column")
+                && input == &json!({"path":"README.md"})
+        ));
+    }
+
+    #[test]
+    fn empty_function_arguments_remain_an_empty_object() {
+        assert_eq!(parse_tool_arguments("  ").unwrap(), json!({}));
     }
 
     #[test]

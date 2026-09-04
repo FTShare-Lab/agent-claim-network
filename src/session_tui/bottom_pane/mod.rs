@@ -897,6 +897,8 @@ impl BottomPane {
             "↑↓ select · Tab/Enter complete".to_string()
         } else if self.at_path_menu_visible() {
             "↑↓ select · Tab/Enter complete · Esc close".to_string()
+        } else if status == SessionRuntimeStatus::Error && session_id.is_none() {
+            "No active session · /new · /resume · /help · /exit".to_string()
         } else {
             match status {
                 SessionRuntimeStatus::Open | SessionRuntimeStatus::Error
@@ -952,6 +954,12 @@ impl BottomPane {
                 format!("input will be queued · queued={queued_count}")
             }
             SessionRuntimeStatus::Compacting => "input will be queued".into(),
+            SessionRuntimeStatus::Resuming if queued_count > 0 => {
+                format!("waiting for target finalization... inputs queued={queued_count}")
+            }
+            SessionRuntimeStatus::Resuming => {
+                "waiting for target finalization... inputs will be queued".into()
+            }
             SessionRuntimeStatus::Finalizing => "finalizing session...".into(),
             SessionRuntimeStatus::Closed => "session closed".into(),
         }
@@ -965,7 +973,14 @@ impl BottomPane {
         queued_count: usize,
         session_id: Option<&str>,
     ) -> String {
-        let hint = self.hint_body(status, running_task_label, queued_count);
+        let hint = if status == SessionRuntimeStatus::Error
+            && session_id.is_none()
+            && !self.finalize_failed
+        {
+            "No active session · /new · /resume · /help · /exit".into()
+        } else {
+            self.hint_body(status, running_task_label, queued_count)
+        };
         match session_id.filter(|id| !id.is_empty()) {
             Some(session_id) => format!("{session_id} {hint}"),
             None => hint,
@@ -1318,6 +1333,7 @@ pub(super) fn input_accepts_text(status: SessionRuntimeStatus) -> bool {
             | SessionRuntimeStatus::Running
             | SessionRuntimeStatus::SyncingInbox
             | SessionRuntimeStatus::Compacting
+            | SessionRuntimeStatus::Resuming
             | SessionRuntimeStatus::Error
     )
 }

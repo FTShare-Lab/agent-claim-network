@@ -176,7 +176,7 @@ pub struct InboxProcessReport {
     pub team_services: TeamServicesConnectionStatus,
     /// Router 访问成功时返回的 scope 概览，供 session prompt 复用，避免重复请求。
     pub router_scopes_overview: Option<ScopesOverviewSnapshot>,
-    /// 本次抽走的总消息数（含 PolicyUpdate / ClaimAttributeUpdate）
+    /// 本次完成本地处理并写入 done ACK 的消息数。
     pub total: usize,
     /// 其中 PolicyUpdate 的条数
     pub policy_count: usize,
@@ -196,4 +196,21 @@ pub struct InboxProcessReport {
     pub new_dispute_ids: Vec<DisputeId>,
     /// 本轮降级处理但未阻断流程的 warning
     pub warnings: Vec<String>,
+    /// 本轮 inbox 的可恢复失败；允许 session 继续创建或使用。
+    pub failures: Vec<InboxProcessFailure>,
+}
+
+/// Inbox 失败对用户提示和副作用声明的分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboxProcessFailureKind {
+    /// Provider、输出解析、schema 或业务校验在 prepared 结果产生前失败。
+    Internalization,
+    /// 本地持久化或应用失败，可能已经发生部分本地副作用。
+    Local,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxProcessFailure {
+    pub kind: InboxProcessFailureKind,
+    pub error: String,
 }

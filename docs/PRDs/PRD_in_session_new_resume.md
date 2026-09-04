@@ -2,6 +2,10 @@
 
 > 状态：已完成（2026-08-31；ND-1 至 ND-8 已实现并完成验证与外部复审）。
 
+> 后续范围说明（2026-09-01）：Finalizing 目标的候选、接管/等待和等待期 queued input 失败语义，由 `docs/PRDs/PRD_resume_finalizing_session.md` 扩展；本文其余 `/new`、`/resume` handoff 与目标启动顺序继续有效。
+
+> 后续范围说明（2026-09-03）：Inbox 第 1 至 6 类失败统一降级放行，以及 `/new` startup 第 7 类失败后的受限命令恢复语义，由 `docs/PRDs/PRD_inbox_failure_and_startup_recovery.md` 扩展；本文 ND-1 的 finalize-first 顺序及其他 handoff 语义继续有效。
+
 ## 背景与问题
 
 当前 TUI 不支持 `/new`；`/resume` 只允许在启动后尚无真实内容的临时空 session 中使用。非空 session 中执行 `/resume` 会要求用户先 `/exit`，而 `/exit` 的 Finalize 成功投递 supervisor 后会直接结束整个 TUI。
@@ -588,10 +592,13 @@ Resume handoff 后 inbox 失败时，目标 session 是否仍可使用？
 
 影响：
 
-- TUI warning 固定为 `Warning: Inbox sync failed; run /inbox to retry.`，详细错误只写日志，避免长错误污染 transcript。
+- 本节原定的单一 warning 文案已由 2026-09-03 Inbox 失败分类覆盖；当前 LLM 内化失败使用
+  `PRD_inbox_failure_and_startup_recovery.md` 的固定 warning，本地失败展示具体错误和可能部分
+  副作用提示。
 - warning 前后各保留一个可见空行；不得紧贴前一条历史或后一条内容。
 - warning 后目标状态进入 `Open`，用户可以正常继续交互或稍后手动执行 `/inbox`；queued input 正常派发。
-- `/new` 的 inbox 失败不采用本降级，完全保持直接启动 ACN 的现有失败语义：新 session 尚未创建、startup Error、无自动恢复或专用重试。
+- 本条关于 `/new` inbox 失败保持 startup Error 的旧范围已由 2026-09-03 ND-9 覆盖；当前第
+  1 至 6 类均降级放行，第 7 类进入四命令受限恢复模式。
 
 ### ND-6：会话切换使用早 interaction generation 隔离现实晚到事件（2026-08-31）
 
@@ -752,9 +759,9 @@ Resume handoff 后 inbox 失败时，目标 session 是否仍可使用？
 
 ### 最终实现语义
 
-- `/new` 真正开始执行时建立 interaction generation 早边界。非空旧 session 立即进入正常 `Finalizing · Committing contribution` 并禁用输入；Supervisor Finalize job 持久化入队、本地快速关闭或前台 fallback 成功后，才清空旧页面并进入目标的正常欢迎页与既有 `inbox → prompt → create session/runtime lease → Open` 启动流程。新 session 启动失败保持直接启动 ACN 的既有语义。
+- `/new` 真正开始执行时建立 interaction generation 早边界。非空旧 session 立即进入正常 `Finalizing · Committing contribution` 并禁用输入；Supervisor Finalize job 持久化入队、本地快速关闭或前台 fallback 成功后，才清空旧页面并进入目标的正常欢迎页与既有 `inbox → prompt → create session/runtime lease → Open` 启动流程。新 session 启动的第 1 至 6 类 inbox 失败和第 7 类受限恢复语义由 2026-09-03 ND-9 及其专项 PRD 覆盖。
 - `/resume` 打开或取消 picker 不改变 generation 和当前 session；选中目标时建立早边界，只取得目标 runtime lease 并做 metadata、agent 和可恢复状态预检。预检成功后旧页面先正常 Finalizing；handoff 成功后才清屏，按“欢迎页 → 只读加载并显示已有历史/context/local claims → 可见 inbox → Open”恢复目标。
-- Resume startup 不重建或替换已有 system prompt、canonical messages、journal 或历史；只有恢复后的正常新 turn 才追加消息。Resume inbox 失败固定显示 `Warning: Inbox sync failed; run /inbox to retry.`，warning 前后各有一个可见空行，随后目标保持 `Open`，queued input 可派发，用户可继续交互或手动 `/inbox`。
+- Resume startup 不重建或替换已有 system prompt、canonical messages、journal 或历史；只有恢复后的正常新 turn 才追加消息。Resume inbox 失败按 2026-09-03 专项 PRD 分类展示 warning 或带部分副作用声明的 error，notice 前后各有一个可见空行，随后目标保持 `Open`，queued input 可派发，用户可继续交互或手动 `/inbox`。
 - Finalizing 期间包括 Esc 在内均不能编辑、提交或取回 queued input；handoff 前已有队列完整保留。目标 startup/history/inbox 期间可以继续输入，但只进入既有队列，目标 `Open` 后才按顺序派发。
 - `RecapEnqueueFinished` 按来源 session ID 隔离；`/copy`、Ctrl+O 与 Ctrl+V 按 interaction generation 隔离。旧 session 的晚到成功、失败或丢弃提示不进入新 transcript，外部剪贴板/预览副作用不回滚，clipboard pending 计数和 preview 临时文件仍正常结算。
 - Ctrl+O 批次准备失败会返回已生成的临时路径，`open` 启动/非零退出失败也携带全部临时路径；预览任务额外由 App 的 `JoinSet` 保留清理路径，因此即使 completion event 在 TUI 退出前尚未消费，shutdown 仍会等待任务、汇总并删除临时文件。
@@ -827,3 +834,40 @@ live box 标题已经提供了与 scrollback 的视觉边界，框内第一行�
 - 本地复审确认改动只作用于 `SyncingInbox` live box 投影，不改变 `Inbox started` 的 scrollback、其他状态的 timeline 间隔或 session-switch 语义。
 - 独立只读外部 code review 未发现现实可触发的 P0/P1，也未发现 P0/P1 级高价值测试缺口；外部 reviewer 未修改文件。
 - 本次没有产生新的业务选择；ND-8 只固化用户确认的可见排列，D1–D14 与 ND-1 至 ND-7 的既有语义均未改变。
+
+### ND-9：Inbox 失败统一降级与 New startup 恢复（2026-09-03）
+
+原因：
+
+ND-5、ND-7 只允许 Resume inbox 失败后恢复 Open；Fresh 与 `/new` 的 inbox 硬错误仍会
+中断 session 创建。finalize-first 的 `/new` 此时已经没有 active session，而通用 Error
+仍允许普通输入和切换命令进入无人消费的队列。
+
+问题：
+
+Inbox 失败是否继续阻止 Fresh 或 `/new` 创建 session，以及无 active session 的启动失败
+允许哪些恢复操作？
+
+选项：
+
+- A：Inbox 第 1 至 6 类失败统一降级并继续创建 session；真正的 prompt/session runtime
+  启动失败只允许 `/new`、`/resume`、`/help`、`/exit`。
+- B：保持 New startup inbox 硬错误与通用 Error 输入队列语义。
+
+选择：A。
+
+原因：
+
+Inbox 的 pending、lease、effect journal 与 done ACK 已提供后续重试边界；本地失败可以
+明确暴露可能存在部分副作用，同时不必牺牲本地会话可用性。prompt 或 runtime 创建失败时
+确实没有可派发输入的 session，受限命令集可以提供完整恢复路径并阻止队列继续增长。
+
+影响：
+
+- 本记录覆盖 ND-5、ND-7 中“只对 Resume inbox 失败降级、`/new` inbox 失败保持直接启动
+  旧语义”的范围；详细失败分类、提示文案与验收标准以
+  `PRD_inbox_failure_and_startup_recovery.md` 为准。
+- ND-1 的 finalize-first 顺序继续有效：旧 session handoff 成功后才启动 `/new` 目标；
+  真正的第 7 类失败进入无 active session 的受限 Error 恢复模式。
+- Finalize、Supervisor、通知、handoff 输入锁、interaction generation 与 Resume 历史只读
+  语义均不改变。

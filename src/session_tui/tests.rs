@@ -2625,19 +2625,58 @@ fn resume_reset_drops_temporary_command_echo_before_restored_history() {
 fn resume_inbox_failure_warning_has_blank_line_on_both_sides() {
     let mut state = super::TuiState::new();
     state.push_system("history tail");
-    state.finish_resume_inbox_with_warning("Warning: Inbox sync failed; run /inbox to retry.");
+    state.push_resume_inbox_notices(vec![SessionEvent::Warning {
+        message: "Inbox internalization failed. This session started without applying some pending updates. Run /inbox to retry.".into(),
+    }]);
+    state.apply_event(SessionEvent::StatusChanged {
+        status: SessionRuntimeStatus::Open,
+    });
     state.push_system("next entry");
 
     let transcript = state.transcript_text();
     let lines = transcript.lines().collect::<Vec<_>>();
     let warning_index = lines
         .iter()
-        .position(|line| line.contains("Warning: Inbox sync failed; run /inbox to retry."))
+        .position(|line| line.contains("Warning: Inbox internalization failed."))
         .expect("Resume inbox warning should render");
     assert!(lines[warning_index.saturating_sub(1)].trim().is_empty());
     assert!(lines
         .get(warning_index.saturating_add(1))
         .is_some_and(|line| line.trim().is_empty()));
+    assert_eq!(state.status, SessionRuntimeStatus::Open);
+}
+
+#[test]
+fn direct_resume_startup_warning_follows_inbox_and_precedes_queued_input() {
+    let mut state = super::TuiState::new();
+    state.push_system("Inbox completed: processed=0");
+    state.finish_resume_inbox_with_warnings(vec![
+        "Warning: MCP server broken-startup failed: connection closed".into(),
+    ]);
+    state.push_command_echo("QUEUED-DIRECT-731".into());
+
+    let lines = state
+        .transcript_text()
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let inbox_index = lines
+        .iter()
+        .position(|line| line.contains("Inbox completed: processed=0"))
+        .expect("Inbox completion should render");
+    let warning_index = lines
+        .iter()
+        .position(|line| line.contains("Warning: MCP server broken-startup failed"))
+        .expect("deferred startup warning should render");
+    let queued_index = lines
+        .iter()
+        .position(|line| line.contains("QUEUED-DIRECT-731"))
+        .expect("queued input should render");
+
+    assert_eq!(warning_index, inbox_index + 2);
+    assert_eq!(queued_index, warning_index + 2);
+    assert!(lines[inbox_index + 1].trim().is_empty());
+    assert!(lines[warning_index + 1].trim().is_empty());
     assert_eq!(state.status, SessionRuntimeStatus::Open);
 }
 
@@ -4437,6 +4476,12 @@ fn configured_visual_row_limit_applies_to_every_live_box_status() {
 
     for (status, title) in cases {
         let mut state = super::TuiState::new();
+        if status == SessionRuntimeStatus::Error {
+            state.apply_event(SessionEvent::SessionStarted {
+                session_id: crate::claim::SessionId::from_str("session_1234abcd").unwrap(),
+                agent_id: crate::claim::AgentId::new("agent-a").unwrap(),
+            });
+        }
         state.begin_pending_turn("验证所有虚线框状态".into());
         state.apply_event(SessionEvent::AssistantTextDelta {
             text: (1..=12)
@@ -4457,6 +4502,44 @@ fn configured_visual_row_limit_applies_to_every_live_box_status() {
         );
         assert!(live.join("\n").contains("status line 12"));
     }
+}
+
+#[test]
+fn startup_failure_without_session_shows_recovery_commands() {
+    let mut state = super::TuiState::new();
+    state.apply_event(SessionEvent::StartupProgress {
+        label: "preparing session prompt...".into(),
+    });
+    state.apply_event(SessionEvent::LocalClaimsUpdated { total: 0 });
+    state.apply_event(SessionEvent::StatusChanged {
+        status: SessionRuntimeStatus::Error,
+    });
+    state.push_startup_error(
+        "Session startup failed:\n读取 ACN.md 失败\n\nNo active session.\nUse /new to try again, /resume to open an existing session,\nor /exit to quit.",
+    );
+
+    let live_lines = lines_plain_text(&super::inline_live_lines_with_width(&state, 96));
+    let live = live_lines.join("\n");
+    assert!(live.contains("Attention · Session startup failed"));
+    assert!(live.contains("No active session · /new · /resume · /help · /exit"));
+    assert!(!live.contains("preparing session prompt..."));
+    assert_eq!(
+        live_box_content_line_count(&live_lines, "Attention · Session startup failed"),
+        1,
+        "启动失败框内只保留 local claims"
+    );
+    assert_eq!(
+        super::composer_hint(&state),
+        "No active session · /new · /resume · /help · /exit"
+    );
+
+    state.push_help();
+    let after_help = lines_plain_text(&super::inline_live_lines_with_width(&state, 96));
+    assert_eq!(
+        live_box_content_line_count(&after_help, "Attention · Session startup failed"),
+        1,
+        "/help 后启动失败框内不应增加空行"
+    );
 }
 
 #[test]

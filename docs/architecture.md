@@ -25,7 +25,7 @@
 
 两个 endpoint 必须成对配置。单项配置会在启动校验阶段报错。
 
-团队服务失败不会中止本地 session。ACN 会显示 warning，将对应连接状态记为失败，并继续处理已持久化的本地 inbox 与本地任务。
+团队服务失败不会中止本地 session。ACN 会显示 warning，将对应连接状态记为失败，并继续处理已持久化的本地 inbox 与本地任务。Inbox 的 LLM 内化失败同样以 warning 放行；本地持久化或应用失败显示 error 和可能部分副作用提示，但 Fresh、`/new`、`/resume` 与会话内 `/inbox` 最终仍回到 `Open`。只有后续 system prompt 或 session runtime 创建失败时才会留下无 active session 的受限 Error 恢复界面。
 
 ## 组件职责
 
@@ -71,6 +71,8 @@ Maintainer 不以 trace 引用次数直接修改 claim，也不删除已经解�
 ### Recap/Finalize Supervisor
 
 Provider request preflight 或手动 `/compact` 完成 summary 本地预检后，会把冻结消息 target 的 Recap job 异步交给独立 supervisor；TUI 退出非空 session，或通过 `/new`、`/resume` 切走非空 session 时，则提交 Finalize job。Supervisor 单 worker 串行执行，使用全局 `Finalize > Recap` 优先级，同优先级保持 FIFO。Recap 与 Finalize 复用 session 级 `finalize.lock` 和 `finalize_checkpoint.yaml`；Recap 只推进 `recapped_until`，Finalize 从最新 cursor 收尾并关闭 session。
+
+Resume `Finalizing` session 时，Supervisor 会协调未完成的收尾工作；如果 session 正由另一个前台进程收尾，则提示用户稍后重试。会话内切换会先确认目标 session 可用，再收尾当前 session。
 
 每个 supervisor job attempt 的 recap 只发起一次模型请求，失败由 job 外层最多重试五次。Recap 不发系统通知；Finalize 仍按配置决定通知。知识应用还与 inbox 共用 agent 级 `knowledge_apply.lock`，但 Maintainer 上传在释放该锁后进行。
 

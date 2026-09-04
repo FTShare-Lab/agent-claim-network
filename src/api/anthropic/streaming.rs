@@ -873,7 +873,7 @@ mod tests {
     use crate::api::provider::{ProviderRequestRejected, ProviderTerminalFailure};
     use crate::api::{
         AnthropicProviderAdapter, ProviderAdapter, ProviderRequest, ProviderRequestObserver,
-        SessionTurnMessage,
+        SessionTurnContentBlock, SessionTurnMessage,
     };
 
     #[derive(Default)]
@@ -1212,6 +1212,84 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn streaming_complete_non_object_tool_input_reaches_recoverable_adapter_path() {
+        let secret = "private-tool-argument";
+        let mut turn = StreamingAssistantTurn::default();
+        for event in [
+            json!({"type":"message_start", "message":{"usage":{"input_tokens":3}}}),
+            json!({
+                "type":"content_block_start", "index":0,
+                "content_block":{
+                    "type":"tool_use", "id":"toolu_bad", "name":"file_read", "input":{}
+                }
+            }),
+            json!({
+                "type":"content_block_delta", "index":0,
+                "delta":{
+                    "type":"input_json_delta",
+                    "partial_json":serde_json::to_string(&json!([secret])).unwrap()
+                }
+            }),
+            json!({"type":"content_block_stop", "index":0}),
+            json!({
+                "type":"message_delta", "delta":{"stop_reason":"tool_use"},
+                "usage":{"output_tokens":9}
+            }),
+            json!({"type":"message_stop"}),
+        ] {
+            turn.apply_event(&event, &mut |_| {}).unwrap();
+        }
+
+        let mut completed = turn.finish().unwrap();
+        completed.replay_messages = vec![json!({
+            "role":"assistant",
+            "content":completed.final_blocks.clone()
+        })];
+        let message = super::super::assistant_turn_message(&completed, "test-model").unwrap();
+
+        assert!(matches!(
+            message.content.as_slice(),
+            [SessionTurnContentBlock::InvalidToolUse { error, .. }]
+                if error.contains("array") && !error.contains(secret)
+        ));
+        let replay = match message.provider_replay.as_ref() {
+            Some(crate::api::ProviderReplayState::AnthropicMessages { messages, .. }) => messages,
+            other => panic!("expected Anthropic replay, got {other:?}"),
+        };
+        assert_eq!(replay[0]["content"][0]["input"], json!({}));
+    }
+
+    #[test]
+    fn streaming_malformed_tool_input_remains_a_stream_failure() {
+        let mut turn = StreamingAssistantTurn::default();
+        for event in [
+            json!({"type":"message_start", "message":{}}),
+            json!({
+                "type":"content_block_start", "index":0,
+                "content_block":{
+                    "type":"tool_use", "id":"toolu_bad", "name":"file_read", "input":{}
+                }
+            }),
+            json!({
+                "type":"content_block_delta", "index":0,
+                "delta":{"type":"input_json_delta", "partial_json":"{\"path\":"}
+            }),
+        ] {
+            turn.apply_event(&event, &mut |_| {}).unwrap();
+        }
+
+        let error = turn
+            .apply_event(
+                &json!({"type":"content_block_stop", "index":0}),
+                &mut |_| {},
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, AnthropicError::StreamFailure { .. }));
+        assert!(error.to_string().contains("input_json_delta 解析失败"));
     }
 
     #[test]

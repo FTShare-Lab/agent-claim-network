@@ -3,7 +3,9 @@
 //! 本模块只定义 TUI / supervisor 消费的稳定事件 DTO，
 //! 以及 session turn event 到 session event 的轻量映射。业务流程仍由 facade 编排。
 
-use crate::agent::runner::TeamServicesConnectionStatus;
+use crate::agent::runner::{
+    InboxProcessFailure, InboxProcessFailureKind, TeamServicesConnectionStatus,
+};
 use crate::agent::user_shell::UserShellCommandStatus;
 use crate::api::{SessionTurnEvent, ToolCallSkipReason, ToolExecutionOutcome};
 use crate::claim::{AgentId, ClaimId, DisputeId, SessionId, TraceId};
@@ -228,6 +230,7 @@ pub enum SessionRuntimeStatus {
     Running,
     SyncingInbox,
     Compacting,
+    Resuming,
     Finalizing,
     Error,
     Closed,
@@ -241,5 +244,69 @@ where
         emit(SessionEvent::Warning {
             message: warning.clone(),
         });
+    }
+}
+
+pub(super) const INBOX_INTERNALIZATION_WARNING: &str = "Inbox internalization failed. This session started without applying some pending updates. Run /inbox to retry.";
+
+pub(super) fn emit_inbox_failures<F>(failures: &[InboxProcessFailure], emit: &mut F)
+where
+    F: FnMut(SessionEvent),
+{
+    for failure in failures {
+        match failure.kind {
+            InboxProcessFailureKind::Internalization => emit(SessionEvent::Warning {
+                message: INBOX_INTERNALIZATION_WARNING.into(),
+            }),
+            InboxProcessFailureKind::Local => emit(SessionEvent::InboxFailed {
+                error: format!(
+                    "{}\nSome local changes may already have been applied. Run /inbox to retry.",
+                    failure.error
+                ),
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inbox_internalization_failure_uses_fixed_warning_without_cause_details() {
+        let failures = vec![InboxProcessFailure {
+            kind: InboxProcessFailureKind::Internalization,
+            error: "provider leaked detail".into(),
+        }];
+        let mut events = Vec::new();
+
+        emit_inbox_failures(&failures, &mut |event| events.push(event));
+
+        assert_eq!(
+            events,
+            vec![SessionEvent::Warning {
+                message: INBOX_INTERNALIZATION_WARNING.into(),
+            }]
+        );
+        assert!(!INBOX_INTERNALIZATION_WARNING.contains("later session"));
+        assert!(!INBOX_INTERNALIZATION_WARNING.contains("provider leaked detail"));
+    }
+
+    #[test]
+    fn inbox_local_failure_discloses_possible_partial_side_effects() {
+        let failures = vec![InboxProcessFailure {
+            kind: InboxProcessFailureKind::Local,
+            error: "writing claim failed".into(),
+        }];
+        let mut events = Vec::new();
+
+        emit_inbox_failures(&failures, &mut |event| events.push(event));
+
+        assert_eq!(
+            events,
+            vec![SessionEvent::InboxFailed {
+                error: "writing claim failed\nSome local changes may already have been applied. Run /inbox to retry.".into(),
+            }]
+        );
     }
 }

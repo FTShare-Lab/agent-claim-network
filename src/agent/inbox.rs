@@ -18,13 +18,16 @@ use super::prepare::{
     llm_visible_claims, prepare_claim_updates, prepare_claims, prepare_disputes, sorted_source_ids,
     validate_visible_policy_sources,
 };
-use super::runner::{AgentRunner, InboxProcessReport, TeamServiceConnectionStatus};
+use super::runner::{
+    AgentRunner, InboxProcessFailure, InboxProcessFailureKind, InboxProcessReport,
+    TeamServiceConnectionStatus,
+};
 use super::traits::ClaimedInboxMessage;
 use crate::api::{
     resolve_placeholders, BufferedProviderRuntime, ClaimAttributeUpdateInternalizeItem,
     ClaimAttributeUpdateInternalizeRequest, InboxInternalizeKind, InternalizeOutcome,
     InternalizeRequest, ProviderRuntimeFallbackScope, ProviderTransport, SessionTurnMessage,
-    StructuredJsonAttemptRequest, StructuredJsonCaller,
+    StructuredJsonCaller,
 };
 use crate::claim::{
     ArbitrationResolutionContext, ArbitrationResolutionId, Claim, ClaimId, ClaimStatus, Dispute,
@@ -136,9 +139,11 @@ impl InboxJsonGenerator for PromptInboxJsonGenerator {
             .map_err(anyhow::Error::from)?;
         let user_text = serde_json::to_string_pretty(&request)?;
         self.json_caller
-            .generate_json(
+            .generate_json_streaming_once(
                 system_prompt,
                 vec![SessionTurnMessage::user_text(user_text)],
+                BufferedProviderRuntime::new(self.fallback_scope.clone()),
+                None,
             )
             .await
     }
@@ -155,11 +160,10 @@ impl InboxJsonGenerator for PromptInboxJsonGenerator {
             .map_err(anyhow::Error::from)?;
         let user_text = serde_json::to_string_pretty(&request)?;
         self.json_caller
-            .generate_json_validated_with_guarded_attempts(
-                StructuredJsonAttemptRequest::claim_attribute_update(
-                    system_prompt,
-                    vec![SessionTurnMessage::user_text(user_text)],
-                ),
+            .generate_json_streaming_validated_with_retry_notice(
+                system_prompt,
+                vec![SessionTurnMessage::user_text(user_text)],
+                BufferedProviderRuntime::new(self.fallback_scope.clone()),
                 validator,
                 |retry, total, error| {
                     log::warn!(
@@ -168,8 +172,6 @@ impl InboxJsonGenerator for PromptInboxJsonGenerator {
                         agent_id
                     );
                 },
-                |_| std::future::ready(()),
-                |_, _| Ok(()),
             )
             .await
     }
@@ -180,9 +182,15 @@ struct InboxSyncReport {
     pull_succeeded: bool,
     accepted: usize,
     warnings: Vec<String>,
+    failure: Option<anyhow::Error>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0:#}")]
+struct InboxInternalizationFailure(anyhow::Error);
+
 const INBOX_EFFECT_SCHEMA_VERSION: u32 = 1;
+const MAX_INBOX_DRAIN: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -256,30 +264,33 @@ impl AgentRunner {
     /// - 连续同类型消息收集成 batch 后交给 LLM；ClaimAttributeUpdate 以批量 Effect
     ///   Journal 保留逐消息幂等与恢复边界
     /// - 单次最多处理 1024 条，避免极端 inbox 堆积让一次 session 卡太久
-    pub async fn process_inbox(&self) -> anyhow::Result<InboxProcessReport> {
+    pub async fn process_inbox(&self) -> InboxProcessReport {
         self.process_inbox_with(self.inbox_generator.as_ref()).await
     }
 
     pub(super) async fn process_inbox_with(
         &self,
         generator: &dyn InboxJsonGenerator,
-    ) -> anyhow::Result<InboxProcessReport> {
+    ) -> InboxProcessReport {
         let _guard = self.inbox_process_lock.lock().await;
         let mut report = InboxProcessReport::default();
         if self.team_services_configured() {
-            let sync_report = self.sync_inbox_to_local().await?;
+            let sync_report = self.sync_inbox_to_local().await;
             report.team_services.maintainer = if sync_report.pull_succeeded {
                 TeamServiceConnectionStatus::Connected
             } else {
                 TeamServiceConnectionStatus::Failed
             };
             report.warnings.extend(sync_report.warnings);
+            if let Some(error) = sync_report.failure {
+                record_inbox_failure(&mut report, error);
+            }
             if sync_report.pull_succeeded {
                 // 收件持久化和 receipt ACK 已完成后，才允许历史 pending upload 重试。
-                push_upload_warning(
-                    &mut report.warnings,
-                    self.upload_maintainer_batch(Vec::new(), Vec::new()).await?,
-                );
+                match self.upload_maintainer_batch(Vec::new(), Vec::new()).await {
+                    Ok(upload) => push_upload_warning(&mut report.warnings, upload),
+                    Err(error) => record_inbox_failure(&mut report, error),
+                }
             }
             if let Some(router) = self.context.router.as_ref() {
                 match router.scopes_overview().await {
@@ -296,17 +307,19 @@ impl AgentRunner {
                 }
             }
         }
-        self.process_local_inbox(generator, &mut report).await?;
-        Ok(report)
+        if let Err(error) = self.process_local_inbox(generator, &mut report).await {
+            record_inbox_failure(&mut report, error);
+        }
+        report
     }
 
     /// 从 Maintainer 拉取消息，逐条持久化到本地后批量发送 receipt ACK。
     ///
     /// ACK 只确认本地持久收件；失败会记录 warning，但不会阻止本地 pending 消息继续处理。
-    async fn sync_inbox_to_local(&self) -> anyhow::Result<InboxSyncReport> {
+    async fn sync_inbox_to_local(&self) -> InboxSyncReport {
         let mut report = InboxSyncReport::default();
         let Some(maintainer_client) = self.maintainer_client.as_ref() else {
-            return Ok(report);
+            return report;
         };
         let pulled = match maintainer_client.pull_inbox(&self.agent_id).await {
             Ok(msgs) => {
@@ -321,7 +334,7 @@ impl AgentRunner {
                     self.agent_id,
                 );
                 report.warnings.push(warning);
-                return Ok(report);
+                return report;
             }
         };
 
@@ -330,13 +343,17 @@ impl AgentRunner {
         for msg in &pulled {
             if let Err(err) = self.inbox.accept_pulled(msg).await {
                 // 即便本批后续落盘失败，也要尽力确认已经持久化的前缀，避免永久重投。
-                let _ack_warning = self.ack_persisted_inbox(&persisted_ids).await;
-                return Err(err.context(format!(
+                if let Some(warning) = self.ack_persisted_inbox(&persisted_ids).await {
+                    report.warnings.push(warning);
+                }
+                report.accepted = persisted_ids.len();
+                report.failure = Some(err.context(format!(
                     "agent {} 持久化 maintainer inbox 失败 msg_id={}；此前已落盘并尝试 ACK {} 条",
                     self.agent_id,
                     msg.id,
                     persisted_ids.len()
                 )));
+                return report;
             }
             if persisted_id_set.insert(msg.id.clone()) {
                 persisted_ids.push(msg.id.clone());
@@ -354,7 +371,7 @@ impl AgentRunner {
                 report.accepted
             );
         }
-        Ok(report)
+        report
     }
 
     async fn ack_persisted_inbox(&self, inbox_ids: &[InboxId]) -> Option<String> {
@@ -391,20 +408,22 @@ impl AgentRunner {
                 &mut llm_msgs,
             )
             .await;
-        if let Err(err) = result {
+        if let Err(error) = result {
+            record_inbox_failure(report, error);
             for claimed_msg in &claimed {
-                if let Err(release_err) = self.inbox.release_claimed(claimed_msg).await {
-                    log::warn!(
-                        target: "agent",
-                        "agent {} release inbox lease 失败 msg_id={}: {release_err:#}",
-                        self.agent_id,
-                        claimed_msg.message.id
+                if let Err(error) = self.inbox.release_claimed(claimed_msg).await {
+                    record_inbox_failure(
+                        report,
+                        error.context(format!(
+                            "agent {} release inbox lease 失败 msg_id={}",
+                            self.agent_id, claimed_msg.message.id
+                        )),
                     );
                 }
             }
-            return Err(err);
+            return Ok(());
         }
-        for claimed_msg in claimed.iter().skip(report.total) {
+        for claimed_msg in claimed.iter().skip(MAX_INBOX_DRAIN) {
             self.inbox.release_claimed(claimed_msg).await?;
         }
 
@@ -432,8 +451,7 @@ impl AgentRunner {
         batch_kind: &mut Option<InboxInternalizeKind>,
         llm_msgs: &mut Vec<ClaimedInboxMessage>,
     ) -> anyhow::Result<()> {
-        const MAX_DRAIN: usize = 1024;
-        for claimed_msg in claimed.into_iter().take(MAX_DRAIN) {
+        for claimed_msg in claimed.into_iter().take(MAX_INBOX_DRAIN) {
             match claimed_msg.message.kind.clone() {
                 InboxMessageKind::PolicyUpdate { policy }
                     if policy.status == PolicyStatus::Deprecated =>
@@ -442,6 +460,7 @@ impl AgentRunner {
                         .await?;
                     let summary = self.apply_policy_deprecation(&policy).await?;
                     self.inbox.ack_claimed(&claimed_msg).await?;
+                    report.total += 1;
                     report.policy_deprecation_count += 1;
                     report
                         .deprecated_claim_ids
@@ -475,7 +494,6 @@ impl AgentRunner {
                     .await?;
                 }
             }
-            report.total += 1;
         }
 
         self.flush_internalize_updates(generator, batch_kind, llm_msgs, report)
@@ -535,6 +553,7 @@ impl AgentRunner {
         for claimed in &batch {
             self.inbox.ack_claimed(claimed).await?;
         }
+        report.total += msg_ids.len();
         match kind {
             InboxInternalizeKind::PolicyUpdate => report.policy_count += msg_ids.len(),
             InboxInternalizeKind::ClaimAttributeUpdate => {
@@ -1026,7 +1045,8 @@ impl AgentRunner {
         };
         let (now, new_claims, updated_claims, mut new_disputes) = self
             .claim_attribute_update_internalize_and_prepare_once(generator, request, &local_by_id)
-            .await?;
+            .await
+            .map_err(mark_inbox_internalization_failure)?;
         let before_repeat_filter = new_disputes.len();
         new_disputes.retain(|dispute| {
             !messages
@@ -1426,13 +1446,16 @@ impl AgentRunner {
                         }
                         last_err = Some(e);
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(mark_inbox_internalization_failure(e)),
                 }
             }
-            prepared.ok_or_else(|| {
-                last_err
-                    .unwrap_or_else(|| anyhow::anyhow!("internalize_inbox retry loop 未返回结果"))
-            })?
+            prepared
+                .ok_or_else(|| {
+                    last_err.unwrap_or_else(|| {
+                        anyhow::anyhow!("internalize_inbox retry loop 未返回结果")
+                    })
+                })
+                .map_err(mark_inbox_internalization_failure)?
         };
         let should_write_inbox_trace = !prepared_claims.is_empty()
             || !prepared_updates.is_empty()
@@ -2101,6 +2124,29 @@ fn push_upload_warning(
     }
 }
 
+fn mark_inbox_internalization_failure(error: anyhow::Error) -> anyhow::Error {
+    InboxInternalizationFailure(error).into()
+}
+
+fn record_inbox_failure(report: &mut InboxProcessReport, error: anyhow::Error) {
+    let (kind, error) = match error.downcast::<InboxInternalizationFailure>() {
+        Ok(failure) => (
+            InboxProcessFailureKind::Internalization,
+            format!("{:#}", failure.0),
+        ),
+        Err(error) => (InboxProcessFailureKind::Local, format!("{error:#}")),
+    };
+    match kind {
+        InboxProcessFailureKind::Internalization => {
+            log::warn!(target: "agent", "Inbox internalization failed: {error}");
+        }
+        InboxProcessFailureKind::Local => {
+            log::error!(target: "agent", "Inbox local processing failed: {error}");
+        }
+    }
+    report.failures.push(InboxProcessFailure { kind, error });
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -2124,6 +2170,7 @@ mod tests {
     };
     use crate::api::{
         ProviderAdapter, ProviderEvent, ProviderRequest, ProviderResponse, ProviderStop,
+        ProviderStreamFailure,
     };
     use crate::claim::{
         AgentId, ClaimStatus, Confidence, InboxId, InboxMessageKind, Policy, PolicyId,
@@ -2153,6 +2200,11 @@ mod tests {
 
     struct StaticInboxGenerator {
         expected_kind: InboxInternalizeKind,
+        response: Value,
+    }
+
+    struct ClaimWriteFailingInboxGenerator {
+        claims_dir: std::path::PathBuf,
         response: Value,
     }
 
@@ -2216,6 +2268,20 @@ mod tests {
                 self.expected_kind,
                 InboxInternalizeKind::ClaimAttributeUpdate
             );
+            Ok(self.response.clone())
+        }
+    }
+
+    #[async_trait]
+    impl InboxJsonGenerator for ClaimWriteFailingInboxGenerator {
+        async fn generate_json(
+            &self,
+            kind: InboxInternalizeKind,
+            _request: InternalizeRequest,
+            _preferred_transport: Option<ProviderTransport>,
+        ) -> anyhow::Result<Value> {
+            assert_eq!(kind, InboxInternalizeKind::PolicyUpdate);
+            tokio::fs::write(&self.claims_dir, b"blocks claim directory").await?;
             Ok(self.response.clone())
         }
     }
@@ -3024,7 +3090,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn arbitration_retry_budget_business_validation_can_recover_within_total_budget() {
+    async fn arbitration_business_validation_retries_without_transport_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let local = arbitration_claim("agent-a", "local", ClaimStatus::Active);
         let remote = arbitration_claim("agent-b", "remote", ClaimStatus::Active);
@@ -3073,13 +3139,60 @@ mod tests {
 
         let requests = provider.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert!(requests
-            .iter()
-            .all(|request| request.retry_count_override == Some(0)));
+        assert!(requests.iter().all(|request| {
+            request.stream
+                && request.stream_output_mode == crate::api::ProviderStreamOutputMode::Buffered
+                && request.retry_count_override.is_none()
+                && request.allow_continuation
+                && request.runtime_chain_id.is_some()
+                && request.runtime_fallback_scope.is_some()
+        }));
     }
 
     #[tokio::test]
-    async fn arbitration_retry_budget_never_exceeds_configured_total_attempts() {
+    async fn arbitration_transport_failure_uses_buffered_non_streaming_fallback() {
+        let provider = Arc::new(CountingArbitrationProvider::new(vec![
+            Err(ProviderStreamFailure::new("broken stream").into()),
+            arbitration_provider_response(
+                json!({
+                    "new_claims": [],
+                    "updated_claims": [],
+                    "new_disputes": []
+                })
+                .to_string(),
+            ),
+        ]));
+        let generator = prompt_arbitration_generator(provider.clone(), 1);
+        let request = ClaimAttributeUpdateInternalizeRequest {
+            agent_id: AgentId::new("agent-a").unwrap(),
+            claim_attribute_updates: Vec::new(),
+            local_claims: Vec::new(),
+        };
+        let mut validator = |_| Ok((Utc::now(), Vec::new(), Vec::new(), Vec::new()));
+
+        generator
+            .generate_validated_claim_attribute_update_json(request, &mut validator)
+            .await
+            .expect("CAU transport failure should use the common buffered fallback");
+
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].stream);
+        assert!(!requests[1].stream);
+        assert!(requests.iter().all(|request| {
+            request.stream_output_mode == crate::api::ProviderStreamOutputMode::Buffered
+                && request.retry_count_override.is_none()
+                && request.allow_continuation
+        }));
+        assert!(requests[0].runtime_chain_id.is_some());
+        assert!(requests[0].runtime_fallback_scope.is_some());
+        assert!(requests[1].runtime_chain_id.is_none());
+        assert!(requests[1].runtime_fallback_scope.is_none());
+        assert_eq!(requests[0].messages, requests[1].messages);
+    }
+
+    #[tokio::test]
+    async fn arbitration_structured_retry_budget_limits_business_attempts() {
         let dir = tempfile::tempdir().unwrap();
         let local = arbitration_claim("agent-a", "local", ClaimStatus::Active);
         let remote = arbitration_claim("agent-b", "remote", ClaimStatus::Active);
@@ -3127,9 +3240,12 @@ mod tests {
         assert!(error.to_string().contains("JSON"));
         let requests = provider.requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
-        assert!(requests
-            .iter()
-            .all(|request| request.retry_count_override == Some(0)));
+        assert!(requests.iter().all(|request| {
+            request.stream
+                && request.stream_output_mode == crate::api::ProviderStreamOutputMode::Buffered
+                && request.retry_count_override.is_none()
+                && request.allow_continuation
+        }));
     }
 
     #[tokio::test]
@@ -3833,7 +3949,7 @@ mod tests {
             Vec::<SkillSummary>::new(),
         );
 
-        let report = runner.process_inbox_with(generator.as_ref()).await.unwrap();
+        let report = runner.process_inbox_with(generator.as_ref()).await;
 
         assert_eq!(report.policy_count, 1);
         let requests = generator.requests.lock().unwrap();
@@ -3887,7 +4003,7 @@ mod tests {
             Vec::<SkillSummary>::new(),
         );
 
-        let report = runner.process_inbox_with(generator.as_ref()).await.unwrap();
+        let report = runner.process_inbox_with(generator.as_ref()).await;
 
         assert_eq!(report.policy_count, 1);
         assert_eq!(
@@ -3962,15 +4078,16 @@ mod tests {
             Vec::<SkillSummary>::new(),
         );
 
-        let err = runner
-            .process_inbox_with(generator.as_ref())
-            .await
-            .unwrap_err();
+        let report = runner.process_inbox_with(generator.as_ref()).await;
+        let failure = report.failures.first().expect("应记录内化失败");
 
         assert!(
-            err.to_string().contains(expected_error),
-            "unexpected error: {err:#}"
+            failure.error.contains(expected_error),
+            "unexpected error: {}",
+            failure.error
         );
+        assert_eq!(failure.kind, InboxProcessFailureKind::Internalization);
+        assert_eq!(report.total, 0);
         assert_eq!(
             claim_store.list_local_claims().await.unwrap(),
             vec![original]
@@ -3985,6 +4102,49 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn post_prepare_claim_write_failure_is_reported_as_possible_side_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_home = dir.path().to_path_buf();
+        let message = receipt_test_message(PolicyStatus::Active);
+        let policy_id = match &message.kind {
+            InboxMessageKind::PolicyUpdate { policy } => policy.id.clone(),
+            InboxMessageKind::ClaimAttributeUpdate { .. } => unreachable!(),
+        };
+        let inbox = Arc::new(LocalFsInboxReader::new(agent_home.clone()));
+        inbox.accept_pulled(&message).await.unwrap();
+        let generator = Arc::new(ClaimWriteFailingInboxGenerator {
+            claims_dir: paths::agent_home_claims_dir(&agent_home),
+            response: json!({
+                "new_claims": [{
+                    "id": "$new_claim_0$",
+                    "name": "cannot-be-written",
+                    "statement": "prepared output whose local write fails",
+                    "scope": "tests / inbox",
+                    "confidence": "high",
+                    "evidence_summary": "post-prepare failure boundary",
+                    "source_claim_ids": [policy_id.as_str()],
+                }],
+                "updated_claims": [],
+                "new_disputes": [],
+            }),
+        });
+        let runner = receipt_test_runner(
+            &dir,
+            inbox.clone(),
+            Arc::new(NoopMaintainerClient),
+            generator,
+        );
+
+        let report = runner.process_inbox().await;
+
+        assert_eq!(report.total, 0);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].kind, InboxProcessFailureKind::Local);
+        assert!(report.failures[0].error.contains("claims"));
+        assert_eq!(inbox.list_pending().await.unwrap(), vec![message]);
     }
 
     #[tokio::test]
@@ -4041,7 +4201,7 @@ mod tests {
             Vec::<SkillSummary>::new(),
         );
 
-        let report = runner.process_inbox_with(generator.as_ref()).await.unwrap();
+        let report = runner.process_inbox_with(generator.as_ref()).await;
 
         assert_eq!(report.total, messages.len());
         assert_eq!(report.claim_attribute_count, messages.len());
@@ -4566,7 +4726,7 @@ mod tests {
             Vec::<SkillSummary>::new(),
         );
 
-        let report = runner.process_inbox_with(generator.as_ref()).await.unwrap();
+        let report = runner.process_inbox_with(generator.as_ref()).await;
 
         assert_eq!(report.total, 1);
         assert_eq!(report.claim_attribute_count, 1);
@@ -4645,7 +4805,7 @@ mod tests {
             Vec::<SkillSummary>::new(),
         );
 
-        let first = runner.process_inbox_with(generator.as_ref()).await.unwrap();
+        let first = runner.process_inbox_with(generator.as_ref()).await;
 
         assert_eq!(first.total, 1);
         assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
@@ -4676,7 +4836,7 @@ mod tests {
             std::collections::BTreeSet::from([local.id.clone()])
         );
 
-        let still_unauthorized = runner.process_inbox_with(generator.as_ref()).await.unwrap();
+        let still_unauthorized = runner.process_inbox_with(generator.as_ref()).await;
 
         assert_eq!(still_unauthorized.total, 0);
         assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
@@ -4687,7 +4847,7 @@ mod tests {
         maintainer
             .reject_claim_uploads
             .store(false, Ordering::SeqCst);
-        let recovered = runner.process_inbox_with(generator.as_ref()).await.unwrap();
+        let recovered = runner.process_inbox_with(generator.as_ref()).await;
 
         assert_eq!(recovered.total, 0);
         assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
@@ -4855,7 +5015,8 @@ mod tests {
             empty_receipt_generator(),
         );
 
-        let err = runner.sync_inbox_to_local().await.unwrap_err();
+        let report = runner.sync_inbox_to_local().await;
+        let err = report.failure.expect("应记录本地持久化失败");
 
         assert!(err.to_string().contains("此前已落盘并尝试 ACK 1 条"));
         assert_eq!(
@@ -4867,6 +5028,32 @@ mod tests {
             maintainer.acked_batches.lock().unwrap().as_slice(),
             &[vec![first.id]]
         );
+        assert_eq!(maintainer.upload_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn local_persistence_failure_is_reported_without_aborting_inbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let maintainer = Arc::new(RecordingAckMaintainerClient::new(
+            vec![receipt_test_message(PolicyStatus::Active)],
+            false,
+        ));
+        let runner = receipt_test_runner(
+            &dir,
+            Arc::new(PrefixFailingInbox::new(0)),
+            maintainer.clone(),
+            empty_receipt_generator(),
+        );
+
+        let report = runner.process_inbox().await;
+
+        assert_eq!(report.total, 0);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].kind, InboxProcessFailureKind::Local);
+        assert!(report.failures[0]
+            .error
+            .contains("simulated local persistence failure"));
+        assert!(maintainer.acked_batches.lock().unwrap().is_empty());
         assert_eq!(maintainer.upload_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -4886,7 +5073,7 @@ mod tests {
             empty_receipt_generator(),
         );
 
-        let report = runner.process_inbox().await.unwrap();
+        let report = runner.process_inbox().await;
 
         assert_eq!(report.total, 1);
         assert_eq!(
@@ -4922,8 +5109,7 @@ mod tests {
             empty_receipt_generator(),
         )
         .process_inbox()
-        .await
-        .unwrap();
+        .await;
         assert_eq!(
             maintainer_failed.team_services.maintainer,
             TeamServiceConnectionStatus::Failed
@@ -4944,8 +5130,7 @@ mod tests {
             Arc::new(ScopesFailingRouterClient),
         )
         .process_inbox()
-        .await
-        .unwrap();
+        .await;
         assert_eq!(
             router_failed.team_services.maintainer,
             TeamServiceConnectionStatus::Connected
@@ -5131,7 +5316,7 @@ mod tests {
             Vec::<SkillSummary>::new(),
         );
 
-        let report = runner.process_inbox_with(generator.as_ref()).await.unwrap();
+        let report = runner.process_inbox_with(generator.as_ref()).await;
 
         assert_eq!(report.updated_claim_ids, vec![original.id.clone()]);
         assert!(report.new_claim_ids.is_empty());

@@ -1639,7 +1639,7 @@ mod tests {
         .await
         .unwrap();
 
-        let report = runner.process_inbox().await.unwrap();
+        let report = runner.process_inbox().await;
 
         assert_eq!(report.total, 0);
         assert_eq!(
@@ -1672,7 +1672,7 @@ mod tests {
         .await
         .unwrap();
 
-        let report = runner.process_inbox().await.unwrap();
+        let report = runner.process_inbox().await;
 
         assert_eq!(report.total, 0);
         assert_eq!(report.warnings.len(), 1);
@@ -1692,7 +1692,7 @@ mod tests {
         *maintainer.pull_auth.lock().unwrap() = true;
         let runner = build_runner(&dir, maintainer);
 
-        let report = runner.process_inbox().await.unwrap();
+        let report = runner.process_inbox().await;
 
         assert_eq!(report.total, 0);
         assert_eq!(report.warnings.len(), 1);
@@ -1708,7 +1708,7 @@ mod tests {
         *maintainer.pull_forbidden.lock().unwrap() = true;
         let runner = build_runner(&dir, maintainer);
 
-        let report = runner.process_inbox().await.unwrap();
+        let report = runner.process_inbox().await;
 
         assert_eq!(report.total, 0);
         assert_eq!(report.warnings.len(), 1);

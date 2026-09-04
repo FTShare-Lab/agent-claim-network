@@ -46,6 +46,7 @@ pub(super) enum AppEvent {
     /// `@path` 文件附件与目录上下文在 spawn_blocking 中解析后的回灌结果。
     AtPathResolved {
         sequence: u64,
+        submitted_during_startup_recovery: bool,
         expanded_input: String,
         draft: InputDraft,
         result: Result<ResolvedAtPaths, String>,
@@ -204,12 +205,14 @@ impl AppEventSender {
     pub(super) fn at_path_resolved(
         &self,
         sequence: u64,
+        submitted_during_startup_recovery: bool,
         expanded_input: String,
         draft: InputDraft,
         result: Result<ResolvedAtPaths, String>,
     ) {
         self.send(AppEvent::AtPathResolved {
             sequence,
+            submitted_during_startup_recovery,
             expanded_input,
             draft,
             result,

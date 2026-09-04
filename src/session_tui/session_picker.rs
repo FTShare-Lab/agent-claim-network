@@ -4,7 +4,7 @@
 //! 接收事件后异步执行，避免 UI 组件直接读写存储。
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
@@ -22,7 +22,13 @@ const TABLE_FIXED_WIDTH: usize =
 pub(super) struct SessionPickerState {
     sessions: Vec<ResumedSessionSummary>,
     selected: usize,
+    inline_error: Option<SessionPickerInlineError>,
     event_tx: AppEventSender,
+}
+
+struct SessionPickerInlineError {
+    session_id: crate::claim::SessionId,
+    message: String,
 }
 
 impl SessionPickerState {
@@ -30,8 +36,23 @@ impl SessionPickerState {
         Self {
             sessions,
             selected: 0,
+            inline_error: None,
             event_tx,
         }
+    }
+
+    pub(super) fn set_selected_inline_error(&mut self, message: impl Into<String>) {
+        self.inline_error =
+            self.sessions
+                .get(self.selected)
+                .map(|session| SessionPickerInlineError {
+                    session_id: session.id.clone(),
+                    message: message.into(),
+                });
+    }
+
+    pub(super) fn clear_inline_error(&mut self) {
+        self.inline_error = None;
     }
 
     pub(super) fn handle_key_event(&mut self, key: KeyEvent) {
@@ -93,6 +114,23 @@ impl SessionPickerState {
                 Style::default().fg(ratatui::style::Color::DarkGray)
             };
             lines.push(padded_line(line, table_width, style));
+            if let Some(error) = self
+                .inline_error
+                .as_ref()
+                .filter(|error| error.session_id == session.id)
+            {
+                const ERROR_PREFIX: &str = "      Error: ";
+                let message = truncate_to_width(
+                    &error.message,
+                    table_width.saturating_sub(ERROR_PREFIX.width()),
+                );
+                let line = format!("{ERROR_PREFIX}{message}");
+                lines.push(padded_line(
+                    line,
+                    table_width,
+                    Style::default().fg(Color::Red),
+                ));
+            }
         }
         lines.push(Line::from(""));
         lines.push(Line::from("↑↓ Navigate  Enter Select  Esc Cancel"));
@@ -261,6 +299,25 @@ mod tests {
     }
 
     #[test]
+    fn picker_renders_finalizing_candidate_with_existing_status_label() {
+        let (event_tx, _event_rx) = AppEventSender::channel();
+        let mut finalizing = summary("session_aaaaaaaa");
+        finalizing.status = SessionStatus::Finalizing;
+        finalizing.closed_at = None;
+        let picker = SessionPickerState::new(vec![finalizing], event_tx);
+
+        let rendered = picker
+            .render_inline_lines(100)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Finalizing"));
+        assert!(!rendered.contains("Interrupted"));
+    }
+
+    #[test]
     fn picker_render_marks_selected_row_with_visible_marker() {
         let (event_tx, _event_rx) = AppEventSender::channel();
         let mut picker = SessionPickerState::new(
@@ -286,6 +343,52 @@ mod tests {
         assert!(moved
             .iter()
             .any(|line| line.starts_with("› session_bbbbbbbb")));
+    }
+
+    #[test]
+    fn picker_renders_red_error_directly_below_target_without_affecting_selection() {
+        let (event_tx, _event_rx) = AppEventSender::channel();
+        let mut picker = SessionPickerState::new(
+            vec![summary("session_aaaaaaaa"), summary("session_bbbbbbbb")],
+            event_tx,
+        );
+        picker.set_selected_inline_error("still finalizing");
+
+        let lines = picker.render_inline_lines(100);
+        let target_index = lines
+            .iter()
+            .position(|line| line.to_string().starts_with("› session_aaaaaaaa"))
+            .unwrap();
+        assert_eq!(
+            lines[target_index + 1].to_string().trim_end(),
+            "      Error: still finalizing"
+        );
+        assert_eq!(lines[target_index + 1].style.fg, Some(Color::Red));
+        assert!(lines[target_index + 2]
+            .to_string()
+            .starts_with("  session_bbbbbbbb"));
+        assert_eq!(picker.selected(), 0);
+
+        picker.handle_key_event(KeyEvent::from(KeyCode::Down));
+        assert_eq!(picker.selected(), 1);
+    }
+
+    #[test]
+    fn new_picker_does_not_retain_previous_inline_error() {
+        let (event_tx, _event_rx) = AppEventSender::channel();
+        let mut picker =
+            SessionPickerState::new(vec![summary("session_aaaaaaaa")], event_tx.clone());
+        picker.set_selected_inline_error("still finalizing");
+
+        let reopened = SessionPickerState::new(vec![summary("session_aaaaaaaa")], event_tx);
+        let rendered = reopened
+            .render_inline_lines(100)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!rendered.contains("still finalizing"));
     }
 
     #[test]

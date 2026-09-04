@@ -5,6 +5,7 @@
 ## Session 与恢复
 
 - [OpenAI Responses API 支持](PRD_openai_responses.md)
+- [Inbox 失败降级与 Session 启动恢复](PRD_inbox_failure_and_startup_recovery.md)
 - [Prompt Cache 前缀稳定性修复](PRD_fix_cache_hit.md)
 - [Provider Request 前统一压缩](PRD_compact_in_turn.md)
 - [Turn Journal 与 Mid-Turn 恢复](PRD_turn2message.md)

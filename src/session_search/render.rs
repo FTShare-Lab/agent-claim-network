@@ -64,6 +64,10 @@ fn searchable_text_for_block(
             tool_names.insert(id.clone(), name.clone());
             format!("[tool_use {name} {input}]")
         }
+        SessionContentBlock::InvalidToolUse { id, name, error } => {
+            tool_names.insert(id.clone(), name.clone());
+            format!("[invalid_tool_use {name} {id}] {error}")
+        }
         SessionContentBlock::ToolResult {
             tool_use_id,
             content,
@@ -115,8 +119,12 @@ pub(crate) fn tool_name_map(messages: &[SessionMessage]) -> HashMap<String, Stri
     let mut out = HashMap::new();
     for message in messages {
         for block in &message.content {
-            if let SessionContentBlock::ToolUse { id, name, .. } = block {
-                out.insert(id.clone(), name.clone());
+            match block {
+                SessionContentBlock::ToolUse { id, name, .. }
+                | SessionContentBlock::InvalidToolUse { id, name, .. } => {
+                    out.insert(id.clone(), name.clone());
+                }
+                _ => {}
             }
         }
     }
@@ -200,6 +208,10 @@ fn evidence_text_for_block(
                 was_truncated,
             }
         }
+        SessionContentBlock::InvalidToolUse { id, name, error } => EvidenceBlock::Text {
+            text: format!("[invalid_tool_use {name} {id}] {error}"),
+            was_truncated: false,
+        },
         SessionContentBlock::ToolResult {
             tool_use_id,
             content,

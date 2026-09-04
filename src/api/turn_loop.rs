@@ -1079,8 +1079,10 @@ impl AgentTurnLoop {
         let concurrency_safe = tool_uses
             .iter()
             .map(|tool_use| {
-                self.tools
-                    .is_concurrency_safe(&tool_use.name, &tool_use.input)
+                tool_use.dispatch_rejection.is_none()
+                    && self
+                        .tools
+                        .is_concurrency_safe(&tool_use.name, &tool_use.input)
             })
             .collect::<Vec<_>>();
         let mut executions = (0..tool_uses.len())
@@ -1292,13 +1294,15 @@ impl AgentTurnLoop {
                     let tools = Arc::clone(&self.tools);
                     let execution_name = tool_use.name.clone();
                     let execution_input = tool_use.input.clone();
-                    let dispatch_rejection = duplicate_write_stdin
-                        .get(source_index)
-                        .copied()
-                        .unwrap_or(false)
-                        .then(|| {
-                            "write_stdin was already called for this process in the current assistant response; retry after the next provider response".to_string()
-                        });
+                    let dispatch_rejection = tool_use.dispatch_rejection.clone().or_else(|| {
+                        duplicate_write_stdin
+                            .get(source_index)
+                            .copied()
+                            .unwrap_or(false)
+                            .then(|| {
+                                "write_stdin was already called for this process in the current assistant response; retry after the next provider response".to_string()
+                            })
+                    });
                     let in_flight_tool_use = tool_use.clone();
                     running.push(async move {
                         let executed = execute_tool_use(
@@ -3416,6 +3420,7 @@ fn assistant_message_text(message: &SessionTurnMessage) -> String {
             SessionTurnContentBlock::Image { .. }
             | SessionTurnContentBlock::Document { .. }
             | SessionTurnContentBlock::ToolUse { .. }
+            | SessionTurnContentBlock::InvalidToolUse { .. }
             | SessionTurnContentBlock::ToolResult { .. } => None,
         })
         .collect::<Vec<_>>()
@@ -3497,6 +3502,7 @@ fn replace_provider_media_with_placeholders(
                 | SessionTurnContentBlock::ModelContext { .. }
                 | SessionTurnContentBlock::SkillInstructions { .. }
                 | SessionTurnContentBlock::ToolUse { .. }
+                | SessionTurnContentBlock::InvalidToolUse { .. }
                 | SessionTurnContentBlock::ToolResult { .. } => None,
             };
             if let Some(placeholder) = placeholder {
@@ -3568,6 +3574,7 @@ fn pure_user_text(message: &SessionTurnMessage) -> Option<String> {
                 return None
             }
             SessionTurnContentBlock::ToolUse { .. }
+            | SessionTurnContentBlock::InvalidToolUse { .. }
             | SessionTurnContentBlock::ToolResult { .. } => {
                 return None;
             }
@@ -3801,6 +3808,7 @@ struct CanonicalToolUse {
     id: String,
     name: String,
     input: Value,
+    dispatch_rejection: Option<String>,
 }
 
 fn validate_assistant_message(message: &SessionTurnMessage) -> anyhow::Result<()> {
@@ -3822,22 +3830,30 @@ fn validate_assistant_message(message: &SessionTurnMessage) -> anyhow::Result<()
 fn collect_tool_uses(message: &SessionTurnMessage) -> anyhow::Result<Vec<CanonicalToolUse>> {
     let mut tool_uses = Vec::new();
     for block in &message.content {
-        if let SessionTurnContentBlock::ToolUse { id, name, input } = block {
-            if id.trim().is_empty() {
-                anyhow::bail!("tool_use id 不能为空");
+        let (id, name, input, dispatch_rejection) = match block {
+            SessionTurnContentBlock::ToolUse { id, name, input } => {
+                if !input.is_object() {
+                    anyhow::bail!("tool_use input 必须是 JSON object: {name}");
+                }
+                (id, name, input.clone(), None)
             }
-            if name.trim().is_empty() {
-                anyhow::bail!("tool_use name 不能为空");
+            SessionTurnContentBlock::InvalidToolUse { id, name, error } => {
+                (id, name, json!({}), Some(error.clone()))
             }
-            if !input.is_object() {
-                anyhow::bail!("tool_use input 必须是 JSON object: {name}");
-            }
-            tool_uses.push(CanonicalToolUse {
-                id: id.clone(),
-                name: name.clone(),
-                input: input.clone(),
-            });
+            _ => continue,
+        };
+        if id.trim().is_empty() {
+            anyhow::bail!("tool_use id 不能为空");
         }
+        if name.trim().is_empty() {
+            anyhow::bail!("tool_use name 不能为空");
+        }
+        tool_uses.push(CanonicalToolUse {
+            id: id.clone(),
+            name: name.clone(),
+            input,
+            dispatch_rejection,
+        });
     }
     Ok(tool_uses)
 }
@@ -3890,6 +3906,15 @@ fn validate_provider_response_terminal_semantics(
         }
         (true, ProviderStop::MaxTokens) => {
             anyhow::bail!("provider stop=MaxTokens，无法安全完成 session turn")
+        }
+        (false, ProviderStop::MaxTokens)
+            if tool_uses
+                .iter()
+                .any(|tool_use| tool_use.dispatch_rejection.is_some()) =>
+        {
+            // 参数截断本身是可配对、可恢复的工具失败；保留同一响应中已经完整生成的
+            // sibling 调用，让模型在收到失败结果后自行修正非法调用。
+            Ok(())
         }
         (false, ProviderStop::MaxTokens) => {
             anyhow::bail!("provider stop=MaxTokens 且包含 ToolUse，拒绝执行半截工具调用")
@@ -4443,6 +4468,7 @@ fn provider_request_contains_process_tool_result(
             | SessionTurnContentBlock::Image { .. }
             | SessionTurnContentBlock::Document { .. }
             | SessionTurnContentBlock::ToolUse { .. }
+            | SessionTurnContentBlock::InvalidToolUse { .. }
             | SessionTurnContentBlock::ToolResult { .. } => None,
         })
         .is_some_and(|content| content == &pending.tool_result_content)
@@ -5963,6 +5989,7 @@ mod tests {
                 SessionTurnContentBlock::Image { .. }
                 | SessionTurnContentBlock::Document { .. }
                 | SessionTurnContentBlock::ToolUse { .. }
+                | SessionTurnContentBlock::InvalidToolUse { .. }
                 | SessionTurnContentBlock::ToolResult { .. } => None,
             })
             .collect()
@@ -5993,6 +6020,14 @@ mod tests {
             id: id.into(),
             name: name.into(),
             input,
+        }
+    }
+
+    fn invalid_tool_use(id: &str, name: &str, error: &str) -> SessionTurnContentBlock {
+        SessionTurnContentBlock::InvalidToolUse {
+            id: id.into(),
+            name: name.into(),
+            error: error.into(),
         }
     }
 
@@ -7073,6 +7108,23 @@ mod tests {
                 .unwrap_err();
             assert!(format!("{error:#}").contains(expected_error));
         }
+    }
+
+    #[test]
+    fn fallback_response_validation_accepts_max_tokens_with_invalid_tool_use() {
+        let response = response(
+            vec![
+                invalid_tool_use(
+                    "toolu_bad",
+                    "missing_tool",
+                    "function_call.arguments 不是合法 JSON: EOF while parsing a value at line 1 column 13",
+                ),
+                tool_use("toolu_good", "missing_tool", json!({})),
+            ],
+            ProviderStop::MaxTokens,
+        );
+
+        super::validate_non_streaming_fallback_response(&response, &HashSet::new()).unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -11038,6 +11090,90 @@ mod tests {
             tool_result_content(non_context_messages(&turn)[2], "toolu_2")["ok"],
             true
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_arguments_return_failure_without_blocking_valid_sibling() {
+        let provider = Arc::new(FakeProvider::new(vec![
+            response(
+                vec![
+                    invalid_tool_use(
+                        "toolu_bad",
+                        "working_note",
+                        "function_call.arguments 不是合法 JSON: expected value at line 1 column 13",
+                    ),
+                    tool_use(
+                        "toolu_good",
+                        "working_note",
+                        json!({"action": "add", "note": "survives sibling failure"}),
+                    ),
+                ],
+                ProviderStop::ToolUse,
+            ),
+            response(
+                vec![SessionTurnContentBlock::text("done")],
+                ProviderStop::Done,
+            ),
+        ]));
+        let turn_loop = tool_loop(provider.clone());
+
+        let turn = turn_loop
+            .run_session_turn(request(), &mut |_| {})
+            .await
+            .unwrap();
+        let tool_results = non_context_messages(&turn)[2];
+        let invalid = tool_result_content(tool_results, "toolu_bad");
+        let valid = tool_result_content(tool_results, "toolu_good");
+
+        assert_eq!(invalid["ok"], false);
+        assert_eq!(invalid["outcome"]["kind"], "dispatch_failure");
+        assert!(invalid["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("不是合法 JSON")));
+        assert_eq!(valid["ok"], true);
+        assert_eq!(provider.requests.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn max_tokens_with_invalid_arguments_recovers_and_runs_valid_sibling() {
+        let provider = Arc::new(FakeProvider::new(vec![
+            response(
+                vec![
+                    invalid_tool_use(
+                        "toolu_bad",
+                        "working_note",
+                        "function_call.arguments 不是合法 JSON: EOF while parsing a value at line 1 column 13",
+                    ),
+                    tool_use(
+                        "toolu_good",
+                        "working_note",
+                        json!({"action": "add", "note": "survives truncated sibling"}),
+                    ),
+                ],
+                ProviderStop::MaxTokens,
+            ),
+            response(
+                vec![SessionTurnContentBlock::text("done")],
+                ProviderStop::Done,
+            ),
+        ]));
+        let turn_loop = tool_loop(provider.clone());
+
+        let turn = turn_loop
+            .run_session_turn(request(), &mut |_| {})
+            .await
+            .unwrap();
+        let tool_results = non_context_messages(&turn)[2];
+        let invalid = tool_result_content(tool_results, "toolu_bad");
+        let valid = tool_result_content(tool_results, "toolu_good");
+
+        assert_eq!(invalid["ok"], false);
+        assert_eq!(invalid["outcome"]["kind"], "dispatch_failure");
+        assert!(invalid["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("line 1 column 13")));
+        assert_eq!(valid["ok"], true);
+        assert_eq!(provider.requests.lock().await.len(), 2);
     }
 
     #[tokio::test]

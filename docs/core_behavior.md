@@ -98,6 +98,8 @@ Workbench 会对照 Resolution 时的 direct Claim 快照与当前团队 mirror�
 
 远端 receipt ACK 只表示 Agent 已经把消息持久化到本地，不表示 LLM 内化已经成功。这个区分保证网络重投与本地业务重试互不混淆。
 
+Inbox 失败按副作用边界降级：远端请求与 ACK 失败显示 warning；LLM/provider/解析/校验在 prepared 结果产生前失败时不应用该 batch，保留 pending 并提示 `/inbox` 重试；本地持久化、effect 应用或 done ACK 失败显示具体 error，并明确可能已有部分本地副作用。
+
 ## Router 查询
 
 Agent 在这些情形应考虑查询 Router：

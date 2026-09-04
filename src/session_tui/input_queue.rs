@@ -26,6 +26,8 @@ pub(super) struct QueuedInput {
     draft: InputDraft,
     attachments: Vec<SessionAttachment>,
     submission_sequence: Option<u64>,
+    // 异步 @path/按序回灌不能用消费时状态覆盖用户提交时的 startup 白名单。
+    submitted_during_startup_recovery: bool,
 }
 
 impl QueuedInput {
@@ -46,6 +48,7 @@ impl QueuedInput {
             draft,
             attachments,
             submission_sequence: None,
+            submitted_during_startup_recovery: false,
         }
     }
 
@@ -56,11 +59,17 @@ impl QueuedInput {
             draft: InputDraft::new(text),
             attachments: Vec::new(),
             submission_sequence: None,
+            submitted_during_startup_recovery: false,
         }
     }
 
     pub(super) fn with_submission_sequence(mut self, sequence: u64) -> Self {
         self.submission_sequence = Some(sequence);
+        self
+    }
+
+    pub(super) fn submitted_during_startup_recovery(mut self, submitted: bool) -> Self {
+        self.submitted_during_startup_recovery = submitted;
         self
     }
 
@@ -83,6 +92,10 @@ impl QueuedInput {
 
     pub(super) fn submission_sequence(&self) -> Option<u64> {
         self.submission_sequence
+    }
+
+    pub(super) fn was_submitted_during_startup_recovery(&self) -> bool {
+        self.submitted_during_startup_recovery
     }
 
     pub(super) fn into_draft(self) -> InputDraft {
@@ -134,6 +147,16 @@ impl InputQueueState {
         }
         self.queued_inputs = keep;
         restore
+    }
+
+    pub(super) fn discard_submission_range(&mut self, start: u64, end: u64) -> usize {
+        let before = self.queued_inputs.len();
+        self.queued_inputs.retain(|input| {
+            !input
+                .submission_sequence()
+                .is_some_and(|sequence| (start..end).contains(&sequence))
+        });
+        before.saturating_sub(self.queued_inputs.len())
     }
 
     #[cfg(test)]
@@ -269,5 +292,19 @@ mod tests {
         );
         assert_eq!(queue.queued_count(), 1);
         assert_eq!(queue.pop_next().unwrap().text(), "after");
+    }
+
+    #[test]
+    fn discard_submission_range_only_removes_inputs_from_resume_wait() {
+        let mut queue = InputQueueState::default();
+        queue.enqueue(QueuedInput::from_text("before").with_submission_sequence(2));
+        queue.enqueue(QueuedInput::from_text("during one").with_submission_sequence(3));
+        queue.enqueue(QueuedInput::from_text("during two").with_submission_sequence(4));
+
+        assert_eq!(queue.discard_submission_range(3, 5), 2);
+        let restored = queue.drain_inputs_for_restore_before(5);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].text(), "before");
+        assert!(queue.is_empty());
     }
 }

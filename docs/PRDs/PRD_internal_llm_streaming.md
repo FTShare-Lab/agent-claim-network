@@ -27,3 +27,17 @@ Responses continuation chain 与 fallback scope 相互独立。Inbox 使用 sess
 ## 展示
 
 活动状态保留原有标题，并在末尾追加从该状态开始连续累计的总秒数，例如 `Initializing · Syncing inbox · 8s`、`Working · Streaming response · 16s` 与 `Compacting · Session history · 5s`。不展示内部 attempt 或具体并行子任务；Idle、Error 与 Closed 标题不计时。
+
+## 2026-09-03 补齐 CAU 与 Supervisor Recap
+
+Inbox ClaimAttributeUpdate（CAU）现与 PolicyUpdate 使用相同的 Buffered streaming、session
+fallback scope、provider timeout/retry、continuation 和 transport fallback 语义。完整结果的
+JSON、权限、provenance、引用或其他业务校验失败只消耗结构化/业务 retry，不触发 transport
+切换；Effect Journal 与 ACK 仍只在完整业务校验通过后推进。
+
+Supervisor Recap job 和 Supervisor Finalize 内部 recap 也使用 Buffered streaming，但保持独立
+的 job retry 边界：每个持久化 job attempt 是一次逻辑生成，同一 transport 最多一次，provider
+retry 固定为 0，max-token continuation 关闭；只有 transport failure 可以在本 attempt 内走
+WS → SSE → non-streaming 或 streaming → non-streaming。完整但非法的输出直接结束本 attempt，
+仍由 Supervisor 外层最多五次 attempt 处理。详细拍板与验收见
+[`PRD_cau_supervisor_buffered_streaming.md`](PRD_cau_supervisor_buffered_streaming.md)。
