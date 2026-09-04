@@ -3760,10 +3760,10 @@ impl SessionEngine {
         session: &SessionHandle,
         metadata: &crate::session::SessionMetadata,
         session_messages: &[SessionMessage],
-        provider_messages: &[SessionTurnMessage],
-        active_suffix: &[SessionTurnMessage],
-        current_turn_id: &str,
+        request: &PreflightCompactionRequest<'_>,
     ) -> anyhow::Result<Option<LiveRecoveryCompaction>> {
+        let current_turn_id = request.turn_id;
+        let active_suffix = request.active_suffix.as_slice();
         let Some(history) = metadata
             .compaction
             .as_ref()
@@ -3823,11 +3823,14 @@ impl SessionEngine {
             .is_some_and(|cursor| {
                 cursor.turn_id == current_turn_id
                     && cursor.base_message_count == session_messages.len()
-                    && active_cursor_matches_suffix(cursor, active_suffix)
+                    && (request.active_projection_compacted
+                        || active_cursor_matches_suffix(cursor, active_suffix))
             }) {
+            // 本轮已替换的窗口包含旧摘要和新增尾部；source_hash 仍指向压缩前原文。
             active_suffix.to_vec()
         } else {
-            let Some(provider_prefix) = provider_messages.strip_suffix(active_suffix) else {
+            let Some(provider_prefix) = request.provider_messages.strip_suffix(active_suffix)
+            else {
                 return Ok(None);
             };
             let Some(recovery_suffix) =
@@ -3862,27 +3865,18 @@ impl SessionEngine {
         request: PreflightCompactionRequest<'_>,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
     ) -> anyhow::Result<Option<ProviderProjection>> {
-        let PreflightCompactionRequest {
-            base_system_prompt,
-            provider_messages,
-            active_suffix,
-            turn_id,
-            base_message_count,
-            active_projection_compacted,
-            runtime_projection_tokens,
-            protected_active_tail_segments,
-        } = request;
+        let runtime_projection_tokens = request.runtime_projection_tokens;
         let runtime_budget = self.preflight_runtime_projection_budget(runtime_projection_tokens);
         let projection_budget = runtime_budget.provider_projection;
         let active_context = ActiveProjectionContext {
-            turn_id,
-            base_message_count,
+            turn_id: request.turn_id,
+            base_message_count: request.base_message_count,
         };
         let recovered_state = if let Some(outcome) = self
             .recover_matching_compaction_checkpoint(
                 session,
                 Some(active_context),
-                Some(&active_suffix),
+                Some(&request.active_suffix),
             )
             .await?
         {
@@ -3912,14 +3906,7 @@ impl SessionEngine {
                 .is_some_and(|history| history.recovery_turn_id.is_some())
         });
         let live_recovery = self
-            .build_live_recovery_compaction(
-                session,
-                &metadata,
-                &session_messages,
-                provider_messages,
-                &active_suffix,
-                turn_id,
-            )
+            .build_live_recovery_compaction(session, &metadata, &session_messages, &request)
             .await?;
         if recovery_marker_present && live_recovery.is_none() {
             log::warn!(
@@ -3929,6 +3916,14 @@ impl SessionEngine {
             );
             return Ok(None);
         }
+        let PreflightCompactionRequest {
+            base_system_prompt,
+            active_suffix,
+            turn_id,
+            active_projection_compacted,
+            protected_active_tail_segments,
+            ..
+        } = request;
         let mut planning_metadata = metadata.clone();
         let mut planning_message_count = session_messages.len();
         let mut planning_active_suffix = active_suffix;

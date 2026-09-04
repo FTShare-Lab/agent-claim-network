@@ -4002,6 +4002,158 @@ async fn preflight_active_compaction_preserves_prior_summary_across_multiple_com
 }
 
 #[tokio::test]
+async fn recovery_turn_preserves_summary_across_multiple_auto_compacts() {
+    assert_recovery_turn_can_compact_again(false).await;
+}
+
+#[tokio::test]
+async fn recovery_turn_forces_context_compaction_after_auto_compact() {
+    assert_recovery_turn_can_compact_again(true).await;
+}
+
+async fn assert_recovery_turn_can_compact_again(force_context_recovery: bool) {
+    const RECOVERY_SUMMARY: &str = "Earlier failed work summarized.";
+    const FIRST_SUMMARY: &str = "Failed work and first live tool round summarized.";
+    const SECOND_SUMMARY: &str = "Failed work and both live tool rounds summarized.";
+    const CURRENT_REQUEST: &str = "finish the recovered task through both tool rounds";
+    const NEW_TOOL_MARKER: &str = "SECOND_LIVE_TOOL_PAYLOAD";
+    const PARTIAL: &str = "LATEST_CONTEXT_PARTIAL-";
+
+    let dir = tempfile::tempdir().unwrap();
+    let summary_step = |summary| {
+        response_step(
+            &json!({"committed_summary": null, "active_turn_summary": summary}).to_string(),
+            Vec::new(),
+        )
+    };
+    let tool_step = |id: &str, note: String, used_tokens| {
+        let mut step = tool_use_step(id, "working_note", json!({"action": "add", "note": note}));
+        if let ProviderStep::Response { events, .. } = &mut step {
+            events.push(ProviderEvent::ContextUsageUpdated {
+                usage: ContextUsageSnapshot {
+                    used_tokens,
+                    source: ContextUsageSource::Provider,
+                },
+            });
+        }
+        step
+    };
+    let mut steps = vec![
+        tool_step("toolu_failed", "failed progress ".repeat(1_000), 1),
+        error_step("failed after recording tool progress", Vec::new()),
+        summary_step(RECOVERY_SUMMARY),
+        tool_step(
+            "toolu_live_1",
+            "first live progress ".repeat(1_000),
+            190_000,
+        ),
+        summary_step(FIRST_SUMMARY),
+        tool_step(
+            "toolu_live_2",
+            format!("{NEW_TOOL_MARKER}{}", " second live progress".repeat(1_000)),
+            if force_context_recovery { 1 } else { 190_000 },
+        ),
+    ];
+    if force_context_recovery {
+        steps.push(ProviderStep::Response {
+            response: anthropic_response(
+                PARTIAL,
+                ProviderStop::ContextWindowExceeded,
+                "recovery-context",
+            ),
+            events: Vec::new(),
+        });
+    }
+    steps.push(summary_step(SECOND_SUMMARY));
+    steps.push(if force_context_recovery {
+        ProviderStep::Response {
+            response: anthropic_response("DONE", ProviderStop::Done, "recovery-final"),
+            events: Vec::new(),
+        }
+    } else {
+        response_step("DONE", Vec::new())
+    });
+    let provider = Arc::new(RecordingProvider::new(steps));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.compaction.tail_target_ctx_ratio = 0.00001;
+    let mut session = create_test_session(&store, "session_face0024").await;
+
+    engine
+        .run_turn(&mut session, "record progress before failure", |_| {})
+        .await
+        .expect_err("the initial turn must fail after a tool round");
+    assert!(matches!(
+        engine
+            .compact_session_checkpoint(&mut session, |_| {})
+            .await
+            .unwrap(),
+        SessionCompactionResult::Compacted(_)
+    ));
+    engine.compaction.auto_compact_ctx_ratio = 0.9;
+    let mut events = Vec::new();
+    engine
+        .run_turn(&mut session, CURRENT_REQUEST, |event| events.push(event))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::CompactionCompleted { .. }))
+            .count(),
+        2,
+        "the recovered turn must complete both live compactions"
+    );
+    let requests = provider.requests().await;
+    let summary_requests = requests
+        .iter()
+        .filter(|request| request.system_prompt.contains("committed_summary"))
+        .collect::<Vec<_>>();
+    assert_eq!(summary_requests.len(), 3);
+    let first_live_summary = serde_json::to_string(&summary_requests[1].messages).unwrap();
+    assert!(first_live_summary.contains(RECOVERY_SUMMARY));
+    let second_live_summary = serde_json::to_string(&summary_requests[2].messages).unwrap();
+    assert!(second_live_summary.contains(FIRST_SUMMARY));
+    assert!(second_live_summary.contains(NEW_TOOL_MARKER));
+    assert!(!second_live_summary.contains(PARTIAL));
+
+    let final_request = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
+    assert!(final_request.contains(SECOND_SUMMARY));
+    assert!(!final_request.contains(NEW_TOOL_MARKER));
+    assert_eq!(final_request.matches(CURRENT_REQUEST).count(), 1);
+    if force_context_recovery {
+        assert_eq!(
+            requests
+                .last()
+                .unwrap()
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter(|block| matches!(block, SessionTurnContentBlock::Text { text } if text == PARTIAL))
+                .count(),
+            1
+        );
+        assert_eq!(final_request.matches("private-recovery-context").count(), 1);
+        assert!(final_request.contains("继续，从上一条回复被截断处继续"));
+        let messages = session.read_messages().await.unwrap();
+        assert_eq!(
+            text_content(messages.last().unwrap()),
+            format!("{PARTIAL}DONE")
+        );
+    }
+    let state = session.read_metadata().await.unwrap().compaction.unwrap();
+    assert!(state.active_turn_summary.is_none());
+    assert!(state.frontier.active_turn.is_none());
+    let history = state.provider_history.unwrap();
+    assert!(history.recovery_turn_id.is_none());
+    assert!(history.recovery_base_message_count.is_none());
+    assert!(history.pending_turn.is_none());
+    assert!(history
+        .messages
+        .starts_with(&requests.last().unwrap().messages));
+}
+
+#[tokio::test]
 async fn preflight_does_not_reuse_active_summary_from_previous_turn() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(Vec::new()));
