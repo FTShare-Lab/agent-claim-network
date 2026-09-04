@@ -33,6 +33,8 @@ struct SessionSystemPromptContext<'a> {
     available_skills: Vec<AvailableSkill>,
     subagent_max_concurrent: usize,
     file_edit_authority_enabled: bool,
+    /// 当前 registry 实际暴露的工具名；minimal 评测 prompt 据此描述工具面，而不是靠模型读 schema。
+    available_tools: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -186,6 +188,7 @@ impl SessionEngine {
                 .turn_loop
                 .tool_registry()
                 .file_edit_authority_enabled(),
+            available_tools: Vec::new(),
         };
         let system_prompt = self
             .prompt_registry
@@ -219,6 +222,7 @@ impl SessionEngine {
                 .turn_loop
                 .tool_registry()
                 .file_edit_authority_enabled(),
+            available_tools: Vec::new(),
         };
         let system_prompt = self
             .prompt_registry
@@ -248,6 +252,13 @@ impl SessionEngine {
             available_skills: Vec::new(),
             subagent_max_concurrent: 0,
             file_edit_authority_enabled: false,
+            available_tools: self
+                .turn_loop
+                .tool_registry()
+                .definitions()
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect(),
         };
         self.prompt_registry
             .render(PROMPT_EVALUATION_MINIMAL_AGENT_SYSTEM, context)

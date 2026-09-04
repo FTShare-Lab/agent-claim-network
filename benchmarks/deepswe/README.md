@@ -1,7 +1,7 @@
 # ACN DeepSWE runner
 
-在冻结的 DeepSWE / Pier revision 上跑 ACN 的 DeepSWE 四臂实验：每题 `A`（产 claim）→ freeze barrier →
-`B_empty` / `B_claim` / `B_forced_claim`。`B_claim` 评估模型自主检索 claim 的真实端到端路径，
+在冻结的 DeepSWE / Pier revision 上跑 ACN 的 DeepSWE 四臂实验：每题先执行 `A` / `B_empty`，分别
+freeze，再执行 `B_claim` / `B_forced_claim`。`B_claim` 评估模型自主检索 claim 的真实端到端路径，
 `B_forced_claim` 是强制提供同一冻结 claim 的受控对照，主比较是两者分别相对 `B_empty` 的差异。
 
 ## 与官方口径的关系
@@ -98,8 +98,9 @@ credential**；它只从宿主环境读取。`frozen_skill` 必须指向含 `SKI
 示例刻意指向待生成的 `target/deepswe-runs/deepswe-current/`；不要复用仓库内仅作历史证据的
 `presmoke-v1.json` 或 Luna cohort manifest 作为当前官方对齐 run 的输入。
 
-先 dry-run 校验环境、两份 checkout revision、source/normalized 完整 task 目录 tree hash
-和全部四臂计划：
+先 dry-run 静态校验两份 checkout revision、source/normalized 完整 task 目录 tree hash
+和全部四臂计划；二进制身份在真实启动前使用冻结任务镜像中的无网络 Linux 容器验证，
+dry-run 不执行 Linux 二进制，也不调用 Docker：
 
 ```sh
 ACN_EVAL_UPSTREAM_BASE_URL=<https-url> \
@@ -111,11 +112,14 @@ PYTHONPATH=benchmarks/deepswe/src python -m acn_deepswe.presmoke_cli \
 或环境时用 `--read-key-stdin` 按提示隐藏输入；它只在真实执行且环境无该变量时读取，dry-run
 不读，已有环境值优先，进程退出时清除。
 
-冻结 manifest 中的每题独立执行 `A → freeze → B_empty/B_claim/B_forced_claim`，并以 `task_workers` 限制题间
-并发；同一题内部保持串行，`max_retries=0`。启动配置的
+冻结 manifest 中的每题按 producer / consumer 两波执行，波内可并行；全部题目和 arm 共用
+`task_workers` 个 attempt 许可，`max_retries=0`。启动配置的
 `run_all_variants_without_claims=true` 会要求每题实际执行四臂：若 A 没有 eligible claim，freeze barrier
 仍产出可审计的空 bundle，两个带 claim 的 B 臂照常执行并记录 `EMPTY_CLAIM_BUNDLE`，绝不伪造或借用其他题的
-claim。未开启该开关时才保留历史的“两个带 claim B 臂不适用”行为。基础设施或 Gate 失败会以非零退出，但不会自动重试
+claim。未开启该开关时才保留历史的“两个带 claim B 臂不适用”行为。`claim_quality_gate` 默认为
+`verified_producer_only`：producer 未通过 verifier 时其 claim 全部隔离（bundle manifest 记录
+`quarantined_claim_ids`），两个带 claim 的 B 臂拿到的是空 bundle；显式写 `"none"` 才会把失败 producer 的 claim
+交付给 consumer，只用于隔离研究，不作为正式产品路径。基础设施或 Gate 失败会以非零退出，但不会自动重试
 solve。输出 aggregate manifest 在
 `output_dir/presmoke-aggregate.json`，各题 manifest、jobs 与 claim bundle 在
 `output_dir/tasks/<task>/`。
@@ -129,8 +133,8 @@ Docker daemon 可用、每个 task 的镜像引用能解析为本地 content dig
 
 preflight 通过后，runner 会把 `acn_deepswe`、Pier package、console script 与 coding skill
 一次性复制到 `output_dir/frozen-python/`，四臂只从该目录 import，并在每臂前复核二进制、
-skill、task 与两份 Python source tree hash。`acn_revision` 必须等于当前 ACN `HEAD`；工作树
-有改动时必须写成 `<HEAD>+evaluation-worktree`，具体内容仍由 staged tree hash 唯一标识。
+skill、task 与两份 Python source tree hash。`acn_revision` 必须等于当前 ACN `HEAD`，工作树必须干净；
+历史 `<HEAD>+evaluation-worktree` 标记不能用于当前启动入口。真实运行验证的是冻结副本的二进制身份。
 
 16 GiB Mac 的 Docker VM 约 7.65 GiB，本机 pre-smoke 用 `task_workers=1`、`memory_mb=6144`、
 `cpus=2`；该降配结果不能与官方 8 GiB 资源口径直接横向比较。
@@ -218,11 +222,12 @@ score 的直接复刻，因而不得把本表与外部公布分数当作同口�
 
 Gate 只验证基础设施、claim 归因与隔离：artifact hash、verifier 是否真的跑过、usage 是否
 完整上报、Pier task checksum/trial 隔离，以及 `B_empty` 不得见到任何 claim、带 claim 的两个 B 臂
-只能使用冻结 bundle 内的 claim。A 的 verifier 结果仅决定 `success_efficiency` 或 `failure_recovery` 的统计分层；
+只能使用冻结 bundle 内的 claim。producer 的有效得分决定统计分层，默认质量门控还会隔离失败 producer 的 claim；
 在 `run_all_variants_without_claims=true` 的四臂模式下，没有 claim 的任务会执行四臂并显式标为
 `EMPTY_CLAIM_BUNDLE`，不可与成功注入 claim 的结果混同。`presmoke-aggregate.json` 会单列 `claim_funnel`：每臂的
 bundle 可用、router 检索、内容注入、模型报告使用及对应 claim 数，不能用“挂载成功”代替这些证据。
-`cohort_metrics` 按 producer verifier 分层，每层给出各臂通过数、用量总和 / 均值、`empty_claim_bundle_attempts`，
+`cohort_metrics` 按 producer 结果分层；`failed_producer_quarantine` 保留被隔离题目的四臂结果，
+与 `unpaired_no_claim` 一样不计算 claim 效果配对。每层给出各臂通过数、用量总和 / 均值、`empty_claim_bundle_attempts`，
 以及两组同题配对：`paired_against_producer`（consumer 减 producer）和 `paired_against_no_claim_baseline`
 （claim 臂减同题未拿到 claim 的非 producer 臂，含不一致配对的 `wins` / `losses` 与双侧精确二项检验
 `exact_mcnemar_p`）。分母固定为冻结 task 集：`cohort_coverage` 记录 planned / included / excluded 数量与每个被排除
@@ -230,6 +235,7 @@ task 的原因，不得把缺失或失败的 task 从分母里静默删掉。att
 Rust 侧带 `stage=` 前缀的失败摘要，用于区分 turn 阶段与 finalize 阶段的 agent 失败。
 
 **verifier 判 0 分与 agent 自身失败都是有效实验结果，不是 Gate 失败**，按未通过计分，不得
-重跑刷分。checkpoint 会持久化所有 task 终态（含 Gate、协议与基础设施失败）；普通 `--resume` 遇到任何
+重跑刷分。`verifier_passed` 只有 agent 正常完成且 verifier 通过才为 true；原始 patch 判卷保留在
+`pier_trial` / `verifier_regrade`。checkpoint 会持久化所有 task 终态（含 Gate、协议与基础设施失败）；普通 `--resume` 遇到任何
 失败终态即拒绝。只有无终态且已有半成品的中断 task，才可由操作者显式传
 `--resume --retry-interrupted` 重跑一次；此前的产物和 retry 计数都会保留。

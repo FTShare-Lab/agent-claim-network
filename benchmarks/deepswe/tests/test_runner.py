@@ -650,7 +650,7 @@ class ProvenanceTests(unittest.TestCase):
             plan = build_attempt_plan(DATASET, root / "run", seed=2)
             experiment = build_experiment_manifest("experiment-1", plan, "b" * 64, provenance())
             artifacts = _artifacts(root, claim_bundle=root / "claims.json")
-            execution = _execution(root, artifacts)
+            execution = replace(_execution(root, artifacts), run_all_variants_without_claims=True)
 
             def run(command: list[str], **_kwargs: object) -> FakeCompleted:
                 job = json.loads(Path(command[-1]).read_text())
@@ -672,6 +672,9 @@ class ProvenanceTests(unittest.TestCase):
         # agent 自身失败按未通过计分，不中断实验。
         self.assertEqual(
             [item["status"] for item in manifest["attempt_results"]], ["agent_failed"] * 4
+        )
+        self.assertEqual(
+            [item["verifier_passed"] for item in manifest["attempt_results"]], [False] * 4
         )
 
     def test_producer_wave_gate_failure_stops_before_claim_consumers(self) -> None:
@@ -1225,12 +1228,13 @@ class ProvenanceTests(unittest.TestCase):
         )
 
     def test_a_verifier_failure_with_claims_runs_failure_recovery_pair(self) -> None:
+        """failure_recovery 只在显式关闭质量门控的研究通道里出现。"""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             plan = build_attempt_plan(DATASET, root / "run", seed=2)
             experiment = build_experiment_manifest("experiment-1", plan, "b" * 64, provenance())
             artifacts = _artifacts(root, claim_bundle=root / "claims.json")
-            execution = _execution(root, artifacts)
+            execution = replace(_execution(root, artifacts), claim_quality_gate="none")
             variants: list[str] = []
 
             def run(command: list[str], **_kwargs: object) -> FakeCompleted:
@@ -1569,6 +1573,8 @@ def _write_fake_trial(
                 "router_evidence_incomplete": False,
                 "usage": {
                     "model_requests": 3,
+                    "turn_model_requests": 3,
+                    "finalize_model_requests": 0,
                     "complete_model_responses": 3,
                     "incomplete_model_responses": 0,
                     "audit_incomplete": False,

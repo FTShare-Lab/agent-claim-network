@@ -262,6 +262,7 @@ mod tests {
         available_skills: Vec<AgentSystemSkillContext<'a>>,
         subagent_max_concurrent: usize,
         file_edit_authority_enabled: bool,
+        available_tools: Vec<&'a str>,
     }
 
     #[derive(Serialize)]
@@ -294,6 +295,7 @@ mod tests {
             }],
             subagent_max_concurrent: 7,
             file_edit_authority_enabled,
+            available_tools: vec!["code_run", "write_stdin", "process_list", "consult_router", "submit_task"],
         }
     }
 
@@ -525,15 +527,53 @@ mod tests {
             )
             .unwrap();
 
-        assert!(out.contains("code_run"));
-        assert!(out.contains("write_stdin"));
-        assert!(out.contains("process_list"));
-        assert!(out.contains("consult_router"));
+        assert!(out.contains("Available tools: `code_run`, `write_stdin`, `process_list`, `consult_router`, `submit_task`."));
+        assert!(out.contains("Use `code_run` for shell commands and file edits."));
         assert!(out.contains("candidate claims"));
+        assert!(out.contains("only tool call is the no-argument `submit_task`"));
         assert!(!out.contains("file_read"));
         assert!(!out.contains("working_note"));
         assert!(!out.contains("available_skills"));
         assert!(!out.contains("self claims"));
+    }
+
+    #[test]
+    fn repository_minimal_evaluation_prompt_describes_file_tools_when_registered() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let reg = PromptRegistry::new(&root).unwrap();
+        let mut pi_like = agent_system_test_context(false);
+        pi_like.available_tools = vec![
+            "code_run",
+            "write_stdin",
+            "process_list",
+            "file_read",
+            "file_write",
+            "consult_router",
+            "submit_task",
+        ];
+        let out = reg
+            .render("evaluation_minimal_agent_system", pi_like)
+            .unwrap();
+        assert!(out.contains(
+            "Use `file_read` to inspect files and `file_write` to create or fully replace a file."
+        ));
+        assert!(!out.contains("file_patch"));
+
+        let mut open_code_like = agent_system_test_context(false);
+        open_code_like.available_tools = vec![
+            "code_run",
+            "write_stdin",
+            "process_list",
+            "file_read",
+            "file_patch",
+            "file_write",
+            "consult_router",
+            "submit_task",
+        ];
+        let out = reg
+            .render("evaluation_minimal_agent_system", open_code_like)
+            .unwrap();
+        assert!(out.contains("`file_patch` for localized edits whose `old_content` matches exactly once, and `file_write` to create or fully replace a file."));
     }
 
     #[test]

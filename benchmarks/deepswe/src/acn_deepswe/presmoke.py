@@ -284,6 +284,10 @@ class PresmokeHostRunner:
                 "unpaired_no_claim": (
                     "selected producer produced no frozen claim; claim arms are not paired"
                 ),
+                "failed_producer_quarantine": (
+                    "selected producer failed verification and its claims were quarantined; "
+                    "all arm outcomes remain counted, without claim-effect pairs"
+                ),
             },
             "paired_metric_definitions": {
                 "paired_against_producer": (
@@ -317,14 +321,28 @@ def load_terminal_task_results(
     terminal: list[PresmokeTaskResult] = []
     for spec in task_specs:
         record = records.get(spec.task_id)
+        # checkpoint 可能滞后或指向旧版续跑生成的成功记录；总是检查所有执行目录。
+        paths = [spec.manifest_path] + [
+            root / "tasks" / spec.task_id / "manifest.json"
+            for root in sorted((completion_manifest_path.parent / "resumes").glob("resume-*"))
+        ]
+        if record is not None:
+            recorded_path = record.get("manifest_path")
+            if isinstance(recorded_path, str) and Path(recorded_path).is_absolute():
+                paths.append(Path(recorded_path))
+        recovered = [
+            result
+            for path in {path.resolve(): path for path in paths}.values()
+            if (result := _terminal_result_from_task_manifest(spec, path)) is not None
+        ]
+        if len(recovered) > 1:
+            raise ValueError(f"task 存在多个终态，拒绝选择性复用: {spec.task_id}")
         if record is None:
-            # checkpoint 在父线程收集 future 后才落盘；若进程恰在此前退出，独立 task
-            # manifest 已通过原子 replace 写入，必须优先恢复其中已经明确记录的失败或终态。
-            recovered = _terminal_result_from_task_manifest(spec, spec.manifest_path)
-            if recovered is not None:
-                terminal.append(recovered)
+            terminal.extend(recovered)
             continue
         status = record.get("status")
+        if recovered and status != recovered[0].status:
+            raise ValueError(f"checkpoint 与 task manifest 终态冲突: {spec.task_id}")
         manifest_path = record.get("manifest_path")
         error = record.get("error")
         if not isinstance(manifest_path, str) or not Path(manifest_path).is_absolute():
@@ -732,6 +750,8 @@ _METRIC_VARIANTS = ("A", "B_empty", "B_claim", "B_forced_claim")
 _CLAIM_VARIANTS = ("B_claim", "B_forced_claim")
 _REQUEST_USAGE_FIELDS = (
     "model_requests",
+    "turn_model_requests",
+    "finalize_model_requests",
     "complete_model_responses",
     "incomplete_model_responses",
 )
@@ -742,7 +762,12 @@ _TOKEN_USAGE_FIELDS = (
     "reasoning_tokens",
 )
 _USAGE_FIELDS = _REQUEST_USAGE_FIELDS + _TOKEN_USAGE_FIELDS
-_COHORTS = ("success_efficiency", "failure_recovery", "unpaired_no_claim")
+_COHORTS = (
+    "success_efficiency",
+    "failure_recovery",
+    "unpaired_no_claim",
+    "failed_producer_quarantine",
+)
 
 
 @dataclass(frozen=True)
@@ -880,7 +905,7 @@ class _CohortRow:
         self.task_ids.append(task_id)
         for variant, metrics in attempts.items():
             self.variants[variant].add(metrics)
-        if cohort == "unpaired_no_claim":
+        if cohort in {"unpaired_no_claim", "failed_producer_quarantine"}:
             return
         producer = attempts[self.claim_producer_variant]
         for variant, pair in self.paired_against_producer.items():
@@ -941,8 +966,8 @@ def _cohort_metrics(results: tuple[PresmokeTaskResult, ...]) -> CohortMetrics:
 def _validated_cohort_attempts(
     task: PresmokeTaskResult,
 ) -> tuple[str, str, dict[str, _AttemptMetrics]]:
-    """只接受四臂均有 Gate pass 且哈希闭合的完整 task，避免部分结果污染统计。"""
-    if task.status != "passed" or task.error is not None:
+    """汇总 Gate 与哈希闭合的已执行臂；无 claim 时保留两个 baseline，不伪造 claim 配对。"""
+    if task.status not in {"passed", "no_eligible_claim"} or task.error is not None:
         raise _CohortExclusion(f"task_status={task.status}")
     manifest = _read_mapping_if_present(Path(task.manifest_path))
     if manifest is None:
@@ -964,6 +989,7 @@ def _validated_cohort_attempts(
     if not isinstance(records, list) or len(records) != len(_METRIC_VARIANTS):
         raise _CohortExclusion("attempt_results_incomplete")
     attempts: dict[str, _AttemptMetrics] = {}
+    seen_variants: set[str] = set()
     for record in records:
         if not isinstance(record, Mapping):
             raise _CohortExclusion("attempt_record_invalid")
@@ -973,9 +999,18 @@ def _validated_cohort_attempts(
             not isinstance(attempt_id, str)
             or not attempt_id
             or variant not in _METRIC_VARIANTS
-            or variant in attempts
+            or variant in seen_variants
         ):
             raise _CohortExclusion("attempt_record_invalid")
+        seen_variants.add(variant)
+        if (
+            task.status == "no_eligible_claim"
+            and cohort in {"unpaired_no_claim", "failed_producer_quarantine"}
+            and variant in _CLAIM_VARIANTS
+            and record.get("status") == "not_run"
+            and record.get("reason") == "NO_ELIGIBLE_CLAIM"
+        ):
+            continue
         if record.get("status") not in {"passed", "agent_failed"}:
             raise _CohortExclusion(f"{variant}_status={record.get('status')}")
         result_path = record.get("result_path")
@@ -1003,6 +1038,11 @@ def _validated_cohort_attempts(
             != usage_values["model_requests"]
         ):
             raise _CohortExclusion(f"{variant}_usage_request_count_mismatch")
+        if (
+            usage_values["turn_model_requests"] + usage_values["finalize_model_requests"]
+            != usage_values["model_requests"]
+        ):
+            raise _CohortExclusion(f"{variant}_usage_phase_count_mismatch")
         bundle_available: bool | None = None
         if variant in _CLAIM_VARIANTS:
             observation = record.get("claim_observation")
@@ -1012,12 +1052,20 @@ def _validated_cohort_attempts(
                 raise _CohortExclusion(f"{variant}_claim_observation_missing")
             bundle_available = observation["bundle_available"]
         attempts[variant] = _AttemptMetrics(verifier_passed, bundle_available, usage_values)
-    if set(attempts) != set(_METRIC_VARIANTS):
+    expected_variants = (
+        {"A", "B_empty"} if task.status == "no_eligible_claim" else set(_METRIC_VARIANTS)
+    )
+    if set(attempts) != expected_variants:
         raise _CohortExclusion("attempt_results_incomplete")
     expected_cohort = (
         "success_efficiency" if attempts[producer_variant].verifier_passed else "failure_recovery"
     )
-    if cohort != "unpaired_no_claim" and cohort != expected_cohort:
+    if cohort == "failed_producer_quarantine":
+        if attempts[producer_variant].verifier_passed or any(
+            attempts[variant].bundle_available for variant in _CLAIM_VARIANTS if variant in attempts
+        ):
+            raise _CohortExclusion("quarantined_producer_or_claim_bundle_inconsistent")
+    elif cohort != "unpaired_no_claim" and cohort != expected_cohort:
         raise _CohortExclusion(f"experiment_cohort={cohort}_but_producer_verifier_says={expected_cohort}")
     if logical_variant_map is not None:
         if (
@@ -1036,6 +1084,7 @@ def _validated_cohort_attempts(
         attempts = {
             logical_variant: attempts[physical_variant]
             for logical_variant, physical_variant in logical_variant_map.items()
+            if physical_variant in attempts
         }
         producer_variant = "A"
     return cohort, producer_variant, attempts

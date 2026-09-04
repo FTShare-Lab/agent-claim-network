@@ -36,6 +36,8 @@
   "event_ledger_path": "/tmp/events.jsonl",
   "usage": {
     "model_requests": 1,
+    "turn_model_requests": 1,
+    "finalize_model_requests": 0,
     "complete_model_responses": 1,
     "incomplete_model_responses": 0,
     "audit_incomplete": false,

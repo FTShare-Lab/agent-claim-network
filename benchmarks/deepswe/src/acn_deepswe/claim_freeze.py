@@ -111,10 +111,13 @@ def freeze_claim_bundle(
         if event.seq >= barrier.seq or event.event_type != CLAIM_SNAPSHOT_EVENT:
             continue
         snapshot = _snapshot(event.payload)
-        if snapshot is None:
-            continue
         snapshots[snapshot.claim_id] = snapshot
-    discovered_claims = tuple(sorted(snapshots.values(), key=lambda item: item.claim_id))
+    discovered_claims = tuple(
+        sorted(
+            (snapshot for snapshot in snapshots.values() if snapshot.claim["status"] == "active"),
+            key=lambda item: item.claim_id,
+        )
+    )
     producer_failed = producer is not None and producer["verifier_passed"] is False
     quarantined_claims = (
         discovered_claims
@@ -206,15 +209,13 @@ def _validate_monotonic_sequences(events: list[EventLedger], attempt_id: str) ->
         raise ClaimFreezeError(f"attempt {attempt_id} host event ledger 的 seq 不严格递增")
 
 
-def _snapshot(payload: Mapping[str, object]) -> FrozenClaim | None:
+def _snapshot(payload: Mapping[str, object]) -> FrozenClaim:
     raw_claim = payload.get("claim")
     if not isinstance(raw_claim, Mapping) or not all(isinstance(key, str) for key in raw_claim):
         raise ClaimFreezeError("claim_snapshot.claim 必须是 Rust Claim 对象")
     claim = dict(raw_claim)
     status = claim.get("status")
-    if status in EXCLUDED_STATUSES:
-        return None
-    if status != "active":
+    if status != "active" and status not in EXCLUDED_STATUSES:
         raise ClaimFreezeError("claim_snapshot.status 必须为 active/stale/disputed")
     _validate_rust_claim(claim)
     claim_id = _payload_string(claim, "id")

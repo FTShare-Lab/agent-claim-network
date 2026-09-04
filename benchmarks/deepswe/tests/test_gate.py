@@ -9,6 +9,8 @@ from acn_deepswe.schemas import RouterEvidence, VerifierResult
 FIXTURE = Path(__file__).parent / "fixtures" / "rust-acn-eval-result.json"
 LIVE_USAGE = RustUsage(
     model_requests=12,
+    turn_model_requests=12,
+    finalize_model_requests=0,
     complete_model_responses=12,
     incomplete_model_responses=0,
     audit_incomplete=False,
@@ -71,22 +73,22 @@ class GateValidatorTests(unittest.TestCase):
             42368 / 42480,
         )
 
-    def test_missing_usage_fails_because_token_metric_would_be_unusable(self) -> None:
+    def test_no_requests_fail_but_complete_zero_token_usage_is_valid(self) -> None:
         no_request = GateValidator().validate(
             replace(
                 _b_claim_input(),
-                usage=RustUsage(0, 0, 0, False, ("fixture-checkpoint",), 0, 0, 0, 0),
+                usage=RustUsage(0, 0, 0, 0, 0, False, ("fixture-checkpoint",), 0, 0, 0, 0),
             )
         )
         self.assertIn("NO_MODEL_REQUEST_RECORDED", no_request.reason)
 
-        silent_zero = GateValidator().validate(
+        complete_zero = GateValidator().validate(
             replace(
                 _b_claim_input(),
-                usage=RustUsage(12, 12, 0, False, ("fixture-checkpoint",), 0, 0, 0, 0),
+                usage=RustUsage(12, 12, 0, 12, 0, False, ("fixture-checkpoint",), 0, 0, 0, 0),
             )
         )
-        self.assertIn("USAGE_NOT_REPORTED", silent_zero.reason)
+        self.assertEqual(complete_zero.decision, "pass")
 
     def test_incomplete_response_usage_is_a_nonblocking_audit_warning(self) -> None:
         result = GateValidator().validate(

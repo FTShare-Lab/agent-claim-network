@@ -19,6 +19,8 @@ class RustUsage:
     """`acn_eval` 直接从上游响应累计的 token 用量。"""
 
     model_requests: int
+    turn_model_requests: int
+    finalize_model_requests: int
     complete_model_responses: int
     incomplete_model_responses: int
     audit_incomplete: bool
@@ -31,6 +33,8 @@ class RustUsage:
     def to_dict(self) -> dict[str, int | float | bool | list[str]]:
         return {
             "model_requests": self.model_requests,
+            "turn_model_requests": self.turn_model_requests,
+            "finalize_model_requests": self.finalize_model_requests,
             "complete_model_responses": self.complete_model_responses,
             "incomplete_model_responses": self.incomplete_model_responses,
             "audit_incomplete": self.audit_incomplete,
@@ -59,6 +63,8 @@ class RustUsage:
             raise RustContractError("usage.response_models 必须是字符串数组")
         usage = cls(
             model_requests=field("model_requests"),
+            turn_model_requests=field("turn_model_requests"),
+            finalize_model_requests=field("finalize_model_requests"),
             complete_model_responses=field("complete_model_responses"),
             incomplete_model_responses=field("incomplete_model_responses"),
             audit_incomplete=_boolean(data, "audit_incomplete"),
@@ -75,6 +81,10 @@ class RustUsage:
             raise RustContractError(
                 "usage.complete_model_responses + incomplete_model_responses "
                 "必须等于 model_requests"
+            )
+        if usage.turn_model_requests + usage.finalize_model_requests != usage.model_requests:
+            raise RustContractError(
+                "usage.turn_model_requests + finalize_model_requests 必须等于 model_requests"
             )
         return usage
 

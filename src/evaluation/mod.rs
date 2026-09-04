@@ -19,7 +19,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::fs::LocalFsClaimStore;
 use crate::agent::{LocalClaimStore, SessionEvent, SessionFinalizeReport};
-use crate::api::{with_evaluation_usage_recording, EvaluationUsage, EvaluationUsageRecorder};
+use crate::api::{
+    with_evaluation_usage_recording, EvaluationUsage, EvaluationUsagePhase, EvaluationUsageRecorder,
+};
 use crate::bootstrap::build_evaluation_session_engine;
 use crate::claim::Claim;
 use crate::claim::{AgentId, SessionId};
@@ -216,6 +218,10 @@ pub enum EvaluationFailureKind {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct EvaluationUsageTotals {
     pub model_requests: usize,
+    /// 解题 turn 阶段的请求数；跨臂比较交互效率应使用它，而不是含 finalize recap 的总数。
+    pub turn_model_requests: usize,
+    /// finalize recap 及其 JSON 校验重试的请求数；claim 臂的 used_claim_ids 校验会让它系统性偏高。
+    pub finalize_model_requests: usize,
     /// 同时具备 model、prompt_tokens 与 completion_tokens 的响应数。
     pub complete_model_responses: usize,
     pub incomplete_model_responses: usize,
@@ -232,10 +238,16 @@ impl EvaluationUsageTotals {
     fn accumulate(records: &[EvaluationUsage]) -> Self {
         let mut totals = records.iter().fold(Self::default(), |mut totals, record| {
             totals.model_requests += 1;
+            match record.phase {
+                EvaluationUsagePhase::Turn => totals.turn_model_requests += 1,
+                EvaluationUsagePhase::Finalize => totals.finalize_model_requests += 1,
+            }
             if record.is_complete {
                 totals.complete_model_responses += 1;
             } else {
                 totals.incomplete_model_responses += 1;
+                // 收到响应却缺计量字段不是可重试请求中断，正式 Gate 必须拒绝。
+                totals.audit_incomplete |= record.response_received;
             }
             totals.input_tokens = totals.input_tokens.saturating_add(record.input_tokens);
             totals.output_tokens = totals.output_tokens.saturating_add(record.output_tokens);
@@ -523,6 +535,7 @@ async fn run_attempt_inner(
         .await;
     turn_result.context("stage=turn 执行任务失败")?;
     buffer_evaluation_completion(&event_tx, &submission);
+    crate::api::evaluation_usage::mark_evaluation_finalize_phase();
     let report = engine
         .finalize_session(&mut session, |event| buffer_session_event(&event_tx, event))
         .await
@@ -808,7 +821,7 @@ fn record_model_request_events(
         record_event(events, attempt_id, "model_request", json!(record));
     }
     let mut totals = EvaluationUsageTotals::accumulate(&records);
-    totals.audit_incomplete = recorder.audit_is_incomplete();
+    totals.audit_incomplete |= recorder.audit_is_incomplete();
     totals
 }
 
@@ -1048,7 +1061,7 @@ fn write_new_file_blocking(path: &Path, content: &[u8], label: &str) -> anyhow::
 mod tests {
     use super::*;
     use crate::api::evaluation_usage::{
-        record_evaluation_request_started, record_evaluation_usage,
+        mark_evaluation_finalize_phase, record_evaluation_request_started, record_evaluation_usage,
     };
     use crate::claim::ClaimId;
     use serde_json::json;
@@ -1560,6 +1573,7 @@ harness_mode = "{raw_mode}"
         let totals = EvaluationUsageTotals::accumulate(&[
             EvaluationUsage {
                 request_sequence: 1,
+                phase: EvaluationUsagePhase::Turn,
                 response_received: true,
                 model: Some("model-b".into()),
                 is_complete: true,
@@ -1570,6 +1584,7 @@ harness_mode = "{raw_mode}"
             },
             EvaluationUsage {
                 request_sequence: 2,
+                phase: EvaluationUsagePhase::Finalize,
                 response_received: true,
                 model: Some("model-a".into()),
                 is_complete: false,
@@ -1584,9 +1599,11 @@ harness_mode = "{raw_mode}"
             totals,
             EvaluationUsageTotals {
                 model_requests: 2,
+                turn_model_requests: 1,
+                finalize_model_requests: 1,
                 complete_model_responses: 1,
                 incomplete_model_responses: 1,
-                audit_incomplete: false,
+                audit_incomplete: true,
                 response_models: vec!["model-a".into(), "model-b".into()],
                 input_tokens: 17098,
                 output_tokens: 217,
@@ -1601,6 +1618,29 @@ harness_mode = "{raw_mode}"
     }
 
     #[tokio::test]
+    async fn successful_response_without_usage_fails_audit_but_interrupted_request_does_not() {
+        for response_received in [false, true] {
+            let recorder = Arc::new(EvaluationUsageRecorder::default());
+            with_evaluation_usage_recording(recorder.clone(), async {
+                let complete = record_evaluation_request_started().unwrap();
+                record_evaluation_usage(
+                    Some(complete),
+                    Some(&json!({"input_tokens": 10, "output_tokens": 2})),
+                    Some("eval-model"),
+                );
+                let incomplete = record_evaluation_request_started().unwrap();
+                if response_received {
+                    record_evaluation_usage(Some(incomplete), None, Some("eval-model"));
+                }
+            })
+            .await;
+            let totals = record_model_request_events(&mut Vec::new(), "attempt-1", &recorder);
+            assert_eq!(totals.audit_incomplete, response_received);
+            assert_eq!(totals.incomplete_model_responses, 1);
+        }
+    }
+
+    #[tokio::test]
     async fn agent_steps_include_response_emitted_during_finalize() {
         let recorder = Arc::new(EvaluationUsageRecorder::default());
         with_evaluation_usage_recording(recorder.clone(), async {
@@ -1610,7 +1650,8 @@ harness_mode = "{raw_mode}"
                 Some(&json!({"prompt_tokens": 3, "completion_tokens": 2})),
                 Some("eval-model"),
             );
-            // finalize 期间的模型调用与 turn 调用使用同一个计步口径。
+            // finalize 期间的模型调用与 turn 调用使用同一个计步口径，但按阶段分别计数。
+            mark_evaluation_finalize_phase();
             let finalize_response = record_evaluation_request_started().unwrap();
             record_evaluation_usage(
                 Some(finalize_response),
@@ -1624,6 +1665,8 @@ harness_mode = "{raw_mode}"
         let totals = EvaluationUsageTotals::accumulate(&recorder.take_records());
         assert_eq!(agent_steps, 2);
         assert_eq!(totals.model_requests, 2);
+        assert_eq!(totals.turn_model_requests, 1);
+        assert_eq!(totals.finalize_model_requests, 1);
         assert_eq!(totals.complete_model_responses, 2);
     }
 }

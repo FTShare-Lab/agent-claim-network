@@ -7,7 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from acn_deepswe.presmoke import PresmokeTaskResult
+from acn_deepswe.presmoke import PresmokeTaskResult, load_terminal_task_results
 from acn_deepswe.presmoke_cli import (
     PresmokeCliError,
     _effective_config_hash,
@@ -36,6 +36,29 @@ TASK_IDS = (
 
 
 class PresmokeCliTests(unittest.TestCase):
+    def test_resume_recovers_failure_before_checkpoint_and_detects_partial_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(write_fixture(Path(directory)))
+            with patch("acn_deepswe.presmoke_cli.verify_checkout_revision"):
+                specs, _ = build_task_specs(config, "https://upstream.invalid")
+            spec = specs[0]
+            self.assertFalse(_task_has_partial_artifacts(spec))
+            resume = config.output_dir / "resumes" / "resume-001"
+            output = resume / "attempts" / spec.experiment.attempts[0].attempt_id / "output"
+            output.mkdir(parents=True)
+            self.assertTrue(_task_has_partial_artifacts(spec))
+            manifest = resume / "tasks" / spec.task_id / "manifest.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(json.dumps({
+                "attempt_results": [], "failure": "GATE_FAILED"
+            }))
+
+            terminal = load_terminal_task_results(specs, config.output_dir / "task-completions.json")
+
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0].status, "failed")
+        self.assertEqual(Path(terminal[0].manifest_path), manifest)
+
     def test_directory_tree_hash_covers_instruction_environment_and_tests(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             task = Path(directory) / "task"
@@ -473,10 +496,28 @@ class PresmokeCliTests(unittest.TestCase):
             patch("acn_deepswe.presmoke_cli.subprocess.run", return_value=response) as run,
         ):
             _verify_acn_eval_build_info(
-                Path("/tmp/acn_eval"), expected_revision="a" * 40, expected_version="0.2.5"
+                Path("/tmp/acn_eval"), expected_revision="a" * 40, expected_version="0.2.5",
+                image="sha256:" + "1" * 64,
             )
 
         self.assertEqual(run.call_args.kwargs["env"], {"PATH": "/usr/bin"})
+        command = run.call_args.args[0]
+        self.assertEqual(command[:3], ["docker", "run", "--rm"])
+        self.assertIn("linux/amd64", command)
+        self.assertEqual(command[command.index("--network") + 1], "none")
+        self.assertEqual(command[-2:], ["sha256:" + "1" * 64, "--build-info-json"])
+
+    def test_dry_run_does_not_execute_linux_binary_on_host(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(write_fixture(Path(directory)))
+            config.acn_eval.write_bytes(b"\x7fELF")
+            with (
+                patch("acn_deepswe.presmoke_cli.verify_checkout_revision"),
+                patch("acn_deepswe.presmoke_cli._verify_acn_eval_build_info") as probe,
+            ):
+                specs, _ = build_task_specs(config, "https://upstream.invalid")
+            self.assertTrue(specs)
+            probe.assert_not_called()
 
     def test_pier_executable_binding_requires_checkout_source_install(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

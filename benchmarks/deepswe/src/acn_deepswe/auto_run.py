@@ -955,7 +955,10 @@ def _select_adaptive_producer(run_root: Path) -> dict[str, object]:
             ):
                 raise AutomatedRunError(f"producer {alias} result 绑定无效: {expected_task_id}")
             result = _read_json_object(expected_result, f"producer {alias} attempt result")
-            rewards = result.get("pier_trial")
+            regrade = result.get("verifier_regrade")
+            if regrade is not None and not isinstance(regrade, Mapping):
+                raise AutomatedRunError(f"producer {alias} verifier 重判证据无效: {expected_task_id}")
+            rewards = (regrade if regrade is not None else result).get("pier_trial")
             rewards = rewards.get("verifier_rewards") if isinstance(rewards, Mapping) else None
             if (
                 result.get("attempt_id") != attempt_id
@@ -1171,7 +1174,7 @@ def _harness_mode(raw: Mapping[str, object]) -> str:
 
 
 def _claim_quality_gate(raw: Mapping[str, object]) -> str:
-    value = raw.get("claim_quality_gate", "none")
+    value = raw.get("claim_quality_gate", "verified_producer_only")
     if value not in {"none", "verified_producer_only"}:
         raise AutomatedRunError("claim_quality_gate 无效")
     return value

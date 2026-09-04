@@ -22,6 +22,30 @@ TASK_IDS = tuple(f"task-{index}" for index in range(6))
 
 
 class AutomatedRunTests(unittest.TestCase):
+    def test_adaptive_selector_uses_successful_verifier_regrade_rewards(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_root = Path(directory)
+            _write_adaptive_producer_evidence(
+                run_root, s1_passes=3, s2_passes=3, s1_f2p=(30, 60), s2_f2p=(36, 60)
+            )
+            manifest_path = run_root / "producers/output/tasks" / TASK_IDS[0] / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            record = manifest["attempt_results"][1]
+            result_path = Path(record["result_path"])
+            result = json.loads(result_path.read_text())
+            result["verifier_regrade"] = {
+                "trigger": "VERIFIER_TIMEOUT", "pier_trial": result["pier_trial"]
+            }
+            result["pier_trial"] = {"verifier_rewards": None}
+            result_path.write_text(json.dumps(result))
+            record["result_hash"] = hashlib.sha256(result_path.read_bytes()).hexdigest()
+            manifest_path.write_text(json.dumps(manifest))
+
+            selection = _select_adaptive_producer(run_root)
+
+        self.assertEqual(selection["winner_variant"], "B_empty")
+        self.assertEqual(selection["candidates"]["S2"]["f2p_passed"], 36)
+
     def test_hidden_key_read_requires_a_nonempty_value(self) -> None:
         with patch("acn_deepswe.auto_run.getpass.getpass", return_value="test-credential"):
             self.assertEqual(_read_upstream_key_stdin(), "test-credential")

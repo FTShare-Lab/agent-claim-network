@@ -9,10 +9,20 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use serde_json::Value;
 
+/// 请求发生在解题 turn 还是 finalize recap；claim 臂的 recap 校验重试只应计入后者。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationUsagePhase {
+    #[default]
+    Turn,
+    Finalize,
+}
+
 /// 单次 LLM HTTP attempt 的 OpenAI Chat / Responses usage 投影。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct EvaluationUsage {
     pub request_sequence: u64,
+    pub phase: EvaluationUsagePhase,
     pub response_received: bool,
     pub model: Option<String>,
     pub is_complete: bool,
@@ -28,6 +38,7 @@ impl EvaluationUsage {
         let usage = usage.unwrap_or(&Value::Null);
         Self {
             request_sequence: 0,
+            phase: EvaluationUsagePhase::Turn,
             response_received: true,
             model: model.map(str::to_owned),
             is_complete: model.is_some()
@@ -76,6 +87,7 @@ pub struct EvaluationUsageRecorder {
     records: Mutex<Vec<EvaluationUsage>>,
     next_sequence: AtomicU64,
     audit_incomplete: AtomicBool,
+    finalize_phase: AtomicBool,
 }
 
 impl EvaluationUsageRecorder {
@@ -111,36 +123,48 @@ impl EvaluationUsageRecorder {
         }
     }
 
+    /// 此后开始的请求记为 finalize 阶段；turn 阶段的请求已全部返回。
+    pub fn enter_finalize_phase(&self) {
+        self.finalize_phase.store(true, Ordering::Release);
+    }
+
+    fn current_phase(&self) -> EvaluationUsagePhase {
+        if self.finalize_phase.load(Ordering::Acquire) {
+            EvaluationUsagePhase::Finalize
+        } else {
+            EvaluationUsagePhase::Turn
+        }
+    }
+
     fn start_request(&self) -> u64 {
         let request_sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        let record = EvaluationUsage {
+            request_sequence,
+            phase: self.current_phase(),
+            ..EvaluationUsage::default()
+        };
         match self.records.lock() {
-            Ok(mut records) => records.push(EvaluationUsage {
-                request_sequence,
-                ..EvaluationUsage::default()
-            }),
+            Ok(mut records) => records.push(record),
             Err(poisoned) => {
                 self.audit_incomplete.store(true, Ordering::Release);
-                poisoned.into_inner().push(EvaluationUsage {
-                    request_sequence,
-                    ..EvaluationUsage::default()
-                });
+                poisoned.into_inner().push(record);
             }
         }
         request_sequence
     }
 
     fn record_response(&self, request_sequence: u64, usage: Option<&Value>, model: Option<&str>) {
-        let usage = EvaluationUsage {
-            request_sequence,
-            ..EvaluationUsage::from_response(usage, model)
-        };
         match self.records.lock() {
             Ok(mut records) => {
                 if let Some(record) = records
                     .iter_mut()
                     .find(|record| record.request_sequence == request_sequence)
                 {
-                    *record = usage;
+                    *record = EvaluationUsage {
+                        request_sequence,
+                        phase: record.phase,
+                        ..EvaluationUsage::from_response(usage, model)
+                    };
                 } else {
                     self.audit_incomplete.store(true, Ordering::Release);
                 }
@@ -169,6 +193,11 @@ pub(crate) fn record_evaluation_request_started() -> Option<u64> {
     EVALUATION_USAGE_RECORDER
         .try_with(|recorder| recorder.start_request())
         .ok()
+}
+
+/// 标记当前评测 future 进入 finalize 阶段；不在评测上下文中时是 no-op。
+pub(crate) fn mark_evaluation_finalize_phase() {
+    let _ = EVALUATION_USAGE_RECORDER.try_with(|recorder| recorder.enter_finalize_phase());
 }
 
 /// 成功收到 provider 响应后补齐对应 attempt 的 usage。
@@ -207,6 +236,7 @@ mod tests {
             usage,
             EvaluationUsage {
                 request_sequence: 0,
+                phase: EvaluationUsagePhase::Turn,
                 response_received: true,
                 model: Some("actual-model".into()),
                 is_complete: true,
@@ -234,6 +264,7 @@ mod tests {
             usage,
             EvaluationUsage {
                 request_sequence: 0,
+                phase: EvaluationUsagePhase::Turn,
                 response_received: true,
                 model: Some("actual-responses-model".into()),
                 is_complete: true,

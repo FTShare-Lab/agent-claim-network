@@ -134,7 +134,7 @@ pub use embedding::{
     EmbeddingClient, OpenAiCompatibleEmbeddingClient,
 };
 pub use evaluation_usage::{
-    with_evaluation_usage_recording, EvaluationUsage, EvaluationUsageRecorder,
+    with_evaluation_usage_recording, EvaluationUsage, EvaluationUsagePhase, EvaluationUsageRecorder,
 };
 pub use memory_review_loop::{MemoryReviewLoop, MEMORY_REVIEW_MAX_TOOL_LOOP_TURNS};
 pub use openai_compatible_chat::{OpenAiCompatibleChatError, OpenAiCompatibleChatProviderAdapter};

@@ -41,6 +41,8 @@ def _write_metric_manifest(
     incomplete_variant: str | None = None,
     claim_producer_variant: str = "A",
     logical_variant_map: dict[str, str] | None = None,
+    quarantine: bool = False,
+    skip_claims: bool = False,
 ) -> Path:
     manifest = root / "task-manifest.json"
     records = []
@@ -62,6 +64,8 @@ def _write_metric_manifest(
                     "verifier_passed": passed,
                     "usage": {
                         "model_requests": requests,
+                        "turn_model_requests": requests - 1,
+                        "finalize_model_requests": 1,
                         "complete_model_responses": requests - incomplete,
                         "incomplete_model_responses": incomplete,
                         "input_tokens": input_tokens,
@@ -93,16 +97,24 @@ def _write_metric_manifest(
                 "gate_hash": hashlib.sha256(gate_path.read_bytes()).hexdigest(),
                 "verifier_passed": passed,
                 "claim_observation": (
-                    {"bundle_available": True} if variant.endswith("claim") else None
+                    {"bundle_available": not quarantine} if variant.endswith("claim") else None
                 ),
             }
         )
+        if skip_claims and variant in {"B_claim", "B_forced_claim"}:
+            records[-1].update(
+                status="not_run", reason="NO_ELIGIBLE_CLAIM", result_path=None, gate_path=None
+            )
+    if skip_claims:
+        cohort = "unpaired_no_claim"
+    elif quarantine:
+        cohort = "failed_producer_quarantine"
+    else:
+        cohort = "success_efficiency" if claim_producer_variant == "A" else "failure_recovery"
     manifest.write_text(
         json.dumps(
             {
-                "experiment_cohort": (
-                    "success_efficiency" if claim_producer_variant == "A" else "failure_recovery"
-                ),
+                "experiment_cohort": cohort,
                 "claim_producer_variant": claim_producer_variant,
                 "logical_variant_map": logical_variant_map,
                 "execution": {"claim_producer_variant": claim_producer_variant},
@@ -116,6 +128,72 @@ def _write_metric_manifest(
 
 
 class PresmokeRunnerTests(unittest.TestCase):
+    def test_success_checkpoint_cannot_hide_an_earlier_terminal_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = build_specs(root)[0]
+            resumed = replace(
+                spec,
+                manifest_path=root / "resumes/resume-001/tasks" / spec.task_id / "manifest.json",
+            )
+            write_completed_task_artifacts(resumed)
+            spec.manifest_path.parent.mkdir(parents=True)
+            spec.manifest_path.write_text(json.dumps({
+                "failure": "GATE_FAILED", "attempt_results": []
+            }))
+            checkpoint = root / "task-completions.json"
+            checkpoint.write_text(json.dumps({
+                "task_results": [{
+                    "task_id": spec.task_id, "status": "passed",
+                    "manifest_path": str(resumed.manifest_path), "error": None,
+                }],
+            }))
+            with self.assertRaisesRegex(ValueError, "多个终态"):
+                load_terminal_task_results((spec,), checkpoint)
+
+    def test_no_eligible_claim_keeps_executed_baselines_in_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = _write_metric_manifest(Path(directory), skip_claims=True)
+            metrics = _cohort_metrics(
+                (PresmokeTaskResult("task-a", "no_eligible_claim", str(manifest), None),)
+            )
+        self.assertEqual(metrics.excluded_tasks, {})
+        row = metrics.rows["unpaired_no_claim"]
+        self.assertEqual(row["variants"]["A"]["attempts"], 1)
+        self.assertEqual(row["variants"]["B_empty"]["attempts"], 1)
+        self.assertEqual(row["variants"]["B_claim"]["attempts"], 0)
+        self.assertEqual(row["paired_against_no_claim_baseline"]["B_claim"]["pairs"], 0)
+
+    def test_stage_request_counts_survive_aggregate_totals_and_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = _write_metric_manifest(Path(directory))
+            row = _cohort_metrics(
+                (PresmokeTaskResult("task-a", "passed", str(manifest), None),)
+            ).rows["success_efficiency"]
+        totals = row["variants"]["B_claim"]["usage_totals"]
+        self.assertEqual(totals["turn_model_requests"], 6)
+        self.assertEqual(totals["finalize_model_requests"], 1)
+        pair = row["paired_against_no_claim_baseline"]["B_claim"]
+        self.assertEqual(pair["usage_delta_totals"]["turn_model_requests"], -2)
+
+    def test_quarantined_producer_keeps_all_arm_metrics_without_claim_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = _write_metric_manifest(
+                Path(directory), claim_producer_variant="B_empty", quarantine=True
+            )
+            metrics = _cohort_metrics(
+                (PresmokeTaskResult("task-a", "passed", str(manifest), None),)
+            )
+
+        self.assertEqual(metrics.excluded_tasks, {})
+        self.assertEqual(metrics.coverage_dict(("task-a",))["included_task_count"], 1)
+        row = metrics.rows["failed_producer_quarantine"]
+        self.assertEqual(row["variants"]["B_empty"]["verifier_pass_rate"], 0.0)
+        self.assertEqual(row["variants"]["A"]["attempts"], 1)
+        for variant in ("B_claim", "B_forced_claim"):
+            self.assertEqual(row["variants"][variant]["empty_claim_bundle_attempts"], 1)
+            self.assertEqual(row["paired_against_no_claim_baseline"][variant]["pairs"], 0)
+
     def test_cohort_metrics_keep_success_efficiency_separate_and_report_paired_usage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

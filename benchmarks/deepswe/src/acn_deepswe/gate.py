@@ -115,7 +115,7 @@ class GateValidator:
         """成功响应的 usage 必须完整；重试前的中断请求只作审计告警。"""
         if usage.model_requests <= 0:
             failures.append("NO_MODEL_REQUEST_RECORDED")
-        elif usage.input_tokens <= 0 or usage.output_tokens <= 0:
+        elif usage.complete_model_responses <= 0:
             failures.append("USAGE_NOT_REPORTED")
         if usage.incomplete_model_responses:
             # 上游/链路的瞬时失败可由后续请求恢复。保留计数，避免它阻断 verifier

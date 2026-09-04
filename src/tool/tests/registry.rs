@@ -470,18 +470,18 @@ async fn evaluation_code_run_removes_configured_secret_from_pipe_environment() {
 #[cfg(unix)]
 #[tokio::test]
 async fn evaluation_code_run_removes_configured_secret_from_pty_environment() {
-    let _secret = EnvVarGuard::set("ACN_TEST_EVALUATION_SECRET", "secret-value");
-    let _visible = EnvVarGuard::set("ACN_TEST_EVALUATION_VISIBLE", "visible-value");
+    let _secret = EnvVarGuard::set("ACN_TEST_EVALUATION_PTY_SECRET", "secret-value");
+    let _visible = EnvVarGuard::set("ACN_TEST_EVALUATION_PTY_VISIBLE", "visible-value");
     let dir = tempfile::tempdir().unwrap();
     let registry = ToolRegistry::new(&test_tool_config(dir.path()))
         .unwrap()
-        .for_evaluation("ACN_TEST_EVALUATION_SECRET".into());
+        .for_evaluation("ACN_TEST_EVALUATION_PTY_SECRET".into());
 
     let result = registry
         .dispatch(
             "code_run",
             json!({
-                "script": "printf 'secret=%s\\nvisible=%s\\n' \"${ACN_TEST_EVALUATION_SECRET-unset}\" \"$ACN_TEST_EVALUATION_VISIBLE\"",
+                "script": "printf 'secret=%s\\nvisible=%s\\n' \"${ACN_TEST_EVALUATION_PTY_SECRET-unset}\" \"$ACN_TEST_EVALUATION_PTY_VISIBLE\"",
                 "tty": true,
             }),
         )

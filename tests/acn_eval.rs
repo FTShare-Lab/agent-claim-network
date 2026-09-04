@@ -200,6 +200,8 @@ fn event_and_result_keep_required_fields_and_explicit_empty_arrays() {
         result_value["usage"],
         json!({
             "model_requests": 0,
+            "turn_model_requests": 0,
+            "finalize_model_requests": 0,
             "complete_model_responses": 0,
             "incomplete_model_responses": 0,
             "audit_incomplete": false,

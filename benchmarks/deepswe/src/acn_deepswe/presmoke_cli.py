@@ -590,12 +590,6 @@ def build_task_specs(
     acn_binary_hash = (
         frozen_runtime.acn_binary_hash if frozen_runtime is not None else _sha256_file(acn_eval)
     )
-    verified_acn_eval = frozen_runtime.acn_eval if frozen_runtime is not None else acn_eval
-    _verify_acn_eval_build_info(
-        verified_acn_eval,
-        expected_revision=config.acn_revision,
-        expected_version=config.acn_version,
-    )
     config_hash = _effective_config_hash(config)
     specs: list[PresmokeTaskSpec] = []
     for task_id in frozen_task_ids:
@@ -632,6 +626,13 @@ def build_task_specs(
         image_content_digest = (
             _docker_image_content_digest(agent_image) if resolve_image_digests else None
         )
+        if not specs and image_content_digest is not None:
+            _verify_acn_eval_build_info(
+                acn_eval,
+                expected_revision=config.acn_revision,
+                expected_version=config.acn_version,
+                image=image_content_digest,
+            )
         provenance = EvaluationProvenance(
             deepswe_revision=deepswe_revision,
             pier_revision=pier_revision,
@@ -971,12 +972,6 @@ def stage_python_runtime(
     for source, label in sources:
         _require_directory(source, label)
         source_hashes[label] = _runtime_tree_hash(source)
-    _verify_acn_eval_build_info(
-        config.acn_eval,
-        expected_revision=config.acn_revision,
-        expected_version=config.acn_version,
-    )
-
     target = config.output_dir / "frozen-python"
     if target.exists():
         if allow_existing:
@@ -1069,16 +1064,25 @@ def _next_resume_root(output_dir: Path) -> Path:
 
 
 def _task_has_partial_artifacts(spec: PresmokeTaskSpec) -> bool:
-    """原 task 目录或任一 arm 输出已出现，即视为中断而非尚未调度。"""
+    """原目录和历次 resume 的 task/arm 产物都参与中断判定，避免续跑绕过重试上限。"""
     source_manifest = spec.execution.a_only_source_manifest if spec.execution is not None else None
     adaptive_source = (
         spec.execution.adaptive_source_manifest if spec.execution is not None else None
     )
-    return spec.manifest_path.exists() or any(
-        Path(attempt.output_path).exists()
-        for attempt in spec.experiment.attempts
+    attempts = tuple(
+        attempt for attempt in spec.experiment.attempts
         if (source_manifest is None or attempt.variant != "A")
         and (adaptive_source is None or attempt.variant in CLAIM_BUNDLE_VARIANTS)
+    )
+    if spec.manifest_path.exists() or any(
+        Path(attempt.output_path).exists()
+        for attempt in attempts
+    ):
+        return True
+    return any(
+        (root / "tasks" / spec.task_id / "manifest.json").exists()
+        or any((root / "attempts" / attempt.attempt_id / "output").exists() for attempt in attempts)
+        for root in (spec.manifest_path.parents[2] / "resumes").glob("resume-*")
     )
 
 
@@ -1426,7 +1430,8 @@ def _harness_mode(raw: Mapping[str, object]) -> str:
 
 
 def _claim_quality_gate(raw: Mapping[str, object]) -> str:
-    value = raw.get("claim_quality_gate", "none")
+    # 失败 producer 的 claim 默认不进入候选集；显式写 "none" 才是无门控的研究通道。
+    value = raw.get("claim_quality_gate", "verified_producer_only")
     if value not in {"none", "verified_producer_only"}:
         raise PresmokeCliError("config.claim_quality_gate 无效")
     return value
@@ -1654,17 +1659,30 @@ def _effective_config_hash(config: PresmokeConfig) -> str:
 
 
 def _verify_acn_eval_build_info(
-    executable: Path, *, expected_revision: str, expected_version: str
+    executable: Path, *, expected_revision: str, expected_version: str, image: str
 ) -> dict[str, str]:
-    """验证将实际上传的二进制来自冻结评测 commit，而非同名路径上的旧构建。"""
+    """在冻结任务镜像中验证 Linux 产物身份，避免宿主平台决定能否执行 ELF。"""
     try:
         completed = subprocess.run(
-            [str(executable), "--build-info-json"],
+            [
+                "docker", "run", "--rm", "--pull=never", "--platform", "linux/amd64",
+                "--network", "none", "--read-only", "--cap-drop=ALL",
+                "--security-opt", "no-new-privileges", "--user", "0:0",
+                "--mount", f"type=bind,src={executable.resolve()},dst=/acn_eval,readonly",
+                "--entrypoint", "/acn_eval", image, "--build-info-json",
+            ],
             check=False,
             capture_output=True,
             text=True,
             timeout=30,
-            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+            env={
+                key: os.environ[key]
+                for key in (
+                    "PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG",
+                    "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH",
+                )
+                if key in os.environ
+            },
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise PresmokeCliError(f"无法读取 acn_eval 构建身份: {executable}") from error

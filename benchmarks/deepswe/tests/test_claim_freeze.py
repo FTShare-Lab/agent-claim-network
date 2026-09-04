@@ -21,6 +21,20 @@ def event(
 
 
 class ClaimFreezeTests(unittest.TestCase):
+    def test_later_inactive_snapshot_revokes_prior_active_claim(self) -> None:
+        for status in ("stale", "disputed", "deprecated"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                ledger = root / "events.jsonl"
+                records = [
+                    event(1, "attempt-a", "claim_snapshot", {"claim": claim("claim-1", "观察", "active")}),
+                    event(2, "attempt-a", "claim_snapshot", {"claim": claim("claim-1", "已失效", status)}),
+                    event(3, "attempt-a", "claim_freeze_barrier", {"barrier_id": "barrier-a"}),
+                ]
+                ledger.write_text("".join(json.dumps(item) + "\n" for item in records))
+                bundle = freeze_claim_bundle(ledger, "attempt-a", root / "claims.json")
+                self.assertEqual(bundle.claims, ())
+
     def test_freeze_uses_only_prior_same_attempt_active_claim_snapshots(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

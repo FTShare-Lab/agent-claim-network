@@ -2,6 +2,31 @@
 
 > 状态：已实现 Pre-smoke 评测基础设施；Smoke 与 Full 的实际执行按冻结配置单独启动并保留 provenance。
 
+## 当前设计决策（2026-09-05）
+
+本节记录当前实现与首期方案的差异；下文保留为首期设计背景，运行契约以本节和
+`benchmarks/deepswe/README.md` 为准，不把历史实施要求视为已完成能力。
+
+- 默认 `claim_quality_gate=verified_producer_only`，只交付正常完成且通过 verifier 的 producer
+  claim。失败 producer 的 claim 被隔离；四臂运行时，结果进入 `failed_producer_quarantine`
+  分层，保留各臂得分与用量，不参与 claim 效果配对。只有显式设置 `none` 才研究失败 claim 的恢复效果。
+- 完整四臂按两波执行：A 与 B_empty 完成后分别 freeze，再执行 B_claim 与 B_forced_claim；
+  所有 attempt 共用冻结的并发许可上限。A-only、B-only 和全量自适应 producer 选择是显式阶段模式。
+- 不自建模型 broker。模型出口由 Pier allowlist 控制，usage 来自 Rust provider 响应记录；
+  `direct` 出口仅供诊断。`formal` 表示满足本 runner 的冻结与隔离要求，仍需核对资源、harness
+  和预算，才能判断是否与外部榜单同口径。
+- agent 异常、截断或 deadline 按未通过计分，即使其 patch 的原始 verifier reward 为 1；
+  原始判卷留在 `pier_trial` / `verifier_regrade`。已知 verifier 基础设施故障只允许冻结 patch 重判一次，
+  不重跑 agent；后续 producer 选择使用实际生效的判卷证据。
+- 产物包含总 usage 和 turn/finalize 请求数；`agent_steps` 包含 finalize 响应，不能直接当作纯解题轮数。
+  当前没有自动生成冻结费率费用、耗时配对或 95% 置信区间。已有同题成功率差和精确 McNemar 检验
+  不替代这些报告项；新旧计量契约的运行产物也不能直接混算。
+- 自适应模式从同批任务的两个无 claim 臂中选全量赢家作为 producer，其基线是另一个臂。
+  该选择依赖观测结果，因此属于探索性分析，不能把该基线称为未经选择的独立 baseline，
+  也不能把其配对 p 值直接解释成预注册固定 producer 实验的因果证据。
+
+## 首期设计背景
+
 ## 结论
 
 首期**不复跑 Claude Code、Codex、Cursor CLI、OpenCode**。这些产品已有公开 DeepSWE 数据，

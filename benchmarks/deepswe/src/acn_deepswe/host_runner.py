@@ -162,7 +162,7 @@ class Task1ExecutionConfig:
     run_a_only: bool = False
     a_only_source_manifest: Path | None = None
     claim_producer_variant: str = "A"
-    claim_quality_gate: str = "none"
+    claim_quality_gate: str = "verified_producer_only"
     run_producer_pair_only: bool = False
     adaptive_source_manifest: Path | None = None
     producer_selection_manifest: Path | None = None
@@ -1203,6 +1203,8 @@ class Task1HostRunner:
             frozen_bundle_sha256, frozen_claim_content_hashes = None, {}
         isolation_checks = self._isolation_checks(attempt, execution, trial_dir, pier)
         verifier = verifier_evidence.verifier_for(attempt.attempt_id)
+        # agent 失败按未通过计分；原始 patch 判卷结果仍完整保留在 Pier evidence 中。
+        verifier_passed = verifier.passed and rust_result.exit_type == "completed"
         claim_observation = _claim_observation(
             attempt.variant,
             rust_result.router_evidence,
@@ -1267,7 +1269,7 @@ class Task1HostRunner:
                 "model": self.experiment.provenance.model,
                 "expected_response_model": execution.expected_response_model,
                 "progress_path": str(progress_path.resolve()),
-                "verifier_passed": verifier.passed,
+                "verifier_passed": verifier_passed,
                 "isolation_checks": isolation_checks,
                 "gate": gate.to_dict(),
             },
@@ -1288,7 +1290,7 @@ class Task1HostRunner:
             reason,
             str(result_path),
             str(gate_path),
-            verifier.passed,
+            verifier_passed,
             claim_observation,
             str(progress_path.resolve()),
         ), tuple(trial_names)
