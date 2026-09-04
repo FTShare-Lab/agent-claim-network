@@ -4361,6 +4361,25 @@ fn discarded_assistant_output_does_not_survive_media_recovery_tool_response() {
 }
 
 #[test]
+fn discarded_assistant_output_keeps_the_last_accepted_prefix() {
+    let mut state = super::TuiState::new();
+    state.begin_pending_turn("continue response".into());
+    state.apply_event(SessionEvent::AssistantTextDelta {
+        text: "kept prefix".into(),
+    });
+    state.apply_event(SessionEvent::AssistantOutputAccepted);
+    state.apply_event(SessionEvent::AssistantTextDelta {
+        text: " ghost suffix".into(),
+    });
+
+    state.apply_event(SessionEvent::AssistantOutputDiscarded);
+
+    let transcript = state.transcript_text();
+    assert!(transcript.contains("kept prefix"));
+    assert!(!transcript.contains("ghost suffix"));
+}
+
+#[test]
 fn running_live_box_uses_configured_visual_row_limit() {
     let mut state = super::TuiState::new();
     state.apply_event(SessionEvent::StatusChanged {

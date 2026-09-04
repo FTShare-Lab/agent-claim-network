@@ -9,6 +9,7 @@ use crate::api::llm_http::{read_llm_error_body, LlmHttpError, LlmHttpPhase};
 use crate::api::ProviderRecoveryInterrupt;
 
 use super::protocol::{ChatCompletionRequest, ChatCompletionResponse};
+use super::redact_chat_error_body;
 use super::streaming::{drain_sse_frames, sse_frame_data, ChatStreamAccumulator};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +33,11 @@ pub enum ChatCompletionsError {
     OutputShape { reason: String, raw: String },
     #[error("Chat Completions streaming 响应损坏或未完整结束: {reason}")]
     StreamFailure { reason: String, raw: String },
+    #[error("Chat Completions upstream failed: code={code:?}, {message}")]
+    Failed {
+        code: Option<String>,
+        message: String,
+    },
     #[error("Chat Completions recovery interrupted")]
     RecoveryInterrupted,
     #[error("Chat Completions request preparation failed: {reason}")]
@@ -136,7 +142,7 @@ impl ChatCompletionsClient {
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
     ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
-        let mut noop = || Ok(());
+        let mut noop = |_| Ok(());
         self.send_with_retry_count_and_mode_and_interrupt_and_start_hook(
             request,
             retry_count,
@@ -159,7 +165,7 @@ impl ChatCompletionsClient {
         retry_after_partial: bool,
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
-        request_started: &mut (dyn FnMut() -> Result<(), ChatCompletionsError> + Send),
+        request_started: &mut (dyn FnMut(bool) -> Result<(), ChatCompletionsError> + Send),
     ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
         if request.stream {
             self.send_streaming_with_retry(
@@ -182,14 +188,22 @@ impl ChatCompletionsClient {
         request: &ChatCompletionRequest,
         retry_count: u32,
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
-        request_started: &mut (dyn FnMut() -> Result<(), ChatCompletionsError> + Send),
+        request_started: &mut (dyn FnMut(bool) -> Result<(), ChatCompletionsError> + Send),
     ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
         let mut last_retryable = None;
+        let mut previous_attempt_ambiguous = false;
         for attempt in 0..=retry_count {
             ensure_recovery_active(recovery_interrupt)?;
-            match self.send_json_once(request, request_started).await {
+            match self
+                .send_json_once(request, previous_attempt_ambiguous, request_started)
+                .await
+            {
                 Ok(value) => return Ok(value),
                 Err(e) if is_retryable(&e) && attempt < retry_count => {
+                    previous_attempt_ambiguous = !matches!(
+                        &e,
+                        ChatCompletionsError::Auth(_) | ChatCompletionsError::Status { .. }
+                    );
                     let backoff =
                         compute_backoff(attempt, self.retry_base_delay, self.retry_max_delay);
                     log::warn!(
@@ -217,7 +231,8 @@ impl ChatCompletionsClient {
     async fn send_json_once(
         &self,
         request: &ChatCompletionRequest,
-        request_started: &mut (dyn FnMut() -> Result<(), ChatCompletionsError> + Send),
+        previous_attempt_ambiguous: bool,
+        request_started: &mut (dyn FnMut(bool) -> Result<(), ChatCompletionsError> + Send),
     ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
         let pending = self
             .http
@@ -225,7 +240,7 @@ impl ChatCompletionsClient {
             .bearer_auth(self.api_key.as_str())
             .header("content-type", "application/json")
             .json(request);
-        request_started()?;
+        request_started(previous_attempt_ambiguous)?;
         let resp = pending
             .send()
             .await
@@ -240,9 +255,10 @@ impl ChatCompletionsClient {
         retry_after_partial: bool,
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
-        request_started: &mut (dyn FnMut() -> Result<(), ChatCompletionsError> + Send),
+        request_started: &mut (dyn FnMut(bool) -> Result<(), ChatCompletionsError> + Send),
     ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
         let mut last_retryable = None;
+        let mut previous_attempt_ambiguous = false;
         for attempt in 0..=retry_count {
             ensure_recovery_active(recovery_interrupt)?;
             let mut emitted = false;
@@ -251,8 +267,13 @@ impl ChatCompletionsClient {
                     emitted = true;
                     emit(event);
                 };
-                self.send_streaming_once(request, &mut tracking_emit, request_started)
-                    .await
+                self.send_streaming_once(
+                    request,
+                    previous_attempt_ambiguous,
+                    &mut tracking_emit,
+                    request_started,
+                )
+                .await
             };
             match result {
                 Ok(value) => return Ok(value),
@@ -261,6 +282,10 @@ impl ChatCompletionsClient {
                         && is_retryable(&e)
                         && attempt < retry_count =>
                 {
+                    previous_attempt_ambiguous = !matches!(
+                        &e,
+                        ChatCompletionsError::Auth(_) | ChatCompletionsError::Status { .. }
+                    );
                     let backoff =
                         compute_backoff(attempt, self.retry_base_delay, self.retry_max_delay);
                     log::warn!(
@@ -288,8 +313,9 @@ impl ChatCompletionsClient {
     async fn send_streaming_once(
         &self,
         request: &ChatCompletionRequest,
+        previous_attempt_ambiguous: bool,
         emit: &mut (dyn FnMut(ChatStreamEvent) + Send),
-        request_started: &mut (dyn FnMut() -> Result<(), ChatCompletionsError> + Send),
+        request_started: &mut (dyn FnMut(bool) -> Result<(), ChatCompletionsError> + Send),
     ) -> Result<ChatCompletionResponse, ChatCompletionsError> {
         let pending = self
             .http
@@ -298,7 +324,7 @@ impl ChatCompletionsClient {
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
             .json(request);
-        request_started()?;
+        request_started(previous_attempt_ambiguous)?;
         let resp = pending
             .send()
             .await
@@ -306,13 +332,13 @@ impl ChatCompletionsClient {
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             let body = read_llm_error_body(resp, self.timeout).await;
-            return Err(ChatCompletionsError::Auth(body));
+            return Err(ChatCompletionsError::Auth(redact_chat_error_body(&body)));
         }
         if !status.is_success() {
             let body = read_llm_error_body(resp, self.timeout).await;
             return Err(ChatCompletionsError::Status {
                 status: status.as_u16(),
-                body,
+                body: redact_chat_error_body(&body),
             });
         }
 
@@ -349,13 +375,13 @@ async fn response_json(
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED {
         let body = read_llm_error_body(resp, timeout).await;
-        return Err(ChatCompletionsError::Auth(body));
+        return Err(ChatCompletionsError::Auth(redact_chat_error_body(&body)));
     }
     if !status.is_success() {
         let body = read_llm_error_body(resp, timeout).await;
         return Err(ChatCompletionsError::Status {
             status: status.as_u16(),
-            body,
+            body: redact_chat_error_body(&body),
         });
     }
     let body = resp.text().await.map_err(|error| {
@@ -372,6 +398,19 @@ fn is_retryable(error: &ChatCompletionsError) -> bool {
     match error {
         ChatCompletionsError::Http(error) => error.is_retryable(),
         ChatCompletionsError::Status { status, .. } => *status == 429 || *status >= 500,
+        ChatCompletionsError::Failed { code, .. } => code.as_deref().is_some_and(|code| {
+            matches!(
+                code,
+                "rate_limit_error"
+                    | "rate_limit_exceeded"
+                    | "server_error"
+                    | "api_error"
+                    | "overloaded_error"
+                    | "internal_server_error"
+                    | "service_unavailable"
+                    | "temporarily_unavailable"
+            )
+        }),
         ChatCompletionsError::StreamFailure { .. } => true,
         ChatCompletionsError::Auth(_)
         | ChatCompletionsError::ResponseJson(_)
@@ -416,6 +455,10 @@ pub(crate) fn is_stream_failure(error: &ChatCompletionsError) -> bool {
     matches!(error, ChatCompletionsError::StreamFailure { .. })
         || matches!(error, ChatCompletionsError::Http(error) if error.is_retryable())
         || matches!(error, ChatCompletionsError::Status { status, .. } if *status == 429 || *status >= 500)
+        || matches!(error, ChatCompletionsError::Failed { code: Some(code), .. } if matches!(code.as_str(),
+            "rate_limit_error" | "rate_limit_exceeded" | "server_error" | "api_error"
+                | "overloaded_error" | "internal_server_error" | "service_unavailable"
+                | "temporarily_unavailable"))
 }
 
 fn compute_backoff(attempt: u32, base: Duration, max: Duration) -> Duration {
@@ -440,6 +483,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    use super::super::REDACTED_CHAT_PAYLOAD;
     use super::*;
     use crate::api::chat_completions::{ChatMessage, ChatToolCall};
 
@@ -684,6 +728,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transient_sse_error_marks_the_retry_ambiguous() {
+        let first = sse_response(vec![json!({
+            "error": {
+                "code": "server_error",
+                "message": "retry later"
+            }
+        })]);
+        let second = sse_response(vec![json!({
+            "error": {
+                "code": "invalid_request_error",
+                "message": "invalid input"
+            }
+        })]);
+        let (endpoint, requests) = spawn_body_sequence(vec![first, second]).await;
+        let client = ChatCompletionsClient::new(
+            endpoint,
+            "test-key".into(),
+            Duration::from_secs(5),
+            1,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let mut starts = Vec::new();
+
+        let error = client
+            .send_with_retry_count_and_mode_and_interrupt_and_start_hook(
+                &request(true),
+                1,
+                false,
+                None,
+                &mut |_| {},
+                &mut |previous_attempt_ambiguous| {
+                    starts.push(previous_attempt_ambiguous);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ChatCompletionsError::Failed { code: Some(code), .. }
+                if code == "invalid_request_error"
+        ));
+        assert_eq!(starts, vec![false, true]);
+        assert_eq!(requests.await.unwrap(), 2);
+    }
+
+    #[tokio::test]
     async fn chat_completions_timeout_error_names_llm_timeout() {
         let endpoint = spawn_hanging_server().await;
         let client = ChatCompletionsClient::new(
@@ -732,6 +826,54 @@ mod tests {
 
         assert!(error.contains("LLM response body"));
         assert!(error.contains("reading LLM stream response body"));
+    }
+
+    #[tokio::test]
+    async fn chat_http_errors_redact_echoed_request_payloads() {
+        let media_secret = "B".repeat(300);
+        let system_secret = "private-system-prompt";
+        let user_secret = "private-user-prompt";
+        let tool_secret = "private-tool-argument";
+        for stream in [false, true] {
+            let body = json!({
+                "error": {
+                    "code":"content_filter",
+                    "message":format!("blocked: {user_secret}"),
+                    "system_prompt":system_secret,
+                    "tool_input":tool_secret,
+                    "image":media_secret
+                },
+                "request": {
+                    "messages": [
+                        {"role":"system", "content":system_secret},
+                        {"role":"user", "content":user_secret},
+                        {"role":"assistant", "tool_calls":[{
+                            "function":{"arguments":tool_secret}
+                        }]}
+                    ]
+                }
+            })
+            .to_string();
+            let endpoint = spawn_raw_response(format!(
+                "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            ))
+            .await;
+            let client = test_client(endpoint);
+
+            let error = client
+                .send(&request(stream), &mut |_| {})
+                .await
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains("content_filter"));
+            assert!(error.contains(REDACTED_CHAT_PAYLOAD));
+            assert!(!error.contains(system_secret));
+            assert!(!error.contains(user_secret));
+            assert!(!error.contains(tool_secret));
+            assert!(!error.contains(&media_secret));
+        }
     }
 
     fn request(stream: bool) -> ChatCompletionRequest {

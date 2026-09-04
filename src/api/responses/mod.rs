@@ -10,6 +10,37 @@ mod websocket;
 
 const REDACTED_RESPONSES_PAYLOAD: &str = "[redacted Responses request/replay payload]";
 
+pub(super) fn is_transient_error_code(code: &str) -> bool {
+    matches!(
+        code,
+        "rate_limit_error"
+            | "rate_limit_exceeded"
+            | "server_error"
+            | "api_error"
+            | "overloaded_error"
+            | "internal_server_error"
+            | "service_unavailable"
+            | "temporarily_unavailable"
+    )
+}
+
+pub(super) fn is_deterministic_request_error_code(code: &str) -> bool {
+    matches!(
+        code,
+        "invalid_request"
+            | "invalid_request_error"
+            | "invalid_prompt"
+            | "invalid_image"
+            | "invalid_image_url"
+            | "image_too_large"
+            | "unsupported_image"
+            | "unsupported_media_type"
+            | "content_filter"
+            | "content_policy_violation"
+            | "safety_violation"
+    )
+}
+
 /// 部分兼容网关把上游 WebSocket 的 1009 大消息关闭包装成 500/502。
 /// 只有同时保留关闭码与明确尺寸原因时才识别，避免把普通网关故障误判为请求过大。
 pub(super) fn is_explicit_websocket_message_too_big(error: &ResponsesError) -> bool {
@@ -20,82 +51,103 @@ pub(super) fn is_explicit_websocket_message_too_big(error: &ResponsesError) -> b
         return false;
     }
     let normalized = body.to_ascii_lowercase();
-    normalized.contains("1009") && normalized.contains("message too big")
+    normalized.contains("websocket_message_too_big")
+        || normalized.contains("1009") && normalized.contains("message too big")
 }
 
 pub(super) fn redact_responses_error_body(body: &str) -> String {
-    let redacted = match serde_json::from_str::<serde_json::Value>(body) {
-        Ok(mut value) => {
-            redact_responses_json_value(&mut value);
-            value.to_string()
-        }
-        Err(_) if contains_responses_payload_key(body) => REDACTED_RESPONSES_PAYLOAD.into(),
-        Err(_) => body.to_string(),
-    };
-    crate::api::redact_media_error_body(&redacted)
-}
-
-fn redact_responses_json_value(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, child) in map {
-                if matches!(
-                    key.as_str(),
-                    "request"
-                        | "request_body"
-                        | "instructions"
-                        | "input"
-                        | "output"
-                        | "reasoning"
-                        | "encrypted_content"
-                ) {
-                    *child = serde_json::Value::String(REDACTED_RESPONSES_PAYLOAD.into());
-                } else {
-                    redact_responses_json_value(child);
-                }
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for child in items {
-                redact_responses_json_value(child);
-            }
-        }
-        serde_json::Value::String(text) => {
-            if let Ok(mut embedded) = serde_json::from_str::<serde_json::Value>(text) {
-                redact_responses_json_value(&mut embedded);
-                *text = embedded.to_string();
-            } else if contains_responses_payload_key(text) {
-                *text = REDACTED_RESPONSES_PAYLOAD.into();
-            }
-        }
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    let mut error = serde_json::json!({"message": REDACTED_RESPONSES_PAYLOAD});
+    if let Some(code) = classified_responses_error_code(body) {
+        error["code"] = serde_json::Value::String(code);
     }
+    serde_json::json!({"error": error}).to_string()
 }
 
-fn contains_responses_payload_key(text: &str) -> bool {
-    const KEYS: &[&str] = &[
-        "request",
-        "request_body",
-        "instructions",
-        "input",
-        "output",
-        "reasoning",
-        "encrypted_content",
-    ];
-    let compact = text
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>();
-    KEYS.iter().any(|key| {
-        [
-            format!("\"{key}\":"),
-            format!("\\\"{key}\\\":"),
-            format!("'{key}':"),
-            format!("\\'{key}\\':"),
-        ]
-        .iter()
-        .any(|pattern| compact.contains(pattern))
-    })
+pub(super) fn redact_responses_error_message_with_code(
+    message: &str,
+    code: Option<&str>,
+) -> String {
+    let normalized = message.to_ascii_lowercase();
+    let classified = if normalized.contains("1009") && normalized.contains("message too big") {
+        "websocket_message_too_big".to_string()
+    } else {
+        match code {
+            Some(code)
+                if crate::api::is_provider_non_request_error_code(code)
+                    || !matches!(code, "invalid_request" | "invalid_request_error") =>
+            {
+                code.to_string()
+            }
+            _ => classified_responses_error_code(message)
+                .or_else(|| code.map(str::to_string))
+                .unwrap_or_else(|| "redacted".into()),
+        }
+    };
+    format!("{classified}: {REDACTED_RESPONSES_PAYLOAD}")
+}
+
+pub(super) fn safe_responses_error_code(code: &str) -> Option<&str> {
+    if is_transient_error_code(code)
+        || is_deterministic_request_error_code(code)
+        || crate::api::is_context_window_error_body(code)
+        || crate::api::is_provider_non_request_error_code(code)
+        || crate::api::is_provider_request_too_large_code(code)
+        || code == "websocket_message_too_big"
+    {
+        return Some(code);
+    }
+    None
+}
+
+fn classified_responses_error_code(body: &str) -> Option<String> {
+    let normalized = body.to_ascii_lowercase();
+    if normalized.contains("1009") && normalized.contains("message too big") {
+        return Some("websocket_message_too_big".into());
+    }
+    let structured_code = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| structured_responses_error_code(&value).map(str::to_string));
+    if let Some(code) = structured_code.as_deref() {
+        if crate::api::is_provider_non_request_error_code(code)
+            || !matches!(code, "invalid_request" | "invalid_request_error")
+        {
+            return Some(
+                safe_responses_error_code(code)
+                    .unwrap_or("redacted")
+                    .to_string(),
+            );
+        }
+    }
+    let classification_text =
+        crate::api::provider_error_message(body).unwrap_or_else(|| body.to_string());
+    if crate::api::is_context_window_error_body(&classification_text) {
+        return Some("context_length_exceeded".into());
+    }
+    if crate::api::is_content_policy_error_body(&classification_text) {
+        return Some(content_policy_code(&classification_text).into());
+    }
+    if crate::api::is_provider_media_error(structured_code.as_deref(), &classification_text) {
+        return Some("unsupported_media_type".into());
+    }
+    structured_code
+        .as_deref()
+        .and_then(safe_responses_error_code)
+        .map(str::to_string)
+}
+
+fn structured_responses_error_code(value: &serde_json::Value) -> Option<&str> {
+    crate::api::structured_provider_error_code(value)
+}
+
+fn content_policy_code(body: &str) -> &'static str {
+    let normalized = body.to_ascii_lowercase();
+    if normalized.contains("content_policy_violation") {
+        "content_policy_violation"
+    } else if normalized.contains("safety_violation") {
+        "safety_violation"
+    } else {
+        "content_filter"
+    }
 }
 
 pub(crate) use client::is_stream_recovery_failure;
@@ -173,8 +225,36 @@ mod tests {
         ] {
             let redacted = redact_responses_error_body(body);
 
-            assert_eq!(redacted, REDACTED_RESPONSES_PAYLOAD);
+            assert!(redacted.contains(REDACTED_RESPONSES_PAYLOAD));
             assert!(!redacted.contains("secret-"));
         }
+    }
+
+    #[test]
+    fn generic_code_only_classifies_the_error_message() {
+        let body = r#"{"error":{"code":"invalid_request_error","message":"invalid tool schema"},"request":{"input":"maximum context length content_filter"}}"#;
+
+        let redacted = redact_responses_error_body(body);
+
+        assert!(redacted.contains("invalid_request_error"));
+        assert!(!redacted.contains("context_length_exceeded"));
+        assert!(!redacted.contains("content_filter"));
+    }
+
+    #[test]
+    fn redaction_preserves_the_difference_between_absent_and_unknown_codes() {
+        let without_code =
+            redact_responses_error_body(r#"{"error":{"message":"ordinary invalid parameter"}}"#);
+        assert!(crate::api::provider_error_code(&without_code).is_none());
+        assert!(crate::api::is_provider_request_error(422, &without_code));
+
+        let unknown_code = redact_responses_error_body(
+            r#"{"error":{"code":"future_error","message":"maximum context length"}}"#,
+        );
+        assert_eq!(
+            crate::api::provider_error_code(&unknown_code).as_deref(),
+            Some("redacted")
+        );
+        assert!(!crate::api::is_provider_request_error(400, &unknown_code));
     }
 }

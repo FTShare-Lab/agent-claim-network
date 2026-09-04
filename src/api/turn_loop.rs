@@ -6,7 +6,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,7 +24,8 @@ use tokio::time::Instant;
 
 use super::continuation::{append_with_overlap_dedupe, CONTINUATION_TRIGGER};
 use super::provider::{
-    ProviderNoConsumableOutput, ProviderRequestObserver, ProviderRequestPreparationFailure,
+    ProviderContextWindowExceeded, ProviderMediaRejected, ProviderNoConsumableOutput,
+    ProviderRequestObserver, ProviderRequestPreparationFailure, ProviderRequestRejected,
     ProviderRequestTooLarge, ProviderStreamFailure, ProviderTerminalFailure,
 };
 use crate::api::{
@@ -57,11 +58,20 @@ const OVERSIZED_IMAGE_PLACEHOLDER: &str =
     "[image attachment removed after upstream request_too_large]";
 const OVERSIZED_DOCUMENT_PLACEHOLDER: &str =
     "[document attachment removed after upstream request_too_large]";
+const REJECTED_IMAGE_PLACEHOLDER: &str =
+    "[image attachment removed after provider rejected media input]";
+const REJECTED_DOCUMENT_PLACEHOLDER: &str =
+    "[document attachment removed after provider rejected media input]";
 const OVERSIZED_MEDIA_RECOVERY_CONTEXT: &str = r#"<request_size_recovery>
 The previous provider request exceeded the upstream size limit. All image and document payloads were removed before this retry, so their pixels or document contents are not available in the current model context.
 
 If completing the task still requires visual or document inspection, use the available file-reading tool to read only the few local files necessary to complete the task. For attachments without a readable local path, ask the user to provide a smaller file in a later message.
 </request_size_recovery>"#;
+const REJECTED_MEDIA_RECOVERY_CONTEXT: &str = r#"<media_recovery>
+The previous provider request rejected image or document input. All image and document payloads were removed before this retry, so their pixels or document contents are not available in the current model context.
+
+If completing the task still requires visual or document inspection, use the available file-reading tool to read only the few local files necessary to complete the task. For attachments without a readable local path, ask the user to provide a supported file in a later message.
+</media_recovery>"#;
 // Provider WAL 是发起网络 I/O 前的内部保护边界，不与用户可配置的
 // LLM 请求超时共用几分钟的等待时间。
 const PROVIDER_WAL_PREPARATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -83,27 +93,38 @@ struct ProviderCallOutcome {
 ///
 /// adapter continuation 只能追加 replay message；main 路径在更新内存基线前
 /// 先通过 preflight 写 WAL，child 路径则至少在当前 execution 内保留同一前缀。
-struct ProviderRequestProgress<'a> {
+struct ProviderRequestProgress<'preflight, 'recorder> {
     latest_messages: Vec<SessionTurnMessage>,
-    preflight: Option<&'a mut dyn SessionTurnPreflight>,
+    preflight: Option<&'preflight mut dyn SessionTurnPreflight>,
+    durable_recorder: Option<&'recorder mut dyn SessionTurnEventRecorder>,
     canonical_tail_count: usize,
     preparing_write_ahead: Arc<AtomicBool>,
+    unaccepted_visible_output: Arc<AtomicBool>,
+    visible_output_bytes: Arc<AtomicUsize>,
+    accepted_visible_output_bytes: Arc<AtomicUsize>,
     latest_request_started: bool,
+    ambiguous_send_seen: bool,
     previous_messages_before_pending: Option<Vec<SessionTurnMessage>>,
 }
 
-impl<'a> ProviderRequestProgress<'a> {
+impl<'preflight, 'recorder> ProviderRequestProgress<'preflight, 'recorder> {
     fn new(
         latest_messages: Vec<SessionTurnMessage>,
-        preflight: Option<&'a mut dyn SessionTurnPreflight>,
+        preflight: Option<&'preflight mut dyn SessionTurnPreflight>,
+        durable_recorder: Option<&'recorder mut dyn SessionTurnEventRecorder>,
         canonical_tail_count: usize,
     ) -> Self {
         Self {
             latest_messages,
             preflight,
+            durable_recorder,
             canonical_tail_count,
             preparing_write_ahead: Arc::new(AtomicBool::new(false)),
+            unaccepted_visible_output: Arc::new(AtomicBool::new(false)),
+            visible_output_bytes: Arc::new(AtomicUsize::new(0)),
+            accepted_visible_output_bytes: Arc::new(AtomicUsize::new(0)),
             latest_request_started: false,
+            ambiguous_send_seen: false,
             previous_messages_before_pending: None,
         }
     }
@@ -112,11 +133,22 @@ impl<'a> ProviderRequestProgress<'a> {
         &self.latest_messages
     }
 
-    fn take_preflight(&mut self) -> Option<&'a mut dyn SessionTurnPreflight> {
+    fn take_preflight(&mut self) -> Option<&'preflight mut dyn SessionTurnPreflight> {
         self.preflight.take()
     }
 
+    fn take_durable_recorder(&mut self) -> Option<&'recorder mut dyn SessionTurnEventRecorder> {
+        self.durable_recorder.take()
+    }
+
+    async fn record_durable_event(&mut self, event: SessionTurnEvent) -> anyhow::Result<()> {
+        record_durable_event(&mut self.durable_recorder, event).await
+    }
+
     fn begin_provider_attempt(&mut self) {
+        if self.latest_request_started {
+            self.ambiguous_send_seen = true;
+        }
         self.preparing_write_ahead.store(false, Ordering::Release);
         self.latest_request_started = false;
     }
@@ -137,10 +169,64 @@ impl<'a> ProviderRequestProgress<'a> {
     fn write_ahead_phase(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.preparing_write_ahead)
     }
+
+    fn unaccepted_visible_output_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.unaccepted_visible_output)
+    }
+
+    fn visible_output_bytes_flag(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.visible_output_bytes)
+    }
+
+    fn accepted_visible_output_bytes_flag(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.accepted_visible_output_bytes)
+    }
+
+    fn has_unaccepted_visible_output(&self) -> bool {
+        self.unaccepted_visible_output.load(Ordering::Acquire)
+    }
+
+    fn reset_visible_output_counter_for_fallback(&self) {
+        let accepted_bytes = self.accepted_visible_output_bytes.load(Ordering::Acquire);
+        self.visible_output_bytes
+            .store(accepted_bytes, Ordering::Release);
+    }
+
+    fn ambiguous_send_seen(&self) -> bool {
+        self.ambiguous_send_seen
+    }
+}
+
+#[cfg(test)]
+mod accepted_request_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn accepted_internal_response_clears_retry_ambiguity() {
+        let messages = vec![SessionTurnMessage::user_text("continue")];
+        let mut progress = ProviderRequestProgress::new(messages.clone(), None, None, 1);
+        progress
+            .provider_request_started_after(&messages, true)
+            .unwrap();
+        assert!(progress.ambiguous_send_seen());
+        progress
+            .provider_response_accepted(&messages)
+            .await
+            .unwrap();
+        assert!(!progress.ambiguous_send_seen());
+        let mut continuation = messages;
+        continuation.push(SessionTurnMessage::assistant_text("partial"));
+        progress
+            .before_provider_request(&continuation)
+            .await
+            .unwrap();
+        progress.provider_request_started(&continuation).unwrap();
+        assert!(!progress.ambiguous_send_seen());
+    }
 }
 
 #[async_trait]
-impl ProviderRequestObserver for ProviderRequestProgress<'_> {
+impl ProviderRequestObserver for ProviderRequestProgress<'_, '_> {
     async fn before_provider_request(
         &mut self,
         messages: &[SessionTurnMessage],
@@ -191,6 +277,14 @@ impl ProviderRequestObserver for ProviderRequestProgress<'_> {
     }
 
     fn provider_request_started(&mut self, messages: &[SessionTurnMessage]) -> anyhow::Result<()> {
+        self.provider_request_started_after(messages, false)
+    }
+
+    fn provider_request_started_after(
+        &mut self,
+        messages: &[SessionTurnMessage],
+        previous_attempt_ambiguous: bool,
+    ) -> anyhow::Result<()> {
         if messages != self.latest_messages {
             return Err(ProviderRequestPreparationFailure::new(
                 "adapter 标记发送的 Provider 请求与最新 WAL 不一致",
@@ -200,8 +294,49 @@ impl ProviderRequestObserver for ProviderRequestProgress<'_> {
         if let Some(preflight) = self.preflight.as_deref_mut() {
             preflight.provider_request_started(messages)?;
         }
+        if previous_attempt_ambiguous {
+            self.ambiguous_send_seen = true;
+        }
         self.latest_request_started = true;
         self.previous_messages_before_pending = None;
+        Ok(())
+    }
+
+    fn provider_request_outcome_resolved(
+        &mut self,
+        messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<()> {
+        if messages != self.latest_messages {
+            return Err(ProviderRequestPreparationFailure::new(
+                "adapter 标记终态的 Provider 请求与最新 WAL 不一致",
+            )
+            .into());
+        }
+        self.latest_request_started = false;
+        Ok(())
+    }
+
+    async fn provider_response_accepted(
+        &mut self,
+        messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<()> {
+        self.provider_request_outcome_resolved(messages)?;
+        self.ambiguous_send_seen = false;
+        let visible_output_bytes = self.visible_output_bytes.load(Ordering::Acquire);
+        let accepted_visible_output_bytes =
+            self.accepted_visible_output_bytes.load(Ordering::Acquire);
+        if visible_output_bytes > accepted_visible_output_bytes {
+            self.record_durable_event(SessionTurnEvent::AssistantOutputAccepted)
+                .await
+                .map_err(ProviderRequestPreparationFailure::from_error)?;
+        }
+        if let Some(preflight) = self.preflight.as_deref_mut() {
+            preflight.provider_response_accepted();
+        }
+        self.accepted_visible_output_bytes
+            .store(visible_output_bytes, Ordering::Release);
+        self.unaccepted_visible_output
+            .store(false, Ordering::Release);
         Ok(())
     }
 
@@ -329,7 +464,27 @@ const MAX_PROGRESS_EVENTS_PER_DRAIN: usize = 64;
 
 #[async_trait]
 pub trait SessionTurnEventRecorder: Send {
+    async fn record_historical_media_cleanup(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn record(&mut self, event: SessionTurnEvent) -> anyhow::Result<()>;
+
+    /// 在清理确定性拒绝的 request WAL 前，先持久化可恢复的拒绝决策。
+    async fn record_provider_request_rejected(
+        &mut self,
+        _rejection_id: u64,
+        _discard_turn: bool,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// 自动恢复开始准备下一代 request WAL；旧拒绝 marker 不再是 turn 终态。
+    async fn record_provider_request_retried_after_rejection(
+        &mut self,
+        _rejection_id: u64,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// 在包含该快照的 provider request 发出前写入 owner 的现有 durable transcript。
     async fn record_completed_message(
@@ -437,6 +592,15 @@ pub trait SessionTurnPreflight: Send {
         Ok(())
     }
 
+    /// turn loop 已把被拒请求中的媒体替换为占位符；下一次 request 的回滚快照
+    /// 也必须使用清理后的前缀，避免后续确定性失败重新带回原始附件。
+    async fn provider_request_cleaned_for_retry(
+        &mut self,
+        _recovery_context: &SessionTurnMessage,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// 下一次 provider request 必须先执行上下文窗口恢复压缩。
     /// 默认实现拒绝恢复，避免没有 compaction owner 的调用方原样重放满窗口请求。
     fn request_context_window_recovery(
@@ -444,6 +608,37 @@ pub trait SessionTurnPreflight: Send {
         _assistant_marker: &SessionTurnMessage,
     ) -> anyhow::Result<()> {
         anyhow::bail!("模型上下文已满，但当前 ACN 调用链未接入自动恢复")
+    }
+
+    /// Provider 在发送完整请求后以 context-window 错误拒绝；实现方必须保护当前
+    /// active tail，并在下一次请求前执行同一压缩恢复。
+    async fn request_context_window_recovery_for_rejected_request(
+        &mut self,
+        _provider_messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("模型上下文已满，但当前 ACN 调用链未接入自动恢复")
+    }
+
+    /// Provider 已返回确定性拒绝。实现方先持久化 WAL 回滚快照，再返回本 turn
+    /// 是否已有必须保留的已确认进度；普通 transport 失败不会调用此 hook。
+    async fn prepare_provider_request_rejection(
+        &mut self,
+        _rejection_id: u64,
+    ) -> anyhow::Result<ProviderRejectedRequestRecovery> {
+        Ok(ProviderRejectedRequestRecovery::DiscardTurn)
+    }
+
+    /// 拒绝决策已进入 durable journal 后，应用此前准备的 WAL 回滚快照。
+    async fn apply_provider_request_rejection(&mut self, _rejection_id: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// 自动恢复的新 request WAL 与 supersede marker 均已持久化；此时可删除旧拒绝快照。
+    async fn finish_provider_request_retry_after_rejection(
+        &mut self,
+        _rejection_id: u64,
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 
     fn observe_provider_context_usage(
@@ -455,11 +650,88 @@ pub trait SessionTurnPreflight: Send {
 
     fn clear_provider_context_usage(&mut self) {}
 
+    /// adapter 内部 continuation 的一轮响应已通过基本协议校验。
+    fn provider_response_accepted(&mut self) {}
+
     /// provider 已经成功返回并通过基本协议校验。runtime-only state 可在这里提交
     /// "本 request 已实际交付" 的有界消费；失败、取消和 retry 不会调用它。
     async fn after_provider_response_success(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderRejectedRequestRecovery {
+    DiscardTurn,
+    PreserveTurnProgress,
+}
+
+fn rejected_request_error(
+    message: impl Into<String>,
+    discard_visible_output: bool,
+    recovery: ProviderRejectedRequestRecovery,
+) -> ProviderRequestRejected {
+    match recovery {
+        ProviderRejectedRequestRecovery::DiscardTurn => {
+            if discard_visible_output {
+                ProviderRequestRejected::after_visible_output(message)
+            } else {
+                ProviderRequestRejected::new(message)
+            }
+        }
+        ProviderRejectedRequestRecovery::PreserveTurnProgress => {
+            ProviderRequestRejected::preserving_turn_progress(message, discard_visible_output)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AppliedRejectedRequestRecovery {
+    rejection_id: u64,
+    recovery: ProviderRejectedRequestRecovery,
+}
+
+async fn apply_rejected_request_recovery(
+    preflight: &mut Option<&mut dyn SessionTurnPreflight>,
+    durable_recorder: &mut Option<&mut dyn SessionTurnEventRecorder>,
+    next_rejection_id: &mut u64,
+) -> anyhow::Result<AppliedRejectedRequestRecovery> {
+    *next_rejection_id = next_rejection_id
+        .checked_add(1)
+        .context("Provider 拒绝 generation 溢出")?;
+    let rejection_id = *next_rejection_id;
+    let recovery = if let Some(preflight) = preflight.as_deref_mut() {
+        preflight
+            .prepare_provider_request_rejection(rejection_id)
+            .await?
+    } else {
+        ProviderRejectedRequestRecovery::DiscardTurn
+    };
+    if let Some(recorder) = durable_recorder.as_deref_mut() {
+        recorder
+            .record_provider_request_rejected(
+                rejection_id,
+                recovery == ProviderRejectedRequestRecovery::DiscardTurn,
+            )
+            .await?;
+    }
+    if let Some(preflight) = preflight.as_deref_mut() {
+        if let Err(error) = preflight
+            .apply_provider_request_rejection(rejection_id)
+            .await
+        {
+            return Err(rejected_request_error(
+                format!("Provider 拒绝决策已持久化，但 WAL 回滚需在重启时恢复: {error:#}"),
+                false,
+                recovery,
+            )
+            .into());
+        }
+    }
+    Ok(AppliedRejectedRequestRecovery {
+        rejection_id,
+        recovery,
+    })
 }
 
 /// 一次 turn 调用可选的持久化、上下文观察与压缩 hook 集合。
@@ -1487,7 +1759,7 @@ impl AgentTurnLoop {
         .await?;
         // 精确 Provider WAL 缺失、identity 变化，或进程在 clean WAL 写入前退出时，
         // canonical/journal 中的恢复边界仍必须阻止旧媒体重新进入请求。
-        if replace_media_before_latest_request_size_recovery(&mut provider_messages) > 0 {
+        if replace_media_before_latest_recovery_boundary(&mut provider_messages) > 0 {
             self.provider.discard_runtime_chain(runtime_chain_id).await;
         }
         let mut frozen_provider_prefix = FrozenProviderRequestPrefix::new(
@@ -1515,6 +1787,9 @@ impl AgentTurnLoop {
         let mut pending_process_deliveries = Vec::<PendingProcessDelivery>::new();
         let mut context_continuation = ContextWindowContinuation::default();
         let mut context_window_recoveries = 0usize;
+        let mut rejected_context_recovery_pending: Option<AppliedRejectedRequestRecovery> = None;
+        let mut next_provider_rejection_id = 0u64;
+        let mut ambiguous_provider_send_seen = false;
         let mut turn_idx = 0usize;
         let mut provider_request_idx = 0usize;
         loop {
@@ -1558,9 +1833,22 @@ impl AgentTurnLoop {
                 None
             };
             if let Some(preflight) = preflight.as_mut() {
-                preflight
+                let result = preflight
                     .before_provider_request(&mut system_prompt, &mut provider_messages, emit)
-                    .await?;
+                    .await;
+                if let Err(error) = result {
+                    if let Some(applied) = rejected_context_recovery_pending {
+                        return Err(rejected_request_error(
+                            format!(
+                                "{error:#}\n本次失败请求已从历史中移除，请缩短请求后重试或新建会话。"
+                            ),
+                            false,
+                            applied.recovery,
+                        )
+                        .into());
+                    }
+                    return Err(error);
+                }
             }
             let history_replaced = preflight
                 .as_deref_mut()
@@ -1603,7 +1891,7 @@ impl AgentTurnLoop {
                 // runtime-chain sticky HTTP 状态仍可保留，下一请求必须发送完整新窗口。
                 self.provider.discard_runtime_chain(runtime_chain_id).await;
             }
-            if replace_media_before_latest_request_size_recovery(&mut provider_messages) > 0 {
+            if replace_media_before_latest_recovery_boundary(&mut provider_messages) > 0 {
                 // projection 在 compaction 或其他 provider history 重建后重新剥离了旧
                 // 媒体；旧 cache/replay 已不再描述实际请求，必须从干净窗口开新链。
                 frozen_provider_prefix.clear();
@@ -1668,9 +1956,19 @@ impl AgentTurnLoop {
                     .into()),
                 };
                 if let Err(error) = request_ready {
-                    if let Err(rollback_error) =
-                        preflight.provider_request_abandoned_before_send().await
-                    {
+                    let rollback = preflight.provider_request_abandoned_before_send().await;
+                    if let Some(applied) = rejected_context_recovery_pending {
+                        let message = match rollback {
+                            Ok(()) => format!(
+                                "{error:#}\n自动恢复的新请求未发送；原拒绝请求仍已从历史中移除，请重试或新建会话。"
+                            ),
+                            Err(rollback_error) => format!(
+                                "{error:#}\n回滚确定未发送的 Provider request WAL 失败: {rollback_error:#}"
+                            ),
+                        };
+                        return Err(rejected_request_error(message, false, applied.recovery).into());
+                    }
+                    if let Err(rollback_error) = rollback {
                         return Err(error.context(format!(
                             "回滚确定未发送的 Provider request WAL 失败: {rollback_error:#}"
                         )));
@@ -1678,11 +1976,48 @@ impl AgentTurnLoop {
                     return Err(error);
                 }
             }
+            if let Some(applied) = rejected_context_recovery_pending {
+                if let Some(recorder) = durable_recorder.as_deref_mut() {
+                    if let Err(error) = recorder
+                        .record_provider_request_retried_after_rejection(applied.rejection_id)
+                        .await
+                    {
+                        let rollback = match preflight.as_deref_mut() {
+                            Some(preflight) => {
+                                preflight.provider_request_abandoned_before_send().await
+                            }
+                            None => Ok(()),
+                        };
+                        let message = match rollback {
+                            Ok(()) => format!(
+                                "记录 Provider 拒绝后的自动恢复请求失败: {error:#}\n自动恢复的新请求未发送；原拒绝请求仍已从历史中移除。"
+                            ),
+                            Err(rollback_error) => format!(
+                                "记录 Provider 拒绝后的自动恢复请求失败: {error:#}\n回滚确定未发送的 Provider request WAL 失败: {rollback_error:#}"
+                            ),
+                        };
+                        return Err(rejected_request_error(message, false, applied.recovery).into());
+                    }
+                }
+                if let Some(preflight) = preflight.as_deref_mut() {
+                    if let Err(error) = preflight
+                        .finish_provider_request_retry_after_rejection(applied.rejection_id)
+                        .await
+                    {
+                        log::warn!(
+                            target: "agent",
+                            "清理已 supersede 的 Provider 拒绝恢复记录失败，重启时将继续清理: {error:#}"
+                        );
+                    }
+                }
+            }
+            rejected_context_recovery_pending = None;
             let mut latest_provider_context_usage = None;
-            let provider_call = {
+            let (provider_call, call_had_ambiguous_send) = {
                 let mut request_progress = ProviderRequestProgress::new(
                     request_messages.clone(),
                     preflight.take(),
+                    durable_recorder.take(),
                     committed.len(),
                 );
                 let mut provider_emit = |event| {
@@ -1705,7 +2040,6 @@ impl AgentTurnLoop {
                         &request_messages,
                         &context_continuation,
                         &mut provider_emit,
-                        &mut durable_recorder,
                         &seen_tool_use_ids,
                         provider_interrupt.as_ref(),
                         provider_recovery_interrupt.as_ref(),
@@ -1714,11 +2048,50 @@ impl AgentTurnLoop {
                         &mut request_progress,
                     )
                     .await;
+                let call_had_ambiguous_send = request_progress.ambiguous_send_seen();
+                if result.as_ref().err().is_some_and(|error| {
+                    error.is::<ProviderRequestTooLarge>() || error.is::<ProviderMediaRejected>()
+                }) {
+                    append_adapter_continuation_suffix_to_raw_history(
+                        &mut provider_messages,
+                        &request_messages,
+                        request_progress.latest_messages(),
+                    )?;
+                }
                 preflight = request_progress.take_preflight();
-                result
+                durable_recorder = request_progress.take_durable_recorder();
+                (result, call_had_ambiguous_send)
             };
+            ambiguous_provider_send_seen |= call_had_ambiguous_send;
             let provider_call = match provider_call {
                 Ok(provider_call) => provider_call,
+                Err(error)
+                    if ambiguous_provider_send_seen && rejected_error_clears_turn_wal(&error) =>
+                {
+                    let discard_visible_output = error
+                        .downcast_ref::<ProviderRequestTooLarge>()
+                        .is_some_and(ProviderRequestTooLarge::should_discard_visible_output)
+                        || error
+                            .downcast_ref::<ProviderContextWindowExceeded>()
+                            .is_some_and(
+                                ProviderContextWindowExceeded::should_discard_visible_output,
+                            )
+                        || error
+                            .downcast_ref::<ProviderMediaRejected>()
+                            .is_some_and(ProviderMediaRejected::should_discard_visible_output)
+                        || error
+                            .downcast_ref::<ProviderRequestRejected>()
+                            .is_some_and(ProviderRequestRejected::should_discard_visible_output);
+                    if discard_visible_output {
+                        let discarded = SessionTurnEvent::AssistantOutputDiscarded;
+                        record_durable_event(&mut durable_recorder, discarded.clone()).await?;
+                        emit(discarded);
+                    }
+                    return Err(ProviderTerminalFailure::new(format!(
+                        "更早的 Provider 请求发送结果不明确；保留请求历史以供恢复: {error:#}"
+                    ))
+                    .into());
+                }
                 Err(error)
                     if error.downcast_ref::<ProviderRequestTooLarge>().is_some()
                         && replace_oversized_provider_media(&mut provider_messages) > 0 =>
@@ -1738,6 +2111,16 @@ impl AgentTurnLoop {
                         ),
                         self.now(),
                     );
+                    if let Some(preflight) = preflight.as_deref_mut() {
+                        if preflight
+                            .provider_request_cleaned_for_retry(&recovery_context.message)
+                            .await?
+                        {
+                            if let Some(recorder) = durable_recorder.as_deref_mut() {
+                                recorder.record_historical_media_cleanup().await?;
+                            }
+                        }
+                    }
                     // journal 必须先于恢复请求持久化；成功 turn 再由 committed 进入
                     // canonical。每次真实剥离都追加新边界，不能按相同 fingerprint 去重。
                     if let Some(recorder) = durable_recorder.as_deref_mut() {
@@ -1753,6 +2136,159 @@ impl AgentTurnLoop {
                     record_durable_event(&mut durable_recorder, warning.clone()).await?;
                     emit(warning);
                     continue;
+                }
+                Err(error)
+                    if error.downcast_ref::<ProviderMediaRejected>().is_some()
+                        && replace_rejected_provider_media(&mut provider_messages) > 0 =>
+                {
+                    if error
+                        .downcast_ref::<ProviderMediaRejected>()
+                        .is_some_and(ProviderMediaRejected::should_discard_visible_output)
+                    {
+                        let discarded = SessionTurnEvent::AssistantOutputDiscarded;
+                        record_durable_event(&mut durable_recorder, discarded.clone()).await?;
+                        emit(discarded);
+                    }
+                    let recovery_context = CompletedSessionTurnMessage::new(
+                        SessionTurnMessage::model_context(
+                            ModelContextSource::RequestSizeRecovery,
+                            REJECTED_MEDIA_RECOVERY_CONTEXT,
+                        ),
+                        self.now(),
+                    );
+                    if let Some(preflight) = preflight.as_deref_mut() {
+                        if preflight
+                            .provider_request_cleaned_for_retry(&recovery_context.message)
+                            .await?
+                        {
+                            if let Some(recorder) = durable_recorder.as_deref_mut() {
+                                recorder.record_historical_media_cleanup().await?;
+                            }
+                        }
+                    }
+                    if let Some(recorder) = durable_recorder.as_deref_mut() {
+                        recorder.record_completed_message(&recovery_context).await?;
+                    }
+                    provider_messages.push(recovery_context.message.clone());
+                    committed.push(recovery_context);
+                    frozen_provider_prefix.clear();
+                    self.provider.discard_runtime_chain(runtime_chain_id).await;
+                    let warning = SessionTurnEvent::Warning {
+                        message: "上游拒绝了请求中的图片 / PDF；已从上下文中移除这些附件并重试。"
+                            .into(),
+                    };
+                    record_durable_event(&mut durable_recorder, warning.clone()).await?;
+                    emit(warning);
+                    continue;
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<ProviderContextWindowExceeded>()
+                        .is_some() =>
+                {
+                    if error
+                        .downcast_ref::<ProviderContextWindowExceeded>()
+                        .is_some_and(ProviderContextWindowExceeded::should_discard_visible_output)
+                    {
+                        let discarded = SessionTurnEvent::AssistantOutputDiscarded;
+                        record_durable_event(&mut durable_recorder, discarded.clone()).await?;
+                        emit(discarded);
+                    }
+                    if preflight.is_none() {
+                        return Err(ProviderRequestRejected::new(
+                            "模型上下文已满，但当前 ACN 调用链未接入自动恢复。本次失败请求未进入后续历史，请新建会话。",
+                        )
+                        .into());
+                    }
+                    let applied = apply_rejected_request_recovery(
+                        &mut preflight,
+                        &mut durable_recorder,
+                        &mut next_provider_rejection_id,
+                    )
+                    .await
+                    .with_context(|| "清除被上下文窗口拒绝的 Provider request WAL 失败")?;
+                    frozen_provider_prefix.clear();
+                    self.provider.discard_runtime_chain(runtime_chain_id).await;
+                    if context_window_recoveries >= MAX_CONTEXT_WINDOW_RECOVERIES {
+                        return Err(rejected_request_error(
+                            format!(
+                                "模型上下文已满；自动压缩并重试 {MAX_CONTEXT_WINDOW_RECOVERIES} 次后仍失败。本次失败请求已从历史中移除，请缩短请求后重试或新建会话。"
+                            ),
+                            false,
+                            applied.recovery,
+                        )
+                        .into());
+                    }
+                    preflight
+                        .as_deref_mut()
+                        .context("上下文窗口恢复缺少 preflight owner")?
+                        .request_context_window_recovery_for_rejected_request(&provider_messages)
+                        .await
+                        .map_err(|recovery_error| {
+                            rejected_request_error(
+                                format!(
+                                    "{recovery_error:#}\n本次失败请求已从历史中移除，请缩短请求后重试或新建会话。"
+                                ),
+                                false,
+                                applied.recovery,
+                            )
+                        })?;
+                    context_window_recoveries = context_window_recoveries.saturating_add(1);
+                    rejected_context_recovery_pending = Some(applied);
+                    continue;
+                }
+                Err(error)
+                    if error.downcast_ref::<ProviderRequestRejected>().is_some()
+                        || error.downcast_ref::<ProviderMediaRejected>().is_some()
+                        || error.downcast_ref::<ProviderRequestTooLarge>().is_some() =>
+                {
+                    let discard_visible_output = error
+                        .downcast_ref::<ProviderRequestRejected>()
+                        .is_some_and(ProviderRequestRejected::should_discard_visible_output)
+                        || error
+                            .downcast_ref::<ProviderMediaRejected>()
+                            .is_some_and(ProviderMediaRejected::should_discard_visible_output)
+                        || error
+                            .downcast_ref::<ProviderRequestTooLarge>()
+                            .is_some_and(ProviderRequestTooLarge::should_discard_visible_output);
+                    if discard_visible_output {
+                        let discarded = SessionTurnEvent::AssistantOutputDiscarded;
+                        record_durable_event(&mut durable_recorder, discarded.clone()).await?;
+                        emit(discarded);
+                    }
+                    let applied = apply_rejected_request_recovery(
+                        &mut preflight,
+                        &mut durable_recorder,
+                        &mut next_provider_rejection_id,
+                    )
+                    .await
+                    .with_context(|| "清除被 Provider 拒绝的 request WAL 失败")?;
+                    self.provider.discard_runtime_chain(runtime_chain_id).await;
+                    if let Some(media_error) = error.downcast_ref::<ProviderMediaRejected>() {
+                        return Err(rejected_request_error(
+                            media_error.message(),
+                            discard_visible_output,
+                            applied.recovery,
+                        )
+                        .into());
+                    }
+                    if error.downcast_ref::<ProviderRequestTooLarge>().is_some() {
+                        return Err(rejected_request_error(
+                            "上游拒绝了过大的请求。本次失败请求已从历史中移除。若本次输入本身很长，请缩短后重试；若超限来自既有历史或工具输出，请运行 /compact 后重试，或使用 /new 新建会话。",
+                            discard_visible_output,
+                            applied.recovery,
+                        )
+                        .into());
+                    }
+                    let rejected = error
+                        .downcast_ref::<ProviderRequestRejected>()
+                        .context("Provider 拒绝错误分类在处理期间发生变化")?;
+                    return Err(rejected_request_error(
+                        rejected.message(),
+                        discard_visible_output,
+                        applied.recovery,
+                    )
+                    .into());
                 }
                 Err(error) => return Err(error),
             };
@@ -1802,7 +2338,7 @@ impl AgentTurnLoop {
             if stop == ProviderStop::ContextWindowExceeded {
                 if context_window_recoveries >= MAX_CONTEXT_WINDOW_RECOVERIES {
                     anyhow::bail!(
-                        "模型上下文已满；自动压缩并续写 {MAX_CONTEXT_WINDOW_RECOVERIES} 次后仍未完成。请简化任务或新建会话重试。"
+                        "模型上下文已满；自动压缩并续写 {MAX_CONTEXT_WINDOW_RECOVERIES} 次后仍未完成。请新建会话后重试。"
                     );
                 }
                 let Some(preflight) = preflight.as_mut() else {
@@ -1825,6 +2361,7 @@ impl AgentTurnLoop {
             if let Some(context_appender) = context_appender.as_mut() {
                 context_appender.after_provider_response_success().await?;
             }
+            ambiguous_provider_send_seen = false;
             for tool_use in &tool_uses {
                 if !seen_tool_use_ids.insert(tool_use.id.clone()) {
                     anyhow::bail!(
@@ -2033,13 +2570,12 @@ impl AgentTurnLoop {
         messages: &[SessionTurnMessage],
         context_continuation: &ContextWindowContinuation,
         emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
-        durable_recorder: &mut Option<&mut dyn SessionTurnEventRecorder>,
         seen_tool_use_ids: &HashSet<String>,
         provider_interrupt: Option<&CancellationToken>,
         provider_recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
         runtime_chain_id: ProviderRuntimeChainId,
         runtime_fallback_scope: &crate::api::ProviderRuntimeFallbackScope,
-        request_progress: &mut ProviderRequestProgress<'_>,
+        request_progress: &mut ProviderRequestProgress<'_, '_>,
     ) -> anyhow::Result<ProviderCallOutcome> {
         let (tool_definitions, provider_mcp_routes) = self.tools.definitions_with_mcp_routes();
         let provider_mcp_routes = Arc::new(provider_mcp_routes);
@@ -2053,43 +2589,72 @@ impl AgentTurnLoop {
             });
         }
         let mut emitted_assistant_text = false;
-        let mut streaming_emit = |event| match event {
-            ProviderEvent::ContextUsageUpdated { usage } => {
-                emit(SessionTurnEvent::ContextUsageUpdated { usage });
-            }
-            ProviderEvent::AssistantTextDelta { text } => {
-                emitted_assistant_text |= !text.is_empty();
-                emit(SessionTurnEvent::AssistantTextDelta { text });
-            }
-            ProviderEvent::AssistantMessageCompleted { text } => {
-                emit(SessionTurnEvent::AssistantMessageCompleted {
-                    text: context_continuation.fallback_replacement_text(&text),
-                });
-            }
-        };
-
+        let unaccepted_visible_output = request_progress.unaccepted_visible_output_flag();
+        let visible_output_bytes = request_progress.visible_output_bytes_flag();
+        let accepted_visible_output_bytes = request_progress.accepted_visible_output_bytes_flag();
+        let mut emitted_accepted_visible_output_bytes =
+            accepted_visible_output_bytes.load(Ordering::Acquire);
         let streaming_attempt_base = request_progress.latest_messages().to_vec();
-        let request = ProviderRequest {
-            system_prompt: system_prompt.to_string(),
-            messages: streaming_attempt_base.clone(),
-            tools: tools.clone(),
-            max_tokens: self.max_tokens,
-            stream: true,
-            stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
-            runtime_chain_id: Some(runtime_chain_id),
-            runtime_fallback_scope: Some(runtime_fallback_scope.clone()),
-            recovery_interrupt: provider_recovery_interrupt.cloned(),
-            allow_continuation: true,
-            retry_count_override: None,
-        };
-        let streaming_result = self
-            .send_provider_request_interruptible(
+        let streaming_result = {
+            let mut streaming_emit = |event| match event {
+                ProviderEvent::ContextUsageUpdated { usage } => {
+                    let accepted_bytes = accepted_visible_output_bytes.load(Ordering::Acquire);
+                    if accepted_bytes > emitted_accepted_visible_output_bytes {
+                        emit(SessionTurnEvent::AssistantOutputAccepted);
+                        emitted_accepted_visible_output_bytes = accepted_bytes;
+                    }
+                    emit(SessionTurnEvent::ContextUsageUpdated { usage });
+                }
+                ProviderEvent::AssistantTextDelta { text } => {
+                    let accepted_bytes = accepted_visible_output_bytes.load(Ordering::Acquire);
+                    if accepted_bytes > emitted_accepted_visible_output_bytes {
+                        emit(SessionTurnEvent::AssistantOutputAccepted);
+                        emitted_accepted_visible_output_bytes = accepted_bytes;
+                    }
+                    emitted_assistant_text |= !text.is_empty();
+                    if !text.is_empty() {
+                        visible_output_bytes.fetch_add(text.len(), Ordering::AcqRel);
+                        unaccepted_visible_output.store(true, Ordering::Release);
+                    }
+                    emit(SessionTurnEvent::AssistantTextDelta { text });
+                }
+                ProviderEvent::AssistantMessageCompleted { text } => {
+                    let accepted_bytes = accepted_visible_output_bytes.load(Ordering::Acquire);
+                    if accepted_bytes > emitted_accepted_visible_output_bytes {
+                        emit(SessionTurnEvent::AssistantOutputAccepted);
+                        emitted_accepted_visible_output_bytes = accepted_bytes;
+                    }
+                    emit(SessionTurnEvent::AssistantMessageCompleted {
+                        text: context_continuation.fallback_replacement_text(&text),
+                    });
+                }
+            };
+
+            let request = ProviderRequest {
+                system_prompt: system_prompt.to_string(),
+                messages: streaming_attempt_base.clone(),
+                tools: tools.clone(),
+                max_tokens: self.max_tokens,
+                stream: true,
+                stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                runtime_chain_id: Some(runtime_chain_id),
+                runtime_fallback_scope: Some(runtime_fallback_scope.clone()),
+                recovery_interrupt: provider_recovery_interrupt.cloned(),
+                allow_continuation: true,
+                retry_count_override: None,
+            };
+            self.send_provider_request_interruptible(
                 request,
                 &mut streaming_emit,
                 provider_interrupt,
                 request_progress,
             )
-            .await;
+            .await
+        };
+        let accepted_bytes = accepted_visible_output_bytes.load(Ordering::Acquire);
+        if accepted_bytes > emitted_accepted_visible_output_bytes {
+            emit(SessionTurnEvent::AssistantOutputAccepted);
+        }
         match streaming_result {
             Ok(response) => {
                 let provider_assistant_message = provider_assistant_suffix_for_latest_request(
@@ -2112,20 +2677,38 @@ impl AgentTurnLoop {
                 Err(SessionTurnInterrupted.into())
             }
             Err(error)
+                if request_progress.ambiguous_send_seen()
+                    && rejection_would_mutate_request_wal(&error) =>
+            {
+                if request_progress.has_unaccepted_visible_output() {
+                    let discarded = SessionTurnEvent::AssistantOutputDiscarded;
+                    request_progress
+                        .record_durable_event(discarded.clone())
+                        .await?;
+                    emit(discarded);
+                }
+                Err(ProviderTerminalFailure::new(format!(
+                    "Provider 内部重试前已有发送结果不明确；保留请求历史以供恢复: {error:#}"
+                ))
+                .into())
+            }
+            Err(error)
                 if error.downcast_ref::<ProviderTerminalFailure>().is_some()
                     || error.downcast_ref::<SessionTurnInterrupted>().is_some()
+                    || error
+                        .downcast_ref::<ProviderContextWindowExceeded>()
+                        .is_some()
+                    || error.downcast_ref::<ProviderMediaRejected>().is_some()
+                    || error.downcast_ref::<ProviderRequestRejected>().is_some()
                     || error.downcast_ref::<ProviderRequestTooLarge>().is_some()
                     || error
                         .downcast_ref::<ProviderRequestPreparationFailure>()
                         .is_some() =>
             {
-                if emitted_assistant_text
-                    && error.downcast_ref::<ProviderRequestTooLarge>().is_some()
-                {
-                    Err(ProviderRequestTooLarge::after_visible_output().into())
-                } else {
-                    Err(error)
-                }
+                Err(mark_provider_error_after_visible_output(
+                    error,
+                    request_progress.has_unaccepted_visible_output(),
+                ))
             }
             Err(mut previous_error)
                 if emitted_assistant_text
@@ -2136,6 +2719,15 @@ impl AgentTurnLoop {
                         .downcast_ref::<ProviderNoConsumableOutput>()
                         .is_some() =>
             {
+                if request_progress.has_unaccepted_visible_output() {
+                    let preserved = SessionTurnEvent::AssistantOutputPreservedForFallback;
+                    request_progress
+                        .record_durable_event(preserved.clone())
+                        .await
+                        .map_err(ProviderRequestPreparationFailure::from_error)?;
+                    request_progress.reset_visible_output_counter_for_fallback();
+                    emit(preserved);
+                }
                 for attempt in 1..=NON_STREAMING_FALLBACK_MAX_ATTEMPTS {
                     // 上一轮失败或 durable 写入期间可能收到 steer/cancel；此时不能
                     // 虚构下一次已开始，也不能为必定丢弃的 turn 继续计费。
@@ -2153,7 +2745,9 @@ impl AgentTurnLoop {
                         max_attempts: NON_STREAMING_FALLBACK_MAX_ATTEMPTS,
                         previous_error: previous_error_text,
                     };
-                    record_durable_event(durable_recorder, started_event.clone()).await?;
+                    request_progress
+                        .record_durable_event(started_event.clone())
+                        .await?;
                     if provider_recovery_interrupt
                         .is_some_and(ProviderRecoveryInterrupt::is_cancelled)
                     {
@@ -2225,7 +2819,9 @@ impl AgentTurnLoop {
                                 max_attempts: NON_STREAMING_FALLBACK_MAX_ATTEMPTS,
                                 text: replacement_text,
                             };
-                            record_durable_event(durable_recorder, succeeded_event.clone()).await?;
+                            request_progress
+                                .record_durable_event(succeeded_event.clone())
+                                .await?;
                             emit(succeeded_event);
                             return Ok(ProviderCallOutcome {
                                 response,
@@ -2245,6 +2841,11 @@ impl AgentTurnLoop {
                         }
                         Err(error)
                             if error.downcast_ref::<ProviderTerminalFailure>().is_some()
+                                || error
+                                    .downcast_ref::<ProviderContextWindowExceeded>()
+                                    .is_some()
+                                || error.downcast_ref::<ProviderMediaRejected>().is_some()
+                                || error.downcast_ref::<ProviderRequestRejected>().is_some()
                                 || error.downcast_ref::<ProviderRequestTooLarge>().is_some() =>
                         {
                             let (error_text, _) = truncate_chars(
@@ -2257,15 +2858,29 @@ impl AgentTurnLoop {
                                     max_attempts: NON_STREAMING_FALLBACK_MAX_ATTEMPTS,
                                     error: error_text,
                                 };
-                            record_durable_event(durable_recorder, failed_event.clone()).await?;
+                            request_progress
+                                .record_durable_event(failed_event.clone())
+                                .await?;
                             emit(failed_event);
-                            return if emitted_assistant_text
-                                && error.downcast_ref::<ProviderRequestTooLarge>().is_some()
+                            if request_progress.ambiguous_send_seen()
+                                && rejection_would_mutate_request_wal(&error)
                             {
-                                Err(ProviderRequestTooLarge::after_visible_output().into())
-                            } else {
-                                Err(error)
-                            };
+                                if request_progress.has_unaccepted_visible_output() {
+                                    let discarded = SessionTurnEvent::AssistantOutputDiscarded;
+                                    request_progress
+                                        .record_durable_event(discarded.clone())
+                                        .await?;
+                                    emit(discarded);
+                                }
+                                return Err(ProviderTerminalFailure::new(format!(
+                                    "fallback 请求被上游拒绝，但更早的 Provider attempt 结果不明确；保留请求历史以供恢复: {error:#}"
+                                ))
+                                .into());
+                            }
+                            return Err(mark_provider_error_after_visible_output(
+                                error,
+                                request_progress.has_unaccepted_visible_output(),
+                            ));
                         }
                         Err(error) => {
                             let (error_text, _) = truncate_chars(
@@ -2278,7 +2893,9 @@ impl AgentTurnLoop {
                                     max_attempts: NON_STREAMING_FALLBACK_MAX_ATTEMPTS,
                                     error: error_text,
                                 };
-                            record_durable_event(durable_recorder, failed_event.clone()).await?;
+                            request_progress
+                                .record_durable_event(failed_event.clone())
+                                .await?;
                             emit(failed_event);
                             previous_error = error;
                         }
@@ -2299,7 +2916,7 @@ impl AgentTurnLoop {
         request: ProviderRequest,
         emit: &mut (dyn FnMut(ProviderEvent) + Send),
         provider_interrupt: Option<&CancellationToken>,
-        request_progress: &mut ProviderRequestProgress<'_>,
+        request_progress: &mut ProviderRequestProgress<'_, '_>,
     ) -> anyhow::Result<ProviderResponse> {
         let request_is_streaming = request.stream;
         let request_timeout = self.provider.request_timeout();
@@ -2460,6 +3077,44 @@ impl AgentTurnLoop {
             .await
             .map_err(anyhow::Error::msg)
     }
+}
+
+fn mark_provider_error_after_visible_output(
+    error: anyhow::Error,
+    emitted_assistant_text: bool,
+) -> anyhow::Error {
+    if !emitted_assistant_text {
+        return error;
+    }
+    if error.downcast_ref::<ProviderRequestTooLarge>().is_some() {
+        return ProviderRequestTooLarge::after_visible_output().into();
+    }
+    if error
+        .downcast_ref::<ProviderContextWindowExceeded>()
+        .is_some()
+    {
+        return ProviderContextWindowExceeded::after_visible_output().into();
+    }
+    if let Some(error) = error.downcast_ref::<ProviderMediaRejected>() {
+        return ProviderMediaRejected::after_visible_output(error.message()).into();
+    }
+    if let Some(error) = error.downcast_ref::<ProviderRequestRejected>() {
+        return ProviderRequestRejected::after_visible_output(error.message()).into();
+    }
+    error
+}
+
+fn rejection_would_mutate_request_wal(error: &anyhow::Error) -> bool {
+    rejected_error_clears_turn_wal(error)
+}
+
+fn rejected_error_clears_turn_wal(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ProviderContextWindowExceeded>()
+        .is_some()
+        || error.downcast_ref::<ProviderRequestRejected>().is_some()
+        || error.downcast_ref::<ProviderMediaRejected>().is_some()
+        || error.downcast_ref::<ProviderRequestTooLarge>().is_some()
 }
 
 fn non_streaming_fallback_delay(attempt: u32) -> Duration {
@@ -2711,32 +3366,62 @@ fn runtime_context_text(now: DateTime<Utc>, workspace_root: &Path) -> String {
 /// 若本轮最终失败，则沿用现有 failed-turn 不提交 canonical 的语义。清除 replay 可避免
 /// 相同 provider 的私有历史绕过本次剥离。
 fn replace_oversized_provider_media(messages: &mut [SessionTurnMessage]) -> usize {
-    replace_provider_media_with_oversized_placeholders(messages)
+    replace_provider_media_with_placeholders(
+        messages,
+        OVERSIZED_IMAGE_PLACEHOLDER,
+        OVERSIZED_DOCUMENT_PLACEHOLDER,
+    )
+}
+
+fn replace_rejected_provider_media(messages: &mut [SessionTurnMessage]) -> usize {
+    replace_provider_media_with_placeholders(
+        messages,
+        REJECTED_IMAGE_PLACEHOLDER,
+        REJECTED_DOCUMENT_PLACEHOLDER,
+    )
 }
 
 /// 最后一道恢复边界覆盖它之前的全部媒体；边界后的显式重读属于新事件，仍可发送。
 /// 该投影使 canonical/journal fallback 与精确 Provider WAL 具有相同的
-/// request-too-large 语义。
-fn replace_media_before_latest_request_size_recovery(messages: &mut [SessionTurnMessage]) -> usize {
-    let Some(boundary) = messages.iter().rposition(|message| {
-        message
-            .model_context_snapshot()
-            .is_some_and(|(source, _, _)| *source == ModelContextSource::RequestSizeRecovery)
-    }) else {
+/// 媒体清理语义。已发布的 source 保持不变，具体原因由 context tag 区分。
+pub(crate) fn replace_media_before_latest_recovery_boundary(
+    messages: &mut [SessionTurnMessage],
+) -> usize {
+    let Some((boundary, recovery_text)) =
+        messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, message)| {
+                let (source, _, text) = message.model_context_snapshot()?;
+                (*source == ModelContextSource::RequestSizeRecovery).then_some((index, text))
+            })
+    else {
         return 0;
     };
-    replace_provider_media_with_oversized_placeholders(&mut messages[..boundary])
+    let (image_placeholder, document_placeholder) = if recovery_text.contains("<media_recovery>") {
+        (REJECTED_IMAGE_PLACEHOLDER, REJECTED_DOCUMENT_PLACEHOLDER)
+    } else {
+        (OVERSIZED_IMAGE_PLACEHOLDER, OVERSIZED_DOCUMENT_PLACEHOLDER)
+    };
+    replace_provider_media_with_placeholders(
+        &mut messages[..boundary],
+        image_placeholder,
+        document_placeholder,
+    )
 }
 
-fn replace_provider_media_with_oversized_placeholders(
+fn replace_provider_media_with_placeholders(
     messages: &mut [SessionTurnMessage],
+    image_placeholder: &str,
+    document_placeholder: &str,
 ) -> usize {
     let mut replaced = 0usize;
     for message in messages.iter_mut() {
         for block in &mut message.content {
             let placeholder = match block {
-                SessionTurnContentBlock::Image { .. } => Some(OVERSIZED_IMAGE_PLACEHOLDER),
-                SessionTurnContentBlock::Document { .. } => Some(OVERSIZED_DOCUMENT_PLACEHOLDER),
+                SessionTurnContentBlock::Image { .. } => Some(image_placeholder),
+                SessionTurnContentBlock::Document { .. } => Some(document_placeholder),
                 SessionTurnContentBlock::Text { .. }
                 | SessionTurnContentBlock::ModelContext { .. }
                 | SessionTurnContentBlock::SkillInstructions { .. }
@@ -3707,19 +4392,22 @@ mod tests {
     use tokio::time::{sleep, timeout, Duration};
 
     use super::{
-        assistant_message_text, provider_assistant_suffix_for_latest_request, read_text_file_block,
-        tool_dispatch_failure_payload, ProviderNoConsumableOutput,
-        ProviderRequestPreparationFailure, ProviderRequestProgress, ProviderRequestTooLarge,
-        ProviderStreamFailure, ProviderTerminalFailure, CONTINUATION_TRIGGER,
-        OVERSIZED_DOCUMENT_PLACEHOLDER, OVERSIZED_IMAGE_PLACEHOLDER,
-        OVERSIZED_MEDIA_RECOVERY_CONTEXT,
+        apply_rejected_request_recovery, assistant_message_text,
+        provider_assistant_suffix_for_latest_request, read_text_file_block,
+        tool_dispatch_failure_payload, ProviderContextWindowExceeded, ProviderMediaRejected,
+        ProviderNoConsumableOutput, ProviderRejectedRequestRecovery,
+        ProviderRequestPreparationFailure, ProviderRequestProgress, ProviderRequestRejected,
+        ProviderRequestTooLarge, ProviderStreamFailure, ProviderTerminalFailure,
+        CONTINUATION_TRIGGER, OVERSIZED_DOCUMENT_PLACEHOLDER, OVERSIZED_IMAGE_PLACEHOLDER,
+        OVERSIZED_MEDIA_RECOVERY_CONTEXT, REJECTED_DOCUMENT_PLACEHOLDER,
+        REJECTED_IMAGE_PLACEHOLDER,
     };
     use crate::agent::fs::LocalFsMemoryStore;
     use crate::api::{
         estimate_provider_request_context_tokens, AgentTurnLoop, CompletedSessionTurnMessage,
         ContextUsageSource, ModelContextSource, ProviderAdapter, ProviderEvent,
         ProviderReplayState, ProviderRequest, ProviderRequestObserver, ProviderResponse,
-        ProviderRuntimeChainId, ProviderStop, ProviderTransport, SessionTurn,
+        ProviderRuntimeChainId, ProviderStop, ProviderTransport, SessionAttachment, SessionTurn,
         SessionTurnContentBlock, SessionTurnContextAppender, SessionTurnEvent,
         SessionTurnEventRecorder, SessionTurnHooks, SessionTurnInterrupted, SessionTurnMessage,
         SessionTurnPreflight, SessionTurnRequest, ToolBoundaryControl, ToolCallSkipReason,
@@ -3746,6 +4434,56 @@ mod tests {
             &watchdog_error.to_string(),
         );
         assert_eq!(watchdog_payload["code"], "code_run_internal_timeout");
+    }
+
+    #[tokio::test]
+    async fn durable_rejection_marker_survives_wal_rollback_failure() {
+        let mut preflight_impl = FailingRejectionApplyPreflight::default();
+        let mut recorder_impl = RecordingProviderRejectionRecorder::default();
+        let mut preflight: Option<&mut dyn SessionTurnPreflight> = Some(&mut preflight_impl);
+        let mut recorder: Option<&mut dyn SessionTurnEventRecorder> = Some(&mut recorder_impl);
+        let mut next_rejection_id = 0;
+
+        let error =
+            apply_rejected_request_recovery(&mut preflight, &mut recorder, &mut next_rejection_id)
+                .await
+                .expect_err("WAL rollback failure must preserve provider rejection semantics");
+
+        let rejected = error
+            .downcast_ref::<ProviderRequestRejected>()
+            .expect("error must remain machine-readable as ProviderRequestRejected");
+        assert!(rejected.should_discard_turn());
+        assert_eq!(preflight_impl.prepared_ids, vec![1]);
+        assert_eq!(preflight_impl.applied_ids, vec![1]);
+        assert_eq!(recorder_impl.rejected, vec![(1, true)]);
+        assert!(recorder_impl.retried.is_empty());
+    }
+
+    #[test]
+    fn resolved_physical_attempt_does_not_poison_later_fallback() {
+        let messages = vec![SessionTurnMessage::user_text("request")];
+        let mut progress = ProviderRequestProgress::new(messages.clone(), None, None, 0);
+
+        progress.provider_request_started(&messages).unwrap();
+        progress
+            .provider_request_outcome_resolved(&messages)
+            .unwrap();
+        progress.begin_provider_attempt();
+        progress.provider_request_started(&messages).unwrap();
+
+        assert!(!progress.ambiguous_send_seen());
+    }
+
+    #[test]
+    fn unresolved_physical_attempt_poisoning_remains_sticky_across_fallback() {
+        let messages = vec![SessionTurnMessage::user_text("request")];
+        let mut progress = ProviderRequestProgress::new(messages.clone(), None, None, 0);
+
+        progress.provider_request_started(&messages).unwrap();
+        progress.begin_provider_attempt();
+        progress.provider_request_started(&messages).unwrap();
+
+        assert!(progress.ambiguous_send_seen());
     }
 
     struct FakeProvider {
@@ -3775,6 +4513,14 @@ mod tests {
         requests: Mutex<Vec<ProviderRequest>>,
     }
 
+    struct ResolvedStreamFailureThenRejectedProvider {
+        requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    struct AcceptedThenContinuesProvider {
+        continuation_starts: AtomicUsize,
+    }
+
     struct OversizedRequestProvider {
         failures_remaining: AtomicUsize,
         requests: Mutex<Vec<ProviderRequest>>,
@@ -3782,6 +4528,16 @@ mod tests {
     }
 
     struct OversizedFallbackProvider {
+        calls: AtomicUsize,
+        requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    struct MediaRejectedThenSuccessProvider {
+        calls: AtomicUsize,
+        requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    struct ContextRejectedThenSuccessProvider {
         calls: AtomicUsize,
         requests: Mutex<Vec<ProviderRequest>>,
     }
@@ -3821,6 +4577,12 @@ mod tests {
         abandoned_requests: Arc<AtomicUsize>,
     }
 
+    #[derive(Default)]
+    struct FailingRejectionApplyPreflight {
+        prepared_ids: Vec<u64>,
+        applied_ids: Vec<u64>,
+    }
+
     struct CountingAbandonPreflight {
         abandoned_requests: Arc<AtomicUsize>,
     }
@@ -3853,6 +4615,7 @@ mod tests {
     struct RecordingContextRecoveryPreflight {
         requested: bool,
         applied: usize,
+        rejected_requests: usize,
     }
 
     #[async_trait]
@@ -3876,6 +4639,22 @@ mod tests {
         ) -> anyhow::Result<()> {
             self.requested = true;
             Ok(())
+        }
+
+        async fn request_context_window_recovery_for_rejected_request(
+            &mut self,
+            _provider_messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            self.requested = true;
+            Ok(())
+        }
+
+        async fn prepare_provider_request_rejection(
+            &mut self,
+            _rejection_id: u64,
+        ) -> anyhow::Result<ProviderRejectedRequestRecovery> {
+            self.rejected_requests = self.rejected_requests.saturating_add(1);
+            Ok(ProviderRejectedRequestRecovery::DiscardTurn)
         }
     }
 
@@ -4013,6 +4792,69 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl ProviderAdapter for ResolvedStreamFailureThenRejectedProvider {
+        async fn send(
+            &self,
+            _request: ProviderRequest,
+            _emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        ) -> anyhow::Result<ProviderResponse> {
+            anyhow::bail!("test provider requires request observer")
+        }
+
+        async fn send_with_request_observer(
+            &self,
+            request: ProviderRequest,
+            _emit: &mut (dyn FnMut(ProviderEvent) + Send),
+            observer: &mut (dyn ProviderRequestObserver + Send),
+        ) -> anyhow::Result<ProviderResponse> {
+            observer.before_provider_request(&request.messages).await?;
+            observer.provider_request_started(&request.messages)?;
+            observer.provider_request_outcome_resolved(&request.messages)?;
+            let streaming = request.stream;
+            self.requests.lock().await.push(request);
+            if streaming {
+                return Err(ProviderStreamFailure::new("explicit rate limit response").into());
+            }
+            Err(ProviderRequestRejected::new("fallback rejected request").into())
+        }
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for AcceptedThenContinuesProvider {
+        async fn send(
+            &self,
+            _request: ProviderRequest,
+            _emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        ) -> anyhow::Result<ProviderResponse> {
+            anyhow::bail!("test provider requires request observer")
+        }
+
+        async fn send_with_request_observer(
+            &self,
+            request: ProviderRequest,
+            emit: &mut (dyn FnMut(ProviderEvent) + Send),
+            observer: &mut (dyn ProviderRequestObserver + Send),
+        ) -> anyhow::Result<ProviderResponse> {
+            observer.before_provider_request(&request.messages).await?;
+            observer.provider_request_started(&request.messages)?;
+            emit(ProviderEvent::AssistantTextDelta {
+                text: "accepted prefix".into(),
+            });
+            observer
+                .provider_response_accepted(&request.messages)
+                .await?;
+
+            let mut continuation = request.messages;
+            continuation.push(SessionTurnMessage::assistant_text("accepted prefix"));
+            continuation.push(SessionTurnMessage::user_text("continue"));
+            observer.before_provider_request(&continuation).await?;
+            self.continuation_starts.fetch_add(1, Ordering::SeqCst);
+            observer.provider_request_started(&continuation)?;
+            anyhow::bail!("continuation should not start when accepted output is not durable")
+        }
+    }
+
     impl OversizedRequestProvider {
         fn new(failures: usize) -> Self {
             Self {
@@ -4100,6 +4942,42 @@ mod tests {
                     ProviderStop::Done,
                 )),
             }
+        }
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for MediaRejectedThenSuccessProvider {
+        async fn send(
+            &self,
+            request: ProviderRequest,
+            _emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        ) -> anyhow::Result<ProviderResponse> {
+            self.requests.lock().await.push(request);
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(ProviderMediaRejected::new("provider rejected image input").into());
+            }
+            Ok(response(
+                vec![SessionTurnContentBlock::text("recovered without media")],
+                ProviderStop::Done,
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for ContextRejectedThenSuccessProvider {
+        async fn send(
+            &self,
+            request: ProviderRequest,
+            _emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        ) -> anyhow::Result<ProviderResponse> {
+            self.requests.lock().await.push(request);
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(ProviderContextWindowExceeded::new().into());
+            }
+            Ok(response(
+                vec![SessionTurnContentBlock::text("recovered after compaction")],
+                ProviderStop::Done,
+            ))
         }
     }
 
@@ -4647,6 +5525,8 @@ mod tests {
     }
 
     enum FailingRecorderTarget {
+        AssistantOutputAccepted,
+        AssistantOutputPreservedForFallback,
         Started(&'static str),
         Completed(&'static str),
         Skipped(&'static str),
@@ -4659,6 +5539,12 @@ mod tests {
 
     struct RecordingCompletedMessageRecorder {
         messages: Vec<CompletedSessionTurnMessage>,
+    }
+
+    #[derive(Default)]
+    struct RecordingProviderRejectionRecorder {
+        rejected: Vec<(u64, bool)>,
+        retried: Vec<u64>,
     }
 
     struct StaticContextAppender {
@@ -4691,6 +5577,58 @@ mod tests {
         ) -> anyhow::Result<()> {
             self.messages.push(message.clone());
             Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SessionTurnEventRecorder for RecordingProviderRejectionRecorder {
+        async fn record(&mut self, _event: SessionTurnEvent) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn record_provider_request_rejected(
+            &mut self,
+            rejection_id: u64,
+            discard_turn: bool,
+        ) -> anyhow::Result<()> {
+            self.rejected.push((rejection_id, discard_turn));
+            Ok(())
+        }
+
+        async fn record_provider_request_retried_after_rejection(
+            &mut self,
+            rejection_id: u64,
+        ) -> anyhow::Result<()> {
+            self.retried.push(rejection_id);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SessionTurnPreflight for FailingRejectionApplyPreflight {
+        async fn before_provider_request(
+            &mut self,
+            _system_prompt: &mut String,
+            _provider_messages: &mut Vec<SessionTurnMessage>,
+            _emit: &mut (dyn FnMut(SessionTurnEvent) + Send),
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn prepare_provider_request_rejection(
+            &mut self,
+            rejection_id: u64,
+        ) -> anyhow::Result<ProviderRejectedRequestRecovery> {
+            self.prepared_ids.push(rejection_id);
+            Ok(ProviderRejectedRequestRecovery::DiscardTurn)
+        }
+
+        async fn apply_provider_request_rejection(
+            &mut self,
+            rejection_id: u64,
+        ) -> anyhow::Result<()> {
+            self.applied_ids.push(rejection_id);
+            anyhow::bail!("intentional WAL rollback failure")
         }
     }
 
@@ -4848,6 +5786,14 @@ mod tests {
     impl SessionTurnEventRecorder for FailingRecorder {
         async fn record(&mut self, event: SessionTurnEvent) -> anyhow::Result<()> {
             let matches_target = match (&self.target, &event) {
+                (
+                    FailingRecorderTarget::AssistantOutputAccepted,
+                    SessionTurnEvent::AssistantOutputAccepted,
+                ) => true,
+                (
+                    FailingRecorderTarget::AssistantOutputPreservedForFallback,
+                    SessionTurnEvent::AssistantOutputPreservedForFallback,
+                ) => true,
                 (
                     FailingRecorderTarget::Started(expected_id),
                     SessionTurnEvent::ToolCallStarted { id, .. },
@@ -5303,6 +6249,22 @@ mod tests {
         assert_eq!(requests[0].retry_count_override, None);
         assert!(!requests[1].stream);
         assert_eq!(requests[1].retry_count_override, Some(0));
+        let preserved_index = events
+            .iter()
+            .position(|event| {
+                matches!(event, SessionTurnEvent::AssistantOutputPreservedForFallback)
+            })
+            .expect("visible partial must be preserved before fallback");
+        let fallback_started_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    SessionTurnEvent::NonStreamingFallbackAttemptStarted { attempt: 1, .. }
+                )
+            })
+            .expect("fallback start event");
+        assert!(preserved_index < fallback_started_index);
         assert!(events.iter().any(|event| matches!(
             event,
             SessionTurnEvent::NonStreamingFallbackAttemptStarted {
@@ -5511,7 +6473,8 @@ mod tests {
         let mut preflight = CountingAbandonPreflight {
             abandoned_requests: Arc::clone(&abandoned_requests),
         };
-        let mut progress = ProviderRequestProgress::new(initial.clone(), Some(&mut preflight), 0);
+        let mut progress =
+            ProviderRequestProgress::new(initial.clone(), Some(&mut preflight), None, 0);
 
         progress.before_provider_request(&continued).await.unwrap();
         assert_eq!(progress.latest_messages(), continued);
@@ -5725,6 +6688,28 @@ mod tests {
                 | SessionTurnEvent::NonStreamingFallbackAttemptFailed { attempt: 2, .. }
                 | SessionTurnEvent::NonStreamingFallbackSucceeded { .. }
         )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resolved_stream_failure_then_fallback_rejection_keeps_rejection_semantics() {
+        let provider = Arc::new(ResolvedStreamFailureThenRejectedProvider {
+            requests: Mutex::new(Vec::new()),
+        });
+        let turn_loop = tool_loop(provider.clone());
+        let mut preflight = RecordingContextRecoveryPreflight::default();
+
+        let error = turn_loop
+            .run_session_turn_with_hooks(request(), &mut |_| {}, None, None, Some(&mut preflight))
+            .await
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<ProviderRequestRejected>().is_some());
+        assert!(!error.to_string().contains("结果不明确"));
+        assert_eq!(preflight.rejected_requests, 1);
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].stream);
+        assert!(!requests[1].stream);
     }
 
     #[tokio::test(start_paused = true)]
@@ -7217,8 +8202,83 @@ mod tests {
             .await
             .expect_err("text-only 413 must remain an error");
 
-        assert!(error.downcast_ref::<ProviderRequestTooLarge>().is_some());
+        assert!(error.downcast_ref::<ProviderRequestRejected>().is_some());
+        assert!(error.to_string().contains("/compact"));
+        assert!(error.to_string().contains("/new"));
+        assert!(!error.to_string().contains("缩短文本或工具输出后重试"));
         assert_eq!(provider.requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn media_rejection_strips_media_persists_boundary_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rejected.png");
+        tokio::fs::write(&path, tiny_png_bytes()).await.unwrap();
+        let provider = Arc::new(MediaRejectedThenSuccessProvider {
+            calls: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+        });
+        let turn_loop = tool_loop(provider.clone()).with_now_fn(fixed_now);
+        let mut with_image = request();
+        with_image.user_attachments = vec![SessionAttachment::LocalImage { path }];
+
+        let turn = turn_loop
+            .run_session_turn(with_image, &mut |_| {})
+            .await
+            .unwrap();
+
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        let cleaned_wire = serde_json::to_string(&requests[1].messages).unwrap();
+        assert!(cleaned_wire.contains(REJECTED_IMAGE_PLACEHOLDER));
+        assert!(cleaned_wire.contains("<media_recovery>"));
+        assert!(cleaned_wire.contains("rejected image or document input"));
+        assert!(!requests[1].messages.iter().any(|message| message
+            .content
+            .iter()
+            .any(|block| matches!(block, SessionTurnContentBlock::Image { .. }))));
+        assert!(turn
+            .messages
+            .iter()
+            .any(|message| message
+                .model_context_snapshot()
+                .is_some_and(|(source, _, text)| {
+                    *source == ModelContextSource::RequestSizeRecovery
+                        && text.contains("<media_recovery>")
+                })));
+        assert!(!cleaned_wire.contains(REJECTED_DOCUMENT_PLACEHOLDER));
+    }
+
+    #[tokio::test]
+    async fn rejected_context_window_request_is_discarded_before_compaction_retry() {
+        let provider = Arc::new(ContextRejectedThenSuccessProvider {
+            calls: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+        });
+        let turn_loop = tool_loop(provider.clone());
+        let mut preflight = RecordingContextRecoveryPreflight::default();
+        let mut recorder = RecordingProviderRejectionRecorder::default();
+
+        let turn = turn_loop
+            .run_session_turn_with_hooks(
+                request(),
+                &mut |_| {},
+                None,
+                Some(&mut recorder),
+                Some(&mut preflight),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(provider.requests.lock().await.len(), 2);
+        assert_eq!(preflight.rejected_requests, 1);
+        assert_eq!(preflight.applied, 1);
+        assert_eq!(recorder.rejected, vec![(1, true)]);
+        assert_eq!(recorder.retried, vec![1]);
+        assert_eq!(
+            assistant_message_text(non_context_messages(&turn)[1]),
+            "recovered after compaction"
+        );
     }
 
     #[tokio::test]
@@ -7237,7 +8297,7 @@ mod tests {
             .await
             .expect_err("the one media recovery attempt must not loop");
 
-        assert!(error.downcast_ref::<ProviderRequestTooLarge>().is_some());
+        assert!(error.downcast_ref::<ProviderRequestRejected>().is_some());
         assert_eq!(provider.requests.lock().await.len(), 2);
         assert_eq!(
             events
@@ -7330,7 +8390,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fallback_request_too_large_exits_fallback_loop_and_uses_media_recovery() {
+    async fn ambiguous_fallback_request_too_large_does_not_replace_request_history() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shot.png");
         tokio::fs::write(&path, tiny_png_bytes()).await.unwrap();
@@ -7343,20 +8403,20 @@ mod tests {
         with_image.user_attachments = vec![crate::api::SessionAttachment::LocalImage { path }];
         let mut events = Vec::new();
 
-        turn_loop
+        let error = turn_loop
             .run_session_turn(with_image, &mut |event| events.push(event))
             .await
-            .unwrap();
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("更早的 Provider attempt 结果不明确"));
 
         let requests = provider.requests.lock().await;
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 2);
         assert!(requests[0].stream);
         assert!(!requests[1].stream);
-        assert!(requests[2].stream);
-        assert!(!requests[2].messages.iter().any(|message| message
-            .content
-            .iter()
-            .any(|block| matches!(block, SessionTurnContentBlock::Image { .. }))));
+        assert_eq!(requests[0].messages, requests[1].messages);
         assert_eq!(
             events
                 .iter()
@@ -7372,17 +8432,11 @@ mod tests {
                 .iter()
                 .filter(|event| matches!(event, SessionTurnEvent::Warning { .. }))
                 .count(),
-            1
+            0
         );
-        let discarded = events
+        assert!(events
             .iter()
-            .position(|event| matches!(event, SessionTurnEvent::AssistantOutputDiscarded))
-            .expect("the partial streaming attempt must be discarded before retry");
-        let warning = events
-            .iter()
-            .position(|event| matches!(event, SessionTurnEvent::Warning { .. }))
-            .expect("media recovery must emit a warning");
-        assert!(discarded < warning);
+            .any(|event| matches!(event, SessionTurnEvent::AssistantOutputDiscarded)));
     }
 
     #[tokio::test]
@@ -7636,7 +8690,7 @@ mod tests {
             }]),
         ];
 
-        let replaced = super::replace_media_before_latest_request_size_recovery(&mut messages);
+        let replaced = super::replace_media_before_latest_recovery_boundary(&mut messages);
 
         assert_eq!(replaced, 1);
         assert!(matches!(
@@ -8743,6 +9797,71 @@ mod tests {
             turn.messages.last().map(|message| &message.message),
             Some(&SessionTurnMessage::assistant_text("successful partial"))
         );
+    }
+
+    #[tokio::test]
+    async fn accepted_output_is_durable_before_continuation_send() {
+        let provider = Arc::new(AcceptedThenContinuesProvider {
+            continuation_starts: AtomicUsize::new(0),
+        });
+        let turn_loop = tool_loop(provider.clone());
+        let mut recorder = FailingRecorder {
+            target: FailingRecorderTarget::AssistantOutputAccepted,
+            failed: false,
+        };
+
+        let error = turn_loop
+            .run_session_turn_with_tool_boundary_control_and_recorder(
+                request(),
+                &mut |_| {},
+                None,
+                Some(&mut recorder),
+            )
+            .await
+            .expect_err("continuation must not start before the accepted boundary is durable");
+
+        assert!(error
+            .to_string()
+            .contains("intentional durable recorder failure"));
+        assert!(error
+            .downcast_ref::<ProviderRequestPreparationFailure>()
+            .is_some());
+        assert!(recorder.failed);
+        assert_eq!(provider.continuation_starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn visible_stream_partial_is_durably_preserved_before_fallback_send() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            scripted_failure(
+                vec![ProviderEvent::AssistantTextDelta {
+                    text: "unaccepted partial".into(),
+                }],
+                "stream transport failed",
+            ),
+            scripted_success("fallback response"),
+        ]));
+        let turn_loop = tool_loop(provider.clone());
+        let mut recorder = FailingRecorder {
+            target: FailingRecorderTarget::AssistantOutputPreservedForFallback,
+            failed: false,
+        };
+
+        let error = turn_loop
+            .run_session_turn_with_tool_boundary_control_and_recorder(
+                request(),
+                &mut |_| {},
+                None,
+                Some(&mut recorder),
+            )
+            .await
+            .expect_err("fallback must not start before the visible partial is durable");
+
+        assert!(error
+            .downcast_ref::<ProviderRequestPreparationFailure>()
+            .is_some());
+        assert!(recorder.failed);
+        assert_eq!(provider.requests.lock().await.len(), 1);
     }
 
     #[tokio::test]

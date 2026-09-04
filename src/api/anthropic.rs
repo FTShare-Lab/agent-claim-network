@@ -26,15 +26,18 @@ use super::continuation::{
 use super::endpoint::{resolve_llm_endpoint, LlmEndpointKind};
 use super::llm_http::{read_llm_error_body, LlmHttpError, LlmHttpPhase};
 use super::provider::{
-    NoopProviderRequestObserver, ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy,
-    ProviderNoConsumableOutput, ProviderReplayIdentity, ProviderReplayProtocol, ProviderRequest,
-    ProviderRequestObserver, ProviderRequestPreparationFailure, ProviderRequestTooLarge,
+    NoopProviderRequestObserver, ProviderAdapter, ProviderContextWindowExceeded, ProviderEvent,
+    ProviderHistoryMediaPolicy, ProviderMediaRejected, ProviderNoConsumableOutput,
+    ProviderReplayIdentity, ProviderReplayProtocol, ProviderRequest, ProviderRequestObserver,
+    ProviderRequestPreparationFailure, ProviderRequestRejected, ProviderRequestTooLarge,
     ProviderResponse, ProviderStop, ProviderStreamFailure, ProviderTerminalFailure,
     ProviderTransport, ToolSpec,
 };
-use super::redact_media_error_body;
 use super::types::{SessionTurnContentBlock, SessionTurnEvent, SessionTurnMessage};
-use super::{ProviderRecoveryInterrupt, SessionTurnInterrupted};
+use super::{
+    is_content_policy_error_body, is_context_window_error_body, is_provider_non_request_error_code,
+    ProviderRecoveryInterrupt, SessionTurnInterrupted,
+};
 use crate::config::{AnthropicThinking, ReasoningEffort};
 use crate::prompt::PromptError;
 
@@ -59,8 +62,12 @@ pub enum AnthropicError {
     OutputShape { reason: String, raw: String },
     #[error("Anthropic streaming 响应损坏或未完整结束: {reason}")]
     StreamFailure { reason: String, raw: String },
+    #[error("Anthropic streaming 返回暂态上游错误: {reason}")]
+    TransientFailure { reason: String },
     #[error("Anthropic 没有可消费输出: {reason}")]
     NoConsumableOutput { reason: String },
+    #[error("Anthropic streaming 返回确定性请求错误: {reason}")]
+    RequestRejected { reason: String },
     #[error("Anthropic streaming 返回确定性错误: {reason}")]
     TerminalFailure { reason: String },
     #[error("准备 Anthropic continuation request 失败: {reason}")]
@@ -132,9 +139,26 @@ impl AnthropicContinuationRequestObserver<'_> {
             })
     }
 
-    fn request_started(&mut self) -> Result<(), AnthropicError> {
+    fn request_started(&mut self, previous_attempt_ambiguous: bool) -> Result<(), AnthropicError> {
         self.observer
-            .provider_request_started(&self.messages)
+            .provider_request_started_after(&self.messages, previous_attempt_ambiguous)
+            .map_err(|error| AnthropicError::RequestPreparation {
+                reason: format!("{error:#}"),
+            })
+    }
+
+    fn request_outcome_resolved(&mut self) -> Result<(), AnthropicError> {
+        self.observer
+            .provider_request_outcome_resolved(&self.messages)
+            .map_err(|error| AnthropicError::RequestPreparation {
+                reason: format!("{error:#}"),
+            })
+    }
+
+    async fn response_accepted(&mut self) -> Result<(), AnthropicError> {
+        self.observer
+            .provider_response_accepted(&self.messages)
+            .await
             .map_err(|error| AnthropicError::RequestPreparation {
                 reason: format!("{error:#}"),
             })
@@ -257,14 +281,20 @@ impl AnthropicMessagesClient {
         body: &CreateMessageRequest,
         retry_count: u32,
         recovery_interrupt: Option<&ProviderRecoveryInterrupt>,
-        request_started: &mut (dyn FnMut() -> Result<(), AnthropicError> + Send),
+        request_started: &mut (dyn FnMut(bool) -> Result<(), AnthropicError> + Send),
     ) -> Result<Value, AnthropicError> {
         let mut last_retryable: Option<AnthropicError> = None;
+        let mut previous_attempt_ambiguous = false;
         for attempt in 0..=retry_count {
             ensure_anthropic_recovery_active(recovery_interrupt)?;
-            match self.send_once(body, request_started).await {
+            match self
+                .send_once(body, previous_attempt_ambiguous, request_started)
+                .await
+            {
                 Ok(v) => return Ok(v),
                 Err(e) if is_retryable(&e) && attempt < retry_count => {
+                    previous_attempt_ambiguous =
+                        !matches!(&e, AnthropicError::Auth(_) | AnthropicError::Status { .. });
                     let backoff =
                         compute_backoff(attempt, self.retry_base_delay, self.retry_max_delay);
                     log::warn!(
@@ -292,7 +322,8 @@ impl AnthropicMessagesClient {
     async fn send_once(
         &self,
         body: &CreateMessageRequest,
-        request_started: &mut (dyn FnMut() -> Result<(), AnthropicError> + Send),
+        previous_attempt_ambiguous: bool,
+        request_started: &mut (dyn FnMut(bool) -> Result<(), AnthropicError> + Send),
     ) -> Result<Value, AnthropicError> {
         let pending = self
             .http
@@ -301,7 +332,7 @@ impl AnthropicMessagesClient {
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(body);
-        request_started()?;
+        request_started(previous_attempt_ambiguous)?;
         let resp = pending
             .send()
             .await
@@ -450,12 +481,9 @@ impl AnthropicMessagesClient {
             let body = self.request_for(system, messages.clone(), tools.clone(), max_tokens, None);
             let mut request_start_recorded = false;
             let response_result = {
-                let mut request_started = || {
-                    if request_start_recorded {
-                        return Ok(());
-                    }
+                let mut request_started = |previous_attempt_ambiguous| {
                     if let Some(observer) = request_observer.as_deref_mut() {
-                        observer.request_started()?;
+                        observer.request_started(previous_attempt_ambiguous)?;
                     }
                     request_start_recorded = true;
                     Ok(())
@@ -469,7 +497,12 @@ impl AnthropicMessagesClient {
                 .await
             };
             let response = match response_result {
-                Ok(response) => response,
+                Ok(response) => {
+                    if let Some(observer) = request_observer.as_deref_mut() {
+                        observer.request_outcome_resolved()?;
+                    }
+                    response
+                }
                 Err(AnthropicError::RecoveryInterrupted)
                     if !request_start_recorded
                         && last_stop_reason == "max_tokens"
@@ -498,6 +531,11 @@ impl AnthropicMessagesClient {
                     raw: response.to_string(),
                 })?;
             let stop_reason = required_anthropic_stop_reason(&response)?;
+            if stop_reason != "refusal" {
+                if let Some(observer) = request_observer.as_deref_mut() {
+                    observer.response_accepted().await?;
+                }
+            }
             let assistant_replay = json!({
                 "role": "assistant",
                 "content": assistant_blocks.clone(),
@@ -665,6 +703,8 @@ impl AnthropicProviderAdapter {
                     emit(ProviderEvent::AssistantTextDelta { text });
                 }
                 SessionTurnEvent::AssistantMessageCompleted { .. }
+                | SessionTurnEvent::AssistantOutputAccepted
+                | SessionTurnEvent::AssistantOutputPreservedForFallback
                 | SessionTurnEvent::AssistantOutputDiscarded
                 | SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
                 | SessionTurnEvent::NonStreamingFallbackAttemptFailed { .. }
@@ -715,11 +755,17 @@ impl AnthropicProviderAdapter {
                 return Err(ProviderRequestPreparationFailure::new(reason).into());
             }
             Err(error) => {
+                if anthropic_request_outcome_resolved(&error) {
+                    request_observer.request_outcome_resolved()?;
+                }
                 if matches!(&error, AnthropicError::RecoveryInterrupted) {
                     return Err(SessionTurnInterrupted.into());
                 }
                 if let Some(error) = classify_request_too_large(&error) {
                     return Err(error.into());
+                }
+                if classify_context_window_exceeded(&error) {
+                    return Err(ProviderContextWindowExceeded::new().into());
                 }
                 if request.stream && anthropic_adapter_stream_failure(&error) {
                     return Err(ProviderStreamFailure::new(error.to_string()).into());
@@ -727,7 +773,17 @@ impl AnthropicProviderAdapter {
                 if let AnthropicError::TerminalFailure { reason } = &error {
                     return Err(ProviderTerminalFailure::new(reason.clone()).into());
                 }
-                return Err(wrap_media_rejection(error, request_has_media).into());
+                let error = wrap_media_rejection(error, request_has_media);
+                if let AnthropicError::RequestRejected { reason } = &error {
+                    return Err(ProviderRequestRejected::new(reason.clone()).into());
+                }
+                if matches!(&error, AnthropicError::MediaRejected { .. }) {
+                    return Err(ProviderMediaRejected::new(error.to_string()).into());
+                }
+                if anthropic_adapter_request_rejected(&error) {
+                    return Err(ProviderRequestRejected::new(error.to_string()).into());
+                }
+                return Err(error.into());
             }
         };
         if !request.stream {
@@ -740,6 +796,9 @@ impl AnthropicProviderAdapter {
             }
         }
 
+        if turn.final_stop_reason == "refusal" {
+            return Err(ProviderRequestRejected::new("Anthropic 模型拒绝了本次请求").into());
+        }
         let stop = provider_stop_from_turn(&turn)?;
         if !turn.merged_text.trim().is_empty() {
             emit(ProviderEvent::AssistantMessageCompleted {
@@ -763,6 +822,25 @@ impl AnthropicProviderAdapter {
 
 fn anthropic_adapter_stream_failure(error: &AnthropicError) -> bool {
     is_stream_retryable(error)
+}
+
+fn anthropic_request_outcome_resolved(error: &AnthropicError) -> bool {
+    matches!(
+        error,
+        AnthropicError::Auth(_)
+            | AnthropicError::Status { .. }
+            | AnthropicError::RequestRejected { .. }
+            | AnthropicError::TerminalFailure { .. }
+            | AnthropicError::MediaRejected { .. }
+    )
+}
+
+fn anthropic_adapter_request_rejected(error: &AnthropicError) -> bool {
+    matches!(
+        error,
+        AnthropicError::Status { status, body }
+            if crate::api::is_provider_request_error(*status, body)
+    )
 }
 
 impl AnthropicProviderAdapter {
@@ -1126,128 +1204,138 @@ fn api_block_to_session_turn_block(
     }
 }
 
-/// 请求携带媒体块时，上游 4xx（鉴权 / 限流除外）大概率是模型不支持多模态：
-/// 这类网关常报"参数 / 格式不对"之类的误导性文案，这里补上明确提示，
-/// 同时在 Display 中保留上游核心错误信息（PRD 要求不静默降级）。
 fn wrap_media_rejection(error: AnthropicError, request_has_media: bool) -> AnthropicError {
     if !request_has_media {
         return error;
     }
-    match error {
-        AnthropicError::Status { status, body }
-            if (400..500).contains(&status) && status != 401 && status != 429 =>
-        {
-            AnthropicError::MediaRejected {
-                source: Box::new(AnthropicError::Status {
-                    status,
-                    body: redact_media_error_body(&body),
-                }),
-            }
+    let rejected = match &error {
+        AnthropicError::Status { status, body } => {
+            crate::api::is_provider_request_error(*status, body)
+                && crate::api::is_provider_media_error_body(body)
         }
+        AnthropicError::RequestRejected { reason } => {
+            crate::api::is_provider_media_error(None, reason)
+        }
+        _ => false,
+    };
+    let error = match error {
+        AnthropicError::Status { status, body } => AnthropicError::Status {
+            status,
+            body: redact_anthropic_error_body(&body),
+        },
         other => other,
+    };
+    if rejected {
+        AnthropicError::MediaRejected {
+            source: Box::new(error),
+        }
+    } else {
+        error
     }
 }
 
 fn classify_request_too_large(error: &AnthropicError) -> Option<ProviderRequestTooLarge> {
-    let AnthropicError::Status { status: 413, .. } = error else {
+    let AnthropicError::Status { status, body } = error else {
         return None;
     };
-    Some(ProviderRequestTooLarge::new())
+    crate::api::is_provider_request_too_large(*status, body).then(ProviderRequestTooLarge::new)
 }
 
-const REDACTED_ANTHROPIC_PAYLOAD: &str = "[redacted Anthropic request/replay payload]";
-const ANTHROPIC_PRIVATE_KEYS: &[&str] = &[
-    "request",
-    "request_body",
-    "messages",
-    "input",
-    "system",
-    "content",
-    "thinking",
-    "signature",
-    "encrypted_content",
-    "data",
-];
-
-fn redact_anthropic_error_body(body: &str) -> String {
-    let redacted = match serde_json::from_str::<Value>(body) {
-        Ok(mut value) => {
-            redact_anthropic_json_value(&mut value);
-            value.to_string()
-        }
-        Err(_) if contains_anthropic_private_key(body) => REDACTED_ANTHROPIC_PAYLOAD.into(),
-        Err(_) => body.to_string(),
-    };
-    redact_media_error_body(&redacted)
-}
-
-fn redact_anthropic_json_value(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            for (key, child) in map {
-                if ANTHROPIC_PRIVATE_KEYS
-                    .iter()
-                    .any(|private_key| key.eq_ignore_ascii_case(private_key))
-                {
-                    *child = Value::String(REDACTED_ANTHROPIC_PAYLOAD.into());
-                } else {
-                    redact_anthropic_json_value(child);
-                }
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                redact_anthropic_json_value(item);
-            }
-        }
-        Value::String(text) => {
-            if let Ok(mut embedded) = serde_json::from_str::<Value>(text) {
-                redact_anthropic_json_value(&mut embedded);
-                *text = embedded.to_string();
-            } else if contains_anthropic_private_key(text) {
-                *text = REDACTED_ANTHROPIC_PAYLOAD.into();
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+fn classify_context_window_exceeded(error: &AnthropicError) -> bool {
+    match error {
+        AnthropicError::Status { body, .. } => is_context_window_error_body(body),
+        AnthropicError::RequestRejected { reason } => is_context_window_error_body(reason),
+        _ => false,
     }
 }
 
-fn contains_anthropic_private_key(text: &str) -> bool {
-    let compact = text
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>()
-        .to_ascii_lowercase();
-    ANTHROPIC_PRIVATE_KEYS.iter().any(|key| {
-        [
-            format!("\"{key}\":"),
-            format!("\"{key}\"="),
-            format!("\\\"{key}\\\":"),
-            format!("\\\"{key}\\\"="),
-            format!("'{key}':"),
-            format!("'{key}'="),
-        ]
-        .iter()
-        .any(|pattern| compact.contains(pattern))
-            || contains_unquoted_private_key(text, key)
-    })
+const REDACTED_ANTHROPIC_PAYLOAD: &str = "[redacted Anthropic request/replay payload]";
+
+fn redact_anthropic_error_body(body: &str) -> String {
+    let mut error = json!({"message": REDACTED_ANTHROPIC_PAYLOAD});
+    if let Some(error_type) = classified_anthropic_error_type(body) {
+        error["type"] = Value::String(error_type);
+    }
+    json!({"error": error}).to_string()
 }
 
-fn contains_unquoted_private_key(text: &str, key: &str) -> bool {
-    let lowercase = text.to_ascii_lowercase();
-    lowercase.match_indices(key).any(|(start, _)| {
-        let previous_is_identifier = lowercase[..start]
-            .chars()
-            .next_back()
-            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
-        if previous_is_identifier {
-            return false;
+fn safe_anthropic_error_type(error_type: &str) -> Option<&str> {
+    if matches!(
+        error_type,
+        "invalid_request"
+            | "invalid_request_error"
+            | "invalid_prompt"
+            | "authentication_error"
+            | "invalid_api_key"
+            | "permission_error"
+            | "not_found_error"
+            | "model_not_found"
+            | "rate_limit_error"
+            | "api_error"
+            | "overloaded_error"
+            | "server_error"
+            | "content_filter"
+            | "content_policy_violation"
+            | "safety_violation"
+            | "invalid_image"
+            | "invalid_image_url"
+            | "image_too_large"
+            | "unsupported_image"
+            | "unsupported_media_type"
+            | "request_too_large"
+            | "request_entity_too_large"
+            | "payload_too_large"
+    ) || is_context_window_error_body(error_type)
+    {
+        Some(error_type)
+    } else {
+        None
+    }
+}
+
+fn classified_anthropic_error_type(body: &str) -> Option<String> {
+    let structured_type = crate::api::provider_error_code(body);
+    if let Some(error_type) = structured_type.as_deref() {
+        if is_provider_non_request_error_code(error_type)
+            || !matches!(error_type, "invalid_request" | "invalid_request_error")
+        {
+            return Some(
+                safe_anthropic_error_type(error_type)
+                    .unwrap_or("redacted")
+                    .to_string(),
+            );
         }
-        matches!(
-            lowercase[start + key.len()..].trim_start().chars().next(),
-            Some(':' | '=')
-        )
-    })
+    }
+    let classification_text =
+        crate::api::provider_error_message(body).unwrap_or_else(|| body.to_string());
+    if is_context_window_error_body(&classification_text) {
+        return Some("context_length_exceeded".into());
+    }
+    if is_content_policy_error_body(&classification_text) {
+        return Some(
+            if classification_text
+                .to_ascii_lowercase()
+                .contains("content_policy_violation")
+            {
+                "content_policy_violation"
+            } else if classification_text
+                .to_ascii_lowercase()
+                .contains("safety_violation")
+            {
+                "safety_violation"
+            } else {
+                "content_filter"
+            }
+            .into(),
+        );
+    }
+    if crate::api::is_provider_media_error(structured_type.as_deref(), &classification_text) {
+        return Some("unsupported_media_type".into());
+    }
+    structured_type
+        .as_deref()
+        .and_then(safe_anthropic_error_type)
+        .map(str::to_string)
 }
 
 fn is_retryable(e: &AnthropicError) -> bool {
@@ -1256,10 +1344,12 @@ fn is_retryable(e: &AnthropicError) -> bool {
         AnthropicError::Status { status, .. } => *status == 429 || *status >= 500,
         AnthropicError::ResponseJson(_)
         | AnthropicError::OutputShape { .. }
-        | AnthropicError::StreamFailure { .. } => true,
+        | AnthropicError::StreamFailure { .. }
+        | AnthropicError::TransientFailure { .. } => true,
         AnthropicError::Auth(_)
         | AnthropicError::InvalidEndpoint(_)
         | AnthropicError::Prompt(_)
+        | AnthropicError::RequestRejected { .. }
         | AnthropicError::TerminalFailure { .. }
         | AnthropicError::RequestPreparation { .. }
         | AnthropicError::RecoveryInterrupted
@@ -1273,12 +1363,13 @@ fn is_stream_retryable(error: &AnthropicError) -> bool {
     match error {
         AnthropicError::Http(error) => error.is_retryable(),
         AnthropicError::Status { status, .. } => *status == 429 || *status >= 500,
-        AnthropicError::StreamFailure { .. } => true,
+        AnthropicError::StreamFailure { .. } | AnthropicError::TransientFailure { .. } => true,
         AnthropicError::Auth(_)
         | AnthropicError::ResponseJson(_)
         | AnthropicError::InvalidEndpoint(_)
         | AnthropicError::OutputShape { .. }
         | AnthropicError::NoConsumableOutput { .. }
+        | AnthropicError::RequestRejected { .. }
         | AnthropicError::TerminalFailure { .. }
         | AnthropicError::RequestPreparation { .. }
         | AnthropicError::RecoveryInterrupted
@@ -1337,6 +1428,30 @@ fn compute_backoff(attempt: u32, base: Duration, max: Duration) -> Duration {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn media_recovery_requires_explicit_media_error() {
+        for (error_code, message, expected) in [
+            ("invalid_request_error", "invalid tool schema", false),
+            ("unsupported_media_type", "unsupported media type", true),
+            ("invalid_image", "invalid image", true),
+            (
+                "invalid_request_error",
+                "maximum context length exceeded",
+                false,
+            ),
+            ("content_policy_violation", "content policy rejected", false),
+            ("invalid_request_error", "unsupported image format", true),
+        ] {
+            let body = serde_json::json!({"error": {"code": error_code, "type": error_code, "message": message}}).to_string();
+            let error = wrap_media_rejection(AnthropicError::Status { status: 400, body }, true);
+            assert_eq!(
+                matches!(error, AnthropicError::MediaRejected { .. }),
+                expected,
+                "{error_code}: {message}"
+            );
+        }
+    }
     use std::sync::{Arc, Mutex};
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1377,9 +1492,20 @@ mod tests {
         assert!(!is_stream_retryable(&AnthropicError::RecoveryInterrupted));
     }
 
+    #[test]
+    fn transient_failure_keeps_request_outcome_unresolved() {
+        let error = AnthropicError::TransientFailure {
+            reason: "temporary failure".into(),
+        };
+
+        assert!(!anthropic_request_outcome_resolved(&error));
+    }
+
     #[derive(Default)]
     struct RecordingRequestObserver {
         requests: Vec<Vec<SessionTurnMessage>>,
+        resolved: usize,
+        accepted: usize,
     }
 
     struct CancellingStartedObserver {
@@ -1402,6 +1528,22 @@ mod tests {
             messages: &[SessionTurnMessage],
         ) -> anyhow::Result<()> {
             self.requests.push(messages.to_vec());
+            Ok(())
+        }
+
+        fn provider_request_outcome_resolved(
+            &mut self,
+            _messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            self.resolved += 1;
+            Ok(())
+        }
+
+        async fn provider_response_accepted(
+            &mut self,
+            _messages: &[SessionTurnMessage],
+        ) -> anyhow::Result<()> {
+            self.accepted += 1;
             Ok(())
         }
     }
@@ -1899,7 +2041,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_error_redaction_removes_echoed_request_fields_but_keeps_diagnostics() {
+    fn anthropic_error_redaction_keeps_only_allowlisted_type() {
         let input_secret = "private-user-input";
         let system_secret = "private-system-prompt";
         let content_secret = "private-content-block";
@@ -1920,11 +2062,40 @@ mod tests {
         let redacted = redact_anthropic_error_body(&body);
 
         assert!(redacted.contains("invalid_request"));
-        assert!(redacted.contains("safe-diagnostic"));
-        assert!(redacted.contains("messages.2.content"));
+        assert!(redacted.contains(REDACTED_ANTHROPIC_PAYLOAD));
+        assert!(!redacted.contains("safe-diagnostic"));
+        assert!(!redacted.contains("messages.2.content"));
         assert!(!redacted.contains(input_secret));
         assert!(!redacted.contains(system_secret));
         assert!(!redacted.contains(content_secret));
+    }
+
+    #[test]
+    fn anthropic_generic_type_only_classifies_the_error_message() {
+        let body = r#"{"error":{"type":"invalid_request_error","message":"invalid tool schema"},"request":{"messages":"maximum context length content_filter"}}"#;
+
+        let redacted = redact_anthropic_error_body(body);
+
+        assert!(redacted.contains("invalid_request_error"));
+        assert!(!redacted.contains("context_length_exceeded"));
+        assert!(!redacted.contains("content_filter"));
+    }
+
+    #[test]
+    fn anthropic_redaction_preserves_absent_and_unknown_type_distinction() {
+        let without_type =
+            redact_anthropic_error_body(r#"{"error":{"message":"ordinary invalid parameter"}}"#);
+        assert!(crate::api::provider_error_code(&without_type).is_none());
+        assert!(crate::api::is_provider_request_error(400, &without_type));
+
+        let unknown_type = redact_anthropic_error_body(
+            r#"{"error":{"type":"future_error","message":"maximum context length"}}"#,
+        );
+        assert_eq!(
+            crate::api::provider_error_code(&unknown_type).as_deref(),
+            Some("redacted")
+        );
+        assert!(!crate::api::is_provider_request_error(400, &unknown_type));
     }
 
     #[test]
@@ -1934,12 +2105,12 @@ mod tests {
 
         let redacted = redact_anthropic_error_body(&body);
 
-        assert_eq!(redacted, REDACTED_ANTHROPIC_PAYLOAD);
+        assert!(redacted.contains(REDACTED_ANTHROPIC_PAYLOAD));
         assert!(!redacted.contains(secret));
 
         let quoted_body = format!(r#"invalid request: \"InPuT\" = \"{secret}\""#);
         let quoted_redacted = redact_anthropic_error_body(&quoted_body);
-        assert_eq!(quoted_redacted, REDACTED_ANTHROPIC_PAYLOAD);
+        assert!(quoted_redacted.contains(REDACTED_ANTHROPIC_PAYLOAD));
         assert!(!quoted_redacted.contains(secret));
     }
 
@@ -1959,9 +2130,6 @@ mod tests {
         assert!(redacted.contains("invalid_request"));
         assert!(redacted.contains(REDACTED_ANTHROPIC_PAYLOAD));
         assert!(!redacted.contains(secret));
-        assert!(!contains_anthropic_private_key(
-            "invalid_input: missing required field"
-        ));
     }
 
     #[tokio::test]
@@ -2263,6 +2431,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_streaming_refusal_is_resolved_but_not_accepted() {
+        let (endpoint, _) = spawn_json_server(vec![json!({
+            "content":[{"type":"text", "text":"refused"}],
+            "stop_reason":"refusal",
+            "usage":{"input_tokens":1,"output_tokens":1}
+        })])
+        .await;
+        let adapter = AnthropicProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            128,
+            Duration::from_secs(2),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let mut observer = RecordingRequestObserver::default();
+
+        let error = adapter
+            .send_with_request_observer(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 128,
+                    stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: None,
+                    allow_continuation: true,
+                    retry_count_override: None,
+                },
+                &mut |_| {},
+                &mut observer,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<ProviderRequestRejected>().is_some());
+        assert_eq!(observer.resolved, 1);
+        assert_eq!(observer.accepted, 0);
+    }
+
+    #[tokio::test]
     async fn non_streaming_context_window_stop_returns_valid_partial_without_internal_retry() {
         let responses = vec![json!({
             "content":[
@@ -2472,7 +2687,7 @@ mod tests {
     }
 
     #[test]
-    fn media_request_4xx_wraps_hint_and_preserves_upstream_body() {
+    fn generic_content_type_error_is_not_assumed_to_be_media() {
         let error = wrap_media_rejection(
             AnthropicError::Status {
                 status: 400,
@@ -2481,9 +2696,30 @@ mod tests {
             true,
         );
         let text = error.to_string();
-        assert!(text.contains("可能不支持图片 / PDF 附件"));
-        assert!(text.contains("unsupported content type"));
+        assert!(!text.contains("可能不支持图片 / PDF 附件"));
+        assert!(text.contains(REDACTED_ANTHROPIC_PAYLOAD));
+        assert!(!text.contains("unsupported content type"));
         assert!(!is_retryable(&error));
+    }
+
+    #[test]
+    fn media_request_content_policy_error_is_not_rewritten_as_media_rejection() {
+        for code in [
+            "content_filter",
+            "content_policy_violation",
+            "safety_violation",
+        ] {
+            let error = wrap_media_rejection(
+                AnthropicError::Status {
+                    status: 400,
+                    body: json!({"error":{"code":code}}).to_string(),
+                },
+                true,
+            );
+
+            assert!(matches!(&error, AnthropicError::Status { status: 400, .. }));
+            assert!(anthropic_adapter_request_rejected(&error));
+        }
     }
 
     #[test]
@@ -2502,6 +2738,80 @@ mod tests {
             body: "bad request".into(),
         })
         .is_none());
+        for error_type in [
+            "authentication_error",
+            "model_not_found",
+            "rate_limit_error",
+            "future_error",
+            "content_length_exceeded",
+        ] {
+            assert!(classify_request_too_large(&AnthropicError::Status {
+                status: 413,
+                body: json!({"error":{"type":error_type}}).to_string(),
+            })
+            .is_some());
+        }
+    }
+
+    #[test]
+    fn http_400_context_limit_precedes_media_rejection() {
+        let error = AnthropicError::Status {
+            status: 400,
+            body: "input exceeds the context window".into(),
+        };
+
+        assert!(classify_context_window_exceeded(&error));
+        assert!(anthropic_adapter_request_rejected(&error));
+    }
+
+    #[test]
+    fn deterministic_anthropic_4xx_is_a_request_rejection() {
+        let error = AnthropicError::Status {
+            status: 422,
+            body: "invalid historical block".into(),
+        };
+
+        assert!(anthropic_adapter_request_rejected(&error));
+
+        for status in [408, 409, 423, 425, 499] {
+            let ambiguous = AnthropicError::Status {
+                status,
+                body: "request outcome unknown".into(),
+            };
+            assert!(!anthropic_adapter_request_rejected(&ambiguous));
+        }
+    }
+
+    #[test]
+    fn structured_anthropic_types_override_status_only_classification() {
+        let auth = AnthropicError::Status {
+            status: 400,
+            body: redact_anthropic_error_body(
+                r#"{"error":{"type":null,"code":"authentication_error","message":"bad key"}}"#,
+            ),
+        };
+        assert!(!anthropic_adapter_request_rejected(&auth));
+        assert!(!classify_context_window_exceeded(&auth));
+
+        let context = AnthropicError::Status {
+            status: 403,
+            body: redact_anthropic_error_body(
+                r#"{"error":{"type":"context_length_exceeded","message":"too long"}}"#,
+            ),
+        };
+        assert!(classify_context_window_exceeded(&context));
+        assert!(anthropic_adapter_request_rejected(&context));
+
+        let media = wrap_media_rejection(
+            AnthropicError::Status {
+                status: 403,
+                body: redact_anthropic_error_body(
+                    r#"{"error":{"type":"unsupported_media_type","message":"bad image"}}"#,
+                ),
+            },
+            true,
+        );
+        assert!(matches!(media, AnthropicError::MediaRejected { .. }));
     }
 
     #[test]
@@ -2527,8 +2837,8 @@ mod tests {
             true,
         );
         let text = error.to_string();
-        assert!(text.contains("unsupported image"));
-        assert!(text.contains("[redacted media payload]"));
+        assert!(text.contains(REDACTED_ANTHROPIC_PAYLOAD));
+        assert!(!text.contains("unsupported image"));
         assert!(!text.contains(&"A".repeat(300)));
     }
 
@@ -2542,7 +2852,7 @@ mod tests {
             false,
         );
         assert!(!error.to_string().contains("可能不支持图片"));
-        for status in [401u16, 429] {
+        for status in [401u16, 408, 429] {
             let error = wrap_media_rejection(
                 AnthropicError::Status {
                     status,

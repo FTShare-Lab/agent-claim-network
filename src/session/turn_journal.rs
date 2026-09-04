@@ -44,6 +44,7 @@ pub fn canonical_user_content_hash(
 pub enum TurnJournalStatus {
     Committed,
     Failed,
+    RejectedByProvider,
     Cancelled,
     InterruptedByUser,
 }
@@ -53,6 +54,7 @@ impl TurnJournalStatus {
         match self {
             Self::Committed => "committed",
             Self::Failed => "failed",
+            Self::RejectedByProvider => "rejected_by_provider",
             Self::Cancelled => "cancelled",
             Self::InterruptedByUser => "interrupted_by_user",
         }
@@ -117,6 +119,10 @@ pub enum TurnJournalEventKind {
     AssistantDelta {
         text: String,
     },
+    /// 标记最近 assistant 流式片段中已经通过 provider 协议校验的前缀。
+    AssistantOutputAccepted,
+    /// fallback 发送前的 durable 边界；保留片段但不把它升级为已通过协议校验的前缀。
+    AssistantOutputPreservedForFallback,
     /// 丢弃最近一个尚未完成的 assistant 流式片段；该 attempt 未进入 canonical。
     AssistantOutputDiscarded,
     AssistantCompleted {
@@ -187,6 +193,17 @@ pub enum TurnJournalEventKind {
         signal: Option<i32>,
         success: bool,
     },
+    /// WAL 清理前持久化的拒绝决策；`TurnFinished` 尚未写入便崩溃时仍可恢复。
+    ProviderRequestRejected {
+        rejection_id: u64,
+        discard_turn: bool,
+    },
+    /// 自动恢复的下一代 request WAL 已持久化；此前同 id 的拒绝 marker 不再代表 turn 终态。
+    ProviderRequestRetriedAfterRejection {
+        rejection_id: u64,
+    },
+    /// 已提交历史的媒体清理独立于当前 turn 的拒绝结果继续生效。
+    HistoricalMediaCleaned,
     TurnFinished {
         status: TurnJournalStatus,
     },
@@ -495,8 +512,10 @@ pub struct TurnJournalProjection {
 impl TurnJournalProjection {
     pub fn unresolved_tail(&self) -> Option<&TurnJournalTurn> {
         self.turns
-            .last()
-            .filter(|turn| !matches!(turn.status, Some(TurnJournalStatus::Committed)))
+            .iter()
+            .rev()
+            .take_while(|turn| turn.status != Some(TurnJournalStatus::Committed))
+            .find(|turn| turn.status != Some(TurnJournalStatus::RejectedByProvider))
     }
 }
 
@@ -637,6 +656,10 @@ pub fn replay_turn_journal(read: TurnJournalRead) -> TurnJournalProjection {
             timeline_items: Vec::new(),
             user_steers: Vec::new(),
             non_streaming_fallbacks: Vec::new(),
+            provider_rejection_status: None,
+            provider_rejection_at: None,
+            provider_rejection_id: None,
+            historical_media_cleaned: false,
         });
         turn.apply(event.created_at, event.kind);
     }
@@ -665,7 +688,12 @@ pub fn turn_journal_recovery_context_for_chain<'a>(
 ) -> Option<String> {
     let unresolved_turns = turns
         .into_iter()
-        .filter(|turn| turn.status != Some(TurnJournalStatus::Committed))
+        .filter(|turn| {
+            !matches!(
+                turn.status,
+                Some(TurnJournalStatus::Committed | TurnJournalStatus::RejectedByProvider)
+            )
+        })
         .collect::<Vec<_>>();
     if unresolved_turns.is_empty() {
         return None;
@@ -1078,6 +1106,10 @@ struct TurnAccumulator {
     timeline_items: Vec<TimelineAccumulatorItem>,
     user_steers: Vec<String>,
     non_streaming_fallbacks: Vec<TurnJournalNonStreamingFallback>,
+    provider_rejection_status: Option<TurnJournalStatus>,
+    provider_rejection_at: Option<DateTime<Utc>>,
+    provider_rejection_id: Option<u64>,
+    historical_media_cleaned: bool,
 }
 
 impl TurnAccumulator {
@@ -1092,6 +1124,9 @@ impl TurnAccumulator {
             return;
         }
         match kind {
+            TurnJournalEventKind::HistoricalMediaCleaned => {
+                self.historical_media_cleaned = true;
+            }
             TurnJournalEventKind::TurnStarted => {
                 self.started_at = Some(created_at);
             }
@@ -1158,6 +1193,10 @@ impl TurnAccumulator {
             TurnJournalEventKind::AssistantDelta { text } => {
                 self.push_assistant_delta(text);
             }
+            TurnJournalEventKind::AssistantOutputAccepted => {
+                self.accept_incomplete_assistant();
+            }
+            TurnJournalEventKind::AssistantOutputPreservedForFallback => {}
             TurnJournalEventKind::AssistantOutputDiscarded => {
                 self.discard_incomplete_assistant();
             }
@@ -1299,6 +1338,25 @@ impl TurnAccumulator {
                     });
                 }
             }
+            TurnJournalEventKind::ProviderRequestRejected {
+                rejection_id,
+                discard_turn,
+            } => {
+                self.provider_rejection_status = Some(if discard_turn {
+                    TurnJournalStatus::RejectedByProvider
+                } else {
+                    TurnJournalStatus::Failed
+                });
+                self.provider_rejection_at = Some(created_at);
+                self.provider_rejection_id = Some(rejection_id);
+            }
+            TurnJournalEventKind::ProviderRequestRetriedAfterRejection { rejection_id } => {
+                if self.provider_rejection_id == Some(rejection_id) {
+                    self.provider_rejection_status = None;
+                    self.provider_rejection_at = None;
+                    self.provider_rejection_id = None;
+                }
+            }
             TurnJournalEventKind::TurnFinished { status } => {
                 self.status = Some(status);
                 self.finished_at = Some(created_at);
@@ -1350,16 +1408,28 @@ impl TurnAccumulator {
             .filter_map(|id| tools.remove(&id))
             .map(ToolAccumulator::finish)
             .collect();
+        let status = self.provider_rejection_status.or(self.status);
+        let finished_at = self.finished_at.or(self.provider_rejection_at);
         TurnJournalTurn {
             turn_id: self.turn_id,
             started_at: self.started_at,
             accepted_at: self.accepted_at,
-            finished_at: self.finished_at,
-            status: self.status,
+            finished_at,
+            status,
             original_user_request: self.original_user_request,
             canonical_user_content_hash: self.canonical_user_content_hash,
             canonical_user_first_text: self.canonical_user_first_text,
-            model_context: self.model_context,
+            model_context: if status == Some(TurnJournalStatus::RejectedByProvider) {
+                self.model_context
+                    .into_iter()
+                    .filter(|context| {
+                        self.historical_media_cleaned
+                            && context.source == ModelContextSource::RequestSizeRecovery
+                    })
+                    .collect()
+            } else {
+                self.model_context
+            },
             skill_instructions: self.skill_instructions,
             compaction_assets: self.compaction_assets,
             assistant_text,
@@ -1400,7 +1470,16 @@ impl TurnAccumulator {
                 .push(TimelineAccumulatorItem::Assistant(AssistantSegment {
                     text,
                     completed: false,
+                    accepted_bytes: 0,
                 })),
+        }
+    }
+
+    fn accept_incomplete_assistant(&mut self) {
+        if let Some(TimelineAccumulatorItem::Assistant(segment)) = self.timeline_items.last_mut() {
+            if !segment.completed {
+                segment.accepted_bytes = segment.text.len();
+            }
         }
     }
 
@@ -1409,10 +1488,12 @@ impl TurnAccumulator {
             Some(TimelineAccumulatorItem::Assistant(segment)) if !segment.completed => {
                 segment.text = text;
                 segment.completed = true;
+                segment.accepted_bytes = segment.text.len();
             }
             _ => self
                 .timeline_items
                 .push(TimelineAccumulatorItem::Assistant(AssistantSegment {
+                    accepted_bytes: text.len(),
                     text,
                     completed: true,
                 })),
@@ -1420,11 +1501,17 @@ impl TurnAccumulator {
     }
 
     fn discard_incomplete_assistant(&mut self) {
-        if matches!(
-            self.timeline_items.last(),
-            Some(TimelineAccumulatorItem::Assistant(segment)) if !segment.completed
-        ) {
+        let Some(TimelineAccumulatorItem::Assistant(segment)) = self.timeline_items.last_mut()
+        else {
+            return;
+        };
+        if segment.completed {
+            return;
+        }
+        if segment.accepted_bytes == 0 {
             self.timeline_items.pop();
+        } else {
+            segment.text.truncate(segment.accepted_bytes);
         }
     }
 
@@ -1442,6 +1529,7 @@ impl TurnAccumulator {
 struct AssistantSegment {
     text: String,
     completed: bool,
+    accepted_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -2153,6 +2241,62 @@ mod tests {
         assert_eq!(turn.assistant_text, "hello");
         assert!(!turn.assistant_completed);
         assert_eq!(turn.status, Some(TurnJournalStatus::InterruptedByUser));
+    }
+
+    #[test]
+    fn replay_discards_only_assistant_output_after_accepted_boundary() {
+        let read = TurnJournalRead {
+            warnings: Vec::new(),
+            events: vec![
+                TurnJournalEvent {
+                    seq: 1,
+                    turn_id: "turn_1".into(),
+                    created_at: ts(1),
+                    kind: TurnJournalEventKind::TurnStarted,
+                },
+                TurnJournalEvent {
+                    seq: 2,
+                    turn_id: "turn_1".into(),
+                    created_at: ts(2),
+                    kind: TurnJournalEventKind::AssistantDelta {
+                        text: "kept".into(),
+                    },
+                },
+                TurnJournalEvent {
+                    seq: 3,
+                    turn_id: "turn_1".into(),
+                    created_at: ts(3),
+                    kind: TurnJournalEventKind::AssistantOutputAccepted,
+                },
+                TurnJournalEvent {
+                    seq: 4,
+                    turn_id: "turn_1".into(),
+                    created_at: ts(4),
+                    kind: TurnJournalEventKind::AssistantDelta {
+                        text: " ghost".into(),
+                    },
+                },
+                TurnJournalEvent {
+                    seq: 5,
+                    turn_id: "turn_1".into(),
+                    created_at: ts(5),
+                    kind: TurnJournalEventKind::AssistantOutputDiscarded,
+                },
+                TurnJournalEvent {
+                    seq: 6,
+                    turn_id: "turn_1".into(),
+                    created_at: ts(6),
+                    kind: TurnJournalEventKind::TurnFinished {
+                        status: TurnJournalStatus::Failed,
+                    },
+                },
+            ],
+        };
+
+        let projection = replay_turn_journal(read);
+
+        assert_eq!(projection.turns[0].assistant_text, "kept");
+        assert_eq!(projection.turns[0].status, Some(TurnJournalStatus::Failed));
     }
 
     #[test]
@@ -2993,5 +3137,141 @@ mod tests {
         assert!(context.contains(r#""attempt":5"#));
         assert!(context.contains(r#""state":"attempt_failed""#));
         assert!(context.contains("fallback 5 failed"));
+    }
+
+    #[test]
+    fn provider_rejected_turn_is_not_reintroduced_as_recovery_context() {
+        let projection = replay_turn_journal(TurnJournalRead {
+            warnings: Vec::new(),
+            events: vec![
+                TurnJournalEvent {
+                    seq: 1,
+                    turn_id: "turn_rejected".into(),
+                    created_at: ts(1),
+                    kind: TurnJournalEventKind::UserInputAccepted {
+                        text: "content rejected upstream".into(),
+                    },
+                },
+                TurnJournalEvent {
+                    seq: 2,
+                    turn_id: "turn_rejected".into(),
+                    created_at: ts(2),
+                    kind: TurnJournalEventKind::TurnFinished {
+                        status: TurnJournalStatus::RejectedByProvider,
+                    },
+                },
+            ],
+        });
+
+        assert!(turn_journal_recovery_context(
+            &projection.turns[0],
+            RecoveryContextLimits::default()
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn unresolved_provider_rejection_marker_overrides_later_finish_status() {
+        for status in [
+            TurnJournalStatus::Failed,
+            TurnJournalStatus::Cancelled,
+            TurnJournalStatus::InterruptedByUser,
+        ] {
+            let projection = replay_turn_journal(TurnJournalRead {
+                warnings: Vec::new(),
+                events: vec![
+                    TurnJournalEvent {
+                        seq: 1,
+                        turn_id: "turn_retry".into(),
+                        created_at: ts(1),
+                        kind: TurnJournalEventKind::ProviderRequestRejected {
+                            rejection_id: 1,
+                            discard_turn: true,
+                        },
+                    },
+                    TurnJournalEvent {
+                        seq: 2,
+                        turn_id: "turn_retry".into(),
+                        created_at: ts(2),
+                        kind: TurnJournalEventKind::TurnFinished { status },
+                    },
+                ],
+            });
+
+            assert_eq!(
+                projection.turns[0].status,
+                Some(TurnJournalStatus::RejectedByProvider)
+            );
+            assert_eq!(projection.turns[0].finished_at, Some(ts(2)));
+        }
+    }
+
+    #[test]
+    fn retry_generation_supersedes_matching_provider_rejection_marker() {
+        let projection = replay_turn_journal(TurnJournalRead {
+            warnings: Vec::new(),
+            events: vec![
+                TurnJournalEvent {
+                    seq: 1,
+                    turn_id: "turn_retry".into(),
+                    created_at: ts(1),
+                    kind: TurnJournalEventKind::ProviderRequestRejected {
+                        rejection_id: 7,
+                        discard_turn: true,
+                    },
+                },
+                TurnJournalEvent {
+                    seq: 2,
+                    turn_id: "turn_retry".into(),
+                    created_at: ts(2),
+                    kind: TurnJournalEventKind::ProviderRequestRetriedAfterRejection {
+                        rejection_id: 7,
+                    },
+                },
+                TurnJournalEvent {
+                    seq: 3,
+                    turn_id: "turn_retry".into(),
+                    created_at: ts(3),
+                    kind: TurnJournalEventKind::TurnFinished {
+                        status: TurnJournalStatus::Failed,
+                    },
+                },
+            ],
+        });
+
+        assert_eq!(projection.turns[0].status, Some(TurnJournalStatus::Failed));
+        assert_eq!(projection.turns[0].finished_at, Some(ts(3)));
+    }
+
+    #[test]
+    fn stale_retry_generation_does_not_clear_newer_provider_rejection() {
+        let projection = replay_turn_journal(TurnJournalRead {
+            warnings: Vec::new(),
+            events: vec![
+                TurnJournalEvent {
+                    seq: 1,
+                    turn_id: "turn_retry".into(),
+                    created_at: ts(1),
+                    kind: TurnJournalEventKind::ProviderRequestRejected {
+                        rejection_id: 8,
+                        discard_turn: true,
+                    },
+                },
+                TurnJournalEvent {
+                    seq: 2,
+                    turn_id: "turn_retry".into(),
+                    created_at: ts(2),
+                    kind: TurnJournalEventKind::ProviderRequestRetriedAfterRejection {
+                        rejection_id: 7,
+                    },
+                },
+            ],
+        });
+
+        assert_eq!(
+            projection.turns[0].status,
+            Some(TurnJournalStatus::RejectedByProvider)
+        );
+        assert_eq!(projection.turns[0].finished_at, Some(ts(1)));
     }
 }

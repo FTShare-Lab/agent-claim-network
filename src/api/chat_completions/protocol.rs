@@ -221,6 +221,8 @@ pub struct ChatCompletionMessage {
     pub role: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
+    #[serde(default)]
+    pub refusal: Option<String>,
     #[serde(default, deserialize_with = "crate::serde_util::null_as_default")]
     pub tool_calls: Vec<ChatToolCall>,
 }
@@ -243,6 +245,8 @@ pub(super) struct ChatStreamFrame {
     pub choices: Vec<ChatStreamChoice>,
     #[serde(default)]
     pub usage: Option<Value>,
+    #[serde(default)]
+    pub error: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,6 +263,8 @@ pub(super) struct ChatStreamDelta {
     pub role: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
+    #[serde(default)]
+    pub refusal: Option<String>,
     #[serde(default, deserialize_with = "crate::serde_util::null_as_default")]
     pub tool_calls: Vec<ChatStreamToolCallDelta>,
 }

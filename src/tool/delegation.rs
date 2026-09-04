@@ -553,17 +553,12 @@ pub(super) fn delegation_tool_definitions(config: DelegationRunnerConfig) -> Vec
     ]
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum WaitSubagentsUntil {
+    #[default]
     AnyTerminal,
     AllTerminal,
-}
-
-impl Default for WaitSubagentsUntil {
-    fn default() -> Self {
-        Self::AnyTerminal
-    }
 }
 
 impl WaitSubagentsUntil {

@@ -51,6 +51,7 @@ fn find_frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
 pub(super) struct ChatStreamAccumulator {
     role: Option<String>,
     content: String,
+    refusal: String,
     tool_calls: FxHashMap<usize, ToolCallDraft>,
     finish_reason: Option<ChatFinishReason>,
     usage: Option<Value>,
@@ -71,6 +72,13 @@ impl ChatStreamAccumulator {
                 raw: data.to_string(),
             }
         })?;
+        if let Some(error) = frame.error {
+            let body = serde_json::json!({"error": error}).to_string();
+            return Err(ChatCompletionsError::Failed {
+                code: super::safe_chat_error_code(&body).map(str::to_string),
+                message: super::redact_chat_error_body(&body),
+            });
+        }
         if self.finish_reason.is_some() && !frame.choices.is_empty() {
             return Err(ChatCompletionsError::StreamFailure {
                 reason: "finish_reason 后仍收到 choice delta".into(),
@@ -92,6 +100,9 @@ impl ChatStreamAccumulator {
                 if !content.is_empty() {
                     emit(ChatStreamEvent::ContentDelta { text: content });
                 }
+            }
+            if let Some(refusal) = choice.delta.refusal {
+                self.refusal.push_str(&refusal);
             }
             for tool_call in choice.delta.tool_calls {
                 let index = tool_call.index.unwrap_or(self.tool_calls.len());
@@ -141,6 +152,11 @@ impl ChatStreamAccumulator {
                 None
             } else {
                 Some(self.content)
+            },
+            refusal: if self.refusal.is_empty() {
+                None
+            } else {
+                Some(self.refusal)
             },
             tool_calls,
         };
@@ -300,6 +316,32 @@ mod tests {
     }
 
     #[test]
+    fn stream_accumulates_refusal_without_emitting_assistant_text() {
+        let mut accumulator = ChatStreamAccumulator::default();
+        let mut events = Vec::new();
+        accumulator
+            .apply_frame(
+                r#"{"choices":[{"delta":{"role":"assistant","refusal":"cannot "}}]}"#,
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        accumulator
+            .apply_frame(
+                r#"{"choices":[{"delta":{"refusal":"comply"},"finish_reason":"stop"}]}"#,
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+
+        let response = accumulator.finish().unwrap();
+
+        assert_eq!(
+            response.choices[0].message.refusal.as_deref(),
+            Some("cannot comply")
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
     fn stream_rejects_tool_delta_after_finish_reason() {
         let mut accumulator = ChatStreamAccumulator::default();
         accumulator
@@ -317,6 +359,34 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, ChatCompletionsError::StreamFailure { .. }));
+    }
+
+    #[test]
+    fn stream_surfaces_structured_error_frame_without_request_echo() {
+        for code in [
+            "content_filter",
+            "unsupported_media_type",
+            "rate_limit_error",
+        ] {
+            let mut accumulator = ChatStreamAccumulator::default();
+            let error = accumulator
+                .apply_frame(
+                    &format!(r#"{{"error":{{"code":"{code}","message":"private request echo"}}}}"#),
+                    &mut |_| {},
+                )
+                .unwrap_err();
+
+            let ChatCompletionsError::Failed {
+                code: actual_code,
+                message,
+            } = error
+            else {
+                panic!("expected structured stream failure");
+            };
+            assert_eq!(actual_code.as_deref(), Some(code));
+            assert!(message.contains(code));
+            assert!(!message.contains("private request echo"));
+        }
     }
 
     #[test]

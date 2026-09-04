@@ -119,6 +119,10 @@ Provider 私有 replay 不属于用户可见 transcript，不进入 TUI、sessio
 
 `openai_chat` 当前没有 provider 私有 Reasoning replay；厂商扩展的 Reasoning 字段会被丢弃。
 
+请求发送结果不明确时，Agent 保留 Provider WAL 供恢复；收到并接受完整响应（包括内部续写前的 `max_tokens` 中间响应）后，该次发送的歧义结束。后续确定性拒绝按自身结果回滚：本轮尚无已确认响应时丢弃失败 turn，已有已确认进度时保留此前进度。HTTP、流式和非流式错误分类都利用已知外层错误类别，未知细粒度 code 不会遮蔽它，也不会仅因未知 code 就清除 WAL。
+
+HTTP 413 或明确的 WebSocket 1009 尺寸错误可触发媒体清理；其他请求只有明确指向图片 / PDF 的错误才进入媒体恢复。上下文窗口错误和内容策略拒绝优先走各自路径，非法 tool schema 等普通请求错误不会剥离媒体。清理后的紧邻重试再次被确定性拒绝时，已提交历史的媒体占位符和恢复边界继续有效，失败 turn 的输入和动态上下文被丢弃。正常 resume、Provider WAL 缺失或 replay identity 改变时都会遵循该边界；仅当前失败 turn 带媒体时不保留无意义的清理边界。
+
 ## Recap、Finalize 与知识形成
 
 Compact 的 summary 只负责 provider context，并独立推进 compaction frontier。对于已提交且尚未 recap 的 canonical messages，compact 会异步投递 Supervisor Recap job；Recap 从最新 `recapped_until` 处理到冻结 target，不影响前台 summary 的成功结果。Session Finalize 则从最新 cursor 覆盖到最终 `message_count`，并处理 Finalize 专属的后台进程终态。

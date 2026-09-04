@@ -12,19 +12,19 @@ use super::context_usage_from_openai_usage;
 use super::continuation::{
     append_with_overlap_dedupe, CONTINUATION_TRIGGER, MAX_CONTINUATION_TURNS,
 };
+use super::is_context_window_error_body;
 use super::provider::{
-    NoopProviderRequestObserver, ProviderAdapter, ProviderEvent, ProviderHistoryMediaPolicy,
-    ProviderNoConsumableOutput, ProviderRecoveryInterrupt, ProviderReplayIdentity,
-    ProviderReplayProtocol, ProviderRequest, ProviderRequestObserver,
-    ProviderRequestPreparationFailure, ProviderRequestTooLarge, ProviderResponse,
-    ProviderRuntimeChainId, ProviderStop, ProviderStreamFailure, ProviderTerminalFailure,
-    ProviderTransport, ToolSpec,
+    NoopProviderRequestObserver, ProviderAdapter, ProviderContextWindowExceeded, ProviderEvent,
+    ProviderHistoryMediaPolicy, ProviderMediaRejected, ProviderNoConsumableOutput,
+    ProviderRecoveryInterrupt, ProviderReplayIdentity, ProviderReplayProtocol, ProviderRequest,
+    ProviderRequestObserver, ProviderRequestPreparationFailure, ProviderRequestRejected,
+    ProviderRequestTooLarge, ProviderResponse, ProviderRuntimeChainId, ProviderStop,
+    ProviderStreamFailure, ProviderTerminalFailure, ProviderTransport, ToolSpec,
 };
-use super::redact_media_error_body;
 use super::responses::{
-    is_explicit_websocket_message_too_big, is_stream_recovery_failure, ResponsesClient,
-    ResponsesError, ResponsesReasoning, ResponsesRequest, ResponsesStreamEvent, ResponsesTerminal,
-    ResponsesTool,
+    is_deterministic_request_error_code, is_explicit_websocket_message_too_big,
+    is_stream_recovery_failure, redact_responses_error_body, ResponsesClient, ResponsesError,
+    ResponsesReasoning, ResponsesRequest, ResponsesStreamEvent, ResponsesTerminal, ResponsesTool,
 };
 use super::types::{ProviderReplayState, SessionTurnContentBlock, SessionTurnMessage};
 use super::SessionTurnInterrupted;
@@ -44,6 +44,8 @@ pub enum OpenAiCompatibleResponsesError {
     NoConsumableOutput { reason: String },
     #[error("准备 Responses continuation request 失败: {reason}")]
     RequestPreparation { reason: String },
+    #[error("Responses 模型拒绝了本次请求")]
+    Refused,
     #[error(
         "当前模型可能不支持图片 / PDF 附件输入，请确认模型多模态能力或移除附件后重试。上游原始错误: {source}"
     )]
@@ -248,12 +250,12 @@ impl OpenAiCompatibleResponsesProviderAdapter {
             );
             let mut request_start_recorded = false;
             let response_result = {
-                let mut request_started = || {
-                    if request_start_recorded {
-                        return Ok(());
-                    }
+                let mut request_started = |previous_attempt_ambiguous| {
                     observer
-                        .provider_request_started(&provider_messages)
+                        .provider_request_started_after(
+                            &provider_messages,
+                            previous_attempt_ambiguous,
+                        )
                         .map_err(|error| ResponsesError::RequestPreparation {
                             reason: format!("{error:#}"),
                         })?;
@@ -295,7 +297,14 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                 }
             };
             let (response, transport) = match response_result {
-                Ok(response) => response,
+                Ok(response) => {
+                    observer
+                        .provider_request_outcome_resolved(&provider_messages)
+                        .map_err(|error| OpenAiCompatibleResponsesError::RequestPreparation {
+                            reason: format!("{error:#}"),
+                        })?;
+                    response
+                }
                 Err(ResponsesError::RecoveryInterrupted)
                     if !request_start_recorded
                         && last_terminal == ResponsesTerminal::MaxOutputTokens
@@ -318,9 +327,29 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                     last_terminal = ResponsesTerminal::Completed;
                     break;
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    if responses_client_outcome_resolved(&error) {
+                        observer
+                            .provider_request_outcome_resolved(&provider_messages)
+                            .map_err(|error| {
+                                OpenAiCompatibleResponsesError::RequestPreparation {
+                                    reason: format!("{error:#}"),
+                                }
+                            })?;
+                    }
+                    return Err(error.into());
+                }
             };
             last_transport = transport;
+            if response.refused {
+                return Err(OpenAiCompatibleResponsesError::Refused);
+            }
+            observer
+                .provider_response_accepted(&provider_messages)
+                .await
+                .map_err(|error| OpenAiCompatibleResponsesError::RequestPreparation {
+                    reason: format!("{error:#}"),
+                })?;
             if let Some(usage) = response
                 .usage
                 .as_ref()
@@ -500,10 +529,22 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                 if let Some(error) = classify_request_too_large(&error) {
                     return Err(error.into());
                 }
-                if request.stream && responses_adapter_stream_failure(&error) {
+                if classify_context_window_exceeded(&error) {
+                    return Err(ProviderContextWindowExceeded::new().into());
+                }
+                if responses_adapter_stream_failure(&error) {
                     return Err(ProviderStreamFailure::new(error.to_string()).into());
                 }
+                if matches!(&error, OpenAiCompatibleResponsesError::Refused) {
+                    return Err(ProviderRequestRejected::new(error.to_string()).into());
+                }
                 let error = wrap_media_rejection(error, request_has_media);
+                if matches!(&error, OpenAiCompatibleResponsesError::MediaRejected { .. }) {
+                    return Err(ProviderMediaRejected::new(error.to_string()).into());
+                }
+                if responses_adapter_request_rejected(&error) {
+                    return Err(ProviderRequestRejected::new(error.to_string()).into());
+                }
                 if responses_adapter_terminal_failure(&error) {
                     return Err(ProviderTerminalFailure::new(error.to_string()).into());
                 }
@@ -538,6 +579,16 @@ fn responses_adapter_stream_failure(error: &OpenAiCompatibleResponsesError) -> b
     matches!(error, OpenAiCompatibleResponsesError::Client(error) if is_stream_recovery_failure(error))
 }
 
+fn responses_client_outcome_resolved(error: &ResponsesError) -> bool {
+    match error {
+        ResponsesError::Failed { .. } => !is_stream_recovery_failure(error),
+        ResponsesError::Auth(_)
+        | ResponsesError::Status { .. }
+        | ResponsesError::Incomplete { .. } => true,
+        _ => false,
+    }
+}
+
 fn responses_adapter_terminal_failure(error: &OpenAiCompatibleResponsesError) -> bool {
     match error {
         OpenAiCompatibleResponsesError::Client(
@@ -548,7 +599,8 @@ fn responses_adapter_terminal_failure(error: &OpenAiCompatibleResponsesError) ->
             | ResponsesError::RequestPreparation { .. },
         )
         | OpenAiCompatibleResponsesError::MediaRejected { .. }
-        | OpenAiCompatibleResponsesError::RequestPreparation { .. } => true,
+        | OpenAiCompatibleResponsesError::RequestPreparation { .. }
+        | OpenAiCompatibleResponsesError::Refused => true,
         OpenAiCompatibleResponsesError::Client(ResponsesError::Status { status, .. }) => {
             *status != 429 && *status < 500
         }
@@ -561,6 +613,36 @@ fn responses_adapter_terminal_failure(error: &OpenAiCompatibleResponsesError) ->
         )
         | OpenAiCompatibleResponsesError::OutputShape { .. }
         | OpenAiCompatibleResponsesError::NoConsumableOutput { .. } => false,
+    }
+}
+
+fn responses_adapter_request_rejected(error: &OpenAiCompatibleResponsesError) -> bool {
+    match error {
+        OpenAiCompatibleResponsesError::Client(ResponsesError::Failed {
+            code: Some(code), ..
+        }) => is_deterministic_request_error_code(code),
+        OpenAiCompatibleResponsesError::Client(ResponsesError::Incomplete { reason }) => {
+            is_deterministic_request_error_code(reason)
+        }
+        OpenAiCompatibleResponsesError::Client(ResponsesError::Status { status, body }) => {
+            crate::api::is_provider_request_error(*status, body)
+        }
+        OpenAiCompatibleResponsesError::Client(
+            ResponsesError::Http(_)
+            | ResponsesError::Auth(_)
+            | ResponsesError::ResponseJson(_)
+            | ResponsesError::InvalidEndpoint(_)
+            | ResponsesError::OutputShape { .. }
+            | ResponsesError::StreamFailure { .. }
+            | ResponsesError::RecoveryInterrupted
+            | ResponsesError::RequestPreparation { .. },
+        )
+        | OpenAiCompatibleResponsesError::Client(ResponsesError::Failed { code: None, .. })
+        | OpenAiCompatibleResponsesError::OutputShape { .. }
+        | OpenAiCompatibleResponsesError::NoConsumableOutput { .. }
+        | OpenAiCompatibleResponsesError::RequestPreparation { .. }
+        | OpenAiCompatibleResponsesError::MediaRejected { .. }
+        | OpenAiCompatibleResponsesError::Refused => false,
     }
 }
 
@@ -843,16 +925,30 @@ fn wrap_media_rejection(
     if !request_has_media {
         return error;
     }
+    let rejected = match &error {
+        OpenAiCompatibleResponsesError::Client(ResponsesError::Status { status, body }) => {
+            crate::api::is_provider_request_error(*status, body)
+                && crate::api::is_provider_media_error_body(body)
+        }
+        OpenAiCompatibleResponsesError::Client(ResponsesError::Failed { code, message }) => {
+            crate::api::is_provider_media_error(code.as_deref(), message)
+        }
+        _ => false,
+    };
     match error {
-        OpenAiCompatibleResponsesError::Client(ResponsesError::Status { status, body })
-            if (400..500).contains(&status) && status != 401 && status != 429 =>
-        {
-            OpenAiCompatibleResponsesError::MediaRejected {
-                source: ResponsesError::Status {
-                    status,
-                    body: redact_media_error_body(&body),
-                },
+        OpenAiCompatibleResponsesError::Client(ResponsesError::Status { status, body }) => {
+            let source = ResponsesError::Status {
+                status,
+                body: redact_responses_error_body(&body),
+            };
+            if rejected {
+                OpenAiCompatibleResponsesError::MediaRejected { source }
+            } else {
+                OpenAiCompatibleResponsesError::Client(source)
             }
+        }
+        OpenAiCompatibleResponsesError::Client(source) if rejected => {
+            OpenAiCompatibleResponsesError::MediaRejected { source }
         }
         other => other,
     }
@@ -864,9 +960,23 @@ fn classify_request_too_large(
     let OpenAiCompatibleResponsesError::Client(error) = error else {
         return None;
     };
-    (matches!(error, ResponsesError::Status { status: 413, .. })
+    (matches!(error, ResponsesError::Status { status, body }
+        if crate::api::is_provider_request_too_large(*status, body))
         || is_explicit_websocket_message_too_big(error))
     .then(ProviderRequestTooLarge::new)
+}
+
+fn classify_context_window_exceeded(error: &OpenAiCompatibleResponsesError) -> bool {
+    match error {
+        OpenAiCompatibleResponsesError::Client(ResponsesError::Status { body, .. }) => {
+            is_context_window_error_body(body)
+        }
+        OpenAiCompatibleResponsesError::Client(ResponsesError::Failed { code, message }) => {
+            code.as_deref().is_some_and(is_context_window_error_body)
+                || is_context_window_error_body(message)
+        }
+        _ => false,
+    }
 }
 
 fn output_shape(reason: impl Into<String>) -> OpenAiCompatibleResponsesError {
@@ -877,6 +987,36 @@ fn output_shape(reason: impl Into<String>) -> OpenAiCompatibleResponsesError {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn media_recovery_requires_explicit_media_error() {
+        for (error_code, message, expected) in [
+            ("invalid_request_error", "invalid tool schema", false),
+            ("unsupported_media_type", "unsupported media type", true),
+            ("invalid_image", "invalid image", true),
+            (
+                "invalid_request_error",
+                "maximum context length exceeded",
+                false,
+            ),
+            ("content_policy_violation", "content policy rejected", false),
+            ("invalid_request_error", "unsupported image format", true),
+        ] {
+            let body = serde_json::json!({"error": {"code": error_code, "type": error_code, "message": message}}).to_string();
+            let error = wrap_media_rejection(
+                OpenAiCompatibleResponsesError::Client(ResponsesError::Status {
+                    status: 400,
+                    body,
+                }),
+                true,
+            );
+            assert_eq!(
+                matches!(error, OpenAiCompatibleResponsesError::MediaRejected { .. }),
+                expected,
+                "{error_code}: {message}"
+            );
+        }
+    }
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -934,6 +1074,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingRequestObserver {
         requests: Vec<Vec<SessionTurnMessage>>,
+        started: usize,
+        previous_attempt_ambiguity: Vec<bool>,
     }
 
     struct CancellingStartedObserver {
@@ -985,6 +1127,17 @@ mod tests {
             messages: &[SessionTurnMessage],
         ) -> anyhow::Result<()> {
             self.requests.push(messages.to_vec());
+            Ok(())
+        }
+
+        fn provider_request_started_after(
+            &mut self,
+            _messages: &[SessionTurnMessage],
+            previous_attempt_ambiguous: bool,
+        ) -> anyhow::Result<()> {
+            self.started += 1;
+            self.previous_attempt_ambiguity
+                .push(previous_attempt_ambiguous);
             Ok(())
         }
     }
@@ -1206,6 +1359,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn physical_retries_are_reported_to_request_observer() {
+        let success = json!({
+            "status":"completed",
+            "output":[{
+                "type":"message",
+                "role":"assistant",
+                "content":[{"type":"output_text","text":"ok"}]
+            }]
+        })
+        .to_string();
+        let (endpoint, requests) =
+            spawn_status_sequence(vec![(500, "temporary".into()), (200, success)]).await;
+        let adapter = OpenAiCompatibleResponsesProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            Duration::from_secs(5),
+            1,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let mut observer = RecordingRequestObserver::default();
+
+        let response = adapter
+            .send_with_request_observer(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 32,
+                    stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: None,
+                    allow_continuation: false,
+                    retry_count_override: None,
+                },
+                &mut |_| {},
+                &mut observer,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.stop, ProviderStop::Done);
+        assert_eq!(observer.requests.len(), 1);
+        assert_eq!(observer.started, 2);
+        assert_eq!(observer.previous_attempt_ambiguity, vec![false, false]);
+        assert_eq!(requests.await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_context_window_response_is_classified_without_retrying() {
+        let failed = json!({
+            "status":"failed",
+            "error": {
+                "code":"context_length_exceeded",
+                "message":"maximum context length exceeded"
+            },
+            "output":[]
+        })
+        .to_string();
+        let (endpoint, requests) = spawn_status_sequence(vec![(200, failed)]).await;
+        let adapter = OpenAiCompatibleResponsesProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            Duration::from_secs(5),
+            1,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let mut observer = RecordingRequestObserver::default();
+
+        let error = adapter
+            .send_with_request_observer(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 32,
+                    stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: None,
+                    allow_continuation: false,
+                    retry_count_override: None,
+                },
+                &mut |_| {},
+                &mut observer,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .downcast_ref::<ProviderContextWindowExceeded>()
+            .is_some());
+        assert_eq!(observer.requests.len(), 1);
+        assert_eq!(observer.started, 1);
+        assert_eq!(requests.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_refusal_is_a_request_rejection_without_assistant_commit() {
+        let refusal = json!({
+            "status":"completed",
+            "output":[{
+                "type":"message",
+                "role":"assistant",
+                "status":"completed",
+                "content":[{"type":"refusal","refusal":"cannot comply"}]
+            }]
+        })
+        .to_string();
+        let (endpoint, requests) = spawn_status_sequence(vec![(200, refusal)]).await;
+        let adapter = OpenAiCompatibleResponsesProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            Duration::from_secs(5),
+            1,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let mut events = Vec::new();
+
+        let error = adapter
+            .send(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 32,
+                    stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: None,
+                    allow_continuation: false,
+                    retry_count_override: None,
+                },
+                &mut |event| events.push(event),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<ProviderRequestRejected>().is_some());
+        assert!(events.is_empty());
+        assert_eq!(requests.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn consecutive_main_like_turns_keep_exact_responses_wire_prefix() {
         let first_item = json!({
             "type":"message","id":"msg_1","role":"assistant","status":"completed",
@@ -1393,7 +1702,7 @@ mod tests {
     }
 
     #[test]
-    fn media_4xx_gets_hint_without_protocol_fallback() {
+    fn generic_4xx_with_media_does_not_get_media_hint() {
         let error = wrap_media_rejection(
             OpenAiCompatibleResponsesError::Client(ResponsesError::Status {
                 status: 400,
@@ -1402,8 +1711,52 @@ mod tests {
             true,
         );
 
-        assert!(error.to_string().contains("可能不支持图片 / PDF 附件"));
-        assert!(error.to_string().contains("bad input"));
+        assert!(!error.to_string().contains("可能不支持图片 / PDF 附件"));
+        assert!(error
+            .to_string()
+            .contains("redacted Responses request/replay payload"));
+        assert!(!error.to_string().contains("bad input"));
+
+        for status in [408, 409, 423, 425, 499] {
+            let ambiguous = wrap_media_rejection(
+                OpenAiCompatibleResponsesError::Client(ResponsesError::Status {
+                    status,
+                    body: "request outcome unknown".into(),
+                }),
+                true,
+            );
+            assert!(matches!(
+                ambiguous,
+                OpenAiCompatibleResponsesError::Client(ResponsesError::Status {
+                    status: actual,
+                    ..
+                }) if actual == status
+            ));
+            assert!(!responses_adapter_request_rejected(&ambiguous));
+        }
+    }
+
+    #[test]
+    fn media_request_content_policy_error_is_not_rewritten_as_media_rejection() {
+        for code in [
+            "content_filter",
+            "content_policy_violation",
+            "safety_violation",
+        ] {
+            let error = wrap_media_rejection(
+                OpenAiCompatibleResponsesError::Client(ResponsesError::Status {
+                    status: 400,
+                    body: json!({"error":{"code":code}}).to_string(),
+                }),
+                true,
+            );
+
+            assert!(matches!(
+                &error,
+                OpenAiCompatibleResponsesError::Client(ResponsesError::Status { status: 400, .. })
+            ));
+            assert!(responses_adapter_request_rejected(&error));
+        }
     }
 
     #[test]
@@ -1426,6 +1779,150 @@ mod tests {
             ))
             .is_none()
         );
+        for code in [
+            "authentication_error",
+            "model_not_found",
+            "rate_limit_error",
+            "future_error",
+            "content_length_exceeded",
+        ] {
+            assert!(
+                classify_request_too_large(&OpenAiCompatibleResponsesError::Client(
+                    ResponsesError::Status {
+                        status: 413,
+                        body: json!({"error":{"code":code}}).to_string(),
+                    }
+                ))
+                .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn http_400_context_limit_precedes_media_rejection() {
+        let error = OpenAiCompatibleResponsesError::Client(ResponsesError::Status {
+            status: 400,
+            body: r#"{"error":{"code":"context_length_exceeded"}}"#.into(),
+        });
+
+        assert!(classify_context_window_exceeded(&error));
+        assert!(responses_adapter_request_rejected(&error));
+
+        let failed = OpenAiCompatibleResponsesError::Client(ResponsesError::Failed {
+            code: Some("invalid_request_error".into()),
+            message: "maximum context length exceeded".into(),
+        });
+        assert!(classify_context_window_exceeded(&failed));
+        assert!(responses_adapter_request_rejected(&failed));
+    }
+
+    #[test]
+    fn failed_and_incomplete_terminals_are_request_rejections() {
+        for error in [
+            ResponsesError::Failed {
+                code: Some("content_filter".into()),
+                message: "content policy".into(),
+            },
+            ResponsesError::Incomplete {
+                reason: "content_filter".into(),
+            },
+        ] {
+            assert!(responses_adapter_request_rejected(
+                &OpenAiCompatibleResponsesError::Client(error)
+            ));
+        }
+
+        let transient = ResponsesError::Failed {
+            code: Some("server_error".into()),
+            message: "temporary failure".into(),
+        };
+        assert!(!responses_client_outcome_resolved(&transient));
+        let transient = OpenAiCompatibleResponsesError::Client(transient);
+        assert!(!responses_adapter_request_rejected(&transient));
+        assert!(responses_adapter_stream_failure(&transient));
+
+        for code in [None, Some("unknown_provider_error".into())] {
+            let unknown = OpenAiCompatibleResponsesError::Client(ResponsesError::Failed {
+                code,
+                message: "unclassified failure".into(),
+            });
+            assert!(!responses_adapter_request_rejected(&unknown));
+            assert!(!responses_adapter_stream_failure(&unknown));
+            assert!(responses_adapter_terminal_failure(&unknown));
+        }
+    }
+
+    #[test]
+    fn structured_responses_codes_override_status_only_classification() {
+        let auth = OpenAiCompatibleResponsesError::Client(ResponsesError::Status {
+            status: 400,
+            body: redact_responses_error_body(
+                r#"{"error":{"code":"authentication_error","message":"bad key"}}"#,
+            ),
+        });
+        assert!(!responses_adapter_request_rejected(&auth));
+        assert!(!classify_context_window_exceeded(&auth));
+
+        let context = OpenAiCompatibleResponsesError::Client(ResponsesError::Status {
+            status: 403,
+            body: redact_responses_error_body(
+                r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#,
+            ),
+        });
+        assert!(classify_context_window_exceeded(&context));
+        assert!(responses_adapter_request_rejected(&context));
+
+        let media = wrap_media_rejection(
+            OpenAiCompatibleResponsesError::Client(ResponsesError::Status {
+                status: 403,
+                body: redact_responses_error_body(
+                    r#"{"error":{"code":"unsupported_media_type","message":"bad image"}}"#,
+                ),
+            }),
+            true,
+        );
+        assert!(matches!(
+            media,
+            OpenAiCompatibleResponsesError::MediaRejected { .. }
+        ));
+
+        for code in [
+            "invalid_api_key",
+            "model_not_found",
+            "unknown_provider_error",
+        ] {
+            let error = OpenAiCompatibleResponsesError::Client(ResponsesError::Status {
+                status: 400,
+                body: redact_responses_error_body(
+                    &json!({"error":{"code":code,"message":"configuration error"}}).to_string(),
+                ),
+            });
+            assert!(!responses_adapter_request_rejected(&error), "code={code}");
+        }
+
+        let invalid_prompt = OpenAiCompatibleResponsesError::Client(ResponsesError::Status {
+            status: 404,
+            body: redact_responses_error_body(
+                r#"{"error":{"code":"invalid_prompt","message":"invalid history"}}"#,
+            ),
+        });
+        assert!(responses_adapter_request_rejected(&invalid_prompt));
+    }
+
+    #[test]
+    fn explicit_failed_media_code_uses_media_recovery() {
+        let error = wrap_media_rejection(
+            OpenAiCompatibleResponsesError::Client(ResponsesError::Failed {
+                code: Some("unsupported_image".into()),
+                message: "unsupported_image: redacted".into(),
+            }),
+            true,
+        );
+
+        assert!(matches!(
+            error,
+            OpenAiCompatibleResponsesError::MediaRejected { .. }
+        ));
     }
 
     #[test]
@@ -1625,6 +2122,71 @@ mod tests {
             event,
             ProviderEvent::AssistantMessageCompleted { text } if text == "hello world"
         )));
+    }
+
+    #[tokio::test]
+    async fn transient_sse_error_marks_the_retry_ambiguous() {
+        let first = format!(
+            "data: {}\n\n",
+            json!({
+                "type":"error",
+                "status_code":503,
+                "code":"server_error",
+                "message":"retry later"
+            })
+        );
+        let second = format!(
+            "data: {}\n\n",
+            json!({
+                "type":"error",
+                "code":"invalid_request_error",
+                "message":"invalid input"
+            })
+        );
+        let (endpoint, requests) = spawn_mixed_sequence(vec![
+            ("text/event-stream", first),
+            ("text/event-stream", second),
+        ])
+        .await;
+        let adapter = OpenAiCompatibleResponsesProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            Duration::from_secs(5),
+            1,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let mut observer = RecordingRequestObserver::default();
+
+        let error = adapter
+            .send_with_request_observer(
+                ProviderRequest {
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 32,
+                    stream: true,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: None,
+                    allow_continuation: false,
+                    retry_count_override: None,
+                },
+                &mut |_| {},
+                &mut observer,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.downcast_ref::<ProviderRequestRejected>().is_some(),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(observer.previous_attempt_ambiguity, vec![false, true]);
+        assert_eq!(requests.await.unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -2476,7 +3038,10 @@ mod tests {
             json!({"type":"response.output_text.delta","delta":"partial"}),
             json!({
                 "type":"response.failed",
-                "response":{"error":{"message":"deterministic failure"}}
+                "response":{"error":{
+                    "code":"content_filter",
+                    "message":"deterministic failure"
+                }}
             })
         );
         let (endpoint, requests) = spawn_raw_sequence(vec![body]).await;
@@ -2514,7 +3079,11 @@ mod tests {
         let requests = requests.await.unwrap();
 
         assert_eq!(requests.len(), 1);
-        assert!(error.to_string().contains("deterministic failure"));
+        assert!(error.to_string().contains("content_filter"));
+        assert!(error
+            .to_string()
+            .contains("redacted Responses request/replay payload"));
+        assert!(!error.to_string().contains("deterministic failure"));
         assert!(events.iter().all(|event| !matches!(
             event,
             crate::api::SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
@@ -2589,6 +3158,90 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn transient_failed_json_during_fallback_retries_non_streaming() {
+        let final_item = json!({
+            "type":"message","id":"msg_ok","role":"assistant","status":"completed",
+            "content":[{"type":"output_text","text":"fallback recovered"}]
+        });
+        let (endpoint, requests) = spawn_mixed_sequence(vec![
+            (
+                "text/event-stream",
+                format!(
+                    "data: {}\n\n",
+                    json!({"type":"response.output_text.delta","delta":"partial"})
+                ),
+            ),
+            (
+                "application/json",
+                json!({
+                    "status":"failed",
+                    "error":{"code":"server_error","message":"temporary failure"},
+                    "output":[]
+                })
+                .to_string(),
+            ),
+            (
+                "application/json",
+                json!({"status":"completed","output":[final_item]}).to_string(),
+            ),
+        ])
+        .await;
+        let adapter = Arc::new(
+            OpenAiCompatibleResponsesProviderAdapter::new(
+                "test-key".into(),
+                endpoint,
+                "test-model".into(),
+                Duration::from_secs(5),
+                0,
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .unwrap(),
+        );
+        let tools = Arc::new(ToolRegistry::new(&ToolConfig::default()).unwrap());
+        let turn_loop = AgentTurnLoop::new(adapter, tools, 128);
+        let mut events = Vec::new();
+
+        let turn = turn_loop
+            .run_session_turn(
+                SessionTurnRequest {
+                    current_session_id: None,
+                    current_turn_id: None,
+                    system_prompt: "system".into(),
+                    history: Vec::new(),
+                    user_text: "hello".into(),
+                    user_attachments: Vec::new(),
+                    skill_instructions: Vec::new(),
+                },
+                &mut |event| events.push(event),
+            )
+            .await
+            .unwrap();
+        let requests = requests.await.unwrap();
+
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1]["stream"], false);
+        assert_eq!(requests[2]["stream"], false);
+        assert_eq!(requests[1]["input"], requests[2]["input"]);
+        assert!(turn.messages.iter().any(|message| {
+            matches!(
+                message.content.first(),
+                Some(SessionTurnContentBlock::Text { text }) if text == "fallback recovered"
+            )
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    crate::api::SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }
+                ))
+                .count(),
+            2
+        );
+    }
+
     async fn spawn_json_sequence(
         bodies: Vec<Value>,
     ) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
@@ -2655,6 +3308,29 @@ mod tests {
                 requests.push(serde_json::from_slice(&request[body_start..]).unwrap());
             }
             requests
+        });
+        (format!("http://{address}/v1"), handle)
+    }
+
+    async fn spawn_status_sequence(
+        responses: Vec<(u16, String)>,
+    ) -> (String, tokio::task::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected = responses.len();
+        let handle = tokio::spawn(async move {
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                assert!(!request.is_empty());
+                let reason = if status == 200 { "OK" } else { "Test Error" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            expected
         });
         (format!("http://{address}/v1"), handle)
     }

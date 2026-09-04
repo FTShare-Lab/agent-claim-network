@@ -70,6 +70,7 @@ pub enum SessionEvent {
     AssistantTextDelta {
         text: String,
     },
+    AssistantOutputAccepted,
     AssistantOutputDiscarded,
     AssistantMessageCompleted {
         text: String,

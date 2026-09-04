@@ -269,6 +269,10 @@ pub enum SessionTurnEvent {
     AssistantTextDelta {
         text: String,
     },
+    /// 当前物理响应已经通过协议校验；后续 attempt 失败时只丢弃此边界后的临时输出。
+    AssistantOutputAccepted,
+    /// 已显示的流式片段必须在 non-streaming fallback 前持久化，但原物理响应仍未确认。
+    AssistantOutputPreservedForFallback,
     /// 当前 provider attempt 已显示的未完成 assistant 文本不会进入 canonical，
     /// 消费方必须在恢复重试前移除该临时输出。
     AssistantOutputDiscarded,
