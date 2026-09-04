@@ -6,6 +6,7 @@
 
 - [ACN 使用指南](user_guide.md)
 - [配置参数](config_parameters.md)
+- [Maintainer 自裁决说明](maintainer_auto_arbitration.md)
 - [已知问题](outstanding_issues.md)
 
 ## 架构与概念
