@@ -105,6 +105,8 @@ struct ProviderRequestProgress<'preflight, 'recorder> {
     latest_request_started: bool,
     ambiguous_send_seen: bool,
     previous_messages_before_pending: Option<Vec<SessionTurnMessage>>,
+    fallback_output_prefix: Option<String>,
+    accepted_fallback_text: Option<String>,
 }
 
 impl<'preflight, 'recorder> ProviderRequestProgress<'preflight, 'recorder> {
@@ -126,6 +128,8 @@ impl<'preflight, 'recorder> ProviderRequestProgress<'preflight, 'recorder> {
             latest_request_started: false,
             ambiguous_send_seen: false,
             previous_messages_before_pending: None,
+            fallback_output_prefix: None,
+            accepted_fallback_text: None,
         }
     }
 
@@ -340,6 +344,44 @@ impl ProviderRequestObserver for ProviderRequestProgress<'_, '_> {
         Ok(())
     }
 
+    async fn provider_response_checkpoint(
+        &mut self,
+        history: &[SessionTurnMessage],
+        non_streaming_text: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.preparing_write_ahead.store(true, Ordering::Release);
+        if let (Some(prefix), Some(text)) = (&self.fallback_output_prefix, non_streaming_text) {
+            let mut accepted = prefix.clone();
+            append_with_overlap_dedupe(&mut accepted, text);
+            if let Some(recorder) = self.durable_recorder.as_deref_mut() {
+                recorder
+                    .record_assistant_output_checkpoint(&accepted)
+                    .await
+                    .map_err(ProviderRequestPreparationFailure::from_error)?;
+            }
+            self.visible_output_bytes
+                .store(accepted.len(), Ordering::Release);
+            self.accepted_visible_output_bytes
+                .store(accepted.len(), Ordering::Release);
+            self.unaccepted_visible_output
+                .store(false, Ordering::Release);
+            self.accepted_fallback_text = Some(accepted);
+        }
+        if let Some(preflight) = self.preflight.as_deref_mut() {
+            time::timeout(
+                PROVIDER_WAL_PREPARATION_TIMEOUT,
+                preflight.provider_response_checkpoint(history, self.canonical_tail_count),
+            )
+            .await
+            .map_err(|_| {
+                ProviderRequestPreparationFailure::new("Provider 内部响应状态保存超时（10 秒）")
+            })?
+            .map_err(ProviderRequestPreparationFailure::from_error)?;
+        }
+        self.preparing_write_ahead.store(false, Ordering::Release);
+        Ok(())
+    }
+
     async fn provider_request_abandoned_before_send(
         &mut self,
         messages: &[SessionTurnMessage],
@@ -464,6 +506,9 @@ const MAX_PROGRESS_EVENTS_PER_DRAIN: usize = 64;
 
 #[async_trait]
 pub trait SessionTurnEventRecorder: Send {
+    async fn record_assistant_output_checkpoint(&mut self, _text: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn record_historical_media_cleanup(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -511,6 +556,15 @@ pub trait SessionTurnContextAppender: Send {
 
 #[async_trait]
 pub trait SessionTurnPreflight: Send {
+    /// 已接受的内部响应形成新的恢复前缀，不沿用此前 request 的截断位置。
+    async fn provider_response_checkpoint(
+        &mut self,
+        provider_messages: &[SessionTurnMessage],
+        canonical_tail_count: usize,
+    ) -> anyhow::Result<()> {
+        self.provider_response_ready(provider_messages, canonical_tail_count)
+            .await
+    }
     /// 本轮初始 history 中已经由此前真实 Provider 请求确认、必须原样重放的前缀长度。
     ///
     /// turn loop 只会在此前缀之后规范化新后缀，避免 adjacent-user merge 等 wire
@@ -2764,6 +2818,16 @@ impl AgentTurnLoop {
                     }
 
                     let fallback_attempt_base = request_progress.latest_messages().to_vec();
+                    let mut prior_output = SessionTurnMessage::assistant_text("");
+                    merge_prior_attempt_continuation_text(
+                        &mut prior_output,
+                        messages,
+                        &fallback_attempt_base,
+                    )?;
+                    request_progress.fallback_output_prefix = Some(
+                        context_continuation
+                            .fallback_replacement_text(&assistant_message_text(&prior_output)),
+                    );
                     let fallback_request = ProviderRequest {
                         system_prompt: system_prompt.to_string(),
                         messages: fallback_attempt_base.clone(),
@@ -2797,6 +2861,13 @@ impl AgentTurnLoop {
                             validate_non_streaming_fallback_response(&response, seen_tool_use_ids)?;
                             Ok(response)
                         });
+                    if fallback_result.is_err() {
+                        if let Some(text) = request_progress.accepted_fallback_text.as_ref() {
+                            emit(SessionTurnEvent::AssistantMessageCompleted {
+                                text: text.clone(),
+                            });
+                        }
+                    }
                     match fallback_result {
                         Ok(response) => {
                             let provider_assistant_message =

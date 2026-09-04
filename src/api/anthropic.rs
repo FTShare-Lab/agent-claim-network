@@ -164,20 +164,41 @@ impl AnthropicContinuationRequestObserver<'_> {
             })
     }
 
+    async fn checkpoint_response(
+        &mut self,
+        replay: Value,
+        text: &str,
+        non_streaming_text: Option<&str>,
+    ) -> Result<(), AnthropicError> {
+        let mut history = self.messages.clone();
+        history.push(self.round_message(vec![replay], text.to_string()));
+        self.observer
+            .provider_response_checkpoint(&history, non_streaming_text)
+            .await
+            .map_err(|error| AnthropicError::RequestPreparation {
+                reason: format!("{error:#}"),
+            })
+    }
+
     fn push_round(&mut self, replay_messages: Vec<Value>, text: String) {
+        self.messages
+            .push(self.round_message(replay_messages, text));
+    }
+
+    fn round_message(&self, replay_messages: Vec<Value>, text: String) -> SessionTurnMessage {
         let content = if text.trim().is_empty() {
             Vec::new()
         } else {
             vec![SessionTurnContentBlock::text(text)]
         };
-        self.messages.push(SessionTurnMessage {
+        SessionTurnMessage {
             role: "assistant".into(),
             content,
             provider_replay: Some(crate::api::ProviderReplayState::AnthropicMessages {
                 model: self.model.clone(),
                 messages: replay_messages,
             }),
-        });
+        }
     }
 
     fn discard_pending_round(&mut self) -> Result<(), AnthropicError> {
@@ -573,6 +594,11 @@ impl AnthropicMessagesClient {
             }
             if round == max_continuation_turns {
                 break;
+            }
+            if let Some(observer) = request_observer.as_deref_mut() {
+                observer
+                    .checkpoint_response(assistant_replay.clone(), &round_text, Some(&merged_text))
+                    .await?;
             }
             let continuation = json!({"role": "user", "content": CONTINUATION_TRIGGER});
             messages.push(ApiMessage::raw(continuation.clone()));

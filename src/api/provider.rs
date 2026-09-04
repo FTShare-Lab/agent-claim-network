@@ -133,6 +133,16 @@ pub trait ProviderRequestObserver: Send {
         self.provider_request_outcome_resolved(messages)
     }
 
+    /// 内部续写前保存已接受的响应；history 不含下一请求的 continuation trigger。
+    /// 非流式正文没有 delta 事件，由 owner 同时保存其累计文本。
+    async fn provider_response_checkpoint(
+        &mut self,
+        _history: &[SessionTurnMessage],
+        _non_streaming_text: Option<&str>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// adapter 已准备内部 continuation，但在任何 transport send-started 之前决定
     /// 放弃；owner 必须回滚该 continuation 的 request WAL。
     async fn provider_request_abandoned_before_send(

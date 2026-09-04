@@ -380,6 +380,24 @@ impl OpenAiCompatibleResponsesProviderAdapter {
             if round == max_continuation_turns {
                 break;
             }
+            let mut accepted_history = provider_messages.clone();
+            accepted_history.push(SessionTurnMessage {
+                role: "assistant".into(),
+                content: vec![SessionTurnContentBlock::text(round_text.clone())],
+                provider_replay: Some(ProviderReplayState::OpenAiResponses {
+                    model: Some(self.model.clone()),
+                    items: round_replay_items.clone(),
+                }),
+            });
+            observer
+                .provider_response_checkpoint(
+                    &accepted_history,
+                    (!stream).then_some(merged_text.as_str()),
+                )
+                .await
+                .map_err(|error| OpenAiCompatibleResponsesError::RequestPreparation {
+                    reason: format!("{error:#}"),
+                })?;
             let continuation = user_text_item(CONTINUATION_TRIGGER);
             input.push(continuation.clone());
             replay_items.push(continuation.clone());

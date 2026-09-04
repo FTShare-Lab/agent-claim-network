@@ -1042,6 +1042,19 @@ impl SessionTurnPreflight for PreflightCompactor<'_> {
         .await
     }
 
+    async fn provider_response_checkpoint(
+        &mut self,
+        provider_messages: &[SessionTurnMessage],
+        canonical_tail_count: usize,
+    ) -> anyhow::Result<()> {
+        self.persist_provider_history(
+            provider_messages,
+            canonical_tail_count,
+            provider_messages.len(),
+        )
+        .await
+    }
+
     fn provider_request_started(
         &mut self,
         _provider_messages: &[SessionTurnMessage],
@@ -5309,6 +5322,8 @@ impl SessionEngine {
     where
         F: FnMut(SessionEvent),
     {
+        let journal = session.read_turn_journal().await;
+        self.recover_provider_rejection(session, &journal).await?;
         let metadata = session.read_metadata().await?;
         let session_messages = session.read_messages().await?;
         validate_session_compaction_state(&metadata, session_messages.len())?;

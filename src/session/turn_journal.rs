@@ -121,6 +121,10 @@ pub enum TurnJournalEventKind {
     },
     /// 标记最近 assistant 流式片段中已经通过 provider 协议校验的前缀。
     AssistantOutputAccepted,
+    /// 非流式内部响应已接受，但后续 continuation 尚未完成。
+    AssistantOutputCheckpoint {
+        text: String,
+    },
     /// fallback 发送前的 durable 边界；保留片段但不把它升级为已通过协议校验的前缀。
     AssistantOutputPreservedForFallback,
     /// 丢弃最近一个尚未完成的 assistant 流式片段；该 attempt 未进入 canonical。
@@ -1195,6 +1199,21 @@ impl TurnAccumulator {
             }
             TurnJournalEventKind::AssistantOutputAccepted => {
                 self.accept_incomplete_assistant();
+            }
+            TurnJournalEventKind::AssistantOutputCheckpoint { text } => {
+                match self.timeline_items.last_mut() {
+                    Some(TimelineAccumulatorItem::Assistant(segment)) if !segment.completed => {
+                        segment.text = text;
+                        segment.accepted_bytes = segment.text.len();
+                    }
+                    _ => self.timeline_items.push(TimelineAccumulatorItem::Assistant(
+                        AssistantSegment {
+                            accepted_bytes: text.len(),
+                            text,
+                            completed: false,
+                        },
+                    )),
+                }
             }
             TurnJournalEventKind::AssistantOutputPreservedForFallback => {}
             TurnJournalEventKind::AssistantOutputDiscarded => {
@@ -3273,5 +3292,49 @@ mod tests {
             Some(TurnJournalStatus::RejectedByProvider)
         );
         assert_eq!(projection.turns[0].finished_at, Some(ts(1)));
+    }
+    #[test]
+    fn accepted_output_checkpoints_replace_unconfirmed_text_without_completing_turn() {
+        let events = [
+            TurnJournalEventKind::TurnStarted,
+            TurnJournalEventKind::AssistantDelta {
+                text: "unconfirmed stream fragment".into(),
+            },
+            TurnJournalEventKind::AssistantOutputCheckpoint {
+                text: "accepted prefix".into(),
+            },
+            TurnJournalEventKind::AssistantOutputCheckpoint {
+                text: "accepted prefix and continuation".into(),
+            },
+            TurnJournalEventKind::AssistantDelta {
+                text: " unconfirmed suffix".into(),
+            },
+            TurnJournalEventKind::AssistantOutputDiscarded,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| TurnJournalEvent {
+            seq: u64::try_from(index).unwrap() + 1,
+            turn_id: "turn_1".into(),
+            created_at: ts(1),
+            kind,
+        })
+        .collect();
+        let projection = replay_turn_journal(TurnJournalRead {
+            events,
+            warnings: Vec::new(),
+        });
+        assert_eq!(
+            projection.turns[0].assistant_text,
+            "accepted prefix and continuation"
+        );
+        assert_eq!(projection.turns[0].status, None);
+        assert!(matches!(
+            &projection.turns[0].timeline_items[0],
+            TurnJournalTimelineItem::Assistant {
+                completed: false,
+                ..
+            }
+        ));
     }
 }

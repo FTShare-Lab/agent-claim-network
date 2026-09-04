@@ -8794,6 +8794,215 @@ async fn manual_compact_noop_reports_nothing_new_for_empty_session() {
 }
 
 #[tokio::test]
+async fn manual_compact_after_rejection_survives_the_next_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        ProviderStep::Rejected {
+            message: "invalid request",
+        },
+        json_by_request_kind_responses(
+            &[r#"{"committed_summary":"retained manual summary","active_turn_summary":null}"#],
+            &[],
+        ),
+        response_step("continued", Vec::new()),
+    ]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.compaction.auto_compact_ctx_ratio = 0.0;
+    engine.context_window = 20_000;
+    engine.compaction.tail_target_ctx_ratio = 0.015;
+    engine.compaction.tail_hard_ctx_ratio = 0.0225;
+    engine.compaction.tail_previous_real_user_turns = 1;
+    let mut session = create_test_session(&store, "session_face0028").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "old request ".repeat(120)),
+            NewSessionMessage::text(
+                SessionMessageRole::Assistant,
+                "OLD_UNCOMPACTED_ANSWER ".repeat(120),
+            ),
+            NewSessionMessage::text(SessionMessageRole::User, "latest request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "latest answer"),
+        ])
+        .await
+        .unwrap();
+    engine
+        .run_turn(&mut session, "REJECTED_PROMPT", |_| {})
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        engine
+            .compact_session_checkpoint(&mut session, |_| {})
+            .await
+            .unwrap(),
+        SessionCompactionResult::Compacted(_)
+    ));
+    assert_eq!(
+        session
+            .read_metadata()
+            .await
+            .unwrap()
+            .compaction
+            .unwrap()
+            .committed_summary,
+        "retained manual summary"
+    );
+    engine
+        .run_turn(&mut session, "next prompt", |_| {})
+        .await
+        .unwrap();
+    let requests = provider.requests().await;
+    let next_request = requests.last().unwrap();
+    let next = format!(
+        "{}{}",
+        next_request.system_prompt,
+        serde_json::to_string(&next_request.messages).unwrap()
+    );
+    assert!(next.contains("retained manual summary"));
+    assert!(!next.contains("OLD_UNCOMPACTED_ANSWER"));
+    assert!(!next.contains("REJECTED_PROMPT"));
+}
+
+#[tokio::test]
+async fn rejected_fallback_continuation_preserves_accepted_output_across_adapters() {
+    use crate::api::{
+        AnthropicProviderAdapter, OpenAiCompatibleChatProviderAdapter,
+        OpenAiCompatibleResponsesProviderAdapter,
+    };
+    use axum::response::IntoResponse;
+    const ACCEPTED: &str = "accepted fallback prefix";
+    for protocol in 0..3 {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let requests = captured.clone();
+        let app = axum::Router::new().fallback(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let requests = requests.clone();
+            async move {
+                let mut requests = requests.lock().await;
+                let index = requests.len();
+                requests.push(body);
+                if index == 0 {
+                    let delta = match protocol {
+                        0 => json!({"type":"response.output_text.delta","item_id":"msg_partial","output_index":0,"content_index":0,"delta":"unconfirmed stream fragment"}),
+                        1 => json!({"choices":[{"index":0,"delta":{"role":"assistant","content":"unconfirmed stream fragment"},"finish_reason":null}]}),
+                        _ => json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"unconfirmed stream fragment"}}),
+                    };
+                    return ([("content-type", "text/event-stream")], format!("data: {delta}\n\n")).into_response();
+                }
+                if index == 1 {
+                    let partial = match protocol {
+                        0 => json!({"id":"resp_partial","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","id":"msg_partial","role":"assistant","status":"completed","content":[{"type":"output_text","text":ACCEPTED}]}]}),
+                        1 => json!({"choices":[{"message":{"role":"assistant","content":ACCEPTED},"finish_reason":"length"}]}),
+                        _ => json!({"id":"msg_partial","type":"message","role":"assistant","content":[{"type":"text","text":ACCEPTED}],"stop_reason":"max_tokens"}),
+                    };
+                    return axum::Json(partial).into_response();
+                }
+                (axum::http::StatusCode::BAD_REQUEST, axum::Json(json!({"error":{"type":"invalid_request_error","message":"continuation rejected"}}))).into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let timeout = Duration::from_secs(5);
+        let provider: Arc<dyn ProviderAdapter> = match protocol {
+            0 => Arc::new(
+                OpenAiCompatibleResponsesProviderAdapter::new(
+                    "test-key".into(),
+                    endpoint,
+                    "test-model".into(),
+                    timeout,
+                    0,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )
+                .unwrap(),
+            ),
+            1 => Arc::new(
+                OpenAiCompatibleChatProviderAdapter::new(
+                    "test-key".into(),
+                    endpoint,
+                    "test-model".into(),
+                    timeout,
+                    0,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )
+                .unwrap(),
+            ),
+            _ => Arc::new(
+                AnthropicProviderAdapter::new(
+                    "test-key".into(),
+                    endpoint,
+                    "test-model".into(),
+                    128,
+                    timeout,
+                    0,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )
+                .unwrap(),
+            ),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, store) = build_test_engine(&dir, provider);
+        engine.compaction.auto_compact_ctx_ratio = 0.0;
+        let mut session = create_test_session(&store, "session_face0029").await;
+        let error = engine
+            .run_turn(&mut session, "finish the answer", |_| {})
+            .await
+            .unwrap_err();
+        server.abort();
+        assert!(
+            error.downcast_ref::<ProviderRequestRejected>().is_some(),
+            "protocol={protocol}: {error:#}"
+        );
+        assert_eq!(captured.lock().await.len(), 3, "protocol={protocol}");
+        let mut compaction = session.read_metadata().await.unwrap().compaction.unwrap();
+        let history = compaction.provider_history.as_ref().unwrap();
+        assert_eq!(
+            history
+                .pending_turn
+                .as_ref()
+                .unwrap()
+                .provider_request_message_count,
+            Some(history.messages.len())
+        );
+        assert!(
+            serde_json::to_string(&history.messages)
+                .unwrap()
+                .contains(ACCEPTED),
+            "protocol={protocol}: accepted response missing from rollback WAL"
+        );
+        let journal = replay_turn_journal(session.read_turn_journal().await);
+        assert_eq!(
+            journal.turns[0].assistant_text, ACCEPTED,
+            "protocol={protocol}"
+        );
+        assert_eq!(journal.turns[0].status, Some(TurnJournalStatus::Failed));
+        // 重建不能依赖当前模型的私有 replay，也不能靠残留 WAL 掩盖 journal 缺口。
+        let journal_read = session.read_turn_journal().await;
+        engine
+            .recover_provider_rejection(&mut session, &journal_read)
+            .await
+            .unwrap();
+        compaction.provider_history = None;
+        session.update_compaction(compaction).await.unwrap();
+        let resumed_provider = Arc::new(RecordingProvider::new(vec![response_step(
+            "continued",
+            Vec::new(),
+        )]));
+        let (resumed_engine, _) = build_test_engine(&dir, resumed_provider.clone());
+        resumed_engine
+            .run_turn(&mut session, "continue", |_| {})
+            .await
+            .unwrap();
+        assert!(
+            serde_json::to_string(&resumed_provider.requests().await[0].messages)
+                .unwrap()
+                .contains(ACCEPTED)
+        );
+    }
+}
+
+#[tokio::test]
 async fn manual_compact_summarizes_pending_failed_turn_without_changing_authorities() {
     const FULL_ONLY_MARKER: &str = "FULL-PENDING-WAL-ONLY-MARKER";
     const RECOVERY_SUMMARY: &str = "failed file read summarized for recovery";

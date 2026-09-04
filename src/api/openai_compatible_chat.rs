@@ -350,6 +350,29 @@ impl OpenAiCompatibleChatProviderAdapter {
             if round == max_continuation_turns {
                 break;
             }
+            let mut accepted_history = provider_messages.clone();
+            accepted_history.push(SessionTurnMessage {
+                role: "assistant".into(),
+                content: vec![SessionTurnContentBlock::text(round_text.clone())],
+                provider_replay: Some(ProviderReplayState::OpenAiChatCompletions {
+                    model: self.model.clone(),
+                    messages: vec![serde_json::to_value(&assistant_replay).map_err(|error| {
+                        OpenAiCompatibleChatError::OutputShape {
+                            reason: format!("序列化 Chat accepted response 失败: {error}"),
+                            raw: String::new(),
+                        }
+                    })?],
+                }),
+            });
+            observer
+                .provider_response_checkpoint(
+                    &accepted_history,
+                    (!stream).then_some(merged_text.as_str()),
+                )
+                .await
+                .map_err(|error| OpenAiCompatibleChatError::RequestPreparation {
+                    reason: format!("{error:#}"),
+                })?;
             let continuation = ChatMessage::user(CONTINUATION_TRIGGER.to_string());
             messages.push(continuation.clone());
             let replay_messages = [assistant_replay, continuation]

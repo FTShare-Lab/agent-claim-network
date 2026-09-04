@@ -268,6 +268,11 @@ impl AnthropicMessagesClient {
             if round == max_continuation_turns {
                 break;
             }
+            if let Some(observer) = request_observer.as_deref_mut() {
+                observer
+                    .checkpoint_response(assistant_replay.clone(), &round_text, None)
+                    .await?;
+            }
             let continuation = json!({"role": "user", "content": CONTINUATION_TRIGGER});
             messages.push(ApiMessage::raw(continuation.clone()));
             replay_messages.push(continuation.clone());

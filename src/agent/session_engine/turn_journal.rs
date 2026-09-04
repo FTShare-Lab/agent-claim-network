@@ -94,6 +94,14 @@ pub(super) struct TurnJournalDurableEventRecorder {
 
 #[async_trait]
 impl SessionTurnEventRecorder for TurnJournalDurableEventRecorder {
+    async fn record_assistant_output_checkpoint(&mut self, text: &str) -> anyhow::Result<()> {
+        self.assistant_delta_flusher.flush();
+        self.sink
+            .send_immediate_durable(TurnJournalEventKind::AssistantOutputCheckpoint {
+                text: text.to_string(),
+            })
+            .await
+    }
     async fn record(&mut self, event: SessionTurnEvent) -> anyhow::Result<()> {
         match event {
             SessionTurnEvent::Warning { .. }
