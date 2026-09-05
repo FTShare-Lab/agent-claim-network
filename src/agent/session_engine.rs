@@ -1317,9 +1317,6 @@ impl PreflightCompactor<'_> {
         // “是否曾发生过语义 compaction”当成恢复正确性的开关。
         // 尚无 compaction state 时复用空 summary 的同一有界窗口，
         // 不建立另一个持久化事实源。
-        if self.provider_compaction_before_turn.is_none() {
-            self.provider_compaction_before_turn = Some(metadata.compaction.clone());
-        }
         let previous = self
             .provider_compaction_before_clean_retry
             .take()
@@ -2577,15 +2574,17 @@ impl SessionEngine {
         let Some(record) = read_provider_rejection_recovery(&path).await? else {
             return Ok(false);
         };
+        // 记录写入后回滚已在同一 turn 内应用完毕；turn 一旦写下终态，残留记录只是
+        // 崩溃窗口保护的遗留物，此时重放会覆盖之后的 /compact 等写入。
+        let turn_finished = journal.events.iter().any(|event| {
+            event.turn_id == record.turn_id
+                && matches!(event.kind, TurnJournalEventKind::TurnFinished { .. })
+        });
+        if turn_finished {
+            clear_provider_rejection_recovery(&path).await?;
+            return Ok(false);
+        }
         if record.cleaned_request {
-            let turn_finished = journal.events.iter().any(|event| {
-                event.turn_id == record.turn_id
-                    && matches!(event.kind, TurnJournalEventKind::TurnFinished { .. })
-            });
-            if turn_finished {
-                clear_provider_rejection_recovery(&path).await?;
-                return Ok(false);
-            }
             match record.into_recovery_compaction() {
                 Some(compaction) => session.update_compaction(compaction).await?,
                 None => session.clear_compaction().await?,

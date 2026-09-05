@@ -5662,6 +5662,78 @@ async fn journaled_rejection_recovers_wal_rollback_after_crash_window() {
 }
 
 #[tokio::test]
+async fn finished_rejected_turn_clears_stale_recovery_record_without_rollback() {
+    const POST_REJECTION_STATE: &str = "POST_REJECTION_MANUAL_COMPACT_STATE";
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (engine, store) = build_test_engine(&dir, provider);
+    let mut session = create_test_session(&store, "session_a11b1c11").await;
+    // 拒绝已在 turn 内回滚并写下终态；随后用户 /compact 等写入产生了新状态。
+    let mut later_state =
+        SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
+    later_state.provider_history = Some(Box::new(CompactedProviderHistory {
+        replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
+        pending_turn: None,
+        canonical_message_until: 0,
+        messages: vec![SessionTurnMessage::user_text(POST_REJECTION_STATE)],
+    }));
+    session.update_compaction(later_state).await.unwrap();
+    write_provider_rejection_recovery(
+        &session.paths.provider_rejection_recovery_json,
+        &ProviderRejectionRecoveryRecord::new(
+            "turn_1".into(),
+            1,
+            ProviderRejectedRequestRecovery::DiscardTurn,
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    let mut writer = session.open_turn_journal_writer().await.unwrap();
+    for kind in [
+        TurnJournalEventKind::TurnStarted,
+        TurnJournalEventKind::UserInputAccepted {
+            text: "rejected request".into(),
+        },
+        TurnJournalEventKind::ProviderRequestRejected {
+            rejection_id: 1,
+            discard_turn: true,
+        },
+        TurnJournalEventKind::TurnFinished {
+            status: TurnJournalStatus::RejectedByProvider,
+        },
+    ] {
+        writer
+            .append("turn_1", Utc::now(), kind, TurnJournalFlush::Immediate)
+            .await
+            .unwrap();
+    }
+    drop(writer);
+
+    let journal_read = session.read_turn_journal().await;
+    let journal_changed = engine
+        .recover_provider_rejection(&mut session, &journal_read)
+        .await
+        .unwrap();
+
+    assert!(!journal_changed);
+    assert!(
+        !tokio::fs::try_exists(&session.paths.provider_rejection_recovery_json)
+            .await
+            .unwrap()
+    );
+    let compaction = session.read_metadata().await.unwrap().compaction.unwrap();
+    assert!(
+        serde_json::to_string(&compaction.provider_history.unwrap().messages)
+            .unwrap()
+            .contains(POST_REJECTION_STATE),
+        "已终态 turn 的残留拒绝记录不得回滚之后写入的 compaction 状态"
+    );
+}
+
+#[tokio::test]
 async fn prepared_retry_wal_without_supersede_marker_keeps_rejection_terminal() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(vec![response_step(

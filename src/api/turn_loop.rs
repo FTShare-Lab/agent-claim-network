@@ -2124,7 +2124,8 @@ impl AgentTurnLoop {
             let provider_call = match provider_call {
                 Ok(provider_call) => provider_call,
                 Err(error)
-                    if ambiguous_provider_send_seen && rejected_error_clears_turn_wal(&error) =>
+                    if ambiguous_provider_send_seen
+                        && rejection_would_mutate_request_wal(&error) =>
                 {
                     let discard_visible_output = error
                         .downcast_ref::<ProviderRequestTooLarge>()
@@ -3179,8 +3180,15 @@ fn mark_provider_error_after_visible_output(
     error
 }
 
+/// 更早一次发送结果不明确时，哪些拒绝不能按自身分类回滚 WAL。
+/// 上下文窗口拒绝只取决于请求内容：那次结果不明确的发送携带同一份内容，上游对它的
+/// 裁决必然相同，因此不需要为它冻结 WAL，仍进入压缩重试。媒体 / 尺寸 / 普通拒绝
+/// 会改写 WAL 内容，保持保守。
 fn rejection_would_mutate_request_wal(error: &anyhow::Error) -> bool {
     rejected_error_clears_turn_wal(error)
+        && error
+            .downcast_ref::<ProviderContextWindowExceeded>()
+            .is_none()
 }
 
 fn rejected_error_clears_turn_wal(error: &anyhow::Error) -> bool {
@@ -4639,6 +4647,11 @@ mod tests {
         requests: Mutex<Vec<ProviderRequest>>,
     }
 
+    struct AmbiguousThenContextRejectedProvider {
+        calls: AtomicUsize,
+        requests: Mutex<Vec<ProviderRequest>>,
+    }
+
     struct RepeatedMediaRecoveryProvider {
         calls: AtomicUsize,
         requests: Mutex<Vec<ProviderRequest>>,
@@ -5057,6 +5070,31 @@ mod tests {
                 vec![SessionTurnContentBlock::text("recovered without media")],
                 ProviderStop::Done,
             ))
+        }
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for AmbiguousThenContextRejectedProvider {
+        async fn send(
+            &self,
+            request: ProviderRequest,
+            emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        ) -> anyhow::Result<ProviderResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requests.lock().await.push(request);
+            match call {
+                0 => {
+                    emit(ProviderEvent::AssistantTextDelta {
+                        text: "partial".into(),
+                    });
+                    Err(ProviderStreamFailure::new("stream failed").into())
+                }
+                1 => Err(ProviderContextWindowExceeded::new().into()),
+                _ => Ok(response(
+                    vec![SessionTurnContentBlock::text("recovered after compaction")],
+                    ProviderStop::Done,
+                )),
+            }
         }
     }
 
@@ -8370,6 +8408,46 @@ mod tests {
                         && text.contains("<media_recovery>")
                 })));
         assert!(!cleaned_wire.contains(REJECTED_DOCUMENT_PLACEHOLDER));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_send_does_not_block_context_window_recovery() {
+        let provider = Arc::new(AmbiguousThenContextRejectedProvider {
+            calls: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+        });
+        let turn_loop = tool_loop(provider.clone());
+        let mut preflight = RecordingContextRecoveryPreflight::default();
+        let mut recorder = RecordingProviderRejectionRecorder::default();
+        let mut events = Vec::new();
+
+        let turn = turn_loop
+            .run_session_turn_with_hooks(
+                request(),
+                &mut |event| events.push(event),
+                None,
+                Some(&mut recorder),
+                Some(&mut preflight),
+            )
+            .await
+            .expect("同一份内容的上下文窗口拒绝不应被更早的发送歧义冻结");
+
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].stream);
+        assert!(!requests[1].stream);
+        assert_eq!(requests[0].messages, requests[1].messages);
+        assert_eq!(preflight.rejected_requests, 1);
+        assert_eq!(preflight.applied, 1);
+        assert_eq!(recorder.rejected, vec![(1, true)]);
+        assert_eq!(recorder.retried, vec![1]);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, SessionTurnEvent::AssistantOutputDiscarded)));
+        assert_eq!(
+            assistant_message_text(non_context_messages(&turn)[1]),
+            "recovered after compaction"
+        );
     }
 
     #[tokio::test]
