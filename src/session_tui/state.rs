@@ -27,6 +27,7 @@ use super::at_path_completion::{AtPathCompletionLimits, AtPathDirectoryEntry};
 use super::attachment::AttachmentError;
 use super::bottom_pane::{BottomPane, InputDraft};
 use super::cell::user_text_display_lines;
+use super::claim_panel::{ClaimPanelAction, ClaimPanelState};
 use super::input_queue::{InputQueueState, PendingInputPreview, QueuedInput};
 use super::mcp_panel::{McpPanelKeyAction, McpPanelRequest, McpPanelState};
 use super::process_panel::{ProcessPanelKeyAction, ProcessPanelState, ProcessTerminationTarget};
@@ -78,6 +79,7 @@ pub struct SessionTuiState {
     attachment_cfg: AttachmentConfig,
     mcp_panel: McpPanelState,
     process_panel: ProcessPanelState,
+    claim_panel: ClaimPanelState,
     delegation_panel: DelegationPanelState,
     input_revision: u64,
     at_path_scan_generation: u64,
@@ -199,6 +201,7 @@ impl Default for SessionTuiState {
             attachment_cfg: AttachmentConfig::default(),
             mcp_panel: McpPanelState::default(),
             process_panel: ProcessPanelState::default(),
+            claim_panel: ClaimPanelState::default(),
             delegation_panel: DelegationPanelState::default(),
             input_revision: 0,
             at_path_scan_generation: 0,
@@ -667,6 +670,7 @@ impl SessionTuiState {
     pub(super) fn open_mcp_panel(&mut self) {
         self.delegation_panel.visible = false;
         self.process_panel.close();
+        self.claim_panel.close();
         self.mcp_panel.open();
     }
 
@@ -677,6 +681,7 @@ impl SessionTuiState {
     pub(super) fn open_process_panel(&mut self) {
         self.delegation_panel.visible = false;
         self.mcp_panel.close();
+        self.claim_panel.close();
         self.process_panel.open();
     }
 
@@ -714,6 +719,57 @@ impl SessionTuiState {
         self.process_panel
             .visible()
             .then(|| self.process_panel.render_lines(width, height))
+    }
+
+    pub(super) fn open_claim_panel(&mut self) {
+        self.delegation_panel.visible = false;
+        self.mcp_panel.close();
+        self.process_panel.close();
+        self.claim_panel.open();
+    }
+
+    pub(super) fn claim_panel_visible(&self) -> bool {
+        self.claim_panel.visible()
+    }
+    pub(super) fn paste_claim_panel(&mut self, pasted: &str) -> bool {
+        self.claim_panel.handle_paste(pasted)
+    }
+    pub(super) fn handle_claim_panel_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> ClaimPanelAction {
+        self.claim_panel.handle_key(key)
+    }
+    pub(super) fn set_claim_panel_claim_page(&mut self, page: crate::agent::claims::ClaimListPage) {
+        self.claim_panel.set_claim_page(page);
+    }
+    pub(super) fn set_claim_panel_claim(&mut self, claim: crate::agent::claims::ClaimDetail) {
+        self.claim_panel.set_claim(claim);
+    }
+    pub(super) fn set_claim_panel_trace_page(&mut self, page: crate::agent::claims::TraceListPage) {
+        self.claim_panel.set_trace_page(page);
+    }
+    pub(super) fn set_claim_panel_trace(&mut self, trace: crate::agent::claims::TraceDetail) {
+        self.claim_panel.set_trace(trace);
+    }
+    pub(super) fn fail_claim_panel(&mut self, message: impl Into<String>) {
+        self.claim_panel.fail(message);
+    }
+    pub(super) fn finish_claim_panel_save(
+        &mut self,
+        claim: crate::agent::claims::ClaimDetail,
+        notice: Option<String>,
+    ) {
+        self.claim_panel.finish_save(claim, notice);
+    }
+    pub(super) fn claim_panel_lines(
+        &self,
+        width: u16,
+        height: u16,
+    ) -> Option<Vec<ratatui::text::Line<'static>>> {
+        self.claim_panel
+            .visible()
+            .then(|| self.claim_panel.render_lines(width, height))
     }
 
     pub(super) fn set_mcp_notice(&mut self, notice: impl Into<String>) {
@@ -827,6 +883,7 @@ impl SessionTuiState {
         self.delegation_panel.visible = true;
         self.mcp_panel.close();
         self.process_panel.close();
+        self.claim_panel.close();
         self.delegation_panel.scroll = 0;
     }
 
@@ -1355,6 +1412,7 @@ impl SessionTuiState {
         self.start_separator_flushed = false;
         self.delegation_panel = DelegationPanelState::default();
         self.process_panel = ProcessPanelState::default();
+        self.claim_panel = ClaimPanelState::default();
     }
 
     fn apply_background_tool_completion(

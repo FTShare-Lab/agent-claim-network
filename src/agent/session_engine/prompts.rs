@@ -8,6 +8,7 @@ use anyhow::Context;
 use chrono::Utc;
 use serde::Serialize;
 
+use crate::agent::claims::DEFAULT_CLAIM_LIST_LIMIT;
 use crate::agent::prepare::llm_visible_claims;
 use crate::agent::{InboxProcessReport, TeamServiceConnectionStatus};
 use crate::api::AvailableSkill;
@@ -174,7 +175,7 @@ impl SessionEngine {
         } else {
             (String::new(), String::new())
         };
-        let local_claims_snapshot = self.render_local_claims_snapshot().await;
+        let local_claims_snapshot = self.render_local_claims_catalog().await?;
         let context = SessionSystemPromptContext {
             agent_id: &self.agent.agent_id,
             memory_enabled,
@@ -294,6 +295,16 @@ impl SessionEngine {
                 format_local_claims_snapshot(&[])
             }
         }
+    }
+
+    async fn render_local_claims_catalog(&self) -> anyhow::Result<String> {
+        let page = self
+            .runner
+            .list_claims(None, false, 0, DEFAULT_CLAIM_LIST_LIMIT)
+            .await
+            .context("读取本地 claim 目录失败")?;
+        let catalog = serde_json::to_string(&page).context("序列化本地 claim 目录失败")?;
+        Ok(format!("```json\n{catalog}\n```"))
     }
 
     pub(super) async fn render_memory_review_system_prompt(&self) -> anyhow::Result<String> {

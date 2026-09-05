@@ -463,7 +463,9 @@ mod tests {
         assert!(!out.contains("# 你看到的输入"));
         assert!(!out.contains("available_skills：当前工作区内可用"));
         assert!(out.contains("router scope overview 快照"));
-        assert!(out.contains("# 你的自有 claims 快照"));
+        assert!(out.contains("# 你的自有 claims 目录"));
+        assert!(out.contains("expected_revision"));
+        assert!(out.contains("不包含当时 claim 的版本快照"));
         assert!(out.contains("self claims 快照"));
         assert!(out.contains("```jsonl"));
         assert!(out.contains("\"id\":\"claim_1234abcd\""));

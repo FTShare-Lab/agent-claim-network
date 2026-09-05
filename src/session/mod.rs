@@ -210,6 +210,13 @@ pub enum FinalizeCheckpointStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinalizeClaimRevision {
+    pub claim_id: ClaimId,
+    /// `None` 表示 prepare 时该 claim 尚不存在。
+    pub preimage_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// Recap/Finalize 共用的单代 checkpoint；物理文件名保留为 `finalize_checkpoint.yaml`。
 pub struct FinalizeCheckpoint {
     pub recap_start_index: usize,
@@ -217,6 +224,8 @@ pub struct FinalizeCheckpoint {
     pub recap_segment_hash: String,
     #[serde(default)]
     pub prepared_claims: Vec<Claim>,
+    #[serde(default)]
+    pub expected_claim_revisions: Vec<FinalizeClaimRevision>,
     #[serde(default)]
     pub prepared_disputes: Vec<Dispute>,
     #[serde(default)]
@@ -2824,6 +2833,7 @@ frontier:
                 recap_end_index: 0,
                 recap_segment_hash: "legacy-hash".into(),
                 prepared_claims: Vec::new(),
+                expected_claim_revisions: Vec::new(),
                 prepared_disputes: Vec::new(),
                 used_claim_ids: Vec::new(),
                 trace_text: "legacy frozen trace".into(),
@@ -3396,6 +3406,7 @@ frontier:
             recap_end_index: 2,
             recap_segment_hash: "hash".into(),
             prepared_claims: Vec::new(),
+            expected_claim_revisions: Vec::new(),
             prepared_disputes: Vec::new(),
             used_claim_ids: vec![ClaimId::random()],
             trace_text: "trace text".into(),
@@ -3408,6 +3419,34 @@ frontier:
         let stored = handle.read_finalize_checkpoint().await.unwrap();
 
         assert_eq!(stored, Some(checkpoint));
+    }
+
+    #[test]
+    fn legacy_finalize_checkpoint_without_claim_revisions_deserializes() {
+        let checkpoint = FinalizeCheckpoint {
+            recap_start_index: 0,
+            recap_end_index: 2,
+            recap_segment_hash: "hash".into(),
+            prepared_claims: Vec::new(),
+            expected_claim_revisions: Vec::new(),
+            prepared_disputes: Vec::new(),
+            used_claim_ids: Vec::new(),
+            trace_text: "trace text".into(),
+            trace_created_at: Utc::now(),
+            trace_id: None,
+            status: FinalizeCheckpointStatus::Prepared,
+        };
+        let mut encoded = serde_yaml_ng::to_value(&checkpoint).unwrap();
+        encoded
+            .as_mapping_mut()
+            .unwrap()
+            .remove(serde_yaml_ng::Value::String(
+                "expected_claim_revisions".into(),
+            ));
+
+        let decoded: FinalizeCheckpoint = serde_yaml_ng::from_value(encoded).unwrap();
+
+        assert_eq!(decoded, checkpoint);
     }
 
     #[tokio::test]
@@ -4420,6 +4459,7 @@ frontier:
             recap_end_index: 2,
             recap_segment_hash: "hash".into(),
             prepared_claims: Vec::new(),
+            expected_claim_revisions: Vec::new(),
             prepared_disputes: Vec::new(),
             used_claim_ids: vec![ClaimId::random()],
             trace_text: "trace result".into(),

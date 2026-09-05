@@ -170,6 +170,7 @@ acn --resume
 常用命令：
 
 - `/help`：显示内置帮助
+- `/claim`：浏览、核对和修订本地自有 claim，回查关联 trace
 - `/compact`：手动压缩上下文
 - `/copy`：复制最近一条 assistant 回复
 - `/exit`：结束当前 session，并把 finalize 交给后台 supervisor
@@ -190,6 +191,18 @@ acn --resume
 单个 `@` 文本文件默认最多完整内联 100,000 个字符，可通过 `[agent.tool].file_read_max_chars` 调整。
 
 `/mcp`、`/ps` 和 `/subagents` 是 live panel；在 turn 进行中也可以打开，关闭后返回原交互状态。
+
+### 查看与修订 claim
+
+在空闲时输入 `/claim` 打开本地知识面板，选择条目后按 `Enter` 查看完整判断、适用范围、证据摘要和来源。可以搜索不在当前页的条目，也可以查看 deprecated 条目。关联 trace 显示这条 claim 曾参与哪些任务，长任务文本分页展开。
+
+详情中按 `e` 编辑，`Ctrl+S` 保存，`Esc` 取消或返回。可以修订 name、statement、scope、evidence_summary、confidence 和 status；id、holder、创建时间和来源链不能修改。保存时若其他会话已经更新该 claim，会提示版本冲突，保留当前草稿供核对，不覆盖别人的新内容。关闭面板后回到原聊天输入。加载或保存期间也可按 `Esc` 返回；已经发起的保存会继续执行，失败会在聊天区提示。
+
+也可以直接用自然语言让主 Agent 读取或纠正已有 claim。它会通过同一个 `claim` 工具先读取，再带 revision 修订，不需要修改 YAML。新建 claim 和整理来源链仍由 compact/finalize 等知识流程完成。
+
+普通 session 的启动目录只含前 20 条摘要；完整判断和 trace 由工具按需读取。目录不会在会话中重写，后续读取能看到最新版本。历史 trace 记录形成和使用背景，不能证明后来修订的判断已通过验证。团队模式保存后通过既有同步流程上传 claim；单人模式只保存在当前 Agent 本地。
+
+升级前创建的 session 在 resume 时仍保留原 system prompt，可能包含旧的 claim 操作限制。要使用完整的新工具指引，请开启新 session；`/claim` 面板可以直接操作现有本地条目。
 
 ## 团队连接状态
 

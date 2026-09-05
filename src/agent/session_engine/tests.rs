@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
+use super::super::claims::claim_revision;
 use super::super::fs::{
     LocalFsClaimStore, LocalFsInboxReader, LocalFsMemoryStore, LocalFsReportedDisputeClaimSetStore,
 };
@@ -66,7 +67,7 @@ use crate::api::{
 };
 use crate::claim::{
     AgentId, Claim, ClaimId, ClaimStatus, Confidence, Dispute, DisputeId, InboxId, InboxMessage,
-    SessionId,
+    SessionId, TraceId,
 };
 use crate::config::{
     AgentSessionTurnJournalConfig, SessionCompactionConfig, ToolConfig, UserShellConfig,
@@ -82,7 +83,7 @@ use crate::router::{AgentQuery, RouterClient, RouterQueryResult, ScopesOverviewS
 use crate::session::{
     canonical_user_content_hash, replay_turn_journal, ActiveTurnCompactionCursor,
     CompactedProviderHistory, CompactionCheckpoint, CompactionCheckpointStatus, FinalizeCheckpoint,
-    FinalizeCheckpointStatus, NewSessionMessage, PendingProviderHistoryTurn,
+    FinalizeCheckpointStatus, FinalizeClaimRevision, NewSessionMessage, PendingProviderHistoryTurn,
     SessionCompactionState, SessionContentBlock, SessionMessage, SessionMessageRole,
     SessionMetadata, SessionStatus, SessionStore, TurnJournalEventKind, TurnJournalFlush,
     TurnJournalModelContext, TurnJournalNonStreamingFallbackState, TurnJournalProjection,
@@ -823,6 +824,7 @@ fn prepared_empty_finalize_checkpoint(
         recap_end_index,
         recap_segment_hash,
         prepared_claims: Vec::new(),
+        expected_claim_revisions: Vec::new(),
         prepared_disputes: Vec::new(),
         used_claim_ids: Vec::new(),
         trace_text: "prepared recap trace".into(),
@@ -2260,6 +2262,88 @@ async fn manual_inbox_rejects_solo_mode_without_changing_session_to_error() {
         session.read_metadata().await.unwrap().status,
         SessionStatus::Open
     );
+}
+
+#[tokio::test]
+async fn claim_catalog_is_bounded_and_details_remain_readable_after_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (engine, _) = build_local_test_engine(&dir, provider);
+    let created_at = "2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+    let mut claims = Vec::new();
+    for index in 0..25 {
+        let claim = Claim {
+            id: ClaimId::random(),
+            name: format!("catalog-{index}-{}", "目录".repeat(200)),
+            statement: format!("DETAIL_ONLY_{index}: {}", "evidence ".repeat(2_000)),
+            scope: "project/example/".repeat(100),
+            holder: engine.agent.agent_id.clone(),
+            confidence: Confidence::Medium,
+            status: ClaimStatus::Active,
+            created_at: created_at + chrono::Duration::seconds(index),
+            updated_at: None,
+            source_claim_ids: Vec::new(),
+            evidence_summary: "EVIDENCE_ONLY: observed test result".into(),
+        };
+        engine.agent.claim_store.write_claim(&claim).await.unwrap();
+        claims.push(claim);
+    }
+    let report = engine.start_session(1, |_| {}).await.unwrap();
+    let frozen = tokio::fs::read_to_string(&report.session.paths.system_prompt)
+        .await
+        .unwrap();
+    let catalog = frozen
+        .split_once("# 你的自有 claims 目录\n")
+        .unwrap()
+        .1
+        .split_once("```json\n")
+        .unwrap()
+        .1
+        .split_once("\n```")
+        .unwrap()
+        .0;
+    let page: serde_json::Value = serde_json::from_str(catalog).unwrap();
+    assert_eq!(page["items"].as_array().unwrap().len(), 20);
+    assert_eq!(page["omitted"], 5);
+    assert_eq!(page["next_offset"], 20);
+    assert!(catalog.chars().count() < 20_000);
+    assert!(!frozen.contains("DETAIL_ONLY_"));
+    assert!(!frozen.contains("EVIDENCE_ONLY"));
+
+    let hidden = &claims[0];
+    assert!(!catalog.contains(hidden.id.as_str()));
+    let found = engine
+        .runner
+        .list_claims(Some("DETAIL_ONLY_0:"), false, 0, 20)
+        .await
+        .unwrap();
+    assert_eq!(found.items.len(), 1);
+    assert_eq!(found.items[0].id, hidden.id);
+    let detail = engine.runner.read_claim(&hidden.id).await.unwrap();
+    assert_eq!(detail.claim, *hidden);
+
+    let mut revised = hidden.clone();
+    revised.statement = "LATEST_DETAIL".into();
+    revised.updated_at = Some(Utc::now());
+    engine
+        .agent
+        .claim_store
+        .write_claim(&revised)
+        .await
+        .unwrap();
+    let latest = engine.runner.read_claim(&hidden.id).await.unwrap();
+    assert_eq!(latest.claim, revised);
+    assert_ne!(latest.revision, detail.revision);
+    assert_eq!(
+        tokio::fs::read_to_string(&report.session.paths.system_prompt)
+            .await
+            .unwrap(),
+        frozen
+    );
+    assert!(engine
+        .render_local_claims_snapshot()
+        .await
+        .contains("LATEST_DETAIL"));
 }
 
 #[tokio::test]
@@ -6081,6 +6165,7 @@ async fn legacy_prepared_finalize_checkpoint_recovers_before_completion_cursor_m
             recap_end_index: 2,
             recap_segment_hash: checkpoint_hash,
             prepared_claims: Vec::new(),
+            expected_claim_revisions: Vec::new(),
             prepared_disputes: Vec::new(),
             used_claim_ids: Vec::new(),
             trace_text: "legacy frozen trace".into(),
@@ -6206,6 +6291,7 @@ async fn legacy_applied_completion_only_checkpoint_closes_without_llm_retry() {
             recap_end_index: 2,
             recap_segment_hash: checkpoint_hash,
             prepared_claims: Vec::new(),
+            expected_claim_revisions: Vec::new(),
             prepared_disputes: Vec::new(),
             used_claim_ids: Vec::new(),
             trace_text: "legacy completion-only trace".into(),
@@ -6275,6 +6361,7 @@ async fn legacy_stale_finalize_checkpoint_is_discarded_before_recapping_new_mess
             recap_end_index: 2,
             recap_segment_hash: old_hash,
             prepared_claims: Vec::new(),
+            expected_claim_revisions: Vec::new(),
             prepared_disputes: Vec::new(),
             used_claim_ids: Vec::new(),
             trace_text: "old lifecycle trace".into(),
@@ -6435,6 +6522,7 @@ async fn legacy_same_range_checkpoint_with_new_completion_is_discarded_without_l
             recap_end_index: 2,
             recap_segment_hash: old_hash,
             prepared_claims: Vec::new(),
+            expected_claim_revisions: Vec::new(),
             prepared_disputes: Vec::new(),
             used_claim_ids: Vec::new(),
             trace_text: "old completion-only trace".into(),
@@ -6539,6 +6627,7 @@ async fn prepared_finalize_checkpoint_hash_mismatch_is_not_overwritten() {
         recap_end_index: 2,
         recap_segment_hash: "different-prepared-hash".into(),
         prepared_claims: Vec::new(),
+        expected_claim_revisions: Vec::new(),
         prepared_disputes: Vec::new(),
         used_claim_ids: Vec::new(),
         trace_text: "prepared frozen trace".into(),
@@ -7518,6 +7607,86 @@ async fn finalize_recovers_prepared_recap_prefix_before_processing_remaining_mes
     assert_eq!(checkpoint.recap_start_index, 2);
     assert_eq!(checkpoint.recap_end_index, 4);
     assert_eq!(checkpoint.status, FinalizeCheckpointStatus::Applied);
+}
+
+#[tokio::test]
+async fn finalize_recovery_does_not_overwrite_claim_edited_after_prepared_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (engine, store) = build_test_engine(&dir, provider);
+    let mut session = create_test_session(&store, "session_face0021").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "prepared request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "prepared answer"),
+        ])
+        .await
+        .unwrap();
+    let messages = session.read_messages().await.unwrap();
+    let created_at = Utc::now() - chrono::Duration::seconds(10);
+    let original = Claim {
+        id: "claim_22222222".parse().unwrap(),
+        name: "original".into(),
+        statement: "original statement".into(),
+        scope: "test".into(),
+        holder: AgentId::new("agent-a").unwrap(),
+        confidence: Confidence::Medium,
+        status: ClaimStatus::Active,
+        created_at,
+        updated_at: None,
+        source_claim_ids: Vec::new(),
+        evidence_summary: "original evidence".into(),
+    };
+    let trace_created_at = Utc::now() - chrono::Duration::seconds(5);
+    let mut prepared = original.clone();
+    prepared.statement = "prepared finalize statement".into();
+    prepared.updated_at = Some(trace_created_at);
+    let mut edited = original.clone();
+    edited.statement = "new interactive edit".into();
+    edited.updated_at = Some(Utc::now());
+    let claim_store = LocalFsClaimStore::new(dir.path().join("agents").join("agent-a"));
+    claim_store.write_claim(&edited).await.unwrap();
+
+    let checkpoint = FinalizeCheckpoint {
+        recap_start_index: 0,
+        recap_end_index: 2,
+        recap_segment_hash: hash_session_segment(&messages).unwrap(),
+        prepared_claims: vec![prepared],
+        expected_claim_revisions: vec![FinalizeClaimRevision {
+            claim_id: original.id.clone(),
+            preimage_hash: Some(claim_revision(&original).unwrap()),
+        }],
+        prepared_disputes: Vec::new(),
+        used_claim_ids: Vec::new(),
+        trace_text: "prepared recap trace".into(),
+        trace_created_at,
+        trace_id: Some(TraceId::random()),
+        status: FinalizeCheckpointStatus::Prepared,
+    };
+    session
+        .write_finalize_checkpoint(&checkpoint)
+        .await
+        .unwrap();
+    session.mark_finalizing(Utc::now()).await.unwrap();
+
+    let report = engine
+        .finalize_existing_session_once(&session.metadata.id, |_| {})
+        .await
+        .unwrap();
+
+    let claims = claim_store.list_local_claims().await.unwrap();
+    assert_eq!(claims, vec![edited]);
+    assert!(report.updated_claim_ids.is_empty());
+    assert!(report.trace_id.is_none());
+    assert!(report.warnings.iter().any(|warning| {
+        warning.contains("session=session_face0021")
+            && warning.contains("claim=claim_22222222")
+            && warning.contains("superseded")
+    }));
+    let applied = session.read_finalize_checkpoint().await.unwrap().unwrap();
+    assert_eq!(applied.status, FinalizeCheckpointStatus::Applied);
+    assert!(applied.prepared_claims.is_empty());
+    assert!(applied.trace_id.is_none());
 }
 
 #[tokio::test]

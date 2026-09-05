@@ -19,6 +19,9 @@ pub trait LocalClaimStore: Send + Sync {
     async fn write_claim(&self, claim: &Claim) -> anyhow::Result<()>;
     async fn write_trace(&self, trace: &Trace) -> anyhow::Result<()>;
     async fn list_local_claims(&self) -> anyhow::Result<Vec<Claim>>;
+    async fn read_claim(&self, id: &ClaimId) -> anyhow::Result<Claim>;
+    async fn list_local_traces(&self) -> anyhow::Result<Vec<Trace>>;
+    async fn read_trace(&self, id: &crate::claim::TraceId) -> anyhow::Result<Trace>;
 }
 
 #[async_trait]

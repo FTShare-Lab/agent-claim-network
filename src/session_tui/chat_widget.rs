@@ -17,6 +17,7 @@ use super::attachment::{read_clipboard_image_blocking, resolve_at_paths};
 use super::bottom_pane::{
     classify_input, input_accepts_text, is_shift_enter_newline, InputAction, PreviewHit,
 };
+use super::claim_panel::ClaimPanelAction;
 use super::input_queue::QueuedInput;
 use super::mcp_panel::McpPanelKeyAction;
 use super::process_panel::ProcessPanelKeyAction;
@@ -100,6 +101,11 @@ impl ChatWidget {
     }
 
     pub(super) fn handle_paste(&mut self, pasted: String) {
+        if self.state.claim_panel_visible() {
+            self.state.paste_claim_panel(&pasted);
+            self.app_event_tx.request_render();
+            return;
+        }
         if self.state.mcp_panel_visible() || self.state.process_panel_visible() {
             self.app_event_tx.request_render();
             return;
@@ -123,6 +129,19 @@ impl ChatWidget {
 
     pub(super) fn handle_key_event_for_width(&mut self, key: KeyEvent, width: u16) {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return;
+        }
+
+        if self.state.claim_panel_visible() {
+            let action = self.state.handle_claim_panel_key(key);
+            if !matches!(action, ClaimPanelAction::None) {
+                self.app_event_tx.claim_panel_action(action);
+            }
+            if self.state.claim_panel_visible() {
+                self.app_event_tx.request_render();
+            } else {
+                self.app_event_tx.request_resize_render();
+            }
             return;
         }
 
@@ -440,7 +459,7 @@ impl ChatWidget {
             && input_action_is_slash_command(&input_action)
             && !matches!(
                 input_action,
-                InputAction::Mcp | InputAction::Ps | InputAction::Subagents
+                InputAction::Claim | InputAction::Mcp | InputAction::Ps | InputAction::Subagents
             );
         if force_queue_for_attachments {
             self.state.set_status_notice(ATTACHMENT_STEER_QUEUE_NOTICE);
@@ -460,7 +479,10 @@ impl ChatWidget {
                 && !force_queue_for_slash_command
                 && !matches!(
                     input_action,
-                    InputAction::Mcp | InputAction::Ps | InputAction::Subagents
+                    InputAction::Claim
+                        | InputAction::Mcp
+                        | InputAction::Ps
+                        | InputAction::Subagents
                 )
             {
                 self.app_event_tx.steer_input(sequence, input);
@@ -570,6 +592,16 @@ impl ChatWidget {
     }
 
     fn live_lines(&self, width: u16, height: u16, terminal_width: u16) -> LiveRender {
+        if let Some(mut panel_lines) = self
+            .state
+            .claim_panel_lines(width, height.saturating_sub(1).max(1))
+        {
+            panel_lines.push(status_line(&self.state, width));
+            return LiveRender {
+                lines: hard_wrap_styled_lines(panel_lines, usize::from(width.max(1))),
+                cursor_base_row: None,
+            };
+        }
         if let Some(mut panel_lines) = self
             .state
             .process_panel_lines(width, height.saturating_sub(1).max(1))
@@ -792,6 +824,7 @@ fn input_action_is_slash_command(action: &InputAction) -> bool {
     matches!(
         action,
         InputAction::Compact
+            | InputAction::Claim
             | InputAction::Copy
             | InputAction::Exit
             | InputAction::Help
@@ -2530,7 +2563,7 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), AppEvent::RenderRequested);
         chat.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
-        assert_eq!(chat.state().input(), "/copy");
+        assert_eq!(chat.state().input(), "/compact");
         assert_eq!(rx.try_recv().unwrap(), AppEvent::RenderRequested);
         assert!(rx.try_recv().is_err());
     }

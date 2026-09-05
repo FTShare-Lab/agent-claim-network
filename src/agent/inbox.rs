@@ -265,6 +265,7 @@ impl AgentRunner {
         generator: &dyn InboxJsonGenerator,
     ) -> anyhow::Result<InboxProcessReport> {
         let _guard = self.inbox_process_lock.lock().await;
+        self.recover_pending_claim_edit().await?;
         let mut report = InboxProcessReport::default();
         if self.team_services_configured() {
             let sync_report = self.sync_inbox_to_local().await?;

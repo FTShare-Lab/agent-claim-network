@@ -329,18 +329,18 @@ pub enum DelegationEventKind {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum DelegationReadMode {
+    #[default]
     Summary,
     Result,
-    EventsTail { limit: usize },
-    TranscriptTail { limit: usize, max_chars: usize },
-}
-
-impl Default for DelegationReadMode {
-    fn default() -> Self {
-        Self::Summary
-    }
+    EventsTail {
+        limit: usize,
+    },
+    TranscriptTail {
+        limit: usize,
+        max_chars: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

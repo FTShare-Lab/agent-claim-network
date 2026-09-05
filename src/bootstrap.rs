@@ -143,6 +143,7 @@ pub fn build_agent_cli_session_engine_with_mcp(
         ))
         .with_process_id_attempts(cfg.agent.session.id_mint_max_attempts())
         .with_process_owner_agent_id(context.agent_id.clone())
+        .with_claim_runner(runner.clone())
         .with_memory_store(context.memory_store.clone())
         .with_memory_enabled(cfg.agent.memory.enabled)
         .with_session_search(session_search)

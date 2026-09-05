@@ -4,6 +4,7 @@
 //! `workspace_root` 仅作为相对路径与执行 cwd 的默认基准，并非 sandbox 边界。
 //! Web / note / ask_user 仍保留为独立意图工具。
 
+mod claim;
 mod command;
 mod concurrency;
 mod delegation;
@@ -35,6 +36,7 @@ use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::AgentRunner;
 use crate::agent::MemoryStore;
 use crate::api::ToolExecutionOutcome;
 use crate::attachment::{AttachmentError, AttachmentKind, AttachmentLimits, FILE_READ_MEDIA_KEY};
@@ -109,6 +111,8 @@ pub enum ToolError {
     Memory(String),
     #[error("router: {0}")]
     Router(String),
+    #[error("claim: {0}")]
+    Claim(String),
     #[error("attachment: {0}")]
     Attachment(#[from] AttachmentError),
     #[error("subagent: {0}")]
@@ -301,6 +305,7 @@ struct ToolAccessProfile {
     working_note: bool,
     ask_user: bool,
     memory: bool,
+    claim: bool,
     router: bool,
     session_search: bool,
     mcp: bool,
@@ -320,6 +325,7 @@ impl ToolAccessProfile {
             working_note: true,
             ask_user: true,
             memory: true,
+            claim: true,
             router: true,
             session_search: true,
             mcp: true,
@@ -339,6 +345,7 @@ impl ToolAccessProfile {
             working_note: false,
             ask_user: false,
             memory: false,
+            claim: false,
             router: false,
             session_search: false,
             mcp: true,
@@ -358,6 +365,7 @@ impl ToolAccessProfile {
             working_note: false,
             ask_user: false,
             memory: true,
+            claim: false,
             router: false,
             session_search: false,
             mcp: false,
@@ -377,6 +385,7 @@ impl ToolAccessProfile {
             working_note: true,
             ask_user: false,
             memory: false,
+            claim: false,
             router: true,
             session_search: false,
             mcp: false,
@@ -397,6 +406,7 @@ impl ToolAccessProfile {
             working_note: false,
             ask_user: false,
             memory: false,
+            claim: false,
             router: true,
             session_search: false,
             mcp: false,
@@ -416,6 +426,7 @@ impl ToolAccessProfile {
             working_note: false,
             ask_user: false,
             memory: false,
+            claim: false,
             router: true,
             session_search: false,
             mcp: false,
@@ -513,6 +524,7 @@ pub struct ToolRegistry {
     web_search_api_key_env: String,
     web_search_api_key: Option<String>,
     memory_store: Option<Arc<dyn MemoryStore>>,
+    claim_runner: Option<Arc<AgentRunner>>,
     memory_enabled: bool,
     router_client: Option<Arc<dyn RouterClient>>,
     session_search: Option<Arc<SessionSearchService>>,

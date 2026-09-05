@@ -11,6 +11,7 @@ mod attachment;
 mod bottom_pane;
 mod cell;
 mod chat_widget;
+mod claim_panel;
 mod cleanup_housekeeping;
 mod completion_menu;
 mod composer;

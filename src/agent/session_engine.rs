@@ -1536,6 +1536,11 @@ impl SessionEngine {
         self.mcp_manager.clone()
     }
 
+    /// TUI 管理面板复用当前 session 的领域服务与存储边界。
+    pub fn claim_runner(&self) -> Arc<AgentRunner> {
+        Arc::clone(&self.runner)
+    }
+
     pub(crate) async fn bind_delegation_runtime_lease(
         &self,
         session_id: &SessionId,

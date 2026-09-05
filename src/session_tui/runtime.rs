@@ -28,6 +28,11 @@ const UNALIGNED_JOURNAL_TURN_NOTICE: &str =
 const RESUME_HISTORY_REAL_USER_TURNS: usize = 10;
 
 pub(super) enum WorkerEvent {
+    ClaimListLoaded(u64, anyhow::Result<crate::agent::claims::ClaimListPage>),
+    ClaimLoaded(u64, anyhow::Result<crate::agent::claims::ClaimDetail>),
+    ClaimTracesLoaded(u64, anyhow::Result<crate::agent::claims::TraceListPage>),
+    ClaimTraceLoaded(u64, anyhow::Result<crate::agent::claims::TraceDetail>),
+    ClaimSaved(u64, anyhow::Result<crate::agent::claims::ClaimUpdateResult>),
     Session {
         task_id: Option<u64>,
         event: SessionEvent,

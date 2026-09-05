@@ -1861,14 +1861,15 @@ fn slash_menu_lists_matching_commands_and_bolds_first_match() {
     // 原生命令超过 5 行窗口：只显示前 5 条（字母序），其余靠上下键滚动
     assert!(text.contains("/compact"));
     assert!(text.contains("/copy"));
-    assert!(text.contains("/inbox"));
+    assert!(text.contains("/claim"));
     assert!(!text.contains("/skills"));
+    assert!(text.find("/claim").unwrap() < text.find("/compact").unwrap());
     assert!(text.find("/compact").unwrap() < text.find("/copy").unwrap());
     assert!(text.find("/copy").unwrap() < text.find("/exit").unwrap());
     let compact_span = lines
         .iter()
         .flat_map(|line| line.spans.iter())
-        .find(|span| span.content.starts_with("/compact"))
+        .find(|span| span.content.starts_with("/claim"))
         .expect("First slash command should render");
     assert!(compact_span.style.add_modifier.contains(Modifier::BOLD));
 }
@@ -1897,7 +1898,7 @@ fn slash_menu_puts_skills_first_and_scrolls_window_with_selection() {
     assert!(!text.contains("/inbox"));
 
     // 连续向下移动选中，窗口跟随滚动，末尾的原生命令进入视野
-    for _ in 0..11 {
+    for _ in 0..12 {
         assert!(state.select_next_slash_completion());
     }
     let text = super::composer_lines_with_width(&state, 96)
@@ -2240,6 +2241,7 @@ fn slash_commands_are_classified_for_tui_loop() {
     let catalog = super::slash_command::SlashCommandCatalog::default();
     let classify = |raw: &str| super::classify_input(raw, &catalog);
     assert_eq!(classify("/help"), super::InputAction::Help);
+    assert_eq!(classify("/claim"), super::InputAction::Claim);
     assert_eq!(classify("/inbox"), super::InputAction::Inbox);
     assert_eq!(classify("/mcp"), super::InputAction::Mcp);
     assert_eq!(classify("/new"), super::InputAction::New);

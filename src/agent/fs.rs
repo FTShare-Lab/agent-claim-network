@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 use super::traits::{
     ClaimedInboxMessage, InboxReader, LocalClaimStore, MemoryStore, ReportedDisputeClaimSetStore,
 };
-use crate::claim::{Claim, ClaimId, DisputeId, InboxId, InboxMessage, Trace};
+use crate::claim::{Claim, ClaimId, DisputeId, InboxId, InboxMessage, Trace, TraceId};
 use crate::memory::{
     apply_ops_to_texts, snapshot_texts, MemoryApplyReport, MemoryOp, MemorySnapshot,
 };
@@ -58,6 +58,21 @@ impl LocalClaimStore for LocalFsClaimStore {
     async fn list_local_claims(&self) -> anyhow::Result<Vec<Claim>> {
         let dir = paths::agent_home_claims_dir(&self.agent_home);
         list_yaml_files(&dir).await
+    }
+
+    async fn read_claim(&self, id: &ClaimId) -> anyhow::Result<Claim> {
+        let path = paths::agent_home_claims_dir(&self.agent_home).join(format!("{id}.yaml"));
+        Ok(read_yaml(&path).await?)
+    }
+
+    async fn list_local_traces(&self) -> anyhow::Result<Vec<Trace>> {
+        let dir = paths::agent_home_traces_dir(&self.agent_home);
+        list_trace_yaml_files(&dir).await
+    }
+
+    async fn read_trace(&self, id: &TraceId) -> anyhow::Result<Trace> {
+        let path = paths::agent_home_traces_dir(&self.agent_home).join(format!("{id}.yaml"));
+        Ok(read_yaml(&path).await?)
     }
 }
 
@@ -763,6 +778,35 @@ async fn list_yaml_files(dir: &std::path::Path) -> anyhow::Result<Vec<Claim>> {
                 );
             }
             Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(out)
+}
+
+async fn list_trace_yaml_files(dir: &std::path::Path) -> anyhow::Result<Vec<Trace>> {
+    if !fs::try_exists(dir).await? {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut rd = fs::read_dir(dir).await?;
+    while let Some(entry) = rd.next_entry().await? {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".yaml") || name.contains(".tmp.") {
+            continue;
+        }
+        match read_yaml(&path).await {
+            Ok(trace) => out.push(trace),
+            Err(StorageError::Decode { source, .. }) => {
+                log::warn!(
+                    target: "agent",
+                    "跳过损坏的本地 trace YAML {:?}: {source}",
+                    path
+                );
+            }
+            Err(error) => return Err(error.into()),
         }
     }
     Ok(out)

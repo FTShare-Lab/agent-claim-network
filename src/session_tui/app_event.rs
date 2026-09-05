@@ -11,6 +11,7 @@ use crate::claim::SessionId;
 use super::at_path_completion::AtPathDirectoryEntry;
 use super::attachment::{PreviewFailure, PreviewFile, PreviewTarget, ResolvedAtPaths};
 use super::bottom_pane::InputDraft;
+use super::claim_panel::ClaimPanelAction;
 use super::input_queue::QueuedInput;
 use super::mcp_panel::McpPanelRequest;
 use super::process_panel::ProcessPanelKeyAction;
@@ -68,6 +69,7 @@ pub(super) enum AppEvent {
     },
     /// `/mcp` 面板触发的 server 操作。
     McpPanelRequest(McpPanelRequest),
+    ClaimPanelAction(ClaimPanelAction),
     ProcessPanelAction(ProcessPanelKeyAction),
     ProcessPanelSnapshot {
         session_id: SessionId,
@@ -180,6 +182,10 @@ impl AppEventSender {
 
     pub(super) fn mcp_panel_request(&self, request: McpPanelRequest) {
         self.send(AppEvent::McpPanelRequest(request));
+    }
+
+    pub(super) fn claim_panel_action(&self, action: ClaimPanelAction) {
+        self.send(AppEvent::ClaimPanelAction(action));
     }
 
     pub(super) fn process_panel_action(&self, action: ProcessPanelKeyAction) {

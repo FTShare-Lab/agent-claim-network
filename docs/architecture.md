@@ -132,7 +132,7 @@ Agent 进程使用 `<acn_home>/<upstream>/data/agents/<agent_id>/`。Router 和 
 5. 退出后 finalize 生成 recap，形成或更新 claim 与 trace；canonical message 或后台终态任一仍未 recap 时都交给 supervisor，团队模式下再持久上传 claim mirror，并报告符合条件的 dispute。
 6. 已 finalize 的 session 关闭；空 session 可以直接清理。
 
-已创建 session 的 system prompt 是冻结快照。修改 `ACN.md`、Memory、Skill 或本地 claim 只影响后续新 session。
+已创建 session 的 system prompt 是冻结快照。修改 `ACN.md`、Memory、Skill 或本地 claim 不会改写该快照；普通 session 的 claim 目录只包含有界摘要，`claim` 工具按需读取最新本地正文、修订自有判断并回查 trace。`/claim` 面板与工具复用 `AgentRunner` 的同一个领域入口。评测 session 保持既有冻结 claim 交付契约。
 
 ## Claim 协作流
 

@@ -61,6 +61,7 @@ impl ToolRegistry {
             web_search_api_key_env: cfg.web.api_key_env.clone(),
             web_search_api_key,
             memory_store: None,
+            claim_runner: None,
             memory_enabled: true,
             router_client: None,
             session_search: None,
@@ -87,6 +88,11 @@ impl ToolRegistry {
 
     pub fn with_memory_store(mut self, memory_store: Arc<dyn MemoryStore>) -> Self {
         self.memory_store = Some(memory_store);
+        self
+    }
+
+    pub fn with_claim_runner(mut self, runner: Arc<AgentRunner>) -> Self {
+        self.claim_runner = Some(runner);
         self
     }
 
@@ -177,6 +183,7 @@ impl ToolRegistry {
         self.access = ToolAccessProfile::delegation();
         self.delegation_host = None;
         self.delegation_progress = progress;
+        self.claim_runner = None;
         self
     }
 
@@ -185,6 +192,7 @@ impl ToolRegistry {
         self.delegation_host = None;
         self.delegation_progress = None;
         self.evaluation_submission = None;
+        self.claim_runner = None;
         self
     }
 
@@ -196,6 +204,7 @@ impl ToolRegistry {
         self.mcp_manager = None;
         self.delegation_host = None;
         self.delegation_progress = None;
+        self.claim_runner = None;
         self
     }
 
@@ -208,6 +217,7 @@ impl ToolRegistry {
         self.mcp_manager = None;
         self.delegation_host = None;
         self.delegation_progress = None;
+        self.claim_runner = None;
         self
     }
 
@@ -220,6 +230,7 @@ impl ToolRegistry {
         self.mcp_manager = None;
         self.delegation_host = None;
         self.delegation_progress = None;
+        self.claim_runner = None;
         self
     }
 
@@ -232,6 +243,7 @@ impl ToolRegistry {
         self.mcp_manager = None;
         self.delegation_host = None;
         self.delegation_progress = None;
+        self.claim_runner = None;
         self
     }
 
@@ -637,6 +649,9 @@ impl ToolRegistry {
         if self.memory_enabled && self.access.memory && self.memory_store.is_some() {
             definitions.extend(memory::definitions());
         }
+        if self.access.claim && self.claim_runner.is_some() {
+            definitions.push(claim::definition());
+        }
         if self.access.router && self.router_client.is_some() {
             definitions.push(ToolDefinition {
                 name: "consult_router".into(),
@@ -892,6 +907,9 @@ impl ToolRegistry {
             }
             "memory" if self.memory_enabled && self.access.memory => {
                 memory::dispatch(self.memory_store.as_ref(), name, input).await
+            }
+            "claim" if self.access.claim && self.claim_runner.is_some() => {
+                claim::dispatch(self.claim_runner.as_ref(), input).await
             }
             "consult_router" if self.access.router => self.consult_router(input).await,
             "session_search" if self.access.session_search => {
