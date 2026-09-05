@@ -37,6 +37,7 @@ use super::attachment::{
 };
 use super::bottom_pane::{classify_input, input_accepts_text, InputAction, InputDraft};
 use super::chat_widget::ChatWidget;
+use super::claim_panel::{ClaimPanelAction, ClaimPanelSave};
 use super::cleanup_housekeeping::{
     spawn_session_cleanup_housekeeping, SessionCleanupActivity, SessionCleanupHousekeepingConfig,
 };
@@ -82,6 +83,23 @@ pub(super) fn recap_enqueue_warning(result: &anyhow::Result<()>) -> Option<&'sta
 fn is_ctrl_c_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
         && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn claim_update(save: ClaimPanelSave) -> crate::agent::claims::ClaimUpdate {
+    crate::agent::claims::ClaimUpdate {
+        id: save.id,
+        expected_revision: save.expected_revision,
+        name: Some(save.name),
+        statement: Some(save.statement),
+        scope: Some(save.scope),
+        evidence_summary: Some(save.evidence_summary),
+        confidence: Some(save.confidence),
+        status: Some(save.status),
+    }
+}
+
+fn claim_panel_response_is_current(response: u64, current: u64, visible: bool) -> bool {
+    visible && response == current
 }
 
 fn compaction_noop_notice(reason: SessionCompactionNoopReason) -> &'static str {
@@ -230,6 +248,7 @@ struct SessionTuiApp {
     process_snapshot_in_flight: bool,
     /// 恢复态 `/exit` 已被接纳后立即封锁后续输入派发；事件循环退出前也不能再启动 turn/shell。
     exit_without_finalize_requested: bool,
+    claim_operation_generation: u64,
     /// 每个 optimistic `/ps` terminate 都必须先实际绘制一帧，再允许 worker 覆盖为
     /// authoritative snapshot；不能用时间延迟猜测 TUI 是否已经完成 draw。
     process_termination_render_acks: BTreeMap<u64, oneshot::Sender<()>>,
@@ -371,6 +390,7 @@ impl SessionTuiApp {
             process_snapshot_generation: 0,
             process_snapshot_in_flight: false,
             exit_without_finalize_requested: false,
+            claim_operation_generation: 0,
             process_termination_render_acks: BTreeMap::new(),
         })
     }
@@ -619,6 +639,116 @@ impl SessionTuiApp {
 
     fn handle_worker_event(&mut self, worker_event: WorkerEvent) -> anyhow::Result<bool> {
         match worker_event {
+            WorkerEvent::ClaimListLoaded(generation, result) => {
+                if !claim_panel_response_is_current(
+                    generation,
+                    self.claim_operation_generation,
+                    self.chat_widget.state().claim_panel_visible(),
+                ) {
+                    return Ok(false);
+                }
+                match result {
+                    Ok(page) => self
+                        .chat_widget
+                        .state_mut()
+                        .set_claim_panel_claim_page(page),
+                    Err(error) => self
+                        .chat_widget
+                        .state_mut()
+                        .fail_claim_panel(format!("加载 claims 失败: {error:#}")),
+                }
+                self.tui.render_requester().schedule_render();
+            }
+            WorkerEvent::ClaimLoaded(generation, result) => {
+                if !claim_panel_response_is_current(
+                    generation,
+                    self.claim_operation_generation,
+                    self.chat_widget.state().claim_panel_visible(),
+                ) {
+                    return Ok(false);
+                }
+                match result {
+                    Ok(claim) => self.chat_widget.state_mut().set_claim_panel_claim(claim),
+                    Err(error) => self
+                        .chat_widget
+                        .state_mut()
+                        .fail_claim_panel(format!("加载 claim 失败: {error:#}")),
+                }
+                self.tui.render_requester().schedule_render();
+            }
+            WorkerEvent::ClaimTracesLoaded(generation, result) => {
+                if !claim_panel_response_is_current(
+                    generation,
+                    self.claim_operation_generation,
+                    self.chat_widget.state().claim_panel_visible(),
+                ) {
+                    return Ok(false);
+                }
+                match result {
+                    Ok(page) => self
+                        .chat_widget
+                        .state_mut()
+                        .set_claim_panel_trace_page(page),
+                    Err(error) => self
+                        .chat_widget
+                        .state_mut()
+                        .fail_claim_panel(format!("加载 traces 失败: {error:#}")),
+                }
+                self.tui.render_requester().schedule_render();
+            }
+            WorkerEvent::ClaimTraceLoaded(generation, result) => {
+                if !claim_panel_response_is_current(
+                    generation,
+                    self.claim_operation_generation,
+                    self.chat_widget.state().claim_panel_visible(),
+                ) {
+                    return Ok(false);
+                }
+                match result {
+                    Ok(trace) => self.chat_widget.state_mut().set_claim_panel_trace(trace),
+                    Err(error) => self
+                        .chat_widget
+                        .state_mut()
+                        .fail_claim_panel(format!("加载 trace 失败: {error:#}")),
+                }
+                self.tui.render_requester().schedule_render();
+            }
+            WorkerEvent::ClaimSaved(generation, result) => {
+                if !claim_panel_response_is_current(
+                    generation,
+                    self.claim_operation_generation,
+                    self.chat_widget.state().claim_panel_visible(),
+                ) {
+                    if let Err(error) = result {
+                        self.chat_widget
+                            .state_mut()
+                            .push_error(format!("后台保存 claim 失败: {error:#}"));
+                        self.tui.render_requester().schedule_render();
+                    }
+                    return Ok(false);
+                }
+                match result {
+                    Ok(saved) => {
+                        let notice = saved.sync_warning;
+                        self.chat_widget.state_mut().finish_claim_panel_save(
+                            crate::agent::claims::ClaimDetail {
+                                claim: saved.claim,
+                                revision: saved.revision,
+                            },
+                            notice,
+                        );
+                    }
+                    Err(error) => {
+                        let message = if error.to_string().contains("revision conflict") {
+                            format!("保存冲突：claim 已被其他操作修改。请 Esc 返回后重新打开详情。{error:#}")
+                        } else {
+                            format!("保存 claim 失败: {error:#}")
+                        };
+                        self.chat_widget.state_mut().fail_claim_panel(message);
+                    }
+                }
+                self.tui.render_requester().schedule_render();
+            }
             WorkerEvent::Session { task_id, event } => {
                 if !self.session_task.current_task_matches(task_id) {
                     return Ok(false);
@@ -1228,6 +1358,7 @@ impl SessionTuiApp {
                 self.tui.render_requester().schedule_render();
             }
             AppEvent::McpPanelRequest(request) => self.start_mcp_panel_request(request),
+            AppEvent::ClaimPanelAction(action) => self.start_claim_panel_action(action),
             AppEvent::ProcessPanelAction(ProcessPanelKeyAction::Terminate { target }) => {
                 self.terminate_process_from_panel(target)
             }
@@ -1547,6 +1678,7 @@ impl SessionTuiApp {
                 } else if !management_panel_blocks_global_interrupt(
                     self.chat_widget.state().process_panel_visible(),
                     self.chat_widget.state().mcp_panel_visible(),
+                    self.chat_widget.state().claim_panel_visible(),
                 ) && is_ctrl_c_key(key)
                     && self.chat_widget.state().input().is_empty()
                     && self.app_has_interruptible_work()
@@ -1635,7 +1767,8 @@ impl SessionTuiApp {
                 let dispatch_next_after_input = session_can_dispatch
                     && !matches!(
                         action,
-                        InputAction::Mcp
+                        InputAction::Claim
+                            | InputAction::Mcp
                             | InputAction::Ps
                             | InputAction::Subagents
                             | InputAction::Exit
@@ -1670,6 +1803,21 @@ impl SessionTuiApp {
         }
         match action {
             InputAction::Send(_) => self.start_turn(input)?,
+            InputAction::Claim => {
+                if self.session_task.task_running()
+                    || self.start_handle.is_some()
+                    || self.resume_handle.is_some()
+                {
+                    self.chat_widget
+                        .state_mut()
+                        .push_error("当前任务忙碌，完成后再运行 /claim。");
+                } else {
+                    self.chat_widget
+                        .state_mut()
+                        .settle_turn_animation_before_command();
+                    self.open_claim_panel();
+                }
+            }
             InputAction::ShellCommand(command) => {
                 let state = self.chat_widget.state_mut();
                 state.settle_turn_animation_before_command();
@@ -1798,6 +1946,87 @@ impl SessionTuiApp {
         }
         self.chat_widget.state_mut().open_mcp_panel();
         self.tui.render_requester().schedule_render();
+    }
+
+    fn open_claim_panel(&mut self) {
+        self.chat_widget.state_mut().clear_status_notice();
+        self.chat_widget.state_mut().open_claim_panel();
+        self.start_claim_panel_action(ClaimPanelAction::LoadList {
+            query: String::new(),
+            include_deprecated: false,
+            offset: 0,
+        });
+        self.tui.render_requester().schedule_render();
+    }
+
+    fn start_claim_panel_action(&mut self, action: ClaimPanelAction) {
+        if matches!(action, ClaimPanelAction::None) {
+            return;
+        }
+        self.claim_operation_generation = self.claim_operation_generation.wrapping_add(1);
+        let generation = self.claim_operation_generation;
+        let runner = self.engine.claim_runner();
+        let worker_tx = self.worker_tx.clone();
+        match action {
+            ClaimPanelAction::None => {}
+            ClaimPanelAction::LoadList {
+                query,
+                include_deprecated,
+                offset,
+            } => {
+                tokio::spawn(async move {
+                    let query = (!query.is_empty()).then_some(query);
+                    let result = runner
+                        .list_claims(
+                            query.as_deref(),
+                            include_deprecated,
+                            offset,
+                            crate::agent::claims::DEFAULT_CLAIM_LIST_LIMIT,
+                        )
+                        .await;
+                    let _ = worker_tx.send(WorkerEvent::ClaimListLoaded(generation, result));
+                });
+            }
+            ClaimPanelAction::LoadClaim(id) => {
+                tokio::spawn(async move {
+                    let result = runner.read_claim(&id).await;
+                    let _ = worker_tx.send(WorkerEvent::ClaimLoaded(generation, result));
+                });
+            }
+            ClaimPanelAction::LoadTraces { claim_id, offset } => {
+                tokio::spawn(async move {
+                    let result = runner
+                        .list_traces(
+                            Some(&claim_id),
+                            offset,
+                            crate::agent::claims::DEFAULT_CLAIM_LIST_LIMIT,
+                        )
+                        .await;
+                    let _ = worker_tx.send(WorkerEvent::ClaimTracesLoaded(generation, result));
+                });
+            }
+            ClaimPanelAction::LoadTrace {
+                trace_id,
+                task_offset,
+            } => {
+                tokio::spawn(async move {
+                    let result = runner
+                        .read_trace(
+                            &trace_id,
+                            task_offset,
+                            crate::agent::claims::DEFAULT_TRACE_TASK_PAGE_LIMIT,
+                        )
+                        .await;
+                    let _ = worker_tx.send(WorkerEvent::ClaimTraceLoaded(generation, result));
+                });
+            }
+            ClaimPanelAction::Save(save) => {
+                tokio::spawn(async move {
+                    let result = runner.update_claim(claim_update(save)).await;
+                    let _ = worker_tx.send(WorkerEvent::ClaimSaved(generation, result));
+                });
+            }
+        }
     }
 
     fn mcp_panel_can_open(&self) -> bool {
@@ -2856,7 +3085,7 @@ fn route_input_submission(
         InputSubmissionRoute::Reject
     } else if matches!(
         action,
-        InputAction::Mcp | InputAction::Ps | InputAction::Subagents
+        InputAction::Claim | InputAction::Mcp | InputAction::Ps | InputAction::Subagents
     ) {
         // 管理面板只是前台 live view；运行中的 turn 不能把它们排入 queued input。
         InputSubmissionRoute::Dispatch
@@ -2916,8 +3145,9 @@ fn mcp_panel_can_open_from_parts(
 fn management_panel_blocks_global_interrupt(
     process_panel_visible: bool,
     mcp_panel_visible: bool,
+    claim_panel_visible: bool,
 ) -> bool {
-    process_panel_visible || mcp_panel_visible
+    process_panel_visible || mcp_panel_visible || claim_panel_visible
 }
 
 fn command_echoes(action: &InputAction) -> bool {
@@ -2926,6 +3156,7 @@ fn command_echoes(action: &InputAction) -> bool {
         InputAction::Send(_)
             | InputAction::ShellCommand(_)
             | InputAction::Mcp
+            | InputAction::Claim
             | InputAction::Ps
             | InputAction::Subagents
             | InputAction::Ignore
@@ -3752,9 +3983,12 @@ done
     fn management_panels_consume_ctrl_c_before_global_turn_cancel() {
         // `/ps` 确认页只允许白名单按键；`Ctrl-C` 不能越过 ChatWidget 的 panel 路由，
         // 变成全局 turn cancel。`/mcp` 也同样优先接收面板按键。
-        assert!(management_panel_blocks_global_interrupt(true, false));
-        assert!(management_panel_blocks_global_interrupt(false, true));
-        assert!(!management_panel_blocks_global_interrupt(false, false));
+        assert!(management_panel_blocks_global_interrupt(true, false, false));
+        assert!(management_panel_blocks_global_interrupt(false, true, false));
+        assert!(management_panel_blocks_global_interrupt(false, false, true));
+        assert!(!management_panel_blocks_global_interrupt(
+            false, false, false
+        ));
     }
 
     #[test]
@@ -4115,5 +4349,12 @@ done
         advance_input_submission_sequence(&mut next, &mut skipped);
         assert_eq!(next, 2);
         assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn claim_panel_rejects_closed_and_stale_worker_responses() {
+        assert!(claim_panel_response_is_current(4, 4, true));
+        assert!(!claim_panel_response_is_current(3, 4, true));
+        assert!(!claim_panel_response_is_current(4, 4, false));
     }
 }

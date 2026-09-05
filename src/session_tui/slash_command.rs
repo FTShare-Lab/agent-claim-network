@@ -9,6 +9,7 @@ use super::completion_menu::{render_completion_menu, CompletionMenuEntry, Comple
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SlashCommandAction {
+    Claim,
     Compact,
     Copy,
     Exit,
@@ -30,6 +31,11 @@ struct SlashCommandSpec {
 }
 
 const SLASH_COMMANDS: &[SlashCommandSpec] = &[
+    SlashCommandSpec {
+        command: "/claim",
+        description: "查看和编辑本地 claims",
+        action: SlashCommandAction::Claim,
+    },
     SlashCommandSpec {
         command: "/compact",
         description: "压缩当前 session 历史",
@@ -298,6 +304,7 @@ mod tests {
         assert_eq!(
             commands,
             vec![
+                "/claim",
                 "/compact",
                 "/copy",
                 "/exit",
@@ -326,6 +333,7 @@ mod tests {
             vec![
                 "/tui-smoke-test-with-tmux",
                 "/verify",
+                "/claim",
                 "/compact",
                 "/copy",
                 "/exit",
@@ -455,8 +463,8 @@ mod tests {
         assert!(text.contains("/verify"));
         assert!(!text.contains("/resume"));
 
-        // 选中第 7 项（/inbox）时窗口滚动，选中行加粗可见
-        for _ in 0..6 {
+        // 选中 /inbox 时窗口滚动，选中行加粗可见
+        for _ in 0..7 {
             assert!(state.select_next(catalog.matching("/").len()));
         }
         let lines = render_slash_menu(&catalog, "/", &state, 96);

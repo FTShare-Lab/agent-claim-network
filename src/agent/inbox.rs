@@ -274,6 +274,10 @@ impl AgentRunner {
     ) -> InboxProcessReport {
         let _guard = self.inbox_process_lock.lock().await;
         let mut report = InboxProcessReport::default();
+        // 团队模式下未完成的 claim 编辑先于 inbox 内化恢复；失败按本地失败降级，不阻断 session。
+        if let Err(error) = self.recover_pending_claim_edit().await {
+            record_inbox_failure(&mut report, error.context("恢复待完成的 claim 编辑失败"));
+        }
         if self.team_services_configured() {
             let sync_report = self.sync_inbox_to_local().await;
             report.team_services.maintainer = if sync_report.pull_succeeded {

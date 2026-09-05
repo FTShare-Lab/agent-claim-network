@@ -32,6 +32,10 @@ Claim 是某个 Agent 愿意作为 holder 维护、可被团队检索和引用�
 - `USER.md` 内容永不进入 claim。私有 Memory 也不能作为可反查的条目身份上传。
 - stale 表示需要复核，不等于自动失效；deprecated 表示 holder 已不再推荐使用。
 
+普通 session 的启动上下文只包含有界本地 claim 目录。主 Agent 通过 `claim` 工具搜索目录、读取正文，再按当前任务的 scope、证据与时间判断是否采用。目录在 session 内冻结，工具读取的是最新本地内容；打开条目不等于验证或采纳它。
+
+主 Agent 与用户的 `/claim` 面板可以修订 holder 为当前 Agent 的已有 claim，包括名称、判断、范围、证据摘要、置信度和状态；不能修改 id、holder、创建时间或来源链，也不能直接新建或删除。修订要求读取时的完整内容 revision，在 `knowledge_apply.lock` 内重新校验，冲突时保留较新的版本并要求重新读取。团队同步沿用既有 Maintainer 上传队列；单人模式不发团队请求、不累积待补传队列。
+
 ## Policy
 
 Policy 是 Maintainer 发布的行动约束或 claim 属性更新建议，不是客观事实，也不自动覆盖 Agent 的私有判断。
@@ -57,6 +61,8 @@ Trace 记录一次任务使用了哪些来源、产出了哪些本地 claim：
 Trace 不区分“借用”与“内化”状态，也不替代 session transcript。它用于解释知识产出链路，而不是把每个工具调用或推理步骤永久化。
 
 Trace 保存在 holder Agent 本地，不上传 Maintainer，也不进入 Router 派生视图。
+
+`claim` 工具与 `/claim` 面板可按 claim ID 回查关联 trace，再分页展开任务正文。历史 trace 没有对应的 claim 版本快照，不能证明后来修订的 statement 已获验证；人工或工具编辑本身不额外生成任务 trace，也不按引用次数自动改变 confidence。
 
 ## Dispute
 
