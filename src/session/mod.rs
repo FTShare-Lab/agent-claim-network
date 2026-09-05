@@ -198,6 +198,9 @@ pub struct CompactionCheckpoint {
     pub active_turn_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn: Option<ActiveTurnCompactionCursor>,
+    /// 手动同时压缩 recovery turn 时，canonical summary 提交不能删除其压缩后 Provider WAL。
+    #[serde(default)]
+    pub preserve_provider_history: bool,
     pub status: CompactionCheckpointStatus,
 }
 
@@ -260,6 +263,14 @@ pub struct SessionCompactionState {
 pub struct CompactedProviderHistory {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_identity: Option<ProviderReplayIdentity>,
+    /// 该窗口仍包含未进入 canonical transcript 的恢复 turn。跨 Provider 身份时只能
+    /// 投影其中的中性内容；新的成功 turn 提交后清除。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_turn_id: Option<String>,
+    /// 最早仍未解决 recovery turn 开始前的 canonical message 数。后续失败 turn
+    /// 可以推进 Provider WAL 的 canonical cursor，但手动 compact 仍须从这里规划。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_base_message_count: Option<usize>,
     /// `None` 表示 cursor 已随 canonical commit 确认；`Some` 表示这是当前 turn
     /// 的 write-ahead 窗口。它可以是最后一次实际请求，也可以暂存尚待 canonical
     /// commit 接受的 response-inclusive history，cursor 可暂时领先 messages.jsonl。
@@ -429,6 +440,7 @@ pub struct SessionPaths {
     pub compaction_assets_dir: PathBuf,
     pub session_yaml: PathBuf,
     pub provider_history_json: PathBuf,
+    pub provider_rejection_recovery_json: PathBuf,
     pub system_prompt: PathBuf,
     pub messages_jsonl: PathBuf,
     pub turn_events_jsonl: PathBuf,
@@ -451,6 +463,7 @@ impl SessionPaths {
             compaction_assets_dir: dir.join("compaction_assets"),
             session_yaml: dir.join("session.yaml"),
             provider_history_json: dir.join("provider_history.json"),
+            provider_rejection_recovery_json: dir.join("provider_rejection_recovery.json"),
             system_prompt: dir.join("system_prompt.md"),
             messages_jsonl: dir.join("messages.jsonl"),
             turn_events_jsonl: dir.join("turn_events.jsonl"),
@@ -1652,7 +1665,7 @@ fn extract_last_user_text(messages: &[SessionMessage]) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-fn is_real_user_message(message: &SessionMessage) -> bool {
+pub(crate) fn is_real_user_message(message: &SessionMessage) -> bool {
     message.role == SessionMessageRole::User
         && !is_user_shell_command_message(message)
         && !message
@@ -2644,6 +2657,8 @@ frontier:
                 protocol: crate::api::ProviderReplayProtocol::OpenAiResponses,
                 model: "test-model".into(),
             }),
+            recovery_turn_id: None,
+            recovery_base_message_count: None,
             pending_turn: None,
             canonical_message_until: 0,
             messages: vec![SessionTurnMessage::user_text("hello")],
@@ -2857,6 +2872,8 @@ frontier:
             .unwrap();
         let expected = CompactedProviderHistory {
             replay_identity: None,
+            recovery_turn_id: None,
+            recovery_base_message_count: None,
             pending_turn: None,
             canonical_message_until: 0,
             messages: vec![SessionTurnMessage::user_text("legacy exact window")],

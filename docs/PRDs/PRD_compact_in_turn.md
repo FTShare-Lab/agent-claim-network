@@ -299,6 +299,13 @@ struct CompactionPlan {
 - 手动 `/compact`：忽略上下文压力阈值，但仍要求 plan 能推进 coverage。
 - 手动 `/compact` 不是“强制重写 summary”，而是“忽略触发阈值，尝试推进 summary coverage”。如果 coverage 推不动，TUI 统一显示 `Nothing new to compact.`。
 - 手动 `/compact` 即使发生在 turn committed 之后、没有下一次 provider request，也仍然尝试压缩当前 canonical session history；删除的是自动 post-turn check，不是手动 post-turn compact。
+- 如果连续失败或取消的 turn 尚未进入 `messages.jsonl`，手动 `/compact` 会从 pending
+  Provider request WAL 中最早仍可恢复的 turn 起取 provider-safe suffix，并与 canonical
+  history 一起交给 in-turn compact 使用的同一 planner。Provider 身份变化时只移除私有
+  replay 与原始媒体载荷，保留中性的文本、工具调用和工具结果。产出的投影写回现有
+  Provider WAL；最后一次请求之后的进度仍由原有 journal recovery context 恢复，不因压缩而
+  隐藏，失败后追加的 canonical 本地记录作为受保护尾部保持时序。该恢复投影在被新的成功
+  turn 消费前，后续手动 `/compact` 不得用纯 canonical summary 覆盖它。
 - 每次 provider request 前最多执行一次 compact 检查。
 - 单个 active turn 内允许多次 compact，只要新的 provider-safe segment 能推进 coverage。
 

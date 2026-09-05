@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::{redact_responses_error_body, ResponsesError};
+use super::{safe_responses_error_code, ResponsesError};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponsesRequest {
@@ -57,6 +57,7 @@ pub struct ReducedResponses {
     pub response_id: Option<String>,
     pub output_items: Vec<Value>,
     pub output_text: String,
+    pub refused: bool,
     pub function_calls: Vec<ResponsesFunctionCall>,
     pub usage: Option<Value>,
     pub terminal: ResponsesTerminal,
@@ -83,13 +84,17 @@ pub fn reduce_response_value(value: Value) -> Result<ReducedResponses, Responses
                 ResponsesTerminal::MaxOutputTokens
             } else {
                 return Err(ResponsesError::Incomplete {
-                    reason: redact_responses_error_body(reason),
+                    reason: safe_responses_error_code(reason)
+                        .unwrap_or("redacted_incomplete_reason")
+                        .to_string(),
                 });
             }
         }
         "failed" => {
+            let code = response_error_code(object.get("error"));
             return Err(ResponsesError::Failed {
-                message: response_error_message(object.get("error")),
+                message: response_error_message(object.get("error"), code.as_deref()),
+                code,
             });
         }
         other => {
@@ -104,6 +109,7 @@ pub fn reduce_response_value(value: Value) -> Result<ReducedResponses, Responses
         .cloned()
         .ok_or_else(|| shape_error("response 缺少 output array"))?;
     let mut output_text = String::new();
+    let mut refused = false;
     let mut function_calls = Vec::new();
     let mut call_ids = HashSet::new();
     for (index, item) in output_items.iter().enumerate() {
@@ -117,7 +123,7 @@ pub fn reduce_response_value(value: Value) -> Result<ReducedResponses, Responses
         match kind {
             "message" => {
                 validate_consumable_item_status(terminal, index, item_object)?;
-                reduce_message_item(index, item_object, &mut output_text)?;
+                reduce_message_item(index, item_object, &mut output_text, &mut refused)?;
             }
             "function_call" => {
                 validate_consumable_item_status(terminal, index, item_object)?;
@@ -145,6 +151,7 @@ pub fn reduce_response_value(value: Value) -> Result<ReducedResponses, Responses
             .map(str::to_string),
         output_items,
         output_text,
+        refused,
         function_calls,
         usage: object
             .get("usage")
@@ -181,6 +188,7 @@ fn reduce_message_item(
     item_index: usize,
     item: &serde_json::Map<String, Value>,
     output_text: &mut String,
+    refused: &mut bool,
 ) -> Result<(), ResponsesError> {
     let role = item
         .get("role")
@@ -211,7 +219,10 @@ fn reduce_message_item(
             })?;
         let visible_text = match kind {
             "output_text" => Some(("text", "output_text")),
-            "refusal" => Some(("refusal", "refusal")),
+            "refusal" => {
+                *refused = true;
+                Some(("refusal", "refusal"))
+            }
             _ => None,
         };
         if let Some((field, label)) = visible_text {
@@ -241,14 +252,25 @@ fn required_item_string(
         .ok_or_else(|| shape_error(format!("output[{index}] function_call 缺少 {field}")))
 }
 
-fn response_error_message(error: Option<&Value>) -> String {
+fn response_error_message(error: Option<&Value>, code: Option<&str>) -> String {
     let message = error
         .and_then(Value::as_object)
         .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
         .filter(|message| !message.trim().is_empty())
         .unwrap_or("upstream response failed");
-    redact_responses_error_body(message)
+    super::redact_responses_error_message_with_code(message, code)
+}
+
+fn response_error_code(error: Option<&Value>) -> Option<String> {
+    error
+        .and_then(crate::api::structured_provider_error_code)
+        .filter(|code| !code.trim().is_empty())
+        .map(|code| {
+            safe_responses_error_code(code)
+                .unwrap_or("redacted")
+                .to_string()
+        })
 }
 
 fn shape_error(reason: impl Into<String>) -> ResponsesError {
@@ -259,6 +281,18 @@ fn shape_error(reason: impl Into<String>) -> ResponsesError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_response_uses_outer_type_when_detail_code_is_unknown() {
+        let error = super::reduce_response_value(serde_json::json!({
+            "status": "failed", "error": {
+                "code": "invalid_value", "type": "invalid_request_error", "message": "invalid input[2]"
+            }
+        })).unwrap_err();
+        assert!(
+            matches!(error, super::ResponsesError::Failed { code: Some(code), .. } if code == "invalid_request_error")
+        );
+    }
+
     use serde_json::json;
 
     use super::*;
@@ -292,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn reducer_projects_refusal_as_visible_assistant_text() {
+    fn reducer_marks_refusal_for_adapter_rejection() {
         let refusal = json!({
             "type":"message",
             "id":"msg_refusal",
@@ -307,6 +341,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(reduced.output_text, "I cannot help with that.");
+        assert!(reduced.refused);
         assert_eq!(reduced.output_items, vec![refusal]);
         assert_eq!(reduced.terminal, ResponsesTerminal::Completed);
     }
@@ -339,13 +374,78 @@ mod tests {
 
         let failed = reduce_response_value(json!({
             "status":"failed",
-            "error":{"message":"request rejected"},
+            "error":{"code":"invalid_request_error","message":"request rejected"},
             "output":[]
         }))
         .unwrap_err();
         assert!(matches!(
             failed,
-            ResponsesError::Failed { ref message } if message == "request rejected"
+            ResponsesError::Failed { ref code, ref message }
+                if code.as_deref() == Some("invalid_request_error")
+                    && message.contains("redacted Responses request/replay payload")
+                    && !message.contains("request rejected")
+        ));
+    }
+
+    #[test]
+    fn reducer_does_not_override_structured_rate_limit_with_echoed_context_text() {
+        let error = reduce_response_value(serde_json::json!({
+            "status":"failed",
+            "error":{
+                "code":"rate_limit_error",
+                "message":"request echoed: maximum context length"
+            },
+            "output":[]
+        }))
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ResponsesError::Failed { code: Some(code), message }
+                if code == "rate_limit_error"
+                    && message.contains("rate_limit_error")
+                    && !message.contains("maximum context length")
+        ));
+    }
+
+    #[test]
+    fn reducer_preserves_unknown_structured_code_without_using_its_message() {
+        let error = reduce_response_value(serde_json::json!({
+            "status":"failed",
+            "error":{
+                "code":"future_error",
+                "message":"maximum context length"
+            },
+            "output":[]
+        }))
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ResponsesError::Failed { ref code, ref message }
+                if code.as_deref() == Some("redacted")
+                    && !message.contains("context_length_exceeded")
+                    && !message.contains("maximum context length")
+        ));
+    }
+
+    #[test]
+    fn reducer_falls_back_from_null_code_to_structured_type() {
+        let error = reduce_response_value(serde_json::json!({
+            "status":"failed",
+            "error":{
+                "code":null,
+                "type":"authentication_error",
+                "message":"invalid request"
+            },
+            "output":[]
+        }))
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ResponsesError::Failed { code: Some(code), .. }
+                if code == "authentication_error"
         ));
     }
 

@@ -101,10 +101,45 @@ pub trait ProviderRequestObserver: Send {
         messages: &[SessionTurnMessage],
     ) -> anyhow::Result<()>;
 
-    /// adapter 已完成本地恢复检查，即将第一次发起该逻辑请求的网络 I/O。
-    /// 该边界用于区分“WAL 已准备但请求确定未发送”和“发送结果存在歧义”。
+    /// adapter 已完成本地恢复检查，即将发起一次真实网络 I/O。底层 transport
+    /// 每次 retry 或 fallback 都必须上报，用于识别已有发送结果不明确的请求。
     fn provider_request_started(&mut self, messages: &[SessionTurnMessage]) -> anyhow::Result<()> {
         let _ = messages;
+        Ok(())
+    }
+
+    fn provider_request_started_after(
+        &mut self,
+        messages: &[SessionTurnMessage],
+        _previous_attempt_ambiguous: bool,
+    ) -> anyhow::Result<()> {
+        self.provider_request_started(messages)
+    }
+
+    /// 上游已返回明确 HTTP/协议终态；后续 fallback/retry 不应把该次发送视为结果含糊。
+    fn provider_request_outcome_resolved(
+        &mut self,
+        _messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// 上游响应不仅有明确终态，也已通过 adapter 的基本协议校验。continuation
+    /// 后续失败时，owner 可保留该响应已经确认的进度。
+    async fn provider_response_accepted(
+        &mut self,
+        messages: &[SessionTurnMessage],
+    ) -> anyhow::Result<()> {
+        self.provider_request_outcome_resolved(messages)
+    }
+
+    /// 内部续写前保存已接受的响应；history 不含下一请求的 continuation trigger。
+    /// 非流式正文没有 delta 事件，由 owner 同时保存其累计文本。
+    async fn provider_response_checkpoint(
+        &mut self,
+        _history: &[SessionTurnMessage],
+        _non_streaming_text: Option<&str>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -381,6 +416,116 @@ impl ProviderRequestTooLarge {
 
     pub(crate) fn should_discard_visible_output(&self) -> bool {
         self.discard_visible_output
+    }
+}
+
+/// Provider 明确判定请求超过模型上下文窗口。与成功响应中的
+/// `ProviderStop::ContextWindowExceeded` 不同，这一结果没有可提交的 assistant suffix。
+#[derive(Debug, thiserror::Error)]
+#[error("LLM provider rejected the request because the model context window is full")]
+pub(crate) struct ProviderContextWindowExceeded {
+    discard_visible_output: bool,
+}
+
+impl ProviderContextWindowExceeded {
+    pub(crate) fn new() -> Self {
+        Self {
+            discard_visible_output: false,
+        }
+    }
+
+    pub(crate) fn after_visible_output() -> Self {
+        Self {
+            discard_visible_output: true,
+        }
+    }
+
+    pub(crate) fn should_discard_visible_output(&self) -> bool {
+        self.discard_visible_output
+    }
+}
+
+/// Provider 明确拒绝请求中的图片或 PDF。turn loop 可以剥离媒体并重试，adapter
+/// 只负责保留已经脱敏的上游错误语义。
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct ProviderMediaRejected {
+    message: String,
+    discard_visible_output: bool,
+}
+
+impl ProviderMediaRejected {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            discard_visible_output: false,
+        }
+    }
+
+    pub(crate) fn after_visible_output(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            discard_visible_output: true,
+        }
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub(crate) fn should_discard_visible_output(&self) -> bool {
+        self.discard_visible_output
+    }
+}
+
+/// Provider 已明确拒绝本次请求，原样重放不会恢复。该分类只用于已经收到确定性
+/// 上游终态的请求；超时、断流等结果不确定的失败仍保守保留 WAL。
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct ProviderRequestRejected {
+    message: String,
+    discard_visible_output: bool,
+    discard_turn: bool,
+}
+
+impl ProviderRequestRejected {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            discard_visible_output: false,
+            discard_turn: true,
+        }
+    }
+
+    pub(crate) fn after_visible_output(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            discard_visible_output: true,
+            discard_turn: true,
+        }
+    }
+
+    pub(crate) fn preserving_turn_progress(
+        message: impl Into<String>,
+        discard_visible_output: bool,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            discard_visible_output,
+            discard_turn: false,
+        }
+    }
+
+    pub(crate) fn should_discard_visible_output(&self) -> bool {
+        self.discard_visible_output
+    }
+
+    pub(crate) fn should_discard_turn(&self) -> bool {
+        self.discard_turn
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
     }
 }
 

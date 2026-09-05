@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use super::{
-    redact_responses_error_body, reduce_response_value, ReducedResponses, ResponsesError,
+    is_transient_error_code, reduce_response_value, ReducedResponses, ResponsesError,
     ResponsesStreamEvent,
 };
 
@@ -75,7 +75,7 @@ impl ResponsesEventDecoder {
         }
         match kind {
             "response.created" | "response.output_item.added" | "response.in_progress" => {}
-            "response.output_text.delta" | "response.refusal.delta" => {
+            "response.output_text.delta" => {
                 let delta = event.get("delta").and_then(Value::as_str).ok_or_else(|| {
                     ResponsesError::StreamFailure {
                         reason: format!("{kind} 缺少 delta"),
@@ -86,6 +86,13 @@ impl ResponsesEventDecoder {
                         text: delta.to_string(),
                     });
                 }
+            }
+            "response.refusal.delta" => {
+                event.get("delta").and_then(Value::as_str).ok_or_else(|| {
+                    ResponsesError::StreamFailure {
+                        reason: "response.refusal.delta 缺少 delta".into(),
+                    }
+                })?;
             }
             "response.output_item.done" => {
                 let index = event
@@ -208,7 +215,7 @@ impl ResponsesEventDecoder {
     }
 }
 
-fn event_error_message(error: Option<&Value>) -> String {
+fn event_error_message(error: Option<&Value>, code: Option<&str>) -> String {
     let message = error
         .and_then(Value::as_object)
         .and_then(|error| {
@@ -222,45 +229,44 @@ fn event_error_message(error: Option<&Value>) -> String {
         .and_then(Value::as_str)
         .filter(|message| !message.trim().is_empty())
         .unwrap_or("upstream Responses stream failed");
-    redact_responses_error_body(message)
+    super::redact_responses_error_message_with_code(message, code)
 }
 
 fn response_stream_error(event: &Value, error: Option<&Value>) -> ResponsesError {
-    let message = event_error_message(error);
+    let mut code = event_error_code(event).map(|code| {
+        super::safe_responses_error_code(code)
+            .unwrap_or("redacted")
+            .to_string()
+    });
+    let message = event_error_message(error, code.as_deref());
     if let Some(status) = event_error_status(event) {
-        return ResponsesError::Status {
+        let status_error = ResponsesError::Status {
             status,
-            body: message,
+            body: super::redact_responses_error_body(&event.to_string()),
         };
+        if status == 413 || super::is_explicit_websocket_message_too_big(&status_error) {
+            return status_error;
+        }
+        if code.as_deref().is_some_and(is_transient_error_code) {
+            return ResponsesError::Failed { code, message };
+        }
+        if status == 429 || status >= 500 {
+            if code.as_deref().is_none_or(|code| code == "redacted") {
+                code = Some(if status == 429 {
+                    "rate_limit_error".into()
+                } else {
+                    "server_error".into()
+                });
+            }
+            return ResponsesError::Failed { code, message };
+        }
+        return status_error;
     }
-    if event_error_code(event).is_some_and(is_transient_error_code) {
-        return ResponsesError::StreamFailure { reason: message };
-    }
-    ResponsesError::Failed { message }
+    ResponsesError::Failed { code, message }
 }
 
 fn event_error_code(event: &Value) -> Option<&str> {
-    event
-        .get("code")
-        .or_else(|| event.pointer("/error/code"))
-        .or_else(|| event.pointer("/error/type"))
-        .or_else(|| event.pointer("/response/error/code"))
-        .or_else(|| event.pointer("/response/error/type"))
-        .and_then(Value::as_str)
-}
-
-fn is_transient_error_code(code: &str) -> bool {
-    matches!(
-        code,
-        "rate_limit_error"
-            | "rate_limit_exceeded"
-            | "server_error"
-            | "api_error"
-            | "overloaded_error"
-            | "internal_server_error"
-            | "service_unavailable"
-            | "temporarily_unavailable"
-    )
+    super::structured_responses_error_code(event)
 }
 
 fn event_error_status(event: &Value) -> Option<u16> {
@@ -401,18 +407,9 @@ mod tests {
         let reduced = decoder.finish(&mut |event| events.push(event)).unwrap();
 
         assert_eq!(reduced.output_text, "request refused");
+        assert!(reduced.refused);
         assert_eq!(reduced.output_items, vec![refusal]);
-        assert_eq!(
-            events,
-            vec![
-                ResponsesStreamEvent::TextDelta {
-                    text: "request ".into()
-                },
-                ResponsesStreamEvent::TextDelta {
-                    text: "refused".into()
-                }
-            ]
-        );
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -721,7 +718,7 @@ mod tests {
     }
 
     #[test]
-    fn decoder_classifies_code_only_transient_events_as_stream_failures() {
+    fn decoder_classifies_code_only_transient_events_as_resolved_failures() {
         for event in [
             json!({
                 "type":"response.failed",
@@ -738,7 +735,7 @@ mod tests {
                 .push_chunk(sse_event(event).as_bytes(), &mut |_| {})
                 .unwrap_err();
 
-            assert!(matches!(error, ResponsesError::StreamFailure { .. }));
+            assert!(matches!(error, ResponsesError::Failed { .. }));
         }
     }
 
@@ -761,16 +758,95 @@ mod tests {
     }
 
     #[test]
-    fn decoder_preserves_wrapped_error_status_and_nested_message() {
-        for (event, expected_status, expected_message) in [
+    fn decoder_preserves_unknown_structured_code_without_using_its_message() {
+        for status in [None, Some(400)] {
+            let mut event = json!({
+                "type":"error",
+                "code":"future_error",
+                "message":"maximum context length"
+            });
+            if let Some(status) = status {
+                event["status"] = json!(status);
+            }
+            let mut decoder = ResponsesSseDecoder::default();
+            let error = decoder
+                .push_chunk(sse_event(event).as_bytes(), &mut |_| {})
+                .unwrap_err();
+
+            match error {
+                ResponsesError::Failed { code, message } => {
+                    assert_eq!(code.as_deref(), Some("redacted"));
+                    assert!(!message.contains("context_length_exceeded"));
+                }
+                ResponsesError::Status { status, body } => {
+                    assert_eq!(status, 400);
+                    assert_eq!(
+                        crate::api::provider_error_code(&body).as_deref(),
+                        Some("redacted")
+                    );
+                    assert!(!crate::api::is_provider_request_error(status, &body));
+                }
+                other => panic!("unexpected error: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn decoder_preserves_nested_structured_code_when_status_is_present() {
+        for (status, code, expected_code) in [
+            (413, "authentication_error", "authentication_error"),
+            (413, "model_not_found", "model_not_found"),
+            (413, "rate_limit_error", "rate_limit_error"),
+            (413, "server_error", "server_error"),
+            (413, "future_error", "redacted"),
+            (400, "future_error", "redacted"),
+        ] {
+            let mut decoder = ResponsesSseDecoder::default();
+            let error = decoder
+                .push_chunk(
+                    sse_event(json!({
+                        "type":"response.failed",
+                        "status":status,
+                        "response":{"error":{
+                            "code":code,
+                            "message":"maximum context length exceeded"
+                        }}
+                    }))
+                    .as_bytes(),
+                    &mut |_| {},
+                )
+                .unwrap_err();
+
+            let ResponsesError::Status {
+                status: actual_status,
+                body,
+            } = error
+            else {
+                panic!("expected status error");
+            };
+            assert_eq!(actual_status, status);
+            assert_eq!(
+                crate::api::provider_error_code(&body).as_deref(),
+                Some(expected_code)
+            );
+            if status == 413 {
+                assert!(crate::api::is_provider_request_too_large(status, &body));
+            } else {
+                assert!(!crate::api::is_provider_request_error(status, &body));
+            }
+        }
+    }
+
+    #[test]
+    fn decoder_marks_wrapped_transient_status_as_failed_and_keeps_deterministic_status() {
+        for (event, expected_code) in [
             (
                 json!({
                     "type":"error",
                     "status":429,
                     "error":{"message":"rate limited","secret":"opaque"}
                 }),
-                429,
-                "rate limited",
+                "rate_limit_error",
             ),
             (
                 json!({
@@ -778,17 +854,7 @@ mod tests {
                     "status_code":503,
                     "error":{"message":"temporarily unavailable","secret":"opaque"}
                 }),
-                503,
-                "temporarily unavailable",
-            ),
-            (
-                json!({
-                    "type":"error",
-                    "status":401,
-                    "error":{"message":"invalid credential","secret":"opaque"}
-                }),
-                401,
-                "invalid credential",
+                "server_error",
             ),
         ] {
             let mut decoder = ResponsesSseDecoder::default();
@@ -796,14 +862,63 @@ mod tests {
                 .push_chunk(sse_event(event).as_bytes(), &mut |_| {})
                 .unwrap_err();
 
-            match error {
-                ResponsesError::Status { status, body } => {
-                    assert_eq!(status, expected_status);
-                    assert_eq!(body, expected_message);
-                    assert!(!body.contains("opaque"));
-                }
-                other => panic!("expected status error, got {other}"),
-            }
+            assert!(matches!(
+                &error,
+                ResponsesError::Failed { code: Some(code), .. } if code == expected_code
+            ));
+            let text = error.to_string();
+            assert!(text.contains("redacted Responses request/replay payload"));
+            assert!(!text.contains("opaque"));
+            assert!(!text.contains("rate limited"));
+            assert!(!text.contains("temporarily unavailable"));
+        }
+
+        let mut decoder = ResponsesSseDecoder::default();
+        let error = decoder
+            .push_chunk(
+                sse_event(json!({
+                    "type":"error",
+                    "status":401,
+                    "error":{"message":"invalid credential","secret":"opaque"}
+                }))
+                .as_bytes(),
+                &mut |_| {},
+            )
+            .unwrap_err();
+        assert!(matches!(error, ResponsesError::Status { status: 401, .. }));
+        let text = error.to_string();
+        assert!(text.contains("redacted Responses request/replay payload"));
+        assert!(!text.contains("opaque"));
+        assert!(!text.contains("invalid credential"));
+    }
+
+    #[test]
+    fn decoder_preserves_deterministic_code_with_wrapped_status() {
+        for code in [
+            "content_filter",
+            "invalid_request_error",
+            "unsupported_media_type",
+        ] {
+            let mut decoder = ResponsesSseDecoder::default();
+            let error = decoder
+                .push_chunk(
+                    sse_event(json!({
+                        "type":"error",
+                        "status":403,
+                        "error":{"code":code,"message":"private request echo"}
+                    }))
+                    .as_bytes(),
+                    &mut |_| {},
+                )
+                .unwrap_err();
+
+            let ResponsesError::Status { status, body } = error else {
+                panic!("expected status error");
+            };
+            assert_eq!(status, 403);
+            assert!(body.contains(code));
+            assert!(crate::api::is_provider_request_error(status, &body));
+            assert!(!body.contains("private request echo"));
         }
     }
 

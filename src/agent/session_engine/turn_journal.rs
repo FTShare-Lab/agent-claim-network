@@ -94,6 +94,14 @@ pub(super) struct TurnJournalDurableEventRecorder {
 
 #[async_trait]
 impl SessionTurnEventRecorder for TurnJournalDurableEventRecorder {
+    async fn record_assistant_output_checkpoint(&mut self, text: &str) -> anyhow::Result<()> {
+        self.assistant_delta_flusher.flush();
+        self.sink
+            .send_immediate_durable(TurnJournalEventKind::AssistantOutputCheckpoint {
+                text: text.to_string(),
+            })
+            .await
+    }
     async fn record(&mut self, event: SessionTurnEvent) -> anyhow::Result<()> {
         match event {
             SessionTurnEvent::Warning { .. }
@@ -122,6 +130,20 @@ impl SessionTurnEventRecorder for TurnJournalDurableEventRecorder {
                 self.assistant_delta_flusher.flush();
                 self.sink
                     .send_immediate_durable(TurnJournalEventKind::AssistantOutputDiscarded)
+                    .await
+            }
+            SessionTurnEvent::AssistantOutputAccepted => {
+                self.assistant_delta_flusher.flush();
+                self.sink
+                    .send_immediate_durable(TurnJournalEventKind::AssistantOutputAccepted)
+                    .await
+            }
+            SessionTurnEvent::AssistantOutputPreservedForFallback => {
+                self.assistant_delta_flusher.flush();
+                self.sink
+                    .send_immediate_durable(
+                        TurnJournalEventKind::AssistantOutputPreservedForFallback,
+                    )
                     .await
             }
             SessionTurnEvent::NonStreamingFallbackAttemptFailed {
@@ -240,6 +262,37 @@ impl SessionTurnEventRecorder for TurnJournalDurableEventRecorder {
                 source: *source,
                 fingerprint: fingerprint.to_string(),
                 text: text.to_string(),
+            })
+            .await
+    }
+
+    async fn record_provider_request_rejected(
+        &mut self,
+        rejection_id: u64,
+        discard_turn: bool,
+    ) -> anyhow::Result<()> {
+        self.assistant_delta_flusher.flush();
+        self.sink
+            .send_immediate_durable(TurnJournalEventKind::ProviderRequestRejected {
+                rejection_id,
+                discard_turn,
+            })
+            .await
+    }
+
+    async fn record_historical_media_cleanup(&mut self) -> anyhow::Result<()> {
+        self.sink
+            .send_immediate_durable(TurnJournalEventKind::HistoricalMediaCleaned)
+            .await
+    }
+
+    async fn record_provider_request_retried_after_rejection(
+        &mut self,
+        rejection_id: u64,
+    ) -> anyhow::Result<()> {
+        self.sink
+            .send_immediate_durable(TurnJournalEventKind::ProviderRequestRetriedAfterRejection {
+                rejection_id,
             })
             .await
     }

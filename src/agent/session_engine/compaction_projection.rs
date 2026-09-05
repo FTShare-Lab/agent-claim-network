@@ -15,8 +15,8 @@ use crate::api::{
     estimate_provider_replay_tokens, estimate_session_turn_messages_tokens, estimate_text_tokens,
     estimated_projected_segment_tokens, large_tool_result_omission_text,
     omit_turn_messages_tool_results, project_compaction_input_media,
-    project_compaction_input_tool_results, project_turn_message_tool_results,
-    provider_anchor_end_index, provider_safe_segments,
+    project_compaction_input_tool_results, project_turn_message_for_safe_transcript,
+    project_turn_message_tool_results, provider_anchor_end_index, provider_safe_segments,
     strip_file_edit_authority_compaction_notices, ProviderHistoryMediaPolicy,
     ProviderReplayIdentity, SessionTurnContentBlock, SessionTurnMessage, TurnMessage,
     FILE_EDIT_AUTHORITY_COMPACTION_NOTICE,
@@ -193,10 +193,19 @@ pub(super) fn compacted_context_for_turn(
             session_messages_to_provider_turn_messages(messages, media_policy, replay_identity),
         ));
     };
-    if let Some(provider_history) =
-        replayable_compacted_provider_history(metadata, messages.len(), replay_identity.as_ref())
-    {
+    if let Some(provider_history) = compaction.provider_history.as_deref().filter(|history| {
+        (history.replay_identity.as_ref() == replay_identity.as_ref()
+            || history.recovery_turn_id.is_some())
+            && (history.canonical_message_until <= messages.len() || history.pending_turn.is_some())
+    }) {
+        let replays_exactly = provider_history.replay_identity.as_ref() == replay_identity.as_ref();
         let mut history = provider_history.messages.clone();
+        if !replays_exactly {
+            history = history
+                .into_iter()
+                .map(project_turn_message_for_safe_transcript)
+                .collect();
+        }
         if !file_edit_authority_enabled {
             strip_file_edit_authority_compaction_notices(&mut history);
         }
@@ -474,11 +483,19 @@ pub(super) fn project_provider_context(
     );
     let mut messages = if let Some(provider_history) =
         compaction.provider_history.as_ref().filter(|history| {
-            history.replay_identity.as_ref() == replay_identity.as_ref()
+            (history.replay_identity.as_ref() == replay_identity.as_ref()
+                || history.recovery_turn_id.is_some())
                 && (history.canonical_message_until <= session_messages.len()
                     || history.pending_turn.is_some())
         }) {
+        let replays_exactly = provider_history.replay_identity.as_ref() == replay_identity.as_ref();
         let mut messages = provider_history.messages.clone();
+        if !replays_exactly {
+            messages = messages
+                .into_iter()
+                .map(project_turn_message_for_safe_transcript)
+                .collect();
+        }
         if !file_edit_authority_enabled {
             strip_file_edit_authority_compaction_notices(&mut messages);
         }
