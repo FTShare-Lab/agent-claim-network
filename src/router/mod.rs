@@ -23,7 +23,10 @@ mod vector;
 
 pub use debug::{ClaimRetrievalDebug, RetrievalDebug};
 pub use index::{ClaimIndex, ClaimIndexEntry};
-pub use overview::{ScopeOverviewItem, ScopesOverviewSnapshot};
+pub use overview::{
+    RouterClaimSummary, RouterClaimSummaryCatalog, RouterClaimSummaryText, ScopeOverviewItem,
+    ScopesOverviewSnapshot,
+};
 pub use rerank::{
     apply_rerank_order, build_reranker, default_reranker, RerankCandidate, RouterReranker,
 };

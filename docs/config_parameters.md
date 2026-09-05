@@ -248,6 +248,8 @@ MCP server 按连接方式分两类：
 - `code_run_max_output_chars`：单次 `code_run` / `write_stdin` 工具中每个 stdout/stderr stream 回传允许的最大输出字符数，默认 `1048576`，最多 `2097152`；pipe 模式两个 stream 各自适用该上限，PTY 只有 stdout。
 - `write_stdin_max_poll_timeout_ms`：`write_stdin` 空轮询的最大观察窗口，默认且最大 `300000`ms。它必须不小于内部 `code_run` 最大观察窗口 `30000`ms；非空写入仍受内部 `30000`ms 上限约束。
 
+终态输出在快照连续、无丢失且覆盖流结尾时，若超过本次 `max_output_chars`，会在该预算内保留连续前缀，并用四分之一预算展示 `stdout_tail_preview` / `stderr_tail_preview`（预算不足四字符时不启用）。预览的绝对字符起点由对应 `*_tail_preview_start_cursor` 给出；`stdout_cursor` / `stderr_cursor` 只推进连续前缀，provider 确认后继续轮询仍能读取中间内容。运行中、buffer gap 或还有后续保留页时沿用原分页。
+
 background-shell 其余时序、容量和 PTY 参数是 `config.rs` 内部默认值与资源护栏，而不是部署 TOML 键：`code_run` 初始观察窗口 / 最小值 / 最大值固定为 `10000`ms / `250`ms / `30000`ms，写入和空轮询默认值固定为 `250`ms / `5000`ms；输出 buffer、owner entry 容量、PTY 尺寸与 stdin buffer 也由内部值约束。部署配置不能将这些值下调或覆盖。
 - `session_search_default_limit`：session search 默认返回条数，默认 `3`。
 - `session_search_max_limit`：session search 最大返回条数，默认 `5`。

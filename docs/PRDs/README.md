@@ -22,6 +22,7 @@
 ## Tool 与后台执行
 
 - [Claim Harness：发现、核对与修订](PRD_claim_harness.md)
+- [DeepSWE Claim Harness：可发现的知识与可靠的执行反馈](PRD_deepswe_claim_harness.md)
 - [并发工具调用](PRD_parallel_tools.md)
 - [`code_run` 后台长命令与受管终端](PRD_background_shell.md)
 - [Session Search](PRD_session_search.md)

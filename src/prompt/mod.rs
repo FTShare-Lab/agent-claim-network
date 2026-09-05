@@ -532,6 +532,9 @@ mod tests {
         assert!(out.contains("Available tools: `code_run`, `write_stdin`, `process_list`, `consult_router`, `submit_task`."));
         assert!(out.contains("Use `code_run` for shell commands and file edits."));
         assert!(out.contains("candidate claims"));
+        assert!(out.contains("bounded summary catalog"));
+        assert!(out.contains("Do not mark a claim as used from summary metadata alone"));
+        assert!(out.contains("multiple full candidate claims"));
         assert!(out.contains("only tool call is the no-argument `submit_task`"));
         assert!(!out.contains("file_read"));
         assert!(!out.contains("working_note"));
@@ -749,7 +752,8 @@ mod tests {
         assert!(out.contains("transcript 中可能包含 router 工具调用结果"));
         assert!(out.contains("candidate_claims"));
         assert!(out.contains("disputes"));
-        assert!(out.contains("transcript 中真实出现过的 claim id"));
+        assert!(out.contains("目录摘要中的 ID 仅供发现"));
+        assert!(out.contains("没有读取正文时，不能据此计入使用、来源或 dispute"));
         assert!(out.contains("\"updated_claims\""));
         assert!(out.contains("必须输出完整属性和 `status`"));
         assert!(out.contains("仍相关的来源 id 需要一并返回"));

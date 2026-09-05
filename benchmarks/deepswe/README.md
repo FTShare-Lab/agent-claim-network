@@ -1,5 +1,8 @@
 # ACN DeepSWE runner
 
+比较 `ff12e50` 与 claim harness 改动的异机完整 113 题配对流程见
+[CLAIM_HARNESS_EXPERIMENT.md](CLAIM_HARNESS_EXPERIMENT.md)。
+
 在冻结的 DeepSWE / Pier revision 上跑 ACN 的 DeepSWE 四臂实验：每题先执行 `A` / `B_empty`，分别
 freeze，再执行 `B_claim` / `B_forced_claim`。`B_claim` 评估模型自主检索 claim 的真实端到端路径，
 `B_forced_claim` 是强制提供同一冻结 claim 的受控对照，主比较是两者分别相对 `B_empty` 的差异。

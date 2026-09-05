@@ -46,7 +46,7 @@ pub enum EvaluationHarnessMode {
 /// 评测 runtime 的 ACN.md 只承载 claim 交付契约；通用工程流程由冻结 skill 单一维护。
 const EVALUATION_ACN_MD_GUIDANCE: &str = r#"不要在会话中创建、更新或删除 claim 或 dispute；会话结束后的 finalize 会另线提取可复用判断。
 
-system prompt 中的 router scope overview 已是本 attempt 的冻结快照，不要再调用 overview。若当前 user turn 含 `<frozen-claims>`，这些内容就是本 attempt 的完整强制交付，不要调用 `consult_router`。否则，仅当 scope overview 非空时，在形成具体检索问题后选择最相关的一个 scope，调用一次 `consult_router` query；后续直接使用该次返回，不要重复查询。
+system prompt 中的 router scope overview 和有界 claim 摘要目录已是本 attempt 的冻结快照，不要再调用 overview。摘要目录只用于发现候选，正文尚未交付，目录中的 ID 不能仅据摘要记为已使用；若目录标出 omitted，它并非全量列表。若当前 user turn 含 `<frozen-claims>`，这些内容就是本 attempt 的完整强制交付，不要调用 `consult_router`。否则，仅当 scope overview 非空时，根据摘要中的 name 和 scope 选择最相关的一个 scope，结合当前任务形成具体 semantic_query，调用一次 `consult_router` query 获取完整候选 claim；一次查询可能返回同 scope 的多条候选正文，后续直接使用该次返回，不要重复查询。
 
 候选 claim 只是此前探索的经验和线索，不代表其中的方案已经成功，也不保证在当前任务或当前代码状态下仍成立。始终以当前任务契约、工作区事实以及可复现的工具和测试结果独立判断；证据不足、条件不符或与当前证据冲突时，不要沿用其中的解法。
 
@@ -1059,12 +1059,269 @@ fn write_new_file_blocking(path: &Path, content: &[u8], label: &str) -> anyhow::
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
     use super::*;
+    use async_trait::async_trait;
+    use tokio::sync::Mutex;
+
+    use crate::agent::fs::{
+        LocalFsInboxReader, LocalFsMemoryStore, LocalFsReportedDisputeClaimSetStore,
+    };
+    use crate::agent::maintainer_upload::LocalFsMaintainerUploadQueue;
+    use crate::agent::{
+        AgentRunner, PromptInboxJsonGenerator, ReportedDisputeClaimSetStore, SessionEngine,
+        SessionEngineOptions, SessionRuntimeProfile,
+    };
     use crate::api::evaluation_usage::{
         mark_evaluation_finalize_phase, record_evaluation_request_started, record_evaluation_usage,
     };
-    use crate::claim::ClaimId;
+    use crate::api::{
+        AgentTurnLoop, MemoryReviewLoop, ProviderAdapter, ProviderEvent, ProviderRequest,
+        ProviderResponse, ProviderStop, SessionTurnContentBlock, SessionTurnMessage,
+        StructuredJsonCaller,
+    };
+    use crate::claim::{ClaimId, Dispute, InboxId, InboxMessage, SessionId};
+    use crate::config::{
+        AgentSessionSkillConfig, AgentSessionTurnJournalConfig, SessionCompactionConfig,
+        ToolConfig, UserShellConfig,
+    };
+    use crate::maintainer::traits::MaintainerClient;
+    use crate::prompt::PromptRegistry;
+    use crate::session::SessionStore;
+    use crate::tool::ToolRegistry;
     use serde_json::json;
+
+    struct ClaimCatalogFlowProvider {
+        calls: AtomicUsize,
+        requests: Mutex<Vec<ProviderRequest>>,
+        claim: Claim,
+    }
+
+    struct NoopEvaluationMaintainerClient;
+
+    struct SubmitOnlyProvider {
+        requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    impl SubmitOnlyProvider {
+        fn new() -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        async fn requests(&self) -> Vec<ProviderRequest> {
+            self.requests.lock().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for SubmitOnlyProvider {
+        fn emit_preflight_context_estimate(&self) -> bool {
+            false
+        }
+
+        async fn send(
+            &self,
+            request: ProviderRequest,
+            _emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        ) -> anyhow::Result<ProviderResponse> {
+            self.requests.lock().await.push(request);
+            Ok(tool_use_response(
+                "toolu_submit_empty",
+                "submit_task",
+                json!({}),
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl MaintainerClient for NoopEvaluationMaintainerClient {
+        async fn pull_inbox(&self, _agent_id: &AgentId) -> anyhow::Result<Vec<InboxMessage>> {
+            Ok(Vec::new())
+        }
+
+        async fn ack_inbox(
+            &self,
+            _agent_id: &AgentId,
+            _inbox_ids: &[InboxId],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn upload_claim(&self, _claim: &Claim) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn report_dispute(&self, _dispute: &Dispute) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ClaimCatalogFlowProvider {
+        fn new(claim: Claim) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                requests: Mutex::new(Vec::new()),
+                claim,
+            }
+        }
+
+        async fn requests(&self) -> Vec<ProviderRequest> {
+            self.requests.lock().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for ClaimCatalogFlowProvider {
+        fn emit_preflight_context_estimate(&self) -> bool {
+            false
+        }
+
+        async fn send(
+            &self,
+            request: ProviderRequest,
+            _emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        ) -> anyhow::Result<ProviderResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requests.lock().await.push(request.clone());
+            match call {
+                0 => {
+                    assert!(request.system_prompt.contains(&self.claim.name));
+                    assert!(request.system_prompt.contains(&self.claim.scope));
+                    assert!(request.system_prompt.contains(self.claim.id.as_str()));
+                    assert!(request.system_prompt.contains(self.claim.holder.as_str()));
+                    assert!(!request.system_prompt.contains(&self.claim.statement));
+                    assert!(!request.system_prompt.contains(&self.claim.evidence_summary));
+                    Ok(tool_use_response(
+                        "toolu_query",
+                        "consult_router",
+                        json!({
+                            "mode": "query",
+                            "scope": self.claim.scope,
+                            "semantic_query": "retry cleanup ordering",
+                        }),
+                    ))
+                }
+                1 => {
+                    let transcript = serde_json::to_string(&request.messages)?;
+                    assert!(transcript.contains(&self.claim.statement));
+                    assert!(transcript.contains(&self.claim.evidence_summary));
+                    Ok(tool_use_response(
+                        "toolu_write",
+                        "file_write",
+                        json!({
+                            "path": "claim-applied.txt",
+                            "content": format!("applied {}\n", self.claim.statement),
+                        }),
+                    ))
+                }
+                2 => Ok(tool_use_response("toolu_submit", "submit_task", json!({}))),
+                _ => anyhow::bail!("unexpected provider call {call}"),
+            }
+        }
+    }
+
+    fn tool_use_response(id: &str, name: &str, input: Value) -> ProviderResponse {
+        ProviderResponse {
+            assistant_message: SessionTurnMessage {
+                role: "assistant".into(),
+                content: vec![SessionTurnContentBlock::ToolUse {
+                    id: id.into(),
+                    name: name.into(),
+                    input,
+                }],
+                provider_replay: None,
+            },
+            stop: ProviderStop::ToolUse,
+        }
+    }
+
+    fn build_fake_evaluation_session_engine(
+        directory: &tempfile::TempDir,
+        provider: Arc<dyn ProviderAdapter>,
+        router: Arc<FrozenClaimBundleRouter>,
+        submission: EvaluationSubmission,
+    ) -> anyhow::Result<SessionEngine> {
+        let agent_id = AgentId::new("eval_test")?;
+        let agents_root = directory.path().join("agents");
+        let agent_home = agents_root.join(agent_id.as_str());
+        let prompts = Arc::new(PromptRegistry::bundled()?);
+        let claim_store: Arc<dyn LocalClaimStore> =
+            Arc::new(LocalFsClaimStore::new(agent_home.clone()));
+        let reported_claims: Arc<dyn ReportedDisputeClaimSetStore> =
+            Arc::new(LocalFsReportedDisputeClaimSetStore::new(agent_home.clone()));
+        let json_caller = Arc::new(StructuredJsonCaller::new(
+            provider.clone(),
+            1_024,
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        ));
+        let runner = Arc::new(AgentRunner::new(
+            agent_id.clone(),
+            Arc::new(PromptInboxJsonGenerator::new(
+                prompts.clone(),
+                json_caller.clone(),
+            )),
+            claim_store,
+            reported_claims,
+            Arc::new(LocalFsInboxReader::new(agent_home.clone())),
+            Arc::new(LocalFsMemoryStore::new(
+                agent_home.clone(),
+                1_024,
+                1_024,
+                false,
+            )),
+            router.clone(),
+            Arc::new(NoopEvaluationMaintainerClient),
+            Arc::new(LocalFsMaintainerUploadQueue::new(agent_home)),
+            0,
+            Vec::new(),
+        ));
+        let tool_config = ToolConfig {
+            workspace_root: directory.path().to_path_buf(),
+            ..Default::default()
+        };
+        let tools = Arc::new(
+            ToolRegistry::new(&tool_config)?
+                .with_process_owner_agent_id(agent_id)
+                .with_router_client(router)
+                .for_evaluation(EVALUATION_MODEL_KEY_ENV.into())
+                .with_evaluation_submission(submission),
+        );
+        let turn_loop = Arc::new(AgentTurnLoop::new(provider.clone(), tools.clone(), 1_024));
+        let memory_review_loop = Arc::new(MemoryReviewLoop::new(
+            provider,
+            Arc::new(tools.as_ref().clone().for_memory_review()),
+            2,
+            1_024,
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        ));
+        Ok(SessionEngine::new(
+            runner,
+            turn_loop,
+            memory_review_loop,
+            json_caller,
+            prompts,
+            SessionStore::new(agents_root),
+            SessionEngineOptions {
+                compaction: SessionCompactionConfig::default(),
+                skills: AgentSessionSkillConfig::default(),
+                context_window: 200_000,
+                user_shell: UserShellConfig::default(),
+                workspace_root: directory.path().to_path_buf(),
+                turn_journal: AgentSessionTurnJournalConfig::default(),
+                subagent_max_concurrent: 0,
+                runtime_profile: SessionRuntimeProfile::Evaluation,
+            },
+        )
+        .with_session_metadata("evaluation", "fake-model"))
+    }
 
     #[test]
     fn evaluation_agent_identity_is_deterministic_and_attempt_specific() {
@@ -1148,6 +1405,10 @@ harness_mode = "{raw_mode}"
         );
         assert!(EVALUATION_ACN_MD_GUIDANCE.contains("不要再调用 overview"));
         assert!(EVALUATION_ACN_MD_GUIDANCE.contains("调用一次 `consult_router` query"));
+        assert!(EVALUATION_ACN_MD_GUIDANCE.contains("有界 claim 摘要目录"));
+        assert!(EVALUATION_ACN_MD_GUIDANCE.contains("不能仅据摘要记为已使用"));
+        assert!(EVALUATION_ACN_MD_GUIDANCE.contains("omitted"));
+        assert!(EVALUATION_ACN_MD_GUIDANCE.contains("同 scope 的多条候选正文"));
         assert!(EVALUATION_ACN_MD_GUIDANCE.contains("<frozen-claims>"));
         assert!(EVALUATION_ACN_MD_GUIDANCE.contains("consult_router"));
         assert!(EVALUATION_ACN_MD_GUIDANCE.contains("候选 claim 只是此前探索的经验和线索"));
@@ -1374,6 +1635,104 @@ harness_mode = "{raw_mode}"
         assert_eq!(prompt, config.task_prompt);
         assert!(claim_ids.is_empty());
         assert!(router.take_evidence().is_empty());
+    }
+
+    #[tokio::test]
+    async fn standard_evaluation_session_keeps_b_empty_schema_while_claim_arm_reads_and_applies() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut claim = snapshot_claim("claim_55555555", "retry cleanup ordering");
+        claim.scope = "runtime/retry".into();
+        claim.statement = "remove the retry marker only after cleanup completes".into();
+        claim.evidence_summary = "verified against the cleanup regression".into();
+        let router = Arc::new(
+            FrozenClaimBundleRouter::new(
+                FrozenClaimBundle {
+                    schema_version: EVALUATION_SCHEMA_VERSION,
+                    claims: vec![claim.clone()],
+                },
+                "attempt-001".into(),
+                None,
+            )
+            .unwrap()
+            .with_delivery_policy(FrozenClaimDeliveryPolicy::OnDemandOnce),
+        );
+        let provider = Arc::new(ClaimCatalogFlowProvider::new(claim.clone()));
+        let submission = EvaluationSubmission::new();
+        let engine = build_fake_evaluation_session_engine(
+            &directory,
+            provider.clone(),
+            router.clone(),
+            submission.clone(),
+        )
+        .unwrap();
+
+        let start = engine
+            .start_session_with_id_factory(SessionId::random, 2, |_| {})
+            .await
+            .unwrap();
+        assert!(router.take_evidence().is_empty());
+        let mut session = start.session;
+        engine
+            .run_turn(&mut session, "repair retry cleanup", |_| {})
+            .await
+            .unwrap();
+
+        assert!(submission.was_submitted());
+        let claim_requests = provider.requests().await;
+        assert_eq!(claim_requests.len(), 3);
+        assert_eq!(
+            tokio::fs::read_to_string(directory.path().join("claim-applied.txt"))
+                .await
+                .unwrap(),
+            format!("applied {}\n", claim.statement)
+        );
+        let evidence = router.take_evidence();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].injected_claim_ids, vec![claim.id.to_string()]);
+
+        let empty_directory = tempfile::tempdir().unwrap();
+        let empty_router = Arc::new(
+            FrozenClaimBundleRouter::new(
+                FrozenClaimBundle {
+                    schema_version: EVALUATION_SCHEMA_VERSION,
+                    claims: Vec::new(),
+                },
+                "attempt-empty".into(),
+                None,
+            )
+            .unwrap()
+            .with_delivery_policy(FrozenClaimDeliveryPolicy::Disabled),
+        );
+        let empty_provider = Arc::new(SubmitOnlyProvider::new());
+        let empty_submission = EvaluationSubmission::new();
+        let empty_engine = build_fake_evaluation_session_engine(
+            &empty_directory,
+            empty_provider.clone(),
+            empty_router.clone(),
+            empty_submission.clone(),
+        )
+        .unwrap();
+        let empty_start = empty_engine
+            .start_session_with_id_factory(SessionId::random, 2, |_| {})
+            .await
+            .unwrap();
+        let mut empty_session = empty_start.session;
+        empty_engine
+            .run_turn(&mut empty_session, "repair retry cleanup", |_| {})
+            .await
+            .unwrap();
+
+        assert!(empty_submission.was_submitted());
+        assert!(empty_router.take_evidence().is_empty());
+        let empty_requests = empty_provider.requests().await;
+        assert_eq!(empty_requests.len(), 1);
+        assert_eq!(claim_requests[0].tools, empty_requests[0].tools);
+        assert!(empty_requests[0]
+            .system_prompt
+            .contains("团队 router 当前没有可用 scope"));
+        assert!(!empty_requests[0].system_prompt.contains(&claim.name));
+        assert!(!empty_requests[0].system_prompt.contains(claim.id.as_str()));
+        assert!(!empty_requests[0].system_prompt.contains(&claim.statement));
     }
 
     #[test]

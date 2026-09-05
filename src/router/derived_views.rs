@@ -157,6 +157,7 @@ mod tests {
                     resolved_disputes: 0,
                     latest_claim_created_at: "2026-07-13T00:00:00Z".parse().unwrap(),
                 }],
+                claim_summaries: None,
             },
         )
     }

@@ -13,6 +13,46 @@ struct ProcessExecutionDelivery {
     termination_requested: bool,
 }
 
+struct ProcessOutputPreview {
+    text: String,
+    truncated: bool,
+    tail: Option<(String, u64)>,
+}
+
+fn process_output_preview(
+    snapshot: &process::ProcessOutput,
+    max_chars: usize,
+    terminal: bool,
+) -> ProcessOutputPreview {
+    let text = String::from_utf8_lossy(&snapshot.bytes);
+    let tail_chars = max_chars / 4;
+    if terminal
+        && snapshot.page_contiguous
+        && !snapshot.truncated
+        && !snapshot.has_more_retained
+        && tail_chars > 0
+        && text.chars().count() > max_chars
+    {
+        let (tail_offset, tail_start_cursor) = text.char_indices().rev().take(tail_chars).fold(
+            (text.len(), snapshot.cursor.0),
+            |(_, cursor), (offset, _)| (offset, cursor - 1),
+        );
+        // 预览不推进交付游标；未展示的中段仍必须通过正常分页确认。
+        ProcessOutputPreview {
+            text: text.chars().take(max_chars - tail_chars).collect(),
+            truncated: true,
+            tail: Some((text[tail_offset..].to_string(), tail_start_cursor)),
+        }
+    } else {
+        let (text, truncated) = truncate_chars(&text, max_chars);
+        ProcessOutputPreview {
+            text,
+            truncated,
+            tail: None,
+        }
+    }
+}
+
 impl ToolRegistry {
     pub(crate) fn empty_background_process_projection() -> String {
         concat!(
@@ -974,14 +1014,8 @@ impl ToolRegistry {
                 .await;
             state = process.state().await;
         }
-        let stdout = truncate_chars(
-            &String::from_utf8_lossy(&stdout_snapshot.bytes),
-            max_output_chars,
-        );
-        let stderr = truncate_chars(
-            &String::from_utf8_lossy(&stderr_snapshot.bytes),
-            max_output_chars,
-        );
+        let stdout = process_output_preview(&stdout_snapshot, max_output_chars, !state.is_live());
+        let stderr = process_output_preview(&stderr_snapshot, max_output_chars, !state.is_live());
         let stdin_open = process.stdin_open().await;
         let elapsed_ms = process
             .started_at
@@ -1014,32 +1048,32 @@ impl ToolRegistry {
         // 该游标仍通过 provider-success receipt 两阶段提交；provider 失败会回滚，因此
         // 下一轮既不会跳过未见内容，也不会在成功交付后无限重放同一前缀。
         let (stdout_snapshot_start, stderr_snapshot_start) = snapshot_start;
-        let stdout_visible_chars = u64::try_from(stdout.0.chars().count()).unwrap_or(u64::MAX);
-        let stderr_visible_chars = u64::try_from(stderr.0.chars().count()).unwrap_or(u64::MAX);
+        let stdout_visible_chars = u64::try_from(stdout.text.chars().count()).unwrap_or(u64::MAX);
+        let stderr_visible_chars = u64::try_from(stderr.text.chars().count()).unwrap_or(u64::MAX);
         let stdout_page_is_contiguous = stdout_snapshot.page_contiguous;
         let stderr_page_is_contiguous = stderr_snapshot.page_contiguous;
-        let reported_stdout_cursor = if stdout.1 && stdout_page_is_contiguous {
+        let reported_stdout_cursor = if stdout.truncated && stdout_page_is_contiguous {
             OutputCursor(
                 stdout_snapshot_start
                     .0
                     .saturating_add(stdout_visible_chars)
                     .min(stdout_snapshot.cursor.0),
             )
-        } else if stdout.1 {
+        } else if stdout.truncated {
             stdout_snapshot_start
         } else if stdout_cursor_out_of_range {
             OutputCursor(0)
         } else {
             stdout_snapshot.cursor
         };
-        let reported_stderr_cursor = if stderr.1 && stderr_page_is_contiguous {
+        let reported_stderr_cursor = if stderr.truncated && stderr_page_is_contiguous {
             OutputCursor(
                 stderr_snapshot_start
                     .0
                     .saturating_add(stderr_visible_chars)
                     .min(stderr_snapshot.cursor.0),
             )
-        } else if stderr.1 {
+        } else if stderr.truncated {
             stderr_snapshot_start
         } else if stderr_cursor_out_of_range {
             OutputCursor(0)
@@ -1053,15 +1087,21 @@ impl ToolRegistry {
             "exit_code": exit_code,
             "signal": signal,
             "success": success,
-            "stdout": stdout.0,
-            "stderr": stderr.0,
+            "stdout": stdout.text,
+            "stderr": stderr.text,
             "stdout_cursor": reported_stdout_cursor.0,
             "stderr_cursor": reported_stderr_cursor.0,
             "chunk_id": format!("{}:{}", process.id.as_str(), elapsed_ms),
             "wall_time_ms": elapsed_ms,
-            "truncated": stdout.1 || stderr.1 || stdout_snapshot.truncated || stderr_snapshot.truncated || explicit_cursor_out_of_range,
+            "truncated": stdout.truncated || stderr.truncated || stdout_snapshot.truncated || stderr_snapshot.truncated || explicit_cursor_out_of_range,
             "omitted_bytes": stdout_snapshot.omitted_bytes.saturating_add(stderr_snapshot.omitted_bytes),
         });
+        for (stream, tail) in [("stdout", stdout.tail), ("stderr", stderr.tail)] {
+            if let Some((text, start_cursor)) = tail {
+                output[format!("{stream}_tail_preview")] = json!(text);
+                output[format!("{stream}_tail_preview_start_cursor")] = json!(start_cursor);
+            }
+        }
         // 终态但截断的初始结果也必须给出 logical id：它不出现在 live-only
         // process_list 中，模型只能用这个 id 通过 write_stdin 取完整结果。
         if running || output["truncated"].as_bool().unwrap_or(true) {
@@ -1083,9 +1123,10 @@ impl ToolRegistry {
         let mut execution = ToolExecution::new(output, outcome);
         // snapshot_since 会把 retained head、不可恢复 gap 与 retained tail 拆成独立连续页；
         // 局部截断只提交当前页已经展示的前缀。非连续页或 future cursor 绝不能提交。
-        let locally_truncated = stdout.1 || stderr.1 || explicit_cursor_out_of_range;
-        let unsafe_local_truncation =
-            (stdout.1 && !stdout_page_is_contiguous) || (stderr.1 && !stderr_page_is_contiguous);
+        let locally_truncated =
+            stdout.truncated || stderr.truncated || explicit_cursor_out_of_range;
+        let unsafe_local_truncation = (stdout.truncated && !stdout_page_is_contiguous)
+            || (stderr.truncated && !stderr_page_is_contiguous);
         // owner 的终态读取必须生成 provider-success receipt，否则模型虽已收到 final result 却永远
         // 无法完成消费。main 对 child 的跨 owner 观察显式关闭该 receipt，不能改动 child delivery。
         if ((delivery.track && implicit_cursor) || (delivery.allow_terminal && !running))
@@ -1827,6 +1868,34 @@ async fn terminate_after_initial_yield_timeout(process: &ManagedProcess) {
                 "failed to terminate process {} after initial yield watchdog: {error}",
                 process.id.as_str()
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_preview_requires_a_complete_terminal_page() {
+        for (terminal, page_contiguous, truncated, has_more_retained) in [
+            (false, true, false, false),
+            (true, false, false, false),
+            (true, true, true, false),
+            (true, true, false, true),
+        ] {
+            let snapshot = process::ProcessOutput {
+                bytes: b"0123456789".to_vec(),
+                cursor: OutputCursor(10),
+                truncated,
+                omitted_bytes: 0,
+                page_contiguous,
+                has_more_retained,
+            };
+            let preview = process_output_preview(&snapshot, 8, terminal);
+            assert_eq!(preview.text, "01234567");
+            assert!(preview.truncated);
+            assert!(preview.tail.is_none());
         }
     }
 }

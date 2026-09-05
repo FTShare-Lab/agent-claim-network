@@ -740,7 +740,7 @@ mod tests {
         }
 
         async fn scopes_overview(&self) -> anyhow::Result<ScopesOverviewSnapshot> {
-            Ok(ScopesOverviewSnapshot { scopes: vec![] })
+            Ok(ScopesOverviewSnapshot::default())
         }
     }
 

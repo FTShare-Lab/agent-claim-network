@@ -1141,6 +1141,79 @@ async fn truncated_final_output_advances_by_provider_acknowledged_pages() {
 
 #[tokio::test]
 #[cfg(unix)]
+async fn terminal_tail_preview_preserves_unread_middle_and_delivery_rollback() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_tool_config(dir.path());
+    config.code_run_max_output_chars = 64;
+    config.background_process_output_buffer_bytes = 128;
+    let registry = ToolRegistry::new(&config).unwrap();
+    let session = SessionId::from_str("session_aaaaaaaa").unwrap();
+    let context = file_tool_context(&session);
+    let initial = registry
+        .dispatch_with_context(
+            "code_run",
+            json!({
+                "script": "printf '0123456789abcdefghij'; printf '甲乙丙丁戊己庚辛壬癸' >&2",
+                "max_output_chars": 8
+            }),
+            context.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(initial.output["state"], "finished");
+    assert_eq!(initial.output["stdout"], "012345");
+    assert_eq!(initial.output["stdout_cursor"], 6);
+    assert_eq!(initial.output["stdout_tail_preview"], "ij");
+    assert_eq!(initial.output["stdout_tail_preview_start_cursor"], 18);
+    assert_eq!(initial.output["stderr"], "甲乙丙丁戊己");
+    assert_eq!(initial.output["stderr_cursor"], 6);
+    assert_eq!(initial.output["stderr_tail_preview"], "壬癸");
+    assert_eq!(initial.output["stderr_tail_preview_start_cursor"], 8);
+    assert_eq!(initial.output["truncated"], true);
+    let process_id = initial.output["process_id"].as_str().unwrap();
+    let receipt = initial.process_delivery_receipt.unwrap();
+    registry.begin_process_deliveries(&[receipt]).await;
+    registry
+        .rollback_process_deliveries_for_owner(&session, None)
+        .await;
+
+    let retry = registry
+        .dispatch_with_context(
+            "write_stdin",
+            json!({"process_id": process_id, "max_output_chars": 8}),
+            context.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry.output["stdout"], "012345");
+    assert_eq!(retry.output["stdout_tail_preview"], "ij");
+    assert_eq!(retry.output["stdout_cursor"], 6);
+    acknowledge_process_output(&registry, &retry).await;
+
+    let rest = registry
+        .dispatch_with_context(
+            "write_stdin",
+            json!({"process_id": process_id, "max_output_chars": 64}),
+            context.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rest.output["stdout"], "6789abcdefghij");
+    assert_eq!(rest.output["stderr"], "庚辛壬癸");
+    assert_eq!(rest.output["stdout_cursor"], 20);
+    assert_eq!(rest.output["stderr_cursor"], 10);
+    assert_eq!(rest.output["truncated"], false);
+    assert!(rest.output.get("stdout_tail_preview").is_none());
+    acknowledge_process_output(&registry, &rest).await;
+    assert!(registry
+        .process_manager
+        .find_for_owner(&registry.process_owner(&context), process_id)
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+#[cfg(unix)]
 async fn initially_finished_truncated_code_run_is_retained_until_a_full_result_is_delivered() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_tool_config(dir.path());

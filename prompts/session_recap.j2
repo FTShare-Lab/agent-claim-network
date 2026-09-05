@@ -12,7 +12,7 @@
 - 复盘阶段只输出 claim / dispute JSON；不要提出或执行其他动作
 - 不引用用户身份 / 私密 / 偏好/ 喜好 / 爱好
 - agent 私有用户画像、偏好与私密信息不得成为 claim/dispute 内容或证据来源
-- 你拥有 `local_claims[*].id`，以及 transcript 中真实出现过的 claim id；这些都是 **真实的、已存在的 claim id**
+- 可归因的已有 claim 来自 `local_claims` 或 transcript 中包含完整正文的 claim / `candidate_claims`。目录摘要中的 ID 仅供发现；没有读取正文时，不能据此计入使用、来源或 dispute。
 
 {% if memory_enabled %}
 # persistent memory 边界
@@ -116,7 +116,7 @@ claim/dispute 的生成应基于 transcript、`background_process_completions` �
 7. 不要使用未声明的占位符（声明了 0..2 就不要在别处出现 `$new_claim_5$`，否则替换会失败）
 
 # 内容约束
-- `used_claim_ids`：本段 recap 中对结论、判断、行动、`new_claim` 或 `new_dispute` 形成**有实质帮助**的已有 claim id；只能从 `local_claims[*].id` 或 transcript 中真实出现过的 claim id 里挑。不要因为 router 返回了候选就全量填入；未实际用于判断的候选不要填。不能出现本次产生的新 claim 占位符
+- `used_claim_ids`：本段 recap 中对结论、判断、行动、`new_claim` 或 `new_dispute` 形成**有实质帮助**的已有 claim id；只能从 `local_claims` 或 transcript 中已展示完整正文的 claim 里挑。不要因为目录展示了 ID 或 router 返回了候选就全量填入；未实际用于判断的候选不要填。不能出现本次产生的新 claim 占位符
 - `new_claims[*].source_claim_ids`：来源 claim id；可同时含真实 id 和本次产生的新 claim 占位符
 - `new_claims` 不要返回 `status`；即使误传，后端也会忽略并把新 claim 初始化为 `active`
 - `updated_claims` 只能更新 `local_claims` 中已有的 claim，必须输出完整属性和 `status`；更新后的状态可以是 `active`、`stale` 或 `deprecated`

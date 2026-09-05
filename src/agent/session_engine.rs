@@ -4062,6 +4062,9 @@ impl SessionEngine {
             .as_ref()
             .map(SessionCompactionState::committed_message_until)
             .unwrap_or(0);
+        let committed_file_workset = compacted_file_workset_from_session_messages(
+            &session_messages[..summary_start.min(session_messages.len())],
+        );
         let committed_summary_tokens = metadata
             .compaction
             .as_ref()
@@ -4071,6 +4074,7 @@ impl SessionEngine {
                 estimate_compacted_committed_summary_message_tokens(
                     summary,
                     self.turn_loop.tool_registry().file_edit_authority_enabled(),
+                    &committed_file_workset,
                 )
             })
             .unwrap_or(0);

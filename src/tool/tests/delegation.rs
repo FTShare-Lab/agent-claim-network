@@ -850,7 +850,7 @@ async fn delegation_registry_exposes_execution_web_and_hides_acn_stateful_tools(
                 disputes: Vec::new(),
                 retrieval_debug: None,
             },
-            overview: ScopesOverviewSnapshot { scopes: Vec::new() },
+            overview: ScopesOverviewSnapshot::default(),
         }))
         .for_delegation(None);
     let names = registry

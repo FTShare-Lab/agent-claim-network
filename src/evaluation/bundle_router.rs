@@ -12,11 +12,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::claim::{Claim, ClaimStatus};
 use crate::router::{
-    lexical::query_match_score, AgentQuery, CandidateClaim, RetrievalDocument, RouterClient,
-    RouterQueryResult, ScopeOverviewItem, ScopesOverviewSnapshot,
+    lexical::query_match_score, AgentQuery, CandidateClaim, RetrievalDocument, RouterClaimSummary,
+    RouterClaimSummaryCatalog, RouterClaimSummaryText, RouterClient, RouterQueryResult,
+    ScopeOverviewItem, ScopesOverviewSnapshot,
 };
 
 use super::EVALUATION_SCHEMA_VERSION;
+
+const CLAIM_SUMMARY_LIMIT: usize = 20;
+const CLAIM_SUMMARY_NAME_CHARS: usize = 120;
+const CLAIM_SUMMARY_SCOPE_CHARS: usize = 240;
 
 /// 冻结 bundle 在单个 attempt 内的唯一交付方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,9 +282,13 @@ impl RouterClient for FrozenClaimBundleRouter {
             FrozenClaimDeliveryPolicy::Unrestricted => true,
         };
         Ok(if visible {
-            self.overview.clone()
+            let mut overview = self.overview.clone();
+            if self.delivery_policy == FrozenClaimDeliveryPolicy::ForcedOnce {
+                overview.claim_summaries = None;
+            }
+            overview
         } else {
-            ScopesOverviewSnapshot { scopes: Vec::new() }
+            ScopesOverviewSnapshot::default()
         })
     }
 }
@@ -329,18 +338,46 @@ fn build_overview(claims: &[Claim]) -> ScopesOverviewSnapshot {
         row.active_claims += 1;
         row.latest_claim_created_at = row.latest_claim_created_at.max(claim.created_at);
     }
+    let scopes = rows
+        .into_iter()
+        .map(|(scope, counts)| ScopeOverviewItem {
+            scope,
+            active_claims: counts.active_claims,
+            stale_claims: 0,
+            open_disputes: 0,
+            resolved_disputes: 0,
+            latest_claim_created_at: counts.latest_claim_created_at,
+        })
+        .collect();
+    let mut summaries = claims.iter().collect::<Vec<_>>();
+    summaries.sort_by(|left, right| {
+        right
+            .effective_updated_at()
+            .cmp(&left.effective_updated_at())
+            .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+    });
+    let omitted = summaries.len().saturating_sub(CLAIM_SUMMARY_LIMIT);
+    let items = summaries
+        .into_iter()
+        .take(CLAIM_SUMMARY_LIMIT)
+        .map(|claim| RouterClaimSummary {
+            id: claim.id.clone(),
+            name: bounded_summary_text(&claim.name, CLAIM_SUMMARY_NAME_CHARS),
+            scope: bounded_summary_text(&claim.scope, CLAIM_SUMMARY_SCOPE_CHARS),
+            holder: claim.holder.clone(),
+            confidence: claim.confidence,
+        })
+        .collect();
     ScopesOverviewSnapshot {
-        scopes: rows
-            .into_iter()
-            .map(|(scope, counts)| ScopeOverviewItem {
-                scope,
-                active_claims: counts.active_claims,
-                stale_claims: 0,
-                open_disputes: 0,
-                resolved_disputes: 0,
-                latest_claim_created_at: counts.latest_claim_created_at,
-            })
-            .collect(),
+        scopes,
+        claim_summaries: Some(RouterClaimSummaryCatalog { items, omitted }),
+    }
+}
+
+fn bounded_summary_text(value: &str, limit: usize) -> RouterClaimSummaryText {
+    RouterClaimSummaryText {
+        text: value.chars().take(limit).collect(),
+        truncated: value.chars().count() > limit,
     }
 }
 
@@ -443,7 +480,7 @@ mod tests {
         let router = FrozenClaimBundleRouter::new(
             FrozenClaimBundle {
                 schema_version: EVALUATION_SCHEMA_VERSION,
-                claims: vec![claim],
+                claims: vec![claim.clone()],
             },
             "attempt-001".into(),
             None,
@@ -451,7 +488,13 @@ mod tests {
         .unwrap()
         .with_delivery_policy(FrozenClaimDeliveryPolicy::OnDemandOnce);
 
-        assert_eq!(router.scopes_overview().await.unwrap().scopes.len(), 1);
+        let overview = router.scopes_overview().await.unwrap();
+        assert_eq!(overview.scopes.len(), 1);
+        let summaries = overview.claim_summaries.unwrap();
+        assert_eq!(summaries.items.len(), 1);
+        assert_eq!(summaries.items[0].id, claim.id);
+        assert_eq!(summaries.items[0].holder, claim.holder);
+        assert_eq!(summaries.omitted, 0);
         assert!(router.scopes_overview().await.unwrap().scopes.is_empty());
         let query = AgentQuery::from_task("billing/payment", "payment timeout");
         assert_eq!(
@@ -465,6 +508,90 @@ mod tests {
             .to_string()
             .contains("只允许一次"));
         assert_eq!(router.take_evidence().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn frozen_overview_bounds_and_truncates_summaries_without_exposing_claim_body() {
+        let long_name = "n".repeat(CLAIM_SUMMARY_NAME_CHARS + 1);
+        let long_scope = "s".repeat(CLAIM_SUMMARY_SCOPE_CHARS + 1);
+        let claims = (0..=CLAIM_SUMMARY_LIMIT)
+            .map(|index| {
+                let mut claim = sample_claim(
+                    &format!("claim_{index:08x}"),
+                    &long_name,
+                    "secret full statement",
+                );
+                claim.scope = long_scope.clone();
+                claim.evidence_summary = "secret evidence summary".into();
+                claim
+            })
+            .collect::<Vec<_>>();
+        let router = FrozenClaimBundleRouter::new(
+            FrozenClaimBundle {
+                schema_version: EVALUATION_SCHEMA_VERSION,
+                claims,
+            },
+            "attempt-001".into(),
+            None,
+        )
+        .unwrap()
+        .with_delivery_policy(FrozenClaimDeliveryPolicy::OnDemandOnce);
+
+        let overview = router.scopes_overview().await.unwrap();
+        let catalog = overview.claim_summaries.unwrap();
+        let encoded = serde_json::to_string(&catalog).unwrap();
+
+        assert_eq!(catalog.items.len(), CLAIM_SUMMARY_LIMIT);
+        assert_eq!(catalog.omitted, 1);
+        assert_eq!(
+            catalog.items[0].name.text.chars().count(),
+            CLAIM_SUMMARY_NAME_CHARS
+        );
+        assert!(catalog.items[0].name.truncated);
+        assert_eq!(
+            catalog.items[0].scope.text.chars().count(),
+            CLAIM_SUMMARY_SCOPE_CHARS
+        );
+        assert!(catalog.items[0].scope.truncated);
+        assert!(!encoded.contains("secret full statement"));
+        assert!(!encoded.contains("secret evidence summary"));
+    }
+
+    #[tokio::test]
+    async fn one_scope_query_can_deliver_multiple_complete_frozen_claims_once() {
+        let first = sample_claim("claim_11111111", "cleanup ordering", "first body");
+        let second = sample_claim("claim_22222222", "cleanup fallback", "second body");
+        let router = FrozenClaimBundleRouter::new(
+            FrozenClaimBundle {
+                schema_version: EVALUATION_SCHEMA_VERSION,
+                claims: vec![first.clone(), second.clone()],
+            },
+            "attempt-001".into(),
+            None,
+        )
+        .unwrap()
+        .with_delivery_policy(FrozenClaimDeliveryPolicy::OnDemandOnce);
+
+        let result = router
+            .query(&AgentQuery::from_task(
+                "billing/payment",
+                "cleanup ordering fallback",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(result.candidate_claims.len(), 2);
+        assert!(result
+            .candidate_claims
+            .iter()
+            .any(|candidate| candidate.claim == first));
+        assert!(result
+            .candidate_claims
+            .iter()
+            .any(|candidate| candidate.claim == second));
+        let evidence = router.take_evidence();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].injected_claim_ids.len(), 2);
     }
 
     #[tokio::test]
@@ -483,6 +610,9 @@ mod tests {
         .unwrap()
         .with_delivery_policy(FrozenClaimDeliveryPolicy::ForcedOnce);
 
+        let overview = router.scopes_overview().await.unwrap();
+        assert_eq!(overview.scopes.len(), 2);
+        assert!(overview.claim_summaries.is_none());
         let delivered = router
             .deliver_forced_claims_once("fix payment timeout")
             .unwrap();

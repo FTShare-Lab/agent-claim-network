@@ -586,7 +586,10 @@ fn build_scopes_overview(
             .then_with(|| rhs.stale_claims.cmp(&lhs.stale_claims))
             .then_with(|| lhs.scope.cmp(&rhs.scope))
     });
-    ScopesOverviewSnapshot { scopes }
+    ScopesOverviewSnapshot {
+        scopes,
+        claim_summaries: None,
+    }
 }
 
 pub async fn run_refresh_worker(

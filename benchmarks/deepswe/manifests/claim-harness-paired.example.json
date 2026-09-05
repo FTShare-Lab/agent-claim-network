@@ -1,0 +1,55 @@
+{
+  "frozen_manifest": "/var/lib/acn-eval/claim-harness-paired/rollout-01/frozen-manifest.json",
+  "attempt_plan": "/var/lib/acn-eval/claim-harness-paired/rollout-01/new-output/attempt-plan.json",
+  "deepswe_checkout": "/opt/benchmarks/DeepSWE",
+  "source_tasks_root": "/opt/benchmarks/DeepSWE/tasks",
+  "pier_checkout": "/opt/benchmarks/pier",
+  "pier_executable": "/opt/benchmarks/pier/.venv/bin/pier",
+  "pier_egress_proxy_image": "pier-egress-proxy:ubuntu-24.04",
+  "pier_egress_proxy_content_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "acn_eval": "/opt/acn-checkouts/claim-harness-new/target/x86_64-unknown-linux-gnu/release/acn_eval",
+  "frozen_skill": "/opt/acn-eval-assets/coding-benchmark",
+  "normalized_root": "/var/lib/acn-eval/claim-harness-paired/rollout-01/normalized",
+  "output_dir": "/var/lib/acn-eval/claim-harness-paired/rollout-01/new-output",
+  "model": "frozen-model-alias",
+  "response_model": "frozen-model-checkpoint",
+  "reasoning_effort": "max",
+  "run_class": "diagnostic",
+  "acn_main_revision": "ff12e50c0bb16eb114dfd8b45353f49ef4c341b6",
+  "acn_version": "0.2.5",
+  "model_egress_mode": "pier",
+  "harness_mode": "standard",
+  "claim_quality_gate": "verified_producer_only",
+  "file_edit_authority_enabled": true,
+  "acn_revision": "0000000000000000000000000000000000000000",
+  "task_workers": 20,
+  "cleanup_stale_pier_resources": true,
+  "run_all_variants_without_claims": true,
+  "claim_producer_variant": "A",
+  "progress": {
+    "poll_secs": 30,
+    "stall_after_secs": 600
+  },
+  "resources": {
+    "cpus": 2,
+    "memory_mb": 16384,
+    "storage_mb": 20480,
+    "max_tokens": 65536,
+    "context_window": 1000000
+  },
+  "timeouts": {
+    "agent_seconds": 5400,
+    "deadline_reserve_seconds": 120,
+    "verifier_seconds": 2700
+  },
+  "llm_retry": {
+    "retry_count": 2,
+    "retry_base_delay_ms": 1000,
+    "retry_max_delay_ms": 30000
+  },
+  "host_capacity": {
+    "memory_reserve_mb": 65536,
+    "disk_reserve_mb": 65536,
+    "disk_admission_mb_per_worker": 20480
+  }
+}

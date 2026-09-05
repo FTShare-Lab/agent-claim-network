@@ -396,5 +396,6 @@ fn sample_scopes_overview() -> ScopesOverviewSnapshot {
             resolved_disputes: 0,
             latest_claim_created_at: "2026-05-20T00:00:00Z".parse().unwrap(),
         }],
+        claim_summaries: None,
     }
 }

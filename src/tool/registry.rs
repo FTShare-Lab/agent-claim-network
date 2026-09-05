@@ -347,7 +347,7 @@ impl ToolRegistry {
                             "minimum": 1,
                             "maximum": self.limits.code_run_max_output_chars,
                             "default": self.limits.code_run_max_output_chars,
-                            "description": "Maximum returned output characters per stdout/stderr stream for this call (PTY uses stdout only). Usually omit this field; truncated output advances only after provider delivery and the next poll continues from the returned cursor."
+                            "description": "Maximum returned output characters per stdout/stderr stream for this call (PTY uses stdout only). Usually omit. Long, fully retained terminal output splits this budget between the continuous prefix and a separate stdout_tail_preview/stderr_tail_preview with its own *_tail_preview_start_cursor. Returned stdout_cursor/stderr_cursor advance only over the prefix after provider delivery; poll to read the unread middle."
                         }
                     },
                     "required": ["script", "description"],
@@ -397,7 +397,7 @@ impl ToolRegistry {
                             "minimum": 1,
                             "maximum": self.limits.code_run_max_output_chars,
                             "default": self.limits.code_run_max_output_chars,
-                            "description": "Maximum returned output characters per stdout/stderr stream for this call (PTY uses stdout only). Usually omit this field. If truncated=true, the returned cursor identifies the end of the visible prefix; after provider delivery, the next implicit poll continues from there instead of replaying the same prefix."
+                            "description": "Maximum returned output characters per stdout/stderr stream for this call (PTY uses stdout only). Usually omit. Long, fully retained terminal output reserves part of this budget for a separate stdout_tail_preview/stderr_tail_preview with its own *_tail_preview_start_cursor. If truncated=true, returned stdout_cursor/stderr_cursor identify only the continuous prefix end; after provider delivery, the next implicit poll reads from there, including the unread middle."
                         },
                         "stdout_cursor": {
                             "type": "integer",
@@ -655,7 +655,7 @@ impl ToolRegistry {
         if self.access.router && self.router_client.is_some() {
             definitions.push(ToolDefinition {
                 name: "consult_router".into(),
-                description: "Consult the team router. Use mode='overview' to list available team claim scopes before choosing a query boundary. Use mode='query' with a non-empty scope to retrieve candidate claims and related disputes. Overview is only a map of available scopes; query returns concrete claim content.".into(),
+                description: "Consult the team router. The system prompt may already contain a bounded summary catalog for discovery. Use mode='overview' only when a fresh scope map is needed. Use mode='query' with one relevant non-empty scope and a specific semantic_query to retrieve complete candidate claims and related disputes; one query may return multiple candidates from that scope.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {

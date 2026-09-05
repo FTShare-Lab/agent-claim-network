@@ -101,9 +101,17 @@ Agent 在这些情形应考虑查询 Router：
 - 需要核对已有 claim 是否冲突或过时
 - 即使本地已有较高置信度，任务仍明确要求团队视角或冲突检查
 
-Router 返回完整候选 claim，而不是服务端文件路径。Agent 只能引用本次上下文中已经出现的候选 ID；模型凭空生成的 ID 会被校验拒绝。
+Router 返回完整候选 claim，而不是服务端文件路径。Agent 的引用与使用必须来自已展示完整正文的 claim；目录摘要中的 ID 仅用于发现，不能仅据摘要计为使用或来源。模型凭空生成的 ID 会被校验拒绝。
 
 查询无结果不是错误，Agent 可以继续使用本地知识和工具完成任务。
+
+DeepSWE 的冻结 Router 在 `B_claim` 启动时提供最多 20 条有界摘要，不注入正文或证据；模型仍通过既有 scope / semantic query 获取完整候选，且一次 query 的测评约束保持不变。超量目录明确报告 omitted。`B_empty` 无目录，`B_forced_claim` 仍强制注入全文；普通团队 Router 的 overview 不生成该冻结目录。
+
+## 压缩后的文件工作集
+
+SessionEngine 在模型摘要之外保留成功 `file_read/file_write/file_patch` 的文件工作集，从已压缩的 canonical 消息和 active 消息确定性重算。失败或尚未返回的工具调用不计入，shell 操作不做路径猜测；修改过的路径不再重复列为只读路径。工作集有数量、路径长度及总字符边界，超量明确报告 omitted，并计入 provider 上下文预算。
+
+这些路径记录历史操作，不表示当前文件仍存在、内容正确或已取得修改许可。模型仍需遵守现有文件读取与编辑授权；工作集不新增持久化文件，恢复时复用 session 与 turn journal。
 
 ## Session 的 provider 私有 replay
 
