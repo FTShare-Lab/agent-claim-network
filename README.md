@@ -279,7 +279,7 @@ acn --upstream team
 
 切换到团队模式后只同步此后的新 Claim，单人阶段的历史不会自动补传。
 
-用上一阵子之后，判断会互相引用；冲突不会被强行合成一句结论，而是留下 dispute 待复核。Maintainer 的管理台可以看到整体状态。
+用上一阵子之后，判断会互相引用。判断出现冲突时，会记录为 Dispute，可由 Maintainer 自动分析裁决，或交由人工处理。Maintainer 的管理台可以看到整体状态。
 
 团队里没有可以强行写入各 Agent 的「真理」。Policy 与别人的 Claim 只是输入；只有结合自己的上下文主动采纳后，才变成该 Agent 自己的判断，且不同 Agent 可以内化成不同结论。
 
@@ -293,17 +293,32 @@ acn --upstream team
   <sub>团队模式下 Claim 如何被发现、借用，以及 Dispute 如何回流。</sub>
 </p>
 
+### Maintainer 自裁决
+
+团队里的 Claim 出现分歧时，Maintainer 可以根据相关 Claim、来源证据和团队规则生成分析。分析通过且材料未发生变化时，可自动形成正式裁决；证据不足时保留争议，交由人工处理。
+
+自裁决默认关闭，启用时需独立配置模型。可选择人工发起分析（`manual`）、自动分析后由人工采用（`shadow`），或自动分析并采用（`auto`）。建议先用 `shadow` 观察效果。
+
+裁决会向相关 Agent 发送更新建议，由各 Agent 决定如何修改自己的 Claim。管理台可查看分析依据、裁决结论、通知送达情况和后续变化。配置、操作及演示见 [Maintainer 自裁决说明](docs/maintainer_auto_arbitration.md)。
+
 <details>
 <summary><b>部署 Router 与 Maintainer</b></summary>
 
-二者是本仓库另外两个 binary，可用同一份配置：
+通过 Homebrew 安装 ACN 时，已包含 `acn-router` 和 `acn-maintainer`。在两个终端中分别启动，可使用同一份配置：
 
 ```bash
-cargo run --bin acn-router     -- --config /path/to/config.toml
-cargo run --bin acn-maintainer -- --config /path/to/config.toml
+acn-router --config /path/to/config.toml
+acn-maintainer --config /path/to/config.toml
 ```
 
-本机试跑用上面即可；长期给团队用再加 `--release`（编译更慢，运行更省、二进制更小）。可以分开部署，只要每个 Agent 都能访问到这两个地址。
+从源码运行时，在仓库目录下使用：
+
+```bash
+cargo run --release --bin acn-router     -- --config /path/to/config.toml
+cargo run --release --bin acn-maintainer -- --config /path/to/config.toml
+```
+
+请将 Router 和 Maintainer 部署在同一台机器上，使用同一个 ACN 数据目录。Router 需要读取 Maintainer 保存的 Claim 和争议记录；各 Agent 可运行在其他机器上，只需能访问这两个服务地址。
 
 - **Router**：按 scope / 语义检索团队 Claim 与相关 dispute，只负责发现，不判对错。
 - **Maintainer**：接收 Claim 镜像与 dispute，发布 policy、治理过期知识，并可选用独立 LLM 辅助分析冲突并解决。
@@ -357,6 +372,7 @@ Agent 私有数据默认在 `~/.acn`，按所选 upstream 分开：
 
 - [使用指南](docs/user_guide.md)
 - [配置参数](docs/config_parameters.md)
+- [Maintainer 自裁决说明](docs/maintainer_auto_arbitration.md)
 - [系统架构](docs/architecture.md)
 - [核心行为与数据边界](docs/core_behavior.md)
 - [Memory 设计](docs/memory_design.md)

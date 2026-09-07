@@ -137,7 +137,7 @@ cd /path/to/workspace
 acn
 ```
 
-The directory in which ACN starts becomes the working directory and the cwd for tools and `!commands`. In the TUI, use `/help` to see available commands. Common controls include `Enter` to send, `Shift+Enter` for a new line, `Ctrl+Enter` to steer an active turn, and `/exit` to close the session.
+The directory in which ACN starts becomes the working directory and the cwd for tools and `!commands`. In the TUI, use `/help` to see available commands. Common controls include `Enter` to send, `Shift+Enter` for a new line, `Ctrl+Enter` to steer an active turn, `/new` to create and switch to a new session, `/resume` to switch to a previous session, and `/exit` to close the session.
 
 <details>
 <summary><b>Use the Anthropic protocol</b></summary>
@@ -209,7 +209,7 @@ acn mcp add / add-json / remove / enable / disable / login / logout / status
 acn update
 ```
 
-If ACN was started with a custom `--config` or `--upstream`, pass the same option when managing the supervisor. ACN identifies the supervisor environment using the effective configuration, upstream, and the credential fingerprint required for finalization. When any of these changes, the next launch safely takes over the previous supervisor and continues unfinished finalize jobs in the new environment. A failed finalize can be retried using the user-visible session ID with `acn supervisor retry <session_id>`, or using the job ID shown by `jobs`.
+If ACN was started with a custom `--config` or `--upstream`, pass the same option when managing the supervisor. ACN identifies the supervisor environment using the effective configuration, upstream, and the credential fingerprint required for finalization. When any of these changes, the next launch safely takes over the previous supervisor and continues unfinished finalize jobs in the new environment. Sessions marked `Finalizing` can usually be resumed directly; if another foreground process is still finishing the session, follow the prompt and try again later. For maintenance, `acn supervisor retry <session_id>` can also accept the job ID shown by `jobs`.
 
 </details>
 
@@ -221,10 +221,11 @@ If ACN was started with a custom `--config` or `--upstream`, pass the same optio
 | `/help` | Show help |
 | `/compact` | Compact context |
 | `/copy` | Copy the most recent response |
-| `/inbox` | Sync team messages (reports an unconfigured service in standalone mode) |
+| `/inbox` | Sync and process inbox messages |
 | `/mcp` | Show MCP status and tools |
+| `/new` | Create and switch to a new session |
 | `/ps` | Show background processes |
-| `/resume` | Select a previous session |
+| `/resume` | Select and switch to a previous session |
 | `/skills` | Show available Skills |
 | `/subagents` | Show subagents |
 | `/exit` | End the session |
@@ -278,7 +279,7 @@ acn --upstream team
 
 After switching to team mode, only newly created Claims are synchronized. Historical Claims from standalone mode are not uploaded automatically.
 
-Over time, Claims can cite one another. Conflicting judgments are not forcibly merged into a single conclusion; ACN instead records a dispute for later review. Maintainer's management console exposes the overall team state.
+Over time, Claims can cite one another. Conflicting judgments are recorded as Disputes, which Maintainer can analyze and resolve automatically or leave for human review. Maintainer's management console shows the overall team state.
 
 The team has no central “truth” that can be forced into every Agent. Policies and Claims from other Agents are inputs. They become an Agent's own judgments only after that Agent actively adopts them in its own context, and different Agents may internalize them differently.
 
@@ -292,17 +293,32 @@ The team has no central “truth” that can be forced into every Agent. Policie
   <sub>How Claims are discovered and reused in team mode, and how Disputes flow back for review.</sub>
 </p>
 
+### Maintainer Auto-Arbitration
+
+When team Claims disagree, Maintainer can analyze the related Claims, source evidence, and team policies. If the analysis passes and the evidence has not changed, it can adopt a formal resolution automatically. Disputes with insufficient evidence remain open for human review.
+
+Auto-arbitration is disabled by default and requires its own model configuration. Choose manually initiated analysis (`manual`), automatic analysis with human adoption (`shadow`), or automatic analysis and adoption (`auto`). Start with `shadow` to evaluate the results.
+
+Resolutions send update suggestions to the relevant Agents, each of which decides how to change its own Claims. The console shows the analysis evidence, resolution, delivery status, and subsequent changes. See the [Maintainer Auto-Arbitration Guide (Chinese)](docs/maintainer_auto_arbitration.md) for configuration, usage, and a demo.
+
 <details>
 <summary><b>Deploy Router and Maintainer</b></summary>
 
-Both are separate binaries in this repository and can use the same configuration file:
+The Homebrew installation includes both `acn-router` and `acn-maintainer`. Start them in separate terminals; they can use the same configuration file:
 
 ```bash
-cargo run --bin acn-router     -- --config /path/to/config.toml
-cargo run --bin acn-maintainer -- --config /path/to/config.toml
+acn-router --config /path/to/config.toml
+acn-maintainer --config /path/to/config.toml
 ```
 
-The commands above are sufficient for local evaluation. For long-running team deployments, add `--release` for slower compilation but lower runtime overhead and smaller binaries. Router and Maintainer may be deployed separately as long as every Agent can reach both endpoints.
+To run from source, use these commands from the repository directory:
+
+```bash
+cargo run --release --bin acn-router     -- --config /path/to/config.toml
+cargo run --release --bin acn-maintainer -- --config /path/to/config.toml
+```
+
+Deploy Router and Maintainer on the same machine and use the same ACN data directory. Router reads the Claims and dispute records saved by Maintainer. Agents can run on other machines as long as they can reach both service endpoints.
 
 - **Router**: retrieves team Claims and related disputes by scope or semantic similarity. It helps discover information but does not decide what is correct.
 - **Maintainer**: receives Claim mirrors and disputes, publishes policies, manages stale knowledge, and can optionally use an independent LLM to analyze conflicts and resolve them.
@@ -356,6 +372,7 @@ Private Agent data is stored under `~/.acn` by default and separated by the sele
 
 - [User Guide](docs/user_guide.md)
 - [Configuration Parameters](docs/config_parameters.md)
+- [Maintainer Auto-Arbitration (Chinese)](docs/maintainer_auto_arbitration.md)
 - [Architecture](docs/architecture.md)
 - [Core Behavior and Data Boundaries](docs/core_behavior.md)
 - [Memory Design](docs/memory_design.md)
