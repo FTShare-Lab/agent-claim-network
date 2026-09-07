@@ -737,6 +737,7 @@ fn anthropic_stream_error_event(event: &Value) -> AnthropicError {
             "invalid_request"
             | "invalid_request_error"
             | "invalid_prompt"
+            | "unsupported_media_type"
             | "context_length_exceeded"
             | "content_filter"
             | "content_policy_violation"
@@ -1009,10 +1010,14 @@ mod tests {
                 anthropic_stream_error_event(&json!({
                     "type": "error", "error": {"type": "invalid_request_error", "message": message}
                 })),
-                AnthropicError::MediaRejected { .. }
+                AnthropicError::RequestRejected { .. }
             ));
         }
-        for error_type in ["context_length_exceeded", "invalid_request"] {
+        for error_type in [
+            "context_length_exceeded",
+            "invalid_request",
+            "unsupported_media_type",
+        ] {
             let error = anthropic_stream_error_event(&json!({
                 "type":"error",
                 "error":{"type":error_type,"message":"rejected"}
@@ -1025,7 +1030,7 @@ mod tests {
 
         let media = anthropic_stream_error_event(&json!({
             "type":"error",
-            "error":{"type":"unsupported_media_type","message":"rejected"}
+            "error":{"type":"invalid_image","message":"rejected"}
         }));
         assert!(matches!(media, AnthropicError::MediaRejected { .. }));
     }

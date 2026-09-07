@@ -43,6 +43,13 @@ adapter 在 HTTP 状态、流式 `error` 事件、非流式响应和 WebSocket c
 
 分类规则：结构化 error code / type 优先于 HTTP status；已知的非请求错误 code（限流、过载、鉴权等）不会被当作请求错误；未知 code 一律按非请求错误处理（保守保留 WAL）；只有完全没有 code 时才回落到 `400 | 415 | 422` 判定。每种类型都带 `after_visible_output` 变体，用于通知 TUI 丢弃已展示但未被接受的流式输出。
 
+媒体剥离分类收窄（2026-09-07，已实现）：
+
+- 仅结构化 `code` / `type` 为 `invalid_image`、`invalid_image_url`、`image_too_large`、`unsupported_image` 时识别为媒体拒绝；不从上游 `message` 或请求内容推断。
+- `unsupported_media_type` 保留为普通确定性请求错误，即使 message 提到图片 / PDF，也不升级为附件剥离。该错误码可能表示 HTTP Content-Type 不受支持。
+- 三种 adapter 的错误脱敏只保留明确媒体错误码，不再将正文中的图片 / PDF 描述转换为媒体错误码。仅有通用错误码的媒体故障走既有普通拒绝恢复，历史附件保持原样；这类故障不再自动剥离重试。
+- HTTP 413、已支持的 WebSocket 1009 尺寸判断，以及上下文超限等其他分类不变。不新增配置、持久化字段或恢复状态机。
+
 ### 4.2 回滚粒度
 
 - **本 turn 尚无已接受响应** → `DiscardTurn`：恢复到 turn 开始前的 compaction 状态，turn journal 记 `RejectedByProvider`，该 turn 不进入 `recovery_turn_chain`，下一 turn 不再前置注入它。

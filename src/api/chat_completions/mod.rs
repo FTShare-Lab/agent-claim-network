@@ -26,13 +26,6 @@ pub(super) fn redact_chat_error_body(body: &str) -> String {
         _ if crate::api::is_content_policy_error_body(&classification_text) => {
             Some(content_policy_code(&classification_text))
         }
-        _ if crate::api::is_provider_media_error(
-            structured_code.as_deref(),
-            &classification_text,
-        ) =>
-        {
-            Some("unsupported_media_type")
-        }
         (_, Some(code)) => Some(code),
         _ => None,
     };

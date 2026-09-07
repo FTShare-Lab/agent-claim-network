@@ -126,9 +126,6 @@ fn classified_responses_error_code(body: &str) -> Option<String> {
     if crate::api::is_content_policy_error_body(&classification_text) {
         return Some(content_policy_code(&classification_text).into());
     }
-    if crate::api::is_provider_media_error(structured_code.as_deref(), &classification_text) {
-        return Some("unsupported_media_type".into());
-    }
     structured_code
         .as_deref()
         .and_then(safe_responses_error_code)

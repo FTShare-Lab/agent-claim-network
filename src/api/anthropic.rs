@@ -1296,9 +1296,6 @@ fn wrap_media_rejection(error: AnthropicError, request_has_media: bool) -> Anthr
             crate::api::is_provider_request_error(*status, body)
                 && crate::api::is_provider_media_error_body(body)
         }
-        AnthropicError::RequestRejected { reason } => {
-            crate::api::is_provider_media_error(None, reason)
-        }
         _ => false,
     };
     let error = match error {
@@ -1412,9 +1409,6 @@ fn classified_anthropic_error_type(body: &str) -> Option<String> {
             .into(),
         );
     }
-    if crate::api::is_provider_media_error(structured_type.as_deref(), &classification_text) {
-        return Some("unsupported_media_type".into());
-    }
     structured_type
         .as_deref()
         .and_then(safe_anthropic_error_type)
@@ -1516,7 +1510,8 @@ mod tests {
     fn media_recovery_requires_explicit_media_error() {
         for (error_code, message, expected) in [
             ("invalid_request_error", "invalid tool schema", false),
-            ("unsupported_media_type", "unsupported media type", true),
+            ("unsupported_media_type", "unsupported media type", false),
+            ("unsupported_media_type", "unsupported image format", false),
             ("invalid_image", "invalid image", true),
             (
                 "invalid_request_error",
@@ -1524,7 +1519,8 @@ mod tests {
                 false,
             ),
             ("content_policy_violation", "content policy rejected", false),
-            ("invalid_request_error", "unsupported image format", true),
+            ("invalid_request_error", "unsupported image format", false),
+            ("invalid_request_error", "invalid pdf", false),
         ] {
             let body = serde_json::json!({"error": {"code": error_code, "type": error_code, "message": message}}).to_string();
             let error = wrap_media_rejection(AnthropicError::Status { status: 400, body }, true);
@@ -3110,7 +3106,7 @@ mod tests {
             AnthropicError::Status {
                 status: 403,
                 body: redact_anthropic_error_body(
-                    r#"{"error":{"type":"unsupported_media_type","message":"bad image"}}"#,
+                    r#"{"error":{"type":"invalid_image","message":"bad image"}}"#,
                 ),
             },
             true,

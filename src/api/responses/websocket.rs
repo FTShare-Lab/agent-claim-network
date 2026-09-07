@@ -1247,6 +1247,11 @@ mod tests {
         WebSocketMessageTooBigThenHttpMessageTooBigThenSuccess,
         NativeWebSocketMessageTooBigThenHttp413ThenSuccess,
         UnauthorizedError,
+        MediaClassificationError {
+            code: &'static str,
+            message: &'static str,
+            wrapped_status: bool,
+        },
         PingBetweenRequests,
         TrailingEventAfterTerminal,
         PreviousNotFoundOnce,
@@ -1630,6 +1635,21 @@ mod tests {
                             reason: "message too big".into(),
                         })))
                         .await;
+                    return;
+                }
+                FakeBehavior::MediaClassificationError {
+                    code,
+                    message,
+                    wrapped_status,
+                } => {
+                    let mut event = json!({
+                        "type":"error",
+                        "error":{"code":code,"type":"invalid_request_error","message":message}
+                    });
+                    if *wrapped_status {
+                        event["status"] = json!(415);
+                    }
+                    send_json_frame(&mut socket, event).await;
                     return;
                 }
                 FakeBehavior::UnauthorizedError => {
@@ -2438,6 +2458,94 @@ mod tests {
             assert!(requests[0].to_string().contains("input_image"));
             assert!(!requests[1].to_string().contains("input_image"));
             assert!(requests[1].to_string().contains("request_size_recovery"));
+        }
+    }
+
+    #[tokio::test]
+    async fn media_recovery_over_websocket_requires_explicit_code() {
+        use crate::api::{
+            AgentTurnLoop, OpenAiCompatibleResponsesProviderAdapter, ProviderRequestRejected,
+            SessionTurnContentBlock, SessionTurnEvent, SessionTurnMessage, SessionTurnRequest,
+        };
+        use crate::config::ToolConfig;
+        use crate::tool::ToolRegistry;
+
+        for wrapped_status in [false, true] {
+            for (code, message, expected_requests) in [
+                (
+                    "unsupported_media_type",
+                    "Content-Type must be application/json",
+                    1,
+                ),
+                ("unsupported_media_type", "invalid image", 1),
+                ("invalid_request_error", "invalid pdf", 1),
+                ("invalid_request_error", "invalid_image", 1),
+                ("invalid_image", "", 2),
+            ] {
+                let (server, state) =
+                    start_websocket_server(FakeBehavior::MediaClassificationError {
+                        code,
+                        message,
+                        wrapped_status,
+                    })
+                    .await;
+                let adapter = Arc::new(
+                    OpenAiCompatibleResponsesProviderAdapter::new(
+                        "test-key".into(),
+                        server.endpoint.clone(),
+                        "test-model".into(),
+                        Duration::from_secs(2),
+                        0,
+                        Duration::ZERO,
+                        Duration::ZERO,
+                    )
+                    .unwrap()
+                    .with_websockets(true, 1)
+                    .unwrap(),
+                );
+                let tools = Arc::new(ToolRegistry::new(&ToolConfig::default()).unwrap());
+                let turn_loop = AgentTurnLoop::new(adapter, tools, 32);
+                let mut history = SessionTurnMessage::user_text("historical image");
+                history.content.push(SessionTurnContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: "aW1hZ2U=".into(),
+                });
+                let mut events = Vec::new();
+                let error = turn_loop
+                    .run_session_turn_with_runtime_chain_hooks(
+                        SessionTurnRequest {
+                            current_session_id: None,
+                            current_turn_id: None,
+                            system_prompt: "system".into(),
+                            history: vec![history],
+                            user_text: "new text".into(),
+                            user_attachments: Vec::new(),
+                            skill_instructions: Vec::new(),
+                        },
+                        ProviderRuntimeChainId::new(),
+                        &mut |event| events.push(event),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(error.is::<ProviderRequestRejected>(), "{code}: {error:#}");
+                assert_eq!(state.http_requests.load(Ordering::SeqCst), 0);
+                let requests = state.requests.lock().await;
+                assert_eq!(requests.len(), expected_requests, "{code}");
+                assert!(requests[0].to_string().contains("input_image"));
+                if expected_requests == 2 {
+                    assert!(!requests[1].to_string().contains("input_image"));
+                }
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, SessionTurnEvent::Warning { .. }))
+                        .count(),
+                    expected_requests - 1
+                );
+            }
         }
     }
 

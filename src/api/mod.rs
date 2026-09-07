@@ -106,53 +106,17 @@ fn structured_provider_error_code(value: &serde_json::Value) -> Option<&str> {
 }
 
 fn is_provider_media_error_code(code: &str) -> bool {
+    // 剥离会改写历史附件；只接受明确的结构化媒体错误码，不能由 message 推断。
     matches!(
         code,
-        "invalid_image"
-            | "invalid_image_url"
-            | "image_too_large"
-            | "unsupported_image"
-            | "unsupported_media_type"
+        "invalid_image" | "invalid_image_url" | "image_too_large" | "unsupported_image"
     )
-}
-
-fn is_provider_media_error(code: Option<&str>, message: &str) -> bool {
-    if code.is_some_and(is_provider_non_request_error_code)
-        || code.is_some_and(is_context_window_error_body)
-        || code.is_some_and(is_content_policy_error_body)
-        || is_context_window_error_body(message)
-        || is_content_policy_error_body(message)
-    {
-        return false;
-    }
-    if code.is_some_and(is_provider_media_error_code) {
-        return true;
-    }
-    let message = message.to_ascii_lowercase();
-    [
-        "invalid image",
-        "invalid_image",
-        "invalid_image_url",
-        "image_too_large",
-        "unsupported_image",
-        "unsupported_media_type",
-        "unsupported image",
-        "unsupported media type",
-        "image format is not supported",
-        "image is too large",
-        "invalid pdf",
-        "unsupported pdf",
-        "pdf is not supported",
-    ]
-    .iter()
-    .any(|phrase| message.contains(phrase))
 }
 
 fn is_provider_media_error_body(body: &str) -> bool {
-    is_provider_media_error(
-        provider_error_code(body).as_deref(),
-        &provider_error_message(body).unwrap_or_else(|| body.to_string()),
-    )
+    provider_error_code(body)
+        .as_deref()
+        .is_some_and(is_provider_media_error_code)
 }
 
 fn provider_error_message(body: &str) -> Option<String> {
@@ -196,7 +160,7 @@ fn is_provider_non_request_error_code(code: &str) -> bool {
 fn is_provider_deterministic_request_error_code(code: &str) -> bool {
     matches!(
         code,
-        "invalid_request" | "invalid_request_error" | "invalid_prompt"
+        "invalid_request" | "invalid_request_error" | "invalid_prompt" | "unsupported_media_type"
     ) || is_context_window_error_body(code)
         || is_content_policy_error_body(code)
         || is_provider_media_error_code(code)
@@ -223,11 +187,26 @@ mod rejection_classification_tests {
 
     #[tokio::test]
     async fn media_recovery_is_consistent_across_http_adapters() {
-        for protocol in 0..3 {
+        for (protocol, stream_error) in
+            (0..3).flat_map(|protocol| [false, true].map(|stream| (protocol, stream)))
+        {
+            use axum::response::IntoResponse;
             for (code, message, expected_requests) in [
                 ("invalid_value", "invalid tool schema", 1),
-                ("unsupported_media_type", "unsupported image", 2),
+                ("unsupported_media_type", "unsupported image", 1),
+                (
+                    "unsupported_media_type",
+                    "Content-Type must be application/json",
+                    1,
+                ),
+                ("unsupported_media_type", "", 1),
+                ("invalid_request_error", "unsupported image format", 1),
+                ("invalid_request_error", "invalid pdf", 1),
+                ("invalid_request_error", "invalid_image", 1),
                 ("invalid_image", "invalid image", 2),
+                ("invalid_image_url", "", 2),
+                ("image_too_large", "", 2),
+                ("unsupported_image", "", 2),
                 (
                     "context_length_exceeded",
                     "maximum context length exceeded",
@@ -241,9 +220,20 @@ mod rejection_classification_tests {
                     let captured = captured.clone();
                     async move {
                         captured.lock().await.push(body);
-                        (axum::http::StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({
+                        let error = serde_json::json!({
+                            "type": "error",
                             "error": {"code": code, "type": "invalid_request_error", "message": message}
-                        })))
+                        });
+                        if stream_error {
+                            ([("content-type", "text/event-stream")], format!("data: {error}\n\n")).into_response()
+                        } else {
+                            let status = if code == "unsupported_media_type" {
+                                axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+                            } else {
+                                axum::http::StatusCode::BAD_REQUEST
+                            };
+                            (status, axum::Json(error)).into_response()
+                        }
                     }
                 });
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -320,19 +310,67 @@ mod rejection_classification_tests {
                     .unwrap_err();
                 assert!(
                     error.downcast_ref::<ProviderRequestRejected>().is_some(),
-                    "protocol={protocol} code={code}: {error:#}"
+                    "protocol={protocol} stream_error={stream_error} code={code}: {error:#}"
                 );
                 assert_eq!(
                     requests.lock().await.len(),
                     expected_requests,
-                    "protocol={protocol} code={code}"
+                    "protocol={protocol} stream_error={stream_error} code={code}"
                 );
                 assert_eq!(
                     warnings.len(),
                     expected_requests - 1,
-                    "protocol={protocol} code={code}"
+                    "protocol={protocol} stream_error={stream_error} code={code}"
                 );
+                let captured = requests.lock().await;
+                assert!(captured[0].to_string().contains("aW1hZ2U="));
+                if expected_requests == 2 {
+                    assert!(!captured[1].to_string().contains("aW1hZ2U="));
+                }
                 server.abort();
+            }
+        }
+    }
+
+    #[test]
+    fn media_error_message_cannot_supply_a_structured_code() {
+        for message in [
+            "invalid image",
+            "unsupported image",
+            "invalid pdf",
+            "unsupported_media_type",
+            "invalid_image",
+            r#"{"error":{"code":"invalid_image"}}"#,
+        ] {
+            for error_type in [
+                None,
+                Some("invalid_request_error"),
+                Some("unsupported_media_type"),
+            ] {
+                let body =
+                    serde_json::json!({"error":{"type":error_type,"message":message}}).to_string();
+                assert!(!is_provider_media_error_body(&body));
+                for redacted in [
+                    super::responses::redact_responses_error_body(&body),
+                    super::chat_completions::redact_chat_error_body(&body),
+                ] {
+                    assert!(
+                        !is_provider_media_error_body(&redacted),
+                        "{body}: {redacted}"
+                    );
+                    assert!(is_provider_request_error(400, &redacted));
+                }
+            }
+        }
+        for code in [
+            "invalid_image",
+            "invalid_image_url",
+            "image_too_large",
+            "unsupported_image",
+        ] {
+            for field in ["code", "type"] {
+                let body = serde_json::json!({"error":{field:code,"message":""}}).to_string();
+                assert!(is_provider_media_error_body(&body));
             }
         }
     }

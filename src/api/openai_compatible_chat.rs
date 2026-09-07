@@ -806,9 +806,9 @@ fn wrap_media_rejection(
             crate::api::is_provider_request_error(*status, body)
                 && crate::api::is_provider_media_error_body(body)
         }
-        OpenAiCompatibleChatError::Client(ChatCompletionsError::Failed { code, message }) => {
-            crate::api::is_provider_media_error(code.as_deref(), message)
-        }
+        OpenAiCompatibleChatError::Client(ChatCompletionsError::Failed { code, .. }) => code
+            .as_deref()
+            .is_some_and(crate::api::is_provider_media_error_code),
         _ => false,
     };
     match error {
@@ -1031,7 +1031,8 @@ mod tests {
     fn media_recovery_requires_explicit_media_error() {
         for (error_code, message, expected) in [
             ("invalid_request_error", "invalid tool schema", false),
-            ("unsupported_media_type", "unsupported media type", true),
+            ("unsupported_media_type", "unsupported media type", false),
+            ("unsupported_media_type", "unsupported image format", false),
             ("invalid_image", "invalid image", true),
             (
                 "invalid_request_error",
@@ -1039,7 +1040,8 @@ mod tests {
                 false,
             ),
             ("content_policy_violation", "content policy rejected", false),
-            ("invalid_request_error", "unsupported image format", true),
+            ("invalid_request_error", "unsupported image format", false),
+            ("invalid_request_error", "invalid pdf", false),
         ] {
             let body = serde_json::json!({"error": {"code": error_code, "type": error_code, "message": message}}).to_string();
             let error = wrap_media_rejection(
@@ -2189,7 +2191,7 @@ mod tests {
             OpenAiCompatibleChatError::Client(ChatCompletionsError::Status {
                 status: 403,
                 body: redact_chat_error_body(
-                    r#"{"error":{"code":"unsupported_media_type","message":"bad image"}}"#,
+                    r#"{"error":{"code":"invalid_image","message":"bad image"}}"#,
                 ),
             }),
             true,
@@ -2233,8 +2235,8 @@ mod tests {
 
         let media = wrap_media_rejection(
             OpenAiCompatibleChatError::Client(ChatCompletionsError::Failed {
-                code: Some("unsupported_media_type".into()),
-                message: "unsupported_media_type: redacted".into(),
+                code: Some("invalid_image".into()),
+                message: "invalid_image: redacted".into(),
             }),
             true,
         );
