@@ -8,8 +8,8 @@ use crate::api::endpoint::{resolve_llm_endpoint, LlmEndpointKind};
 use crate::api::llm_http::{read_llm_error_body, LlmHttpError, LlmHttpPhase};
 use crate::api::ProviderRecoveryInterrupt;
 
+use super::normalize_chat_error_body;
 use super::protocol::{ChatCompletionRequest, ChatCompletionResponse};
-use super::redact_chat_error_body;
 use super::streaming::{drain_sse_frames, sse_frame_data, ChatStreamAccumulator};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,9 +21,9 @@ pub enum ChatStreamEvent {
 pub enum ChatCompletionsError {
     #[error("{0}")]
     Http(#[from] LlmHttpError),
-    #[error("LLM provider authentication failed (401): {0}")]
+    #[error("LLM provider authentication failed (401): {}", crate::api::provider_error_display_detail(.0))]
     Auth(String),
-    #[error("LLM provider returned HTTP {status}: {body}")]
+    #[error("LLM provider returned HTTP {status}: {}", crate::api::provider_error_display_detail(.body))]
     Status { status: u16, body: String },
     #[error("LLM response JSON parse failed: {0}")]
     ResponseJson(#[from] serde_json::Error),
@@ -33,7 +33,7 @@ pub enum ChatCompletionsError {
     OutputShape { reason: String, raw: String },
     #[error("Chat Completions streaming 响应损坏或未完整结束: {reason}")]
     StreamFailure { reason: String, raw: String },
-    #[error("Chat Completions upstream failed: code={code:?}, {message}")]
+    #[error("Chat Completions upstream failed: code={code:?}, {}", crate::api::provider_error_display_detail(.message))]
     Failed {
         code: Option<String>,
         message: String,
@@ -332,13 +332,13 @@ impl ChatCompletionsClient {
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             let body = read_llm_error_body(resp, self.timeout).await;
-            return Err(ChatCompletionsError::Auth(redact_chat_error_body(&body)));
+            return Err(ChatCompletionsError::Auth(normalize_chat_error_body(&body)));
         }
         if !status.is_success() {
             let body = read_llm_error_body(resp, self.timeout).await;
             return Err(ChatCompletionsError::Status {
                 status: status.as_u16(),
-                body: redact_chat_error_body(&body),
+                body: normalize_chat_error_body(&body),
             });
         }
 
@@ -375,13 +375,13 @@ async fn response_json(
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED {
         let body = read_llm_error_body(resp, timeout).await;
-        return Err(ChatCompletionsError::Auth(redact_chat_error_body(&body)));
+        return Err(ChatCompletionsError::Auth(normalize_chat_error_body(&body)));
     }
     if !status.is_success() {
         let body = read_llm_error_body(resp, timeout).await;
         return Err(ChatCompletionsError::Status {
             status: status.as_u16(),
-            body: redact_chat_error_body(&body),
+            body: normalize_chat_error_body(&body),
         });
     }
     let body = resp.text().await.map_err(|error| {
@@ -483,7 +483,6 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    use super::super::REDACTED_CHAT_PAYLOAD;
     use super::*;
     use crate::api::chat_completions::{ChatMessage, ChatToolCall};
 
@@ -868,9 +867,8 @@ mod tests {
                 .to_string();
 
             assert!(error.contains("content_filter"));
-            assert!(error.contains(REDACTED_CHAT_PAYLOAD));
             assert!(!error.contains(system_secret));
-            assert!(!error.contains(user_secret));
+            assert!(error.contains(user_secret));
             assert!(!error.contains(tool_secret));
             assert!(!error.contains(&media_secret));
         }

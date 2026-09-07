@@ -50,9 +50,9 @@ use protocol::*;
 pub enum AnthropicError {
     #[error("{0}")]
     Http(#[from] LlmHttpError),
-    #[error("LLM provider authentication failed (401): {0}")]
+    #[error("LLM provider authentication failed (401): {}", crate::api::provider_error_display_detail(.0))]
     Auth(String),
-    #[error("LLM provider returned HTTP {status}: {body}")]
+    #[error("LLM provider returned HTTP {status}: {}", crate::api::provider_error_display_detail(.body))]
     Status { status: u16, body: String },
     #[error("LLM response JSON parse failed: {0}")]
     ResponseJson(#[from] serde_json::Error),
@@ -87,7 +87,7 @@ pub enum AnthropicError {
 
 impl std::fmt::Debug for AnthropicError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // anyhow / test debug 链也只能看到已脱敏的 Display，不能展开 raw replay。
+        // anyhow / test debug 链沿用诊断 Display，不能额外展开 raw replay。
         std::fmt::Display::fmt(self, formatter)
     }
 }
@@ -362,13 +362,13 @@ impl AnthropicMessagesClient {
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             let body = read_llm_error_body(resp, self.timeout).await;
-            return Err(AnthropicError::Auth(redact_anthropic_error_body(&body)));
+            return Err(AnthropicError::Auth(normalize_anthropic_error_body(&body)));
         }
         if !status.is_success() {
             let body = read_llm_error_body(resp, self.timeout).await;
             return Err(AnthropicError::Status {
                 status: status.as_u16(),
-                body: redact_anthropic_error_body(&body),
+                body: normalize_anthropic_error_body(&body),
             });
         }
 
@@ -1301,7 +1301,7 @@ fn wrap_media_rejection(error: AnthropicError, request_has_media: bool) -> Anthr
     let error = match error {
         AnthropicError::Status { status, body } => AnthropicError::Status {
             status,
-            body: redact_anthropic_error_body(&body),
+            body: normalize_anthropic_error_body(&body),
         },
         other => other,
     };
@@ -1323,16 +1323,18 @@ fn classify_request_too_large(error: &AnthropicError) -> Option<ProviderRequestT
 
 fn classify_context_window_exceeded(error: &AnthropicError) -> bool {
     match error {
-        AnthropicError::Status { body, .. } => is_context_window_error_body(body),
-        AnthropicError::RequestRejected { reason } => is_context_window_error_body(reason),
+        AnthropicError::Status { body, .. } => crate::api::provider_error_code(body)
+            .as_deref()
+            .is_some_and(is_context_window_error_body),
+        AnthropicError::RequestRejected { reason } => reason
+            .split_once(" message=")
+            .is_some_and(|(classification, _)| is_context_window_error_body(classification)),
         _ => false,
     }
 }
 
-const REDACTED_ANTHROPIC_PAYLOAD: &str = "[redacted Anthropic request/replay payload]";
-
-fn redact_anthropic_error_body(body: &str) -> String {
-    let mut error = json!({"message": REDACTED_ANTHROPIC_PAYLOAD});
+fn normalize_anthropic_error_body(body: &str) -> String {
+    let mut error = json!({"message": crate::api::provider_error_display_message(body)});
     if let Some(error_type) = classified_anthropic_error_type(body) {
         error["type"] = Value::String(error_type);
     }
@@ -1340,37 +1342,7 @@ fn redact_anthropic_error_body(body: &str) -> String {
 }
 
 fn safe_anthropic_error_type(error_type: &str) -> Option<&str> {
-    if matches!(
-        error_type,
-        "invalid_request"
-            | "invalid_request_error"
-            | "invalid_prompt"
-            | "authentication_error"
-            | "invalid_api_key"
-            | "permission_error"
-            | "not_found_error"
-            | "model_not_found"
-            | "rate_limit_error"
-            | "api_error"
-            | "overloaded_error"
-            | "server_error"
-            | "content_filter"
-            | "content_policy_violation"
-            | "safety_violation"
-            | "invalid_image"
-            | "invalid_image_url"
-            | "image_too_large"
-            | "unsupported_image"
-            | "unsupported_media_type"
-            | "request_too_large"
-            | "request_entity_too_large"
-            | "payload_too_large"
-    ) || is_context_window_error_body(error_type)
-    {
-        Some(error_type)
-    } else {
-        None
-    }
+    super::safe_provider_error_code(error_type, super::ProviderErrorCodeProtocol::Messages)
 }
 
 fn classified_anthropic_error_type(body: &str) -> Option<String> {
@@ -2259,7 +2231,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_error_redaction_removes_nested_and_embedded_private_replay() {
+    fn anthropic_error_display_preserves_embedded_message() {
         let secret = "opaque-thinking-payload";
         let body = json!({
             "error": {
@@ -2273,16 +2245,15 @@ mod tests {
         })
         .to_string();
 
-        let redacted = redact_anthropic_error_body(&body);
+        let redacted = normalize_anthropic_error_body(&body);
 
         assert!(redacted.contains("invalid_request"));
-        assert!(redacted.contains(REDACTED_ANTHROPIC_PAYLOAD));
-        assert!(!redacted.contains(secret));
-        assert!(!redacted.contains("opaque-signature"));
+        assert!(redacted.contains(secret));
+        assert!(redacted.contains("opaque-signature"));
     }
 
     #[test]
-    fn anthropic_error_redaction_keeps_only_allowlisted_type() {
+    fn anthropic_error_display_omits_fields_outside_message() {
         let input_secret = "private-user-input";
         let system_secret = "private-system-prompt";
         let content_secret = "private-content-block";
@@ -2300,11 +2271,10 @@ mod tests {
         })
         .to_string();
 
-        let redacted = redact_anthropic_error_body(&body);
+        let redacted = normalize_anthropic_error_body(&body);
 
         assert!(redacted.contains("invalid_request"));
-        assert!(redacted.contains(REDACTED_ANTHROPIC_PAYLOAD));
-        assert!(!redacted.contains("safe-diagnostic"));
+        assert!(redacted.contains("safe-diagnostic"));
         assert!(!redacted.contains("messages.2.content"));
         assert!(!redacted.contains(input_secret));
         assert!(!redacted.contains(system_secret));
@@ -2315,7 +2285,7 @@ mod tests {
     fn anthropic_generic_type_only_classifies_the_error_message() {
         let body = r#"{"error":{"type":"invalid_request_error","message":"invalid tool schema"},"request":{"messages":"maximum context length content_filter"}}"#;
 
-        let redacted = redact_anthropic_error_body(body);
+        let redacted = normalize_anthropic_error_body(body);
 
         assert!(redacted.contains("invalid_request_error"));
         assert!(!redacted.contains("context_length_exceeded"));
@@ -2325,11 +2295,11 @@ mod tests {
     #[test]
     fn anthropic_redaction_preserves_absent_and_unknown_type_distinction() {
         let without_type =
-            redact_anthropic_error_body(r#"{"error":{"message":"ordinary invalid parameter"}}"#);
+            normalize_anthropic_error_body(r#"{"error":{"message":"ordinary invalid parameter"}}"#);
         assert!(crate::api::provider_error_code(&without_type).is_none());
         assert!(crate::api::is_provider_request_error(400, &without_type));
 
-        let unknown_type = redact_anthropic_error_body(
+        let unknown_type = normalize_anthropic_error_body(
             r#"{"error":{"type":"future_error","message":"maximum context length"}}"#,
         );
         assert_eq!(
@@ -2340,23 +2310,21 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_error_redaction_hides_non_json_request_echo() {
+    fn anthropic_error_display_preserves_plain_text() {
         let secret = "private-user-input";
         let body = format!("invalid request: input: {secret}");
 
-        let redacted = redact_anthropic_error_body(&body);
+        let redacted = normalize_anthropic_error_body(&body);
 
-        assert!(redacted.contains(REDACTED_ANTHROPIC_PAYLOAD));
-        assert!(!redacted.contains(secret));
+        assert!(redacted.contains(secret));
 
         let quoted_body = format!(r#"invalid request: \"InPuT\" = \"{secret}\""#);
-        let quoted_redacted = redact_anthropic_error_body(&quoted_body);
-        assert!(quoted_redacted.contains(REDACTED_ANTHROPIC_PAYLOAD));
-        assert!(!quoted_redacted.contains(secret));
+        let quoted_redacted = normalize_anthropic_error_body(&quoted_body);
+        assert!(quoted_redacted.contains(secret));
     }
 
     #[test]
-    fn anthropic_error_redaction_hides_unquoted_echo_inside_json_message() {
+    fn anthropic_error_display_preserves_upstream_message() {
         let secret = "private-system-prompt";
         let body = json!({
             "error": {
@@ -2366,11 +2334,10 @@ mod tests {
         })
         .to_string();
 
-        let redacted = redact_anthropic_error_body(&body);
+        let redacted = normalize_anthropic_error_body(&body);
 
         assert!(redacted.contains("invalid_request"));
-        assert!(redacted.contains(REDACTED_ANTHROPIC_PAYLOAD));
-        assert!(!redacted.contains(secret));
+        assert!(redacted.contains(secret));
     }
 
     #[tokio::test]
@@ -2987,6 +2954,22 @@ mod tests {
     }
 
     #[test]
+    fn displayed_message_does_not_override_context_classification() {
+        for code in ["rate_limit_error", "future_error", "invalid_image"] {
+            let event = json!({"error": {"type": code, "message": "echo: maximum context length"}});
+            let error = AnthropicError::Status {
+                status: 400,
+                body: normalize_anthropic_error_body(&event.to_string()),
+            };
+            assert!(!classify_context_window_exceeded(&error));
+        }
+        let error = AnthropicError::RequestRejected {
+            reason: "Anthropic stream 返回 error event: type=invalid_request message=echo: maximum context length".into(),
+        };
+        assert!(!classify_context_window_exceeded(&error));
+    }
+
+    #[test]
     fn generic_content_type_error_is_not_assumed_to_be_media() {
         let error = wrap_media_rejection(
             AnthropicError::Status {
@@ -2997,8 +2980,7 @@ mod tests {
         );
         let text = error.to_string();
         assert!(!text.contains("可能不支持图片 / PDF 附件"));
-        assert!(text.contains(REDACTED_ANTHROPIC_PAYLOAD));
-        assert!(!text.contains("unsupported content type"));
+        assert!(text.contains("unsupported content type"));
         assert!(!is_retryable(&error));
     }
 
@@ -3057,7 +3039,7 @@ mod tests {
     fn http_400_context_limit_precedes_media_rejection() {
         let error = AnthropicError::Status {
             status: 400,
-            body: "input exceeds the context window".into(),
+            body: normalize_anthropic_error_body("input exceeds the context window"),
         };
 
         assert!(classify_context_window_exceeded(&error));
@@ -3086,7 +3068,7 @@ mod tests {
     fn structured_anthropic_types_override_status_only_classification() {
         let auth = AnthropicError::Status {
             status: 400,
-            body: redact_anthropic_error_body(
+            body: normalize_anthropic_error_body(
                 r#"{"error":{"type":null,"code":"authentication_error","message":"bad key"}}"#,
             ),
         };
@@ -3095,7 +3077,7 @@ mod tests {
 
         let context = AnthropicError::Status {
             status: 403,
-            body: redact_anthropic_error_body(
+            body: normalize_anthropic_error_body(
                 r#"{"error":{"type":"context_length_exceeded","message":"too long"}}"#,
             ),
         };
@@ -3105,7 +3087,7 @@ mod tests {
         let media = wrap_media_rejection(
             AnthropicError::Status {
                 status: 403,
-                body: redact_anthropic_error_body(
+                body: normalize_anthropic_error_body(
                     r#"{"error":{"type":"invalid_image","message":"bad image"}}"#,
                 ),
             },
@@ -3137,8 +3119,7 @@ mod tests {
             true,
         );
         let text = error.to_string();
-        assert!(text.contains(REDACTED_ANTHROPIC_PAYLOAD));
-        assert!(!text.contains("unsupported image"));
+        assert!(text.contains("unsupported image"));
         assert!(!text.contains(&"A".repeat(300)));
     }
 

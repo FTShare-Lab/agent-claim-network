@@ -229,7 +229,7 @@ fn event_error_message(error: Option<&Value>, code: Option<&str>) -> String {
         .and_then(Value::as_str)
         .filter(|message| !message.trim().is_empty())
         .unwrap_or("upstream Responses stream failed");
-    super::redact_responses_error_message_with_code(message, code)
+    super::normalize_responses_error_message_with_code(message, code)
 }
 
 fn response_stream_error(event: &Value, error: Option<&Value>) -> ResponsesError {
@@ -242,7 +242,7 @@ fn response_stream_error(event: &Value, error: Option<&Value>) -> ResponsesError
     if let Some(status) = event_error_status(event) {
         let status_error = ResponsesError::Status {
             status,
-            body: super::redact_responses_error_body(&event.to_string()),
+            body: super::normalize_responses_error_body(&event.to_string()),
         };
         if status == 413 || super::is_explicit_websocket_message_too_big(&status_error) {
             return status_error;
@@ -867,10 +867,8 @@ mod tests {
                 ResponsesError::Failed { code: Some(code), .. } if code == expected_code
             ));
             let text = error.to_string();
-            assert!(text.contains("redacted Responses request/replay payload"));
             assert!(!text.contains("opaque"));
-            assert!(!text.contains("rate limited"));
-            assert!(!text.contains("temporarily unavailable"));
+            assert!(text.contains("rate limited") || text.contains("temporarily unavailable"));
         }
 
         let mut decoder = ResponsesSseDecoder::default();
@@ -887,9 +885,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, ResponsesError::Status { status: 401, .. }));
         let text = error.to_string();
-        assert!(text.contains("redacted Responses request/replay payload"));
         assert!(!text.contains("opaque"));
-        assert!(!text.contains("invalid credential"));
+        assert!(text.contains("invalid credential"));
     }
 
     #[test]
@@ -918,12 +915,12 @@ mod tests {
             assert_eq!(status, 403);
             assert!(body.contains(code));
             assert!(crate::api::is_provider_request_error(status, &body));
-            assert!(!body.contains("private request echo"));
+            assert!(body.contains("private request echo"));
         }
     }
 
     #[test]
-    fn decoder_redacts_replay_echoed_inside_error_message() {
+    fn decoder_displays_upstream_error_message() {
         let secret = "opaque-reasoning-replay";
         let event = json!({
             "type":"error",
@@ -939,7 +936,6 @@ mod tests {
             .unwrap_err();
         let display = error.to_string();
 
-        assert!(!display.contains(secret));
-        assert!(display.contains("redacted Responses request/replay payload"));
+        assert!(display.contains(secret));
     }
 }

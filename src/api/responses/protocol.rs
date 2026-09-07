@@ -259,7 +259,7 @@ fn response_error_message(error: Option<&Value>, code: Option<&str>) -> String {
         .and_then(Value::as_str)
         .filter(|message| !message.trim().is_empty())
         .unwrap_or("upstream response failed");
-    super::redact_responses_error_message_with_code(message, code)
+    super::normalize_responses_error_message_with_code(message, code)
 }
 
 fn response_error_code(error: Option<&Value>) -> Option<String> {
@@ -382,8 +382,7 @@ mod tests {
             failed,
             ResponsesError::Failed { ref code, ref message }
                 if code.as_deref() == Some("invalid_request_error")
-                    && message.contains("redacted Responses request/replay payload")
-                    && !message.contains("request rejected")
+                    && message.contains("request rejected")
         ));
     }
 
@@ -404,7 +403,7 @@ mod tests {
             ResponsesError::Failed { code: Some(code), message }
                 if code == "rate_limit_error"
                     && message.contains("rate_limit_error")
-                    && !message.contains("maximum context length")
+                    && message.contains("maximum context length")
         ));
     }
 
@@ -425,7 +424,7 @@ mod tests {
             ResponsesError::Failed { ref code, ref message }
                 if code.as_deref() == Some("redacted")
                     && !message.contains("context_length_exceeded")
-                    && !message.contains("maximum context length")
+                    && message.contains("maximum context length")
         ));
     }
 

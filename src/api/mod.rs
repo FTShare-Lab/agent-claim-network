@@ -46,12 +46,14 @@ fn is_context_window_error_body(body: &str) -> bool {
 fn is_content_policy_error_body(body: &str) -> bool {
     body.to_ascii_lowercase()
         .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
-        .any(|token| {
-            matches!(
-                token,
-                "content_filter" | "content_policy_violation" | "safety_violation"
-            )
-        })
+        .any(is_provider_content_policy_error_code)
+}
+
+fn is_provider_content_policy_error_code(code: &str) -> bool {
+    matches!(
+        code,
+        "content_filter" | "content_policy_violation" | "safety_violation"
+    )
 }
 
 fn is_provider_request_rejection_status(status: u16) -> bool {
@@ -138,6 +140,35 @@ fn provider_error_message(body: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// 展示上游诊断文字；只在无法提取 message 时限制正文长度，不重新判断错误类别。
+fn provider_error_display_message(body: &str) -> String {
+    if let Some(message) = provider_error_message(body).filter(|message| !message.trim().is_empty())
+    {
+        return message;
+    }
+    let body = body.trim();
+    if body.is_empty() {
+        return "Unknown error".into();
+    }
+    let mut end = body.len().min(1000);
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end < body.len() {
+        format!("{}…", &body[..end])
+    } else {
+        body.to_string()
+    }
+}
+
+fn provider_error_display_detail(body: &str) -> String {
+    let message = provider_error_display_message(body);
+    match provider_error_code(body) {
+        Some(code) => format!("{code}: {message}"),
+        None => message,
+    }
+}
+
 fn is_provider_non_request_error_code(code: &str) -> bool {
     matches!(
         code,
@@ -146,7 +177,13 @@ fn is_provider_non_request_error_code(code: &str) -> bool {
             | "permission_error"
             | "not_found_error"
             | "model_not_found"
-            | "rate_limit_error"
+    ) || is_provider_transient_error_code(code)
+}
+
+fn is_provider_transient_error_code(code: &str) -> bool {
+    matches!(
+        code,
+        "rate_limit_error"
             | "rate_limit_exceeded"
             | "server_error"
             | "api_error"
@@ -158,12 +195,48 @@ fn is_provider_non_request_error_code(code: &str) -> bool {
 }
 
 fn is_provider_deterministic_request_error_code(code: &str) -> bool {
+    is_provider_explicit_request_error_code(code)
+        || is_context_window_error_body(code)
+        || is_content_policy_error_body(code)
+}
+
+fn is_provider_explicit_request_error_code(code: &str) -> bool {
     matches!(
         code,
         "invalid_request" | "invalid_request_error" | "invalid_prompt" | "unsupported_media_type"
-    ) || is_context_window_error_body(code)
-        || is_content_policy_error_body(code)
+    ) || is_provider_content_policy_error_code(code)
         || is_provider_media_error_code(code)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProviderErrorCodeProtocol {
+    Messages,
+    ChatCompletions,
+    Responses,
+}
+
+fn safe_provider_error_code(code: &str, protocol: ProviderErrorCodeProtocol) -> Option<&str> {
+    // 集中维护展示白名单，同时保留各协议既有识别范围，避免整理时改变重试行为。
+    if protocol == ProviderErrorCodeProtocol::Messages
+        && matches!(
+            code,
+            "rate_limit_exceeded"
+                | "internal_server_error"
+                | "service_unavailable"
+                | "temporarily_unavailable"
+        )
+    {
+        return None;
+    }
+    let known = is_provider_non_request_error_code(code)
+        || is_provider_explicit_request_error_code(code)
+        || is_provider_request_too_large_code(code)
+        || code == "context_length_exceeded";
+    let context = protocol != ProviderErrorCodeProtocol::ChatCompletions
+        && is_context_window_error_body(code);
+    let websocket =
+        protocol == ProviderErrorCodeProtocol::Responses && code == "websocket_message_too_big";
+    (known || context || websocket).then_some(code)
 }
 
 fn is_provider_request_error(status: u16, body: &str) -> bool {
@@ -182,8 +255,134 @@ fn is_provider_request_too_large(status: u16, _body: &str) -> bool {
 #[cfg(test)]
 mod rejection_classification_tests {
     use super::*;
+
+    #[test]
+    fn error_display_prefers_message_and_bounds_only_fallback_body() {
+        let message = "诊断".repeat(600);
+        let body =
+            serde_json::json!({"error":{"message": message}, "request":"omitted"}).to_string();
+        assert_eq!(provider_error_display_message(&body), message);
+        assert_eq!(provider_error_display_message("  "), "Unknown error");
+        assert_eq!(
+            provider_error_display_message("plain reason"),
+            "plain reason"
+        );
+        let fallback = "错".repeat(500);
+        assert_eq!(
+            provider_error_display_message(&fallback),
+            format!("{}…", "错".repeat(333))
+        );
+        let blank = serde_json::json!({"error":{"message":" "},"detail":"fallback"}).to_string();
+        assert_eq!(provider_error_display_message(&blank), blank);
+    }
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn centralized_error_code_allowlist_preserves_protocol_boundaries() {
+        use ProviderErrorCodeProtocol::{ChatCompletions, Messages, Responses};
+        // 位掩码顺序为 Messages / Chat Completions / Responses，固定整理前的展示范围。
+        for (code, protocols) in [
+            ("invalid_request", 7),
+            ("invalid_request_error", 7),
+            ("invalid_prompt", 7),
+            ("authentication_error", 7),
+            ("invalid_api_key", 7),
+            ("permission_error", 7),
+            ("not_found_error", 7),
+            ("model_not_found", 7),
+            ("rate_limit_error", 7),
+            ("rate_limit_exceeded", 6),
+            ("server_error", 7),
+            ("api_error", 7),
+            ("overloaded_error", 7),
+            ("internal_server_error", 6),
+            ("service_unavailable", 6),
+            ("temporarily_unavailable", 6),
+            ("context_length_exceeded", 7),
+            ("content_filter", 7),
+            ("content_policy_violation", 7),
+            ("safety_violation", 7),
+            ("invalid_image", 7),
+            ("invalid_image_url", 7),
+            ("image_too_large", 7),
+            ("unsupported_image", 7),
+            ("unsupported_media_type", 7),
+            ("request_too_large", 7),
+            ("request_entity_too_large", 7),
+            ("payload_too_large", 7),
+            ("websocket_message_too_big", 4),
+            ("prompt is too long", 5),
+            ("CONTEXT_LENGTH_EXCEEDED", 5),
+            ("unknown_error", 0),
+            ("invalid_image: private input", 0),
+            ("content_filter: private input", 0),
+            ("", 0),
+        ] {
+            for (protocol, mask) in [(Messages, 1), (ChatCompletions, 2), (Responses, 4)] {
+                let expected = (protocols & mask != 0).then_some(code);
+                assert_eq!(
+                    safe_provider_error_code(code, protocol),
+                    expected,
+                    "{code}, mask={mask}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_retry_and_request_categories_remain_distinct() {
+        for code in [
+            "rate_limit_error",
+            "rate_limit_exceeded",
+            "server_error",
+            "api_error",
+            "overloaded_error",
+            "internal_server_error",
+            "service_unavailable",
+            "temporarily_unavailable",
+        ] {
+            assert!(is_provider_transient_error_code(code));
+            assert!(is_provider_non_request_error_code(code));
+            assert!(!is_provider_explicit_request_error_code(code));
+        }
+        for code in [
+            "authentication_error",
+            "invalid_api_key",
+            "permission_error",
+            "not_found_error",
+            "model_not_found",
+        ] {
+            assert!(is_provider_non_request_error_code(code));
+            assert!(!is_provider_transient_error_code(code));
+        }
+        for code in [
+            "invalid_request",
+            "invalid_request_error",
+            "invalid_prompt",
+            "invalid_image",
+            "invalid_image_url",
+            "image_too_large",
+            "unsupported_image",
+            "unsupported_media_type",
+            "content_filter",
+            "content_policy_violation",
+            "safety_violation",
+        ] {
+            assert!(is_provider_explicit_request_error_code(code));
+            assert!(is_provider_deterministic_request_error_code(code));
+            assert!(!is_provider_transient_error_code(code));
+        }
+        for code in [
+            "context_length_exceeded",
+            "request_too_large",
+            "websocket_message_too_big",
+            "unknown_error",
+        ] {
+            assert!(!is_provider_explicit_request_error_code(code));
+            assert!(!is_provider_transient_error_code(code));
+        }
+    }
 
     #[tokio::test]
     async fn media_recovery_is_consistent_across_http_adapters() {
@@ -351,8 +550,8 @@ mod rejection_classification_tests {
                     serde_json::json!({"error":{"type":error_type,"message":message}}).to_string();
                 assert!(!is_provider_media_error_body(&body));
                 for redacted in [
-                    super::responses::redact_responses_error_body(&body),
-                    super::chat_completions::redact_chat_error_body(&body),
+                    super::responses::normalize_responses_error_body(&body),
+                    super::chat_completions::normalize_chat_error_body(&body),
                 ] {
                     assert!(
                         !is_provider_media_error_body(&redacted),
@@ -383,8 +582,8 @@ mod rejection_classification_tests {
         }})
         .to_string();
         for redacted in [
-            super::responses::redact_responses_error_body(&body),
-            super::chat_completions::redact_chat_error_body(&body),
+            super::responses::normalize_responses_error_body(&body),
+            super::chat_completions::normalize_chat_error_body(&body),
         ] {
             assert!(
                 super::is_provider_request_error(400, &redacted),

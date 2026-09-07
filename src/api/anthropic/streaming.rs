@@ -318,7 +318,7 @@ impl AnthropicMessagesClient {
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             let body = read_llm_error_body(resp, self.timeout).await;
-            return Err(AnthropicError::Auth(super::redact_anthropic_error_body(
+            return Err(AnthropicError::Auth(super::normalize_anthropic_error_body(
                 &body,
             )));
         }
@@ -326,7 +326,7 @@ impl AnthropicMessagesClient {
             let body = read_llm_error_body(resp, self.timeout).await;
             return Err(AnthropicError::Status {
                 status: status.as_u16(),
-                body: super::redact_anthropic_error_body(&body),
+                body: super::normalize_anthropic_error_body(&body),
             });
         }
 
@@ -722,10 +722,10 @@ fn anthropic_stream_error_event(event: &Value) -> AnthropicError {
     let reason = format!(
         "Anthropic stream 返回 error event: type={} message={}",
         safe_error_type.unwrap_or("unknown"),
-        super::redact_anthropic_error_body(message)
+        message
     );
     match safe_error_type {
-        Some("rate_limit_error" | "api_error" | "overloaded_error" | "server_error") => {
+        Some(error_type) if crate::api::is_provider_transient_error_code(error_type) => {
             AnthropicError::TransientFailure { reason }
         }
         Some(error_type) if crate::api::is_provider_media_error_code(error_type) => {
@@ -733,16 +733,12 @@ fn anthropic_stream_error_event(event: &Value) -> AnthropicError {
                 source: Box::new(AnthropicError::RequestRejected { reason }),
             }
         }
-        Some(
-            "invalid_request"
-            | "invalid_request_error"
-            | "invalid_prompt"
-            | "unsupported_media_type"
-            | "context_length_exceeded"
-            | "content_filter"
-            | "content_policy_violation"
-            | "safety_violation",
-        ) => AnthropicError::RequestRejected { reason },
+        Some(error_type)
+            if crate::api::is_provider_explicit_request_error_code(error_type)
+                || error_type == "context_length_exceeded" =>
+        {
+            AnthropicError::RequestRejected { reason }
+        }
         _ => AnthropicError::TerminalFailure { reason },
     }
 }
@@ -1036,7 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_error_redacts_unknown_type_and_free_text_message() {
+    fn stream_error_filters_unknown_type_but_displays_message() {
         let error = anthropic_stream_error_event(&json!({
             "type":"error",
             "error":{
@@ -1048,9 +1044,8 @@ mod tests {
 
         assert!(matches!(error, AnthropicError::TerminalFailure { .. }));
         assert!(display.contains("type=unknown"));
-        assert!(display.contains("redacted Anthropic request/replay payload"));
         assert!(!display.contains("private-tool-output"));
-        assert!(!display.contains("private prompt copied by upstream"));
+        assert!(display.contains("private prompt copied by upstream"));
     }
 
     #[tokio::test]

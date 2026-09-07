@@ -1176,10 +1176,7 @@ fn idle_box_content(state: &SessionTuiState) -> Option<IdleBoxContent> {
         }
         SessionRuntimeStatus::Error => Some(IdleBoxContent {
             title: "Attention · Last turn failed",
-            lines: vec![Line::styled(
-                "Edit the prompt, retry, or /exit to finalize",
-                Style::default().fg(Color::DarkGray),
-            )],
+            lines: vec![],
         }),
         SessionRuntimeStatus::Initializing
         | SessionRuntimeStatus::Running
@@ -1726,6 +1723,28 @@ mod tests {
             composer_hint(chat.state()),
             "waiting for target finalization... inputs queued=1"
         );
+    }
+
+    #[test]
+    fn failed_idle_box_keeps_title_without_prompt_edit_advice() {
+        let (sender, _rx) = AppEventSender::channel();
+        let mut chat = ChatWidget::new(sender);
+        chat.state_mut().status = SessionRuntimeStatus::Error;
+        let startup = idle_box_content(chat.state()).unwrap();
+        assert_eq!(startup.title, "Attention · Session startup failed");
+        chat.state_mut().session_id = Some("session_test".into());
+        let failed = idle_box_content(chat.state()).unwrap();
+        assert_eq!(failed.title, "Attention · Last turn failed");
+        assert!(failed.lines.is_empty());
+        let rendered = chat
+            .render_inline(100, 30)
+            .live_lines
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Attention · Last turn failed"));
+        assert!(!rendered.contains("Edit the prompt"));
     }
 
     #[test]

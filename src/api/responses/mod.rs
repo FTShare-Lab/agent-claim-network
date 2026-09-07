@@ -8,37 +8,12 @@ mod protocol;
 mod streaming;
 mod websocket;
 
-const REDACTED_RESPONSES_PAYLOAD: &str = "[redacted Responses request/replay payload]";
-
 pub(super) fn is_transient_error_code(code: &str) -> bool {
-    matches!(
-        code,
-        "rate_limit_error"
-            | "rate_limit_exceeded"
-            | "server_error"
-            | "api_error"
-            | "overloaded_error"
-            | "internal_server_error"
-            | "service_unavailable"
-            | "temporarily_unavailable"
-    )
+    super::is_provider_transient_error_code(code)
 }
 
 pub(super) fn is_deterministic_request_error_code(code: &str) -> bool {
-    matches!(
-        code,
-        "invalid_request"
-            | "invalid_request_error"
-            | "invalid_prompt"
-            | "invalid_image"
-            | "invalid_image_url"
-            | "image_too_large"
-            | "unsupported_image"
-            | "unsupported_media_type"
-            | "content_filter"
-            | "content_policy_violation"
-            | "safety_violation"
-    )
+    super::is_provider_explicit_request_error_code(code)
 }
 
 /// 部分兼容网关把上游 WebSocket 的 1009 大消息关闭包装成 500/502。
@@ -55,15 +30,16 @@ pub(super) fn is_explicit_websocket_message_too_big(error: &ResponsesError) -> b
         || normalized.contains("1009") && normalized.contains("message too big")
 }
 
-pub(super) fn redact_responses_error_body(body: &str) -> String {
-    let mut error = serde_json::json!({"message": REDACTED_RESPONSES_PAYLOAD});
+pub(super) fn normalize_responses_error_body(body: &str) -> String {
+    let mut error =
+        serde_json::json!({"message": crate::api::provider_error_display_message(body)});
     if let Some(code) = classified_responses_error_code(body) {
         error["code"] = serde_json::Value::String(code);
     }
     serde_json::json!({"error": error}).to_string()
 }
 
-pub(super) fn redact_responses_error_message_with_code(
+pub(super) fn normalize_responses_error_message_with_code(
     message: &str,
     code: Option<&str>,
 ) -> String {
@@ -83,20 +59,11 @@ pub(super) fn redact_responses_error_message_with_code(
                 .unwrap_or_else(|| "redacted".into()),
         }
     };
-    format!("{classified}: {REDACTED_RESPONSES_PAYLOAD}")
+    format!("{classified}: {message}")
 }
 
 pub(super) fn safe_responses_error_code(code: &str) -> Option<&str> {
-    if is_transient_error_code(code)
-        || is_deterministic_request_error_code(code)
-        || crate::api::is_context_window_error_body(code)
-        || crate::api::is_provider_non_request_error_code(code)
-        || crate::api::is_provider_request_too_large_code(code)
-        || code == "websocket_message_too_big"
-    {
-        return Some(code);
-    }
-    None
+    super::safe_provider_error_code(code, super::ProviderErrorCodeProtocol::Responses)
 }
 
 fn classified_responses_error_code(body: &str) -> Option<String> {
@@ -187,7 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_error_redaction_removes_nested_and_embedded_replay() {
+    fn responses_error_display_preserves_message_but_omits_other_fields() {
         let secret = "opaque-private-replay";
         let body = serde_json::json!({
             "error": {
@@ -206,24 +173,22 @@ mod tests {
         })
         .to_string();
 
-        let redacted = redact_responses_error_body(&body);
+        let redacted = normalize_responses_error_body(&body);
 
         assert!(redacted.contains("invalid_request"));
-        assert!(!redacted.contains(secret));
+        assert!(redacted.contains(secret));
         assert!(!redacted.contains("private system prompt"));
-        assert!(redacted.contains(REDACTED_RESPONSES_PAYLOAD));
     }
 
     #[test]
-    fn responses_error_redaction_detects_spaced_and_single_quoted_echoes() {
+    fn responses_error_display_preserves_plain_text() {
         for body in [
             r#"invalid request: {\"input\" : [{\"encrypted_content\" : \"secret-a\"}]}"#,
             "invalid request: {'reasoning' : {'encrypted_content' : 'secret-b'}}",
         ] {
-            let redacted = redact_responses_error_body(body);
+            let redacted = normalize_responses_error_body(body);
 
-            assert!(redacted.contains(REDACTED_RESPONSES_PAYLOAD));
-            assert!(!redacted.contains("secret-"));
+            assert!(redacted.contains("secret-"));
         }
     }
 
@@ -231,7 +196,7 @@ mod tests {
     fn generic_code_only_classifies_the_error_message() {
         let body = r#"{"error":{"code":"invalid_request_error","message":"invalid tool schema"},"request":{"input":"maximum context length content_filter"}}"#;
 
-        let redacted = redact_responses_error_body(body);
+        let redacted = normalize_responses_error_body(body);
 
         assert!(redacted.contains("invalid_request_error"));
         assert!(!redacted.contains("context_length_exceeded"));
@@ -241,11 +206,11 @@ mod tests {
     #[test]
     fn redaction_preserves_the_difference_between_absent_and_unknown_codes() {
         let without_code =
-            redact_responses_error_body(r#"{"error":{"message":"ordinary invalid parameter"}}"#);
+            normalize_responses_error_body(r#"{"error":{"message":"ordinary invalid parameter"}}"#);
         assert!(crate::api::provider_error_code(&without_code).is_none());
         assert!(crate::api::is_provider_request_error(422, &without_code));
 
-        let unknown_code = redact_responses_error_body(
+        let unknown_code = normalize_responses_error_body(
             r#"{"error":{"code":"future_error","message":"maximum context length"}}"#,
         );
         assert_eq!(

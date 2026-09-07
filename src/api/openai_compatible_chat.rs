@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::chat_completions::{
-    is_stream_failure, redact_chat_error_body, ChatCompletionChoice, ChatCompletionMessage,
+    is_stream_failure, normalize_chat_error_body, ChatCompletionChoice, ChatCompletionMessage,
     ChatCompletionRequest, ChatCompletionResponse, ChatCompletionsClient, ChatCompletionsError,
     ChatContentPart, ChatFinishReason, ChatMessage, ChatMessageContent, ChatStreamEvent,
     ChatStreamOptions, ChatTool, ChatToolCall,
@@ -815,7 +815,7 @@ fn wrap_media_rejection(
         OpenAiCompatibleChatError::Client(ChatCompletionsError::Status { status, body }) => {
             let source = ChatCompletionsError::Status {
                 status,
-                body: redact_chat_error_body(&body),
+                body: normalize_chat_error_body(&body),
             };
             if rejected {
                 OpenAiCompatibleChatError::MediaRejected { source }
@@ -843,11 +843,15 @@ fn classify_request_too_large(
 fn classify_context_window_exceeded(error: &OpenAiCompatibleChatError) -> bool {
     match error {
         OpenAiCompatibleChatError::Client(ChatCompletionsError::Status { body, .. }) => {
-            is_context_window_error_body(body)
+            crate::api::provider_error_code(body)
+                .as_deref()
+                .is_some_and(is_context_window_error_body)
         }
         OpenAiCompatibleChatError::Client(ChatCompletionsError::Failed { code, message }) => {
             code.as_deref().is_some_and(is_context_window_error_body)
-                || is_context_window_error_body(message)
+                || crate::api::provider_error_code(message)
+                    .as_deref()
+                    .is_some_and(is_context_window_error_body)
         }
         _ => false,
     }
@@ -2021,7 +2025,33 @@ mod tests {
     }
 
     #[test]
-    fn generic_4xx_with_media_is_redacted_without_media_hint() {
+    fn displayed_message_does_not_override_context_classification() {
+        for code in ["rate_limit_error", "future_error", "invalid_image"] {
+            let body = normalize_chat_error_body(
+                &serde_json::json!({"error": {
+                    "code": code, "message": "echo: maximum context length"
+                }})
+                .to_string(),
+            );
+            for error in [
+                ChatCompletionsError::Status {
+                    status: 400,
+                    body: body.clone(),
+                },
+                ChatCompletionsError::Failed {
+                    code: Some(code.into()),
+                    message: body,
+                },
+            ] {
+                assert!(!classify_context_window_exceeded(
+                    &OpenAiCompatibleChatError::Client(error)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn generic_4xx_with_media_displays_reason_without_media_hint() {
         let error = wrap_media_rejection(
             OpenAiCompatibleChatError::Client(ChatCompletionsError::Status {
                 status: 400,
@@ -2031,8 +2061,7 @@ mod tests {
         );
         let text = error.to_string();
         assert!(!text.contains("可能不支持图片 / PDF 附件"));
-        assert!(text.contains("redacted Chat Completions request/replay payload"));
-        assert!(!text.contains("1210: 文件格式不正确"));
+        assert!(text.contains("1210: 文件格式不正确"));
         assert!(text.contains("HTTP 400"));
     }
 
@@ -2074,10 +2103,11 @@ mod tests {
             ));
             assert!(chat_adapter_request_rejected(&error));
             let text = error.to_string();
-            assert!(!text.contains(&media_secret));
-            assert!(!text.contains(system_secret));
-            assert!(!text.contains(user_secret));
-            assert!(!text.contains(tool_secret));
+            // 缺少 message 时按拍板回显正文；恢复分类仍由结构化错误码决定。
+            assert!(text.contains(&media_secret));
+            assert!(text.contains(system_secret));
+            assert!(text.contains(user_secret));
+            assert!(text.contains(tool_secret));
         }
     }
 
@@ -2142,7 +2172,7 @@ mod tests {
     fn http_400_context_limit_precedes_media_rejection() {
         let error = OpenAiCompatibleChatError::Client(ChatCompletionsError::Status {
             status: 400,
-            body: "prompt is too long".into(),
+            body: normalize_chat_error_body("prompt is too long"),
         });
 
         assert!(classify_context_window_exceeded(&error));
@@ -2171,7 +2201,7 @@ mod tests {
     fn structured_chat_codes_override_status_only_classification() {
         let auth = OpenAiCompatibleChatError::Client(ChatCompletionsError::Status {
             status: 400,
-            body: redact_chat_error_body(
+            body: normalize_chat_error_body(
                 r#"{"error":{"code":"authentication_error","message":"bad key"}}"#,
             ),
         });
@@ -2180,7 +2210,7 @@ mod tests {
 
         let context = OpenAiCompatibleChatError::Client(ChatCompletionsError::Status {
             status: 403,
-            body: redact_chat_error_body(
+            body: normalize_chat_error_body(
                 r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#,
             ),
         });
@@ -2190,7 +2220,7 @@ mod tests {
         let media = wrap_media_rejection(
             OpenAiCompatibleChatError::Client(ChatCompletionsError::Status {
                 status: 403,
-                body: redact_chat_error_body(
+                body: normalize_chat_error_body(
                     r#"{"error":{"code":"invalid_image","message":"bad image"}}"#,
                 ),
             }),
@@ -2208,7 +2238,7 @@ mod tests {
         ] {
             let error = OpenAiCompatibleChatError::Client(ChatCompletionsError::Status {
                 status: 400,
-                body: redact_chat_error_body(
+                body: normalize_chat_error_body(
                     &json!({"error":{"code":code,"message":"configuration error"}}).to_string(),
                 ),
             });
@@ -2217,7 +2247,7 @@ mod tests {
 
         let invalid_prompt = OpenAiCompatibleChatError::Client(ChatCompletionsError::Status {
             status: 404,
-            body: redact_chat_error_body(
+            body: normalize_chat_error_body(
                 r#"{"error":{"code":"invalid_prompt","message":"invalid history"}}"#,
             ),
         });
@@ -2260,7 +2290,7 @@ mod tests {
         for code in [Some("invalid_request_error".into()), None] {
             let error = OpenAiCompatibleChatError::Client(ChatCompletionsError::Failed {
                 code,
-                message: redact_chat_error_body(
+                message: normalize_chat_error_body(
                     r#"{"error":{"message":"content_policy_violation"}}"#,
                 ),
             });
@@ -2274,7 +2304,7 @@ mod tests {
     }
 
     #[test]
-    fn media_request_4xx_redacts_echoed_data_url_payload() {
+    fn media_request_4xx_displays_upstream_plain_text() {
         let error = wrap_media_rejection(
             OpenAiCompatibleChatError::Client(ChatCompletionsError::Status {
                 status: 400,
@@ -2283,9 +2313,8 @@ mod tests {
             true,
         );
         let text = error.to_string();
-        assert!(text.contains("redacted Chat Completions request/replay payload"));
-        assert!(!text.contains("data:image/png;base64"));
-        assert!(!text.contains(&"A".repeat(300)));
+        assert!(text.contains("data:image/png;base64"));
+        assert!(text.contains(&"A".repeat(300)));
     }
 
     #[test]

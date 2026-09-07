@@ -9,7 +9,7 @@
 - 上下文窗口溢出、请求过大、媒体被拒、非法 tool schema 等**确定性请求错误**，重放同一份内容只会再次失败；保留 WAL 让下一 turn 继续撞同一堵墙。
 - 一次网络级失败后 adapter 会重发同一请求；此时无法判断上游是否已接受第一次发送。若在这种"发送结果不明确"的状态下改写 WAL，可能丢掉上游已计费、已产出的响应。
 
-TUI 侧的全局提示 `Edit the prompt, retry, or /exit to finalize` 对所有失败一视同仁，用户拿不到"该做什么"的信息；`/compact` 也只能压缩 `messages.jsonl`。
+历史 TUI 兜底分支显示通用的编辑 prompt 建议，无法适用于所有失败；历史 `/compact` 也只能压缩 `messages.jsonl`。当前已修复失败窗口压缩，并移除兜底分支的通用操作建议。
 
 ## 2. 目标
 
@@ -18,7 +18,7 @@ TUI 侧的全局提示 `Edit the prompt, retry, or /exit to finalize` 对所有�
 3. 回滚在崩溃窗口内可恢复，且恢复完成后不留下会影响后续写入的残留状态。
 4. 上下文窗口拒绝自动触发一次压缩并重发；重试上限内仍失败才交给用户。
 5. 发送结果不明确时保守保留 WAL，但不因此关闭本可安全进行的恢复。
-6. 错误体脱敏不回显请求内容。
+6. 展示上游错误原因，不主动附加请求正文或鉴权头；展示内容不扩大错误恢复分类范围。
 
 ## 3. 非目标
 
@@ -47,7 +47,7 @@ adapter 在 HTTP 状态、流式 `error` 事件、非流式响应和 WebSocket c
 
 - 仅结构化 `code` / `type` 为 `invalid_image`、`invalid_image_url`、`image_too_large`、`unsupported_image` 时识别为媒体拒绝；不从上游 `message` 或请求内容推断。
 - `unsupported_media_type` 保留为普通确定性请求错误，即使 message 提到图片 / PDF，也不升级为附件剥离。该错误码可能表示 HTTP Content-Type 不受支持。
-- 三种 adapter 的错误脱敏只保留明确媒体错误码，不再将正文中的图片 / PDF 描述转换为媒体错误码。仅有通用错误码的媒体故障走既有普通拒绝恢复，历史附件保持原样；这类故障不再自动剥离重试。
+- 三种 adapter 的错误归一化只接受明确媒体错误码，不将正文中的图片 / PDF 描述转换为媒体错误码。仅有通用错误码的媒体故障走既有普通拒绝恢复，历史附件保持原样；这类故障不再自动剥离重试。
 - HTTP 413、已支持的 WebSocket 1009 尺寸判断，以及上下文超限等其他分类不变。不新增配置、持久化字段或恢复状态机。
 
 ### 4.2 回滚粒度
@@ -77,11 +77,11 @@ adapter 每次物理发送都上报 `provider_request_started_after(messages, pr
 
 **例外：上下文窗口拒绝不受该标志影响。** 该拒绝只取决于请求内容，结果不明确的那次发送携带同一份内容，上游对它的裁决必然相同，不存在"上游已接受并产出"的可能，因此仍按 4.2 回滚并进入压缩重试。判定集中在 `rejection_would_mutate_request_wal`，三处调用点共用。
 
-### 4.5 错误体脱敏
+### 4.5 错误原因展示（2026-09-07 拍板）
 
-上游 4xx 的 `message` 可能回显请求内容（字段路径、被拒的输入值、非 JSON 文本）。用户可见的错误体统一替换为 `{"error":{"message":"[redacted ... payload]","type|code":"<白名单内的分类 code，或 redacted>"}}`，分类在脱敏前完成，脱敏后仍可被 `is_*` 判别器识别。
+三种协议优先展示结构化错误的 `message`，没有非空消息时展示错误正文，正文兜底按 UTF-8 边界截断至 1000 字节并附加省略号；提取出的 message 不做该截断。保留状态码、既有分类白名单和特殊错误提示。错误归一化仍保留分类 code/type，恢复逻辑只消费原有分类结果，不能因为正文恢复展示而扩大附件剥离、重试或 compact 的触发范围。
 
-原始 message 不写入日志。这条与"用户看不到根因"直接冲突，属于待拍板项（第 8 节）。
+不根据字符串特征猜测敏感内容，不主动附加请求正文或鉴权头，不另存完整原始错误体。展示后的错误沿用现有日志与 session 事件链路，可能落盘；用户接受上游 message 或非 JSON 错误正文可能回显输入片段、URL 等信息的边界。此决定替代历史的 message 整段丢弃策略；损坏响应帧及应用自行附加的私有 payload 仍不得写入错误日志。
 
 ## 5. 设计约束
 
@@ -107,9 +107,9 @@ adapter 每次物理发送都上报 `provider_request_started_after(messages, pr
 - 第 6 节矩阵全部有对应测试且通过。
 - `docs/core_behavior.md` 与本文第 4 节一致。
 
-## 8. 遗留与待拍板
+## 8. 收口与长期整理
 
-1. **TUI 失败阶段提示**：`chat_widget.rs` 对任意 `SessionRuntimeStatus::Error` 显示同一句 `Edit the prompt, retry, or /exit to finalize`。上下文窗口耗尽、内容策略拒绝、413 三种情况下正确动作分别是 `/compact`、改内容、缩短输入。需要 `SessionTuiState` 携带最后一次失败的分类后才能区分，同时缺少"删除失败 turn / 丢弃 WAL"的命令入口。属于新能力，需负责人拍板承载点后再做。
-2. **错误体 message 全部丢弃**：现有测试明确锁定"即使 message 看起来无害也不保留"，PRD_provider_stream_recovery 又禁止把原始体写日志。若要恢复可行动性，可选方案是保留不含请求回显特征的白名单 message，或在 debug 级日志保留原始体；两者都推翻既有拍板，需负责人决定。
-3. **sidecar 是第三个持久事实源**：与 journal 的 `ProviderRequestRejected` 事件重复记录"拒绝已发生"，回滚快照只在 sidecar 内。第 4.3 节已把它限定为崩溃窗口保护；长期可考虑把快照并入 journal 事件以消除该文件。
-4. **分类白名单重复维护**：`safe_anthropic_error_type` / `safe_chat_error_code` / `safe_responses_error_code` 三份人工白名单与 transient code 列表共四份拷贝；`anthropic` 侧还反向依赖 `responses::is_media_rejection_error_code`。应上收至 `src/api/mod.rs`。
+1. **TUI 兜底提示（已完成）**：移除 `Edit the prompt, retry, or /exit to finalize`，保留既有 Attention 标题、虚线框和启动失败提示。不增加失败分类状态；删除失败 turn / 丢弃 WAL 的新命令暂缓。
+2. **错误原因展示（已完成）**：按第 4.5 节展示上游消息，取消 message 整段丢弃。无需新增正文敏感性白名单或原始体 debug 日志。
+3. **sidecar 与 journal（非阻塞长期整理）**：两者记录有重叠，sidecar 还保存崩溃恢复所需的回滚快照。保留当前实现；未来可独立评估把快照并入 journal，不纳入本次改动。
+4. **分类白名单集中维护（2026-09-07，已实现）**：展示白名单、明确请求错误与 transient 分类集中在 `src/api/mod.rs`，各协议只保留转调入口；媒体判断同样使用公共函数。保留既有协议差异：Messages 不新增四个兼容 transient 别名，Chat Completions 不新增上下文文本匹配，WebSocket 大消息错误码只在 Responses 展示。此整理不改变重试、剥离或脱敏语义，后续新增错误码统一在公共模块维护。

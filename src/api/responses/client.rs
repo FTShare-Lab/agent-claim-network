@@ -8,7 +8,7 @@ use super::protocol::{reduce_response_value, ReducedResponses, ResponsesRequest}
 use super::streaming::ResponsesSseDecoder;
 use super::websocket::{ResponsesWebSocketTransport, WebSocketSendOutcome};
 use super::{
-    is_explicit_websocket_message_too_big, is_transient_error_code, redact_responses_error_body,
+    is_explicit_websocket_message_too_big, is_transient_error_code, normalize_responses_error_body,
 };
 use crate::api::endpoint::{resolve_llm_endpoint, LlmEndpointKind};
 use crate::api::llm_http::{read_llm_error_body, LlmHttpError, LlmHttpPhase};
@@ -24,9 +24,9 @@ pub enum ResponsesStreamEvent {
 pub enum ResponsesError {
     #[error("{0}")]
     Http(#[from] LlmHttpError),
-    #[error("LLM provider authentication failed (401): {0}")]
+    #[error("LLM provider authentication failed (401): {}", crate::api::provider_error_display_detail(.0))]
     Auth(String),
-    #[error("LLM provider returned HTTP {status}: {body}")]
+    #[error("LLM provider returned HTTP {status}: {}", crate::api::provider_error_display_detail(.body))]
     Status { status: u16, body: String },
     #[error("Responses response JSON parse failed: {0}")]
     ResponseJson(#[from] serde_json::Error),
@@ -428,13 +428,13 @@ impl ResponsesClient {
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             let body = read_llm_error_body(response, self.timeout).await;
-            return Err(ResponsesError::Auth(redact_responses_error_body(&body)));
+            return Err(ResponsesError::Auth(normalize_responses_error_body(&body)));
         }
         if !status.is_success() {
             let body = read_llm_error_body(response, self.timeout).await;
             return Err(ResponsesError::Status {
                 status: status.as_u16(),
-                body: redact_responses_error_body(&body),
+                body: normalize_responses_error_body(&body),
             });
         }
 
@@ -459,13 +459,13 @@ async fn response_json(
     let status = response.status();
     if status == reqwest::StatusCode::UNAUTHORIZED {
         let body = read_llm_error_body(response, timeout).await;
-        return Err(ResponsesError::Auth(redact_responses_error_body(&body)));
+        return Err(ResponsesError::Auth(normalize_responses_error_body(&body)));
     }
     if !status.is_success() {
         let body = read_llm_error_body(response, timeout).await;
         return Err(ResponsesError::Status {
             status: status.as_u16(),
-            body: redact_responses_error_body(&body),
+            body: normalize_responses_error_body(&body),
         });
     }
     let body = response.text().await.map_err(|error| {
@@ -922,7 +922,7 @@ mod tests {
         let display = error.to_string();
 
         assert!(!display.contains(secret));
-        assert!(display.contains("redacted Responses request/replay payload"));
+        assert!(display.contains("invalid request"));
         assert_eq!(requests.await.unwrap(), 1);
     }
 

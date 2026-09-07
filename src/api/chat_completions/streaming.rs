@@ -75,8 +75,8 @@ impl ChatStreamAccumulator {
         if let Some(error) = frame.error {
             let body = serde_json::json!({"error": error}).to_string();
             return Err(ChatCompletionsError::Failed {
-                code: super::safe_chat_error_code(&body).map(str::to_string),
-                message: super::redact_chat_error_body(&body),
+                code: super::safe_chat_error_code(&body),
+                message: super::normalize_chat_error_body(&body),
             });
         }
         if self.finish_reason.is_some() && !frame.choices.is_empty() {
@@ -362,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_surfaces_structured_error_frame_without_request_echo() {
+    fn stream_surfaces_structured_error_frame_and_message() {
         for code in [
             "content_filter",
             "unsupported_media_type",
@@ -385,7 +385,7 @@ mod tests {
             };
             assert_eq!(actual_code.as_deref(), Some(code));
             assert!(message.contains(code));
-            assert!(!message.contains("private request echo"));
+            assert!(message.contains("private request echo"));
         }
     }
 

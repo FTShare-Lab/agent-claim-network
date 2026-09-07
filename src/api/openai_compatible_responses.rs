@@ -23,7 +23,7 @@ use super::provider::{
 };
 use super::responses::{
     is_deterministic_request_error_code, is_explicit_websocket_message_too_big,
-    is_stream_recovery_failure, redact_responses_error_body, ResponsesClient, ResponsesError,
+    is_stream_recovery_failure, normalize_responses_error_body, ResponsesClient, ResponsesError,
     ResponsesReasoning, ResponsesRequest, ResponsesStreamEvent, ResponsesTerminal, ResponsesTool,
 };
 use super::types::{ProviderReplayState, SessionTurnContentBlock, SessionTurnMessage};
@@ -978,7 +978,7 @@ fn wrap_media_rejection(
         OpenAiCompatibleResponsesError::Client(ResponsesError::Status { status, body }) => {
             let source = ResponsesError::Status {
                 status,
-                body: redact_responses_error_body(&body),
+                body: normalize_responses_error_body(&body),
             };
             if rejected {
                 OpenAiCompatibleResponsesError::MediaRejected { source }
@@ -1008,11 +1008,15 @@ fn classify_request_too_large(
 fn classify_context_window_exceeded(error: &OpenAiCompatibleResponsesError) -> bool {
     match error {
         OpenAiCompatibleResponsesError::Client(ResponsesError::Status { body, .. }) => {
-            is_context_window_error_body(body)
+            crate::api::provider_error_code(body)
+                .as_deref()
+                .is_some_and(is_context_window_error_body)
         }
         OpenAiCompatibleResponsesError::Client(ResponsesError::Failed { code, message }) => {
             code.as_deref().is_some_and(is_context_window_error_body)
-                || is_context_window_error_body(message)
+                || message
+                    .split_once(": ")
+                    .is_some_and(|(classification, _)| is_context_window_error_body(classification))
         }
         _ => false,
     }
@@ -1845,6 +1849,33 @@ mod tests {
     }
 
     #[test]
+    fn displayed_message_does_not_override_context_classification() {
+        for code in ["rate_limit_error", "future_error", "invalid_image"] {
+            let body = normalize_responses_error_body(
+                &serde_json::json!({"error": {
+                    "code": code, "message": "echo: maximum context length"
+                }})
+                .to_string(),
+            );
+            let message = crate::api::responses::normalize_responses_error_message_with_code(
+                "echo: maximum context length",
+                Some(code),
+            );
+            for error in [
+                ResponsesError::Status { status: 400, body },
+                ResponsesError::Failed {
+                    code: Some(code.into()),
+                    message,
+                },
+            ] {
+                assert!(!classify_context_window_exceeded(
+                    &OpenAiCompatibleResponsesError::Client(error)
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn generic_4xx_with_media_does_not_get_media_hint() {
         let error = wrap_media_rejection(
             OpenAiCompatibleResponsesError::Client(ResponsesError::Status {
@@ -1855,10 +1886,7 @@ mod tests {
         );
 
         assert!(!error.to_string().contains("可能不支持图片 / PDF 附件"));
-        assert!(error
-            .to_string()
-            .contains("redacted Responses request/replay payload"));
-        assert!(!error.to_string().contains("bad input"));
+        assert!(error.to_string().contains("bad input"));
 
         for status in [408, 409, 423, 425, 499] {
             let ambiguous = wrap_media_rejection(
@@ -1953,7 +1981,10 @@ mod tests {
 
         let failed = OpenAiCompatibleResponsesError::Client(ResponsesError::Failed {
             code: Some("invalid_request_error".into()),
-            message: "maximum context length exceeded".into(),
+            message: crate::api::responses::normalize_responses_error_message_with_code(
+                "maximum context length exceeded",
+                Some("invalid_request_error"),
+            ),
         });
         assert!(classify_context_window_exceeded(&failed));
         assert!(responses_adapter_request_rejected(&failed));
@@ -1999,7 +2030,7 @@ mod tests {
     fn structured_responses_codes_override_status_only_classification() {
         let auth = OpenAiCompatibleResponsesError::Client(ResponsesError::Status {
             status: 400,
-            body: redact_responses_error_body(
+            body: normalize_responses_error_body(
                 r#"{"error":{"code":"authentication_error","message":"bad key"}}"#,
             ),
         });
@@ -2008,7 +2039,7 @@ mod tests {
 
         let context = OpenAiCompatibleResponsesError::Client(ResponsesError::Status {
             status: 403,
-            body: redact_responses_error_body(
+            body: normalize_responses_error_body(
                 r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#,
             ),
         });
@@ -2018,7 +2049,7 @@ mod tests {
         let media = wrap_media_rejection(
             OpenAiCompatibleResponsesError::Client(ResponsesError::Status {
                 status: 403,
-                body: redact_responses_error_body(
+                body: normalize_responses_error_body(
                     r#"{"error":{"code":"invalid_image","message":"bad image"}}"#,
                 ),
             }),
@@ -2036,7 +2067,7 @@ mod tests {
         ] {
             let error = OpenAiCompatibleResponsesError::Client(ResponsesError::Status {
                 status: 400,
-                body: redact_responses_error_body(
+                body: normalize_responses_error_body(
                     &json!({"error":{"code":code,"message":"configuration error"}}).to_string(),
                 ),
             });
@@ -2045,7 +2076,7 @@ mod tests {
 
         let invalid_prompt = OpenAiCompatibleResponsesError::Client(ResponsesError::Status {
             status: 404,
-            body: redact_responses_error_body(
+            body: normalize_responses_error_body(
                 r#"{"error":{"code":"invalid_prompt","message":"invalid history"}}"#,
             ),
         });
@@ -3223,10 +3254,7 @@ mod tests {
 
         assert_eq!(requests.len(), 1);
         assert!(error.to_string().contains("content_filter"));
-        assert!(error
-            .to_string()
-            .contains("redacted Responses request/replay payload"));
-        assert!(!error.to_string().contains("deterministic failure"));
+        assert!(error.to_string().contains("deterministic failure"));
         assert!(events.iter().all(|event| !matches!(
             event,
             crate::api::SessionTurnEvent::NonStreamingFallbackAttemptStarted { .. }

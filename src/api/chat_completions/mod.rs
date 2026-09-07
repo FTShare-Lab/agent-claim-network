@@ -7,14 +7,12 @@ mod client;
 mod protocol;
 mod streaming;
 
-const REDACTED_CHAT_PAYLOAD: &str = "[redacted Chat Completions request/replay payload]";
-
-pub(super) fn redact_chat_error_body(body: &str) -> String {
+pub(super) fn normalize_chat_error_body(body: &str) -> String {
     let structured_code = structured_chat_error_code(body);
     let safe_code = safe_chat_error_code(body);
     let classification_text =
         crate::api::provider_error_message(body).unwrap_or_else(|| body.to_string());
-    let code = match (structured_code.as_deref(), safe_code) {
+    let code = match (structured_code.as_deref(), safe_code.as_deref()) {
         (Some(_), None) => Some("redacted"),
         (_, Some(code)) if crate::api::is_provider_non_request_error_code(code) => Some(code),
         (_, Some(code)) if !matches!(code, "invalid_request" | "invalid_request_error") => {
@@ -29,7 +27,8 @@ pub(super) fn redact_chat_error_body(body: &str) -> String {
         (_, Some(code)) => Some(code),
         _ => None,
     };
-    let mut error = serde_json::json!({"message": REDACTED_CHAT_PAYLOAD});
+    let mut error =
+        serde_json::json!({"message": crate::api::provider_error_display_message(body)});
     if let Some(code) = code {
         error["code"] = serde_json::Value::String(code.to_string());
     }
@@ -47,39 +46,11 @@ fn content_policy_code(body: &str) -> &'static str {
     }
 }
 
-fn safe_chat_error_code(body: &str) -> Option<&'static str> {
+fn safe_chat_error_code(body: &str) -> Option<String> {
     let code = structured_chat_error_code(body)?;
-    match code.as_str() {
-        "invalid_request" => Some("invalid_request"),
-        "invalid_request_error" => Some("invalid_request_error"),
-        "invalid_prompt" => Some("invalid_prompt"),
-        "authentication_error" => Some("authentication_error"),
-        "invalid_api_key" => Some("invalid_api_key"),
-        "permission_error" => Some("permission_error"),
-        "not_found_error" => Some("not_found_error"),
-        "model_not_found" => Some("model_not_found"),
-        "rate_limit_error" => Some("rate_limit_error"),
-        "rate_limit_exceeded" => Some("rate_limit_exceeded"),
-        "server_error" => Some("server_error"),
-        "api_error" => Some("api_error"),
-        "overloaded_error" => Some("overloaded_error"),
-        "internal_server_error" => Some("internal_server_error"),
-        "service_unavailable" => Some("service_unavailable"),
-        "temporarily_unavailable" => Some("temporarily_unavailable"),
-        "context_length_exceeded" => Some("context_length_exceeded"),
-        "content_filter" => Some("content_filter"),
-        "content_policy_violation" => Some("content_policy_violation"),
-        "safety_violation" => Some("safety_violation"),
-        "invalid_image" => Some("invalid_image"),
-        "invalid_image_url" => Some("invalid_image_url"),
-        "image_too_large" => Some("image_too_large"),
-        "unsupported_image" => Some("unsupported_image"),
-        "unsupported_media_type" => Some("unsupported_media_type"),
-        "request_too_large" => Some("request_too_large"),
-        "request_entity_too_large" => Some("request_entity_too_large"),
-        "payload_too_large" => Some("payload_too_large"),
-        _ => None,
-    }
+    super::safe_provider_error_code(&code, super::ProviderErrorCodeProtocol::ChatCompletions)
+        .is_some()
+        .then_some(code)
 }
 
 fn structured_chat_error_code(body: &str) -> Option<String> {
@@ -96,31 +67,29 @@ pub use protocol::{
 
 #[cfg(test)]
 mod tests {
-    use super::{redact_chat_error_body, REDACTED_CHAT_PAYLOAD};
+    use super::normalize_chat_error_body;
 
     #[test]
-    fn redaction_preserves_context_limit_classification_without_echoing_message() {
+    fn normalization_preserves_context_limit_classification_and_message() {
         let secret = "private prompt copied by upstream";
         let body = format!(r#"{{"error":{{"message":"prompt is too long: {secret}"}}}}"#);
 
-        let redacted = redact_chat_error_body(&body);
+        let redacted = normalize_chat_error_body(&body);
 
         assert!(redacted.contains("context_length_exceeded"));
-        assert!(redacted.contains(REDACTED_CHAT_PAYLOAD));
-        assert!(!redacted.contains(secret));
+        assert!(redacted.contains(secret));
     }
 
     #[test]
-    fn redaction_preserves_content_policy_classification_without_echoing_message() {
+    fn normalization_preserves_content_policy_classification_and_message() {
         let secret = "private tool arguments copied by upstream";
         let body =
             format!(r#"{{"error":{{"code":"content_filter","message":"blocked: {secret}"}}}}"#);
 
-        let redacted = redact_chat_error_body(&body);
+        let redacted = normalize_chat_error_body(&body);
 
         assert!(redacted.contains("content_filter"));
-        assert!(redacted.contains(REDACTED_CHAT_PAYLOAD));
-        assert!(!redacted.contains(secret));
+        assert!(redacted.contains(secret));
     }
 
     #[test]
@@ -128,11 +97,11 @@ mod tests {
         let body =
             r#"{"error":{"code":"rate_limit_error","message":"echo: maximum context length"}}"#;
 
-        let redacted = redact_chat_error_body(body);
+        let redacted = normalize_chat_error_body(body);
 
         assert!(redacted.contains("rate_limit_error"));
         assert!(!redacted.contains("context_length_exceeded"));
-        assert!(!redacted.contains("maximum context length"));
+        assert!(redacted.contains("maximum context length"));
     }
 
     #[test]
@@ -145,7 +114,7 @@ mod tests {
             let body = format!(
                 r#"{{"error":{{"code":null,"type":"{error_type}","message":"invalid request"}}}}"#
             );
-            let redacted = redact_chat_error_body(&body);
+            let redacted = normalize_chat_error_body(&body);
 
             assert_eq!(
                 crate::api::provider_error_code(&redacted).as_deref(),
@@ -159,7 +128,7 @@ mod tests {
     fn generic_code_only_classifies_the_error_message() {
         let body = r#"{"error":{"code":"invalid_request_error","message":"invalid tool schema"},"request":{"input":"maximum context length content_filter"}}"#;
 
-        let redacted = redact_chat_error_body(body);
+        let redacted = normalize_chat_error_body(body);
 
         assert!(redacted.contains("invalid_request_error"));
         assert!(!redacted.contains("context_length_exceeded"));
@@ -169,11 +138,11 @@ mod tests {
     #[test]
     fn redaction_preserves_the_difference_between_absent_and_unknown_codes() {
         let without_code =
-            redact_chat_error_body(r#"{"error":{"message":"ordinary invalid parameter"}}"#);
+            normalize_chat_error_body(r#"{"error":{"message":"ordinary invalid parameter"}}"#);
         assert!(crate::api::provider_error_code(&without_code).is_none());
         assert!(crate::api::is_provider_request_error(400, &without_code));
 
-        let unknown_code = redact_chat_error_body(
+        let unknown_code = normalize_chat_error_body(
             r#"{"error":{"code":"future_error","message":"maximum context length"}}"#,
         );
         assert_eq!(

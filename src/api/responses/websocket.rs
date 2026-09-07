@@ -17,7 +17,7 @@ use super::client::compute_backoff;
 use super::protocol::{ReducedResponses, ResponsesRequest};
 use super::streaming::ResponsesEventDecoder;
 use super::{
-    is_explicit_websocket_message_too_big, is_transient_error_code, redact_responses_error_body,
+    is_explicit_websocket_message_too_big, is_transient_error_code, normalize_responses_error_body,
     ResponsesError, ResponsesStreamEvent,
 };
 use crate::api::llm_http::read_llm_error_body;
@@ -506,7 +506,7 @@ impl ResponsesWebSocketTransport {
                     StatusCode::UNAUTHORIZED => {
                         let body = read_llm_error_body(response, CONNECT_TIMEOUT).await;
                         Err(ConnectFailure::Deterministic(ResponsesError::Auth(
-                            redact_responses_error_body(&body),
+                            normalize_responses_error_body(&body),
                         )))
                     }
                     StatusCode::TOO_MANY_REQUESTS => Err(ConnectFailure::TransientStatus(format!(
