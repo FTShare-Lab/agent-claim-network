@@ -66,7 +66,7 @@ Maintainer 是团队治理与投递服务：
 
 Maintainer 不以 trace 引用次数直接修改 claim，也不删除已经解决的历史 dispute。
 
-自裁决提供 `manual`、`shadow`、`auto` 三种模式，并用独立的 Proposal 与 Verification 两阶段模型调用降低误判风险。Analysis 是可审阅的分析结果；管理者 Adopt、人工 Resolve，或 `auto` 模式自动采用后，才形成正式 Resolution。Resolution 仍只是发送给 holder 的治理建议，不会让 Maintainer 直接修改 Agent 的本地 Claim。
+可选的自裁决使用 Maintainer 独立配置的 LLM，通过 Proposal 与 Verification 两阶段调用生成并复核 Analysis。分析被采用后形成正式 Resolution，Claim 调整仍由 holder Agent 执行。模式与操作流程见 [Maintainer 自裁决说明](maintainer_auto_arbitration.md)。
 
 ### Recap/Finalize Supervisor
 
@@ -163,7 +163,7 @@ Agent 进程使用 `<acn_home>/<upstream>/data/agents/<agent_id>/`。Router 和 
 
 ## Inbox 投递
 
-Maintainer outbox 是持久投递台账。消息可定向或广播，并为每个接收 Agent 派生稳定 inbox ID。Agent 的同步顺序是：
+Maintainer outbox 是持久投递台账。消息可定向或广播；定向消息按目标 Agent 创建独立 inbox ID，广播消息共享 inbox ID 并分别记录各 Agent 的收件状态。Sweep 通知还在同一 outbox 记录中保存 Claim 更新时间与建议状态。Agent 的同步顺序是：
 
 1. 拉取消息。
 2. 逐条持久化到本地 inbox。

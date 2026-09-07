@@ -1,5 +1,12 @@
 import '@testing-library/jest-dom/vitest'
 
+// jsdom 不执行布局；滚动区域的真实尺寸在浏览器验收。
+globalThis.ResizeObserver = class {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+
 // Node 的 undici Request 与 jsdom AbortSignal 属于不同 realm。React Router 在
 // memory-router 测试中会把后者传给前者；仅在品牌检查不兼容时去掉
 // signal，避免测试导航在构造 Request 前失败。

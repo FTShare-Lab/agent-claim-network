@@ -15,6 +15,7 @@ pub mod history;
 pub mod http_client;
 pub mod outbox_io;
 pub mod server;
+mod sweep;
 pub mod traits;
 
 use std::collections::BTreeMap;
@@ -33,7 +34,7 @@ use crate::claim::DisputeId;
 use crate::claim::{
     AgentId, Claim, ClaimId, ClaimStatus, Dispute, DisputeStatus, InboxId, InboxMessage,
     InboxMessageKind, MaintainerActionId, OutboxEntry, OutboxTarget, Policy, PolicyId,
-    PolicyMessageType, PolicyStatus,
+    PolicyMessageType, PolicyStatus, SweepNotificationItem,
 };
 use crate::storage::{mint_unique_id_in_dir, paths, read_yaml, write_yaml_atomic, FileLockGuard};
 use crate::time::serde_utc;
@@ -43,12 +44,6 @@ pub type DeliveryMessageType = PolicyMessageType;
 
 const CLAIM_ATTRIBUTE_POLICY_NAME: &str = "claim_attribute_update_suggestion";
 const CLAIM_ATTRIBUTE_POLICY_SCOPE: &str = "maintainer / claim-attribute-update";
-
-struct SweepAgentClaims {
-    agent_id: AgentId,
-    stale_claims: Vec<ClaimId>,
-    deprecated_claims: Vec<ClaimId>,
-}
 
 /// 一次 claim sweep 的产出，便于上层日志、前端详情或测试断言。
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -325,7 +320,9 @@ impl Maintainer {
             target_agents: normalize_target_agents(target_agents),
         };
         self.write_policy(&policy).await?;
-        let pushed = self.create_outbox_entries(&policy, &action_id, now).await?;
+        let pushed = self
+            .create_outbox_entries(&policy, &action_id, now, &[])
+            .await?;
         log::info!(
             target: "maintainer",
             "publish_new_policy id={} name={} → 写文件 + 落 outbox {} 条",
@@ -356,7 +353,9 @@ impl Maintainer {
         policy.target_agents = normalize_target_agents(policy.target_agents);
         let action_id = self.mint_action_id_for_outbox().await?;
         write_yaml_atomic(&p, &policy).await?;
-        let pushed = self.create_outbox_entries(&policy, &action_id, now).await?;
+        let pushed = self
+            .create_outbox_entries(&policy, &action_id, now, &[])
+            .await?;
         log::info!(
             target: "maintainer",
             "deprecate_policy id={} → 更新文件 + 落 outbox {} 条",
@@ -433,91 +432,6 @@ impl Maintainer {
         Ok(())
     }
 
-    /// 跑一遍 claim sweep：检测过期 claim，按 agent 发 ClaimAttributeUpdate 建议，不改写 mirror。
-    /// 判定只看 mirror 中 claim 的最近语义更新时间，不读取 trace 引用频次。
-    pub async fn run_stale_sweep(&self, now: DateTime<Utc>) -> anyhow::Result<ClaimSweepReport> {
-        let mut report = ClaimSweepReport::default();
-        for (agent, claim) in self.list_all_claims().await? {
-            let age = now.signed_duration_since(claim.effective_updated_at());
-            match claim.status {
-                ClaimStatus::Active if age >= self.stale_after => {
-                    let claim_id = claim.id.clone();
-                    report.stale_claims.push((agent, claim_id));
-                }
-                ClaimStatus::Stale if age >= self.deprecate_after => {
-                    let claim_id = claim.id.clone();
-                    report.deprecated_claims.push((agent, claim_id));
-                }
-                _ => {}
-            }
-        }
-        self.send_sweep_notifications(&mut report, now).await;
-        log::info!(
-            target: "maintainer",
-            "run_stale_sweep: stale_claims={} deprecated_claims={} notifications={} notification_errors={}",
-            report.stale_claims.len(),
-            report.deprecated_claims.len(),
-            report.notifications.len(),
-            report.notification_errors.len()
-        );
-        Ok(report)
-    }
-
-    /// 跑 stale sweep 并记录触发来源，供 admin 工作台展示历史。
-    pub async fn run_stale_sweep_with_trigger(
-        &self,
-        now: DateTime<Utc>,
-        trigger: &str,
-    ) -> anyhow::Result<ClaimSweepReport> {
-        let report = self.run_stale_sweep(now).await?;
-        let record = history::SweepRunRecord {
-            run_id: history::fresh_record_id("sweep_run"),
-            triggered_at: now,
-            trigger: trigger.to_string(),
-            report: report.clone(),
-        };
-        self.history_store.write_sweep_run(&record).await?;
-        Ok(report)
-    }
-
-    async fn send_sweep_notifications(&self, report: &mut ClaimSweepReport, now: DateTime<Utc>) {
-        let groups = group_sweep_claims_by_agent(report);
-        for group in groups {
-            let statement = claim_sweep_notification_statement(
-                &group.agent_id,
-                &group.stale_claims,
-                &group.deprecated_claims,
-            );
-            match self
-                .claim_update_suggestion(statement, now, Some(vec![group.agent_id.clone()]))
-                .await
-            {
-                Ok((policy_id, pushed)) => {
-                    report.notifications.push(SweepNotification {
-                        agent_id: group.agent_id,
-                        stale_claims: group.stale_claims,
-                        deprecated_claims: group.deprecated_claims,
-                        policy_id,
-                        pushed,
-                    });
-                }
-                Err(err) => {
-                    log::warn!(
-                        target: "maintainer",
-                        "claim sweep 通知 agent={} 失败，等待下次 sweep 重试: {err:#}",
-                        group.agent_id
-                    );
-                    report.notification_errors.push(SweepNotificationError {
-                        agent_id: group.agent_id,
-                        stale_claims: group.stale_claims,
-                        deprecated_claims: group.deprecated_claims,
-                        error: format!("{err:#}"),
-                    });
-                }
-            }
-        }
-    }
-
     /// 创建一条 claim 属性更新建议 policy，并按目标范围下发 ClaimAttributeUpdate。
     /// statement 承载具体业务语义；name/scope 固定为 maintainer 协议用途。
     pub async fn claim_update_suggestion(
@@ -528,6 +442,18 @@ impl Maintainer {
     ) -> anyhow::Result<(PolicyId, usize)> {
         let _guard = self.outbox_lock.lock().await;
         let _file_guard = self.lock_outbox_file().await?;
+        self.claim_update_suggestion_locked(statement, now, target_agents, &[])
+            .await
+    }
+
+    /// 调用方同时持有进程内锁与 outbox 文件锁；sweep 查重与创建必须处于同一临界区。
+    async fn claim_update_suggestion_locked(
+        &self,
+        statement: String,
+        now: DateTime<Utc>,
+        target_agents: Option<Vec<AgentId>>,
+        sweep_items: &[SweepNotificationItem],
+    ) -> anyhow::Result<(PolicyId, usize)> {
         let action_id = self.mint_action_id_for_outbox().await?;
         let id = self.mint_policy_id().await?;
         let policy = Policy {
@@ -542,7 +468,9 @@ impl Maintainer {
             target_agents: normalize_target_agents(target_agents),
         };
         self.write_policy(&policy).await?;
-        let pushed = self.create_outbox_entries(&policy, &action_id, now).await?;
+        let pushed = self
+            .create_outbox_entries(&policy, &action_id, now, sweep_items)
+            .await?;
         log::info!(
             target: "maintainer",
             "claim_update_suggestion id={} → 写文件 + 落 outbox {} 条",
@@ -1080,6 +1008,7 @@ impl Maintainer {
         policy: &Policy,
         action_id: &MaintainerActionId,
         now: DateTime<Utc>,
+        sweep_items: &[SweepNotificationItem],
     ) -> anyhow::Result<usize> {
         let kind = policy_inbox_kind_for_policy(policy);
         let targets: Vec<OutboxTarget> = match &policy.target_agents {
@@ -1108,6 +1037,7 @@ impl Maintainer {
                 created_at: now,
                 offered_to: vec![],
                 delivered_to: vec![],
+                sweep_items: sweep_items.to_vec(),
                 inbox_message,
             };
             outbox_io::write(&self.team_root, &entry).await?;
@@ -1346,67 +1276,6 @@ fn policy_inbox_kind_for_policy(policy: &Policy) -> InboxMessageKind {
             arbitration_resolution: None,
         },
     }
-}
-
-fn group_sweep_claims_by_agent(report: &ClaimSweepReport) -> Vec<SweepAgentClaims> {
-    let mut groups: Vec<SweepAgentClaims> = Vec::new();
-    for (agent, claim_id) in &report.stale_claims {
-        push_sweep_group_claim(&mut groups, agent, claim_id, false);
-    }
-    for (agent, claim_id) in &report.deprecated_claims {
-        push_sweep_group_claim(&mut groups, agent, claim_id, true);
-    }
-    groups.sort_by(|left, right| left.agent_id.as_str().cmp(right.agent_id.as_str()));
-    groups
-}
-
-fn push_sweep_group_claim(
-    groups: &mut Vec<SweepAgentClaims>,
-    agent: &AgentId,
-    claim_id: &ClaimId,
-    deprecated: bool,
-) {
-    let idx = groups
-        .iter()
-        .position(|candidate| &candidate.agent_id == agent)
-        .unwrap_or_else(|| {
-            groups.push(SweepAgentClaims {
-                agent_id: agent.clone(),
-                stale_claims: Vec::new(),
-                deprecated_claims: Vec::new(),
-            });
-            groups.len() - 1
-        });
-    let group = &mut groups[idx];
-    if deprecated {
-        group.deprecated_claims.push(claim_id.clone());
-    } else {
-        group.stale_claims.push(claim_id.clone());
-    }
-}
-
-fn claim_sweep_notification_statement(
-    agent_id: &AgentId,
-    stale_claims: &[ClaimId],
-    deprecated_claims: &[ClaimId],
-) -> String {
-    format!(
-        "来自 ACN 团队 Maintainer 的通知：\nagent：{agent_id}\n\n根据 maintainer 的定期 claim sweep 机制，您有如下 local claims 建议调整 status 字段。\n\n建议调整 status 为 stale 的 claim：{}\n建议调整 status 为 deprecated 的 claim：{}\n\n注：本次调整为团队建议，具体处理办法请结合本 agent 的自身情况决定。",
-        format_claim_id_list(stale_claims),
-        format_claim_id_list(deprecated_claims)
-    )
-}
-
-fn format_claim_id_list(ids: &[ClaimId]) -> String {
-    if ids.is_empty() {
-        return "[]".into();
-    }
-    let joined = ids
-        .iter()
-        .map(|id| format!("'{id}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("[{joined}]")
 }
 
 fn dispute_status_rank(status: DisputeStatus) -> usize {
@@ -2067,6 +1936,261 @@ mod tests {
             &entries[0].inbox_message.kind,
             InboxMessageKind::ClaimAttributeUpdate { policy, .. } if policy.id == policy_id
         ));
+    }
+
+    #[tokio::test]
+    async fn sweep_deduplicates_pending_and_acked_suggestions_across_restart() -> anyhow::Result<()>
+    {
+        let (m, _team) = build(7, 30);
+        let agent = AgentId::new("agent-a")?;
+        let now: DateTime<Utc> = "2026-04-21T00:00:00Z".parse()?;
+        let mut claim = sample_claim_at(&agent, now - Duration::days(10), ClaimStatus::Active);
+        m.upload_claim(&claim).await?;
+        let first = m.run_stale_sweep(now).await?;
+        assert_eq!(first.notifications.len(), 1);
+
+        // 同一轮重复上传、跨日和显式补上相同时间都不应产生新通知。
+        claim.updated_at = Some(claim.created_at);
+        m.upload_claim(&claim).await?;
+        let second = m.run_stale_sweep(now + Duration::days(1)).await?;
+        assert_eq!(second.stale_claims, first.stale_claims);
+        assert!(second.notifications.is_empty());
+        let pulled = m.pull_inbox(&agent).await?;
+        assert_eq!(pulled.len(), 1);
+        assert_eq!(m.pull_inbox(&agent).await?, pulled);
+        assert!(m.run_stale_sweep(now).await?.notifications.is_empty());
+        m.ack_inbox(&agent, &[pulled[0].id.clone()]).await?;
+        let root = m.team_root.clone();
+        drop(m);
+        let restarted = Maintainer::new(root, Duration::days(7), Duration::days(30), 8);
+        assert!(restarted
+            .run_stale_sweep(now + Duration::days(2))
+            .await?
+            .notifications
+            .is_empty());
+        assert!(restarted.pull_inbox(&agent).await?.is_empty());
+        let entries = outbox_io::list(restarted.team_root()).await?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].sweep_items[0].effective_updated_at,
+            claim.created_at
+        );
+        assert_eq!(entries[0].delivered_to.len(), 1);
+        assert_eq!(restarted.list_all_claims().await?[0].1, claim);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sweep_rearms_for_new_update_time_and_distinct_target_status() -> anyhow::Result<()> {
+        let (m, _team) = build(7, 30);
+        let agent = AgentId::new("agent-a")?;
+        let now: DateTime<Utc> = "2026-04-21T00:00:00Z".parse()?;
+        let mut claim = sample_claim_at(&agent, now - Duration::days(40), ClaimStatus::Active);
+        m.upload_claim(&claim).await?;
+        assert_eq!(m.run_stale_sweep(now).await?.notifications.len(), 1);
+
+        claim.updated_at = Some(now);
+        m.upload_claim(&claim).await?;
+        assert!(m.run_stale_sweep(now).await?.stale_claims.is_empty());
+        assert_eq!(
+            m.run_stale_sweep(now + Duration::days(7))
+                .await?
+                .notifications
+                .len(),
+            1
+        );
+        // 单独改变目标建议也应允许发送，即便镜像沿用同一更新时间。
+        claim.status = ClaimStatus::Stale;
+        m.upload_claim(&claim).await?;
+        assert!(m
+            .run_stale_sweep(now + Duration::days(29))
+            .await?
+            .notifications
+            .is_empty());
+        let deprecated = m.run_stale_sweep(now + Duration::days(30)).await?;
+        assert_eq!(
+            deprecated.notifications[0].deprecated_claims,
+            vec![claim.id.clone()]
+        );
+        assert!(m
+            .run_stale_sweep(now + Duration::days(31))
+            .await?
+            .notifications
+            .is_empty());
+        assert_eq!(outbox_io::list(m.team_root()).await?.len(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sweep_only_sends_new_group_members_and_keeps_agents_independent() -> anyhow::Result<()>
+    {
+        let (m, _team) = build(7, 30);
+        let agent = AgentId::new("agent-a")?;
+        let now: DateTime<Utc> = "2026-04-21T00:00:00Z".parse()?;
+        let mut first = sample_claim_at(&agent, now - Duration::days(40), ClaimStatus::Active);
+        let second = sample_claim_at(&agent, first.created_at, ClaimStatus::Stale);
+        m.upload_claim(&first).await?;
+        m.upload_claim(&second).await?;
+        let initial = m.run_stale_sweep(now).await?;
+        assert_eq!(initial.notifications.len(), 1);
+        assert_eq!(
+            initial.notifications[0].stale_claims,
+            vec![first.id.clone()]
+        );
+        assert_eq!(
+            initial.notifications[0].deprecated_claims,
+            vec![second.id.clone()]
+        );
+
+        let new_claim = sample_claim_at(&agent, first.created_at, ClaimStatus::Active);
+        m.upload_claim(&new_claim).await?;
+        let other_agent = AgentId::new("agent-b")?;
+        let mut other_claim = first.clone();
+        other_claim.holder = other_agent.clone();
+        m.upload_claim(&other_claim).await?;
+        first.status = ClaimStatus::Deprecated;
+        m.upload_claim(&first).await?;
+        let changed = m.run_stale_sweep(now).await?;
+        assert_eq!(changed.notifications.len(), 2);
+        assert_eq!(changed.notifications[0].agent_id, agent);
+        assert_eq!(changed.notifications[0].stale_claims, vec![new_claim.id]);
+        assert!(changed.notifications[0].deprecated_claims.is_empty());
+        assert_eq!(changed.notifications[1].agent_id, other_agent);
+        assert_eq!(changed.notifications[1].stale_claims, vec![other_claim.id]);
+        assert_eq!(changed.deprecated_claims, vec![(agent, second.id)]);
+        assert!(m.run_stale_sweep(now).await?.notifications.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sweep_preserves_legacy_delivery_and_starts_deduplication_with_new_entries(
+    ) -> anyhow::Result<()> {
+        let (m, _team) = build(7, 30);
+        let agent = AgentId::new("agent-a")?;
+        let now: DateTime<Utc> = "2026-04-21T00:00:00Z".parse()?;
+        let claim = sample_claim_at(&agent, now - Duration::days(10), ClaimStatus::Active);
+        m.upload_claim(&claim).await?;
+        m.run_stale_sweep(now).await?;
+        let mut legacy = outbox_io::list(m.team_root()).await?.remove(0);
+        legacy.sweep_items.clear();
+        outbox_io::write(m.team_root(), &legacy).await?;
+        let path =
+            paths::team_store_outbox_dir(m.team_root()).join(format!("{}.yaml", legacy.inbox_id));
+        let legacy_bytes = fs::read(&path).await?;
+        assert!(!String::from_utf8_lossy(&legacy_bytes).contains("sweep_items"));
+
+        assert_eq!(m.run_stale_sweep(now).await?.notifications.len(), 1);
+        assert_eq!(fs::read(&path).await?, legacy_bytes);
+        assert!(m.run_stale_sweep(now).await?.notifications.is_empty());
+        let pulled = m.pull_inbox(&agent).await?;
+        assert_eq!(pulled.len(), 2);
+        assert!(pulled.iter().any(|message| message.id == legacy.inbox_id));
+        let ids: Vec<_> = pulled.into_iter().map(|message| message.id).collect();
+        m.ack_inbox(&agent, &ids).await?;
+        assert!(m.pull_inbox(&agent).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_sweeps_share_the_outbox_file_lock() -> anyhow::Result<()> {
+        let (m, _team) = build(7, 30);
+        let agent = AgentId::new("agent-a")?;
+        let now: DateTime<Utc> = "2026-04-21T00:00:00Z".parse()?;
+        m.upload_claim(&sample_claim_at(
+            &agent,
+            now - Duration::days(10),
+            ClaimStatus::Active,
+        ))
+        .await?;
+        let other = Maintainer::new(
+            m.team_root.clone(),
+            Duration::days(7),
+            Duration::days(30),
+            8,
+        );
+        // 两个实例拥有独立的进程内 Mutex，只能通过同一个文件锁避免重复创建。
+        let (left, right) = tokio::join!(m.run_stale_sweep(now), other.run_stale_sweep(now));
+        assert_eq!(left?.notifications.len() + right?.notifications.len(), 1);
+        assert_eq!(outbox_io::list(m.team_root()).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sweep_recovers_when_policy_exists_but_outbox_commit_is_missing() -> anyhow::Result<()>
+    {
+        let (m, _team) = build(7, 30);
+        let agent = AgentId::new("agent-a")?;
+        let now: DateTime<Utc> = "2026-04-21T00:00:00Z".parse()?;
+        m.upload_claim(&sample_claim_at(
+            &agent,
+            now - Duration::days(10),
+            ClaimStatus::Active,
+        ))
+        .await?;
+        m.run_stale_sweep(now).await?;
+        let entry = outbox_io::list(m.team_root()).await?.remove(0);
+        let path =
+            paths::team_store_outbox_dir(m.team_root()).join(format!("{}.yaml", entry.inbox_id));
+        // 模拟 Policy 已写完、outbox 还停留在空 ID 占位文件的崩溃现场。
+        fs::write(&path, b"").await?;
+        let retry = m.run_stale_sweep(now).await?;
+        assert_eq!(retry.notifications.len(), 1);
+        assert!(retry.notification_errors.is_empty());
+        assert_eq!(outbox_io::list(m.team_root()).await?.len(), 1);
+        assert_eq!(m.pull_inbox(&agent).await?.len(), 1);
+        assert!(m.run_stale_sweep(now).await?.notifications.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sweep_does_not_create_notifications_when_deduplication_ledger_is_unreadable(
+    ) -> anyhow::Result<()> {
+        let (m, _team) = build(7, 30);
+        let agent = AgentId::new("agent-a")?;
+        let now: DateTime<Utc> = "2026-04-21T00:00:00Z".parse()?;
+        m.upload_claim(&sample_claim_at(
+            &agent,
+            now - Duration::days(10),
+            ClaimStatus::Active,
+        ))
+        .await?;
+        let outbox_dir = paths::team_store_outbox_dir(m.team_root());
+        fs::create_dir_all(&outbox_dir).await?;
+        let corrupt_path = outbox_dir.join("inbox_12345678.yaml");
+        fs::write(&corrupt_path, b"invalid: [").await?;
+        assert!(m.run_stale_sweep(now).await.is_err());
+        assert!(m.list_policies().await?.is_empty());
+        fs::remove_file(corrupt_path).await?;
+        assert_eq!(m.run_stale_sweep(now).await?.notifications.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sweep_history_failure_does_not_duplicate_durable_notification() -> anyhow::Result<()> {
+        let (m, _team) = build(7, 30);
+        let agent = AgentId::new("agent-a")?;
+        let now: DateTime<Utc> = "2026-04-21T00:00:00Z".parse()?;
+        m.upload_claim(&sample_claim_at(
+            &agent,
+            now - Duration::days(10),
+            ClaimStatus::Active,
+        ))
+        .await?;
+        let history_path = paths::team_store_maintainer_history_current_path(
+            m.team_root(),
+            history::STREAM_SWEEP_RUNS,
+        );
+        fs::create_dir_all(&history_path).await?;
+        assert!(m.run_stale_sweep_with_trigger(now, "manual").await.is_err());
+        assert_eq!(outbox_io::list(m.team_root()).await?.len(), 1);
+        fs::remove_dir(&history_path).await?;
+        let retry = m
+            .run_stale_sweep_with_trigger(now, "maintainer_startup")
+            .await?;
+        assert_eq!(retry.stale_claims.len(), 1);
+        assert!(retry.notifications.is_empty());
+        assert_eq!(m.history_store.list_sweep_runs().await?.len(), 1);
+        Ok(())
     }
 
     /// stale sweep 只检测旧 stale claim

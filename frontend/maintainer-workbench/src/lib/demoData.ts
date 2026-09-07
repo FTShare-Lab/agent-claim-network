@@ -961,6 +961,7 @@ export async function requestStaticDemoData<T>(path: string, init?: RequestInit)
       throw new Error(`Unknown demo dispute route: ${pathname}`)
     }
     if (pathname === '/api/policies') return clone(demoPolicyRecords) as T
+    if (pathname === '/outbox') return clone(demoOutbox) as T
     if (pathname === '/api/sweeps') return clone(demoSweeps) as T
     if (pathname === '/api/audits') return clone(demoAudits) as T
     if (pathname === '/api/team-auth/status') return clone(demoTeamAuthStatus) as T

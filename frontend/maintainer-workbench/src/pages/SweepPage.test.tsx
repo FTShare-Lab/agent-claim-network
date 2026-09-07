@@ -93,6 +93,21 @@ describe('SweepPage history filters and pagination', () => {
     expect(screen.getByText('11–13 / 13')).toBeInTheDocument()
   })
 
+  it('starts candidate sections collapsed and allows independent expansion', async () => {
+    render(renderWorkbenchRoute('/sweep'))
+    await screen.findByRole('heading', { name: 'Sweep History' })
+    fireEvent.click(sweepRows()[0])
+    const stale = screen.getByRole('button', { name: 'Expand Stale Candidates' })
+    const deprecated = screen.getByRole('button', { name: 'Expand Deprecated Candidates' })
+    expect(stale).toHaveAttribute('aria-expanded', 'false')
+    expect(deprecated).toHaveAttribute('aria-expanded', 'false')
+    fireEvent.click(stale)
+    expect(screen.getByText('No stale candidates in this run.')).toBeVisible()
+    expect(deprecated).toHaveAttribute('aria-expanded', 'false')
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse Stale Candidates' }))
+    expect(screen.queryByText('No stale candidates in this run.')).not.toBeInTheDocument()
+  })
+
   it('filters by time range and trigger before pagination', async () => {
     render(renderWorkbenchRoute('/sweep'))
 

@@ -142,6 +142,7 @@ mod tests {
             created_at: "2026-05-14T10:00:00Z".parse().unwrap(),
             offered_to: vec![],
             delivered_to: vec![],
+            sweep_items: vec![],
             inbox_message: InboxMessage {
                 id: inbox_id,
                 kind: InboxMessageKind::PolicyUpdate { policy },

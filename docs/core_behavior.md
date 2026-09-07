@@ -71,11 +71,11 @@ Dispute 表示多个 claim 之间可能存在冲突、不兼容或适用范围�
 
 已经解决的 dispute 仍保留为历史事实。Router 查询候选 claim 时同时返回相关 dispute，使借用方看见已知争议。
 
-Maintainer 可选使用独立 LLM 生成 Analysis。Analysis 是可审阅的建议，不会自行改变 Dispute；管理者 Adopt、人工 Resolve，或 `auto` 模式完成自动采用后，才形成正式 Resolution。新 Resolution 保留原始 `summary`，类型包括 `coexist`、`lifecycle_update` 和 `conflict_resolved`；无法可靠判断时返回 `unresolved`，Dispute 继续保持 open。
-
-`manual` 只保存新 Dispute；`shadow` 自动生成 Analysis 供人工审阅；`auto` 在 Proposal 与 Verification 都通过后自动采用。每个 Dispute 只保留一个 Current Analysis，再次 Analyze 会替换它。`auto` 在采用前发现上下文变化时最多重分析三轮，仍不稳定则交给人工处理。
+Maintainer 可选使用独立 LLM 生成 Analysis。Analysis 是可审阅的建议，只有分析被采用或完成人工裁决后，才形成正式 Resolution 并解决 Dispute。新 Resolution 保留原始 `summary`，类型包括 `coexist`、`lifecycle_update` 和 `conflict_resolved`；无法可靠判断时，Analysis 记为 `unresolved`，Dispute 继续保持 open。
 
 Resolution 中的 Claim 调整属于治理建议。Maintainer 不要求创建新 Claim，也不直接修改 holder 的本地知识；holder Agent 根据自己的完整上下文决定保持、原地修正、创建或废弃哪些 Claim。
+
+自裁决的模式、分析与采用流程，以及投递后的 Claim 变化观察，见 [Maintainer 自裁决说明](maintainer_auto_arbitration.md)。
 
 Dispute 属于团队治理流：只有配置团队服务时，Agent 才把 finalize 或 inbox 内化形成的 dispute 报告给 Maintainer。单人模式不创建待日后补传的 dispute 队列。
 
@@ -86,8 +86,6 @@ Dispute 属于团队治理流：只有配置团队服务时，Agent 才把 final
 Inbox 是 Maintainer 到 Agent 的下行通道。当前支持 `PolicyUpdate` 和 `ClaimAttributeUpdate`，两类消息都内嵌完整 Policy。
 
 普通建议与 Resolution 使用同一种 ClaimAttributeUpdate 内化流程。Agent 可以更新自己的本地 Claim；该过程不读取 Memory、USER、session transcript 或工具上下文。Agent 可以接受、调整或不采用建议，也可以在确有必要时形成新的 Claim 或 Dispute。
-
-Workbench 会对照 Resolution 时的 direct Claim 快照与当前团队 mirror，帮助管理者观察 holder 后续是否出现相关变化。
 
 消息的本地生命周期是 pending、claimed、handled：
 

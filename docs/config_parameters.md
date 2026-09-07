@@ -365,7 +365,7 @@ background-shell 其余时序、容量和 PTY 参数是 `config.rs` 内部默认
 - `confidence_threshold`：proposal 和 verification 都必须达到的置信度，范围 `[0, 1]`，默认 `0.90`。
 - `max_source_claims`：直接 Claim 的 source graph 广度优先加载上限，默认 `20`。
 
-`auto` 在采用前发现分析上下文变化时会延迟重分析，最多尝试三轮；仍无法获得稳定上下文时保持 Dispute open，等待人工处理。切换到其他模式会停止尚未确定的自动采用。
+模式选择、切换模式的影响、上下文变化时的重分析和人工处理流程见 [Maintainer 自裁决说明](maintainer_auto_arbitration.md)。
 
 ### `[maintainer.llm]`
 

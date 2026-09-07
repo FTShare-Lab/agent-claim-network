@@ -923,6 +923,7 @@ update_observed: true
                     agent_id: current.holder.clone(),
                     sent_at: "2026-08-02T12:00:00Z".parse().unwrap(),
                 }],
+                sweep_items: vec![],
                 inbox_message: message,
             },
         )

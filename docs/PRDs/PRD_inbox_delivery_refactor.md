@@ -99,6 +99,14 @@ inbox_message:
 
 `inbox_message` 是创建 entry 时的完整快照。后续 policy 文件发生变化，不会改写旧 entry 的消息内容。
 
+### Sweep 通知去重（已实现）
+
+Sweep 创建的 targeted entry 额外保存 `sweep_items`，每项包含 `claim_id`、`effective_updated_at` 与 `suggested_status`。该信息属于 Maintainer 台账，不进入 Agent 拉取到的 `InboxMessage` 或内化 prompt。普通 Policy、人工属性建议和仲裁通知省略该字段。
+
+去重键由目标 Agent 与上述三个字段共同组成。检测重复与创建消息共用现有进程内锁和 outbox 文件锁；去重信息与消息快照一起原子落盘。已有记录无论是否 receipt ACK，都会阻止同一轮建议再次创建；未 ACK 消息继续沿用本文定义的稳定 ID 重投，ACK 后的本地重试继续由 Agent 负责。Claim 最近更新时间变化后重新按老化阈值计算，建议目标状态变化也属于不同建议。Sweep history 用于审计，去重只依赖持久 outbox。
+
+旧记录缺少 `sweep_items` 时按空列表读取，继续原有投递流程，不迁移历史积压；从升级后新建的 sweep 通知开始准确去重。相同团队存储上的 Maintainer 实例需统一升级，避免旧版本继续创建重复通知或重写记录时丢失新增字段。Outbox 保留的 sweep 信息也是持续去重的依据，不能仅因 receipt ACK 完成就删除这些记录。
+
 ### `offered_to`
 
 - 表示该消息曾通过 pull 提供给某个 agent。

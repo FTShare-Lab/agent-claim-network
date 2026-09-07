@@ -39,6 +39,11 @@ type OutboxEntryBase = {
   /** 旧 Maintainer 响应可能缺失；派生逻辑统一按空数组处理。 */
   offered_to?: OfferedMark[]
   delivered_to: DeliveredMark[]
+  sweep_items?: Array<{
+    claim_id: string
+    effective_updated_at: string
+    suggested_status: 'active' | 'stale' | 'deprecated'
+  }>
   inbox_message: OutboxMessageSnapshot
 }
 

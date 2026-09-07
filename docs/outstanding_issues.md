@@ -14,10 +14,8 @@
 
 6. 现在agent的local claims被全量送入agent session system prompt，后续可能要考虑裁剪。
 
-7. maintainer 定期 claim sweep 后会按 agent 聚合 stale / deprecated 候选，并通过 `ClaimAttributeUpdate` 给对应 agent 发团队建议；如果 agent 收到建议后没有调整 claim status，下一次 sweep 仍会再次命中并重复提醒。当前先接受"每天重复提醒直到 agent 处理"的语义；后续如觉得噪声过大，可考虑增加 notification cooldown、已提醒记录或仅在候选集合变化时提醒。
+7. TUI running turn 期间 queued input 只按普通文本草稿恢复：ESC 会逐条取回最新 queued input 到 composer；Ctrl-C 中断 turn 后会把剩余 queued input 用换行合并回 composer。若 queued input 原本是 slash command（如 `/compact`），恢复后再次提交可能会被当作自然语言或多行普通输入处理。当前接受该语义；后续如果要保留 command 类型，需要把 queued input 从纯文本草稿升级为带 action/mode 的结构。
 
-8. TUI running turn 期间 queued input 只按普通文本草稿恢复：ESC 会逐条取回最新 queued input 到 composer；Ctrl-C 中断 turn 后会把剩余 queued input 用换行合并回 composer。若 queued input 原本是 slash command（如 `/compact`），恢复后再次提交可能会被当作自然语言或多行普通输入处理。当前接受该语义；后续如果要保留 command 类型，需要把 queued input 从纯文本草稿升级为带 action/mode 的结构。
+8. @附件 功能目前支持 PNG/JPEG/GIF/WebP/PDF/任意UTF-8文件，但不支持 DOCX/XLSX/ZIP 等二进制，他们会被当成文本读取，随后因不是 UTF-8 而失败。这些内容目前上游 Anthropic 协议尚未支持，推荐引导模型采用 code_run 等方式读取解析。参考[Anthropic 附件支持文档](https://platform.claude.com/docs/en/build-with-claude/files)。
 
-9. @附件 功能目前支持 PNG/JPEG/GIF/WebP/PDF/任意UTF-8文件，但不支持 DOCX/XLSX/ZIP 等二进制，他们会被当成文本读取，随后因不是 UTF-8 而失败。这些内容目前上游 Anthropic 协议尚未支持，推荐引导模型采用 code_run 等方式读取解析。参考[Anthropic 附件支持文档](https://platform.claude.com/docs/en/build-with-claude/files)。
-
-10. Maintainer 的 holder adoption 目前通过 Resolution 快照与当前团队 Claim mirror 的差异来观察，因此不能严格证明某次变化由对应通知导致，也不会展示同次内化涉及的其他本地 Claim。后续如评估需要，可补充不含私有上下文的最小执行结果投影。
+9. Maintainer 的 holder adoption 目前通过 Resolution 快照与当前团队 Claim mirror 的差异来观察，因此不能严格证明某次变化由对应通知导致，也不会展示同次内化涉及的其他本地 Claim。后续如评估需要，可补充不含私有上下文的最小执行结果投影。

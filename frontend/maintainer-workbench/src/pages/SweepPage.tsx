@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useMemo, useState } from 'react'
+import { type ReactNode, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router'
 
 import { StatusBadge } from '../components/badges/StatusBadge'
@@ -10,6 +10,7 @@ import { PageContainer } from '../layouts/PageContainer'
 import { useOverviewQuery } from '../features/overview/hooks'
 import { useSweepsQuery, useTriggerSweepMutation } from '../features/sweeps/hooks'
 import type { SweepRunRecord } from '../features/sweeps/types'
+import { SweepClaimComparison } from '../features/sweeps/SweepClaimComparison'
 import { formatDateTime, formatRelativeMinutes } from '../lib/format'
 import { isStaticDemo } from '../lib/runtime'
 
@@ -56,7 +57,7 @@ function ClaimLink({ id }: { id: string }) {
   return (
     <Link
       to={`/claims?claim_id=${encodeURIComponent(id)}`}
-      className="font-mono text-[11px] font-medium text-blue-700 underline-offset-2 transition hover:text-blue-900 hover:underline"
+      className="inline-flex max-w-full items-center rounded border border-blue-200 bg-blue-50 px-1.5 py-0.5 font-mono text-[11px] font-medium leading-4 text-blue-700 underline-offset-2 transition hover:border-blue-300 hover:bg-blue-100 hover:text-blue-900"
     >
       {id}
     </Link>
@@ -67,7 +68,7 @@ function PolicyLink({ id }: { id: string }) {
   return (
     <Link
       to={`/policies?policy_id=${encodeURIComponent(id)}`}
-      className="font-mono text-[11px] font-medium text-blue-700 underline-offset-2 transition hover:text-blue-900 hover:underline"
+      className="inline-flex max-w-full items-center rounded border border-blue-200 bg-blue-50 px-1.5 py-0.5 font-mono text-[11px] font-medium leading-4 text-blue-700 underline-offset-2 transition hover:border-blue-300 hover:bg-blue-100 hover:text-blue-900"
     >
       {id}
     </Link>
@@ -79,9 +80,7 @@ function ClaimList({ ids }: { ids: string[] }) {
   return (
     <div className="flex flex-wrap gap-1">
       {ids.map((id) => (
-        <span key={id} className="rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5">
-          <ClaimLink id={id} />
-        </span>
+        <ClaimLink key={id} id={id} />
       ))}
     </div>
   )
@@ -102,6 +101,45 @@ function DrawerSection({
   )
 }
 
+function CandidateSection({ title, children }: { title: string; children: ReactNode }) {
+  const [expanded, setExpanded] = useState(false)
+  const contentId = useId()
+  return (
+    <section className="rounded-lg border border-slate-200 bg-white p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">{title}</div>
+        <button type="button" aria-expanded={expanded} aria-controls={contentId}
+          aria-label={`${expanded ? 'Collapse' : 'Expand'} ${title}`}
+          onClick={() => setExpanded(!expanded)}
+          className="rounded-md border border-slate-200 px-3 py-1.5 text-xs font-semibold text-blue-700 transition hover:bg-blue-50">
+          {expanded ? 'Collapse' : 'Expand'}
+        </button>
+      </div>
+      <div id={contentId} hidden={!expanded} className="mt-2">{expanded ? children : null}</div>
+    </section>
+  )
+}
+
+// 通知行可因 Claim 标签换行而增高，按实际前五行高度限制滚动区域。
+function FiveRowTable({ children }: { children: ReactNode }) {
+  const container = useRef<HTMLDivElement>(null)
+  const [maxHeight, setMaxHeight] = useState<number>()
+  useLayoutEffect(() => {
+    const table = container.current?.querySelector('table')
+    if (!table) return
+    const measure = () => {
+      const rows = table.querySelectorAll('tbody tr')
+      const scrollbarHeight = container.current ? container.current.offsetHeight - container.current.clientHeight : 0
+      setMaxHeight(rows.length > 5 ? rows[4].getBoundingClientRect().bottom - table.getBoundingClientRect().top + scrollbarHeight : undefined)
+    }
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(table)
+    return () => observer.disconnect()
+  }, [children])
+  return <div ref={container} style={{ maxHeight }} className="overflow-auto overscroll-contain">{children}</div>
+}
+
 function CandidateTable({
   rows,
   empty,
@@ -111,24 +149,24 @@ function CandidateTable({
 }) {
   if (!rows.length) return <div className="text-xs text-slate-500">{empty}</div>
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full min-w-[440px] text-left text-xs">
+    <FiveRowTable>
+      <table className="w-full min-w-[440px] text-left text-xs leading-4">
         <thead className="border-b border-slate-200 text-[10px] font-semibold uppercase tracking-wide text-slate-500">
           <tr>
-            <th className="py-1.5 pr-4">Agent</th>
-            <th className="py-1.5 pr-4">Claim</th>
+            <th className="align-middle py-2 pr-4">Agent</th>
+            <th className="align-middle py-2 pr-4">Claim</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-100">
           {rows.map(([agentId, claimId]) => (
             <tr key={`${agentId}-${claimId}`}>
-              <td className="py-1.5 pr-4 font-mono text-slate-900">{agentId}</td>
-              <td className="py-1.5 pr-4"><ClaimLink id={claimId} /></td>
+              <td className="align-middle py-2 pr-4 font-mono text-slate-900">{agentId}</td>
+              <td className="align-middle py-2 pr-4"><ClaimLink id={claimId} /></td>
             </tr>
           ))}
         </tbody>
       </table>
-    </div>
+    </FiveRowTable>
   )
 }
 
@@ -136,30 +174,31 @@ function NotificationTable({ run }: { run: SweepRunRecord }) {
   const notifications = notificationsOf(run)
   if (!notifications.length) return <div className="text-xs text-slate-500">No ClaimAttributeUpdate notifications were sent.</div>
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full min-w-[760px] text-left text-xs">
+    <FiveRowTable>
+      <table className="w-full min-w-[760px] table-fixed text-left text-xs leading-4">
+        <colgroup><col className="w-[18%]" /><col className="w-[25%]" /><col className="w-[25%]" /><col className="w-[24%]" /><col className="w-[8%]" /></colgroup>
         <thead className="border-b border-slate-200 text-[10px] font-semibold uppercase tracking-wide text-slate-500">
           <tr>
-            <th className="py-1.5 pr-4">Agent</th>
-            <th className="py-1.5 pr-4">Stale Claims</th>
-            <th className="py-1.5 pr-4">Deprecated Claims</th>
-            <th className="py-1.5 pr-4">Policy</th>
-            <th className="py-1.5 pr-4">Pushed</th>
+            <th className="align-middle py-2 pr-4">Agent</th>
+            <th className="align-middle py-2 pr-4">Stale Claims</th>
+            <th className="align-middle py-2 pr-4">Deprecated Claims</th>
+            <th className="align-middle py-2 pr-4">Policy</th>
+            <th className="align-middle py-2 pr-4">Pushed</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-100">
           {notifications.map((row) => (
             <tr key={`${row.agent_id}-${row.policy_id}`}>
-              <td className="py-1.5 pr-4 font-mono text-slate-900">{row.agent_id}</td>
-              <td className="py-1.5 pr-4"><ClaimList ids={row.stale_claims} /></td>
-              <td className="py-1.5 pr-4"><ClaimList ids={row.deprecated_claims} /></td>
-              <td className="py-1.5 pr-4"><PolicyLink id={row.policy_id} /></td>
-              <td className="py-1.5 pr-4 font-mono text-slate-700">{row.pushed}</td>
+              <td className="align-middle break-words py-2 pr-4 font-mono text-slate-900">{row.agent_id}</td>
+              <td className="align-middle py-2 pr-4"><ClaimList ids={row.stale_claims} /></td>
+              <td className="align-middle py-2 pr-4"><ClaimList ids={row.deprecated_claims} /></td>
+              <td className="align-middle py-2 pr-4"><PolicyLink id={row.policy_id} /></td>
+              <td className="align-middle py-2 pr-4 font-mono text-slate-700">{row.pushed}</td>
             </tr>
           ))}
         </tbody>
       </table>
-    </div>
+    </FiveRowTable>
   )
 }
 
@@ -171,19 +210,19 @@ function NotificationErrorTable({ run }: { run: SweepRunRecord }) {
       <table className="w-full min-w-[760px] text-left text-xs">
         <thead className="border-b border-slate-200 text-[10px] font-semibold uppercase tracking-wide text-slate-500">
           <tr>
-            <th className="py-1.5 pr-4">Agent</th>
-            <th className="py-1.5 pr-4">Stale Claims</th>
-            <th className="py-1.5 pr-4">Deprecated Claims</th>
-            <th className="py-1.5 pr-4">Error</th>
+            <th className="align-middle py-2 pr-4">Agent</th>
+            <th className="align-middle py-2 pr-4">Stale Claims</th>
+            <th className="align-middle py-2 pr-4">Deprecated Claims</th>
+            <th className="align-middle py-2 pr-4">Error</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-100">
           {errors.map((row) => (
             <tr key={`${row.agent_id}-${row.error}`}>
-              <td className="py-1.5 pr-4 font-mono text-slate-900">{row.agent_id}</td>
-              <td className="py-1.5 pr-4"><ClaimList ids={row.stale_claims} /></td>
-              <td className="py-1.5 pr-4"><ClaimList ids={row.deprecated_claims} /></td>
-              <td className="py-1.5 pr-4 text-[11px] leading-5 text-rose-700">{row.error}</td>
+              <td className="align-middle py-2 pr-4 font-mono text-slate-900">{row.agent_id}</td>
+              <td className="align-middle py-2 pr-4"><ClaimList ids={row.stale_claims} /></td>
+              <td className="align-middle py-2 pr-4"><ClaimList ids={row.deprecated_claims} /></td>
+              <td className="align-middle py-2 pr-4 text-[11px] leading-5 text-rose-700">{row.error}</td>
             </tr>
           ))}
         </tbody>
@@ -393,17 +432,21 @@ export function SweepPage() {
               </dl>
             </DrawerSection>
 
-            <div className="grid gap-2.5 xl:grid-cols-2">
-              <DrawerSection title="Stale Candidates">
+            <div className="grid gap-2.5" key={selectedRun.run_id}>
+              <CandidateSection title="Stale Candidates">
                 <CandidateTable rows={selectedRun.report.stale_claims} empty="No stale candidates in this run." />
-              </DrawerSection>
-              <DrawerSection title="Deprecated Candidates">
+              </CandidateSection>
+              <CandidateSection title="Deprecated Candidates">
                 <CandidateTable rows={selectedRun.report.deprecated_claims} empty="No deprecated candidates in this run." />
-              </DrawerSection>
+              </CandidateSection>
             </div>
 
             <DrawerSection title="Sweep Notifications">
               <NotificationTable run={selectedRun} />
+            </DrawerSection>
+
+            <DrawerSection title="Suggestions & Current Claims">
+              <SweepClaimComparison key={selectedRun.run_id} run={selectedRun} />
             </DrawerSection>
 
             <DrawerSection title="Notification Errors">

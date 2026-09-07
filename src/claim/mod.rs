@@ -31,6 +31,8 @@ pub use id::{
     PolicyId, SessionId, SourceId, TraceId,
 };
 pub use inbox::{InboxMessage, InboxMessageKind};
-pub use outbox::{DeliveredMark, InboxAckRequest, OfferedMark, OutboxEntry, OutboxTarget};
+pub use outbox::{
+    DeliveredMark, InboxAckRequest, OfferedMark, OutboxEntry, OutboxTarget, SweepNotificationItem,
+};
 pub use policy::{Policy, PolicyMessageType, PolicyStatus};
 pub use trace::Trace;

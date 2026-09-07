@@ -789,6 +789,7 @@ impl ResolutionService {
                         created_at: resolution_record.created_at,
                         offered_to: Vec::new(),
                         delivered_to: Vec::new(),
+                        sweep_items: vec![],
                         inbox_message: target.inbox_message.clone(),
                     },
                 )

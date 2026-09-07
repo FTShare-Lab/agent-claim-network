@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use super::id::{AgentId, InboxId, MaintainerActionId};
 use super::inbox::InboxMessage;
+use super::{ClaimId, ClaimStatus};
 use crate::time::serde_utc;
 
 /// Maintainer 投递台账中的一条记录。
@@ -35,7 +36,20 @@ pub struct OutboxEntry {
     pub offered_to: Vec<OfferedMark>,
     #[serde(default)]
     pub delivered_to: Vec<DeliveredMark>,
+    /// Sweep 按 Claim 更新时间分轮去重的依据，与可投递消息一起原子落盘。
+    /// 缺失表示普通通知或升级前的记录；不从历史消息正文推断去重信息。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sweep_items: Vec<SweepNotificationItem>,
     pub inbox_message: InboxMessage,
+}
+
+/// 一条 sweep 建议的轮次；目标 Agent 由所属 outbox 的 targeted 字段确定。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SweepNotificationItem {
+    pub claim_id: ClaimId,
+    #[serde(with = "serde_utc")]
+    pub effective_updated_at: DateTime<Utc>,
+    pub suggested_status: ClaimStatus,
 }
 
 /// 单个 Agent 的可重投提供记录。
@@ -122,6 +136,7 @@ mod tests {
                 agent_id: AgentId::new("agent-a").unwrap(),
                 sent_at: "2026-05-14T10:01:00Z".parse().unwrap(),
             }],
+            sweep_items: vec![],
             inbox_message: sample_inbox_message(mid),
         };
         let yaml = serde_yaml_ng::to_string(&entry).unwrap();
@@ -147,6 +162,7 @@ mod tests {
             created_at: "2026-05-14T10:00:00Z".parse().unwrap(),
             offered_to: vec![],
             delivered_to: vec![],
+            sweep_items: vec![],
             inbox_message: sample_inbox_message(mid),
         };
         let yaml = serde_yaml_ng::to_string(&entry).unwrap();
@@ -166,6 +182,7 @@ mod tests {
             created_at: "2026-05-14T10:00:00Z".parse().unwrap(),
             offered_to: vec![],
             delivered_to: vec![],
+            sweep_items: vec![],
             inbox_message: sample_inbox_message(mid),
         };
         let yaml = serde_yaml_ng::to_string(&entry).unwrap();
@@ -183,6 +200,7 @@ mod tests {
             created_at: "2026-05-14T10:00:00Z".parse().unwrap(),
             offered_to: vec![],
             delivered_to: vec![],
+            sweep_items: vec![],
             inbox_message: sample_inbox_message(mid),
         };
         let yaml = serde_yaml_ng::to_string(&entry).unwrap();
