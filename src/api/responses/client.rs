@@ -469,7 +469,13 @@ fn is_retryable(error: &ResponsesError) -> bool {
     }
     match error {
         ResponsesError::Http(error) => error.is_retryable(),
-        ResponsesError::Status { status, .. } => *status == 429 || *status >= 500,
+        ResponsesError::Status { status, body } => {
+            *status == 429
+                || *status >= 500
+                // 已保存完整 replay 的请求也可能遭到此校验拒绝，随后原样回放成功。
+                // 仅消耗现有 HTTP retry 预算；不补造 reasoning，也不修改历史或切换 transport。
+                || (*status == 400 && is_replay_validation_rejection(body))
+        }
         ResponsesError::StreamFailure { .. } => true,
         ResponsesError::Auth(_)
         | ResponsesError::ResponseJson(_)
@@ -480,6 +486,17 @@ fn is_retryable(error: &ResponsesError) -> bool {
         | ResponsesError::RecoveryInterrupted
         | ResponsesError::RequestPreparation { .. } => false,
     }
+}
+
+fn is_replay_validation_rejection(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value.get("error")?.get("message")?.as_str().map(|message| {
+                message == "The `reasoning_text` in the thinking mode must be passed back to the API."
+            })
+        })
+        .unwrap_or(false)
 }
 
 pub(crate) fn is_stream_recovery_failure(error: &ResponsesError) -> bool {
@@ -691,6 +708,102 @@ mod tests {
         assert_eq!(requests.await.unwrap(), 2);
     }
 
+    fn replay_validation_error_body() -> String {
+        json!({"error":{"message":"The `reasoning_text` in the thinking mode must be passed back to the API."}}).to_string()
+    }
+
+    #[tokio::test]
+    async fn client_retries_replay_validation_without_changing_request() {
+        for stream in [false, true] {
+            let item = json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]});
+            let terminal = json!({"status":"completed","output":[item]});
+            let success = if stream {
+                format!(
+                    "data: {}\n\ndata: {}\n\n",
+                    json!({"type":"response.output_item.done","output_index":0,"item":item}),
+                    json!({"type":"response.completed","response":terminal})
+                )
+            } else {
+                terminal.to_string()
+            };
+            let (endpoint, requests) =
+                spawn_status_sequence(vec![(400, replay_validation_error_body()), (200, success)])
+                    .await;
+            let client = ResponsesClient::new(
+                endpoint,
+                "test-key".into(),
+                Duration::from_secs(5),
+                2,
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .unwrap();
+            let mut request = request(stream);
+            request.input.extend([
+                json!({"type":"reasoning","content":[{"type":"reasoning_text","text":"Inspect the value."}]}),
+                json!({"type":"function_call","call_id":"call_1","name":"inspect","arguments":"{}"}),
+                json!({"type":"function_call_output","call_id":"call_1","output":"42"}),
+            ]);
+            let response = client.send(&request, &mut |_| {}).await.unwrap();
+            assert_eq!(response.output_text, "ok");
+            // fake server 同时逐字比较重试的 HTTP request，包含完整 reasoning/tool replay。
+            assert_eq!(requests.await.unwrap(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn client_replay_validation_respects_existing_retry_budget() {
+        for stream in [false, true] {
+            for retries in [0, 2] {
+                let responses = (0..=retries)
+                    .map(|_| (400, replay_validation_error_body()))
+                    .collect();
+                let (endpoint, requests) = spawn_status_sequence(responses).await;
+                let client = ResponsesClient::new(
+                    endpoint,
+                    "test-key".into(),
+                    Duration::from_secs(5),
+                    retries,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )
+                .unwrap();
+                let error = client
+                    .send(&request(stream), &mut |_| {})
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, ResponsesError::Status { status: 400, .. }));
+                assert_eq!(
+                    requests.await.unwrap(),
+                    usize::try_from(retries + 1).unwrap()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn client_does_not_retry_other_bad_requests() {
+        for stream in [false, true] {
+            let body = json!({"error":{"message":"Invalid function arguments"}}).to_string();
+            let (endpoint, requests) = spawn_status_sequence(vec![(400, body)]).await;
+            let client = ResponsesClient::new(
+                endpoint,
+                "test-key".into(),
+                Duration::from_secs(5),
+                2,
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .unwrap();
+            let error = client
+                .send(&request(stream), &mut |_| {})
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ResponsesError::Status { status: 400, .. }));
+            assert_eq!(requests.await.unwrap(), 1);
+        }
+    }
+
     #[tokio::test]
     async fn client_retries_streaming_failure_before_any_visible_text() {
         let item = json!({
@@ -885,6 +998,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let expected = responses.len();
         let handle = tokio::spawn(async move {
+            let mut first_request = None;
             for (status, body) in responses {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
@@ -911,6 +1025,14 @@ mod tests {
                     if request.len() >= header_end + 4 + content_length {
                         break;
                     }
+                }
+                if let Some(first) = &first_request {
+                    assert_eq!(
+                        &request, first,
+                        "retry must preserve the complete HTTP request"
+                    );
+                } else {
+                    first_request = Some(request);
                 }
                 let reason = if status == 200 { "OK" } else { "Test Error" };
                 let response = format!(
