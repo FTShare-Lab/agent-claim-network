@@ -1,6 +1,6 @@
 //! provider-neutral 结构化 JSON 调用辅助。
 //!
-//! 本模块用于 internalize/finalize 这类“只要 JSON、不要工具”的 LLM 调用。
+//! 本模块用于 internalize/finalize 这类只消费 JSON、不执行工具的 LLM 调用。
 //! 它复用 `ProviderAdapter::send`，并集中处理纯文本提取、fence 剥离与 JSON parse retry。
 
 use std::sync::Arc;
@@ -18,9 +18,12 @@ use crate::api::{
 use super::provider::{ProviderNoConsumableOutput, ProviderTransport};
 
 const STRUCTURED_JSON_RETRY_RAW_MAX_CHARS: usize = 4000;
+const STRUCTURED_OUTPUT_FUNCTION: &str = "return_structured_result";
 
 /// 通过 provider-neutral 接口生成结构化 JSON。
+#[derive(Clone)]
 pub struct StructuredJsonCaller {
+    output_function_schema: Option<Value>,
     provider: Arc<dyn ProviderAdapter>,
     max_tokens: u32,
     retry_count: u32,
@@ -189,12 +192,63 @@ impl StructuredJsonCaller {
         retry_max_delay: Duration,
     ) -> Self {
         Self {
+            output_function_schema: None,
             provider,
             max_tokens,
             retry_count,
             retry_base_delay,
             retry_max_delay,
         }
+    }
+
+    /// 复盘允许用函数参数承载 JSON；这里仅提取输出，不派发工具执行。
+    pub(crate) fn with_function_output(&self, input_schema: Value) -> Self {
+        let mut caller = self.clone();
+        caller.output_function_schema = Some(input_schema);
+        caller
+    }
+
+    fn prepare_output_request(&self, mut request: ProviderRequest) -> ProviderRequest {
+        if let Some(input_schema) = &self.output_function_schema {
+            request.tools = vec![crate::api::ToolSpec {
+                name: STRUCTURED_OUTPUT_FUNCTION.into(),
+                description: "Return the requested JSON object as this function arguments. This only supplies structured output; it performs no external action.".into(),
+                input_schema: input_schema.clone(),
+            }];
+            request
+                .system_prompt
+                .push_str("\n通过 return_structured_result 函数的参数返回要求的 JSON 对象。");
+        }
+        request
+    }
+
+    fn normalize_output_response(&self, mut response: ProviderResponse) -> ProviderResponse {
+        if self.output_function_schema.is_none()
+            || response.stop != ProviderStop::ToolUse
+            || response.assistant_message.role != "assistant"
+        {
+            return response;
+        }
+        let mut output = None;
+        for block in &response.assistant_message.content {
+            match block {
+                SessionTurnContentBlock::Text { .. } => {}
+                SessionTurnContentBlock::ToolUse { name, input, .. }
+                    if name == STRUCTURED_OUTPUT_FUNCTION
+                        && input.is_object()
+                        && output.is_none() =>
+                {
+                    output = Some(input.to_string());
+                }
+                // 不接受额外调用或其他媒体；保留原响应交给既有终态校验拒绝。
+                _ => return response,
+            }
+        }
+        if let Some(text) = output {
+            response.assistant_message = SessionTurnMessage::assistant_text(text);
+            response.stop = ProviderStop::Done;
+        }
+        response
     }
 
     pub(crate) fn max_tokens(&self) -> u32 {
@@ -291,6 +345,7 @@ impl StructuredJsonCaller {
         V: FnMut(Value) -> anyhow::Result<T>,
     {
         let caller = Self {
+            output_function_schema: self.output_function_schema.clone(),
             provider: Arc::clone(&self.provider),
             max_tokens: self.max_tokens,
             retry_count: 0,
@@ -601,7 +656,7 @@ impl StructuredJsonCaller {
         system_prompt: String,
         messages: Vec<SessionTurnMessage>,
     ) -> Result<Value, JsonCallError> {
-        let request = ProviderRequest {
+        let request = self.prepare_output_request(ProviderRequest {
             system_prompt,
             messages,
             tools: Vec::new(),
@@ -613,7 +668,7 @@ impl StructuredJsonCaller {
             recovery_interrupt: None,
             allow_continuation: true,
             retry_count_override: None,
-        };
+        });
 
         let mut emit = |_event: ProviderEvent| {};
         // 标准调用由 adapter 自己完成 provider retry；这里不能用单次 request timeout
@@ -624,7 +679,7 @@ impl StructuredJsonCaller {
             .await
             .map_err(JsonCallError::Provider)?;
 
-        parse_structured_response(response)
+        parse_structured_response(self.normalize_output_response(response))
     }
 
     #[allow(
@@ -649,7 +704,7 @@ impl StructuredJsonCaller {
                 |transport| transport.retry_fallback_scope(&runtime.fallback_scope),
             )
         });
-        let request = ProviderRequest {
+        let request = self.prepare_output_request(ProviderRequest {
             system_prompt,
             messages,
             tools: Vec::new(),
@@ -665,7 +720,7 @@ impl StructuredJsonCaller {
             recovery_interrupt: None,
             allow_continuation,
             retry_count_override,
-        };
+        });
 
         let response = if buffered_runtime.is_some() && stream {
             send_buffered_with_fallback(&self.provider, request)
@@ -708,7 +763,7 @@ impl StructuredJsonCaller {
                 .map_err(|error| JsonCallFailure::new(JsonCallError::Provider(error), None, None))?
         };
 
-        parse_structured_response_observed(response)
+        parse_structured_response_observed(self.normalize_output_response(response))
     }
 
     fn retry_delay(&self, attempt: u32) -> Duration {
@@ -1052,6 +1107,122 @@ mod tests {
         async fn discard_runtime_chain(&self, chain_id: crate::api::ProviderRuntimeChainId) {
             self.discarded_chains.lock().await.push(chain_id);
         }
+    }
+
+    fn structured_function_response(input: serde_json::Value) -> anyhow::Result<ProviderResponse> {
+        block_response(
+            vec![SessionTurnContentBlock::ToolUse {
+                id: "output-call".into(),
+                name: super::STRUCTURED_OUTPUT_FUNCTION.into(),
+                input,
+            }],
+            ProviderStop::ToolUse,
+        )
+    }
+
+    #[tokio::test]
+    async fn function_output_validates_payload_and_keeps_retry_budget() {
+        let provider = Arc::new(FakeProvider::new(vec![
+            structured_function_response(json!({"value": "invalid"})),
+            structured_function_response(json!({"value": 7})),
+        ]));
+        let value = caller(provider.clone())
+            .with_function_output(json!({"type": "object"}))
+            .generate_json_streaming_validated_with_retry_notice(
+                "system".into(),
+                vec![SessionTurnMessage::user_text("payload")],
+                BufferedProviderRuntime::new(ProviderRuntimeFallbackScope::new_root()),
+                |value| {
+                    value["value"]
+                        .as_u64()
+                        .ok_or_else(|| anyhow::anyhow!("integer required"))
+                },
+                |_, _, _| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(value, 7);
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].tools.len(), 1);
+        assert_eq!(requests[0].tools, requests[1].tools);
+        assert_eq!(requests[0].tools[0].name, super::STRUCTURED_OUTPUT_FUNCTION);
+        assert_eq!(requests[1].messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn function_output_single_attempt_still_rejects_invalid_business_payload() {
+        let provider = Arc::new(FakeProvider::new(vec![structured_function_response(
+            json!({"claim_id": "unknown"}),
+        )]));
+        let error = caller(provider.clone())
+            .with_function_output(json!({"type": "object"}))
+            .generate_json_validated_once(
+                "system".into(),
+                vec![SessionTurnMessage::user_text("payload")],
+                |_| -> anyhow::Result<()> { anyhow::bail!("unknown claim") },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown claim"));
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].retry_count_override, Some(0));
+        assert_eq!(requests[0].tools.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn function_output_rejects_extra_calls_without_executing_them() {
+        let mut response = structured_function_response(json!({"ok": true})).unwrap();
+        response
+            .assistant_message
+            .content
+            .push(SessionTurnContentBlock::ToolUse {
+                id: "unrequested-call".into(),
+                name: "unrequested_action".into(),
+                input: json!({}),
+            });
+        let provider = Arc::new(FakeProvider::new(vec![Ok(response)]));
+        let error = caller(provider.clone())
+            .with_function_output(json!({"type": "object"}))
+            .generate_json(
+                "system".into(),
+                vec![SessionTurnMessage::user_text("payload")],
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("只能包含 Text block"));
+        assert_eq!(provider.requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn function_output_does_not_accept_token_limited_arguments() {
+        let mut response = structured_function_response(json!({"ok": true})).unwrap();
+        response.stop = ProviderStop::MaxTokens;
+        let provider = Arc::new(FakeProvider::new(vec![Ok(response)]));
+        let error = caller(provider)
+            .with_function_output(json!({"type": "object"}))
+            .generate_json(
+                "system".into(),
+                vec![SessionTurnMessage::user_text("payload")],
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("MaxTokens"));
+    }
+
+    #[tokio::test]
+    async fn function_output_also_accepts_valid_text_json() {
+        let provider = Arc::new(FakeProvider::new(vec![text_response(r#"{"ok":true}"#)]));
+        let value = caller(provider)
+            .with_function_output(json!({"type": "object"}))
+            .generate_json(
+                "system".into(),
+                vec![SessionTurnMessage::user_text("payload")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(value, json!({"ok": true}));
     }
 
     fn caller(provider: Arc<dyn ProviderAdapter>) -> StructuredJsonCaller {

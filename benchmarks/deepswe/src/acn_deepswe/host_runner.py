@@ -11,6 +11,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import subprocess
 import threading
 import time
@@ -52,8 +53,8 @@ EVALUATION_MAX_PARALLEL_TOOL_CALLS = 5
 # 与 MiniSWE Responses 对照请求对齐：temperature=1.0、top_p=0.95。
 EVALUATION_TEMPERATURE = 1.0
 EVALUATION_TOP_P = 0.95
-# 由 CLI 主线程的 SIGINT handler 置位。KeyboardInterrupt 只投递到主线程，wave 中的
-# attempt 线程只能看到 Pier 子进程因同一信号退出，需要据此把失败标为操作者中断。
+# 由 CLI 主线程的 SIGINT/SIGTERM handler 置位。wave 线程据此停止派发、通知 Pier
+# 清理退出，并把相关 attempt 标为操作者中断。
 OPERATOR_INTERRUPT = threading.Event()
 CLAIM_BUNDLE_VARIANTS = frozenset(("B_claim", "B_forced_claim"))
 CLAIM_PRODUCER_VARIANTS = frozenset(("A", "B_empty"))
@@ -683,6 +684,40 @@ def build_verifier_regrade_job_config(
     }
 
 
+def _run_interruptible_pier(
+    command: list[str], *, check: bool = False, **kwargs: object
+) -> subprocess.CompletedProcess[str]:
+    """隔离 Pier 进程组；取消时先让 Pier 清理容器，再兜底回收子进程。"""
+    if OPERATOR_INTERRUPT.is_set():
+        return subprocess.CompletedProcess(command, -signal.SIGTERM, None, None)
+    with subprocess.Popen(command, start_new_session=True, **kwargs) as process:
+        while True:
+            try:
+                stdout, stderr = process.communicate(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                if not OPERATOR_INTERRUPT.is_set():
+                    continue
+                # Pier 的 SIGTERM handler 会进入异步 job 清理；先只通知主进程。
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
+                try:
+                    stdout, stderr = process.communicate(timeout=30)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    stdout, stderr = process.communicate()
+                break
+        result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+        if check:
+            result.check_returncode()
+        return result
+
+
 class Task1HostRunner:
     """两波编排四臂，并为 A、B_empty 分别冻结可审计 claim bundle。"""
 
@@ -692,7 +727,7 @@ class Task1HostRunner:
         jobs_directory: Path,
         execution: Task1ExecutionConfig | None = None,
         *,
-        run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        run: Callable[..., subprocess.CompletedProcess[str]] = _run_interruptible_pier,
         cleanup_trial_images: Callable[[str], int] | None = None,
         attempt_semaphore: threading.Semaphore | None = None,
     ) -> None:
@@ -945,7 +980,9 @@ class Task1HostRunner:
 
     @staticmethod
     def _raise_if_attempt_failed(record: AttemptExecutionRecord) -> None:
-        if record.status in {"gate_failed", "infrastructure_failed"}:
+        if record.reason == "INTERRUPTED_BY_OPERATOR" or record.status in {
+            "gate_failed", "infrastructure_failed"
+        }:
             raise TaskExecutionError(record.reason)
 
     @staticmethod
@@ -960,10 +997,22 @@ class Task1HostRunner:
     def _run_one_attempt(
         self, attempt: AttemptManifest, execution: Task1ExecutionConfig
     ) -> AttemptExecutionRecord:
+        cancelled = AttemptExecutionRecord(
+            attempt.attempt_id, attempt.variant, "not_run", "INTERRUPTED_BY_OPERATOR", None, None
+        )
+        if OPERATOR_INTERRUPT.is_set():
+            return cancelled
         if self._attempt_semaphore is None:
             return self._run_one_attempt_unbounded(attempt, execution)
-        with self._attempt_semaphore:
+        while not self._attempt_semaphore.acquire(timeout=0.5):
+            if OPERATOR_INTERRUPT.is_set():
+                return cancelled
+        try:
+            if OPERATOR_INTERRUPT.is_set():
+                return cancelled
             return self._run_one_attempt_unbounded(attempt, execution)
+        finally:
+            self._attempt_semaphore.release()
 
     def _run_one_attempt_unbounded(
         self, attempt: AttemptManifest, execution: Task1ExecutionConfig

@@ -242,3 +242,6 @@ Rust 侧带 `stage=` 前缀的失败摘要，用于区分 turn 阶段与 finaliz
 `pier_trial` / `verifier_regrade`。checkpoint 会持久化所有 task 终态（含 Gate、协议与基础设施失败）；普通 `--resume` 遇到任何
 失败终态即拒绝。只有无终态且已有半成品的中断 task，才可由操作者显式传
 `--resume --retry-interrupted` 重跑一次；此前的产物和 retry 计数都会保留。
+
+实验 CLI 收到 `SIGINT` 或 `SIGTERM` 后会停止启动排队中的 task / attempt，并通知运行中的
+Pier 清理退出；清理超时后回收对应进程组。中断不会删除已有证据，也不会自动重试任务。

@@ -321,6 +321,7 @@ def main(argv: list[str] | None = None) -> int:
                     completion_manifest_path=completion_manifest_path,
                 )
                 signal.signal(signal.SIGINT, _mark_operator_interrupt)
+                signal.signal(signal.SIGTERM, _mark_operator_interrupt)
                 results = runner.run(execute=True)
                 status = (
                     "completed_with_no_eligible_claim"

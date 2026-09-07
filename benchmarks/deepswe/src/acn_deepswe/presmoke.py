@@ -16,6 +16,7 @@ from typing import Protocol
 
 from .dataset import FrozenDatasetManifest
 from .host_runner import (
+    OPERATOR_INTERRUPT,
     Task1ExecutionConfig,
     Task1HostRunner,
     TaskExecutionError,
@@ -136,6 +137,8 @@ class PresmokeHostRunner:
     def _run_task(self, spec: PresmokeTaskSpec, execute: bool) -> PresmokeTaskResult:
         """task runner 必须返回明确执行状态，不能以正常返回推断为通过。"""
         try:
+            if execute and OPERATOR_INTERRUPT.is_set():
+                raise TaskExecutionError("INTERRUPTED_BY_OPERATOR")
             outcome = self._task_runner_factory(spec).run_task1(execute=execute)
         except TaskExecutionError as error:
             return PresmokeTaskResult(spec.task_id, "failed", str(spec.manifest_path), str(error))
