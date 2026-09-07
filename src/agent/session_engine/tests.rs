@@ -32,19 +32,21 @@ use super::{
     estimated_session_message_tokens_projected, finish_cancelled_turn_journal,
     hash_session_segment, is_canonical_messages_committed_error,
     journal_failure_overrides_turn_result, latest_model_context_matches,
-    parse_compaction_summary_outcome, persist_main_background_process_completions,
-    project_provider_context, select_compaction_summary_end_index,
+    manual_pending_provider_turn, parse_compaction_summary_outcome,
+    persist_main_background_process_completions, project_provider_context,
+    provider_recovery_suffix, recovery_turn_chain, select_compaction_summary_end_index,
     session_compaction_transcript_projection,
     session_compaction_transcript_projection_with_memory_mode,
     session_messages_to_provider_turn_messages, session_messages_to_turn_messages,
     session_messages_to_turn_transcript, session_messages_to_turn_transcript_with_memory_mode,
     should_emit_compaction_retry_warning, spawn_turn_control_journal_forwarder,
-    ActiveProjectionContext, CompactionAuditScope, CompactionAuditSummaryContext,
-    CompactionAuditTrigger, CompactionRanges, CompactionSummaryInputs,
-    DelegationProjectionBaseline, MainModelContextAppender, ManualCompactionOutcome,
-    PreflightCompactionRequest, PreflightCompactor, ProviderContextUsageAnchor,
-    ProviderProjectionBudget, SessionCompactionNoopReason, SessionCompactionResult, SessionEngine,
-    SessionEvent, SessionFinalizeOnceOutcome, SessionFinalizePreemptionControl,
+    write_provider_rejection_recovery, ActiveProjectionContext, CompactionAuditScope,
+    CompactionAuditSummaryContext, CompactionAuditTrigger, CompactionRanges,
+    CompactionSummaryInputs, DelegationProjectionBaseline, MainModelContextAppender,
+    ManualCompactionOutcome, PreflightCompactionRequest, PreflightCompactor,
+    ProviderContextUsageAnchor, ProviderProjectionBudget, ProviderRejectionRecoveryRecord,
+    SessionCompactionNoopReason, SessionCompactionResult, SessionEngine, SessionEvent,
+    SessionFinalizeOnceOutcome, SessionFinalizePreemptionControl,
     SessionRecapBackgroundProcessProjection, SessionRecapPreemptionControl,
     SessionTurnCommittedPostCommitError, TurnJournalEmitter, TurnJournalSink,
     COMPACTION_CHECKPOINT_SCHEMA_VERSION, DELEGATION_PROJECTION_MAX_CHARS,
@@ -58,11 +60,12 @@ use crate::api::{
     estimate_session_turn_messages_tokens, estimate_text_tokens, AgentTurnLoop,
     CompletedSessionTurnMessage, ContextUsageSnapshot, ContextUsageSource, InboxInternalizeKind,
     InternalizeRequest, MemoryReviewLoop, ModelContextSource, ProviderAdapter, ProviderEvent,
-    ProviderHistoryMediaPolicy, ProviderReplayIdentity, ProviderReplayProtocol,
-    ProviderReplayState, ProviderRequest, ProviderRequestObserver, ProviderResponse, ProviderStop,
-    ProviderStreamFailure, SessionAttachment, SessionTurnContentBlock, SessionTurnContextAppender,
-    SessionTurnEvent, SessionTurnHooks, SessionTurnMessage, SessionTurnPreflight,
-    SessionTurnRequest, StructuredJsonCaller, ToolCallSkipReason, TurnMessage,
+    ProviderHistoryMediaPolicy, ProviderRejectedRequestRecovery, ProviderReplayIdentity,
+    ProviderReplayProtocol, ProviderReplayState, ProviderRequest, ProviderRequestObserver,
+    ProviderRequestRejected, ProviderResponse, ProviderStop, ProviderStreamFailure,
+    SessionAttachment, SessionTurnContentBlock, SessionTurnContextAppender, SessionTurnEvent,
+    SessionTurnHooks, SessionTurnMessage, SessionTurnPreflight, SessionTurnRequest,
+    StructuredJsonCaller, ToolCallSkipReason, TurnMessage,
 };
 use crate::claim::{
     AgentId, Claim, ClaimId, ClaimStatus, Confidence, Dispute, DisputeId, InboxId, InboxMessage,
@@ -127,6 +130,14 @@ enum ProviderStep {
         message: &'static str,
         events: Vec<ProviderEvent>,
     },
+    TerminalFailure {
+        message: &'static str,
+    },
+    Rejected {
+        message: &'static str,
+    },
+    ContextWindowRejected,
+    MediaRejected,
     StreamFailure(&'static str),
     RequestTooLarge,
 }
@@ -135,6 +146,40 @@ struct RecordingProvider {
     steps: Mutex<VecDeque<ProviderStep>>,
     requests: Mutex<Vec<ProviderRequest>>,
     history_media_policy: ProviderHistoryMediaPolicy,
+}
+
+struct InternalRetryThenRejectedProvider {
+    calls: AtomicUsize,
+    requests: Mutex<Vec<ProviderRequest>>,
+    previous_attempt_ambiguous: bool,
+}
+
+struct AmbiguousRetryMediaThenRejectedProvider {
+    calls: AtomicUsize,
+    requests: Mutex<Vec<ProviderRequest>>,
+}
+
+struct AcceptedContinuationThenRejectedProvider {
+    requests: Mutex<Vec<ProviderRequest>>,
+    reject_media: bool,
+}
+
+impl InternalRetryThenRejectedProvider {
+    async fn requests(&self) -> Vec<ProviderRequest> {
+        self.requests.lock().await.clone()
+    }
+}
+
+impl AmbiguousRetryMediaThenRejectedProvider {
+    async fn requests(&self) -> Vec<ProviderRequest> {
+        self.requests.lock().await.clone()
+    }
+}
+
+impl AcceptedContinuationThenRejectedProvider {
+    async fn requests(&self) -> Vec<ProviderRequest> {
+        self.requests.lock().await.clone()
+    }
 }
 
 impl RecordingProvider {
@@ -283,6 +328,18 @@ impl ProviderAdapter for RecordingProvider {
                 }
                 anyhow::bail!(message)
             }
+            Some(ProviderStep::TerminalFailure { message }) => {
+                Err(crate::api::ProviderTerminalFailure::new(message).into())
+            }
+            Some(ProviderStep::Rejected { message }) => {
+                Err(crate::api::ProviderRequestRejected::new(message).into())
+            }
+            Some(ProviderStep::ContextWindowRejected) => {
+                Err(crate::api::ProviderContextWindowExceeded::new().into())
+            }
+            Some(ProviderStep::MediaRejected) => {
+                Err(crate::api::ProviderMediaRejected::new("provider rejected media input").into())
+            }
             Some(ProviderStep::StreamFailure(message)) => {
                 Err(ProviderStreamFailure::new(message).into())
             }
@@ -290,6 +347,146 @@ impl ProviderAdapter for RecordingProvider {
                 Err(crate::api::ProviderRequestTooLarge::new().into())
             }
             None => anyhow::bail!("recording provider response exhausted"),
+        }
+    }
+}
+
+#[async_trait]
+impl ProviderAdapter for InternalRetryThenRejectedProvider {
+    fn emit_preflight_context_estimate(&self) -> bool {
+        false
+    }
+
+    async fn send(
+        &self,
+        _request: ProviderRequest,
+        _emit: &mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> anyhow::Result<ProviderResponse> {
+        anyhow::bail!("unexpected unobserved Provider request")
+    }
+
+    async fn send_with_request_observer(
+        &self,
+        request: ProviderRequest,
+        emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        observer: &mut (dyn ProviderRequestObserver + Send),
+    ) -> anyhow::Result<ProviderResponse> {
+        observer.before_provider_request(&request.messages).await?;
+        observer.provider_request_started(&request.messages)?;
+        self.requests.lock().await.push(request.clone());
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                observer.provider_request_started_after(
+                    &request.messages,
+                    self.previous_attempt_ambiguous,
+                )?;
+                if self.previous_attempt_ambiguous {
+                    emit(ProviderEvent::AssistantTextDelta {
+                        text: "rejected retry partial".into(),
+                    });
+                }
+                self.requests.lock().await.push(request);
+                Err(crate::api::ProviderRequestRejected::new(
+                    "retry received deterministic rejection",
+                )
+                .into())
+            }
+            1 => Ok(provider_response("recovered ambiguous internal retry")),
+            call => anyhow::bail!("unexpected internal retry provider call {call}"),
+        }
+    }
+}
+
+#[async_trait]
+impl ProviderAdapter for AcceptedContinuationThenRejectedProvider {
+    fn emit_preflight_context_estimate(&self) -> bool {
+        false
+    }
+
+    async fn send(
+        &self,
+        _request: ProviderRequest,
+        _emit: &mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> anyhow::Result<ProviderResponse> {
+        anyhow::bail!("unexpected unobserved Provider request")
+    }
+
+    async fn send_with_request_observer(
+        &self,
+        request: ProviderRequest,
+        emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        observer: &mut (dyn ProviderRequestObserver + Send),
+    ) -> anyhow::Result<ProviderResponse> {
+        observer.before_provider_request(&request.messages).await?;
+        observer.provider_request_started_after(&request.messages, true)?;
+        if self.reject_media && self.requests.lock().await.len() == 2 {
+            self.requests.lock().await.push(request);
+            return Ok(provider_response("completed clean continuation"));
+        }
+        self.requests.lock().await.push(request.clone());
+        emit(ProviderEvent::AssistantTextDelta {
+            text: "kept prefix".into(),
+        });
+        observer
+            .provider_response_accepted(&request.messages)
+            .await?;
+
+        let mut continuation_messages = request.messages.clone();
+        continuation_messages.push(SessionTurnMessage::assistant_text("kept prefix"));
+        continuation_messages.push(SessionTurnMessage::user_text("continue"));
+        observer
+            .before_provider_request(&continuation_messages)
+            .await?;
+        observer.provider_request_started(&continuation_messages)?;
+        let mut continuation_request = request;
+        continuation_request.messages = continuation_messages.clone();
+        self.requests.lock().await.push(continuation_request);
+        emit(ProviderEvent::AssistantTextDelta {
+            text: "ghost suffix".into(),
+        });
+        observer.provider_request_outcome_resolved(&continuation_messages)?;
+        if self.reject_media {
+            Err(crate::api::ProviderRequestTooLarge::new().into())
+        } else {
+            Err(crate::api::ProviderRequestRejected::new("continuation rejected").into())
+        }
+    }
+}
+
+#[async_trait]
+impl ProviderAdapter for AmbiguousRetryMediaThenRejectedProvider {
+    fn emit_preflight_context_estimate(&self) -> bool {
+        false
+    }
+
+    async fn send(
+        &self,
+        _request: ProviderRequest,
+        _emit: &mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> anyhow::Result<ProviderResponse> {
+        anyhow::bail!("unexpected unobserved Provider request")
+    }
+
+    async fn send_with_request_observer(
+        &self,
+        request: ProviderRequest,
+        _emit: &mut (dyn FnMut(ProviderEvent) + Send),
+        observer: &mut (dyn ProviderRequestObserver + Send),
+    ) -> anyhow::Result<ProviderResponse> {
+        observer.before_provider_request(&request.messages).await?;
+        observer.provider_request_started(&request.messages)?;
+        self.requests.lock().await.push(request.clone());
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                observer.provider_request_started_after(&request.messages, true)?;
+                Err(crate::api::ProviderMediaRejected::new("retry rejected image input").into())
+            }
+            1 => Err(crate::api::ProviderRequestRejected::new(
+                "cleaned retry received deterministic rejection",
+            )
+            .into()),
+            2 => Ok(provider_response("recovered ambiguous media request")),
+            call => anyhow::bail!("unexpected ambiguous media provider call {call}"),
         }
     }
 }
@@ -2970,7 +3167,70 @@ async fn request_too_large_media_cleanup_persists_provider_history_for_resume() 
 }
 
 #[tokio::test]
-async fn request_too_large_recovery_discards_streaming_partial_before_tool_response() {
+async fn media_rejection_cleanup_persists_provider_history_for_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let image_path = dir.path().join("rejected-media.png");
+    let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2));
+    let mut image_bytes = Vec::new();
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut image_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    tokio::fs::write(&image_path, image_bytes).await.unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        ProviderStep::MediaRejected,
+        response_step("recovered without rejected media", Vec::new()),
+        response_step("resume stayed clean", Vec::new()),
+    ]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_0ed1af11").await;
+
+    engine
+        .run_turn_with_attachments(
+            &mut session,
+            "inspect rejected media",
+            vec![SessionAttachment::LocalImage { path: image_path }],
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+    let metadata = session.read_metadata().await.unwrap();
+    let stable_history = metadata
+        .compaction
+        .as_ref()
+        .and_then(|compaction| compaction.provider_history.as_ref())
+        .expect("media recovery must persist a clean Provider history")
+        .messages
+        .clone();
+    let stable_wire = serde_json::to_string(&stable_history).unwrap();
+    assert!(stable_wire.contains("<media_recovery>"));
+    assert!(!stable_history.iter().any(|message| message
+        .content
+        .iter()
+        .any(|block| matches!(block, SessionTurnContentBlock::Image { .. }))));
+
+    let agent_id = session.metadata.agent_id.clone();
+    let session_id = session.metadata.id.clone();
+    drop(session);
+    let mut resumed = store
+        .load_existing_session(&agent_id, &session_id)
+        .await
+        .unwrap();
+    engine
+        .run_turn(&mut resumed, "continue after media rejection", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 3);
+    assert!(requests[2].messages.starts_with(&stable_history));
+}
+
+#[tokio::test]
+async fn ambiguous_fallback_413_discards_partial_without_cleaning_media_wal() {
     let dir = tempfile::tempdir().unwrap();
     let image_path = dir.path().join("partial-before-413.png");
     let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2));
@@ -2990,18 +3250,12 @@ async fn request_too_large_recovery_discards_streaming_partial_before_tool_respo
             }],
         ),
         request_too_large_step(),
-        tool_use_step(
-            "toolu_after_413",
-            "working_note",
-            json!({"action": "add", "note": "continue after recovery"}),
-        ),
-        response_step("finished after tool", Vec::new()),
     ]));
-    let (engine, store) = build_test_engine(&dir, provider);
+    let (engine, store) = build_test_engine(&dir, provider.clone());
     let mut session = create_test_session(&store, "session_4130beef").await;
     let mut events = Vec::new();
 
-    engine
+    let error = engine
         .run_turn_with_attachments(
             &mut session,
             "inspect and continue with a tool",
@@ -3009,21 +3263,20 @@ async fn request_too_large_recovery_discards_streaming_partial_before_tool_respo
             |event| events.push(event),
         )
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("更早的 Provider attempt 结果不明确"));
 
-    let discarded = events
+    assert!(events
         .iter()
-        .position(|event| matches!(event, SessionEvent::AssistantOutputDiscarded))
-        .expect("streaming partial must be discarded");
-    let warning = events
+        .any(|event| matches!(event, SessionEvent::AssistantOutputDiscarded)));
+    assert!(!events
         .iter()
-        .position(|event| matches!(event, SessionEvent::Warning { .. }))
-        .expect("media recovery warning must be emitted");
-    let tool_started = events
+        .any(|event| matches!(event, SessionEvent::Warning { .. })));
+    assert!(!events
         .iter()
-        .position(|event| matches!(event, SessionEvent::ToolCallStarted { .. }))
-        .expect("clean retry should be allowed to return a tool call");
-    assert!(discarded < warning && warning < tool_started);
+        .any(|event| matches!(event, SessionEvent::ToolCallStarted { .. })));
 
     let journal_read = session.read_turn_journal().await;
     assert!(journal_read
@@ -3031,6 +3284,7 @@ async fn request_too_large_recovery_discards_streaming_partial_before_tool_respo
         .iter()
         .any(|event| matches!(event.kind, TurnJournalEventKind::AssistantOutputDiscarded)));
     let projection = replay_turn_journal(journal_read);
+    assert_eq!(projection.turns[0].status, Some(TurnJournalStatus::Failed));
     assert!(!projection.turns[0].assistant_text.contains("ghost partial"));
     assert!(!projection.turns[0]
         .timeline_items
@@ -3045,6 +3299,22 @@ async fn request_too_large_recovery_discards_streaming_partial_before_tool_respo
             .unwrap()
             .contains("ghost partial")
     );
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].messages, requests[1].messages);
+    let retained = session
+        .read_metadata()
+        .await
+        .unwrap()
+        .compaction
+        .and_then(|compaction| compaction.provider_history)
+        .expect("ambiguous 413 must retain the original media WAL");
+    assert_eq!(retained.messages, requests[0].messages);
+    assert!(retained.messages.iter().any(|message| message
+        .content
+        .iter()
+        .any(|block| matches!(block, SessionTurnContentBlock::Image { .. }))));
 }
 
 #[tokio::test]
@@ -3123,7 +3393,123 @@ async fn request_too_large_boundary_rebuilds_clean_history_without_provider_wal(
 }
 
 #[tokio::test]
-async fn failed_inline_media_cleanup_resumes_from_clean_provider_history() {
+async fn rejected_clean_retry_keeps_historical_media_boundary() {
+    for recovery_mode in 0..4 {
+        for second_is_413 in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2));
+            let mut bytes = Vec::new();
+            image
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageFormat::Png,
+                )
+                .unwrap();
+            let data = BASE64_STANDARD.encode(bytes);
+            let provider = Arc::new(
+                RecordingProvider::new(vec![
+                    response_step("historical image accepted", Vec::new()),
+                    request_too_large_step(),
+                    if second_is_413 {
+                        request_too_large_step()
+                    } else {
+                        ProviderStep::Rejected {
+                            message: "invalid request",
+                        }
+                    },
+                    response_step("new prompt accepted", Vec::new()),
+                ])
+                .with_history_media_policy(ProviderHistoryMediaPolicy::Preserve),
+            );
+            let (engine, store) = build_test_engine(&dir, provider.clone());
+            let mut session = create_test_session(&store, "session_face0025").await;
+            engine
+                .run_turn_with_attachments(
+                    &mut session,
+                    "historical image",
+                    vec![SessionAttachment::InlineImage {
+                        media_type: "image/png".into(),
+                        data: data.clone(),
+                    }],
+                    |_| {},
+                )
+                .await
+                .unwrap();
+            if recovery_mode == 3 {
+                let mut compaction = session.read_metadata().await.unwrap().compaction.unwrap();
+                let history = compaction.provider_history.as_mut().unwrap();
+                history.replay_identity = Some(ProviderReplayIdentity {
+                    protocol: ProviderReplayProtocol::OpenAiResponses,
+                    model: "previous-model".into(),
+                });
+                for _ in 0..10 {
+                    history
+                        .messages
+                        .push(SessionTurnMessage::assistant_text("old continuation"));
+                    history
+                        .messages
+                        .push(SessionTurnMessage::user_text("continue"));
+                }
+                session.update_compaction(compaction).await.unwrap();
+            }
+            engine
+                .run_turn(&mut session, "REJECTED_TEXT_TURN", |_| {})
+                .await
+                .unwrap_err();
+            let mut compaction = session.read_metadata().await.unwrap().compaction.unwrap();
+            let history = compaction.provider_history.as_mut().unwrap();
+            let cleaned = serde_json::to_string(&history.messages).unwrap();
+            assert!(
+                !cleaned.contains(&data),
+                "mode={recovery_mode}, 413={second_is_413}"
+            );
+            assert!(!cleaned.contains("REJECTED_TEXT_TURN"));
+            assert!(cleaned.contains("<request_size_recovery>"));
+            let journal = replay_turn_journal(session.read_turn_journal().await);
+            assert_eq!(
+                journal.turns[1].status,
+                Some(TurnJournalStatus::RejectedByProvider)
+            );
+            assert_eq!(journal.turns[1].model_context.len(), 1);
+            assert_eq!(
+                journal.turns[1].model_context[0].source,
+                ModelContextSource::RequestSizeRecovery
+            );
+            match recovery_mode {
+                1 => compaction.provider_history = None,
+                2 => {
+                    history.replay_identity = Some(ProviderReplayIdentity {
+                        protocol: ProviderReplayProtocol::OpenAiResponses,
+                        model: "other-model".into(),
+                    })
+                }
+                _ => {}
+            }
+            session.update_compaction(compaction).await.unwrap();
+            let agent_id = session.metadata.agent_id.clone();
+            let session_id = session.metadata.id.clone();
+            drop(session);
+            let mut resumed = store
+                .load_existing_session(&agent_id, &session_id)
+                .await
+                .unwrap();
+            engine
+                .run_turn(&mut resumed, "NEW_TEXT_TURN", |_| {})
+                .await
+                .unwrap();
+            let requests = provider.requests().await;
+            assert_eq!(requests.len(), 4);
+            let wire = serde_json::to_string(&requests[3].messages).unwrap();
+            assert!(!wire.contains(&data));
+            assert!(!wire.contains("REJECTED_TEXT_TURN"));
+            assert!(wire.contains("NEW_TEXT_TURN"));
+            assert!(wire.contains("<request_size_recovery>"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn repeated_request_too_large_discards_the_cleaned_rejected_turn() {
     let dir = tempfile::tempdir().unwrap();
     let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2));
     let mut image_bytes = Vec::new();
@@ -3160,9 +3546,10 @@ async fn failed_inline_media_cleanup_resumes_from_clean_provider_history() {
         .await
         .expect_err("the second 413 must fail the active turn");
 
-    assert!(error
-        .downcast_ref::<crate::api::ProviderRequestTooLarge>()
-        .is_some());
+    let rejected = error
+        .downcast_ref::<crate::api::ProviderRequestRejected>()
+        .expect("the cleaned retry was deterministically rejected");
+    assert!(rejected.should_discard_turn());
     assert_eq!(warnings.len(), 1);
     assert_eq!(
         warnings[0],
@@ -3170,25 +3557,23 @@ async fn failed_inline_media_cleanup_resumes_from_clean_provider_history() {
     );
     assert!(session.read_messages().await.unwrap().is_empty());
     let failed_journal = replay_turn_journal(session.read_turn_journal().await);
-    assert!(failed_journal.turns[0]
+    assert_eq!(
+        failed_journal.turns[0].status,
+        Some(TurnJournalStatus::RejectedByProvider)
+    );
+    assert!(!failed_journal.turns[0]
         .model_context
         .iter()
         .any(|context| context.source == ModelContextSource::RequestSizeRecovery));
     let failed_requests = provider.requests().await;
     assert_eq!(failed_requests.len(), 2);
-    let metadata = session.read_metadata().await.unwrap();
-    let pending_history = metadata
+    assert!(session
+        .read_metadata()
+        .await
+        .unwrap()
         .compaction
-        .as_ref()
-        .and_then(|compaction| compaction.provider_history.as_ref())
-        .expect("the cleaned retry must remain as the failed turn WAL");
-    assert!(pending_history.pending_turn.is_some());
-    assert_eq!(pending_history.messages, failed_requests[1].messages);
-    let pending_wire = serde_json::to_string(&pending_history.messages).unwrap();
-    assert!(pending_wire.contains("image attachment removed after upstream request_too_large"));
-    assert!(pending_wire.contains("<request_size_recovery>"));
-    assert!(pending_wire.contains("few local files necessary to complete the task"));
-    assert!(!pending_wire.contains(&inline_data));
+        .and_then(|compaction| compaction.provider_history)
+        .is_none());
 
     let agent_id = session.metadata.agent_id.clone();
     let session_id = session.metadata.id.clone();
@@ -3204,14 +3589,16 @@ async fn failed_inline_media_cleanup_resumes_from_clean_provider_history() {
 
     let requests = provider.requests().await;
     assert_eq!(requests.len(), 3);
-    assert!(requests[2]
-        .messages
-        .starts_with(&failed_requests[1].messages));
+    let resumed_wire = serde_json::to_string(&requests[2].messages).unwrap();
+    assert!(!resumed_wire.contains("inspect clipboard image"));
+    assert!(!resumed_wire.contains("<request_size_recovery>"));
+    assert!(!resumed_wire.contains(&inline_data));
+    assert!(resumed_wire.contains("continue without the image"));
     assert!(!requests[2].messages.iter().any(|message| message
         .content
         .iter()
         .any(|block| matches!(block, SessionTurnContentBlock::Image { .. }))));
-    assert!(resumed
+    assert!(!resumed
         .read_messages()
         .await
         .unwrap()
@@ -3230,7 +3617,7 @@ async fn failed_inline_media_cleanup_resumes_from_clean_provider_history() {
 }
 
 #[tokio::test]
-async fn failed_media_cleanup_recovers_boundary_without_provider_wal() {
+async fn repeated_request_too_large_preserves_completed_tool_with_clean_history() {
     let dir = tempfile::tempdir().unwrap();
     let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2));
     let mut image_bytes = Vec::new();
@@ -3242,9 +3629,14 @@ async fn failed_media_cleanup_recovers_boundary_without_provider_wal() {
         .unwrap();
     let inline_data = BASE64_STANDARD.encode(image_bytes);
     let provider = Arc::new(RecordingProvider::new(vec![
+        tool_use_step(
+            "toolu_before_repeated_413",
+            "working_note",
+            json!({"action": "add", "note": "TOOL_COMPLETED_BEFORE_REPEATED_413"}),
+        ),
         request_too_large_step(),
         request_too_large_step(),
-        response_step("continued from journal boundary", Vec::new()),
+        response_step("continued from clean journal boundary", Vec::new()),
     ]));
     let (engine, store) = build_test_engine(&dir, provider.clone());
     let mut session = create_test_session(&store, "session_4130dead").await;
@@ -3260,16 +3652,28 @@ async fn failed_media_cleanup_recovers_boundary_without_provider_wal() {
             |_| {},
         )
         .await
-        .expect_err("cleaned retry should preserve a failed journal boundary");
+        .expect_err("the cleaned retry should be rejected without losing tool progress");
 
-    let mut compaction = session
+    let projection = replay_turn_journal(session.read_turn_journal().await);
+    assert_eq!(projection.turns[0].status, Some(TurnJournalStatus::Failed));
+    assert!(projection.turns[0]
+        .tool_calls
+        .iter()
+        .any(|tool| tool.tool_use_id == "toolu_before_repeated_413"
+            && tool.completed_summary.is_some()));
+    let clean_history = session
         .read_metadata()
         .await
         .unwrap()
         .compaction
-        .expect("failed cleaned request should leave a Provider WAL");
-    compaction.provider_history = None;
-    session.update_compaction(compaction).await.unwrap();
+        .and_then(|compaction| compaction.provider_history)
+        .expect("accepted tool request must remain as a clean recovery boundary");
+    let clean_wire = serde_json::to_string(&clean_history.messages).unwrap();
+    assert!(!clean_wire.contains(&inline_data));
+    assert!(!clean_history.messages.iter().any(|message| message
+        .content
+        .iter()
+        .any(|block| matches!(block, SessionTurnContentBlock::Image { .. }))));
     let agent_id = session.metadata.agent_id.clone();
     let session_id = session.metadata.id.clone();
     drop(session);
@@ -3279,19 +3683,28 @@ async fn failed_media_cleanup_recovers_boundary_without_provider_wal() {
         .unwrap();
 
     engine
-        .run_turn(&mut resumed, "continue from journal only", |_| {})
+        .run_turn(&mut resumed, "continue after repeated 413", |_| {})
         .await
         .unwrap();
 
     let requests = provider.requests().await;
-    assert_eq!(requests.len(), 3);
-    let rebuilt_wire = serde_json::to_string(&requests[2].messages).unwrap();
+    assert_eq!(requests.len(), 4);
+    let rebuilt_wire = serde_json::to_string(&requests[3].messages).unwrap();
     assert!(rebuilt_wire.contains("<request_size_recovery>"));
+    assert!(rebuilt_wire.contains("tools_completed"));
+    assert!(rebuilt_wire.contains("toolu_before_repeated_413"));
+    assert!(rebuilt_wire.contains("TOOL_COMPLETED_BEFORE_REPEATED_413"));
     assert!(!rebuilt_wire.contains(&inline_data));
-    assert!(!requests[2].messages.iter().any(|message| message
-        .content
-        .iter()
-        .any(|block| matches!(block, SessionTurnContentBlock::Image { .. }))));
+    assert!(!requests[3].messages.iter().any(|message| {
+        message.content.iter().any(|block| {
+            matches!(block, SessionTurnContentBlock::Image { .. })
+                || matches!(
+                    block,
+                    SessionTurnContentBlock::ToolUse { id, .. }
+                        if id == "toolu_before_repeated_413"
+                )
+        })
+    }));
     assert!(resumed
         .read_messages()
         .await
@@ -3754,6 +4167,152 @@ async fn context_window_recovery_forces_compaction_and_preserves_latest_anthropi
 }
 
 #[tokio::test]
+async fn rejected_context_window_request_cleans_wal_then_compacts_and_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let older_tool_payload = format!("REJECTED_CONTEXT_PAYLOAD-{}", "x".repeat(12_000));
+    let provider = Arc::new(RecordingProvider::new(vec![
+        ProviderStep::Response {
+            response: ProviderResponse {
+                assistant_message: SessionTurnMessage {
+                    role: "assistant".into(),
+                    provider_replay: None,
+                    content: vec![SessionTurnContentBlock::ToolUse {
+                        id: "toolu_rejected_context".into(),
+                        name: "working_note".into(),
+                        input: json!({"action": "add", "note": older_tool_payload}),
+                    }],
+                },
+                stop: ProviderStop::ToolUse,
+            },
+            events: Vec::new(),
+        },
+        ProviderStep::ContextWindowRejected,
+        response_step(
+            r#"{"committed_summary": null, "active_turn_summary": "The earlier working-note tool round completed."}"#,
+            Vec::new(),
+        ),
+        response_step("recovered after rejected context request", Vec::new()),
+    ]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.compaction.auto_compact_ctx_ratio = 0.9;
+    engine.compaction.tail_target_ctx_ratio = 0.00001;
+    let mut session = create_test_session(&store, "session_c07e1701").await;
+
+    engine
+        .run_turn(&mut session, "recover the rejected context request", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 4);
+    assert!(serde_json::to_string(&requests[2].messages)
+        .unwrap()
+        .contains("REJECTED_CONTEXT_PAYLOAD"));
+    let retried_wire = serde_json::to_string(&requests[3].messages).unwrap();
+    assert!(retried_wire.contains("compacted_current_turn_progress"));
+    assert!(!retried_wire.contains("REJECTED_CONTEXT_PAYLOAD"));
+    let metadata = session.read_metadata().await.unwrap();
+    let stable_history = metadata
+        .compaction
+        .as_ref()
+        .and_then(|compaction| compaction.provider_history.as_ref())
+        .expect("successful retry must promote the compacted Provider history");
+    assert!(stable_history.pending_turn.is_none());
+    let journal = replay_turn_journal(session.read_turn_journal().await);
+    assert_eq!(journal.turns[0].status, Some(TurnJournalStatus::Committed));
+}
+
+#[tokio::test]
+async fn first_request_context_rejection_compacts_committed_history_and_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let older_payload = format!("OLDER_COMMITTED_CONTEXT-{}", "x".repeat(12_000));
+    let provider = Arc::new(RecordingProvider::new(vec![
+        response_step(&older_payload, Vec::new()),
+        ProviderStep::ContextWindowRejected,
+        response_step(
+            r#"{"committed_summary":"Older committed context.","active_turn_summary":null}"#,
+            Vec::new(),
+        ),
+        response_step("recovered after first request rejection", Vec::new()),
+    ]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.compaction.auto_compact_ctx_ratio = 0.9;
+    engine.compaction.tail_target_ctx_ratio = 0.00001;
+    let mut session = create_test_session(&store, "session_c07e1702").await;
+
+    engine
+        .run_turn(&mut session, "create committed history", |_| {})
+        .await
+        .unwrap();
+    engine
+        .run_turn(&mut session, "recover on the first request", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 4);
+    let rejected_wire = serde_json::to_string(&requests[1].messages).unwrap();
+    assert!(rejected_wire.contains("OLDER_COMMITTED_CONTEXT"));
+    let compaction_wire = serde_json::to_string(&requests[2].messages).unwrap();
+    assert!(compaction_wire.contains("OLDER_COMMITTED_CONTEXT"));
+    let retried_wire = serde_json::to_string(&requests[3].messages).unwrap();
+    assert!(retried_wire.contains("Older committed context."));
+    assert!(!retried_wire.contains("OLDER_COMMITTED_CONTEXT"));
+    assert!(retried_wire.contains("recover on the first request"));
+
+    let journal = replay_turn_journal(session.read_turn_journal().await);
+    assert_eq!(journal.turns.len(), 2);
+    assert!(journal
+        .turns
+        .iter()
+        .all(|turn| turn.status == Some(TurnJournalStatus::Committed)));
+}
+
+#[tokio::test]
+async fn failed_retry_after_context_rejection_remains_recoverable() {
+    let dir = tempfile::tempdir().unwrap();
+    let older_payload = format!("OLDER_CONTEXT_BEFORE_FAILED_RETRY-{}", "x".repeat(12_000));
+    let provider = Arc::new(RecordingProvider::new(vec![
+        response_step(&older_payload, Vec::new()),
+        ProviderStep::ContextWindowRejected,
+        response_step(
+            r#"{"committed_summary":"Older context.","active_turn_summary":null}"#,
+            Vec::new(),
+        ),
+        error_step("transport failed after context recovery", Vec::new()),
+        response_step("recovered on the next turn", Vec::new()),
+    ]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.compaction.auto_compact_ctx_ratio = 0.9;
+    engine.compaction.tail_target_ctx_ratio = 0.00001;
+    let mut session = create_test_session(&store, "session_c07e1703").await;
+
+    engine
+        .run_turn(&mut session, "create older context", |_| {})
+        .await
+        .unwrap();
+    engine
+        .run_turn(&mut session, "recover context then fail", |_| {})
+        .await
+        .unwrap_err();
+
+    let journal = replay_turn_journal(session.read_turn_journal().await);
+    assert_eq!(journal.turns[1].status, Some(TurnJournalStatus::Failed));
+
+    engine
+        .run_turn(&mut session, "continue after failed retry", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 5);
+    let resumed_wire = serde_json::to_string(&requests[4].messages).unwrap();
+    assert!(resumed_wire.contains("recover context then fail"));
+    assert!(resumed_wire.contains("<interrupted_turn_context>"));
+    assert!(resumed_wire.contains("continue after failed retry"));
+}
+
+#[tokio::test]
 async fn internal_max_token_then_context_recovery_preserves_entire_anthropic_replay_chain() {
     let dir = tempfile::tempdir().unwrap();
     let older_tool_payload = format!("OLDER_INTERNAL_CONTEXT_PAYLOAD-{}", "x".repeat(12_000));
@@ -4189,6 +4748,204 @@ async fn preflight_active_compaction_preserves_prior_summary_across_multiple_com
 }
 
 #[tokio::test]
+async fn recovered_turn_can_compact_after_context_request_rejection() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        tool_use_step(
+            "toolu_recovered",
+            "working_note",
+            json!({"action": "add", "note": "recoverable work ".repeat(1_000)}),
+        ),
+        error_step("interrupted earlier work", Vec::new()),
+        ProviderStep::ContextWindowRejected,
+        response_step(
+            &json!({"committed_summary":null,"active_turn_summary":"Intermediate recovery summary. ".repeat(100)}).to_string(),
+            Vec::new(),
+        ),
+        ProviderStep::ContextWindowRejected,
+        response_step(
+            r#"{"committed_summary":null,"active_turn_summary":"Recovered work summarized."}"#,
+            Vec::new(),
+        ),
+        response_step("recovered after context rejection", Vec::new()),
+    ]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.compaction.auto_compact_ctx_ratio = 0.0;
+    engine.compaction.tail_target_ctx_ratio = 0.00001;
+    let mut session = create_test_session(&store, "session_face0026").await;
+    engine
+        .run_turn(&mut session, "earlier task", |_| {})
+        .await
+        .unwrap_err();
+    engine.compaction.auto_compact_ctx_ratio = 0.9;
+    let mut compacted = false;
+    engine
+        .run_turn(&mut session, "resume task", |event| {
+            compacted |= matches!(event, SessionEvent::CompactionCompleted { .. });
+        })
+        .await
+        .unwrap();
+    assert!(compacted);
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 7);
+    let final_wire = serde_json::to_string(&requests[6].messages).unwrap();
+    assert!(final_wire.contains("Recovered work summarized."));
+    assert!(final_wire.contains("resume task"));
+}
+
+#[tokio::test]
+async fn recovery_turn_preserves_summary_across_multiple_auto_compacts() {
+    assert_recovery_turn_can_compact_again(false).await;
+}
+
+#[tokio::test]
+async fn recovery_turn_forces_context_compaction_after_auto_compact() {
+    assert_recovery_turn_can_compact_again(true).await;
+}
+
+async fn assert_recovery_turn_can_compact_again(force_context_recovery: bool) {
+    const RECOVERY_SUMMARY: &str = "Earlier failed work summarized.";
+    const FIRST_SUMMARY: &str = "Failed work and first live tool round summarized.";
+    const SECOND_SUMMARY: &str = "Failed work and both live tool rounds summarized.";
+    const CURRENT_REQUEST: &str = "finish the recovered task through both tool rounds";
+    const NEW_TOOL_MARKER: &str = "SECOND_LIVE_TOOL_PAYLOAD";
+    const PARTIAL: &str = "LATEST_CONTEXT_PARTIAL-";
+
+    let dir = tempfile::tempdir().unwrap();
+    let summary_step = |summary| {
+        response_step(
+            &json!({"committed_summary": null, "active_turn_summary": summary}).to_string(),
+            Vec::new(),
+        )
+    };
+    let tool_step = |id: &str, note: String, used_tokens| {
+        let mut step = tool_use_step(id, "working_note", json!({"action": "add", "note": note}));
+        if let ProviderStep::Response { events, .. } = &mut step {
+            events.push(ProviderEvent::ContextUsageUpdated {
+                usage: ContextUsageSnapshot {
+                    used_tokens,
+                    source: ContextUsageSource::Provider,
+                },
+            });
+        }
+        step
+    };
+    let mut steps = vec![
+        tool_step("toolu_failed", "failed progress ".repeat(1_000), 1),
+        error_step("failed after recording tool progress", Vec::new()),
+        summary_step(RECOVERY_SUMMARY),
+        tool_step(
+            "toolu_live_1",
+            "first live progress ".repeat(1_000),
+            190_000,
+        ),
+        summary_step(FIRST_SUMMARY),
+        tool_step(
+            "toolu_live_2",
+            format!("{NEW_TOOL_MARKER}{}", " second live progress".repeat(1_000)),
+            if force_context_recovery { 1 } else { 190_000 },
+        ),
+    ];
+    if force_context_recovery {
+        steps.push(ProviderStep::Response {
+            response: anthropic_response(
+                PARTIAL,
+                ProviderStop::ContextWindowExceeded,
+                "recovery-context",
+            ),
+            events: Vec::new(),
+        });
+    }
+    steps.push(summary_step(SECOND_SUMMARY));
+    steps.push(if force_context_recovery {
+        ProviderStep::Response {
+            response: anthropic_response("DONE", ProviderStop::Done, "recovery-final"),
+            events: Vec::new(),
+        }
+    } else {
+        response_step("DONE", Vec::new())
+    });
+    let provider = Arc::new(RecordingProvider::new(steps));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.compaction.tail_target_ctx_ratio = 0.00001;
+    let mut session = create_test_session(&store, "session_face0024").await;
+
+    engine
+        .run_turn(&mut session, "record progress before failure", |_| {})
+        .await
+        .expect_err("the initial turn must fail after a tool round");
+    assert!(matches!(
+        engine
+            .compact_session_checkpoint(&mut session, |_| {})
+            .await
+            .unwrap(),
+        SessionCompactionResult::Compacted(_)
+    ));
+    engine.compaction.auto_compact_ctx_ratio = 0.9;
+    let mut events = Vec::new();
+    engine
+        .run_turn(&mut session, CURRENT_REQUEST, |event| events.push(event))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::CompactionCompleted { .. }))
+            .count(),
+        2,
+        "the recovered turn must complete both live compactions"
+    );
+    let requests = provider.requests().await;
+    let summary_requests = requests
+        .iter()
+        .filter(|request| request.system_prompt.contains("committed_summary"))
+        .collect::<Vec<_>>();
+    assert_eq!(summary_requests.len(), 3);
+    let first_live_summary = serde_json::to_string(&summary_requests[1].messages).unwrap();
+    assert!(first_live_summary.contains(RECOVERY_SUMMARY));
+    let second_live_summary = serde_json::to_string(&summary_requests[2].messages).unwrap();
+    assert!(second_live_summary.contains(FIRST_SUMMARY));
+    assert!(second_live_summary.contains(NEW_TOOL_MARKER));
+    assert!(!second_live_summary.contains(PARTIAL));
+
+    let final_request = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
+    assert!(final_request.contains(SECOND_SUMMARY));
+    assert!(!final_request.contains(NEW_TOOL_MARKER));
+    assert_eq!(final_request.matches(CURRENT_REQUEST).count(), 1);
+    if force_context_recovery {
+        assert_eq!(
+            requests
+                .last()
+                .unwrap()
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter(|block| matches!(block, SessionTurnContentBlock::Text { text } if text == PARTIAL))
+                .count(),
+            1
+        );
+        assert_eq!(final_request.matches("private-recovery-context").count(), 1);
+        assert!(final_request.contains("继续，从上一条回复被截断处继续"));
+        let messages = session.read_messages().await.unwrap();
+        assert_eq!(
+            text_content(messages.last().unwrap()),
+            format!("{PARTIAL}DONE")
+        );
+    }
+    let state = session.read_metadata().await.unwrap().compaction.unwrap();
+    assert!(state.active_turn_summary.is_none());
+    assert!(state.frontier.active_turn.is_none());
+    let history = state.provider_history.unwrap();
+    assert!(history.recovery_turn_id.is_none());
+    assert!(history.recovery_base_message_count.is_none());
+    assert!(history.pending_turn.is_none());
+    assert!(history
+        .messages
+        .starts_with(&requests.last().unwrap().messages));
+}
+
+#[tokio::test]
 async fn preflight_does_not_reuse_active_summary_from_previous_turn() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(Vec::new()));
@@ -4335,6 +5092,8 @@ async fn failed_turn_after_stable_compaction_replays_latest_write_ahead_provider
         SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
     compaction.provider_history = Some(Box::new(CompactedProviderHistory {
         replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
         pending_turn: None,
         canonical_message_until: 0,
         messages: vec![SessionTurnMessage::user_text("STABLE_COMPACTED_BASELINE")],
@@ -4465,6 +5224,1209 @@ async fn failed_uncompacted_turn_replays_write_ahead_provider_window_after_resta
 }
 
 #[tokio::test]
+async fn provider_rejected_turn_drops_request_wal_and_is_not_replayed_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        ProviderStep::Rejected {
+            message: "provider rejected historical content",
+        },
+        response_step("accepted clean retry", Vec::new()),
+    ]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.compaction.auto_compact_ctx_ratio = 0.0;
+    let mut session = create_test_session(&store, "session_9e1ec7ed").await;
+
+    let error = engine
+        .run_turn(&mut session, "REJECTED_REQUEST_MUST_NOT_REPLAY", |_| {})
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("provider rejected historical content"));
+
+    let metadata = session.read_metadata().await.unwrap();
+    assert!(metadata
+        .compaction
+        .as_ref()
+        .and_then(|compaction| compaction.provider_history.as_ref())
+        .is_none());
+    let journal = replay_turn_journal(session.read_turn_journal().await);
+    assert_eq!(
+        journal.turns[0].status,
+        Some(TurnJournalStatus::RejectedByProvider)
+    );
+
+    let agent_id = session.metadata.agent_id.clone();
+    let session_id = session.metadata.id.clone();
+    drop(session);
+    let mut resumed = store
+        .load_existing_session(&agent_id, &session_id)
+        .await
+        .unwrap();
+    engine
+        .run_turn(&mut resumed, "clean replacement request", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 2);
+    let resumed_wire = serde_json::to_string(&requests[1].messages).unwrap();
+    assert!(!resumed_wire.contains("REJECTED_REQUEST_MUST_NOT_REPLAY"));
+    assert!(!resumed_wire.contains("interrupted_turn_context"));
+    assert!(resumed_wire.contains("clean replacement request"));
+}
+
+#[tokio::test]
+async fn ambiguous_stream_attempt_followed_by_fallback_rejection_keeps_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        error_step(
+            "stream transport failed",
+            vec![ProviderEvent::AssistantTextDelta {
+                text: "uncertain partial".into(),
+            }],
+        ),
+        ProviderStep::Rejected {
+            message: "fallback rejected the same request",
+        },
+        response_step("recovered ambiguous request", Vec::new()),
+    ]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_a11b1c03").await;
+
+    let error = engine
+        .run_turn(&mut session, "AMBIGUOUS_STREAM_REQUEST", |_| {})
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("更早的 Provider attempt 结果不明确"));
+    let projection = replay_turn_journal(session.read_turn_journal().await);
+    assert_eq!(projection.turns[0].status, Some(TurnJournalStatus::Failed));
+    assert!(!projection.turns[0]
+        .assistant_text
+        .contains("uncertain partial"));
+
+    let failed_requests = provider.requests().await;
+    assert_eq!(failed_requests.len(), 2);
+    assert_eq!(failed_requests[0].messages, failed_requests[1].messages);
+    let retained = session
+        .read_metadata()
+        .await
+        .unwrap()
+        .compaction
+        .and_then(|compaction| compaction.provider_history)
+        .expect("an earlier ambiguous attempt must keep its request WAL");
+    assert_eq!(retained.messages, failed_requests[0].messages);
+
+    let agent_id = session.metadata.agent_id.clone();
+    let session_id = session.metadata.id.clone();
+    drop(session);
+    let mut resumed = store
+        .load_existing_session(&agent_id, &session_id)
+        .await
+        .unwrap();
+    engine
+        .run_turn(&mut resumed, "resume ambiguous stream request", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 3);
+    assert!(requests[2]
+        .messages
+        .starts_with(&failed_requests[0].messages));
+    let resumed_wire = serde_json::to_string(&requests[2].messages).unwrap();
+    assert!(resumed_wire.contains("AMBIGUOUS_STREAM_REQUEST"));
+    assert!(resumed_wire.contains("<interrupted_turn_context>"));
+}
+
+#[tokio::test]
+async fn ambiguous_internal_retry_followed_by_rejection_keeps_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(InternalRetryThenRejectedProvider {
+        calls: AtomicUsize::new(0),
+        requests: Mutex::new(Vec::new()),
+        previous_attempt_ambiguous: true,
+    });
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_a11b1c06").await;
+
+    let mut events = Vec::new();
+    let error = engine
+        .run_turn(&mut session, "AMBIGUOUS_INTERNAL_RETRY", |event| {
+            events.push(event)
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("内部重试前已有发送结果不明确"));
+    let projection = replay_turn_journal(session.read_turn_journal().await);
+    assert_eq!(projection.turns[0].status, Some(TurnJournalStatus::Failed));
+    assert!(projection.turns[0].assistant_text.is_empty());
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, SessionEvent::AssistantOutputDiscarded)));
+
+    let failed_requests = provider.requests().await;
+    assert_eq!(failed_requests.len(), 2);
+    assert_eq!(failed_requests[0].messages, failed_requests[1].messages);
+    let retained = session
+        .read_metadata()
+        .await
+        .unwrap()
+        .compaction
+        .and_then(|compaction| compaction.provider_history)
+        .expect("ambiguous internal retry must keep its request WAL");
+    assert_eq!(retained.messages, failed_requests[0].messages);
+
+    let agent_id = session.metadata.agent_id.clone();
+    let session_id = session.metadata.id.clone();
+    drop(session);
+    let mut resumed = store
+        .load_existing_session(&agent_id, &session_id)
+        .await
+        .unwrap();
+    engine
+        .run_turn(&mut resumed, "resume ambiguous internal retry", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 3);
+    assert!(requests[2]
+        .messages
+        .starts_with(&failed_requests[0].messages));
+    let resumed_wire = serde_json::to_string(&requests[2].messages).unwrap();
+    assert!(resumed_wire.contains("AMBIGUOUS_INTERNAL_RETRY"));
+    assert!(resumed_wire.contains("<interrupted_turn_context>"));
+}
+
+#[tokio::test]
+async fn resolved_internal_retry_followed_by_rejection_clears_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(InternalRetryThenRejectedProvider {
+        calls: AtomicUsize::new(0),
+        requests: Mutex::new(Vec::new()),
+        previous_attempt_ambiguous: false,
+    });
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_a11b1c09").await;
+
+    let error = engine
+        .run_turn(&mut session, "RESOLVED_INTERNAL_RETRY", |_| {})
+        .await
+        .unwrap_err();
+    assert!(error.downcast_ref::<ProviderRequestRejected>().is_some());
+    let projection = replay_turn_journal(session.read_turn_journal().await);
+    assert_eq!(
+        projection.turns[0].status,
+        Some(TurnJournalStatus::RejectedByProvider)
+    );
+
+    engine
+        .run_turn(&mut session, "continue after resolved retry", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 3);
+    let resumed_wire = serde_json::to_string(&requests[2].messages).unwrap();
+    assert!(!resumed_wire.contains("RESOLVED_INTERNAL_RETRY"));
+    assert!(!resumed_wire.contains("<interrupted_turn_context>"));
+    assert!(resumed_wire.contains("continue after resolved retry"));
+}
+
+#[tokio::test]
+async fn ambiguous_media_rejection_preserves_the_original_request_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2));
+    let mut image_bytes = Vec::new();
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut image_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    let inline_data = BASE64_STANDARD.encode(image_bytes);
+    let provider = Arc::new(AmbiguousRetryMediaThenRejectedProvider {
+        calls: AtomicUsize::new(0),
+        requests: Mutex::new(Vec::new()),
+    });
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_a11b1c07").await;
+
+    let error = engine
+        .run_turn_with_attachments(
+            &mut session,
+            "AMBIGUOUS_MEDIA_RETRY",
+            vec![SessionAttachment::InlineImage {
+                media_type: "image/png".into(),
+                data: inline_data.clone(),
+            }],
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("发送结果不明确"));
+    let projection = replay_turn_journal(session.read_turn_journal().await);
+    assert_eq!(projection.turns[0].status, Some(TurnJournalStatus::Failed));
+    let failed_requests = provider.requests().await;
+    assert_eq!(failed_requests.len(), 1);
+    let retained_wire = serde_json::to_string(&failed_requests[0].messages).unwrap();
+    assert!(!retained_wire.contains("<media_recovery>"));
+    assert!(retained_wire.contains(&inline_data));
+    let retained = session
+        .read_metadata()
+        .await
+        .unwrap()
+        .compaction
+        .and_then(|compaction| compaction.provider_history)
+        .expect("ambiguous media rejection must retain the original WAL");
+    assert_eq!(retained.messages, failed_requests[0].messages);
+
+    let agent_id = session.metadata.agent_id.clone();
+    let session_id = session.metadata.id.clone();
+    drop(session);
+    let mut resumed = store
+        .load_existing_session(&agent_id, &session_id)
+        .await
+        .unwrap();
+    let rejection = engine
+        .run_turn(&mut resumed, "resume ambiguous media request", |_| {})
+        .await
+        .unwrap_err();
+    assert!(rejection
+        .downcast_ref::<ProviderRequestRejected>()
+        .is_some());
+
+    engine
+        .run_turn(&mut resumed, "retry after explicit rejection", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 3);
+    assert!(requests[1]
+        .messages
+        .starts_with(&failed_requests[0].messages));
+    let resumed_wire = serde_json::to_string(&requests[2].messages).unwrap();
+    assert!(!resumed_wire.contains("resume ambiguous media request"));
+    assert!(resumed_wire.contains("retry after explicit rejection"));
+}
+
+#[tokio::test]
+async fn ambiguous_stream_followed_by_text_only_413_keeps_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        error_step(
+            "stream transport failed",
+            vec![ProviderEvent::AssistantTextDelta {
+                text: "uncertain text partial".into(),
+            }],
+        ),
+        request_too_large_step(),
+        response_step("recovered text-only 413", Vec::new()),
+    ]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_a11b1c07").await;
+
+    let error = engine
+        .run_turn(&mut session, "AMBIGUOUS_TEXT_ONLY_413", |_| {})
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("更早的 Provider attempt 结果不明确"));
+    let projection = replay_turn_journal(session.read_turn_journal().await);
+    assert_eq!(projection.turns[0].status, Some(TurnJournalStatus::Failed));
+
+    let failed_requests = provider.requests().await;
+    assert_eq!(failed_requests.len(), 2);
+    assert_eq!(failed_requests[0].messages, failed_requests[1].messages);
+    let retained = session
+        .read_metadata()
+        .await
+        .unwrap()
+        .compaction
+        .and_then(|compaction| compaction.provider_history)
+        .expect("ambiguous text-only 413 must keep its request WAL");
+    assert_eq!(retained.messages, failed_requests[0].messages);
+
+    let agent_id = session.metadata.agent_id.clone();
+    let session_id = session.metadata.id.clone();
+    drop(session);
+    let mut resumed = store
+        .load_existing_session(&agent_id, &session_id)
+        .await
+        .unwrap();
+    engine
+        .run_turn(&mut resumed, "resume text-only 413", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 3);
+    assert!(requests[2]
+        .messages
+        .starts_with(&failed_requests[0].messages));
+    let resumed_wire = serde_json::to_string(&requests[2].messages).unwrap();
+    assert!(resumed_wire.contains("AMBIGUOUS_TEXT_ONLY_413"));
+    assert!(resumed_wire.contains("<interrupted_turn_context>"));
+}
+
+#[tokio::test]
+async fn journaled_rejection_recovers_wal_rollback_after_crash_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        "accepted after crash recovery",
+        Vec::new(),
+    )]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_a11b1c04").await;
+    let rejected_messages = vec![SessionTurnMessage::user_text(
+        "CRASH_WINDOW_REJECTED_REQUEST",
+    )];
+    let mut rejected_compaction =
+        SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
+    rejected_compaction.provider_history = Some(Box::new(CompactedProviderHistory {
+        replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
+        pending_turn: Some(PendingProviderHistoryTurn {
+            turn_id: "turn_1".into(),
+            base_message_count: 0,
+            provider_request_message_count: Some(rejected_messages.len()),
+        }),
+        canonical_message_until: 1,
+        messages: rejected_messages,
+    }));
+    session
+        .update_compaction(rejected_compaction)
+        .await
+        .unwrap();
+    write_provider_rejection_recovery(
+        &session.paths.provider_rejection_recovery_json,
+        &ProviderRejectionRecoveryRecord::new(
+            "turn_1".into(),
+            1,
+            ProviderRejectedRequestRecovery::DiscardTurn,
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    let mut writer = session.open_turn_journal_writer().await.unwrap();
+    for kind in [
+        TurnJournalEventKind::TurnStarted,
+        TurnJournalEventKind::UserInputAccepted {
+            text: "CRASH_WINDOW_REJECTED_REQUEST".into(),
+        },
+        TurnJournalEventKind::ProviderRequestRejected {
+            rejection_id: 1,
+            discard_turn: true,
+        },
+    ] {
+        writer
+            .append("turn_1", Utc::now(), kind, TurnJournalFlush::Immediate)
+            .await
+            .unwrap();
+    }
+    drop(writer);
+
+    engine
+        .run_turn(&mut session, "clean request after crash", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 1);
+    let wire = serde_json::to_string(&requests[0].messages).unwrap();
+    assert!(!wire.contains("CRASH_WINDOW_REJECTED_REQUEST"));
+    assert!(!wire.contains("<interrupted_turn_context>"));
+    assert!(wire.contains("clean request after crash"));
+    assert!(
+        !tokio::fs::try_exists(&session.paths.provider_rejection_recovery_json)
+            .await
+            .unwrap()
+    );
+    let projection = replay_turn_journal(session.read_turn_journal().await);
+    assert_eq!(
+        projection.turns[0].status,
+        Some(TurnJournalStatus::RejectedByProvider)
+    );
+    assert_eq!(
+        projection.turns[1].status,
+        Some(TurnJournalStatus::Committed)
+    );
+}
+
+#[tokio::test]
+async fn finished_rejected_turn_clears_stale_recovery_record_without_rollback() {
+    const POST_REJECTION_STATE: &str = "POST_REJECTION_MANUAL_COMPACT_STATE";
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (engine, store) = build_test_engine(&dir, provider);
+    let mut session = create_test_session(&store, "session_a11b1c11").await;
+    // 拒绝已在 turn 内回滚并写下终态；随后用户 /compact 等写入产生了新状态。
+    let mut later_state =
+        SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
+    later_state.provider_history = Some(Box::new(CompactedProviderHistory {
+        replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
+        pending_turn: None,
+        canonical_message_until: 0,
+        messages: vec![SessionTurnMessage::user_text(POST_REJECTION_STATE)],
+    }));
+    session.update_compaction(later_state).await.unwrap();
+    write_provider_rejection_recovery(
+        &session.paths.provider_rejection_recovery_json,
+        &ProviderRejectionRecoveryRecord::new(
+            "turn_1".into(),
+            1,
+            ProviderRejectedRequestRecovery::DiscardTurn,
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    let mut writer = session.open_turn_journal_writer().await.unwrap();
+    for kind in [
+        TurnJournalEventKind::TurnStarted,
+        TurnJournalEventKind::UserInputAccepted {
+            text: "rejected request".into(),
+        },
+        TurnJournalEventKind::ProviderRequestRejected {
+            rejection_id: 1,
+            discard_turn: true,
+        },
+        TurnJournalEventKind::TurnFinished {
+            status: TurnJournalStatus::RejectedByProvider,
+        },
+    ] {
+        writer
+            .append("turn_1", Utc::now(), kind, TurnJournalFlush::Immediate)
+            .await
+            .unwrap();
+    }
+    drop(writer);
+
+    let journal_read = session.read_turn_journal().await;
+    let journal_changed = engine
+        .recover_provider_rejection(&mut session, &journal_read)
+        .await
+        .unwrap();
+
+    assert!(!journal_changed);
+    assert!(
+        !tokio::fs::try_exists(&session.paths.provider_rejection_recovery_json)
+            .await
+            .unwrap()
+    );
+    let compaction = session.read_metadata().await.unwrap().compaction.unwrap();
+    assert!(
+        serde_json::to_string(&compaction.provider_history.unwrap().messages)
+            .unwrap()
+            .contains(POST_REJECTION_STATE),
+        "已终态 turn 的残留拒绝记录不得回滚之后写入的 compaction 状态"
+    );
+}
+
+#[tokio::test]
+async fn prepared_retry_wal_without_supersede_marker_keeps_rejection_terminal() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        "accepted after retry preparation crash",
+        Vec::new(),
+    )]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_a11b1c10").await;
+    let retry_messages = vec![SessionTurnMessage::user_text(
+        "RETRY_WAL_PREPARED_BEFORE_SUPERSEDE_MARKER",
+    )];
+    let mut compaction =
+        SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
+    compaction.provider_history = Some(Box::new(CompactedProviderHistory {
+        replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
+        pending_turn: Some(PendingProviderHistoryTurn {
+            turn_id: "turn_1".into(),
+            base_message_count: 0,
+            provider_request_message_count: Some(retry_messages.len()),
+        }),
+        canonical_message_until: 1,
+        messages: retry_messages,
+    }));
+    session.update_compaction(compaction).await.unwrap();
+    write_provider_rejection_recovery(
+        &session.paths.provider_rejection_recovery_json,
+        &ProviderRejectionRecoveryRecord::new(
+            "turn_1".into(),
+            1,
+            ProviderRejectedRequestRecovery::DiscardTurn,
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    let mut writer = session.open_turn_journal_writer().await.unwrap();
+    for kind in [
+        TurnJournalEventKind::TurnStarted,
+        TurnJournalEventKind::UserInputAccepted {
+            text: "original context-rejected request".into(),
+        },
+        TurnJournalEventKind::ProviderRequestRejected {
+            rejection_id: 1,
+            discard_turn: true,
+        },
+    ] {
+        writer
+            .append("turn_1", Utc::now(), kind, TurnJournalFlush::Immediate)
+            .await
+            .unwrap();
+    }
+    drop(writer);
+
+    engine
+        .run_turn(
+            &mut session,
+            "continue after retry preparation crash",
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    let wire = serde_json::to_string(&requests[0].messages).unwrap();
+    assert!(!wire.contains("RETRY_WAL_PREPARED_BEFORE_SUPERSEDE_MARKER"));
+    assert!(!wire.contains("original context-rejected request"));
+    assert!(!wire.contains("<interrupted_turn_context>"));
+    assert!(wire.contains("continue after retry preparation crash"));
+}
+
+#[tokio::test]
+async fn supersede_marker_keeps_prepared_retry_wal_and_clears_old_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        "accepted superseded retry",
+        Vec::new(),
+    )]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_a11b1c12").await;
+    let retry_messages = vec![SessionTurnMessage::user_text(
+        "SUPERSEDED_RETRY_WAL_MUST_SURVIVE",
+    )];
+    let mut compaction =
+        SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
+    compaction.provider_history = Some(Box::new(CompactedProviderHistory {
+        replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
+        pending_turn: Some(PendingProviderHistoryTurn {
+            turn_id: "turn_1".into(),
+            base_message_count: 0,
+            provider_request_message_count: Some(retry_messages.len()),
+        }),
+        canonical_message_until: 1,
+        messages: retry_messages,
+    }));
+    session.update_compaction(compaction).await.unwrap();
+    write_provider_rejection_recovery(
+        &session.paths.provider_rejection_recovery_json,
+        &ProviderRejectionRecoveryRecord::new(
+            "turn_1".into(),
+            1,
+            ProviderRejectedRequestRecovery::DiscardTurn,
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    let mut writer = session.open_turn_journal_writer().await.unwrap();
+    for kind in [
+        TurnJournalEventKind::TurnStarted,
+        TurnJournalEventKind::UserInputAccepted {
+            text: "original context-rejected request".into(),
+        },
+        TurnJournalEventKind::ProviderRequestRejected {
+            rejection_id: 1,
+            discard_turn: true,
+        },
+        TurnJournalEventKind::ProviderRequestRetriedAfterRejection { rejection_id: 1 },
+    ] {
+        writer
+            .append("turn_1", Utc::now(), kind, TurnJournalFlush::Immediate)
+            .await
+            .unwrap();
+    }
+    drop(writer);
+
+    engine
+        .run_turn(&mut session, "continue after supersede crash", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    let wire = serde_json::to_string(&requests[0].messages).unwrap();
+    assert!(wire.contains("SUPERSEDED_RETRY_WAL_MUST_SURVIVE"));
+    assert!(wire.contains("<interrupted_turn_context>"));
+    assert!(wire.contains("continue after supersede crash"));
+    assert!(
+        !tokio::fs::try_exists(&session.paths.provider_rejection_recovery_json)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn cleaned_media_sidecar_replaces_raw_wal_after_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        "accepted cleaned media recovery",
+        Vec::new(),
+    )]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_a11b1c11").await;
+    let raw_messages = vec![SessionTurnMessage {
+        role: "user".into(),
+        content: vec![SessionTurnContentBlock::Image {
+            media_type: "image/png".into(),
+            data: "RAW_MEDIA_AFTER_CRASH".into(),
+        }],
+        provider_replay: None,
+    }];
+    let cleaned_messages = vec![SessionTurnMessage::user_text(
+        "CLEANED_MEDIA_REQUEST_AFTER_CRASH",
+    )];
+    let history = |messages: Vec<SessionTurnMessage>| CompactedProviderHistory {
+        replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
+        pending_turn: Some(PendingProviderHistoryTurn {
+            turn_id: "turn_1".into(),
+            base_message_count: 0,
+            provider_request_message_count: Some(messages.len()),
+        }),
+        canonical_message_until: 1,
+        messages,
+    };
+    let mut raw_compaction =
+        SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
+    raw_compaction.provider_history = Some(Box::new(history(raw_messages)));
+    session.update_compaction(raw_compaction).await.unwrap();
+    let mut cleaned_compaction =
+        SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
+    cleaned_compaction.provider_history = Some(Box::new(history(cleaned_messages)));
+    write_provider_rejection_recovery(
+        &session.paths.provider_rejection_recovery_json,
+        &ProviderRejectionRecoveryRecord::cleaned_request(
+            "turn_1".into(),
+            Some(cleaned_compaction),
+        ),
+    )
+    .await
+    .unwrap();
+    let mut writer = session.open_turn_journal_writer().await.unwrap();
+    for kind in [
+        TurnJournalEventKind::TurnStarted,
+        TurnJournalEventKind::UserInputAccepted {
+            text: "request with media before crash".into(),
+        },
+    ] {
+        writer
+            .append("turn_1", Utc::now(), kind, TurnJournalFlush::Immediate)
+            .await
+            .unwrap();
+    }
+    drop(writer);
+
+    engine
+        .run_turn(&mut session, "continue after media cleanup crash", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    let wire = serde_json::to_string(&requests[0].messages).unwrap();
+    assert!(!wire.contains("RAW_MEDIA_AFTER_CRASH"));
+    assert!(wire.contains("CLEANED_MEDIA_REQUEST_AFTER_CRASH"));
+    assert!(wire.contains("continue after media cleanup crash"));
+}
+
+#[tokio::test]
+async fn stale_cleaned_media_sidecar_cannot_overwrite_finished_turn_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        "accepted after stale media sidecar",
+        Vec::new(),
+    )]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_a11b1c14").await;
+    let history = |message: &str| CompactedProviderHistory {
+        replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
+        pending_turn: Some(PendingProviderHistoryTurn {
+            turn_id: "turn_1".into(),
+            base_message_count: 0,
+            provider_request_message_count: Some(1),
+        }),
+        canonical_message_until: 0,
+        messages: vec![SessionTurnMessage::user_text(message)],
+    };
+    let mut current = SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
+    current.provider_history = Some(Box::new(history("NEWER_FINISHED_TURN_WAL")));
+    session.update_compaction(current).await.unwrap();
+    let mut stale = SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
+    stale.provider_history = Some(Box::new(history("STALE_CLEANED_MEDIA_WAL")));
+    write_provider_rejection_recovery(
+        &session.paths.provider_rejection_recovery_json,
+        &ProviderRejectionRecoveryRecord::cleaned_request("turn_1".into(), Some(stale)),
+    )
+    .await
+    .unwrap();
+    let mut writer = session.open_turn_journal_writer().await.unwrap();
+    for kind in [
+        TurnJournalEventKind::TurnStarted,
+        TurnJournalEventKind::TurnFinished {
+            status: TurnJournalStatus::Committed,
+        },
+    ] {
+        writer
+            .append("turn_1", Utc::now(), kind, TurnJournalFlush::Immediate)
+            .await
+            .unwrap();
+    }
+    drop(writer);
+
+    engine
+        .run_turn(&mut session, "continue after stale media sidecar", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    let wire = serde_json::to_string(&requests[0].messages).unwrap();
+    assert!(wire.contains("NEWER_FINISHED_TURN_WAL"));
+    assert!(!wire.contains("STALE_CLEANED_MEDIA_WAL"));
+    assert!(
+        !tokio::fs::try_exists(&session.paths.provider_rejection_recovery_json)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn unjournaled_rejection_sidecar_completes_rejection_after_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        "accepted after ambiguous crash",
+        Vec::new(),
+    )]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_a11b1c05").await;
+    let rejected_messages = vec![SessionTurnMessage::user_text(
+        "CRASH_BEFORE_REJECTION_JOURNAL",
+    )];
+    let mut rejected_compaction =
+        SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
+    rejected_compaction.provider_history = Some(Box::new(CompactedProviderHistory {
+        replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
+        pending_turn: Some(PendingProviderHistoryTurn {
+            turn_id: "turn_1".into(),
+            base_message_count: 0,
+            provider_request_message_count: Some(rejected_messages.len()),
+        }),
+        canonical_message_until: 1,
+        messages: rejected_messages,
+    }));
+    session
+        .update_compaction(rejected_compaction)
+        .await
+        .unwrap();
+    write_provider_rejection_recovery(
+        &session.paths.provider_rejection_recovery_json,
+        &ProviderRejectionRecoveryRecord::new(
+            "turn_1".into(),
+            1,
+            ProviderRejectedRequestRecovery::DiscardTurn,
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    let mut writer = session.open_turn_journal_writer().await.unwrap();
+    for kind in [
+        TurnJournalEventKind::TurnStarted,
+        TurnJournalEventKind::UserInputAccepted {
+            text: "CRASH_BEFORE_REJECTION_JOURNAL".into(),
+        },
+    ] {
+        writer
+            .append("turn_1", Utc::now(), kind, TurnJournalFlush::Immediate)
+            .await
+            .unwrap();
+    }
+    drop(writer);
+
+    engine
+        .run_turn(&mut session, "continue after rejected request", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 1);
+    let wire = serde_json::to_string(&requests[0].messages).unwrap();
+    assert!(!wire.contains("CRASH_BEFORE_REJECTION_JOURNAL"));
+    assert!(!wire.contains("<interrupted_turn_context>"));
+    assert!(wire.contains("continue after rejected request"));
+    assert!(
+        !tokio::fs::try_exists(&session.paths.provider_rejection_recovery_json)
+            .await
+            .unwrap()
+    );
+    let projection = replay_turn_journal(session.read_turn_journal().await);
+    assert_eq!(
+        projection.turns[0].status,
+        Some(TurnJournalStatus::RejectedByProvider)
+    );
+}
+
+#[tokio::test]
+async fn stale_rejection_event_does_not_replace_latest_sidecar_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![response_step(
+        "accepted after second rejection crash",
+        Vec::new(),
+    )]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_a11b1c08").await;
+    let latest_messages = vec![SessionTurnMessage::user_text(
+        "SECOND_REJECTION_WAL_MUST_SURVIVE",
+    )];
+    let mut compaction =
+        SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
+    compaction.provider_history = Some(Box::new(CompactedProviderHistory {
+        replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
+        pending_turn: Some(PendingProviderHistoryTurn {
+            turn_id: "turn_1".into(),
+            base_message_count: 0,
+            provider_request_message_count: Some(latest_messages.len()),
+        }),
+        canonical_message_until: 1,
+        messages: latest_messages,
+    }));
+    session.update_compaction(compaction).await.unwrap();
+    write_provider_rejection_recovery(
+        &session.paths.provider_rejection_recovery_json,
+        &ProviderRejectionRecoveryRecord::new(
+            "turn_1".into(),
+            2,
+            ProviderRejectedRequestRecovery::DiscardTurn,
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    let mut writer = session.open_turn_journal_writer().await.unwrap();
+    for kind in [
+        TurnJournalEventKind::TurnStarted,
+        TurnJournalEventKind::UserInputAccepted {
+            text: "first rejected request".into(),
+        },
+        TurnJournalEventKind::ProviderRequestRejected {
+            rejection_id: 1,
+            discard_turn: true,
+        },
+    ] {
+        writer
+            .append("turn_1", Utc::now(), kind, TurnJournalFlush::Immediate)
+            .await
+            .unwrap();
+    }
+    drop(writer);
+
+    engine
+        .run_turn(&mut session, "continue after crash", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 1);
+    let wire = serde_json::to_string(&requests[0].messages).unwrap();
+    assert!(!wire.contains("SECOND_REJECTION_WAL_MUST_SURVIVE"));
+    assert!(!wire.contains("<interrupted_turn_context>"));
+    assert!(wire.contains("continue after crash"));
+    assert!(
+        !tokio::fs::try_exists(&session.paths.provider_rejection_recovery_json)
+            .await
+            .unwrap()
+    );
+    let projection = replay_turn_journal(session.read_turn_journal().await);
+    assert_eq!(
+        projection.turns[0].status,
+        Some(TurnJournalStatus::RejectedByProvider)
+    );
+}
+
+#[tokio::test]
+async fn rejection_after_completed_tool_preserves_progress_without_replaying_rejected_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        tool_use_step(
+            "toolu_before_rejection",
+            "working_note",
+            json!({"action": "add", "note": "SIDE_EFFECT_ALREADY_COMPLETED"}),
+        ),
+        ProviderStep::Rejected {
+            message: "provider rejected tool continuation",
+        },
+        response_step("continued without repeating the tool", Vec::new()),
+    ]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_9e1ec7ee").await;
+
+    let error = engine
+        .run_turn(&mut session, "complete one tool before rejection", |_| {})
+        .await
+        .unwrap_err();
+    let rejected = error
+        .downcast_ref::<crate::api::ProviderRequestRejected>()
+        .expect("the second request must retain the provider rejection classification");
+    assert!(!rejected.should_discard_turn());
+
+    let projection = replay_turn_journal(session.read_turn_journal().await);
+    let failed_turn = &projection.turns[0];
+    assert_eq!(failed_turn.status, Some(TurnJournalStatus::Failed));
+    let completed_tool = failed_turn
+        .tool_calls
+        .iter()
+        .find(|tool| tool.tool_use_id == "toolu_before_rejection")
+        .expect("completed tool progress must remain in the failed turn journal");
+    assert!(completed_tool.completed_summary.is_some());
+    assert_eq!(
+        completed_tool.outcome,
+        Some(crate::api::ToolExecutionOutcome::Completed)
+    );
+
+    let first_requests = provider.requests().await;
+    assert_eq!(first_requests.len(), 2);
+    let rejected_request = first_requests[1].messages.clone();
+    let restored = session
+        .read_metadata()
+        .await
+        .unwrap()
+        .compaction
+        .and_then(|state| state.provider_history)
+        .expect("the accepted request boundary must remain available for recovery");
+    assert_eq!(restored.messages, first_requests[0].messages);
+    assert_ne!(restored.messages, rejected_request);
+
+    let agent_id = session.metadata.agent_id.clone();
+    let session_id = session.metadata.id.clone();
+    drop(session);
+    let mut resumed = store
+        .load_existing_session(&agent_id, &session_id)
+        .await
+        .unwrap();
+    engine
+        .run_turn(&mut resumed, "continue after rejected continuation", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 3);
+    let resumed_wire = serde_json::to_string(&requests[2].messages).unwrap();
+    assert!(resumed_wire.contains("<interrupted_turn_context>"));
+    assert!(
+        resumed_wire.contains("tools_completed"),
+        "resumed request omitted completed tool recovery: {resumed_wire}"
+    );
+    assert!(resumed_wire.contains("toolu_before_rejection"));
+    assert!(resumed_wire.contains("SIDE_EFFECT_ALREADY_COMPLETED"));
+    assert!(!requests[2]
+        .messages
+        .iter()
+        .any(|message| message.content.iter().any(|block| matches!(
+            block,
+            SessionTurnContentBlock::ToolUse { id, .. }
+                | SessionTurnContentBlock::ToolResult { tool_use_id: id, .. }
+                if id == "toolu_before_rejection"
+        ))));
+}
+
+#[tokio::test]
+async fn internal_continuation_size_recovery_uses_the_latest_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(AcceptedContinuationThenRejectedProvider {
+        requests: Mutex::new(Vec::new()),
+        reject_media: true,
+    });
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_face0027").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "adjacent raw user one"),
+            NewSessionMessage::text(SessionMessageRole::User, "adjacent raw user two"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "earlier answer"),
+        ])
+        .await
+        .unwrap();
+    let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2));
+    let mut bytes = Vec::new();
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    let data = BASE64_STANDARD.encode(bytes);
+    engine
+        .run_turn_with_attachments(
+            &mut session,
+            "continue with media",
+            vec![SessionAttachment::InlineImage {
+                media_type: "image/png".into(),
+                data: data.clone(),
+            }],
+            |_| {},
+        )
+        .await
+        .unwrap();
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 3);
+    let retry = serde_json::to_string(&requests[2].messages).unwrap();
+    assert!(retry.contains("kept prefix"));
+    assert!(retry.contains("continue"));
+    assert!(!retry.contains("ghost suffix"));
+    assert!(!retry.contains(&data));
+    assert!(retry.contains("<request_size_recovery>"));
+}
+
+#[tokio::test]
+async fn rejection_discards_only_output_after_the_last_accepted_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(AcceptedContinuationThenRejectedProvider {
+        requests: Mutex::new(Vec::new()),
+        reject_media: false,
+    });
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_9e1ec7ef").await;
+    let mut events = Vec::new();
+
+    let error = engine
+        .run_turn(&mut session, "preserve accepted provider output", |event| {
+            events.push(event)
+        })
+        .await
+        .unwrap_err();
+    let rejected = error
+        .downcast_ref::<crate::api::ProviderRequestRejected>()
+        .expect("continuation rejection must remain machine-readable");
+    assert!(!rejected.should_discard_turn());
+
+    let projection = replay_turn_journal(session.read_turn_journal().await);
+    assert_eq!(projection.turns[0].status, Some(TurnJournalStatus::Failed));
+    assert_eq!(projection.turns[0].assistant_text, "kept prefix");
+    assert!(!projection.turns[0].assistant_text.contains("ghost suffix"));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, SessionEvent::AssistantOutputDiscarded)));
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 2);
+    let restored = session
+        .read_metadata()
+        .await
+        .unwrap()
+        .compaction
+        .and_then(|state| state.provider_history)
+        .expect("accepted request boundary must remain recoverable");
+    assert_eq!(restored.messages, requests[0].messages);
+}
+
+#[tokio::test]
+async fn rejected_turn_preserves_earlier_ambiguous_wal_and_journal_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        error_step("ambiguous transport failure", Vec::new()),
+        ProviderStep::Rejected {
+            message: "provider rejected only the later request",
+        },
+        response_step("recovered the ambiguous request", Vec::new()),
+    ]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.compaction.auto_compact_ctx_ratio = 0.0;
+    let mut session = create_test_session(&store, "session_a11b1c02").await;
+
+    engine
+        .run_turn(&mut session, "AMBIGUOUS_REQUEST_MUST_REMAIN", |_| {})
+        .await
+        .unwrap_err();
+    let ambiguous_request = provider.requests().await[0].messages.clone();
+
+    engine
+        .run_turn(
+            &mut session,
+            "REJECTED_LATER_REQUEST_MUST_DISAPPEAR",
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+
+    let metadata = session.read_metadata().await.unwrap();
+    let preserved = metadata
+        .compaction
+        .as_ref()
+        .and_then(|compaction| compaction.provider_history.as_ref())
+        .expect("later rejection must restore the earlier ambiguous WAL");
+    assert_eq!(preserved.messages, ambiguous_request);
+    assert!(preserved.pending_turn.is_none());
+    let projection = replay_turn_journal(session.read_turn_journal().await);
+    assert_eq!(projection.turns[0].status, Some(TurnJournalStatus::Failed));
+    assert_eq!(
+        projection.turns[1].status,
+        Some(TurnJournalStatus::RejectedByProvider)
+    );
+    assert_eq!(
+        projection
+            .unresolved_tail()
+            .map(|turn| turn.turn_id.as_str()),
+        Some(projection.turns[0].turn_id.as_str())
+    );
+
+    let mut compaction = metadata.compaction.unwrap();
+    compaction.provider_history = None;
+    session.update_compaction(compaction).await.unwrap();
+    let agent_id = session.metadata.agent_id.clone();
+    let session_id = session.metadata.id.clone();
+    drop(session);
+    let mut resumed = store
+        .load_existing_session(&agent_id, &session_id)
+        .await
+        .unwrap();
+
+    engine
+        .run_turn(
+            &mut resumed,
+            "recover after provider identity change",
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    let resumed_wire = serde_json::to_string(&requests[2].messages).unwrap();
+    assert!(resumed_wire.contains("AMBIGUOUS_REQUEST_MUST_REMAIN"));
+    assert!(resumed_wire.contains("interrupted_turn_context"));
+    assert!(!resumed_wire.contains("REJECTED_LATER_REQUEST_MUST_DISAPPEAR"));
+}
+
+#[tokio::test]
 async fn failed_internal_continuation_wal_replays_latest_request_after_restart() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(FailingInternalContinuationProvider::new());
@@ -4546,6 +6508,8 @@ async fn cancelled_turn_after_stable_compaction_replays_write_ahead_provider_win
         SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
     compaction.provider_history = Some(Box::new(CompactedProviderHistory {
         replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
         pending_turn: None,
         canonical_message_until: 0,
         messages: vec![SessionTurnMessage::user_text("STABLE_CANCEL_BASELINE")],
@@ -4715,6 +6679,7 @@ async fn preflight_compaction_summarizes_oversized_previous_turn_instead_of_fail
             &mut session,
             PreflightCompactionRequest {
                 base_system_prompt: "system",
+                provider_messages: &[],
                 active_suffix: vec![SessionTurnMessage::user_text("small current request")],
                 turn_id: "turn_1",
                 base_message_count: 4,
@@ -4820,6 +6785,7 @@ async fn preflight_externalizes_skill_and_attachment_only_after_full_projection_
             &mut session,
             PreflightCompactionRequest {
                 base_system_prompt: "system",
+                provider_messages: &[],
                 active_suffix,
                 turn_id: "turn_1",
                 base_message_count: 0,
@@ -4998,6 +6964,7 @@ async fn preflight_retries_once_with_half_summary_limit_after_reference_projecti
             &mut session,
             PreflightCompactionRequest {
                 base_system_prompt: "system",
+                provider_messages: &[],
                 active_suffix,
                 turn_id: "turn_1",
                 base_message_count: 0,
@@ -5335,6 +7302,7 @@ async fn preflight_errors_after_single_retry_when_plain_user_text_remains_over_h
             &mut session,
             PreflightCompactionRequest {
                 base_system_prompt: "system",
+                provider_messages: &[],
                 active_suffix,
                 turn_id: "turn_1",
                 base_message_count: 0,
@@ -5380,6 +7348,53 @@ async fn run_turn_failure_writes_failed_journal_without_canonical_messages() {
     assert_eq!(turn.assistant_text, "partial output");
     assert_eq!(turn.non_streaming_fallbacks.len(), 1);
     assert_eq!(turn.non_streaming_fallbacks[0].attempt, 5);
+}
+
+#[tokio::test]
+async fn provider_terminal_failure_preserves_request_wal_for_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        ProviderStep::TerminalFailure {
+            message: "unknown upstream terminal",
+        },
+        response_step("resumed from preserved request", Vec::new()),
+    ]));
+    let (engine, store) = build_test_engine(&dir, provider.clone());
+    let mut session = create_test_session(&store, "session_bbbbbbb3").await;
+
+    let error = engine
+        .run_turn(&mut session, "REQUEST_MUST_REMAIN_IN_WAL", |_| {})
+        .await
+        .unwrap_err();
+    assert!(error
+        .downcast_ref::<crate::api::ProviderTerminalFailure>()
+        .is_some());
+    let first_request = provider.requests().await[0].messages.clone();
+    let metadata = session.read_metadata().await.unwrap();
+    let persisted = metadata
+        .compaction
+        .as_ref()
+        .and_then(|compaction| compaction.provider_history.as_ref())
+        .expect("terminal failure must preserve Provider request WAL");
+    assert_eq!(persisted.messages, first_request);
+    assert!(!session
+        .read_turn_journal()
+        .await
+        .events
+        .iter()
+        .any(|event| matches!(
+            event.kind,
+            TurnJournalEventKind::ProviderRequestRejected { .. }
+        )));
+
+    engine
+        .run_turn(&mut session, "continue after upstream recovery", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].messages.starts_with(&first_request));
 }
 
 #[tokio::test]
@@ -7002,6 +9017,7 @@ async fn finalize_recovered_summary_checkpoint_still_runs_recap() {
             safe_until_event_seq: 10,
             source_hash: "stale_hash".into(),
         }),
+        preserve_provider_history: false,
         status: CompactionCheckpointStatus::Applied,
     };
     session
@@ -7035,6 +9051,892 @@ async fn manual_compact_noop_reports_nothing_new_for_empty_session() {
         outcome,
         SessionCompactionResult::Noop(SessionCompactionNoopReason::NothingNew)
     ));
+}
+
+#[tokio::test]
+async fn manual_compact_after_rejection_survives_the_next_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        ProviderStep::Rejected {
+            message: "invalid request",
+        },
+        json_by_request_kind_responses(
+            &[r#"{"committed_summary":"retained manual summary","active_turn_summary":null}"#],
+            &[],
+        ),
+        response_step("continued", Vec::new()),
+    ]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.compaction.auto_compact_ctx_ratio = 0.0;
+    engine.context_window = 20_000;
+    engine.compaction.tail_target_ctx_ratio = 0.015;
+    engine.compaction.tail_hard_ctx_ratio = 0.0225;
+    engine.compaction.tail_previous_real_user_turns = 1;
+    let mut session = create_test_session(&store, "session_face0028").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "old request ".repeat(120)),
+            NewSessionMessage::text(
+                SessionMessageRole::Assistant,
+                "OLD_UNCOMPACTED_ANSWER ".repeat(120),
+            ),
+            NewSessionMessage::text(SessionMessageRole::User, "latest request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "latest answer"),
+        ])
+        .await
+        .unwrap();
+    engine
+        .run_turn(&mut session, "REJECTED_PROMPT", |_| {})
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        engine
+            .compact_session_checkpoint(&mut session, |_| {})
+            .await
+            .unwrap(),
+        SessionCompactionResult::Compacted(_)
+    ));
+    assert_eq!(
+        session
+            .read_metadata()
+            .await
+            .unwrap()
+            .compaction
+            .unwrap()
+            .committed_summary,
+        "retained manual summary"
+    );
+    engine
+        .run_turn(&mut session, "next prompt", |_| {})
+        .await
+        .unwrap();
+    let requests = provider.requests().await;
+    let next_request = requests.last().unwrap();
+    let next = format!(
+        "{}{}",
+        next_request.system_prompt,
+        serde_json::to_string(&next_request.messages).unwrap()
+    );
+    assert!(next.contains("retained manual summary"));
+    assert!(!next.contains("OLD_UNCOMPACTED_ANSWER"));
+    assert!(!next.contains("REJECTED_PROMPT"));
+}
+
+#[tokio::test]
+async fn rejected_fallback_continuation_preserves_accepted_output_across_adapters() {
+    use crate::api::{
+        AnthropicProviderAdapter, OpenAiCompatibleChatProviderAdapter,
+        OpenAiCompatibleResponsesProviderAdapter,
+    };
+    use axum::response::IntoResponse;
+    const ACCEPTED: &str = "accepted fallback prefix";
+    for protocol in 0..3 {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let requests = captured.clone();
+        let app = axum::Router::new().fallback(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let requests = requests.clone();
+            async move {
+                let mut requests = requests.lock().await;
+                let index = requests.len();
+                requests.push(body);
+                if index == 0 {
+                    let delta = match protocol {
+                        0 => json!({"type":"response.output_text.delta","item_id":"msg_partial","output_index":0,"content_index":0,"delta":"unconfirmed stream fragment"}),
+                        1 => json!({"choices":[{"index":0,"delta":{"role":"assistant","content":"unconfirmed stream fragment"},"finish_reason":null}]}),
+                        _ => json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"unconfirmed stream fragment"}}),
+                    };
+                    return ([("content-type", "text/event-stream")], format!("data: {delta}\n\n")).into_response();
+                }
+                if index == 1 {
+                    let partial = match protocol {
+                        0 => json!({"id":"resp_partial","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","id":"msg_partial","role":"assistant","status":"completed","content":[{"type":"output_text","text":ACCEPTED}]}]}),
+                        1 => json!({"choices":[{"message":{"role":"assistant","content":ACCEPTED},"finish_reason":"length"}]}),
+                        _ => json!({"id":"msg_partial","type":"message","role":"assistant","content":[{"type":"text","text":ACCEPTED}],"stop_reason":"max_tokens"}),
+                    };
+                    return axum::Json(partial).into_response();
+                }
+                (axum::http::StatusCode::BAD_REQUEST, axum::Json(json!({"error":{"type":"invalid_request_error","message":"continuation rejected"}}))).into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let timeout = Duration::from_secs(5);
+        let provider: Arc<dyn ProviderAdapter> = match protocol {
+            0 => Arc::new(
+                OpenAiCompatibleResponsesProviderAdapter::new(
+                    "test-key".into(),
+                    endpoint,
+                    "test-model".into(),
+                    timeout,
+                    0,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )
+                .unwrap(),
+            ),
+            1 => Arc::new(
+                OpenAiCompatibleChatProviderAdapter::new(
+                    "test-key".into(),
+                    endpoint,
+                    "test-model".into(),
+                    timeout,
+                    0,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )
+                .unwrap(),
+            ),
+            _ => Arc::new(
+                AnthropicProviderAdapter::new(
+                    "test-key".into(),
+                    endpoint,
+                    "test-model".into(),
+                    128,
+                    timeout,
+                    0,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )
+                .unwrap(),
+            ),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, store) = build_test_engine(&dir, provider);
+        engine.compaction.auto_compact_ctx_ratio = 0.0;
+        let mut session = create_test_session(&store, "session_face0029").await;
+        let error = engine
+            .run_turn(&mut session, "finish the answer", |_| {})
+            .await
+            .unwrap_err();
+        server.abort();
+        assert!(
+            error.downcast_ref::<ProviderRequestRejected>().is_some(),
+            "protocol={protocol}: {error:#}"
+        );
+        assert_eq!(captured.lock().await.len(), 3, "protocol={protocol}");
+        let mut compaction = session.read_metadata().await.unwrap().compaction.unwrap();
+        let history = compaction.provider_history.as_ref().unwrap();
+        assert_eq!(
+            history
+                .pending_turn
+                .as_ref()
+                .unwrap()
+                .provider_request_message_count,
+            Some(history.messages.len())
+        );
+        assert!(
+            serde_json::to_string(&history.messages)
+                .unwrap()
+                .contains(ACCEPTED),
+            "protocol={protocol}: accepted response missing from rollback WAL"
+        );
+        let journal = replay_turn_journal(session.read_turn_journal().await);
+        assert_eq!(
+            journal.turns[0].assistant_text, ACCEPTED,
+            "protocol={protocol}"
+        );
+        assert_eq!(journal.turns[0].status, Some(TurnJournalStatus::Failed));
+        // 重建不能依赖当前模型的私有 replay，也不能靠残留 WAL 掩盖 journal 缺口。
+        let journal_read = session.read_turn_journal().await;
+        engine
+            .recover_provider_rejection(&mut session, &journal_read)
+            .await
+            .unwrap();
+        compaction.provider_history = None;
+        session.update_compaction(compaction).await.unwrap();
+        let resumed_provider = Arc::new(RecordingProvider::new(vec![response_step(
+            "continued",
+            Vec::new(),
+        )]));
+        let (resumed_engine, _) = build_test_engine(&dir, resumed_provider.clone());
+        resumed_engine
+            .run_turn(&mut session, "continue", |_| {})
+            .await
+            .unwrap();
+        assert!(
+            serde_json::to_string(&resumed_provider.requests().await[0].messages)
+                .unwrap()
+                .contains(ACCEPTED)
+        );
+    }
+}
+
+#[tokio::test]
+async fn manual_compact_summarizes_pending_failed_turn_without_changing_authorities() {
+    const FULL_ONLY_MARKER: &str = "FULL-PENDING-WAL-ONLY-MARKER";
+    const RECOVERY_SUMMARY: &str = "failed file read summarized for recovery";
+    const LATEST_PARTIAL: &str = "latest provider partial after the compactable request";
+    const POST_COMPACT_CANONICAL_MARKER: &str = "POST-COMPACT-CANONICAL-MARKER";
+
+    let dir = tempfile::tempdir().unwrap();
+    tokio::fs::write(
+        dir.path().join("large-note.txt"),
+        format!("{}{FULL_ONLY_MARKER}", "x".repeat(12_000)),
+    )
+    .await
+    .unwrap();
+    let mut provider_steps = vec![tool_use_step(
+        "toolu_manual_recovery",
+        "file_read",
+        json!({"path": "large-note.txt", "show_linenos": false}),
+    )];
+    provider_steps.extend(exhausted_stream_failure_steps(
+        "provider failed after file read",
+        LATEST_PARTIAL,
+    ));
+    provider_steps.extend([
+        json_by_request_kind_responses(
+            &[
+                r#"{"committed_summary":null,"active_turn_summary":"failed file read summarized for recovery"}"#,
+            ],
+            &[],
+        ),
+        response_step("continued from compacted recovery", Vec::new()),
+    ]);
+    let provider = Arc::new(RecordingProvider::new(provider_steps));
+    let tools = Arc::new(
+        ToolRegistry::new(&ToolConfig {
+            workspace_root: dir.path().to_path_buf(),
+            ..ToolConfig::default()
+        })
+        .unwrap(),
+    );
+    let (mut engine, store) =
+        build_test_engine_with_tools(&dir, provider.clone(), Arc::clone(&tools));
+    engine.compaction.auto_compact_ctx_ratio = 0.0;
+    engine.compaction.tail_target_ctx_ratio = 0.00001;
+    let mut session = create_test_session(&store, "session_face0019").await;
+
+    engine
+        .run_turn(&mut session, "read the large note and continue", |_| {})
+        .await
+        .expect_err("the provider must fail after receiving the full tool result");
+    assert!(session.read_messages().await.unwrap().is_empty());
+    let before = session.read_metadata().await.unwrap().compaction.unwrap();
+    let provider_history_before = before.provider_history.clone().unwrap();
+    assert!(provider_history_before.pending_turn.is_some());
+    assert!(serde_json::to_string(&provider_history_before.messages)
+        .unwrap()
+        .contains(FULL_ONLY_MARKER));
+
+    assert!(matches!(
+        engine
+            .compact_session_checkpoint(&mut session, |_| {})
+            .await
+            .unwrap(),
+        SessionCompactionResult::Compacted(_)
+    ));
+    let after = session.read_metadata().await.unwrap().compaction.unwrap();
+    assert!(after.committed_summary.is_empty());
+    assert_eq!(after.frontier.committed_message_until, 0);
+    assert_eq!(after.active_turn_summary.as_deref(), Some(RECOVERY_SUMMARY));
+    assert!(after.frontier.active_turn.is_some());
+    let compacted_wal = serde_json::to_string(&after.provider_history.unwrap()).unwrap();
+    assert!(compacted_wal.contains(RECOVERY_SUMMARY));
+    assert!(!compacted_wal.contains(FULL_ONLY_MARKER));
+    assert!(!compacted_wal.contains(LATEST_PARTIAL));
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "record local follow-up"),
+            NewSessionMessage::text(
+                SessionMessageRole::Assistant,
+                format!("{}{POST_COMPACT_CANONICAL_MARKER}", "z".repeat(12_000)),
+            ),
+        ])
+        .await
+        .unwrap();
+    let requests_after_first_compact = provider.requests().await.len();
+    engine
+        .compact_session_checkpoint(&mut session, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(
+        provider.requests().await.len(),
+        requests_after_first_compact
+    );
+    let after_second_compact = session.read_metadata().await.unwrap().compaction.unwrap();
+    assert_eq!(
+        after_second_compact.active_turn_summary.as_deref(),
+        Some(RECOVERY_SUMMARY)
+    );
+    assert!(after_second_compact.frontier.active_turn.is_some());
+    assert!(
+        serde_json::to_string(&after_second_compact.provider_history)
+            .unwrap()
+            .contains(RECOVERY_SUMMARY)
+    );
+
+    engine
+        .run_turn(&mut session, "continue from the recovered state", |_| {})
+        .await
+        .unwrap();
+    let requests = provider.requests().await;
+    let continuation = requests.last().unwrap();
+    let continuation_json = serde_json::to_string(&continuation.messages).unwrap();
+    assert!(continuation_json.contains(RECOVERY_SUMMARY));
+    assert!(continuation_json.contains(LATEST_PARTIAL));
+    assert!(continuation_json.contains(POST_COMPACT_CANONICAL_MARKER));
+    assert!(!continuation_json.contains(FULL_ONLY_MARKER));
+    let final_state = session.read_metadata().await.unwrap().compaction.unwrap();
+    assert!(final_state.committed_summary.is_empty());
+    assert_eq!(final_state.frontier.committed_message_until, 0);
+    assert!(final_state.active_turn_summary.is_none());
+    assert!(final_state.frontier.active_turn.is_none());
+    assert!(final_state
+        .provider_history
+        .as_ref()
+        .is_some_and(|history| history.recovery_turn_id.is_none()));
+}
+
+#[tokio::test]
+async fn manual_compact_projects_committed_and_failed_turn_summaries_together() {
+    const COMMITTED_MARKER: &str = "FULL-COMMITTED-HISTORY-MARKER";
+    const ACTIVE_MARKER: &str = "FULL-ACTIVE-RECOVERY-MARKER";
+    const COMMITTED_SUMMARY: &str = "earlier committed work summarized";
+    const ACTIVE_SUMMARY: &str = "failed active work summarized";
+    const POST_FAILURE_MARKER: &str = "POST-FAILURE-CANONICAL-MARKER";
+    const NEXT_REQUEST: &str = "continue from the mixed recovered state";
+
+    let dir = tempfile::tempdir().unwrap();
+    tokio::fs::write(
+        dir.path().join("active-note.txt"),
+        format!("{}{ACTIVE_MARKER}", "a".repeat(12_000)),
+    )
+    .await
+    .unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        tool_use_step(
+            "toolu_manual_mixed",
+            "file_read",
+            json!({"path": "active-note.txt", "show_linenos": false}),
+        ),
+        error_step("provider failed after mixed history", Vec::new()),
+        json_by_request_kind_responses(
+            &[
+                r#"{"committed_summary":"earlier committed work summarized","active_turn_summary":"failed active work summarized"}"#,
+            ],
+            &[],
+        ),
+        response_step("continued from both summaries", Vec::new()),
+    ]));
+    let tools = Arc::new(
+        ToolRegistry::new(&ToolConfig {
+            workspace_root: dir.path().to_path_buf(),
+            ..ToolConfig::default()
+        })
+        .unwrap(),
+    );
+    let (mut engine, store) =
+        build_test_engine_with_tools(&dir, provider.clone(), Arc::clone(&tools));
+    engine.compaction.auto_compact_ctx_ratio = 0.0;
+    engine.compaction.tail_target_ctx_ratio = 0.00001;
+    let mut session = create_test_session(&store, "session_face0021").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "earlier request"),
+            NewSessionMessage::text(
+                SessionMessageRole::Assistant,
+                format!("{}{COMMITTED_MARKER}", "c".repeat(12_000)),
+            ),
+        ])
+        .await
+        .unwrap();
+
+    engine
+        .run_turn(&mut session, "read the active note and continue", |_| {})
+        .await
+        .expect_err("the second main request must fail");
+    let provider_history_before = session
+        .read_metadata()
+        .await
+        .unwrap()
+        .compaction
+        .as_ref()
+        .and_then(|state| state.provider_history.clone())
+        .expect("failed turn must retain its exact request WAL");
+    let raw_wal = serde_json::to_string(&provider_history_before).unwrap();
+    assert!(raw_wal.contains(COMMITTED_MARKER));
+    assert!(raw_wal.contains(ACTIVE_MARKER));
+    session
+        .append_messages(&[NewSessionMessage::text(
+            SessionMessageRole::User,
+            POST_FAILURE_MARKER,
+        )])
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        engine
+            .compact_session_checkpoint(&mut session, |_| {})
+            .await
+            .unwrap(),
+        SessionCompactionResult::Compacted(_)
+    ));
+    let after = session.read_metadata().await.unwrap().compaction.unwrap();
+    assert_eq!(after.committed_summary, COMMITTED_SUMMARY);
+    assert_eq!(after.frontier.committed_message_until, 2);
+    assert_eq!(after.active_turn_summary.as_deref(), Some(ACTIVE_SUMMARY));
+    assert!(after.frontier.active_turn.is_some());
+    let compacted_wal = serde_json::to_string(&after.provider_history.unwrap()).unwrap();
+    assert!(compacted_wal.contains(COMMITTED_SUMMARY));
+    assert!(compacted_wal.contains(ACTIVE_SUMMARY));
+    assert!(!compacted_wal.contains(COMMITTED_MARKER));
+    assert!(!compacted_wal.contains(ACTIVE_MARKER));
+
+    let requests = provider.requests().await;
+    let summary_request = requests
+        .iter()
+        .find(|request| request.system_prompt.contains("committed_summary"))
+        .expect("manual mixed compact must call the shared summarizer");
+    let summary_json = serde_json::to_string(&summary_request.messages).unwrap();
+    assert!(summary_json.contains(COMMITTED_MARKER));
+    assert!(summary_json.contains(ACTIVE_MARKER));
+
+    engine
+        .run_turn(&mut session, NEXT_REQUEST, |_| {})
+        .await
+        .unwrap();
+    let requests = provider.requests().await;
+    let continuation_json = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
+    assert!(continuation_json.contains(COMMITTED_SUMMARY));
+    assert!(continuation_json.contains(ACTIVE_SUMMARY));
+    assert!(!continuation_json.contains(COMMITTED_MARKER));
+    assert!(!continuation_json.contains(ACTIVE_MARKER));
+    let summary_at = continuation_json.find(ACTIVE_SUMMARY).unwrap();
+    let post_failure_at = continuation_json.find(POST_FAILURE_MARKER).unwrap();
+    let next_request_at = continuation_json.rfind(NEXT_REQUEST).unwrap();
+    assert!(summary_at < post_failure_at);
+    assert!(post_failure_at < next_request_at);
+}
+
+#[tokio::test]
+async fn manual_compact_does_not_duplicate_canonical_records_between_failed_turns() {
+    const FIRST_REQUEST: &str = "first failed request";
+    const SECOND_REQUEST: &str = "second failed request";
+    const THIRD_REQUEST: &str = "third failed request";
+    const SHELL_MARKER: &str = "INTERLEAVED-SHELL-MARKER";
+    const ACTIVE_SUMMARY: &str = "failed turns and interleaved shell record summarized in order";
+    const UPDATED_ACTIVE_SUMMARY: &str = "later failure merged into the recovery summary";
+
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        error_step("first provider failure", Vec::new()),
+        error_step("second provider failure", Vec::new()),
+        json_by_request_kind_responses(
+            &[
+                r#"{"committed_summary":null,"active_turn_summary":"failed turns and interleaved shell record summarized in order"}"#,
+            ],
+            &[],
+        ),
+        error_step("third provider failure", Vec::new()),
+        json_by_request_kind_responses(
+            &[
+                r#"{"committed_summary":null,"active_turn_summary":"later failure merged into the recovery summary"}"#,
+            ],
+            &[],
+        ),
+        json_by_request_kind_responses(
+            &[
+                r#"{"committed_summary":null,"active_turn_summary":"live turn merged with recovery"}"#,
+            ],
+            &[],
+        ),
+    ]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.compaction.auto_compact_ctx_ratio = 0.0;
+    engine.compaction.tail_target_ctx_ratio = 0.00001;
+    let mut session = create_test_session(&store, "session_face0023").await;
+    let encoded_shell_marker = SHELL_MARKER
+        .bytes()
+        .map(|byte| format!("\\{byte:03o}"))
+        .collect::<String>();
+
+    engine
+        .run_turn(&mut session, FIRST_REQUEST, |_| {})
+        .await
+        .expect_err("the first turn must fail");
+    engine
+        .run_user_shell_command(
+            &mut session,
+            format!("printf '{encoded_shell_marker}'"),
+            CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+    engine
+        .run_turn(&mut session, SECOND_REQUEST, |_| {})
+        .await
+        .expect_err("the second turn must fail");
+    let before_compact = session.read_metadata().await.unwrap().compaction.unwrap();
+    let before_compact_history = before_compact.provider_history.unwrap();
+    assert_eq!(before_compact_history.recovery_base_message_count, Some(0));
+
+    assert!(matches!(
+        engine
+            .compact_session_checkpoint(&mut session, |_| {})
+            .await
+            .unwrap(),
+        SessionCompactionResult::Compacted(_)
+    ));
+    let requests = provider.requests().await;
+    let summary_request = requests
+        .iter()
+        .find(|request| request.system_prompt.contains("committed_summary"))
+        .expect("manual recovery compact must call the shared summarizer");
+    let summary_json = serde_json::to_string(&summary_request.messages).unwrap();
+    assert_eq!(summary_json.matches(SHELL_MARKER).count(), 1);
+
+    let state = session.read_metadata().await.unwrap().compaction.unwrap();
+    assert!(state.committed_summary.is_empty());
+    assert_eq!(state.frontier.committed_message_until, 0);
+    assert_eq!(state.active_turn_summary.as_deref(), Some(ACTIVE_SUMMARY));
+    assert_eq!(
+        state
+            .provider_history
+            .as_deref()
+            .and_then(|history| history.recovery_base_message_count),
+        Some(0)
+    );
+
+    engine
+        .run_turn(&mut session, THIRD_REQUEST, |_| {})
+        .await
+        .expect_err("the third turn must fail");
+    assert!(matches!(
+        engine
+            .compact_session_checkpoint(&mut session, |_| {})
+            .await
+            .unwrap(),
+        SessionCompactionResult::Compacted(_)
+    ));
+    let state = session.read_metadata().await.unwrap().compaction.unwrap();
+    assert!(state.committed_summary.is_empty());
+    assert_eq!(state.frontier.committed_message_until, 0);
+    assert_eq!(
+        state.active_turn_summary.as_deref(),
+        Some(UPDATED_ACTIVE_SUMMARY)
+    );
+
+    let mut live_provider_messages = state
+        .provider_history
+        .as_deref()
+        .expect("manual recovery compact should persist its Provider projection")
+        .messages
+        .clone();
+    let mut writer = session.open_turn_journal_writer().await.unwrap();
+    let live_started_at = Utc::now();
+    writer
+        .append(
+            "turn_live",
+            live_started_at,
+            TurnJournalEventKind::TurnStarted,
+            TurnJournalFlush::Immediate,
+        )
+        .await
+        .unwrap();
+    writer
+        .append(
+            "turn_live",
+            live_started_at,
+            TurnJournalEventKind::UserInputAccepted {
+                text: "live request".into(),
+            },
+            TurnJournalFlush::Immediate,
+        )
+        .await
+        .unwrap();
+    drop(writer);
+    let live_active_suffix = oversized_active_suffix("live request".into(), None, None);
+    live_provider_messages.extend(live_active_suffix.iter().cloned());
+    let base_message_count = session.read_metadata().await.unwrap().message_count;
+    let live_projection = engine
+        .compact_provider_preflight(
+            &mut session,
+            PreflightCompactionRequest {
+                base_system_prompt: "system",
+                provider_messages: &live_provider_messages,
+                active_suffix: live_active_suffix,
+                turn_id: "turn_live",
+                base_message_count,
+                active_projection_compacted: false,
+                runtime_projection_tokens: 0,
+                protected_active_tail_segments: 0,
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap()
+        .expect("live preflight should compact the active tool history");
+    let live_projection_json = serde_json::to_string(&live_projection.messages).unwrap();
+    assert!(
+        live_projection_json.contains("live request"),
+        "live preflight must retain the current user request as the raw anchor"
+    );
+    let live_request_at = live_projection_json.find("live request").unwrap();
+    let live_summary_at = live_projection_json
+        .find("live turn merged with recovery")
+        .unwrap();
+    assert!(
+        live_request_at < live_summary_at,
+        "the replacement WAL must place the current raw anchor before the recovery summary"
+    );
+    let live_state = session.read_metadata().await.unwrap().compaction.unwrap();
+    assert_eq!(
+        live_state
+            .provider_history
+            .as_deref()
+            .and_then(|history| history.recovery_turn_id.as_deref()),
+        Some("turn_live")
+    );
+    let journal_projection = replay_turn_journal(session.read_turn_journal().await);
+    let canonical_messages = session.read_messages().await.unwrap();
+    let recovery_turns = recovery_turn_chain(&journal_projection, &canonical_messages);
+    let recovery_suffix = provider_recovery_suffix(&live_projection.messages, &recovery_turns)
+        .expect("the replacement WAL must remain recoverable from the current raw anchor");
+    let recovery_suffix_json = serde_json::to_string(&recovery_suffix).unwrap();
+    assert!(recovery_suffix_json.contains("live request"));
+    assert!(recovery_suffix_json.contains("live turn merged with recovery"));
+    let requests = provider.requests().await;
+    let live_summary_request = requests
+        .last()
+        .expect("live preflight should call the shared summarizer");
+    assert!(
+        serde_json::to_string(&live_summary_request.messages)
+            .unwrap()
+            .contains(UPDATED_ACTIVE_SUMMARY),
+        "live preflight must carry the unresolved recovery summary into its replacement"
+    );
+}
+
+#[test]
+fn manual_recovery_keeps_repeated_failed_turns_across_provider_identity_change() {
+    fn failed_turn(turn_id: &str, original_user_request: &str) -> TurnJournalTurn {
+        TurnJournalTurn {
+            turn_id: turn_id.into(),
+            started_at: None,
+            accepted_at: None,
+            finished_at: None,
+            status: Some(TurnJournalStatus::Failed),
+            original_user_request: Some(original_user_request.into()),
+            canonical_user_content_hash: None,
+            canonical_user_first_text: None,
+            model_context: Vec::new(),
+            skill_instructions: Vec::new(),
+            compaction_assets: Vec::new(),
+            assistant_text: String::new(),
+            assistant_completed: false,
+            tool_calls: Vec::new(),
+            timeline_items: Vec::new(),
+            user_steers: Vec::new(),
+            non_streaming_fallbacks: Vec::new(),
+        }
+    }
+
+    let first = failed_turn("turn_first", "continue");
+    let latest = failed_turn("turn_latest", "continue");
+    let recovery_turns = vec![&first, &latest];
+    let old_identity = ProviderReplayIdentity {
+        protocol: ProviderReplayProtocol::OpenAiResponses,
+        model: "old-model".into(),
+    };
+    let current_identity = ProviderReplayIdentity {
+        protocol: ProviderReplayProtocol::AnthropicMessages,
+        model: "current-model".into(),
+    };
+    let history = CompactedProviderHistory {
+        replay_identity: Some(old_identity),
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
+        pending_turn: Some(PendingProviderHistoryTurn {
+            turn_id: latest.turn_id.clone(),
+            base_message_count: 0,
+            provider_request_message_count: Some(4),
+        }),
+        canonical_message_until: 0,
+        messages: vec![
+            SessionTurnMessage::user_text("continue"),
+            SessionTurnMessage {
+                role: "assistant".into(),
+                content: vec![SessionTurnContentBlock::ToolUse {
+                    id: "toolu_first".into(),
+                    name: "working_note".into(),
+                    input: json!({"action": "add", "note": "keep neutral tool input"}),
+                }],
+                provider_replay: Some(ProviderReplayState::OpenAiResponses {
+                    model: Some("old-model".into()),
+                    items: vec![json!({"opaque": "PRIVATE-REPLAY-MARKER"})],
+                }),
+            },
+            SessionTurnMessage {
+                role: "user".into(),
+                content: vec![SessionTurnContentBlock::ToolResult {
+                    tool_use_id: "toolu_first".into(),
+                    content: "FIRST-TOOL-RESULT".into(),
+                }],
+                provider_replay: None,
+            },
+            SessionTurnMessage::user_text("continue"),
+        ],
+    };
+
+    let recovered = manual_pending_provider_turn(
+        Some(&history),
+        &recovery_turns,
+        Some(&current_identity),
+        &[],
+        ProviderHistoryMediaPolicy::Placeholder,
+    )
+    .unwrap()
+    .expect("the provider-neutral WAL suffix should survive an identity change");
+
+    assert_eq!(recovered.base_message_count, 0);
+    assert_eq!(recovered.turn_id, "turn_latest");
+    assert_eq!(recovered.protected_tail_segments, 0);
+    assert!(recovered
+        .active_suffix
+        .iter()
+        .all(|message| message.provider_replay.is_none()));
+    let recovered_json = serde_json::to_string(&recovered.active_suffix).unwrap();
+    assert!(recovered_json.contains("toolu_first"));
+    assert!(recovered_json.contains("FIRST-TOOL-RESULT"));
+    assert_eq!(recovered_json.matches("continue").count(), 2);
+    assert!(!recovered_json.contains("PRIVATE-REPLAY-MARKER"));
+
+    let stable_history = CompactedProviderHistory {
+        replay_identity: history.replay_identity.clone(),
+        recovery_turn_id: Some(first.turn_id.clone()),
+        recovery_base_message_count: Some(0),
+        pending_turn: None,
+        canonical_message_until: 0,
+        messages: history.messages[..3].to_vec(),
+    };
+    let recovered = manual_pending_provider_turn(
+        Some(&stable_history),
+        &recovery_turns,
+        Some(&current_identity),
+        &[],
+        ProviderHistoryMediaPolicy::Placeholder,
+    )
+    .unwrap()
+    .expect("stable unresolved WAL should remain manually compactable");
+    assert_eq!(recovered.turn_id, "turn_first");
+    let recovered_json = serde_json::to_string(&recovered.active_suffix).unwrap();
+    assert!(recovered_json.contains("toolu_first"));
+    assert!(recovered_json.contains("FIRST-TOOL-RESULT"));
+    assert_eq!(recovered_json.matches("continue").count(), 1);
+}
+
+#[tokio::test]
+async fn manual_compact_keeps_short_pending_turn_as_raw_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![error_step(
+        "provider failed before any progress",
+        Vec::new(),
+    )]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.compaction.auto_compact_ctx_ratio = 0.0;
+    engine.compaction.tail_target_ctx_ratio = 0.6;
+    let mut session = create_test_session(&store, "session_face0020").await;
+
+    engine
+        .run_turn(&mut session, "short request", |_| {})
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        engine
+            .compact_session_checkpoint(&mut session, |_| {})
+            .await
+            .unwrap(),
+        SessionCompactionResult::Noop(SessionCompactionNoopReason::NothingNew)
+    ));
+    assert_eq!(provider.requests().await.len(), 1);
+}
+
+#[tokio::test]
+async fn manual_compact_preserves_stable_raw_recovery_without_pending_turn() {
+    const COMMITTED_MARKER: &str = "COMMITTED-BEFORE-FAILED-TURN";
+    const COMMITTED_SUMMARY: &str = "committed history summarized";
+    const FAILED_REQUEST: &str = "continue after the committed work";
+
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        error_step("provider failed before any progress", Vec::new()),
+        json_by_request_kind_responses(
+            &[r#"{"committed_summary":"committed history summarized","active_turn_summary":null}"#],
+            &[],
+        ),
+    ]));
+    let (mut engine, store) = build_test_engine(&dir, provider.clone());
+    engine.compaction.auto_compact_ctx_ratio = 0.0;
+    engine.compaction.tail_target_ctx_ratio = 0.00001;
+    let mut session = create_test_session(&store, "session_face0022").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "earlier request"),
+            NewSessionMessage::text(
+                SessionMessageRole::Assistant,
+                format!("{}{COMMITTED_MARKER}", "c".repeat(12_000)),
+            ),
+        ])
+        .await
+        .unwrap();
+
+    engine
+        .run_turn(&mut session, FAILED_REQUEST, |_| {})
+        .await
+        .unwrap_err();
+    let projection = replay_turn_journal(session.read_turn_journal().await);
+    let canonical_messages = session.read_messages().await.unwrap();
+    engine
+        .reconcile_pending_provider_history(&mut session, &projection, &canonical_messages)
+        .await
+        .unwrap();
+    let stable = session.read_metadata().await.unwrap().compaction.unwrap();
+    let stable_history = stable.provider_history.unwrap();
+    assert!(stable_history.pending_turn.is_none());
+    assert!(stable_history.recovery_turn_id.is_some());
+
+    assert!(matches!(
+        engine
+            .compact_session_checkpoint(&mut session, |_| {})
+            .await
+            .unwrap(),
+        SessionCompactionResult::Compacted(_)
+    ));
+    let compacted = session.read_metadata().await.unwrap().compaction.unwrap();
+    assert_eq!(compacted.committed_summary, COMMITTED_SUMMARY);
+    assert!(compacted.active_turn_summary.is_none());
+    let compacted_history = compacted.provider_history.unwrap();
+    assert!(compacted_history.pending_turn.is_none());
+    assert!(compacted_history.recovery_turn_id.is_some());
+    let compacted_wal = serde_json::to_string(&compacted_history.messages).unwrap();
+    assert!(compacted_wal.contains(COMMITTED_SUMMARY));
+    assert!(compacted_wal.contains(FAILED_REQUEST));
+    assert!(!compacted_wal.contains(COMMITTED_MARKER));
+
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "later local record"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "l".repeat(12_000)),
+        ])
+        .await
+        .unwrap();
+    let requests_before_second_compact = provider.requests().await.len();
+    engine
+        .compact_session_checkpoint(&mut session, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(
+        provider.requests().await.len(),
+        requests_before_second_compact
+    );
+    let after_second = session.read_metadata().await.unwrap().compaction.unwrap();
+    let after_second_history = after_second.provider_history.unwrap();
+    assert!(after_second_history.recovery_turn_id.is_some());
+    let after_second_wal = serde_json::to_string(&after_second_history.messages).unwrap();
+    assert!(after_second_wal.contains(FAILED_REQUEST));
 }
 
 #[test]
@@ -7164,6 +10066,7 @@ async fn preflight_compact_skips_context_only_committed_projection_without_provi
             &mut session,
             PreflightCompactionRequest {
                 base_system_prompt: "system",
+                provider_messages: &[],
                 active_suffix: vec![SessionTurnMessage::user_text("current request")],
                 turn_id: "turn_1",
                 base_message_count: 4,
@@ -7214,6 +10117,12 @@ async fn main_forced_context_recovery_errors_when_only_model_context_is_compacta
         capture_provider_history: false,
         last_compacted_provider_history: None,
         provider_compaction_before_pending_request: None,
+        provider_compaction_before_started_request: None,
+        provider_compaction_before_turn: None,
+        provider_history_before_turn: Vec::new(),
+        provider_compaction_for_context_retry: None,
+        provider_compaction_before_clean_retry: None,
+        provider_response_accepted_in_turn: false,
         background_completion_delivery_seq: Arc::new(AtomicU64::new(0)),
         provider_replay_identity: None,
     };
@@ -7291,6 +10200,7 @@ async fn preflight_compact_keeps_active_scope_when_committed_projection_is_empty
             &mut session,
             PreflightCompactionRequest {
                 base_system_prompt: "system",
+                provider_messages: &[],
                 active_suffix,
                 turn_id: "turn_1",
                 base_message_count: 2,
@@ -8033,6 +10943,7 @@ async fn manual_compact_applied_summary_checkpoint_clears_file_read_state() {
         summary: "checkpointed summary".into(),
         active_turn_summary: None,
         active_turn: None,
+        preserve_provider_history: false,
         status: CompactionCheckpointStatus::Applied,
     };
     session
@@ -8289,6 +11200,7 @@ async fn manual_compact_bad_checkpoint_range_writes_failed_audit() {
         summary: "bad range summary".into(),
         active_turn_summary: None,
         active_turn: None,
+        preserve_provider_history: false,
         status: CompactionCheckpointStatus::Applied,
     };
     session
@@ -8346,6 +11258,7 @@ async fn finalize_ignores_legacy_v2_compaction_checkpoint() {
         summary: String::new(),
         active_turn_summary: None,
         active_turn: None,
+        preserve_provider_history: false,
         status: CompactionCheckpointStatus::Applied,
     };
     session
@@ -8604,6 +11517,88 @@ async fn missing_committed_journal_marker_is_reconciled_with_canonical_messages(
     let next_user_text = last_user_text(&requests[0]);
     assert!(!next_user_text.contains("<interrupted_turn_context>"));
     assert!(next_user_text.contains("next request"));
+}
+
+#[tokio::test]
+async fn canonical_retry_after_rejection_is_not_duplicated_when_finish_marker_is_missing() {
+    for (discard_turn, session_id) in [(true, "session_aaaaaa12"), (false, "session_aaaaaa13")] {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(RecordingProvider::new(vec![response_step(
+            "next answer",
+            Vec::new(),
+        )]));
+        let (engine, store) = build_test_engine(&dir, provider.clone());
+        let mut session = create_test_session(&store, session_id).await;
+        let journal_at = Utc::now();
+        let committed_at = journal_at + chrono::Duration::milliseconds(10);
+        session
+            .append_session_turn_messages(
+                &[
+                    CompletedSessionTurnMessage::new(
+                        SessionTurnMessage::user_text("committed after rejection"),
+                        committed_at,
+                    ),
+                    CompletedSessionTurnMessage::new(
+                        SessionTurnMessage::assistant_text("committed retry answer"),
+                        committed_at,
+                    ),
+                ],
+                "test-model",
+            )
+            .await
+            .unwrap();
+        let mut compaction =
+            SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
+        compaction.provider_history = Some(Box::new(CompactedProviderHistory {
+            replay_identity: None,
+            recovery_turn_id: None,
+            recovery_base_message_count: None,
+            pending_turn: Some(PendingProviderHistoryTurn {
+                turn_id: "turn_1".into(),
+                base_message_count: 0,
+                provider_request_message_count: Some(1),
+            }),
+            canonical_message_until: 2,
+            messages: vec![
+                SessionTurnMessage::user_text("committed after rejection"),
+                SessionTurnMessage::assistant_text("committed retry answer"),
+            ],
+        }));
+        session.update_compaction(compaction).await.unwrap();
+
+        let mut writer = session.open_turn_journal_writer().await.unwrap();
+        for kind in [
+            TurnJournalEventKind::TurnStarted,
+            TurnJournalEventKind::UserInputAccepted {
+                text: "committed after rejection".into(),
+            },
+            TurnJournalEventKind::ProviderRequestRejected {
+                rejection_id: 1,
+                discard_turn,
+            },
+            TurnJournalEventKind::AssistantCompleted {
+                text: "committed retry answer".into(),
+            },
+        ] {
+            writer
+                .append("turn_1", journal_at, kind, TurnJournalFlush::Immediate)
+                .await
+                .unwrap();
+        }
+        drop(writer);
+
+        engine
+            .run_turn(&mut session, "next request", |_| {})
+            .await
+            .unwrap();
+
+        let requests = provider.requests().await;
+        let wire = serde_json::to_string(&requests[0].messages).unwrap();
+        assert_eq!(wire.matches("committed after rejection").count(), 1);
+        assert_eq!(wire.matches("committed retry answer").count(), 1);
+        assert!(!wire.contains("<interrupted_turn_context>"));
+        assert!(wire.contains("next request"));
+    }
 }
 
 #[tokio::test]
@@ -11183,6 +14178,8 @@ async fn persisted_provider_window_replays_new_canonical_tail_without_reprojecti
         SessionCompactionState::from_committed_summary(2, "covered summary".into(), Utc::now());
     compaction.provider_history = Some(Box::new(CompactedProviderHistory {
         replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
         pending_turn: None,
         canonical_message_until: 2,
         messages: vec![SessionTurnMessage::user_text("STABLE_COMPACT_WINDOW")],
@@ -11214,6 +14211,96 @@ async fn persisted_provider_window_replays_new_canonical_tail_without_reprojecti
 }
 
 #[tokio::test]
+async fn recovery_provider_window_projects_safely_across_identity_change() {
+    const RECOVERY_MARKER: &str = "RECOVERY-NEUTRAL-MARKER";
+    const PRIVATE_REPLAY_MARKER: &str = "PRIVATE-REPLAY-MARKER";
+    const CANONICAL_TAIL_MARKER: &str = "CANONICAL-TAIL-MARKER";
+
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (_engine, store) = build_test_engine(&dir, provider);
+    let mut session = create_test_session(&store, "session_c0ffee2b").await;
+    session
+        .append_messages(&[NewSessionMessage::text(
+            SessionMessageRole::Assistant,
+            CANONICAL_TAIL_MARKER,
+        )])
+        .await
+        .unwrap();
+    let old_identity = ProviderReplayIdentity {
+        protocol: ProviderReplayProtocol::OpenAiResponses,
+        model: "old-model".into(),
+    };
+    let current_identity = ProviderReplayIdentity {
+        protocol: ProviderReplayProtocol::AnthropicMessages,
+        model: "current-model".into(),
+    };
+    let mut compaction =
+        SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
+    compaction.provider_history = Some(Box::new(CompactedProviderHistory {
+        replay_identity: Some(old_identity),
+        recovery_turn_id: Some("turn_failed".into()),
+        recovery_base_message_count: Some(0),
+        pending_turn: None,
+        canonical_message_until: 0,
+        messages: vec![SessionTurnMessage {
+            role: "assistant".into(),
+            content: vec![SessionTurnContentBlock::text(RECOVERY_MARKER)],
+            provider_replay: Some(ProviderReplayState::OpenAiResponses {
+                model: Some("old-model".into()),
+                items: vec![json!({"opaque": PRIVATE_REPLAY_MARKER})],
+            }),
+        }],
+    }));
+    session.update_compaction(compaction).await.unwrap();
+    let metadata = session.read_metadata().await.unwrap();
+    let messages = session.read_messages().await.unwrap();
+
+    let (_, history) = compacted_context_for_turn(
+        "system",
+        &metadata,
+        messages.clone(),
+        usize::MAX,
+        usize::MAX,
+        4,
+        4096,
+        ProviderHistoryMediaPolicy::Placeholder,
+        Some(current_identity.clone()),
+        true,
+    )
+    .unwrap();
+    let rendered = serde_json::to_string(&history).unwrap();
+    assert!(rendered.contains(RECOVERY_MARKER));
+    assert!(rendered.contains(CANONICAL_TAIL_MARKER));
+    assert!(!rendered.contains(PRIVATE_REPLAY_MARKER));
+
+    let projection = project_provider_context(
+        "system",
+        metadata.compaction.as_ref().unwrap(),
+        &messages,
+        vec![SessionTurnMessage::user_text("next request")],
+        ActiveProjectionContext {
+            turn_id: "turn_next",
+            base_message_count: messages.len(),
+        },
+        ProviderProjectionBudget {
+            tail_token_limit: usize::MAX,
+            tail_hard_token_limit: usize::MAX,
+            tail_previous_real_user_turns: 4,
+            tool_result_raw_max_chars: 4096,
+        },
+        ProviderHistoryMediaPolicy::Placeholder,
+        Some(current_identity),
+        0,
+        true,
+    );
+    let rendered = serde_json::to_string(&projection.messages).unwrap();
+    assert!(rendered.contains(RECOVERY_MARKER));
+    assert!(rendered.contains(CANONICAL_TAIL_MARKER));
+    assert!(!rendered.contains(PRIVATE_REPLAY_MARKER));
+}
+
+#[tokio::test]
 async fn disabled_authority_filters_historical_compaction_notice_without_rewriting_wal() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(Vec::new()));
@@ -11224,6 +14311,8 @@ async fn disabled_authority_filters_historical_compaction_notice_without_rewriti
         SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
     compaction.provider_history = Some(Box::new(CompactedProviderHistory {
         replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
         pending_turn: None,
         canonical_message_until: 0,
         messages: vec![historical],
@@ -11286,6 +14375,12 @@ async fn provider_wal_rolls_back_only_when_request_never_started() {
         capture_provider_history: true,
         last_compacted_provider_history: None,
         provider_compaction_before_pending_request: None,
+        provider_compaction_before_started_request: None,
+        provider_compaction_before_turn: None,
+        provider_history_before_turn: Vec::new(),
+        provider_compaction_for_context_retry: None,
+        provider_compaction_before_clean_retry: None,
+        provider_response_accepted_in_turn: false,
         background_completion_delivery_seq: delivery_seq,
         provider_replay_identity: None,
     };
@@ -11320,6 +14415,12 @@ async fn provider_wal_rolls_back_only_when_request_never_started() {
         capture_provider_history: true,
         last_compacted_provider_history: None,
         provider_compaction_before_pending_request: None,
+        provider_compaction_before_started_request: None,
+        provider_compaction_before_turn: None,
+        provider_history_before_turn: Vec::new(),
+        provider_compaction_for_context_retry: None,
+        provider_compaction_before_clean_retry: None,
+        provider_response_accepted_in_turn: false,
         background_completion_delivery_seq: Arc::new(AtomicU64::new(0)),
         provider_replay_identity: None,
     };
@@ -11362,6 +14463,8 @@ async fn pending_provider_window_reconciles_canonical_tail_after_post_commit_fai
         SessionCompactionState::from_committed_summary(1, "covered summary".into(), Utc::now());
     compaction.provider_history = Some(Box::new(CompactedProviderHistory {
         replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
         pending_turn: Some(PendingProviderHistoryTurn {
             turn_id: "turn_1".into(),
             base_message_count: 0,
@@ -11407,6 +14510,8 @@ async fn uncommitted_pending_provider_window_discards_unaccepted_response_suffix
         SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
     compaction.provider_history = Some(Box::new(CompactedProviderHistory {
         replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
         pending_turn: Some(PendingProviderHistoryTurn {
             turn_id: "turn_1".into(),
             base_message_count: 0,
@@ -11451,6 +14556,7 @@ async fn uncommitted_pending_provider_window_discards_unaccepted_response_suffix
         .and_then(|compaction| compaction.provider_history.as_ref())
         .unwrap();
     assert!(provider_history.pending_turn.is_none());
+    assert_eq!(provider_history.recovery_turn_id.as_deref(), Some("turn_1"));
     assert_eq!(provider_history.canonical_message_until, 0);
     assert_eq!(provider_history.messages, vec![exact_request.clone()]);
     let (_, projected) = compacted_context_for_turn(
@@ -11490,6 +14596,8 @@ async fn committed_pending_provider_window_preserves_later_shell_tail() {
         SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
     compaction.provider_history = Some(Box::new(CompactedProviderHistory {
         replay_identity: None,
+        recovery_turn_id: None,
+        recovery_base_message_count: None,
         pending_turn: Some(PendingProviderHistoryTurn {
             turn_id: "turn_1".into(),
             base_message_count: 0,
@@ -11538,6 +14646,7 @@ async fn committed_pending_provider_window_preserves_later_shell_tail() {
         .and_then(|compaction| compaction.provider_history.as_ref())
         .unwrap();
     assert!(provider_history.pending_turn.is_none());
+    assert!(provider_history.recovery_turn_id.is_none());
     assert_eq!(provider_history.canonical_message_until, 2);
     let (_, projected) = compacted_context_for_turn(
         "system",
@@ -11903,6 +15012,7 @@ async fn preflight_recovers_matching_compaction_checkpoint_before_replanning() {
         summary: "recovered committed summary".into(),
         active_turn_summary: None,
         active_turn: None,
+        preserve_provider_history: false,
         status: CompactionCheckpointStatus::Applied,
     };
     session
@@ -11916,6 +15026,7 @@ async fn preflight_recovers_matching_compaction_checkpoint_before_replanning() {
             &mut session,
             PreflightCompactionRequest {
                 base_system_prompt: "system",
+                provider_messages: &[],
                 active_suffix: vec![SessionTurnMessage::user_text("continue")],
                 turn_id: "turn_1",
                 base_message_count: messages.len(),
@@ -11974,6 +15085,7 @@ async fn preflight_checkpoint_recovery_validation_failure_writes_failed_audit() 
         summary: "recovered committed summary".into(),
         active_turn_summary: None,
         active_turn: None,
+        preserve_provider_history: false,
         status: CompactionCheckpointStatus::Applied,
     };
     session
@@ -11986,6 +15098,7 @@ async fn preflight_checkpoint_recovery_validation_failure_writes_failed_audit() 
             &mut session,
             PreflightCompactionRequest {
                 base_system_prompt: "system",
+                provider_messages: &[],
                 active_suffix: vec![SessionTurnMessage::user_text("continue")],
                 turn_id: "turn_1",
                 base_message_count: messages.len(),
@@ -12376,6 +15489,12 @@ async fn preflight_preserves_persisted_context_before_auto_compaction() {
         capture_provider_history: false,
         last_compacted_provider_history: None,
         provider_compaction_before_pending_request: None,
+        provider_compaction_before_started_request: None,
+        provider_compaction_before_turn: None,
+        provider_history_before_turn: Vec::new(),
+        provider_compaction_for_context_retry: None,
+        provider_compaction_before_clean_retry: None,
+        provider_response_accepted_in_turn: false,
         background_completion_delivery_seq: Arc::new(AtomicU64::new(0)),
         provider_replay_identity: None,
     };
@@ -12649,6 +15768,12 @@ async fn preflight_keeps_oversized_anchor_when_auto_compaction_does_not_trigger(
         capture_provider_history: false,
         last_compacted_provider_history: None,
         provider_compaction_before_pending_request: None,
+        provider_compaction_before_started_request: None,
+        provider_compaction_before_turn: None,
+        provider_history_before_turn: Vec::new(),
+        provider_compaction_for_context_retry: None,
+        provider_compaction_before_clean_retry: None,
+        provider_response_accepted_in_turn: false,
         background_completion_delivery_seq: Arc::new(AtomicU64::new(0)),
         provider_replay_identity: None,
     };
@@ -12687,6 +15812,12 @@ async fn preflight_trigger_uses_session_provider_context_anchor() {
         capture_provider_history: false,
         last_compacted_provider_history: None,
         provider_compaction_before_pending_request: None,
+        provider_compaction_before_started_request: None,
+        provider_compaction_before_turn: None,
+        provider_history_before_turn: Vec::new(),
+        provider_compaction_for_context_retry: None,
+        provider_compaction_before_clean_retry: None,
+        provider_response_accepted_in_turn: false,
         background_completion_delivery_seq: Arc::new(AtomicU64::new(0)),
         provider_replay_identity: None,
     };
@@ -12739,6 +15870,12 @@ async fn preflight_trigger_uses_in_turn_provider_context_anchor() {
         capture_provider_history: false,
         last_compacted_provider_history: None,
         provider_compaction_before_pending_request: None,
+        provider_compaction_before_started_request: None,
+        provider_compaction_before_turn: None,
+        provider_history_before_turn: Vec::new(),
+        provider_compaction_for_context_retry: None,
+        provider_compaction_before_clean_retry: None,
+        provider_response_accepted_in_turn: false,
         background_completion_delivery_seq: Arc::new(AtomicU64::new(0)),
         provider_replay_identity: None,
     };
@@ -12778,6 +15915,12 @@ async fn preflight_trigger_uses_session_anchor_as_high_watermark() {
         capture_provider_history: false,
         last_compacted_provider_history: None,
         provider_compaction_before_pending_request: None,
+        provider_compaction_before_started_request: None,
+        provider_compaction_before_turn: None,
+        provider_history_before_turn: Vec::new(),
+        provider_compaction_for_context_retry: None,
+        provider_compaction_before_clean_retry: None,
+        provider_response_accepted_in_turn: false,
         background_completion_delivery_seq: Arc::new(AtomicU64::new(0)),
         provider_replay_identity: None,
     };

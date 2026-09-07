@@ -17,6 +17,24 @@ async fn acknowledge_process_output(registry: &ToolRegistry, execution: &ToolExe
 }
 
 #[cfg(unix)]
+async fn wait_for_managed_terminal(
+    registry: &ToolRegistry,
+    context: &ToolDispatchContext,
+    process_id: &str,
+) {
+    let process = registry
+        .process_manager
+        .find_for_owner(&registry.process_owner(context), process_id)
+        .await
+        .expect("process must remain registered before final output is acknowledged");
+    // 等待 watcher 的终态通知，不消费输出，也不推进 delivery cursor。
+    assert!(
+        process.wait_for_terminal(Duration::from_secs(5)).await,
+        "managed process {process_id} should reach a terminal state"
+    );
+}
+
+#[cfg(unix)]
 async fn collect_stdout_until_terminal(
     registry: &ToolRegistry,
     context: &ToolDispatchContext,
@@ -492,7 +510,7 @@ async fn long_code_run_yields_process_id_without_timeout_kill() {
     assert_eq!(running.outcome, ToolExecutionOutcome::ProcessRunning);
     let process_id = running.output["process_id"].as_str().unwrap().to_string();
     acknowledge_process_output(&registry, &running).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    wait_for_managed_terminal(&registry, &ToolDispatchContext::default(), &process_id).await;
     let completed = registry
         .dispatch("write_stdin", json!({"process_id": process_id}))
         .await
@@ -837,6 +855,7 @@ async fn main_agent_can_terminate_subagent_process_without_taking_input_ownershi
 #[cfg(unix)]
 async fn background_projection_ignores_elapsed_time_and_output_growth_but_tracks_lifecycle() {
     let dir = tempfile::tempdir().unwrap();
+    let output_release = dir.path().join("output.release");
     let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
     let session = SessionId::from_str("session_aaaaaaaa").unwrap();
     let context = file_tool_context(&session);
@@ -844,7 +863,10 @@ async fn background_projection_ignores_elapsed_time_and_output_growth_but_tracks
         .dispatch_with_context(
             "code_run",
             json!({
-                "script": "printf first; sleep 0.3; printf second; sleep 3",
+                "script": format!(
+                    "printf first; while [ ! -f {} ]; do sleep 0.05; done; printf second; sleep 30",
+                    shell_quote_path(&output_release)
+                ),
                 "yield_time_ms": 50,
             }),
             context.clone(),
@@ -868,7 +890,8 @@ async fn background_projection_ignores_elapsed_time_and_output_growth_but_tracks
         after_output_cursor_advance, before,
         "advancing an ordinary output delivery cursor must not change the semantic projection"
     );
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    tokio::fs::write(&output_release, "").await.unwrap();
+    wait_for_managed_stdout(&registry, &context, &process_id, "second").await;
     let after_output_growth = registry
         .background_process_projection_for_owner_with_notifications(&owner, Vec::new())
         .await
@@ -997,14 +1020,18 @@ async fn pipe_process_rejects_text_but_accepts_ctrl_c() {
 #[cfg(unix)]
 async fn runtime_terminate_reports_already_exited_after_a_stale_ps_snapshot() {
     let dir = tempfile::tempdir().unwrap();
+    let exit_release = dir.path().join("exit.release");
     let registry = ToolRegistry::new(&test_tool_config(dir.path())).unwrap();
     let session = SessionId::from_str("session_aaaaaaaa").unwrap();
     let context = file_tool_context(&session);
     let running = registry
         .dispatch_with_context(
             "code_run",
-            json!({"script": "sleep 0.5", "yield_time_ms": 250}),
-            context,
+            json!({
+                "script": format!("while [ ! -f {} ]; do sleep 0.05; done", shell_quote_path(&exit_release)),
+                "yield_time_ms": 250
+            }),
+            context.clone(),
         )
         .await
         .unwrap();
@@ -1016,7 +1043,8 @@ async fn runtime_terminate_reports_already_exited_after_a_stale_ps_snapshot() {
         .expect("running process must have a /ps snapshot")
         .instance_id;
 
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    tokio::fs::write(&exit_release, "").await.unwrap();
+    wait_for_managed_terminal(&registry, &context, &process_id).await;
     let error = registry
         .terminate_process_for_root_session(&session, &process_id, None, stale_instance_id)
         .await
@@ -1044,7 +1072,7 @@ async fn truncated_final_output_advances_by_provider_acknowledged_pages() {
         .unwrap();
     let process_id = running.output["process_id"].as_str().unwrap().to_string();
     acknowledge_process_output(&registry, &running).await;
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    wait_for_managed_terminal(&registry, &context, &process_id).await;
 
     let partial = registry
         .dispatch_with_context(

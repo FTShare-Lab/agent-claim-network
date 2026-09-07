@@ -5704,6 +5704,8 @@ mod tests {
     #[tokio::test]
     async fn disable_during_refresh_prevents_stale_ready_outcome() {
         let dir = tempfile::tempdir().unwrap();
+        let initialize_started = dir.path().join("initialize.started");
+        let initialize_release = dir.path().join("initialize.release");
         let script_path = dir.path().join("slow_stdio_mock.sh");
         tokio::fs::write(&script_path, slow_stdio_mock_script())
             .await
@@ -5715,7 +5717,16 @@ mod tests {
             McpServerConfig::stdio(
                 "sh".to_string(),
                 vec![script_path.display().to_string()],
-                BTreeMap::new(),
+                BTreeMap::from([
+                    (
+                        "MCP_FIXTURE_INITIALIZE_STARTED".into(),
+                        initialize_started.display().to_string(),
+                    ),
+                    (
+                        "MCP_FIXTURE_INITIALIZE_RELEASE".into(),
+                        initialize_release.display().to_string(),
+                    ),
+                ]),
                 Vec::new(),
             ),
         );
@@ -5727,9 +5738,10 @@ mod tests {
         ));
         let refresh_manager = Arc::clone(&manager);
         let refresh = tokio::spawn(async move { refresh_manager.refresh_all().await });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        wait_for_file(&initialize_started).await;
 
         manager.disable_server("stdio_server").await.unwrap();
+        tokio::fs::write(&initialize_release, "").await.unwrap();
         refresh.await.unwrap().unwrap();
         let snapshot = manager.snapshot().await;
 
@@ -6122,6 +6134,8 @@ mod tests {
     #[tokio::test]
     async fn removed_server_during_refresh_drops_stale_ready_outcome() {
         let dir = tempfile::tempdir().unwrap();
+        let initialize_started = dir.path().join("initialize.started");
+        let initialize_release = dir.path().join("initialize.release");
         let script_path = dir.path().join("slow_stdio_mock.sh");
         tokio::fs::write(&script_path, slow_stdio_mock_script())
             .await
@@ -6133,7 +6147,16 @@ mod tests {
             McpServerConfig::stdio(
                 "sh".to_string(),
                 vec![script_path.display().to_string()],
-                BTreeMap::new(),
+                BTreeMap::from([
+                    (
+                        "MCP_FIXTURE_INITIALIZE_STARTED".into(),
+                        initialize_started.display().to_string(),
+                    ),
+                    (
+                        "MCP_FIXTURE_INITIALIZE_RELEASE".into(),
+                        initialize_release.display().to_string(),
+                    ),
+                ]),
                 Vec::new(),
             ),
         );
@@ -6145,12 +6168,13 @@ mod tests {
         ));
         let refresh_manager = Arc::clone(&manager);
         let refresh = tokio::spawn(async move { refresh_manager.refresh_all().await });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        wait_for_file(&initialize_started).await;
 
         write_mcp_json_config_atomic(&path, &McpJsonConfig::default())
             .await
             .unwrap();
         manager.refresh_all().await.unwrap();
+        tokio::fs::write(&initialize_release, "").await.unwrap();
         refresh.await.unwrap().unwrap();
         let snapshot = manager.snapshot().await;
 
@@ -6330,7 +6354,8 @@ case "$line" in
     printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id"
     ;;
   *'"method":"initialize"'*)
-    sleep 1
+    : > "$MCP_FIXTURE_INITIALIZE_STARTED"
+    while [ ! -f "$MCP_FIXTURE_INITIALIZE_RELEASE" ]; do sleep 0.05; done
     printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"slow-stdio-mock","version":"1.0.0"}}}\n' "$id"
     ;;
   *'"method":"tools/list"'*)
@@ -7087,7 +7112,7 @@ done
     }
 
     async fn wait_for_file(path: &Path) {
-        time::timeout(Duration::from_secs(2), async {
+        time::timeout(Duration::from_secs(5), async {
             loop {
                 if tokio::fs::try_exists(path).await.unwrap_or(false) {
                     return;

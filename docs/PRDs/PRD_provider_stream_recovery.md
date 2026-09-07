@@ -30,7 +30,7 @@ ACN 的三种主对话 provider 都先请求 HTTP SSE streaming；streaming 失�
 - 不把所有 `OutputShape`、所有 JSON 错误或 non-streaming 格式错误都标记为异常流。
 - 不修改 WebSocket、TUI 布局、timeline cell 或 Reasoning 展示。
 - 不增加 TOML 参数，不改变 `retry_count` 和 non-streaming fallback 最多 5 次的现有配置语义。
-- 不保存原始损坏 SSE frame、请求体、Reasoning 或附件内容到错误日志。
+- 不主动把原始损坏 SSE frame、请求体、Reasoning 或附件内容附加到错误日志。上游明确返回的错误 message 按 `PRD_provider_rejection_recovery.md` 第 4.5 节展示，并沿用现有错误记录链路。
 
 ## 4. 已拍板语义
 
@@ -86,7 +86,7 @@ ACN 的三种主对话 provider 都先请求 HTTP SSE streaming；streaming 失�
 - streaming delta 可以作为当前运行中 TUI 的临时展示；只有成功 fallback 的完整文本会通过既有 replacement event 替换它。
 - 未完整或已放弃 attempt 的 tool call 永不执行，也不生成 tool result。
 - 只有最终成功 attempt 的工具调用进入工具执行，而且每个调用只执行一次。
-- 最终失败不向 `messages.jsonl` 写入 canonical assistant 或 provider replay；resume 只恢复此前 committed 历史。诊断性 `turn_events.jsonl` 仍可记录既有失败/fallback 事件，但不能包含原始私有 payload。
+- 最终失败不向 `messages.jsonl` 写入 canonical assistant 或 provider replay；resume 只恢复此前 committed 历史。诊断性 `turn_events.jsonl` 仍可记录既有失败/fallback 事件及归一化后的上游错误消息，不额外附加原始私有 payload。
 
 ### 4.6 不进入 fallback 的路径
 

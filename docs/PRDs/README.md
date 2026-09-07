@@ -11,6 +11,7 @@
 - [Turn Journal 与 Mid-Turn 恢复](PRD_turn2message.md)
 - [异常退出 Session 恢复](PRD_interrupted_session_resume.md)
 - [流式失败回退非流式重试](PRD_retry_non_streaming.md)
+- [Provider 确定性拒绝恢复](PRD_provider_rejection_recovery.md)
 - [Finalize Supervisor](PRD_finalize_supervisor.md)
 - [Session Auto Cleanup](PRD_auto_cleanup.md)
 

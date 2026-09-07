@@ -2211,7 +2211,7 @@ mod tests {
         fixture.service = Arc::new(
             (*fixture.service)
                 .clone()
-                .with_context_retry(10, Duration::from_millis(20)),
+                .with_context_retry(20, Duration::from_millis(500)),
         );
         let job = fixture.report().await;
         let service = fixture.service.clone();
@@ -2221,7 +2221,7 @@ mod tests {
                 .process_analysis(&running_job, &CancellationToken::new())
                 .await
         });
-        tokio::time::sleep(Duration::from_millis(45)).await;
+        wait_for_context_preparation(&fixture, &job).await;
         assert_eq!(fixture.evaluator.calls(), (0, 0));
         assert_eq!(
             fixture.store.read_analysis(&job).await.unwrap().state,
@@ -2244,7 +2244,13 @@ mod tests {
 
     #[tokio::test]
     async fn scheduler_cancellation_interrupts_context_wait_without_model_call() {
-        let fixture = Fixture::new(ArbitrationMode::Shadow, ScriptedEvaluator::approved()).await;
+        let mut fixture =
+            Fixture::new(ArbitrationMode::Shadow, ScriptedEvaluator::approved()).await;
+        fixture.service = Arc::new(
+            (*fixture.service)
+                .clone()
+                .with_context_retry(20, Duration::from_millis(500)),
+        );
         let cancel = CancellationToken::new();
         let (scheduler, handle) = crate::maintainer::arbitration::spawn_arbitration_scheduler(
             fixture.service.clone(),
@@ -2254,22 +2260,11 @@ mod tests {
         let job = fixture.report().await;
         let _ = scheduler.enqueue(job.clone()).await.unwrap();
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if fixture.store.read_analysis(&job).await.unwrap().state
-                    == AnalysisState::WaitingContext
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("scheduler 应进入 context wait");
+        wait_for_context_preparation(&fixture, &job).await;
         cancel.cancel();
-        tokio::time::timeout(Duration::from_secs(1), handle)
+        tokio::time::timeout(Duration::from_secs(5), handle)
             .await
-            .expect("scheduler cancellation 不应等待完整 context retry delay")
+            .expect("scheduler cancellation 不应等待完整 context retry 耗尽")
             .unwrap()
             .unwrap();
 
@@ -2278,6 +2273,22 @@ mod tests {
             AnalysisState::WaitingContext
         );
         assert_eq!(fixture.evaluator.calls(), (0, 0));
+    }
+
+    async fn wait_for_context_preparation(fixture: &Fixture, job: &AnalysisJob) {
+        // 等待真实落盘状态，避免把线程调度和文件 I/O 限制在几十毫秒内。
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let state = fixture.store.read_analysis(job).await.unwrap().state;
+                if state == AnalysisState::WaitingContext {
+                    break;
+                }
+                assert_eq!(state, AnalysisState::Pending, "context wait 前不应提前终结");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Analysis 应在有限时间内进入 context wait");
     }
 
     #[tokio::test]

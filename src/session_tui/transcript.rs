@@ -42,6 +42,7 @@ pub(super) struct TranscriptState {
     history: Vec<HistoryEntry>,
     active_user: Option<usize>,
     active_assistant: Option<usize>,
+    active_assistant_accepted_bytes: usize,
     activity: Option<String>,
     flushed_until: usize,
 }
@@ -147,6 +148,7 @@ impl TranscriptState {
         self.history.clear();
         self.active_user = None;
         self.active_assistant = None;
+        self.active_assistant_accepted_bytes = 0;
         self.activity = None;
         self.flushed_until = 0;
     }
@@ -276,11 +278,13 @@ impl TranscriptState {
 
     pub(super) fn push_user(&mut self, text: String) {
         self.active_assistant = None;
+        self.active_assistant_accepted_bytes = 0;
         self.history.push(HistoryEntry::User(UserCell { text }));
     }
 
     pub(super) fn push_active_user(&mut self, text: String) {
         self.active_assistant = None;
+        self.active_assistant_accepted_bytes = 0;
         let index = self.history.len();
         self.history.push(HistoryEntry::User(UserCell { text }));
         self.active_user = Some(index);
@@ -298,10 +302,12 @@ impl TranscriptState {
         self.history
             .push(HistoryEntry::Assistant(AssistantCell { text }));
         self.active_assistant = Some(index);
+        self.active_assistant_accepted_bytes = 0;
     }
 
     pub(super) fn push_historical_assistant(&mut self, text: String) {
         self.active_assistant = None;
+        self.active_assistant_accepted_bytes = 0;
         self.history
             .push(HistoryEntry::Assistant(AssistantCell { text }));
     }
@@ -310,25 +316,45 @@ impl TranscriptState {
         if let Some(index) = self.active_assistant {
             if let Some(HistoryEntry::Assistant(cell)) = self.history.get_mut(index) {
                 cell.text = text;
+                self.active_assistant_accepted_bytes = cell.text.len();
                 if self.active_user.is_none() {
                     self.active_assistant = None;
+                    self.active_assistant_accepted_bytes = 0;
                 }
                 return;
             }
         }
 
+        let accepted_bytes = text.len();
         let index = self.history.len();
         self.history
             .push(HistoryEntry::Assistant(AssistantCell { text }));
         if self.active_user.is_some() {
             self.active_assistant = Some(index);
+            self.active_assistant_accepted_bytes = accepted_bytes;
+        }
+    }
+
+    pub(super) fn accept_active_assistant_output(&mut self) {
+        let Some(index) = self.active_assistant else {
+            return;
+        };
+        if let Some(HistoryEntry::Assistant(cell)) = self.history.get(index) {
+            self.active_assistant_accepted_bytes = cell.text.len();
         }
     }
 
     pub(super) fn discard_active_assistant(&mut self) {
-        let Some(index) = self.active_assistant.take() else {
+        let Some(index) = self.active_assistant else {
             return;
         };
+        if self.active_assistant_accepted_bytes > 0 {
+            if let Some(HistoryEntry::Assistant(cell)) = self.history.get_mut(index) {
+                cell.text.truncate(self.active_assistant_accepted_bytes);
+            }
+            return;
+        }
+        self.active_assistant = None;
         if index.saturating_add(1) == self.history.len()
             && matches!(self.history.last(), Some(HistoryEntry::Assistant(_)))
         {
@@ -346,6 +372,7 @@ impl TranscriptState {
         summary: String,
     ) {
         self.active_assistant = None;
+        self.active_assistant_accepted_bytes = 0;
         self.history.push(HistoryEntry::Tool(ToolCell {
             turn_id,
             id,
@@ -494,6 +521,7 @@ impl TranscriptState {
         reason: ToolCallSkipReason,
     ) {
         self.active_assistant = None;
+        self.active_assistant_accepted_bytes = 0;
         self.history.push(HistoryEntry::Tool(ToolCell {
             turn_id: None,
             id,
@@ -513,6 +541,7 @@ impl TranscriptState {
 
     pub(super) fn push_shell_started(&mut self, command: String) {
         self.active_assistant = None;
+        self.active_assistant_accepted_bytes = 0;
         self.history
             .push(HistoryEntry::ShellCommand(ShellCommandCell::running(
                 command,
@@ -565,11 +594,13 @@ impl TranscriptState {
 
     pub(super) fn clear_active_assistant(&mut self) {
         self.active_assistant = None;
+        self.active_assistant_accepted_bytes = 0;
     }
 
     pub(super) fn commit_active_turn(&mut self) {
         self.active_user = None;
         self.active_assistant = None;
+        self.active_assistant_accepted_bytes = 0;
     }
 
     pub(super) fn release_active_user(&mut self) {

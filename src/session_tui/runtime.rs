@@ -3,6 +3,7 @@
 //! 本模块负责把 start/turn/finalize 放进 tokio task，并用 turn id 过滤过期事件。
 //! UI 状态机只接收 `WorkerEvent`，不直接持有底层 worker 的回调细节。
 
+use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -891,7 +892,7 @@ fn select_resume_history(
     }
 
     (
-        merge_resume_turns(canonical, journal, limit),
+        merge_resume_turns_by_time(messages, &projection, canonical, journal, limit),
         journal_has_read_warnings.then(|| TURN_JOURNAL_FALLBACK_WARNING.to_string()),
     )
 }
@@ -916,89 +917,105 @@ fn journal_covers_canonical_suffix(
         })
 }
 
+#[cfg(test)]
 fn merge_resume_turns(
     base: Vec<crate::session::HistoricalTimelineTurn>,
     journal: Vec<crate::session::HistoricalTimelineTurn>,
     limit: usize,
 ) -> Vec<crate::session::HistoricalTimelineTurn> {
-    let match_matrix = unique_resume_turn_matches(&base, &journal);
+    let base_times = vec![None; base.len()];
+    let journal_times = vec![None; journal.len()];
+    merge_resume_turns_with_times(base, journal, base_times, journal_times, limit)
+}
+
+fn merge_resume_turns_by_time(
+    messages: &[crate::session::SessionMessage],
+    projection: &crate::session::TurnJournalProjection,
+    canonical: Vec<crate::session::HistoricalTimelineTurn>,
+    journal: Vec<crate::session::HistoricalTimelineTurn>,
+    limit: usize,
+) -> Vec<crate::session::HistoricalTimelineTurn> {
+    let mut canonical_times = messages
+        .iter()
+        .rev()
+        .filter(|message| crate::session::is_real_user_message(message))
+        .take(canonical.len())
+        .map(|message| message.created_at)
+        .collect::<Vec<_>>();
+    canonical_times.reverse();
+    let canonical_times = canonical_times.into_iter().map(Some).collect();
+    let journal_times = journal
+        .iter()
+        .map(|turn| {
+            turn.turn_id.as_deref().and_then(|turn_id| {
+                projection
+                    .turns
+                    .iter()
+                    .find(|projected| projected.turn_id == turn_id)
+                    .and_then(|projected| {
+                        projected
+                            .accepted_at
+                            .or(projected.started_at)
+                            .or(projected.finished_at)
+                    })
+            })
+        })
+        .collect();
+    merge_resume_turns_with_times(canonical, journal, canonical_times, journal_times, limit)
+}
+
+fn merge_resume_turns_with_times(
+    base: Vec<crate::session::HistoricalTimelineTurn>,
+    journal: Vec<crate::session::HistoricalTimelineTurn>,
+    base_times: Vec<Option<DateTime<Utc>>>,
+    journal_times: Vec<Option<DateTime<Utc>>>,
+    limit: usize,
+) -> Vec<crate::session::HistoricalTimelineTurn> {
+    let match_matrix = resume_turn_matches(
+        &base,
+        &journal,
+        base_times.as_slice(),
+        journal_times.as_slice(),
+    );
     let matches = resume_turn_lcs_lengths(&match_matrix);
     let mut merged = Vec::with_capacity(base.len().saturating_add(journal.len()));
     let (mut base_index, mut journal_index) = (0usize, 0usize);
     while base_index < base.len() && journal_index < journal.len() {
         if match_matrix[base_index][journal_index] {
             if matches[base_index + 1][journal_index] == matches[base_index][journal_index] {
-                merged.push((base[base_index].clone(), ResumeTurnOrigin::Canonical));
+                merged.push((base[base_index].clone(), base_times[base_index]));
                 base_index = base_index.saturating_add(1);
             } else {
                 merged.push((
                     merge_matched_resume_turn(&base[base_index], &journal[journal_index]),
-                    ResumeTurnOrigin::Canonical,
+                    journal_times[journal_index].or(base_times[base_index]),
                 ));
                 base_index = base_index.saturating_add(1);
                 journal_index = journal_index.saturating_add(1);
             }
         } else if matches[base_index + 1][journal_index] >= matches[base_index][journal_index + 1] {
-            merged.push((base[base_index].clone(), ResumeTurnOrigin::Canonical));
+            merged.push((base[base_index].clone(), base_times[base_index]));
             base_index = base_index.saturating_add(1);
         } else {
             merged.push((
                 mark_unaligned_journal_turn(journal[journal_index].clone()),
-                ResumeTurnOrigin::UnalignedJournal,
+                journal_times[journal_index],
             ));
             journal_index = journal_index.saturating_add(1);
         }
     }
-    merged.extend(
-        base.into_iter()
-            .skip(base_index)
-            .map(|turn| (turn, ResumeTurnOrigin::Canonical)),
-    );
+    merged.extend(base.into_iter().zip(base_times).skip(base_index));
     merged.extend(
         journal
             .into_iter()
-            .skip(journal_index)
             .map(mark_unaligned_journal_turn)
-            .map(|turn| (turn, ResumeTurnOrigin::UnalignedJournal)),
+            .zip(journal_times)
+            .skip(journal_index),
     );
-    limit_merged_resume_turns(merged, limit)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ResumeTurnOrigin {
-    Canonical,
-    UnalignedJournal,
-}
-
-fn limit_merged_resume_turns(
-    merged: Vec<(crate::session::HistoricalTimelineTurn, ResumeTurnOrigin)>,
-    limit: usize,
-) -> Vec<crate::session::HistoricalTimelineTurn> {
-    let canonical_count = merged
-        .iter()
-        .filter(|(_, origin)| *origin == ResumeTurnOrigin::Canonical)
-        .count();
-    let journal_count = merged.len().saturating_sub(canonical_count);
-    let canonical_to_skip = canonical_count.saturating_sub(limit);
-    let journal_capacity = limit.saturating_sub(canonical_count.min(limit));
-    let journal_to_skip = journal_count.saturating_sub(journal_capacity);
-    let (mut canonical_seen, mut journal_seen) = (0usize, 0usize);
-
-    merged
-        .into_iter()
-        .filter_map(|(turn, origin)| match origin {
-            ResumeTurnOrigin::Canonical => {
-                let keep = canonical_seen >= canonical_to_skip;
-                canonical_seen = canonical_seen.saturating_add(1);
-                keep.then_some(turn)
-            }
-            ResumeTurnOrigin::UnalignedJournal => {
-                let keep = journal_seen >= journal_to_skip;
-                journal_seen = journal_seen.saturating_add(1);
-                keep.then_some(turn)
-            }
-        })
-        .collect()
+    merged.sort_by_key(|(_, occurred_at)| *occurred_at);
+    let mut latest = merged.into_iter().rev().take(limit).collect::<Vec<_>>();
+    latest.reverse();
+    latest.into_iter().map(|(turn, _)| turn).collect()
 }
 
 fn resume_turn_lcs_lengths(matches: &[Vec<bool>]) -> Vec<Vec<usize>> {
@@ -1017,46 +1034,52 @@ fn resume_turn_lcs_lengths(matches: &[Vec<bool>]) -> Vec<Vec<usize>> {
     lengths
 }
 
-fn unique_resume_turn_matches(
+fn resume_turn_matches(
     base: &[crate::session::HistoricalTimelineTurn],
     journal: &[crate::session::HistoricalTimelineTurn],
+    base_times: &[Option<DateTime<Utc>>],
+    journal_times: &[Option<DateTime<Utc>>],
 ) -> Vec<Vec<bool>> {
-    let compatible = base
-        .iter()
-        .map(|base_turn| {
+    base.iter()
+        .enumerate()
+        .map(|(base_index, base_turn)| {
             journal
                 .iter()
-                .map(|journal_turn| resume_turns_compatible(base_turn, journal_turn))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let base_match_counts = compatible
-        .iter()
-        .map(|row| row.iter().filter(|matched| **matched).count())
-        .collect::<Vec<_>>();
-    let journal_match_counts = (0..journal.len())
-        .map(|journal_index| compatible.iter().filter(|row| row[journal_index]).count())
-        .collect::<Vec<_>>();
-    compatible
-        .into_iter()
-        .enumerate()
-        .map(|(base_index, row)| {
-            row.into_iter()
                 .enumerate()
-                .map(|(journal_index, matched)| {
-                    matched
-                        && base_match_counts[base_index] == 1
-                        && journal_match_counts[journal_index] == 1
+                .map(|(journal_index, journal_turn)| {
+                    resume_turns_compatible(base_turn, journal_turn)
+                        && resume_turn_times_compatible(
+                            journal_turn,
+                            base_times.get(base_index).and_then(Option::as_ref),
+                            journal_times.get(journal_index).and_then(Option::as_ref),
+                        )
                 })
                 .collect()
         })
         .collect()
 }
 
+fn resume_turn_times_compatible(
+    journal: &crate::session::HistoricalTimelineTurn,
+    canonical_time: Option<&DateTime<Utc>>,
+    journal_time: Option<&DateTime<Utc>>,
+) -> bool {
+    journal.status.is_some()
+        || match (canonical_time, journal_time) {
+            (Some(canonical_time), Some(journal_time)) => journal_time <= canonical_time,
+            _ => true,
+        }
+}
+
 fn resume_turns_compatible(
     base: &crate::session::HistoricalTimelineTurn,
     journal: &crate::session::HistoricalTimelineTurn,
 ) -> bool {
+    if journal.status != Some(crate::session::TurnJournalStatus::Committed)
+        && (journal.status.is_some() || journal.assistant_text.is_none())
+    {
+        return false;
+    }
     resume_turn_user_identity_matches(base, journal)
         && match (&base.assistant_text, &journal.assistant_text) {
             (Some(base_text), Some(journal_text)) => base_text == journal_text,
@@ -1889,6 +1912,148 @@ mod tests {
     }
 
     #[test]
+    fn resume_history_repeated_user_text_keeps_latest_distinct_turns() {
+        let now = Utc::now();
+        let mut messages = Vec::new();
+        let mut events = Vec::new();
+        let mut seq = 1_u64;
+
+        for turn_number in 1..=10_usize {
+            let created_at = now
+                + chrono::Duration::seconds(i64::try_from(turn_number).expect("测试序号可转换"));
+            let response = "same response".to_string();
+            let message_index = turn_number.saturating_sub(1).saturating_mul(2);
+            messages.push(SessionMessage {
+                index: message_index,
+                role: SessionMessageRole::User,
+                content: vec![SessionContentBlock::text("继续")],
+                created_at,
+                model: "test-model".into(),
+                provider_replay: None,
+            });
+            messages.push(SessionMessage {
+                index: message_index.saturating_add(1),
+                role: SessionMessageRole::Assistant,
+                content: vec![SessionContentBlock::text(response.clone())],
+                created_at,
+                model: "test-model".into(),
+                provider_replay: None,
+            });
+
+            let turn_id = format!("turn_{turn_number}");
+            events.push(TurnJournalEvent {
+                seq,
+                turn_id: turn_id.clone(),
+                created_at,
+                kind: TurnJournalEventKind::UserInputAccepted {
+                    text: "继续".into(),
+                },
+            });
+            seq = seq.saturating_add(1);
+            events.push(TurnJournalEvent {
+                seq,
+                turn_id: turn_id.clone(),
+                created_at,
+                kind: TurnJournalEventKind::AssistantCompleted { text: response },
+            });
+            seq = seq.saturating_add(1);
+            events.push(TurnJournalEvent {
+                seq,
+                turn_id,
+                created_at,
+                kind: TurnJournalEventKind::TurnFinished {
+                    status: TurnJournalStatus::Committed,
+                },
+            });
+            seq = seq.saturating_add(1);
+        }
+
+        let failed_at = now + chrono::Duration::seconds(11);
+        events.push(TurnJournalEvent {
+            seq,
+            turn_id: "turn_11".into(),
+            created_at: failed_at,
+            kind: TurnJournalEventKind::UserInputAccepted {
+                text: "继续".into(),
+            },
+        });
+        events.push(TurnJournalEvent {
+            seq: seq.saturating_add(1),
+            turn_id: "turn_11".into(),
+            created_at: failed_at,
+            kind: TurnJournalEventKind::TurnFinished {
+                status: TurnJournalStatus::Failed,
+            },
+        });
+
+        let (turns, warning) = select_resume_history(
+            &messages,
+            TurnJournalRead {
+                events,
+                warnings: Vec::new(),
+            },
+            10,
+        );
+
+        assert!(warning.is_none());
+        assert_eq!(turns.len(), 10);
+        for (turn, turn_number) in turns[..9].iter().zip(2..=10) {
+            assert_eq!(
+                turn.turn_id.as_deref(),
+                Some(format!("turn_{turn_number}").as_str())
+            );
+            assert_eq!(turn.assistant_text.as_deref(), Some("same response"));
+        }
+        assert_eq!(turns[9].turn_id.as_deref(), Some("turn_11"));
+        assert_eq!(turns[9].status, Some(TurnJournalStatus::Failed));
+    }
+
+    #[test]
+    fn only_canonical_candidate_statuses_match_resume_turns() {
+        let turn = |status| crate::session::HistoricalTimelineTurn {
+            turn_id: None,
+            user_text: "继续".into(),
+            canonical_user_content_hash: None,
+            assistant_text: Some("完成".into()),
+            assistant_completed: true,
+            status,
+            tool_calls: Vec::new(),
+            timeline_items: Vec::new(),
+            user_steers: Vec::new(),
+            recovery_notice: None,
+            turn_status_detail: None,
+        };
+        let canonical = turn(Some(TurnJournalStatus::Committed));
+
+        assert!(resume_turns_compatible(&canonical, &turn(None)));
+        assert!(resume_turns_compatible(
+            &canonical,
+            &turn(Some(TurnJournalStatus::Committed))
+        ));
+        let mut unfinished_without_assistant = turn(None);
+        unfinished_without_assistant.assistant_text = None;
+        unfinished_without_assistant.assistant_completed = false;
+        assert!(!resume_turns_compatible(
+            &canonical,
+            &unfinished_without_assistant
+        ));
+        let canonical_time = Utc::now();
+        let later_uncommitted_time = canonical_time + chrono::Duration::seconds(1);
+        assert!(!resume_turn_times_compatible(
+            &turn(None),
+            Some(&canonical_time),
+            Some(&later_uncommitted_time),
+        ));
+        for status in [
+            TurnJournalStatus::Failed,
+            TurnJournalStatus::Cancelled,
+            TurnJournalStatus::InterruptedByUser,
+        ] {
+            assert!(!resume_turns_compatible(&canonical, &turn(Some(status))));
+        }
+    }
+
+    #[test]
     fn resume_history_silently_merges_journal_turn_without_terminal_event() {
         let now = Utc::now();
         let messages = vec![
@@ -2196,50 +2361,85 @@ mod tests {
     }
 
     #[test]
-    fn resume_limit_prioritizes_duplicate_canonical_turns_over_unaligned_journal_turns() {
-        let canonical = ["canonical 回复一", "canonical 回复二"]
-            .into_iter()
-            .map(|assistant| crate::session::HistoricalTimelineTurn {
-                turn_id: None,
-                user_text: "重试".into(),
-                canonical_user_content_hash: None,
-                assistant_text: Some(assistant.into()),
-                assistant_completed: true,
-                status: Some(TurnJournalStatus::Committed),
-                tool_calls: Vec::new(),
-                timeline_items: Vec::new(),
-                user_steers: Vec::new(),
-                recovery_notice: None,
-                turn_status_detail: None,
-            })
-            .collect::<Vec<_>>();
-        let journal = (0..2)
-            .map(|_| crate::session::HistoricalTimelineTurn {
-                turn_id: Some("turn_journal".into()),
-                user_text: "重试".into(),
-                canonical_user_content_hash: None,
-                assistant_text: None,
-                assistant_completed: false,
-                status: Some(TurnJournalStatus::InterruptedByUser),
-                tool_calls: Vec::new(),
-                timeline_items: Vec::new(),
-                user_steers: Vec::new(),
-                recovery_notice: None,
-                turn_status_detail: None,
-            })
-            .collect::<Vec<_>>();
+    fn resume_limit_uses_turn_time_when_unaligned_sources_cannot_be_ordered_by_lcs() {
+        let now = Utc::now();
+        let mut messages = Vec::new();
+        for index in 0..10usize {
+            let created_at = now + chrono::Duration::seconds(100 + i64::try_from(index).unwrap());
+            messages.push(SessionMessage {
+                index: index.saturating_mul(2),
+                role: SessionMessageRole::User,
+                content: vec![SessionContentBlock::text(format!("canonical {index}"))],
+                created_at,
+                model: "test-model".into(),
+                provider_replay: None,
+            });
+            messages.push(SessionMessage {
+                index: index.saturating_mul(2).saturating_add(1),
+                role: SessionMessageRole::Assistant,
+                content: vec![SessionContentBlock::text(format!("answer {index}"))],
+                created_at,
+                model: "test-model".into(),
+                provider_replay: None,
+            });
+        }
+        let event = |seq, turn_id: &str, created_at, kind| TurnJournalEvent {
+            seq,
+            turn_id: turn_id.into(),
+            created_at,
+            kind,
+        };
+        let failed = || TurnJournalEventKind::TurnFinished {
+            status: TurnJournalStatus::Failed,
+        };
+        let new_at = now + chrono::Duration::seconds(200);
+        let events = vec![
+            event(
+                1,
+                "old_turn",
+                now,
+                TurnJournalEventKind::UserInputAccepted {
+                    text: "journal old".into(),
+                },
+            ),
+            event(2, "old_turn", now, failed()),
+            event(
+                3,
+                "new_turn",
+                new_at,
+                TurnJournalEventKind::UserInputAccepted {
+                    text: "journal new".into(),
+                },
+            ),
+            event(4, "new_turn", new_at, failed()),
+        ];
 
-        let merged = merge_resume_turns(canonical, journal, 2);
-
-        assert_eq!(merged.len(), 2);
-        assert_eq!(
-            merged
-                .iter()
-                .filter_map(|turn| turn.assistant_text.as_deref())
-                .collect::<Vec<_>>(),
-            vec!["canonical 回复一", "canonical 回复二"]
+        let (turns, warning) = select_resume_history(
+            &messages,
+            TurnJournalRead {
+                events,
+                warnings: vec![TurnJournalWarning {
+                    line: Some(21),
+                    message: "damaged tail".into(),
+                }],
+            },
+            10,
         );
-        assert!(merged.iter().all(|turn| turn.recovery_notice.is_none()));
+
+        assert!(warning.is_some());
+        assert_eq!(turns.len(), 10);
+        assert_eq!(
+            turns.first().map(|turn| turn.user_text.as_str()),
+            Some("canonical 1")
+        );
+        assert_eq!(
+            turns.last().map(|turn| turn.user_text.as_str()),
+            Some("journal new")
+        );
+        assert_eq!(
+            turns.last().and_then(|turn| turn.status),
+            Some(TurnJournalStatus::Failed)
+        );
     }
 
     #[test]
