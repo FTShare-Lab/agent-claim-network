@@ -15,6 +15,7 @@
     "postbuild:pages": "bash scripts/sync-pages.sh",
     "lint": "eslint .",
     "preview": "vite preview",
+    "preview:knowledge": "npm run build && node scripts/knowledge-preview.mjs",
     "test": "vitest run"
   },
   "dependencies": {

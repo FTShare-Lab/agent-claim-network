@@ -39,6 +39,16 @@ function expectOldestFirst(values: string[]) {
 }
 
 describe('public demo data contract', () => {
+  it('keeps the public corpus separate from local knowledge-tree stress fixtures', () => {
+    expect(demoClaims).toHaveLength(6)
+    expect(demoPolicies).toHaveLength(3)
+    expect(demoPolicyRecords.policies).toHaveLength(3)
+    expect(demoOverview.snapshot.counts.claims).toBe(6)
+    expect(demoAgents.reduce((total, agent) => total + agent.mirror_claims, 0)).toBe(6)
+    expect(demoClaims.every((view) => !view.claim.scope.startsWith('demo/knowledge/'))).toBe(true)
+    expect(demoPolicies.every((policy) => !policy.scope.startsWith('demo/knowledge/'))).toBe(true)
+  })
+
   it('uses production ID formats and keeps typed relationships valid', () => {
     const claimIds = new Set(demoClaims.map((item) => item.claim.id))
     const disputeIds = new Set(demoDisputes.map((item) => item.id))

@@ -9,6 +9,7 @@ ACN 前端由两个静态页面和一个 React 管理台组成，统一由 Maint
 | Landing | `frontend/static/acn_landing.html` | `/` | 介绍 ACN Claim 来源链、角色边界与管理台入口 |
 | 角色与交互说明 | `frontend/static/acn_roles_interaction.html` | `/docs/acn_roles_interaction.html` | 解释 Agent、Router、Maintainer、对象语义和协作流程 |
 | Maintainer Workbench | `maintainer-workbench/src/` | `/app` | 处理 dispute、policy、sweep、agent、team key 与运行诊断 |
+| 知识树 | `maintainer-workbench/src/pages/KnowledgeTreePage.tsx` | `/app/knowledge-tree` | 选择 Claim 或 Policy，按来源和影响方向展开团队知识关系 |
 
 静态页面使用原生 HTML、CSS 和 JavaScript，内容在无 JavaScript 及打印场景下仍可阅读；Workbench 是以 `/app` 为 basename 的 React SPA，需要 JavaScript。表中的 `/docs/` 是 Maintainer 部署后的 HTTP 路由，不对应仓库根目录的`docs/`；两份静态页面的源码统一保存在 `frontend/static/`。
 

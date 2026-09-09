@@ -1,11 +1,13 @@
 import { useMemo, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 
+import { ClaimDetails } from '../features/claims/ClaimDetails'
+import { matchesClaimFilters } from '../features/claims/filter'
+import { ClaimFilters } from '../features/claims/ClaimFilters'
 import { StatusBadge } from '../components/badges/StatusBadge'
 import { DataTable } from '../components/data-table/DataTable'
 import { DetailDrawer } from '../components/drawer/DetailDrawer'
 import { DrawerSection } from '../components/drawer/DrawerSection'
-import { FilterBar } from '../components/filters/FilterBar'
 import { PaginationBar } from '../components/pagination/PaginationBar'
 import { useDisputesQuery } from '../features/disputes/hooks'
 import type { Dispute } from '../features/disputes/types'
@@ -77,13 +79,7 @@ export function ClaimsPage() {
   const filtered = useMemo(() => {
     return orderClaimsByStatusAndRecentChange(
       data.filter((row) => {
-        const haystack = `${row.claim.id} ${row.claim.name} ${row.claim.statement} ${row.claim.evidence_summary} ${row.claim.scope}`.toLowerCase()
-        if (keyword && !haystack.includes(keyword.toLowerCase())) return false
-        if (agent !== 'all' && row.claim.holder !== agent) return false
-        if (status !== 'all' && row.claim.status !== status) return false
-        if (scope && !row.claim.scope.toLowerCase().includes(scope.toLowerCase())) return false
-        if (onlyDisputed && row.open_dispute_ids.length === 0 && row.resolved_dispute_ids.length === 0) return false
-        return true
+        return matchesClaimFilters(row, { keyword, agent, status, scope, onlyDisputed })
       }),
     )
   }, [agent, data, keyword, onlyDisputed, scope, status])
@@ -155,36 +151,17 @@ export function ClaimsPage() {
 
   return (
     <PageContainer title="Claims" subtitle="Browse mirrored claims published across your agent network.">
-      <FilterBar>
-        <label className="space-y-1 text-xs text-slate-600">
-          <span className="font-medium text-slate-700">Search</span>
-          <input className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none" placeholder="id, statement, evidence, scope" value={keyword} onChange={(event) => { setKeyword(event.target.value); setPage(1) }} />
-        </label>
-        <label className="space-y-1 text-xs text-slate-600">
-          <span className="font-medium text-slate-700">Agent</span>
-          <select className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none" value={agent} onChange={(event) => { setAgent(event.target.value); setPage(1) }}>
-            <option value="all">All Agents</option>
-            {agents.map((item) => (
-              <option key={item} value={item}>
-                {item}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="space-y-1 text-xs text-slate-600">
-          <span className="font-medium text-slate-700">Status</span>
-          <select className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none" value={status} onChange={(event) => { setStatus(event.target.value); setPage(1) }}>
-            <option value="all">All Status</option>
-            <option value="active">Active</option>
-            <option value="stale">Stale</option>
-            <option value="deprecated">Deprecated</option>
-          </select>
-        </label>
-        <label className="space-y-1 text-xs text-slate-600">
-          <span className="font-medium text-slate-700">Scope</span>
-          <input className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none" placeholder="scope fragment" value={scope} onChange={(event) => { setScope(event.target.value); setPage(1) }} />
-        </label>
-      </FilterBar>
+      <ClaimFilters
+        filters={{ keyword, agent, status, scope, onlyDisputed }}
+        agents={agents}
+        onChange={(patch) => {
+          if (patch.keyword !== undefined) setKeyword(patch.keyword)
+          if (patch.agent !== undefined) setAgent(patch.agent)
+          if (patch.status !== undefined) setStatus(patch.status)
+          if (patch.scope !== undefined) setScope(patch.scope)
+          setPage(1)
+        }}
+      />
 
       <section className="space-y-3">
         <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
@@ -255,6 +232,9 @@ export function ClaimsPage() {
       </section>
 
       <DetailDrawer
+        footer={selectedClaim.data ? (
+          <button type="button" className="text-sm font-semibold text-blue-700" onClick={() => navigate(`/knowledge-tree?root_id=${encodeURIComponent(selectedClaim.data.claim.id)}`)}>View knowledge tree</button>
+        ) : undefined}
         modal={false}
         open={Boolean(effectiveDrawerState?.current && (selectedClaim.data || selectedDispute))}
         onClose={closeDrawer}
@@ -271,64 +251,7 @@ export function ClaimsPage() {
         subtitle={selectedDispute?.id ?? selectedClaim.data?.claim.id}
       >
         {selectedClaim.data ? (
-          <>
-            <DrawerSection title="Overview">
-              <dl className="space-y-2 text-sm">
-                <div className="flex justify-between gap-3"><dt className="text-slate-500">Holder Agent</dt><dd className="font-mono text-xs text-slate-900">{selectedClaim.data.claim.holder}</dd></div>
-                <div className="flex justify-between gap-3"><dt className="text-slate-500">Status</dt><dd><StatusBadge>{selectedClaim.data.claim.status}</StatusBadge></dd></div>
-                <div className="flex justify-between gap-3"><dt className="text-slate-500">Confidence</dt><dd className="font-medium capitalize text-slate-900">{selectedClaim.data.claim.confidence}</dd></div>
-                <div className="flex justify-between gap-3"><dt className="text-slate-500">Created At</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedClaim.data.claim.created_at)}</dd></div>
-                {selectedClaim.data.claim.updated_at ? (
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Updated At</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedClaim.data.claim.updated_at)}</dd></div>
-                ) : null}
-              </dl>
-            </DrawerSection>
-            <DrawerSection title="Related Disputes">
-              {selectedClaim.data.open_dispute_ids.length || selectedClaim.data.resolved_dispute_ids.length ? (
-                <div className="flex flex-wrap gap-1">
-                  {[...selectedClaim.data.open_dispute_ids, ...selectedClaim.data.resolved_dispute_ids].map((disputeId) => (
-                    <button
-                      key={disputeId}
-                      type="button"
-                      onClick={() => openDispute(disputeId)}
-                      className={chipLinkClass}
-                    >
-                      {truncateMiddle(disputeId)}
-                    </button>
-                  ))}
-                </div>
-              ) : (
-                <div className="text-xs text-slate-500">No disputes</div>
-              )}
-            </DrawerSection>
-            <DrawerSection title="Scope" tone="claim">
-              <div className="text-sm leading-6 text-slate-900">{selectedClaim.data.claim.scope}</div>
-            </DrawerSection>
-            <DrawerSection title="Statement" tone="claim">
-              <div className="whitespace-pre-wrap text-sm leading-6 text-slate-900">{selectedClaim.data.claim.statement}</div>
-            </DrawerSection>
-            <DrawerSection title="Evidence Summary" tone="claim">
-              <div className="whitespace-pre-wrap text-sm leading-6 text-slate-800">{selectedClaim.data.claim.evidence_summary}</div>
-            </DrawerSection>
-            <DrawerSection title="Source IDs" tone="claim">
-              {selectedClaim.data.claim.source_claim_ids.length ? (
-                <div className="flex flex-wrap gap-1">
-                  {selectedClaim.data.claim.source_claim_ids.map((sourceId) => (
-                    <button
-                      key={sourceId}
-                      type="button"
-                      className={chipLinkClass}
-                      onClick={() => openSource(sourceId)}
-                    >
-                      {sourceId}
-                    </button>
-                  ))}
-                </div>
-              ) : (
-                <div className="text-xs text-slate-500">No sources</div>
-              )}
-            </DrawerSection>
-          </>
+          <ClaimDetails view={selectedClaim.data} onOpenSource={openSource} onOpenDispute={openDispute} />
         ) : selectedDispute ? (
           <>
             <DrawerSection title="Overview">

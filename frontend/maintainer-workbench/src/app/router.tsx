@@ -20,6 +20,7 @@ export const routes: RouteObject[] = [
     children: [
       { index: true, element: <OverviewPage /> },
       { path: 'disputes', lazy: async () => ({ Component: (await import('../pages/DisputesPage')).DisputesPage }) },
+      { path: 'knowledge-tree', lazy: async () => ({ Component: (await import('../pages/KnowledgeTreePage')).KnowledgeTreePage }) },
       { path: 'claims', lazy: async () => ({ Component: (await import('../pages/ClaimsPage')).ClaimsPage }) },
       { path: 'policies', lazy: async () => ({ Component: (await import('../pages/PoliciesPage')).PoliciesPage }) },
       { path: 'agents', lazy: async () => ({ Component: (await import('../pages/AgentsPage')).AgentsPage }) },
