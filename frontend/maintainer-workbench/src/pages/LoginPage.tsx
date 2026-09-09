@@ -108,12 +108,12 @@ function AdminLoginPage() {
     try {
       const ok = await verifyAdminCredentials(username.trim(), password)
       if (!ok) {
-        setError('用户名或密码不正确')
+        setError('Incorrect username or password')
         return
       }
       navigate(redirectTo, { replace: true })
     } catch (err) {
-      setError(err instanceof Error ? err.message : '登录失败，请稍后重试')
+      setError(err instanceof Error ? err.message : 'Sign-in failed. Please try again later.')
     } finally {
       setIsSubmitting(false)
     }

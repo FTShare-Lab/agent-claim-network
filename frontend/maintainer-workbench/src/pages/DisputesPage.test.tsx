@@ -484,9 +484,9 @@ describe('DisputesPage', () => {
 
     const current = await within(drawer).findByRole('article', { name: 'Current analysis analysis_unresolved' })
     expect(current).toHaveTextContent('unresolved')
-    expect(current).toHaveTextContent('不建议修改 Claim')
+    expect(current).toHaveTextContent('recommends no Claim changes')
     expect(within(current).queryByText(/Direct Claim assessments/)).not.toBeInTheDocument()
-    expect(within(current).queryByRole('button', { name: '采用此分析' })).not.toBeInTheDocument()
+    expect(within(current).queryByRole('button', { name: 'Adopt analysis' })).not.toBeInTheDocument()
     fireEvent.click(await within(current).findByText('Analysis context summary'))
     expect(current).toHaveTextContent('Related Claims in context2')
     expect(current).not.toHaveTextContent('Router candidates')
@@ -583,7 +583,7 @@ describe('DisputesPage', () => {
   it('adopts an approved analysis without starting a new model call', async () => {
     render(renderWorkbenchRoute('/disputes'))
     fireEvent.click(await screen.findByText('Scope mismatch'))
-    fireEvent.click(await screen.findByRole('button', { name: '采用此分析' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Adopt analysis' }))
 
     await waitFor(() => expect(fetch).toHaveBeenCalledWith(
       '/api/disputes/dispute_open/analyses/analysis_approved/adopt',
@@ -605,7 +605,7 @@ describe('DisputesPage', () => {
     ).length
     const detailGets = countGets('/api/disputes/dispute_open')
     const analysisGets = countGets('/api/disputes/dispute_open/analyses')
-    fireEvent.click(await screen.findByRole('button', { name: '采用此分析' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Adopt analysis' }))
 
     const conflict = await screen.findByRole('alert')
     expect(conflict).toHaveTextContent('分析输入已变化')
@@ -628,7 +628,7 @@ describe('DisputesPage', () => {
     expect(currentResolution).toHaveTextContent('Recommended · active')
     expect(within(drawer).queryByRole('button', { name: /decision chain/i })).not.toBeInTheDocument()
     expect(within(drawer).queryByText(/Cannot adopt:/)).not.toBeInTheDocument()
-    expect(within(drawer).queryByText('Approved，但采用被阻止')).not.toBeInTheDocument()
+    expect(within(drawer).queryByText('Approved, but adoption is blocked')).not.toBeInTheDocument()
     expect(within(drawer).queryByText('Dispute 已经被其他 Decision 解决')).not.toBeInTheDocument()
     expect(within(drawer).queryByRole('button', { name: 'Analyze' })).not.toBeInTheDocument()
     expect(within(drawer).queryByRole('button', { name: 'Resolve Dispute' })).not.toBeInTheDocument()
@@ -665,7 +665,7 @@ describe('DisputesPage', () => {
     fireEvent.click(analysisToggle)
     const analysis = await within(drawer).findByRole('article', { name: 'Current analysis analysis_resolved' })
     expect(analysis).toHaveTextContent('Historical analysis')
-    expect(analysis).not.toHaveTextContent('等待 5 分钟后重新分析')
+    expect(analysis).not.toHaveTextContent('Reanalysis scheduled in 5 minutes')
     expect(analysis).not.toHaveTextContent('下次重试')
   })
 
@@ -675,9 +675,9 @@ describe('DisputesPage', () => {
     fireEvent.click(await screen.findByText('Scope mismatch'))
     const analysis = await screen.findByRole('article', { name: 'Current analysis analysis_context_churn' })
 
-    expect(analysis).toHaveTextContent('最近一次分析输入变化来自：Router candidate Claims')
-    expect(analysis).toHaveTextContent('Cannot adopt: 分析输入多次变化，等待人工裁决或重新Analyze。')
-    expect(within(analysis).queryByRole('button', { name: '采用此分析' })).not.toBeInTheDocument()
+    expect(analysis).toHaveTextContent('Latest input change: Router candidate Claims')
+    expect(analysis).toHaveTextContent('Cannot adopt: Analysis inputs changed repeatedly. Resolve manually or run Analyze again.')
+    expect(within(analysis).queryByRole('button', { name: 'Adopt analysis' })).not.toBeInTheDocument()
   })
 
   it('summarizes observed updates without scoring recommendation compliance', async () => {
@@ -716,17 +716,17 @@ describe('DisputesPage', () => {
     expect(comparison).toHaveTextContent('At Resolution')
     expect(comparison).toHaveTextContent('Agent Adoption')
     expect(comparison).toHaveTextContent('Current Mirror')
-    expect(holder).toHaveTextContent('首次确认本次 CAU 被内化时冻结的结果')
-    expect(holder).toHaveTextContent('后续修改可能使它与 Agent Adoption 不同')
+    expect(holder).toHaveTextContent('the first confirmed snapshot after this CAU was internalized')
+    expect(holder).toHaveTextContent('may differ from Agent Adoption after later changes')
     expect(comparison).toHaveTextContent('payments / previous')
     expect(comparison).toHaveTextContent('payments / legacy')
     expect(comparison).not.toHaveTextContent('Recommended status')
     expect(comparison).not.toHaveTextContent('Matched')
     expect(comparison).not.toHaveTextContent('Mismatch')
     expect(comparison).not.toHaveTextContent(longSnapshotStatement)
-    fireEvent.click(within(comparison).getAllByRole('button', { name: '展开全文' })[0])
+    fireEvent.click(within(comparison).getAllByRole('button', { name: 'Show more' })[0])
     expect(comparison).toHaveTextContent(longSnapshotStatement)
-    fireEvent.click(within(comparison).getByRole('button', { name: '收起全文' }))
+    fireEvent.click(within(comparison).getByRole('button', { name: 'Show less' }))
     expect(comparison).not.toHaveTextContent(longSnapshotStatement)
 
     expect(within(holder).getByText('Technical details').closest('details')).toHaveAttribute('open')

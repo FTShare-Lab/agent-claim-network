@@ -84,9 +84,9 @@ function NetworkHealthDialog({
         <Dialog.Content className="fixed left-1/2 top-1/2 z-[60] flex max-h-[85vh] w-[min(640px,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 flex-col rounded-lg border border-slate-200 bg-white shadow-lg">
           <div className="flex items-start justify-between gap-3 border-b border-slate-200 px-5 py-3">
             <div>
-              <Dialog.Title className="text-sm font-semibold text-slate-900">Network Health — 计算定义</Dialog.Title>
+              <Dialog.Title className="text-sm font-semibold text-slate-900">Network Health — Metric Definitions</Dialog.Title>
               <Dialog.Description className="mt-0.5 text-xs text-slate-500">
-                各指标的算法与含义，公式中带入当前实时值便于核对。
+                Definitions and formulas with current values for verification.
               </Dialog.Description>
             </div>
             <Dialog.Close asChild>
@@ -101,48 +101,48 @@ function NetworkHealthDialog({
           </div>
           <div className="flex-1 space-y-4 overflow-y-auto px-5 py-4">
             <DefRow
-              title="Network Integrity（顶部进度条）"
-              formula={`分子 = active_claims + active_policies + resolved_disputes
-分母 = claims + active_policies + open_disputes + resolved_disputes
-Integrity% = 分子 / 分母 × 100，clamp 到 [0,100]
+              title="Network Integrity (top progress bar)"
+              formula={`Numerator = active_claims + active_policies + resolved_disputes
+Denominator = claims + active_policies + open_disputes + resolved_disputes
+Integrity% = Numerator / Denominator × 100, clamped to [0,100]
 
-当前: (${counts.active_claims} + ${counts.active_policies} + ${counts.resolved_disputes})
+Current: (${counts.active_claims} + ${counts.active_policies} + ${counts.resolved_disputes})
      / (${counts.claims} + ${counts.active_policies} + ${counts.open_disputes} + ${counts.resolved_disputes})
      = ${integrity === null ? 'insufficient signal' : `${integrity}%`}`}
-              desc={'把 claim / policy / dispute 三类资源里"处于健康或已收敛状态"的数量相加作分子，除以三类资源总数作分母，得到一个综合健康比例。'}
-              note="分子 = 活跃 claim + 生效中 policy + 已关闭 dispute。分母 = 所有 claim(含 stale/deprecated) + 生效中 policy + 所有 dispute(open+resolved)。注意：分母里 policy 只算 active（deprecated_policies 不计入），这是既有口径。健康档位：≥90% Healthy，70–89% Watch，<70% Degraded。"
+              desc={'The ratio combines active Claims, active Policies, and resolved Disputes into an overall health indicator.'}
+              note="Numerator = active Claims + active Policies + resolved Disputes. Denominator = all Claims + active Policies + all Disputes. Deprecated Policies are excluded from this metric. Levels: ≥90% Healthy, 70–89% Watch, <70% Degraded."
             />
             <DefRow
               title="Semantic Consistency"
               formula={`active_claims / claims × 100
 
-当前: ${counts.active_claims} / ${counts.claims} = ${toPercent(counts.active_claims, counts.claims)}%`}
-              desc="活跃 claim 占总 claim 的比例。越高说明 claim 整体还没退化成 stale/deprecated，语义一致性越好。100% 表示所有 claim 都还活跃。"
+Current: ${counts.active_claims} / ${counts.claims} = ${toPercent(counts.active_claims, counts.claims)}%`}
+              desc="The percentage of Claims that remain active rather than stale or deprecated. A value of 100% means every Claim is active."
             />
             <DefRow
               title="Policy Propagation"
               formula={`active_policies / max(active_policies + deprecated_policies, 1) × 100
 
-当前: ${counts.active_policies} / ${Math.max(counts.active_policies + counts.deprecated_policies, 1)} = ${toPercent(counts.active_policies, Math.max(counts.active_policies + counts.deprecated_policies, 1))}%`}
-              desc="生效中 policy 占所有 policy(生效+已废弃) 的比例。越高说明已发布的 policy 大多还在生效，没有被大量废弃。分母用 max(...,1) 防止除零。"
+Current: ${counts.active_policies} / ${Math.max(counts.active_policies + counts.deprecated_policies, 1)} = ${toPercent(counts.active_policies, Math.max(counts.active_policies + counts.deprecated_policies, 1))}%`}
+              desc="The percentage of all Policies, active or deprecated, that remain active. The denominator is at least 1 to avoid division by zero."
             />
             <DefRow
               title="Stale Claims"
-              formula={`counts.stale_claims（原始计数，非百分比）
+              formula={`counts.stale_claims (count, not percentage)
 
-当前: ${counts.stale_claims}`}
-              desc={'当前被判定为 stale 的 claim 数量。越低越好，0 最好。这是绝对计数，不受总数影响，直接反映"有多少 claim 该刷新了"。'}
+Current: ${counts.stale_claims}`}
+              desc={'The number of Claims currently marked stale. This absolute count indicates how many Claims need review; lower is better.'}
             />
             <DefRow
               title="At-Risk Agents"
-              formula={`对每个 agent:
-  ratio = active_claims / mirror_claims       // 活跃 claim 占该 agent 持有 claim 总数的比例
-  若 mirror_claims > 0 且 ratio < 0.5，则该 agent 计为 at-risk
-显示 = at-risk 数量 / 总 agent 数量
+              formula={`For each agent:
+  ratio = active_claims / mirror_claims       // active share of the Claims held by this agent
+  If mirror_claims > 0 and ratio < 0.5, count the agent as at-risk
+Display = at-risk agents / all agents
 
-当前: ${atRisk} / ${agents.length}`}
-              desc={'对每个 agent 算它"活跃 claim 占自己持有 claim 总数(mirror_claims)的比例"；比例不到 50% 的 agent 视为"有风险"——它持有的 claim 大部分已退化成 stale/deprecated，需要关注或触发 sweep。'}
-              note="mirror_claims = 该 agent 持有的 claim 总数(active + stale + deprecated)，即 /api/overview 里每个 agent 的 mirror_claims 字段。持有 0 条 claim 的新 agent 不计入 at-risk（分母为 0 时跳过）。越低越好，0 / N 最佳。"
+Current: ${atRisk} / ${agents.length}`}
+              desc={'An agent is at risk when fewer than half of its mirrored Claims are active. Most of its Claims are then stale or deprecated and may need review or a sweep.'}
+              note="mirror_claims is the total of active, stale, and deprecated Claims held by an agent, as returned by /api/overview. Agents with no Claims are excluded from the at-risk count. Lower is better; 0 / N is ideal."
             />
           </div>
           <div className="border-t border-slate-200 px-5 py-3">

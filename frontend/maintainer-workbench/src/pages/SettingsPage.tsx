@@ -28,17 +28,17 @@ const ENDPOINT_GROUPS: EndpointGroup[] = [
       {
         method: 'POST',
         path: '/api/admin-auth/check',
-        summary: '校验管理员账号密码',
-        body: '无 JSON body。凭据通过 HTTP Basic Auth 头 Authorization: Basic <base64(user:pass)> 传入。',
-        response: '200 OK（凭据正确，返回空体）\n401 Unauthorized（账号或密码错误）',
-        caller: 'workbench 登录页',
+        summary: 'Validate administrator credentials',
+        body: 'No JSON body. Send credentials in the HTTP Basic Auth header: Authorization: Basic <base64(user:pass)>.',
+        response: '200 OK (valid credentials, empty body)\n401 Unauthorized (incorrect username or password)',
+        caller: 'Workbench sign-in page',
       },
       {
         method: 'GET',
         path: '/api/admin-auth/status',
-        summary: '查询 admin 鉴权是否启用',
-        response: '{\n  "enabled": boolean   // true=需要登录, false=免登直接进\n}',
-        caller: 'workbench 路由守卫',
+        summary: 'Check whether administrator authentication is enabled',
+        response: '{\n  "enabled": boolean   // true = sign-in required, false = sign-in not required\n}',
+        caller: 'Workbench route guard',
       },
     ],
   },
@@ -48,20 +48,20 @@ const ENDPOINT_GROUPS: EndpointGroup[] = [
       {
         method: 'GET',
         path: '/health',
-        summary: '存活探针，返回 200',
-        response: '200 OK（无 body）',
-        caller: '编排 / 探活',
+        summary: 'Liveness probe returning HTTP 200',
+        response: '200 OK (empty body)',
+        caller: 'Orchestration / health checks',
       },
       {
         method: 'GET',
         path: '/status',
-        summary: '返回 maintainer 状态快照',
+        summary: 'Return the Maintainer status snapshot',
         response: `MaintainerStatusSnapshot {
   generated_at: ISO8601,
   counts: {
     agents, claims, active_claims, stale_claims, deprecated_claims,
     active_policies, deprecated_policies, open_disputes, resolved_disputes,
-    outbox_entries, send_events   // 均为整数计数
+    outbox_entries, send_events   // all values are integer counts
   },
   agents: [ AgentStatusSummary { agent_id, mirror_claims, active_claims,
            stale_claims, deprecated_claims } ],
@@ -75,25 +75,25 @@ const ENDPOINT_GROUPS: EndpointGroup[] = [
       {
         method: 'GET',
         path: '/api/overview',
-        summary: '运维聚合视图：snapshot + 最新 sweep + 最近事件',
+        summary: 'Operations overview: snapshot, latest sweep, and recent events',
         response: `OverviewResponse {
-  snapshot: MaintainerStatusSnapshot,        // 同 /status
-  latest_sweep: SweepRunRecord | null,       // 最近一次扫描，见 Sweep 组
+  snapshot: MaintainerStatusSnapshot,        // same as /status
+  latest_sweep: SweepRunRecord | null,       // latest sweep; see the Sweep group
   sweep_schedule: {
-    tick_interval_secs: 整数,
+    tick_interval_secs: integer,
     last_auto_sweep_at: ISO8601 | null,
     next_sweep_at: ISO8601 | null,
     last_auto_trigger: "maintainer_startup"|"ticker"|null
   },
-  recent_policy_events: [ PolicyEventRecord ],   // 见 Policies 组
+  recent_policy_events: [ PolicyEventRecord ],   // see the Policies group
   recent_agent_activities: [ AgentActivityRecord ],
-  recent_http_audits: [ HttpAuditRecord ],       // 见 HTTP Audits 组
+  recent_http_audits: [ HttpAuditRecord ],       // see the HTTP Audits group
   recent_dispute_resolutions: [ {
     event_id: string, dispute_id: string,
     occurred_at: ISO8601, summary: string | null
   } ]
 }`,
-        caller: 'workbench Overview 页',
+        caller: 'Workbench Overview page',
       },
     ],
   },
@@ -103,22 +103,22 @@ const ENDPOINT_GROUPS: EndpointGroup[] = [
       {
         method: 'GET',
         path: '/api/agents',
-        summary: '列出所有已注册 agent 及其 claim 计数、活动、来源 IP',
-        response: `AgentView[] 每项 {
+        summary: 'List registered agents with Claim counts, activity, and source IP',
+        response: `AgentView[] entries: {
   agent_id: string,
-  mirror_claims: 整数,    // 该 agent 镜像的 claim 总数
-  active_claims: 整数,     // 其中 active 数量
-  stale_claims: 整数,
-  deprecated_claims: 整数,
+  mirror_claims: integer,    // total mirrored Claims for this agent
+  active_claims: integer,     // active Claim count
+  stale_claims: integer,
+  deprecated_claims: integer,
   last_source_ip: string | null,
   last_activity: {
     event_id: string, agent_id: string,
     activity_kind: "inbox_pulled"|"claim_uploaded"|"dispute_reported", occurred_at: ISO8601,
     summary: string
   } | null,
-  recent_activities: [ 同 last_activity 结构的数组 ]
+  recent_activities: [ objects with the same structure as last_activity ]
 }`,
-        caller: 'workbench Agents 页',
+        caller: 'Workbench Agents page',
       },
     ],
   },
@@ -128,8 +128,8 @@ const ENDPOINT_GROUPS: EndpointGroup[] = [
       {
         method: 'GET',
         path: '/api/claims',
-        summary: '列出所有 claim 视图（claim 本体 + 关联 dispute id）',
-        response: `ClaimView[] 每项 {
+        summary: 'List Claim views with the Claim and related Dispute IDs',
+        response: `ClaimView[] entries: {
   claim: {
     id: string, name: string, statement: string,
     scope: string, holder: string,        // holder = agent_id
@@ -142,19 +142,19 @@ const ENDPOINT_GROUPS: EndpointGroup[] = [
   open_dispute_ids: [ string ],
   resolved_dispute_ids: [ string ]
 }`,
-        caller: 'workbench Claims 页',
+        caller: 'Workbench Claims page',
       },
       {
         method: 'GET',
         path: '/api/claims/{id}',
-        summary: '查询单个 claim 详情',
-        response: 'ClaimView（结构同 /api/claims 的单项）',
+        summary: 'Get details of one Claim',
+        response: 'ClaimView (same structure as one /api/claims entry)',
         caller: 'workbench Claims Drawer',
       },
       {
         method: 'POST',
         path: '/claims/upload',
-        summary: 'agent 上传 / 覆盖一条 claim',
+        summary: 'Upload or replace a Claim on behalf of an agent',
         body: `{
   auth: { agent_id: string, acn_key: string },
   data: Claim {
@@ -164,7 +164,7 @@ const ENDPOINT_GROUPS: EndpointGroup[] = [
     evidence_summary: string
   }
 }`,
-        response: '200 OK（无 body）',
+        response: '200 OK (empty body)',
         caller: 'agent runtime',
       },
     ],
@@ -175,23 +175,23 @@ const ENDPOINT_GROUPS: EndpointGroup[] = [
       {
         method: 'GET',
         path: '/api/disputes',
-        summary: '列出所有 dispute',
-        response: `MaintainerDisputeRecord[] 每项 {
+        summary: 'List all Disputes',
+        response: `MaintainerDisputeRecord[] entries: {
   id: string, name: string,
   reporter_agent_id: string,
-  claims: [ string ],          // direct claim_id 列表
+  claims: [ string ],          // direct Claim IDs
   summary: string,
   status: "open"|"resolved",
   created_at: ISO8601,
   resolved_at?: ISO8601,
   resolution?: DisputeResolution
 }`,
-        caller: 'workbench Disputes 页',
+        caller: 'Workbench Disputes page',
       },
       {
         method: 'GET',
         path: '/api/disputes/{id}',
-        summary: '查询单个 dispute',
+        summary: 'Get one Dispute',
         response: `DisputeDetail {
   ...MaintainerDisputeRecord,
   current_analysis?: ArbitrationAnalysisSummary,
@@ -202,35 +202,35 @@ const ENDPOINT_GROUPS: EndpointGroup[] = [
       {
         method: 'GET',
         path: '/api/disputes/{id}/analyses',
-        summary: '查询当前 Analysis',
+        summary: 'Get the current Analysis',
         response: '{ current_analysis? }',
         caller: 'workbench Disputes Drawer',
       },
       {
         method: 'POST',
         path: '/api/disputes/{id}/analyses',
-        summary: '显式运行 Analysis，并覆盖当前结果',
+        summary: 'Run Analysis explicitly and replace the current result',
         response: '202 Accepted + ArbitrationAnalysisSummary',
         caller: 'workbench Disputes Analyze',
       },
       {
         method: 'GET',
         path: '/api/disputes/{id}/analyses/{analysis_id}',
-        summary: '查询冻结上下文、proposal 与 verification',
+        summary: 'Get the frozen context, proposal, and verification',
         response: 'ArbitrationAnalysisDetail',
-        caller: 'workbench Analysis 卡片',
+        caller: 'Workbench Analysis card',
       },
       {
         method: 'POST',
         path: '/api/disputes/{id}/analyses/{analysis_id}/adopt',
-        summary: '显式采用 approved Analysis，不重新调用模型',
-        response: '201 Created + ArbitrationResolutionRecord；输入已变化或已关闭时 409',
+        summary: 'Adopt an approved Analysis without another model call',
+        response: '201 Created + ArbitrationResolutionRecord; 409 if inputs changed or the Dispute is closed',
         caller: 'workbench Analysis Adopt',
       },
       {
         method: 'POST',
         path: '/disputes/report',
-        summary: 'agent 上报 dispute；shadow/auto 建立 Current Analysis，manual 只保存 dispute',
+        summary: 'Report a Dispute; shadow/auto modes create the Current Analysis, while manual mode only saves the Dispute',
         body: `{
   auth: { agent_id: string, acn_key: string },
   data: Dispute {
@@ -238,13 +238,13 @@ const ENDPOINT_GROUPS: EndpointGroup[] = [
     summary, status, created_at, resolved_at?
   }
 }`,
-        response: '200 OK（无 body）',
+        response: '200 OK (empty body)',
         caller: 'agent runtime',
       },
       {
         method: 'POST',
         path: '/disputes/{id}/resolve',
-        summary: '人类直接关闭一条 dispute，可选通知 direct Claim holder',
+        summary: 'Close a Dispute manually, optionally notifying direct Claim holders',
         body: `{
   resolve_note: string,
   notify_affected_agents: boolean,
@@ -252,13 +252,13 @@ const ENDPOINT_GROUPS: EndpointGroup[] = [
   resolution_basis?: ResolutionBasis,
   claim_assessments?: ClaimAssessment[]
 }`,
-        response: '204 No Content（成功无 body）',
+        response: '204 No Content (success, empty body)',
         caller: 'workbench Disputes Resolve',
       },
       {
         method: 'POST',
         path: '/api/disputes/{id}/resolution/reject',
-        summary: '驳回并替换当前 automatic Resolution',
+        summary: 'Reject and replace the current automatic Resolution',
         body: `{
   expected_resolution_id: string,
   rejection_reason: string,
@@ -267,7 +267,7 @@ const ENDPOINT_GROUPS: EndpointGroup[] = [
   resolution_basis?: ResolutionBasis,
   claim_assessments?: ClaimAssessment[]
 }`,
-        response: '201 Created + ArbitrationResolutionRecord；Resolution 已变化时 409',
+        response: '201 Created + ArbitrationResolutionRecord; 409 if the Resolution changed',
         caller: 'workbench Reject & Replace',
       },
     ],
@@ -278,7 +278,7 @@ const ENDPOINT_GROUPS: EndpointGroup[] = [
       {
         method: 'GET',
         path: '/api/policies',
-        summary: '列出所有 policy 及其投递 / 事件流水',
+        summary: 'List Policies and their delivery and event history',
         response: `PolicyRecordsResponse {
   policies: [ Policy ],
   outbox: [ OutboxEntry ],
@@ -292,13 +292,13 @@ Policy {
   name: string, statement: string, scope: string,
   status: "active"|"deprecated",
   created_at: ISO8601, updated_at?: ISO8601,
-  target_agents?: [ string ]            // 省略 = 广播
+  target_agents?: [ string ]            // omitted = broadcast
 }
 
 OutboxEntry {
   inbox_id: string, maintainer_action_id: string,
-  target_kind: "broadcast",              // 广播时无 target_agent
-  // 或 target_kind: "targeted", target_agent: string
+  target_kind: "broadcast",              // target_agent is absent for broadcasts
+  // or target_kind: "targeted", target_agent: string
   created_at: ISO8601,
   offered_to: [ {
     agent_id: string, first_offered_at: ISO8601,
@@ -313,39 +313,39 @@ SendLogRow {
   maintainer_action_id: string, policy_id: string,
   message_type: "policy_update"|"claim_attribute_update"
 }`,
-        caller: 'workbench Policies 页',
+        caller: 'Workbench Policies page',
       },
       {
         method: 'POST',
         path: '/policies/policy-update',
-        summary: '发布一条 Policy Update (PU)，广播或定向投递给 agent',
+        summary: 'Publish a Policy Update (PU) to all agents or selected agents',
         body: `{
-  name: string,            // 必填
-  statement: string,      // 必填，Policy 文本
-  scope: string,           // 必填
-  target_agents: [ string ] | null   // null/省略 = 广播
+  name: string,            // required
+  statement: string,      // required Policy text
+  scope: string,           // required
+  target_agents: [ string ] | null   // null/omitted = broadcast
 }`,
-        response: 'Policy（新建的那条，结构见 /api/policies）',
+        response: 'New Policy (see /api/policies for its structure)',
         caller: 'workbench New PU',
       },
       {
         method: 'POST',
         path: '/policies/claim-update-suggestion',
-        summary: '发布一条 Claim Attribute Update (CAU) 建议',
+        summary: 'Publish a Claim Attribute Update (CAU) suggestion',
         body: `{
-  statement: string,                   // 必填
-  target_agents: [ string ] | null     // null/省略 = 广播
+  statement: string,                   // required
+  target_agents: [ string ] | null     // null/omitted = broadcast
 }`,
-        response: 'Policy（新建的那条，message_type=claim_attribute_update）',
+        response: 'New Policy with message_type=claim_attribute_update',
         caller: 'workbench New CAU',
       },
       {
         method: 'POST',
         path: '/policies/policy-deprecation',
-        summary: '废弃一条 active policy',
+        summary: 'Deprecate an active Policy',
         body: `{ policy_id: string }`,
         response: `DeprecatePolicyResponse {
-  pushed: 整数    // 向 agent 推送的投递条数
+  pushed: integer    // number of deliveries queued for agents
 }`,
         caller: 'workbench Deprecate',
       },
@@ -357,12 +357,12 @@ SendLogRow {
       {
         method: 'GET',
         path: '/api/sweeps',
-        summary: '列出 sweep 运行历史',
-        response: `SweepRunRecord[] 每项 {
+        summary: 'List sweep history',
+        response: `SweepRunRecord[] entries: {
   run_id: string,
   triggered_at: ISO8601,
   trigger: "manual"|"maintainer_startup"|"ticker",
-  report: ClaimSweepReport     // 见下
+  report: ClaimSweepReport     // see below
 }
 
 ClaimSweepReport {
@@ -370,41 +370,41 @@ ClaimSweepReport {
   deprecated_claims: [ [ agent_id, claim_id ] ],
   notifications: [ {
     agent_id, stale_claims: [claim_id],
-    deprecated_claims: [claim_id], policy_id, pushed: 整数
+    deprecated_claims: [claim_id], policy_id, pushed: integer
   } ],
   notification_errors: [ {
     agent_id, stale_claims, deprecated_claims, error: string
   } ]
 }`,
-        caller: 'workbench Sweep 页',
+        caller: 'Workbench Sweep page',
       },
       {
         method: 'POST',
         path: '/maintenance/sweep',
-        summary: '立即触发一次 stale/deprecated claim 扫描，向 agent 推送 CAU',
-        response: 'ClaimSweepReport（结构同 /api/sweeps 的 report 字段）',
+        summary: 'Run a stale/deprecated Claim sweep immediately and send CAU suggestions to agents',
+        response: 'ClaimSweepReport (same as the report field in /api/sweeps)',
         caller: 'workbench Trigger Sweep',
       },
       {
         method: 'GET',
         path: '/outbox',
-        summary: '查询 outbox 待投递条目',
-        response: `OutboxEntry[]（结构见 /api/policies 的 OutboxEntry）
-支持 query 参数：?limit=整数&open=boolean`,
-        caller: '内部 / 调试',
+        summary: 'List pending outbox deliveries',
+        response: `OutboxEntry[] (see OutboxEntry in /api/policies)
+Supported query parameters: ?limit=integer&open=boolean`,
+        caller: 'Internal / debugging',
       },
       {
         method: 'GET',
         path: '/send_log',
-        summary: '查询已发送投递日志',
-        response: 'SendLogRow[]（结构见 /api/policies 的 SendLogRow）',
-        caller: '内部 / 调试',
+        summary: 'List sent delivery logs',
+        response: 'SendLogRow[] (see SendLogRow in /api/policies)',
+        caller: 'Internal / debugging',
       },
       {
         method: 'GET',
         path: '/actions',
-        summary: '查询 maintainer 动作记录',
-        response: `MaintainerActionRow[] 每项 {
+        summary: 'List Maintainer action records',
+        response: `MaintainerActionRow[] entries: {
   created_at: ISO8601,
   maintainer_action_id: string,
   message_type: "policy_update"|"claim_attribute_update",
@@ -414,23 +414,23 @@ ClaimSweepReport {
   inbox_ids: [ string ],
   target_agents: [ string ],
   delivered_agents: [ string ],
-  outbox_entries: 整数,
-  send_events: 整数
+  outbox_entries: integer,
+  send_events: integer
 }`,
-        caller: '内部 / 调试',
+        caller: 'Internal / debugging',
       },
       {
         method: 'POST',
         path: '/inbox/pull',
-        summary: 'agent 拉取自己 inbox 里的待处理消息；ACK 前相同 inbox_id 可重投',
+        summary: 'Pull pending messages for the agent; the same inbox_id may be redelivered before ACK',
         body: `{
   auth: { agent_id: string, acn_key: string },
   data: { agent_id: string }
 }`,
-        response: `InboxMessage[] 每项 {
+        response: `InboxMessage[] entries: {
   id: string,
   message_type: "policy_update"|"claim_attribute_update",
-  policy: Policy,           // 内嵌的完整 policy
+  policy: Policy,           // complete embedded Policy
   handled_at?: ISO8601
 }`,
         caller: 'agent runtime',
@@ -438,12 +438,12 @@ ClaimSweepReport {
       {
         method: 'POST',
         path: '/inbox/ack',
-        summary: 'agent 在消息原子落盘后确认持久收件；不代表已内化或应用',
+        summary: 'Acknowledge durable receipt after atomic persistence; this does not confirm internalization or application',
         body: `{
   auth: { agent_id: string, acn_key: string },
   data: { agent_id: string, inbox_ids: [ string ] }
 }`,
-        response: '200 OK（无 body；重复 ACK 幂等）',
+        response: '200 OK (empty body; repeated ACKs are idempotent)',
         caller: 'agent runtime',
       },
     ],
@@ -454,25 +454,25 @@ ClaimSweepReport {
       {
         method: 'GET',
         path: '/api/audits',
-        summary: '列出最近的 HTTP 审计记录',
-        response: `HttpAuditRecord[] 每项 {
+        summary: 'List recent HTTP audit records',
+        response: `HttpAuditRecord[] entries: {
   audit_id: string, occurred_at: ISO8601,
   method: string, path: string,
-  status_code: 整数,        // 如 200 / 401 / 500
-  duration_ms: 整数,
+  status_code: integer,        // for example, 200 / 401 / 500
+  duration_ms: integer,
   source_ip: string | null,
-  request_body: string,    // 审计脱敏后的请求体
-  response_body: string,   // 审计脱敏后的响应体
+  request_body: string,    // redacted request body
+  response_body: string,   // redacted response body
   resource_id: string | null,
   summary: string
 }`,
-        caller: 'workbench HTTP Audits 页',
+        caller: 'Workbench HTTP Audits page',
       },
       {
         method: 'GET',
         path: '/api/audits/{id}',
-        summary: '查询单条 HTTP 审计详情',
-        response: 'HttpAuditRecord（结构同 /api/audits 的单项）',
+        summary: 'Get one HTTP audit record',
+        response: 'HttpAuditRecord (same as one /api/audits entry)',
         caller: 'workbench HTTP Audits Drawer',
       },
     ],
@@ -483,42 +483,42 @@ ClaimSweepReport {
       {
         method: 'GET',
         path: '/api/team-auth/status',
-        summary: '返回 maintainer/router team auth 开关状态',
+        summary: 'Return the Maintainer and Router team authentication settings',
         response: `{
   maintainer_team_auth_enabled: boolean,
   router_team_auth_enabled: boolean
 }`,
-        caller: 'workbench Team Auth 页',
+        caller: 'Workbench Team Auth page',
       },
       {
         method: 'GET',
         path: '/api/team-auth/keys',
-        summary: '列出团队 API key 台账行，不返回 hash 或明文 key',
-        response: `TeamAuthKey[] 每项 {
+        summary: 'List team API key records without hashes or plaintext keys',
+        response: `TeamAuthKey[] entries: {
   key_id: string,
   agent_id: string,
   generated_time: ISO8601,
   status: "active"|"revoked"
 }`,
-        caller: 'workbench Team Auth 页',
+        caller: 'Workbench Team Auth page',
       },
       {
         method: 'POST',
         path: '/api/team-auth/keys',
-        summary: '为普通 agent 创建新 key；router-service 是系统保留身份，明文 acn_key 只在本次响应返回',
+        summary: 'Create a key for a regular agent; router-service is a reserved identity and plaintext acn_key is returned only in this response',
         body: `{ agent_id: string }`,
         response: `{
   key: { key_id, agent_id, generated_time, status },
   acn_key: string
 }`,
-        caller: 'workbench Team Auth 页',
+        caller: 'Workbench Team Auth page',
       },
       {
         method: 'POST',
         path: '/api/team-auth/keys/{key_id}/revoke',
-        summary: '把 key 标记为 revoked',
+        summary: 'Mark a key as revoked',
         response: '{ key_id, agent_id, generated_time, status }',
-        caller: 'workbench Team Auth 页',
+        caller: 'Workbench Team Auth page',
       },
     ],
   },
@@ -528,14 +528,14 @@ ClaimSweepReport {
       {
         method: 'POST',
         path: '/api/router-query',
-        summary: '语义检索：按 scope + 语义查询候选 claim 与关联 dispute',
+        summary: 'Retrieve candidate Claims and related Disputes by scope and semantic query',
         body: `{
-  scope: string,                 // 必填，如 "order-system / batch-order-submit"
-  semantic_query: string | null  // 可选语义查询串
+  scope: string,                 // required, for example "order-system / batch-order-submit"
+  semantic_query: string | null  // optional semantic query
 }`,
         response: `RouterQueryResult {
   candidate_claims: [ {
-    ...Claim,                      // 展平的完整 claim 字段
+    ...Claim,                      // complete flattened Claim fields
     open_dispute_ids: [ string ],
     resolved_dispute_ids: [ string ]
   } ],
@@ -547,23 +547,23 @@ ClaimSweepReport {
     mode: "lexical_only"|"vector_only"|"hybrid",
     failed_paths: [ string ],
     error_summaries: [ string ],
-    lexical_hits: 整数,
-    vector_hits: 整数,
+    lexical_hits: integer,
+    vector_hits: integer,
     rerank_fallback: boolean,
     candidates: [ {
       claim_id, hit_sources: "both"|"lexical"|"vector"|"none",
-      lexical_score: 非负整数, vector_score: 0..1000 的整数,
+      lexical_score: nonnegative integer, vector_score: integer from 0 to 1000,
       rank_before_rerank, rank_after_rerank,
       vector_status: "pending"|"ready"|"failed"|"not_requested"
     } ]
   } | null
 }`,
-        caller: 'workbench Router Query 页',
+        caller: 'Workbench Router Query page',
       },
       {
         method: 'POST',
         path: '/claims/query',
-        summary: 'router daemon 查询团队共享 claim 池',
+        summary: 'Query the shared team Claim pool through the Router daemon',
         body: `{
   auth: { agent_id: string, acn_key: string },
   data: {
@@ -571,13 +571,13 @@ ClaimSweepReport {
     semantic_query: string | null
   }
 }`,
-        response: 'RouterQueryResult（结构同 /api/router-query）',
-        caller: 'agent runtime；Workbench Router Query 由 maintainer 使用 router-service 调用',
+        response: 'RouterQueryResult (same structure as /api/router-query)',
+        caller: 'Agent runtime; Workbench Router Query calls through Maintainer using router-service',
       },
       {
         method: 'POST',
         path: '/claims/scopes/overview',
-        summary: 'router daemon 返回团队 scope overview',
+        summary: 'Return the team scope overview from the Router daemon',
         body: `{
   auth: { agent_id: string, acn_key: string },
   data: {}
@@ -588,7 +588,7 @@ ClaimSweepReport {
     latest_claim_created_at: ISO8601
   } ]
 }`,
-        caller: 'agent runtime；maintainer scope overview 使用 router-service 调用',
+        caller: 'Agent runtime; Maintainer requests the scope overview using router-service',
       },
     ],
   },

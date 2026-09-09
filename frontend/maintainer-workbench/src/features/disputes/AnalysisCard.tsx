@@ -14,8 +14,9 @@ function confidence(value: number | undefined) {
   return value === undefined ? 'N/A' : `${Math.round(value * 100)}%`
 }
 
+// 保持与服务端持久化阻塞原因兼容；界面使用独立的英文说明。
 const terminalContextChurnBlocker = '分析输入连续变化，已停止自动处理，等待人工'
-const terminalContextChurnMessage = '分析输入多次变化，等待人工裁决或重新Analyze。'
+const terminalContextChurnMessage = 'Analysis inputs changed repeatedly. Resolve manually or run Analyze again.'
 
 function isTerminalContextChurn(analysis: ArbitrationAnalysisSummary | ArbitrationAnalysisDetail) {
   return analysis.adoption_blocker === terminalContextChurnBlocker
@@ -24,14 +25,14 @@ function isTerminalContextChurn(analysis: ArbitrationAnalysisSummary | Arbitrati
 function analysisStatus(analysis: ArbitrationAnalysisSummary | ArbitrationAnalysisDetail) {
   if (analysis.state === 'waiting_reanalysis') {
     return analysis.context_change_count === 1
-      ? '等待 5 分钟后重新分析'
-      : '等待 15 分钟后重新分析'
+      ? 'Reanalysis scheduled in 5 minutes'
+      : 'Reanalysis scheduled in 15 minutes'
   }
   if (isTerminalContextChurn(analysis)) {
     return terminalContextChurnMessage
   }
   if (analysis.state === 'approved' && analysis.adoption_blocker) {
-    return 'Approved，但采用被阻止'
+    return 'Approved, but adoption is blocked'
   }
   return undefined
 }
@@ -93,11 +94,11 @@ export function AnalysisCard({
       {status ? (
         <div role="status" className="mt-3 rounded-md border border-amber-200 bg-amber-50 p-2.5 text-xs leading-5 text-amber-900">
           <div className="font-semibold">{status}</div>
-          <div className="mt-1">当前第 {analysis.analysis_round ?? 1} 轮；已检测到 {analysis.context_change_count ?? 0} 次分析输入变化。</div>
-          {analysis.next_retry_at ? <div>下次重试：{formatDateTime(analysis.next_retry_at)}</div> : null}
+          <div className="mt-1">Round {analysis.analysis_round ?? 1}; {analysis.context_change_count ?? 0} input changes detected.</div>
+          {analysis.next_retry_at ? <div>Next retry: {formatDateTime(analysis.next_retry_at)}</div> : null}
           {analysis.context_change_reason ? (
             <div className="mt-1">
-              <span className="font-medium">最近一次分析输入变化来自：</span>
+              <span className="font-medium">Latest input change: </span>
               <ExpandableText limit={220}>{analysis.context_change_reason}</ExpandableText>
             </div>
           ) : null}
@@ -138,7 +139,7 @@ export function AnalysisCard({
           ) : null}
           {!compact && unresolved ? (
             <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 p-2.5 text-xs leading-5 text-amber-900">
-              当前 Analysis 未形成可采用的裁决结论，不建议修改 Claim；Dispute 保持 open，等待人类管理者处理。
+              This analysis has no adoptable resolution and recommends no Claim changes. The Dispute remains open for human review.
             </div>
           ) : null}
           {!compact && !unresolved ? (
@@ -221,7 +222,7 @@ export function AnalysisCard({
             {detail.verification.reasoning}
           </ExpandableText>
           {detail.verification.verdict === 'unresolved' ? (
-            <div className="mt-2 text-[11px] text-slate-500">Verification 未给出 Claim 修改建议，等待人类管理者处理。</div>
+            <div className="mt-2 text-[11px] text-slate-500">Verification recommends no Claim changes. Human review is required.</div>
           ) : (
             <div className="mt-2 text-[11px] text-slate-500">
               {detail.verification.claim_assessments.filter((assessment) => assessment.agreed).length}
@@ -266,7 +267,7 @@ export function AnalysisCard({
                 <div className="mt-1 text-slate-500">{formatDateTime(round.started_at)} → {round.completed_at ? formatDateTime(round.completed_at) : 'In progress'}</div>
                 {round.context_change_reason ? (
                   <div className="mt-1 text-amber-800">
-                    <span className="font-medium">该轮结束后检测到的分析输入变化来自：</span>
+                    <span className="font-medium">Input change detected after this round: </span>
                     <ExpandableText limit={180}>{round.context_change_reason}</ExpandableText>
                   </div>
                 ) : null}
@@ -290,7 +291,7 @@ export function AnalysisCard({
           disabled={adopting}
           onClick={() => onAdopt(analysis.analysis_id)}
         >
-          {adopting ? 'Adopting…' : '采用此分析'}
+          {adopting ? 'Adopting…' : 'Adopt analysis'}
         </button>
       ) : null}
     </article>

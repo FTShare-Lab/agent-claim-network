@@ -175,9 +175,9 @@ function HolderCard({
           Direct Claim adoption ({directClaims.length})
         </summary>
         <div className="mt-2 rounded bg-slate-50 p-2 text-xs leading-5 text-slate-600">
-          <span className="font-medium text-slate-800">At Resolution</span> 是裁决时冻结的 Claim；
-          <span className="font-medium text-slate-800"> Agent Adoption</span> 是首次确认本次 CAU 被内化时冻结的结果；
-          <span className="font-medium text-slate-800"> Current Mirror</span> 是 Maintainer 当前看到的最新版本，后续修改可能使它与 Agent Adoption 不同。
+          <span className="font-medium text-slate-800">At Resolution</span> is the Claim snapshot at resolution;
+          <span className="font-medium text-slate-800"> Agent Adoption</span> is the first confirmed snapshot after this CAU was internalized;
+          <span className="font-medium text-slate-800"> Current Mirror</span> is the latest version visible to Maintainer and may differ from Agent Adoption after later changes.
         </div>
         <div className="mt-2 space-y-2">
           {directClaims.length

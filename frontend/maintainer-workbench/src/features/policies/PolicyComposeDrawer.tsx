@@ -167,11 +167,11 @@ export function PolicyComposeDrawer({
     const legalAgents = new Set(agents.map((agent) => agent.agent_id))
     const hasIllegalAgent = newPuForm.targetAgents.some((agentId) => !legalAgents.has(agentId))
     if (!newPuForm.name.trim() || !newPuForm.scope.trim() || !newPuForm.statement.trim()) {
-      setError('Name、Scope、Statement 不能为空。')
+      setError('Name, Scope, and Statement are required.')
       return
     }
     if (hasIllegalAgent) {
-      setError('存在非法 target agent。')
+      setError('One or more target agents are invalid.')
       return
     }
     createPolicy.mutate(
@@ -193,11 +193,11 @@ export function PolicyComposeDrawer({
     const legalAgents = new Set(agents.map((agent) => agent.agent_id))
     const hasIllegalAgent = cauForm.targetAgents.some((agentId) => !legalAgents.has(agentId))
     if (!cauForm.statement.trim()) {
-      setError('Statement 不能为空。')
+      setError('Statement is required.')
       return
     }
     if (hasIllegalAgent) {
-      setError('存在非法 target agent。')
+      setError('One or more target agents are invalid.')
       return
     }
     createClaimAttribute.mutate(
@@ -215,7 +215,7 @@ export function PolicyComposeDrawer({
   async function submitDeprecatePolicy() {
     setError(null)
     if (!selectedPolicyId) {
-      setError('请选择一个 active policy。')
+      setError('Select an active policy.')
       return
     }
     deprecatePolicy.mutate(selectedPolicyId, {

@@ -185,7 +185,7 @@ describe('workbench routes', () => {
     fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'wrong' } })
     fireEvent.click(screen.getByRole('button', { name: /Open Workbench/i }))
 
-    expect(await screen.findByText('用户名或密码不正确')).toBeInTheDocument()
+    expect(await screen.findByText('Incorrect username or password')).toBeInTheDocument()
   })
 
   it('toggles password visibility from the reveal button', async () => {

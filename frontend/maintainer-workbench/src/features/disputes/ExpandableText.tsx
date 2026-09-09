@@ -29,7 +29,7 @@ export function ExpandableText({
           aria-expanded={expanded}
           onClick={() => setExpanded((current) => !current)}
         >
-          {expanded ? '收起全文' : '展开全文'}
+          {expanded ? 'Show less' : 'Show more'}
         </button>
       ) : null}
     </span>

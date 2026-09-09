@@ -446,7 +446,7 @@ export function DisputesPage() {
     const trimmed = resolveNote.trim()
     setResolveError(null)
     if (!trimmed) {
-      setResolveError('Resolve Note 不能为空')
+      setResolveError('Resolve Note is required')
       return
     }
     resolveMutation.mutate({
