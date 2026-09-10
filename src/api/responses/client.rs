@@ -469,12 +469,10 @@ fn is_retryable(error: &ResponsesError) -> bool {
     }
     match error {
         ResponsesError::Http(error) => error.is_retryable(),
-        ResponsesError::Status { status, body } => {
-            *status == 429
-                || *status >= 500
-                // 已保存完整 replay 的请求也可能遭到此校验拒绝，随后原样回放成功。
-                // 仅消耗现有 HTTP retry 预算；不补造 reasoning，也不修改历史或切换 transport。
-                || (*status == 400 && is_replay_validation_rejection(body))
+        ResponsesError::Status { status, .. } => {
+            // 临时实验补丁：上游网关可能把可重试故障返回为任意 HTTP 400。
+            // 仅消耗现有 HTTP retry 预算；不补造 reasoning，也不修改历史或切换 transport。
+            *status == 400 || *status == 429 || *status >= 500
         }
         ResponsesError::StreamFailure { .. } => true,
         ResponsesError::Auth(_)
@@ -486,17 +484,6 @@ fn is_retryable(error: &ResponsesError) -> bool {
         | ResponsesError::RecoveryInterrupted
         | ResponsesError::RequestPreparation { .. } => false,
     }
-}
-
-fn is_replay_validation_rejection(body: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|value| {
-            value.get("error")?.get("message")?.as_str().map(|message| {
-                message == "The `reasoning_text` in the thinking mode must be passed back to the API."
-            })
-        })
-        .unwrap_or(false)
 }
 
 pub(crate) fn is_stream_recovery_failure(error: &ResponsesError) -> bool {
@@ -782,10 +769,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_does_not_retry_other_bad_requests() {
+    async fn client_retries_other_bad_requests_within_existing_budget() {
         for stream in [false, true] {
-            let body = json!({"error":{"message":"Invalid function arguments"}}).to_string();
-            let (endpoint, requests) = spawn_status_sequence(vec![(400, body)]).await;
+            // 网关返回的非 JSON 错误页同样适用，不能依赖某个固定文案。
+            let body = "Temporary gateway failure".to_owned();
+            let (endpoint, requests) = spawn_status_sequence(vec![(400, body); 3]).await;
             let client = ResponsesClient::new(
                 endpoint,
                 "test-key".into(),
@@ -800,7 +788,28 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(error, ResponsesError::Status { status: 400, .. }));
-            assert_eq!(requests.await.unwrap(), 1);
+            assert_eq!(requests.await.unwrap(), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn client_does_not_retry_other_client_errors() {
+        for stream in [false, true] {
+            for status in [401, 403, 404, 422] {
+                let body = json!({"error":{"message":"Request rejected"}}).to_string();
+                let (endpoint, requests) = spawn_status_sequence(vec![(status, body)]).await;
+                let client = ResponsesClient::new(
+                    endpoint,
+                    "test-key".into(),
+                    Duration::from_secs(5),
+                    2,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )
+                .unwrap();
+                assert!(client.send(&request(stream), &mut |_| {}).await.is_err());
+                assert_eq!(requests.await.unwrap(), 1);
+            }
         }
     }
 
