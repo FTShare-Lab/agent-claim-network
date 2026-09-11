@@ -5,7 +5,7 @@ Maintainer Workbench 是 ACN 团队服务的管理界面。它与 Maintainer HTT
 Workbench 面向 Maintainer 管理员，提供以下区域：
 
 - Overview：待处理事项、网络状态和近期活动
-- Knowledge Tree：按来源与影响方向浏览团队知识树
+- Claims Flow：按来源与影响方向浏览团队知识树
 - Claims / Agents：团队 Claim 镜像与 Agent 活动
 - Disputes / Policies：争议复审和治理消息
 - Sweep：Claim aging 检查和扫描历史
@@ -15,23 +15,23 @@ Workbench 面向 Maintainer 管理员，提供以下区域：
 
 ## 知识树
 
-侧栏 Claims 上方的 **Knowledge Tree**（`/app/knowledge-tree`）提供团队知识的树状视图：
+侧栏 Claims 上方的 **Claims Flow**（`/app/knowledge-tree`）提供团队知识的树状视图：
 
 1. 使用与 Claims 相同的标题、ID、正文、证据、scope、Agent、状态和争议筛选，再从结果中选择根节点。也可按知识类型选择 Policy 或属性更新建议。Agent 和争议筛选只匹配 Claim。
 2. 右上角切换 **Sources** 或 **Impact**：前驱递归沿 `source_claim_ids` 向上展示来源；后继反向查找引用该 ID 的 Claim，向下展示影响链。筛选只影响根节点候选列表，不裁剪已选节点的关系树。
-3. Claim 为绿色、Policy 为橙色、属性更新建议为紫色；节点仅显示标题，悬停可查看类型与 ID。连线箭头始终从来源指向派生知识。点击节点在右侧打开详情，可继续查看来源、返回上一节点，或以当前节点重新展开。
+3. Claim 为绿色、Policy Update 为橙色、Claim Attribute Update 为紫色；图例色块与节点使用相同底色和边框。节点显示标题，悬停可查看类型与 ID。卡片内部右上角用 16px 图标表示 Active（绿色 CircleCheck）、Stale（琥珀色 Clock3）或 Deprecated（灰色 CircleSlash）；存在未解决争议的 Claim 额外显示玫红色 MessageCircleWarning。状态图标提供悬停说明和无障碍标签，画布上方有对应英文图例，缺失来源不显示推测状态。连线箭头始终从来源指向派生知识；展开按钮避开箭头末端。点击节点在右侧打开详情，可继续查看来源、返回上一节点，或以当前节点重新展开。
 
 默认展示根节点与第一层关系，每个分支先显示最多 4 个直接关联节点。使用节点旁的 **+** 展开、**−** 折叠；数量按钮表示尚未显示的直接分支，每次再显示最多 4 个。同一知识经不同路径到达时会重复显示，各处的展开状态相互独立。点击标题仍打开详情。
 
-**Expand all** 可展开完整关系，超过 500 个显示节点时用 **Show more nodes** 分批继续；**Collapse all** 收回到根节点。路径内遇到循环引用时，保留重复节点并标明停止展开；缺失来源以灰色占位节点保留其引用关系。缩放围绕当前画布视口中心；**Fit** 查看整体，**Center root** 返回根节点。连续展开时，新一层节点及其分支按钮会一起进入可视区域。
+**Expand all** 可展开完整关系，超过 500 个显示节点时用 **Show more nodes** 分批继续；**Collapse all** 收回到根节点。路径内遇到循环引用时，保留重复节点并标明停止展开；缺失来源以灰色占位节点保留其引用关系。鼠标左键拖拽画布空白处可平移，节点和分支按钮保留点击操作，触屏保留原生滚动。缩放围绕当前画布视口中心；**Fit** 查看整体，**Center root** 返回根节点。连续展开时，新一层节点及其分支按钮会一起进入可视区域。
 
 底部同时显示 **displayed nodes**（当前可见节点数，含重复路径）与 **unique items**（当前可见节点按知识 ID 去重后的数量，包含缺失来源占位）。折叠的知识不计入这两个数，同名但不同 ID 的知识分别计数。
 
-根节点和方向保存在 URL 的 `root_id`、`direction` 参数中，支持刷新和浏览器前进后退。Claims 详情底部的 **View knowledge tree** 可直接打开该 Claim 的来源树。数据复用现有 Claims 和 Policies 接口；Policy 当前没有来源字段，因此其前驱视图仅包含自身。
+根节点和方向保存在 URL 的 `root_id`、`direction` 参数中，支持刷新和浏览器前进后退。Claims 详情底部的 **View claims flow** 可直接打开该 Claim 的来源树。数据复用现有 Claims 和 Policies 接口；Policy 当前没有来源字段，因此其前驱视图仅包含自身。
 
 ### 本地复杂树验收
 
-复杂案例只用于本地验收和自动化测试，位于 `src/test/knowledgePreview.ts`，包含 627 条 Claim 和 5 条 Policy。GitHub Pages 继续使用 `src/lib/demoData.ts` 原有的 6 条 Claim 和 3 条 Policy，公开构建不包含这些压力测试案例。
+复杂案例只用于本地验收和自动化测试，位于 `src/test/knowledgePreview.ts`，包含 630 条 Claim、6 条 Policy 和 3 条 Dispute。未解决争议分别关联 active、stale、deprecated Claim，已解决争议用于验证历史争议不会显示 Disputed 图标。GitHub Pages 继续使用 `src/lib/demoData.ts` 原有的 6 条 Claim 和 3 条 Policy，公开构建不包含这些压力测试案例。
 
 在当前目录运行：
 
@@ -47,6 +47,7 @@ npm run preview:knowledge -- 18063
 
 | 案例 | root_id | 模式 | 完整树节点数 | 验收重点 |
 | --- | --- | --- | --- | --- |
+| 类型与状态验收 | `claim_c1000fa0` | Sources | 8 | 默认 5 个节点即覆盖全部图例颜色；Expand all 展示三种 Claim 状态各自与争议图标并列的效果 |
 | 复杂发布决策 | `claim_c1000014` | Sources | 145 | 23 个不同知识对象、9 层引用、共享证据、历史规则与属性建议 |
 | 边界案例 | `claim_c1000064` | Sources | 20 | 自引用、三节点循环、缺失 Claim/Policy、重复来源、同名不同 ID、长标题、文本转义 |
 | 独立观测 | `claim_c100006f` | Sources / Impact | 1 | 无来源也无影响的独立节点 |

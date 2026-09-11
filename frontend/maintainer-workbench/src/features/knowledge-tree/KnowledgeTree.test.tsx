@@ -14,7 +14,7 @@ afterEach(cleanup)
 describe('knowledge tree branch controls', () => {
   it('starts a wide tree with four branches and expands incrementally or fully', () => {
     render(<KnowledgeTree index={index} rootId={knowledgePreviewRoots.wide} direction="successors" onSelect={vi.fn()} />)
-    const canvas = within(screen.getByRole('region', { name: 'Knowledge tree canvas' }))
+    const canvas = within(screen.getByRole('region', { name: 'Claims flow canvas' }))
     const titleButtons = () => canvas.getAllByRole('button', { pressed: false })
     expect(titleButtons()).toHaveLength(5)
     expect(screen.getByText('5 displayed nodes · 5 unique items')).toBeInTheDocument()
@@ -36,7 +36,7 @@ describe('knowledge tree branch controls', () => {
 
   it('expands repeated lattice paths across multiple batches and resets when re-rooted', () => {
     const view = render(<KnowledgeTree key="lattice" index={index} rootId={knowledgePreviewRoots.lattice} direction="predecessors" onSelect={vi.fn()} />)
-    const summary = within(screen.getByRole('group', { name: 'Tree summary' }))
+    const summary = within(screen.getByRole('group', { name: 'Flow summary' }))
     expect(screen.getByText('3 displayed nodes · 3 unique items')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Expand all' }))
     for (const count of [1000, 1500, 1535]) {
@@ -60,10 +60,10 @@ describe('knowledge tree branch controls', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Expand branches for Verified replay' }))
     expect(screen.getByText('6 displayed nodes · 5 unique items')).toBeInTheDocument()
     fireEvent.click(screen.getAllByRole('button', { name: 'Expand branches for Shared evidence' })[1])
-    expect(screen.getAllByRole('button', { name: 'Policy: Reliable execution' })).toHaveLength(1)
+    expect(screen.getAllByRole('button', { name: 'Policy Update: Reliable execution' })).toHaveLength(1)
     expect(screen.getByText('7 displayed nodes · 6 unique items')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Collapse branches for Verified recovery' }))
-    expect(screen.getAllByRole('button', { name: 'Policy: Reliable execution' })).toHaveLength(1)
+    expect(screen.getAllByRole('button', { name: 'Policy Update: Reliable execution' })).toHaveLength(1)
     expect(screen.getByText('6 displayed nodes · 6 unique items')).toBeInTheDocument()
     expect(onSelect).toHaveBeenCalledTimes(1)
   })
@@ -78,7 +78,7 @@ describe('knowledge tree branch controls', () => {
 
   it('fits below 20 percent and restores the overview when Fit is clicked again', () => {
     render(<KnowledgeTree index={index} rootId={knowledgePreviewRoots.release} direction="predecessors" onSelect={vi.fn()} />)
-    const canvas = screen.getByRole('region', { name: 'Knowledge tree canvas' })
+    const canvas = screen.getByRole('region', { name: 'Claims flow canvas' })
     Object.defineProperties(canvas, { clientWidth: { value: 720 }, clientHeight: { value: 480 } })
     fireEvent.click(screen.getByRole('button', { name: 'Expand all' }))
     fireEvent.click(screen.getByRole('button', { name: 'Fit' }))
@@ -95,7 +95,7 @@ describe('knowledge tree branch controls', () => {
     const rootId = direction === 'predecessors' ? 'node_0' : 'node_4'
     const childId = direction === 'predecessors' ? 'node_1' : 'node_3'
     render(<KnowledgeTree index={indexKnowledge(claims, [])} rootId={rootId} direction={direction} onSelect={vi.fn()} />)
-    const canvas = screen.getByRole('region', { name: 'Knowledge tree canvas' })
+    const canvas = screen.getByRole('region', { name: 'Claims flow canvas' })
     Object.defineProperties(canvas, { clientWidth: { value: 720 }, clientHeight: { value: 360 } })
     canvas.scrollTop = 0
     fireEvent.click(screen.getByRole('button', { name: `Expand branches for ${childId}` }))
@@ -108,7 +108,7 @@ describe('knowledge tree branch controls', () => {
 
   it('keeps the current canvas center when zooming a distant branch', () => {
     render(<KnowledgeTree index={index} rootId={knowledgePreviewRoots.release} direction="predecessors" onSelect={vi.fn()} />)
-    const canvas = screen.getByRole('region', { name: 'Knowledge tree canvas' })
+    const canvas = screen.getByRole('region', { name: 'Claims flow canvas' })
     Object.defineProperties(canvas, { clientWidth: { value: 720 }, clientHeight: { value: 480 } })
     fireEvent.click(screen.getByRole('button', { name: 'Expand all' }))
     canvas.scrollLeft = 2000

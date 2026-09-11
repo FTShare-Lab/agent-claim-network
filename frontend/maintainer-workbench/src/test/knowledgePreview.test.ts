@@ -9,13 +9,26 @@ const index = indexKnowledge(sample.claims, sample.policies)
 
 describe('complex knowledge preview data', () => {
   it('adds unique records with valid IDs and only the two intentional missing references', () => {
-    expect(sample.claims).toHaveLength(627)
-    expect(sample.policies).toHaveLength(5)
+    expect(sample.claims).toHaveLength(630)
+    expect(sample.policies).toHaveLength(6)
     const ids = [...sample.claims.map((view) => view.claim.id), ...sample.policies.map((policy) => policy.id)]
     expect(new Set(ids).size).toBe(ids.length)
     expect(ids.every((id) => /^(claim|policy)_[0-9a-f]{8}$/.test(id))).toBe(true)
     const missing = new Set(sample.claims.flatMap((view) => view.claim.source_claim_ids).filter((id) => !ids.includes(id)))
     expect(missing).toEqual(new Set(missingPreviewSources))
+  })
+
+  it('exposes every legend color on the status review root without expanding a large tree', () => {
+    const initial = buildKnowledgeTree(index, knowledgePreviewRoots.statuses, 'predecessors', 500, { expandAll: false, childLimits: new Map() })
+    expect(initial.nodes).toHaveLength(5)
+    expect(new Set(initial.nodes.map((node) => node.knowledge.kind))).toEqual(new Set(['claim', 'policy_update', 'claim_attribute_update', 'missing']))
+    const statuses = initial.nodes.flatMap(({ knowledge }) => knowledge.kind === 'claim' ? [knowledge.view.claim.status] : knowledge.kind === 'missing' ? [] : [knowledge.policy.status])
+    expect(new Set(statuses)).toEqual(new Set(['active', 'stale', 'deprecated']))
+    expect(initial.nodes.some(({ knowledge }) => knowledge.kind === 'claim' && knowledge.view.open_dispute_ids.length > 0)).toBe(true)
+    const full = buildKnowledgeTree(index, knowledgePreviewRoots.statuses, 'predecessors')
+    expect(full.nodes).toHaveLength(8)
+    const disputed = full.nodes.flatMap(({ knowledge }) => knowledge.kind === 'claim' && knowledge.view.open_dispute_ids.length > 0 ? [knowledge.view.claim.status] : [])
+    expect(new Set(disputed)).toEqual(new Set(['active', 'stale', 'deprecated']))
   })
 
   it('expands the release decision across governance types and shared evidence', () => {
@@ -26,6 +39,19 @@ describe('complex knowledge preview data', () => {
     expect(new Set(tree.nodes.map((node) => node.knowledge.kind))).toEqual(new Set(['claim', 'policy_update', 'claim_attribute_update']))
     expect(tree.nodes.some((node) => node.cycle)).toBe(false)
     expect(tree.omitted).toBe(0)
+  })
+
+  it('covers each lifecycle status with an open dispute and keeps resolved disputes separate', () => {
+    const disputed = sample.claims.filter((view) => view.open_dispute_ids.length > 0)
+    expect(new Set(disputed.map((view) => view.claim.status))).toEqual(new Set(['active', 'stale', 'deprecated']))
+    const release = sample.claims.find((view) => view.claim.id === knowledgePreviewRoots.release)!
+    expect(release.open_dispute_ids).toHaveLength(0)
+    expect(release.resolved_dispute_ids).toHaveLength(1)
+    for (const view of sample.claims) {
+      for (const status of ['open', 'resolved'] as const) {
+        expect(view[`${status}_dispute_ids`]).toEqual(sample.disputes.filter((dispute) => dispute.status === status && dispute.claims.includes(view.claim.id)).map((dispute) => dispute.id))
+      }
+    }
   })
 
   it('terminates both cycle types and keeps missing sources and same-title claims separate', () => {

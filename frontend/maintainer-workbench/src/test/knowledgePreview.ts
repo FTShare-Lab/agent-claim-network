@@ -1,5 +1,6 @@
 // 仅供本地 Maintainer 验收和自动化测试的合成案例，不进入公开演示构建。
 import type { Claim, ClaimView } from '../features/claims/types'
+import type { Dispute } from '../features/disputes/types'
 import type { Policy } from '../features/overview/types'
 
 function claimId(number: number) {
@@ -12,9 +13,11 @@ const policyIds = {
   review: 'policy_c2000003',
   wide: 'policy_c2000004',
   lattice: 'policy_c2000005',
+  retiredReview: 'policy_c2000006',
 }
 
 export const knowledgePreviewRoots = {
+  statuses: claimId(4000),
   release: claimId(20),
   boundaries: claimId(100),
   isolated: claimId(111),
@@ -26,7 +29,7 @@ export const knowledgePreviewRoots = {
 
 export const missingPreviewSources = ['claim_c1ffff01', 'policy_c2ffff01']
 
-export function createKnowledgePreview(now: number): { claims: ClaimView[]; policies: Policy[] } {
+export function createKnowledgePreview(now: number): { claims: ClaimView[]; policies: Policy[]; disputes: Dispute[] } {
   const claims: ClaimView[] = []
   const timestamp = (minutesAgo: number) => new Date(now - minutesAgo * 60_000).toISOString()
   function add(number: number, name: string, sources: string[], scope: string, statement: string, patch: Partial<Claim> = {}) {
@@ -51,6 +54,7 @@ export function createKnowledgePreview(now: number): { claims: ClaimView[]; poli
     policy(policyIds.review, '属性建议：重新核验迁移证据', '建议将旧迁移结论标记为待复核，并结合新的故障注入结果重新评估。', 'demo/knowledge/release', { message_type: 'claim_attribute_update', target_agents: ['research-agent'] }),
     policy(policyIds.wide, '宽树案例：512 条独立采纳路径', '当大量知识引用同一条规范时，验证分批展开与横向浏览是否完整。', 'demo/knowledge/wide'),
     policy(policyIds.lattice, '交叉引用规范：跨层共享证据', '每层的两条知识均引用上一层的两条知识，保留所有推导路径。', 'demo/knowledge/lattice'),
+    policy(policyIds.retiredReview, '已废弃属性建议：沿用旧验收标准', '该建议已废弃，用于核对紫色知识底色与灰色状态图标可以同时存在。', 'demo/knowledge/statuses', { message_type: 'claim_attribute_update', status: 'deprecated' }),
   ]
 
   const release = 'demo/knowledge/release'
@@ -104,5 +108,32 @@ export function createKnowledgePreview(now: number): { claims: ClaimView[]; poli
     previous = current
   }
   add(3100, '交叉引用压力案例：九层共享来源', previous, 'demo/knowledge/lattice', '19 条知识和 1 条规范展开为 1535 个树节点，用于验证重复路径与分批展开。', { created_at: timestamp(15) })
-  return { claims, policies }
+
+  const statuses = 'demo/knowledge/statuses'
+  // 默认首层的五个节点就覆盖全部类型色与状态色；完整展开也保持小规模。
+  add(4000, '类型与状态验收：全部图例', [claimId(4001), policyIds.provenance, policyIds.retiredReview, missingPreviewSources[0]], statuses, '直接打开即可核对全部图例颜色：根节点为生效且有争议的 Claim，来源包含待复核 Claim、生效规范、已废弃属性建议和缺失来源。点击 Expand all 可查看三种 Claim 状态与争议图标的组合，完整树只有 8 个节点。', { created_at: timestamp(1) })
+  add(4001, '待复核结论：证据存在争议', [claimId(4002), policyIds.retired], statuses, '绿色 Claim 底色，右上角同时显示琥珀色 Stale 和玫红色 Disputed 图标。', { status: 'stale' })
+  add(4002, '已废弃结论：争议仍未解决', [policyIds.review], statuses, '绿色 Claim 底色，右上角同时显示灰色 Deprecated 和玫红色 Disputed 图标；废弃不代表争议已解决。', { status: 'deprecated' })
+  const disputes: Dispute[] = [
+    {
+      id: 'dispute_c3000001', name: '迁移证据适用范围待核验', reporter_agent_id: 'research-agent',
+      claims: [claimId(4), claimId(11), claimId(14)], status: 'open', created_at: timestamp(4),
+      summary: '合成争议：历史方案、待复核证据与候选版本结论之间的适用范围尚未确认，用于验证三种状态均可独立叠加争议图标。',
+    },
+    {
+      id: 'dispute_c3000002', name: '发布验收范围已澄清', reporter_agent_id: 'ops-agent',
+      claims: [claimId(19), claimId(20)], status: 'resolved', created_at: timestamp(3), resolved_at: timestamp(2),
+      summary: '合成历史争议：验收结论的范围已澄清，已解决记录不应显示未解决争议图标。',
+    },
+    {
+      id: 'dispute_c3000003', name: '状态验收：三种生命周期的未解决争议', reporter_agent_id: 'research-agent',
+      claims: [claimId(4000), claimId(4001), claimId(4002)], status: 'open', created_at: timestamp(0),
+      summary: '仅供本地验收：在一棵小树中核对 Active、Stale、Deprecated 均可与 Disputed 并列显示，且不会改变知识类型底色。',
+    },
+  ]
+  for (const view of claims) {
+    view.open_dispute_ids = disputes.filter((dispute) => dispute.status === 'open' && dispute.claims.includes(view.claim.id)).map((dispute) => dispute.id)
+    view.resolved_dispute_ids = disputes.filter((dispute) => dispute.status === 'resolved' && dispute.claims.includes(view.claim.id)).map((dispute) => dispute.id)
+  }
+  return { claims, policies, disputes }
 }

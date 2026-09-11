@@ -65,7 +65,7 @@ export function KnowledgeTreePage() {
 
   const error = claims.error || policies.error
   return (
-    <PageContainer title="Knowledge Tree" subtitle="Explore where team knowledge comes from and how it shapes later claims."
+    <PageContainer title="Claims Flow" subtitle="Explore where team knowledge comes from and how it shapes later claims."
       actions={
         <div role="group" aria-label="Traversal direction" className="inline-flex rounded-lg border border-slate-200 bg-white p-1 text-sm">
           {(['predecessors', 'successors'] as const).map((value) => (
@@ -83,8 +83,8 @@ export function KnowledgeTreePage() {
           <select className="rounded-md border border-slate-200 bg-white px-2.5 py-1.5" value={kind} onChange={(event) => { setKind(event.target.value); setPage(1) }}>
             <option value="all">All types</option>
             <option value="claim">Claim</option>
-            <option value="policy_update">Policy</option>
-            <option value="claim_attribute_update">Attribute suggestion</option>
+            <option value="policy_update">{knowledgeStyles.policy_update.label}</option>
+            <option value="claim_attribute_update">{knowledgeStyles.claim_attribute_update.label}</option>
           </select>
         </label>
         <label className="inline-flex items-center gap-2"><input type="checkbox" checked={filters.onlyDisputed} onChange={(event) => changeFilters({ onlyDisputed: event.target.checked })} />Only disputed claims</label>
@@ -106,7 +106,7 @@ export function KnowledgeTreePage() {
                 <button key={entry.id} type="button" aria-pressed={rootId === entry.id} onClick={() => selectRoot(entry.id)}
                   className={cn('block w-full border-b border-slate-100 px-4 py-3 text-left last:border-b-0 hover:bg-slate-50', rootId === entry.id && 'bg-[var(--accent-weak)]')}
                 >
-                  <span className="mb-1 flex items-center gap-1.5 text-[11px] text-slate-500"><span className={cn('h-2 w-2 rounded-full', knowledgeStyles[entry.kind].dot)} />{knowledgeStyles[entry.kind].label}</span>
+                  <span className="mb-1 flex items-center gap-1.5 text-[11px] text-slate-500"><span className={cn('h-3 w-3 shrink-0 rounded border', knowledgeStyles[entry.kind].className)} />{knowledgeStyles[entry.kind].label}</span>
                   <span className="block text-sm font-medium text-slate-900 [overflow-wrap:anywhere]">{entry.name}</span>
                   <span className="mt-1 block truncate font-mono text-[10px] text-slate-500" title={entry.id}>{entry.id}</span>
                 </button>
@@ -129,7 +129,7 @@ export function KnowledgeTreePage() {
                 <KnowledgeTree key={`${rootId}:${direction}`} index={index} rootId={rootId} direction={direction} selectedId={selectedId} onSelect={openKnowledge} />
               </>
             ) : <div role="status" className="flex min-h-96 items-center justify-center rounded-xl border border-dashed border-slate-300 bg-white p-8 text-center text-sm text-slate-500">
-              {rootId ? 'The selected knowledge is unavailable. Choose another root from the list.' : 'Choose a claim, policy, or attribute suggestion to explore its knowledge tree.'}
+              {rootId ? 'The selected knowledge is unavailable. Choose another root from the list.' : 'Choose a Claim, Policy Update, or Claim Attribute Update to explore its flow.'}
             </div>}
           </div>
         </div>

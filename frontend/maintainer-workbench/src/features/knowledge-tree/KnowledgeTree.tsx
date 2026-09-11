@@ -2,6 +2,8 @@
 import { useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 import { knowledgeStyles } from './styles'
+import { KnowledgeStatusIcons, KnowledgeStatusLegend } from './KnowledgeStatus'
+import { useCanvasPan } from './useCanvasPan'
 import { cn } from '../../lib/utils'
 import { BRANCH_BATCH_SIZE, buildKnowledgeTree, NODE_HEIGHT, NODE_WIDTH, VERTICAL_PADDING, type Direction, type Knowledge, type KnowledgeIndex, type TreeExpansion, type TreeNode } from './tree'
 
@@ -25,6 +27,7 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
   const [expansion, setExpansion] = useState<TreeExpansion>(() => ({ expandAll: false, childLimits: new Map() }))
   const [zoom, setZoom] = useState(1)
   const viewport = useRef<HTMLDivElement>(null)
+  const { isPanning, ...panHandlers } = useCanvasPan()
   const branchAnchor = useRef<{ path: string; x: number; y: number; reveal: boolean } | null>(null)
   const zoomAnchor = useRef<{ x: number; y: number } | null>(null)
   const markerId = useId()
@@ -91,12 +94,15 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
   }
 
   return (
-    <section aria-label="Knowledge tree" className="overflow-hidden rounded-xl border border-slate-200 bg-white">
+    <section aria-label="Claims flow" className="overflow-hidden rounded-xl border border-slate-200 bg-white">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-slate-600">
-          {Object.entries(knowledgeStyles).map(([kind, style]) => (
-            <span key={kind} className="inline-flex items-center gap-1.5"><span className={cn('h-2.5 w-2.5 rounded-full', style.dot)} />{style.label}</span>
-          ))}
+        <div className="space-y-2">
+          <div role="group" aria-label="Knowledge type legend" className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-slate-600">
+            {Object.entries(knowledgeStyles).map(([kind, style]) => (
+              <span key={kind} className="inline-flex items-center gap-1.5"><span className={cn('h-3 w-3 shrink-0 rounded border', style.className)} />{style.label}</span>
+            ))}
+          </div>
+          <KnowledgeStatusLegend />
         </div>
         <div className="flex items-center gap-1 text-xs text-slate-600">
           <button type="button" aria-label="Zoom out" disabled={zoom <= 0.2} className="rounded px-2 py-1.5 hover:bg-slate-100 disabled:opacity-40" onClick={() => changeZoom(Math.max(0.2, zoom - 0.2))}>−</button>
@@ -114,28 +120,30 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
         </div>
       </div>
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-2 text-xs text-slate-500">
-        <p>Use + to expand branches and − to collapse. Click a title for details.</p>
+        <p>Drag the canvas to pan. Use + to expand and − to collapse. Click a node for details.</p>
         <div className="flex gap-3">
           <button type="button" disabled={fullyExpanded || (expansion.expandAll && expansion.childLimits.size === 0)} className="font-medium text-blue-700 disabled:text-slate-400" onClick={() => setExpansion({ expandAll: true, childLimits: new Map() })}>Expand all</button>
           <button type="button" disabled={tree.nodes.length <= 1} className="font-medium text-blue-700 disabled:text-slate-400" onClick={() => { setExpansion({ expandAll: false, childLimits: new Map([[encodeURIComponent(rootId), 0]]) }); setBudget(500) }}>Collapse all</button>
         </div>
       </div>
-      <div ref={viewport} tabIndex={0} role="region" aria-label="Knowledge tree canvas" className="h-[560px] max-h-[65vh] min-h-72 overflow-auto overscroll-contain bg-[radial-gradient(#d9dce5_1px,transparent_1px)] bg-[size:20px_20px]">
+      <div ref={viewport} tabIndex={0} role="region" aria-label="Claims flow canvas" {...panHandlers} className={cn('h-[560px] max-h-[65vh] min-h-72 overflow-auto overscroll-contain bg-[radial-gradient(#d9dce5_1px,transparent_1px)] bg-[size:20px_20px]', isPanning ? 'cursor-grabbing select-none' : 'cursor-grab')}>
         <div style={{ width: tree.width * zoom, height: tree.height * zoom, minWidth: '100%' }}>
           <div className="mx-auto overflow-hidden" style={{ width: tree.width * zoom, height: tree.height * zoom }}>
             <div className="relative origin-top-left" style={{ width: tree.width, height: tree.height, transform: `scale(${zoom})` }}>
               <svg aria-hidden="true" width={tree.width} height={tree.height} className="pointer-events-none absolute inset-0">
-                <defs><marker id={markerId} viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8" /></marker></defs>
+                <defs><marker id={markerId} viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b" /></marker></defs>
                 {tree.nodes.filter((node) => node.parent !== null).map((node) => {
                   const parent = tree.nodes[node.parent!]
                   const source = direction === 'predecessors' ? node : parent
                   const target = direction === 'predecessors' ? parent : node
                   const x1 = source.x + NODE_WIDTH / 2
-                  const y1 = source.y + NODE_HEIGHT
+                  const y1 = source.y + NODE_HEIGHT + 4
                   const x2 = target.x + NODE_WIDTH / 2
-                  const y2 = target.y
-                  const midY = (y1 + y2) / 2
-                  return <path key={node.path} data-source={source.knowledge.id} data-target={target.knowledge.id} d={`M ${x1} ${y1} C ${x1} ${midY}, ${x2} ${midY}, ${x2} ${y2}`} fill="none" stroke="#94a3b8" strokeWidth="1.5" markerEnd={`url(#${markerId})`} />
+                  // 末端保留直线与根节点外圈间距，箭头在两种模式下都指向派生知识。
+                  const y2 = target.y - 6
+                  const approachY = y2 - 12
+                  const midY = (y1 + approachY) / 2
+                  return <path key={node.path} data-source={source.knowledge.id} data-target={target.knowledge.id} d={`M ${x1} ${y1} C ${x1} ${midY}, ${x2} ${midY}, ${x2} ${approachY} L ${x2} ${y2}`} fill="none" stroke="#94a3b8" strokeWidth="1.5" markerEnd={`url(#${markerId})`} />
                 })}
               </svg>
               {tree.nodes.map((node) => {
@@ -148,13 +156,14 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
                       aria-pressed={selectedId === node.knowledge.id}
                       title={`${node.knowledge.name} · ${style.label} · ${node.knowledge.id}${node.cycle ? ' · Cycle ends here' : ''}`}
                       onClick={() => onSelect(node.knowledge)}
-                      className={cn('flex w-full items-center justify-center rounded-lg border px-3 text-center text-sm font-semibold shadow-sm transition-shadow hover:shadow-md focus-visible:outline-offset-4', style.className, node.key === 0 && 'ring-2 ring-slate-400 ring-offset-2', selectedId === node.knowledge.id && 'outline-2 outline-offset-2 outline-[var(--accent)]')}
+                      className={cn('relative flex w-full cursor-pointer items-center justify-center rounded-lg border px-3 text-center text-sm font-semibold shadow-sm transition-shadow hover:shadow-md focus-visible:outline-offset-4', node.knowledge.kind !== 'missing' && 'pt-6 pb-2', style.className, node.key === 0 && 'ring-2 ring-slate-400 ring-offset-2', selectedId === node.knowledge.id && 'outline-2 outline-offset-2 outline-[var(--accent)]')}
                       style={{ height: NODE_HEIGHT }}
                     >
+                      <KnowledgeStatusIcons knowledge={node.knowledge} />
                       <span className="line-clamp-2 [overflow-wrap:anywhere]">{node.knowledge.name}</span>
                     </button>
                     {node.childCount > 0 ? (
-                      <div className="absolute left-1/2 flex -translate-x-1/2 items-center gap-1" style={{ top: direction === 'predecessors' ? -30 : NODE_HEIGHT + 6 }}>
+                      <div className="absolute left-1/2 ml-4 flex cursor-pointer items-center gap-1" style={{ top: direction === 'predecessors' ? -30 : NODE_HEIGHT + 6 }}>
                         <button type="button" aria-expanded={node.expanded}
                           aria-label={`${node.expanded ? 'Collapse' : 'Expand'} branches for ${node.knowledge.name}`}
                           title={node.expanded ? 'Collapse this branch' : `Show ${Math.min(BRANCH_BATCH_SIZE, node.childCount)} of ${node.childCount} branches`}
@@ -178,7 +187,7 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
           </div>
         </div>
       </div>
-      <div role="group" aria-label="Tree summary" className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200 px-4 py-3 text-xs text-slate-500">
+      <div role="group" aria-label="Flow summary" className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200 px-4 py-3 text-xs text-slate-500">
         <div>
           <p className="font-medium text-slate-700" aria-live="polite">{tree.nodes.length} displayed {tree.nodes.length === 1 ? 'node' : 'nodes'} · {tree.uniqueCount} unique {tree.uniqueCount === 1 ? 'item' : 'items'}</p>
           <p className="mt-1">Counts cover visible nodes. Arrows point from source to derived knowledge.</p>

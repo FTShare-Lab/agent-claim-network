@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { renderWorkbenchRoute } from '../app/test-utils'
 import { knowledgeClaims, knowledgePolicies, makeClaim } from '../test/knowledgeFixtures'
 
-describe('Knowledge Tree page', () => {
+describe('Claims Flow page', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input)
@@ -23,16 +23,16 @@ describe('Knowledge Tree page', () => {
 
   it('requires an explicit root and keeps complete ancestry when search filters hide its sources', async () => {
     render(renderWorkbenchRoute('/knowledge-tree'))
-    expect(await screen.findByText('Choose a claim, policy, or attribute suggestion to explore its knowledge tree.')).toBeInTheDocument()
+    expect(await screen.findByText('Choose a Claim, Policy Update, or Claim Attribute Update to explore its flow.')).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('Search'), { target: { value: 'Release readiness evidence' } })
     const choices = within(screen.getByRole('region', { name: 'Choose root knowledge' }))
     expect(choices.queryByRole('button', { name: /Shared evidence/ })).not.toBeInTheDocument()
     fireEvent.click(choices.getByRole('button', { name: /Release readiness/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Expand all' }))
-    const canvas = within(screen.getByRole('region', { name: 'Knowledge tree canvas' }))
+    const canvas = within(screen.getByRole('region', { name: 'Claims flow canvas' }))
     expect(canvas.getAllByRole('button', { name: 'Claim: Shared evidence' })).toHaveLength(2)
-    expect(canvas.getAllByRole('button', { name: 'Policy: Reliable execution' })).toHaveLength(2)
-    expect(canvas.getByRole('button', { name: 'Attribute suggestion: Review old evidence' })).toBeInTheDocument()
+    expect(canvas.getAllByRole('button', { name: 'Policy Update: Reliable execution' })).toHaveLength(2)
+    expect(canvas.getByRole('button', { name: 'Claim Attribute Update: Review old evidence' })).toBeInTheDocument()
   })
 
   it('opens claim and policy details in place, follows sources, and supports back and re-rooting', async () => {
@@ -49,10 +49,10 @@ describe('Knowledge Tree page', () => {
     expect(within(screen.getByRole('dialog')).getByText('Release readiness statement')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Close detail drawer' }))
     fireEvent.click(screen.getByRole('button', { name: 'Expand all' }))
-    fireEvent.click(screen.getAllByRole('button', { name: 'Policy: Reliable execution' })[0])
+    fireEvent.click(screen.getAllByRole('button', { name: 'Policy Update: Reliable execution' })[0])
     fireEvent.click(screen.getByRole('button', { name: 'Explore from this node' }))
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
-    expect(await screen.findByRole('button', { name: 'Policy: Reliable execution (root)' })).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: 'Policy Update: Reliable execution (root)' })).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Impact' }))
     fireEvent.click(screen.getByRole('button', { name: 'Expand all' }))
     expect(await screen.findAllByRole('button', { name: 'Claim: Release readiness' })).toHaveLength(2)
@@ -60,13 +60,13 @@ describe('Knowledge Tree page', () => {
 
   it('opens a deep linked policy impact tree and keeps arrow semantics when direction changes', async () => {
     render(renderWorkbenchRoute('/knowledge-tree?root_id=policy_00000001&direction=successors'))
-    const button = await screen.findByRole('button', { name: 'Policy: Reliable execution (root)' })
+    const button = await screen.findByRole('button', { name: 'Policy Update: Reliable execution (root)' })
     expect(button).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Impact' })).toHaveAttribute('aria-pressed', 'true')
-    const canvas = screen.getByRole('region', { name: 'Knowledge tree canvas' })
+    const canvas = screen.getByRole('region', { name: 'Claims flow canvas' })
     expect(canvas.querySelector('path[data-source="policy_00000001"][data-target="claim_00000004"]')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Sources' }))
-    await waitFor(() => expect(within(screen.getByRole('region', { name: 'Knowledge tree canvas' })).getAllByRole('button')).toHaveLength(1))
+    await waitFor(() => expect(within(screen.getByRole('region', { name: 'Claims flow canvas' })).getAllByRole('button')).toHaveLength(1))
   })
 
   it('starts each detail at the top when following a source or returning to the previous node', async () => {
@@ -107,13 +107,13 @@ describe('Knowledge Tree page', () => {
       ? new Response('Unavailable', { status: 503 }) : successfulFetch(input)))
     render(renderWorkbenchRoute('/knowledge-tree?root_id=claim_00000001'))
     expect(await screen.findByRole('alert')).toHaveTextContent('Team knowledge could not be loaded.')
-    expect(screen.queryByRole('region', { name: 'Knowledge tree canvas' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('region', { name: 'Claims flow canvas' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument()
   })
 
   it('links from the existing claim inspector into its tree', async () => {
     render(renderWorkbenchRoute('/claims?claim_id=claim_00000001'))
-    fireEvent.click(await screen.findByRole('button', { name: 'View knowledge tree' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'View claims flow' }))
     expect(await screen.findByRole('button', { name: 'Claim: Release readiness (root)' })).toBeInTheDocument()
   })
 
@@ -142,7 +142,7 @@ describe('Knowledge Tree page', () => {
   it('reports an absent deep linked root without silently selecting a different claim', async () => {
     render(renderWorkbenchRoute('/knowledge-tree?root_id=claim_absent'))
     expect(await screen.findByText('The selected knowledge is unavailable. Choose another root from the list.')).toBeInTheDocument()
-    expect(screen.queryByRole('region', { name: 'Knowledge tree canvas' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('region', { name: 'Claims flow canvas' })).not.toBeInTheDocument()
   })
 
   it('selects roots beyond the first page and resets pagination when filtering', async () => {
@@ -154,7 +154,7 @@ describe('Knowledge Tree page', () => {
     const choices = within(screen.getByRole('region', { name: 'Choose root knowledge' }))
     const candidate = choices.getAllByRole('button').find((button) => button.textContent?.includes('Candidate'))!
     fireEvent.click(candidate)
-    expect(await screen.findByRole('region', { name: 'Knowledge tree canvas' })).toBeInTheDocument()
+    expect(await screen.findByRole('region', { name: 'Claims flow canvas' })).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('Search'), { target: { value: 'Candidate 0' } })
     expect(choices.getByRole('button', { name: /Candidate 0/ })).toBeInTheDocument()
     expect(choices.queryByRole('button', { name: 'Next roots' })).not.toBeInTheDocument()

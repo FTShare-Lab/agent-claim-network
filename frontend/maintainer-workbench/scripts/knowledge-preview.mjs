@@ -27,6 +27,9 @@ for (const { claim } of sample.claims) {
 for (const policy of sample.policies) {
   writeFixture(join(teamRoot, 'maintainer', 'policies', `${policy.id}.yaml`), policy)
 }
+for (const dispute of sample.disputes) {
+  writeFixture(join(teamRoot, 'maintainer', 'disputes', `${dispute.id}.yaml`), dispute)
+}
 const configPath = join(previewDir, 'config.toml')
 writeFileSync(configPath, `[storage]
 acn_home = ${JSON.stringify(relative(repoRoot, previewDir))}
@@ -41,8 +44,9 @@ frontend_dist_dir = "frontend/maintainer-workbench/dist"
 enabled = false
 `, { flag: 'wx' })
 
-console.log(`Local test data: ${relative(repoRoot, previewDir)} (${sample.claims.length} claims, ${sample.policies.length} policies)`)
-console.log(`Knowledge tree: http://127.0.0.1:${port}/app/knowledge-tree?root_id=${knowledgePreviewRoots.release}`)
+console.log(`Local test data: ${relative(repoRoot, previewDir)} (${sample.claims.length} claims, ${sample.policies.length} policies, ${sample.disputes.length} disputes)`)
+console.log(`Type and status review: http://127.0.0.1:${port}/app/knowledge-tree?root_id=${knowledgePreviewRoots.statuses}`)
+console.log(`Complex claims flow: http://127.0.0.1:${port}/app/knowledge-tree?root_id=${knowledgePreviewRoots.release}`)
 const result = spawnSync('cargo', ['run', '--bin', 'acn-maintainer', '--', '--config', configPath], {
   cwd: repoRoot,
   stdio: 'inherit',

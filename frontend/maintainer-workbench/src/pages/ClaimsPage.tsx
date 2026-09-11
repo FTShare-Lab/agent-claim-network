@@ -233,7 +233,7 @@ export function ClaimsPage() {
 
       <DetailDrawer
         footer={selectedClaim.data ? (
-          <button type="button" className="text-sm font-semibold text-blue-700" onClick={() => navigate(`/knowledge-tree?root_id=${encodeURIComponent(selectedClaim.data.claim.id)}`)}>View knowledge tree</button>
+          <button type="button" className="text-sm font-semibold text-blue-700" onClick={() => navigate(`/knowledge-tree?root_id=${encodeURIComponent(selectedClaim.data.claim.id)}`)}>View claims flow</button>
         ) : undefined}
         modal={false}
         open={Boolean(effectiveDrawerState?.current && (selectedClaim.data || selectedDispute))}
