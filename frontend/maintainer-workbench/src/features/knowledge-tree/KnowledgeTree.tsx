@@ -16,6 +16,12 @@ function scrollToRoot(element: HTMLDivElement | null, tree: ReturnType<typeof bu
   element.scrollTop = Math.min(maxTop, Math.max(0, (root.y + NODE_HEIGHT / 2) * zoom - element.clientHeight / 2))
 }
 
+function isHeldByAnotherAgent(knowledge: Knowledge, root: Knowledge | undefined) {
+  return root?.kind === 'claim'
+    && knowledge.kind === 'claim'
+    && knowledge.view.claim.holder !== root.view.claim.holder
+}
+
 export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }: {
   index: KnowledgeIndex
   rootId: string
@@ -32,6 +38,7 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
   const zoomAnchor = useRef<{ x: number; y: number } | null>(null)
   const markerId = useId()
   const tree = useMemo(() => buildKnowledgeTree(index, rootId, direction, budget, expansion), [index, rootId, direction, budget, expansion])
+  const rootKnowledge = index.entries.get(rootId)
   const fullyExpanded = tree.nodes.every((node) => node.children.length === node.childCount)
 
   useLayoutEffect(() => {
@@ -101,6 +108,10 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
             {Object.entries(knowledgeStyles).map(([kind, style]) => (
               <span key={kind} className="inline-flex items-center gap-1.5"><span className={cn('h-3 w-3 shrink-0 rounded border', style.className)} />{style.label}</span>
             ))}
+            <span className="inline-flex items-center gap-1.5">
+              <span data-testid="other-holder-claim-marker" className="h-3 w-3 shrink-0 rounded border border-dashed border-emerald-300 bg-emerald-50" />
+              Dashed border: Claim held by another agent
+            </span>
           </div>
           <KnowledgeStatusLegend />
         </div>
@@ -148,6 +159,7 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
               </svg>
               {tree.nodes.map((node) => {
                 const style = knowledgeStyles[node.knowledge.kind]
+                const heldByAnotherAgent = isHeldByAnotherAgent(node.knowledge, rootKnowledge)
                 return (
                   <div key={node.path} data-tree-node={node.path} className="absolute" style={{ left: node.x, top: node.y, width: NODE_WIDTH }}>
                     <button
@@ -156,7 +168,7 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
                       aria-pressed={selectedId === node.knowledge.id}
                       title={`${node.knowledge.name} · ${style.label} · ${node.knowledge.id}${node.cycle ? ' · Cycle ends here' : ''}`}
                       onClick={() => onSelect(node.knowledge)}
-                      className={cn('relative flex w-full cursor-pointer items-center justify-center rounded-lg border px-3 text-center text-sm font-semibold shadow-sm transition-shadow hover:shadow-md focus-visible:outline-offset-4', node.knowledge.kind !== 'missing' && 'pt-6 pb-2', style.className, node.key === 0 && 'ring-2 ring-slate-400 ring-offset-2', selectedId === node.knowledge.id && 'outline-2 outline-offset-2 outline-[var(--accent)]')}
+                      className={cn('relative flex w-full cursor-pointer items-center justify-center rounded-lg border px-3 text-center text-sm font-semibold shadow-sm transition-shadow hover:shadow-md focus-visible:outline-offset-4', node.knowledge.kind !== 'missing' && 'pt-6 pb-2', style.className, heldByAnotherAgent && 'border-dashed', node.key === 0 && 'ring-2 ring-slate-400 ring-offset-2', selectedId === node.knowledge.id && 'outline-2 outline-offset-2 outline-[var(--accent)]')}
                       style={{ height: NODE_HEIGHT }}
                     >
                       <KnowledgeStatusIcons knowledge={node.knowledge} />

@@ -47,6 +47,26 @@ describe('claims flow status indicators', () => {
     expect(types.getByText('Claim Attribute Update').firstElementChild).toHaveClass('bg-violet-50', 'border-violet-300')
     expect(suggestion).toHaveClass('bg-violet-50', 'border-violet-300')
   })
+
+  it('uses a dashed border only for claims held by another agent', () => {
+    const root = makeClaim('root', ['own', 'other', ...knowledgePolicies.map((policy) => policy.id)], 'Root claim')
+    const own = makeClaim('own', [], 'Own claim')
+    const other = makeClaim('other', [], 'Another agent claim')
+    root.claim.holder = 'selected-agent'
+    own.claim.holder = 'selected-agent'
+    other.claim.holder = 'another-agent'
+    render(<KnowledgeTree index={indexKnowledge([root, own, other], knowledgePolicies)} rootId="root" direction="predecessors" onSelect={vi.fn()} />)
+
+    expect(screen.getByRole('button', { name: 'Claim: Root claim (root)' })).not.toHaveClass('border-dashed')
+    expect(screen.getByRole('button', { name: 'Claim: Own claim' })).not.toHaveClass('border-dashed')
+    expect(screen.getByRole('button', { name: 'Claim: Another agent claim' })).toHaveClass('border-dashed')
+    expect(screen.getByRole('button', { name: 'Policy Update: Reliable execution' })).not.toHaveClass('border-dashed')
+    expect(screen.getByRole('button', { name: 'Claim Attribute Update: Review old evidence' })).not.toHaveClass('border-dashed')
+
+    const legend = within(screen.getByRole('group', { name: 'Knowledge type legend' }))
+    expect(legend.getByText('Dashed border: Claim held by another agent')).toBeInTheDocument()
+    expect(legend.getByTestId('other-holder-claim-marker')).toHaveClass('border-dashed', 'border-emerald-300')
+  })
 })
 
 describe('claims flow mouse panning', () => {

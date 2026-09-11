@@ -19,7 +19,7 @@ Workbench 面向 Maintainer 管理员，提供以下区域：
 
 1. 使用与 Claims 相同的标题、ID、正文、证据、scope、Agent、状态和争议筛选，再从结果中选择根节点。也可按知识类型选择 Policy 或属性更新建议。Agent 和争议筛选只匹配 Claim。
 2. 右上角切换 **Sources** 或 **Impact**：前驱递归沿 `source_claim_ids` 向上展示来源；后继反向查找引用该 ID 的 Claim，向下展示影响链。筛选只影响根节点候选列表，不裁剪已选节点的关系树。
-3. Claim 为绿色、Policy Update 为橙色、Claim Attribute Update 为紫色；图例色块与节点使用相同底色和边框。节点显示标题，悬停可查看类型与 ID。卡片内部右上角用 16px 图标表示 Active（绿色 CircleCheck）、Stale（琥珀色 Clock3）或 Deprecated（灰色 CircleSlash）；存在未解决争议的 Claim 额外显示玫红色 MessageCircleWarning。状态图标提供悬停说明和无障碍标签，画布上方有对应英文图例，缺失来源不显示推测状态。连线箭头始终从来源指向派生知识；展开按钮避开箭头末端。点击节点在右侧打开详情，可继续查看来源、返回上一节点，或以当前节点重新展开。
+3. Claim 为绿色、Policy Update 为橙色、Claim Attribute Update 为紫色；图例色块与节点使用相同底色和边框。根节点为 Claim 时，holder 不同的 Claim 使用绿色虚线边框，Policy Update、Claim Attribute Update 和同一 holder 的 Claim 保持实线，图例会标明该含义。节点显示标题，悬停可查看类型与 ID。卡片内部右上角用 16px 图标表示 Active（绿色 CircleCheck）、Stale（琥珀色 Clock3）或 Deprecated（灰色 CircleSlash）；存在未解决争议的 Claim 额外显示玫红色 MessageCircleWarning。状态图标提供悬停说明和无障碍标签，画布上方有对应英文图例，缺失来源不显示推测状态。连线箭头始终从来源指向派生知识；展开按钮避开箭头末端。点击节点在右侧打开详情，可继续查看来源、返回上一节点，或以当前节点重新展开。
 
 默认展示根节点与第一层关系，每个分支先显示最多 4 个直接关联节点。使用节点旁的 **+** 展开、**−** 折叠；数量按钮表示尚未显示的直接分支，每次再显示最多 4 个。同一知识经不同路径到达时会重复显示，各处的展开状态相互独立。点击标题仍打开详情。
 
