@@ -17,10 +17,10 @@ export function KnowledgeStatusIcons({ knowledge }: { knowledge: Knowledge }) {
   const statuses: (keyof typeof statusStyles)[] = [status]
   if (knowledge.kind === 'claim' && knowledge.view.open_dispute_ids.length > 0) statuses.push('disputed')
   return (
-    <span className="absolute right-2 top-1.5 flex items-center gap-1">
+    <span className="absolute right-1.5 top-1 flex items-center gap-0.5">
       {statuses.map((value) => {
         const { label, Icon, color } = statusStyles[value]
-        return <span key={value} role="img" aria-label={label} title={label} className={cn('inline-flex', color)}><Icon size={16} aria-hidden="true" /></span>
+        return <span key={value} role="img" aria-label={label} title={label} className={cn('inline-flex', color)}><Icon size={14} aria-hidden="true" /></span>
       })}
     </span>
   )

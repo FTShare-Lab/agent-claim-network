@@ -20,8 +20,8 @@ describe('claims flow status indicators', () => {
     for (const name of [label, 'Disputed']) {
       const icon = within(card).getByRole('img', { name })
       expect(icon).toHaveAttribute('title', name)
-      expect(icon.querySelector('svg')).toHaveAttribute('width', '16')
-      expect(icon.querySelector('svg')).toHaveAttribute('height', '16')
+      expect(icon.querySelector('svg')).toHaveAttribute('width', '14')
+      expect(icon.querySelector('svg')).toHaveAttribute('height', '14')
     }
     expect(card).toHaveClass('bg-emerald-50')
     expect(card).toHaveTextContent(/^root$/)
@@ -59,13 +59,13 @@ describe('claims flow status indicators', () => {
 
     expect(screen.getByRole('button', { name: 'Claim: Root claim (root)' })).not.toHaveClass('border-dashed')
     expect(screen.getByRole('button', { name: 'Claim: Own claim' })).not.toHaveClass('border-dashed')
-    expect(screen.getByRole('button', { name: 'Claim: Another agent claim' })).toHaveClass('border-dashed')
+    expect(screen.getByRole('button', { name: 'Claim: Another agent claim' })).toHaveClass('border-2', 'border-dashed', 'border-emerald-400')
     expect(screen.getByRole('button', { name: 'Policy Update: Reliable execution' })).not.toHaveClass('border-dashed')
     expect(screen.getByRole('button', { name: 'Claim Attribute Update: Review old evidence' })).not.toHaveClass('border-dashed')
 
     const legend = within(screen.getByRole('group', { name: 'Knowledge type legend' }))
     expect(legend.getByText('Dashed border: Claim held by another agent')).toBeInTheDocument()
-    expect(legend.getByTestId('other-holder-claim-marker')).toHaveClass('border-dashed', 'border-emerald-300')
+    expect(legend.getByTestId('other-holder-claim-marker')).toHaveClass('border-2', 'border-dashed', 'border-emerald-400')
   })
 })
 

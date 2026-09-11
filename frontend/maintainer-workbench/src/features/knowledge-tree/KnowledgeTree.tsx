@@ -109,7 +109,7 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
               <span key={kind} className="inline-flex items-center gap-1.5"><span className={cn('h-3 w-3 shrink-0 rounded border', style.className)} />{style.label}</span>
             ))}
             <span className="inline-flex items-center gap-1.5">
-              <span data-testid="other-holder-claim-marker" className="h-3 w-3 shrink-0 rounded border border-dashed border-emerald-300 bg-emerald-50" />
+              <span data-testid="other-holder-claim-marker" className="h-3.5 w-5 shrink-0 rounded border-2 border-dashed border-emerald-400 bg-emerald-50" />
               Dashed border: Claim held by another agent
             </span>
           </div>
@@ -168,7 +168,7 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
                       aria-pressed={selectedId === node.knowledge.id}
                       title={`${node.knowledge.name} · ${style.label} · ${node.knowledge.id}${node.cycle ? ' · Cycle ends here' : ''}`}
                       onClick={() => onSelect(node.knowledge)}
-                      className={cn('relative flex w-full cursor-pointer items-center justify-center rounded-lg border px-3 text-center text-sm font-semibold shadow-sm transition-shadow hover:shadow-md focus-visible:outline-offset-4', node.knowledge.kind !== 'missing' && 'pt-6 pb-2', style.className, heldByAnotherAgent && 'border-dashed', node.key === 0 && 'ring-2 ring-slate-400 ring-offset-2', selectedId === node.knowledge.id && 'outline-2 outline-offset-2 outline-[var(--accent)]')}
+                      className={cn('relative flex w-full cursor-pointer items-center justify-center rounded-lg border px-3 text-center text-sm font-semibold shadow-sm transition-shadow hover:shadow-md focus-visible:outline-offset-4', node.knowledge.kind !== 'missing' && 'pt-5 pb-1', style.className, heldByAnotherAgent && 'border-2 border-dashed border-emerald-400', node.key === 0 && 'ring-2 ring-slate-400 ring-offset-2', selectedId === node.knowledge.id && 'outline-2 outline-offset-2 outline-[var(--accent)]')}
                       style={{ height: NODE_HEIGHT }}
                     >
                       <KnowledgeStatusIcons knowledge={node.knowledge} />
