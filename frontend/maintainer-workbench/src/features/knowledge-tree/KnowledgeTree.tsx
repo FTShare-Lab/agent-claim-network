@@ -1,5 +1,5 @@
 // 可滚动和缩放的树形画布，箭头始终从知识来源指向派生知识。
-import { useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useId, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
 
 import { knowledgeStyles } from './styles'
 import { KnowledgeStatusIcons, KnowledgeStatusLegend } from './KnowledgeStatus'
@@ -7,13 +7,24 @@ import { useCanvasPan } from './useCanvasPan'
 import { cn } from '../../lib/utils'
 import { BRANCH_BATCH_SIZE, buildKnowledgeTree, NODE_HEIGHT, NODE_WIDTH, VERTICAL_PADDING, type Direction, type Knowledge, type KnowledgeIndex, type TreeExpansion, type TreeNode } from './tree'
 
+const PAN_MARGIN = 240
+
+type ViewportSize = { width: number; height: number }
+
+function getCanvasLayout(tree: ReturnType<typeof buildKnowledgeTree>, zoom: number, viewportSize: ViewportSize) {
+  const treeWidth = tree.width * zoom
+  const treeHeight = tree.height * zoom
+  const width = Math.max(treeWidth + PAN_MARGIN * 2, viewportSize.width + PAN_MARGIN * 2)
+  const height = Math.max(treeHeight + PAN_MARGIN * 2, viewportSize.height + PAN_MARGIN * 2)
+  return { width, height, treeLeft: (width - treeWidth) / 2, treeTop: (height - treeHeight) / 2 }
+}
+
 function scrollToRoot(element: HTMLDivElement | null, tree: ReturnType<typeof buildKnowledgeTree>, zoom: number) {
   const root = tree.nodes[0]
   if (!element || !root) return
-  const maxLeft = Math.max(0, tree.width * zoom - element.clientWidth)
-  const maxTop = Math.max(0, tree.height * zoom - element.clientHeight)
-  element.scrollLeft = Math.min(maxLeft, Math.max(0, (root.x + NODE_WIDTH / 2) * zoom - element.clientWidth / 2))
-  element.scrollTop = Math.min(maxTop, Math.max(0, (root.y + NODE_HEIGHT / 2) * zoom - element.clientHeight / 2))
+  const layout = getCanvasLayout(tree, zoom, { width: element.clientWidth, height: element.clientHeight })
+  element.scrollLeft = Math.min(layout.width - element.clientWidth, Math.max(0, layout.treeLeft + (root.x + NODE_WIDTH / 2) * zoom - element.clientWidth / 2))
+  element.scrollTop = Math.min(layout.height - element.clientHeight, Math.max(0, layout.treeTop + (root.y + NODE_HEIGHT / 2) * zoom - element.clientHeight / 2))
 }
 
 function isHeldByAnotherAgent(knowledge: Knowledge, root: Knowledge | undefined) {
@@ -32,6 +43,7 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
   const [budget, setBudget] = useState(500)
   const [expansion, setExpansion] = useState<TreeExpansion>(() => ({ expandAll: false, childLimits: new Map() }))
   const [zoom, setZoom] = useState(1)
+  const [viewportSize, setViewportSize] = useState<ViewportSize>({ width: 0, height: 0 })
   const viewport = useRef<HTMLDivElement>(null)
   const { isPanning, ...panHandlers } = useCanvasPan()
   const branchAnchor = useRef<{ path: string; x: number; y: number; reveal: boolean } | null>(null)
@@ -40,6 +52,21 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
   const tree = useMemo(() => buildKnowledgeTree(index, rootId, direction, budget, expansion), [index, rootId, direction, budget, expansion])
   const rootKnowledge = index.entries.get(rootId)
   const fullyExpanded = tree.nodes.every((node) => node.children.length === node.childCount)
+  const canvasLayout = useMemo(() => getCanvasLayout(tree, zoom, viewportSize), [tree, zoom, viewportSize])
+
+  useLayoutEffect(() => {
+    const element = viewport.current
+    if (!element) return
+    const updateViewportSize = () => {
+      const next = { width: element.clientWidth, height: element.clientHeight }
+      setViewportSize((current) => current.width === next.width && current.height === next.height ? current : next)
+    }
+    updateViewportSize()
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(updateViewportSize)
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [])
 
   useLayoutEffect(() => {
     const element = viewport.current
@@ -48,15 +75,15 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
     const center = zoomAnchor.current
     zoomAnchor.current = null
     if (element && center) {
-      const offset = Math.max(0, (element.clientWidth - tree.width * zoom) / 2)
-      element.scrollLeft = center.x * zoom + offset - element.clientWidth / 2
-      element.scrollTop = center.y * zoom - element.clientHeight / 2
+      const layout = getCanvasLayout(tree, zoom, { width: element.clientWidth, height: element.clientHeight })
+      element.scrollLeft = layout.treeLeft + center.x * zoom - element.clientWidth / 2
+      element.scrollTop = layout.treeTop + center.y * zoom - element.clientHeight / 2
       return
     }
     const node = anchor && tree.nodes.find((entry) => entry.path === anchor.path)
     if (element && anchor && node) {
       // 分支增删会改变树的宽高；保留点击节点的位置，便于连续向远端展开。
-      const offset = Math.max(0, (element.clientWidth - tree.width * zoom) / 2)
+      const layout = getCanvasLayout(tree, zoom, { width: element.clientWidth, height: element.clientHeight })
       let anchorY = anchor.y
       if (anchor.reveal && node.children.length) {
         const delta = (tree.nodes[node.children[0]].y - node.y) * zoom
@@ -64,22 +91,22 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
         // 靠近画布边缘时，让新一层节点及其展开按钮一起进入可视区域。
         anchorY = delta < 0 ? Math.max(anchorY, margin - delta) : Math.min(anchorY, element.clientHeight - margin - delta)
       }
-      element.scrollLeft = (node.x + NODE_WIDTH / 2) * zoom + offset - anchor.x
-      element.scrollTop = (node.y + NODE_HEIGHT / 2) * zoom - anchorY
+      element.scrollLeft = layout.treeLeft + (node.x + NODE_WIDTH / 2) * zoom - anchor.x
+      element.scrollTop = layout.treeTop + (node.y + NODE_HEIGHT / 2) * zoom - anchorY
       return
     }
     scrollToRoot(viewport.current, tree, zoom)
-  }, [tree, zoom])
+  }, [tree, zoom, viewportSize])
 
   function changeZoom(nextZoom: number) {
     if (nextZoom === zoom) return
     const element = viewport.current
     if (element) {
       // 缩放围绕当前视口中心，远端分支不会被重新定位到根节点。
-      const offset = Math.max(0, (element.clientWidth - tree.width * zoom) / 2)
+      const layout = getCanvasLayout(tree, zoom, { width: element.clientWidth, height: element.clientHeight })
       zoomAnchor.current = {
-        x: (element.scrollLeft + element.clientWidth / 2 - offset) / zoom,
-        y: (element.scrollTop + element.clientHeight / 2) / zoom,
+        x: (element.scrollLeft + element.clientWidth / 2 - layout.treeLeft) / zoom,
+        y: (element.scrollTop + element.clientHeight / 2 - layout.treeTop) / zoom,
       }
     }
     setZoom(nextZoom)
@@ -88,16 +115,29 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
   function changeBranch(node: TreeNode, limit: number) {
     const element = viewport.current
     if (element) {
-      const offset = Math.max(0, (element.clientWidth - tree.width * zoom) / 2)
+      const layout = getCanvasLayout(tree, zoom, { width: element.clientWidth, height: element.clientHeight })
       branchAnchor.current = {
         path: node.path,
-        x: (node.x + NODE_WIDTH / 2) * zoom + offset - element.scrollLeft,
-        y: (node.y + NODE_HEIGHT / 2) * zoom - element.scrollTop,
+        x: layout.treeLeft + (node.x + NODE_WIDTH / 2) * zoom - element.scrollLeft,
+        y: layout.treeTop + (node.y + NODE_HEIGHT / 2) * zoom - element.scrollTop,
         reveal: limit > node.children.length,
       }
     }
     setExpansion((current) => ({ ...current, childLimits: new Map(current.childLimits).set(node.path, limit) }))
     if (limit > 0 && tree.nodes.length + limit - node.children.length > budget) setBudget((current) => current + 500)
+  }
+
+  function zoomAtPoint(event: MouseEvent<HTMLDivElement>) {
+    if (event.target instanceof Element && event.target.closest('button, a, input, select, textarea')) return
+    const element = event.currentTarget
+    if (zoom >= 1.6) return
+    const bounds = element.getBoundingClientRect()
+    const layout = getCanvasLayout(tree, zoom, { width: element.clientWidth, height: element.clientHeight })
+    zoomAnchor.current = {
+      x: (element.scrollLeft + event.clientX - bounds.left - layout.treeLeft) / zoom,
+      y: (element.scrollTop + event.clientY - bounds.top - layout.treeTop) / zoom,
+    }
+    setZoom(Math.min(1.6, Math.max(zoom + 0.2, zoom * 2)))
   }
 
   return (
@@ -109,8 +149,10 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
               <span key={kind} className="inline-flex items-center gap-1.5"><span className={cn('h-3 w-3 shrink-0 rounded border', style.className)} />{style.label}</span>
             ))}
             <span className="inline-flex items-center gap-1.5">
-              <span data-testid="other-holder-claim-marker" className="h-3.5 w-5 shrink-0 rounded border-2 border-dashed border-emerald-400 bg-emerald-50" />
-              Dashed border: Claim held by another agent
+              <span data-testid="other-holder-claim-marker" className="h-3.5 w-5 shrink-0" aria-hidden="true">
+                <svg viewBox="0 0 20 14" className="h-full w-full"><rect x="0.5" y="0.5" width="19" height="13" rx="3.5" fill="none" stroke="currentColor" strokeWidth="1" strokeDasharray="6 4" className="text-emerald-400" /></svg>
+              </span>
+              Claim held by others
             </span>
           </div>
           <KnowledgeStatusLegend />
@@ -123,23 +165,26 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
           <button type="button" className="rounded px-2 py-1.5 hover:bg-slate-100" onClick={() => {
             const element = viewport.current
             if (!element || !tree.width || !tree.height) return
-            // 整体预览允许低于手动缩放下限；同一缩放值下再次 Fit 也要复位。
-            setZoom(Math.min(1, element.clientWidth / tree.width, element.clientHeight / tree.height))
-            element.scrollLeft = 0
-            element.scrollTop = 0
+            // 整体预览允许低于手动缩放下限，并保留四周平移空间。
+            const nextZoom = Math.min(1, element.clientWidth / tree.width, element.clientHeight / tree.height)
+            const center = { x: tree.width / 2, y: tree.height / 2 }
+            if (nextZoom === zoom) {
+              const layout = getCanvasLayout(tree, zoom, { width: element.clientWidth, height: element.clientHeight })
+              element.scrollLeft = layout.treeLeft + center.x * zoom - element.clientWidth / 2
+              element.scrollTop = layout.treeTop + center.y * zoom - element.clientHeight / 2
+              return
+            }
+            zoomAnchor.current = center
+            setZoom(nextZoom)
           }}>Fit</button>
+          <span aria-hidden="true" className="mx-1 h-4 w-px bg-slate-200" />
+          <button type="button" disabled={fullyExpanded || (expansion.expandAll && expansion.childLimits.size === 0)} className="rounded px-2 py-1.5 font-medium text-blue-700 hover:bg-slate-100 disabled:text-slate-400" onClick={() => setExpansion({ expandAll: true, childLimits: new Map() })}>Expand all</button>
+          <button type="button" disabled={tree.nodes.length <= 1} className="rounded px-2 py-1.5 font-medium text-blue-700 hover:bg-slate-100 disabled:text-slate-400" onClick={() => { setExpansion({ expandAll: false, childLimits: new Map([[encodeURIComponent(rootId), 0]]) }); setBudget(500) }}>Collapse all</button>
         </div>
       </div>
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-2 text-xs text-slate-500">
-        <p>Drag the canvas to pan. Use + to expand and − to collapse. Click a node for details.</p>
-        <div className="flex gap-3">
-          <button type="button" disabled={fullyExpanded || (expansion.expandAll && expansion.childLimits.size === 0)} className="font-medium text-blue-700 disabled:text-slate-400" onClick={() => setExpansion({ expandAll: true, childLimits: new Map() })}>Expand all</button>
-          <button type="button" disabled={tree.nodes.length <= 1} className="font-medium text-blue-700 disabled:text-slate-400" onClick={() => { setExpansion({ expandAll: false, childLimits: new Map([[encodeURIComponent(rootId), 0]]) }); setBudget(500) }}>Collapse all</button>
-        </div>
-      </div>
-      <div ref={viewport} tabIndex={0} role="region" aria-label="Claims flow canvas" {...panHandlers} className={cn('h-[560px] max-h-[65vh] min-h-72 overflow-auto overscroll-contain bg-[radial-gradient(#d9dce5_1px,transparent_1px)] bg-[size:20px_20px]', isPanning ? 'cursor-grabbing select-none' : 'cursor-grab')}>
-        <div style={{ width: tree.width * zoom, height: tree.height * zoom, minWidth: '100%' }}>
-          <div className="mx-auto overflow-hidden" style={{ width: tree.width * zoom, height: tree.height * zoom }}>
+      <div ref={viewport} tabIndex={0} role="region" aria-label="Claims flow canvas" {...panHandlers} onDoubleClick={zoomAtPoint} className={cn('h-[560px] max-h-[65vh] min-h-72 overflow-auto overscroll-contain bg-[radial-gradient(#d9dce5_1px,transparent_1px)] bg-[size:20px_20px]', isPanning ? 'cursor-grabbing select-none' : 'cursor-grab')}>
+        <div className="relative" style={{ width: canvasLayout.width, height: canvasLayout.height }}>
+          <div className="absolute overflow-hidden" style={{ left: canvasLayout.treeLeft, top: canvasLayout.treeTop, width: tree.width * zoom, height: tree.height * zoom }}>
             <div className="relative origin-top-left" style={{ width: tree.width, height: tree.height, transform: `scale(${zoom})` }}>
               <svg aria-hidden="true" width={tree.width} height={tree.height} className="pointer-events-none absolute inset-0">
                 <defs><marker id={markerId} viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b" /></marker></defs>
@@ -168,9 +213,10 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
                       aria-pressed={selectedId === node.knowledge.id}
                       title={`${node.knowledge.name} · ${style.label} · ${node.knowledge.id}${node.cycle ? ' · Cycle ends here' : ''}`}
                       onClick={() => onSelect(node.knowledge)}
-                      className={cn('relative flex w-full cursor-pointer items-center justify-center rounded-lg border px-3 text-center text-sm font-semibold shadow-sm transition-shadow hover:shadow-md focus-visible:outline-offset-4', node.knowledge.kind !== 'missing' && 'pt-5 pb-1', style.className, heldByAnotherAgent && 'border-2 border-dashed border-emerald-400', node.key === 0 && 'ring-2 ring-slate-400 ring-offset-2', selectedId === node.knowledge.id && 'outline-2 outline-offset-2 outline-[var(--accent)]')}
+                      className={cn('relative flex w-full cursor-pointer items-center justify-center rounded-lg border px-3 text-center text-sm font-semibold shadow-sm transition-shadow hover:shadow-md focus-visible:outline-offset-4', node.knowledge.kind !== 'missing' && 'pt-4 pb-0.5', style.className, heldByAnotherAgent && 'border-transparent', node.key === 0 && 'ring-2 ring-slate-400 ring-offset-2', selectedId === node.knowledge.id && 'outline-2 outline-offset-2 outline-[var(--accent)]')}
                       style={{ height: NODE_HEIGHT }}
                     >
+                      {heldByAnotherAgent ? <svg data-testid="other-holder-claim-border" aria-hidden="true" viewBox={`0 0 ${NODE_WIDTH} ${NODE_HEIGHT}`} preserveAspectRatio="none" className="pointer-events-none absolute inset-0 h-full w-full text-emerald-400"><rect x="0.5" y="0.5" width={NODE_WIDTH - 1} height={NODE_HEIGHT - 1} rx="7.5" fill="none" stroke="currentColor" strokeWidth="1" strokeDasharray="12 10" /></svg> : null}
                       <KnowledgeStatusIcons knowledge={node.knowledge} />
                       <span className="line-clamp-2 [overflow-wrap:anywhere]">{node.knowledge.name}</span>
                     </button>

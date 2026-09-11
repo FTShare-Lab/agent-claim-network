@@ -58,7 +58,7 @@ export type TreeNode = {
 
 export const NODE_WIDTH = 220
 // 状态图标贴近右上角，节点只为两行标题保留必要高度。
-export const NODE_HEIGHT = 68
+export const NODE_HEIGHT = 60
 export const BRANCH_BATCH_SIZE = 4
 
 export type TreeExpansion = {

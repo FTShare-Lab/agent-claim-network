@@ -19,11 +19,11 @@ Workbench 面向 Maintainer 管理员，提供以下区域：
 
 1. 使用与 Claims 相同的标题、ID、正文、证据、scope、Agent、状态和争议筛选，再从结果中选择根节点。也可按知识类型选择 Policy 或属性更新建议。Agent 和争议筛选只匹配 Claim。
 2. 右上角切换 **Sources** 或 **Impact**：前驱递归沿 `source_claim_ids` 向上展示来源；后继反向查找引用该 ID 的 Claim，向下展示影响链。筛选只影响根节点候选列表，不裁剪已选节点的关系树。
-3. Claim 为绿色、Policy Update 为橙色、Claim Attribute Update 为紫色；图例色块与节点使用相同底色和边框。根节点为 Claim 时，holder 不同的 Claim 使用更粗、间隔更宽的绿色虚线边框，Policy Update、Claim Attribute Update 和同一 holder 的 Claim 保持实线，图例会标明该含义。节点显示标题，悬停可查看类型与 ID。卡片内部右上角用紧凑的 14px 图标表示 Active（绿色 CircleCheck）、Stale（琥珀色 Clock3）或 Deprecated（灰色 CircleSlash）；存在未解决争议的 Claim 额外显示玫红色 MessageCircleWarning。状态图标提供悬停说明和无障碍标签，画布上方有对应英文图例，缺失来源不显示推测状态。连线箭头始终从来源指向派生知识；展开按钮避开箭头末端。点击节点在右侧打开详情，可继续查看来源、返回上一节点，或以当前节点重新展开。
+3. Claim 为绿色、Policy Update 为橙色、Claim Attribute Update 为紫色；图例色块与节点使用相同底色和边框。根节点为 Claim 时，holder 不同的 Claim 使用可清楚分辨线段与空档的绿色虚线边框，Policy Update、Claim Attribute Update 和同一 holder 的 Claim 保持实线，图例会标明该含义。节点显示标题，悬停可查看类型与 ID。卡片内部右上角用紧凑的 14px 图标表示 Active（绿色 CircleCheck）、Stale（琥珀色 Clock3）或 Deprecated（灰色 CircleSlash）；存在未解决争议的 Claim 额外显示玫红色 MessageCircleWarning。状态图标提供悬停说明和无障碍标签，画布上方有对应英文图例，缺失来源不显示推测状态。连线箭头始终从来源指向派生知识；展开按钮避开箭头末端。点击节点在右侧打开详情，可继续查看来源、返回上一节点，或以当前节点重新展开。
 
 默认展示根节点与第一层关系，每个分支先显示最多 4 个直接关联节点。使用节点旁的 **+** 展开、**−** 折叠；数量按钮表示尚未显示的直接分支，每次再显示最多 4 个。同一知识经不同路径到达时会重复显示，各处的展开状态相互独立。点击标题仍打开详情。
 
-**Expand all** 可展开完整关系，超过 500 个显示节点时用 **Show more nodes** 分批继续；**Collapse all** 收回到根节点。路径内遇到循环引用时，保留重复节点并标明停止展开；缺失来源以灰色占位节点保留其引用关系。鼠标左键拖拽画布空白处可平移，节点和分支按钮保留点击操作，触屏保留原生滚动。缩放围绕当前画布视口中心；**Fit** 查看整体，**Center root** 返回根节点。连续展开时，新一层节点及其分支按钮会一起进入可视区域。
+**Expand all** 可展开完整关系，超过 500 个显示节点时用 **Show more nodes** 分批继续；**Collapse all** 收回到根节点。路径内遇到循环引用时，保留重复节点并标明停止展开；缺失来源以灰色占位节点保留其引用关系。鼠标左键拖拽画布空白处可平移，节点和分支按钮保留点击操作，触屏保留原生滚动。缩放围绕当前画布视口中心；**Fit** 查看整体后仍保留四周平移空间，在画布空白处双击可围绕该点放大，**Center root** 返回根节点。连续展开时，新一层节点及其分支按钮会一起进入可视区域。
 
 底部同时显示 **displayed nodes**（当前可见节点数，含重复路径）与 **unique items**（当前可见节点按知识 ID 去重后的数量，包含缺失来源占位）。折叠的知识不计入这两个数，同名但不同 ID 的知识分别计数。
 

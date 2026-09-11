@@ -59,13 +59,19 @@ describe('claims flow status indicators', () => {
 
     expect(screen.getByRole('button', { name: 'Claim: Root claim (root)' })).not.toHaveClass('border-dashed')
     expect(screen.getByRole('button', { name: 'Claim: Own claim' })).not.toHaveClass('border-dashed')
-    expect(screen.getByRole('button', { name: 'Claim: Another agent claim' })).toHaveClass('border-2', 'border-dashed', 'border-emerald-400')
+    const otherCard = screen.getByRole('button', { name: 'Claim: Another agent claim' })
+    expect(otherCard).toHaveClass('border-transparent')
+    const otherBorder = within(otherCard).getByTestId('other-holder-claim-border').querySelector('rect')
+    expect(otherBorder).toHaveAttribute('stroke-dasharray', '12 10')
+    expect(otherBorder).toHaveAttribute('stroke-width', '1')
     expect(screen.getByRole('button', { name: 'Policy Update: Reliable execution' })).not.toHaveClass('border-dashed')
     expect(screen.getByRole('button', { name: 'Claim Attribute Update: Review old evidence' })).not.toHaveClass('border-dashed')
 
     const legend = within(screen.getByRole('group', { name: 'Knowledge type legend' }))
-    expect(legend.getByText('Dashed border: Claim held by another agent')).toBeInTheDocument()
-    expect(legend.getByTestId('other-holder-claim-marker')).toHaveClass('border-2', 'border-dashed', 'border-emerald-400')
+    expect(legend.getByText('Claim held by others')).toBeInTheDocument()
+    const legendMarker = legend.getByTestId('other-holder-claim-marker').querySelector('rect')
+    expect(legendMarker).toHaveAttribute('stroke-dasharray', '6 4')
+    expect(legendMarker).toHaveAttribute('stroke-width', '1')
   })
 })
 
@@ -114,6 +120,25 @@ describe('claims flow mouse panning', () => {
     fireEvent.pointerMove(canvas, { clientX: 0, clientY: 0 })
     expect(canvas.scrollLeft).toBe(320)
     expect(canvas.scrollTop).toBe(150)
+    expect(onSelect).not.toHaveBeenCalled()
+  })
+
+  it('keeps panning room after Fit and zooms only blank canvas space on double click', () => {
+    const { canvas, onSelect } = setup()
+    Object.defineProperties(canvas, { clientWidth: { value: 720 }, clientHeight: { value: 480 } })
+    fireEvent.click(screen.getByRole('button', { name: 'Fit' }))
+    expect(canvas.scrollLeft).toBe(240)
+    expect(canvas.scrollTop).toBe(240)
+    fireEvent.pointerDown(canvas, { clientX: 200, clientY: 200, button: 0 })
+    fireEvent.pointerMove(canvas, { clientX: 80, clientY: 150 })
+    expect(canvas.scrollLeft).toBe(360)
+    expect(canvas.scrollTop).toBe(290)
+    fireEvent.pointerUp(canvas)
+
+    fireEvent.doubleClick(canvas, { clientX: 200, clientY: 200 })
+    expect(screen.getByLabelText('Zoom level')).toHaveTextContent('160%')
+    fireEvent.doubleClick(screen.getByRole('button', { name: 'Claim: root (root)' }))
+    expect(screen.getByLabelText('Zoom level')).toHaveTextContent('160%')
     expect(onSelect).not.toHaveBeenCalled()
   })
 

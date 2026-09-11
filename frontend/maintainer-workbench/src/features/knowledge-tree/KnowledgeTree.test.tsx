@@ -78,7 +78,7 @@ describe('knowledge tree branch controls', () => {
     expect(screen.getAllByRole('button', { name: /^Collapse branches/ })).toHaveLength(1)
   })
 
-  it('fits below 20 percent and restores the overview when Fit is clicked again', () => {
+  it('fits below 20 percent and keeps panning room around the centered overview', () => {
     render(<KnowledgeTree index={index} rootId={knowledgePreviewRoots.release} direction="predecessors" onSelect={vi.fn()} />)
     const canvas = screen.getByRole('region', { name: 'Claims flow canvas' })
     Object.defineProperties(canvas, { clientWidth: { value: 720 }, clientHeight: { value: 480 } })
@@ -88,8 +88,8 @@ describe('knowledge tree branch controls', () => {
     canvas.scrollLeft = 200
     canvas.scrollTop = 100
     fireEvent.click(screen.getByRole('button', { name: 'Fit' }))
-    expect(canvas.scrollLeft).toBe(0)
-    expect(canvas.scrollTop).toBe(0)
+    expect(canvas.scrollLeft).toBe(240)
+    expect(canvas.scrollTop).toBe(240)
   })
 
   it.each(['predecessors', 'successors'] as const)('keeps the next layer branch controls inside the %s viewport', (direction) => {
@@ -102,7 +102,8 @@ describe('knowledge tree branch controls', () => {
     canvas.scrollTop = 0
     fireEvent.click(screen.getByRole('button', { name: `Expand branches for ${childId}` }))
     const node = canvas.querySelector<HTMLDivElement>(`[data-tree-node="${rootId}/${childId}/node_2"]`)!
-    const nodeTop = Number.parseFloat(node.style.top) - canvas.scrollTop
+    const treeTop = Number.parseFloat(node.parentElement?.parentElement?.style.top ?? '0')
+    const nodeTop = treeTop + Number.parseFloat(node.style.top) - canvas.scrollTop
     // Sources 的按钮位于标题上方 30px；Impact 的按钮位于标题下方并带阴影。
     if (direction === 'predecessors') expect(nodeTop - 30).toBeGreaterThanOrEqual(0)
     else expect(nodeTop + NODE_HEIGHT + 36).toBeLessThanOrEqual(canvas.clientHeight)
@@ -116,8 +117,8 @@ describe('knowledge tree branch controls', () => {
     canvas.scrollLeft = 2000
     canvas.scrollTop = 200
     fireEvent.click(screen.getByRole('button', { name: 'Zoom in' }))
-    expect(canvas.scrollLeft).toBeCloseTo((2000 + 360) * 1.2 - 360)
-    expect(canvas.scrollTop).toBeCloseTo((200 + 240) * 1.2 - 240)
+    expect(canvas.scrollLeft).toBeCloseTo(2424)
+    expect(canvas.scrollTop).toBeCloseTo(240)
     fireEvent.click(screen.getByRole('button', { name: 'Zoom out' }))
     expect(canvas.scrollLeft).toBeCloseTo(2000)
     expect(canvas.scrollTop).toBeCloseTo(200)
