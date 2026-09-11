@@ -14,11 +14,13 @@ afterEach(cleanup)
 describe('knowledge tree branch controls', () => {
   it('starts a wide tree with four branches and expands incrementally or fully', () => {
     render(<KnowledgeTree index={index} rootId={knowledgePreviewRoots.wide} direction="successors" onSelect={vi.fn()} />)
-    const canvas = within(screen.getByRole('region', { name: 'Claims flow canvas' }))
-    const titleButtons = () => canvas.getAllByRole('button', { pressed: false })
+    const canvas = screen.getByRole('region', { name: 'Claims flow canvas' })
+    const canvasQueries = within(canvas)
+    // 宽树包含数百个节点；直接统计稳定的树节点标记，避免反复遍历整棵无障碍树。
+    const titleButtons = () => canvas.querySelectorAll('[data-tree-node] > button')
     expect(titleButtons()).toHaveLength(5)
     expect(screen.getByText('5 displayed nodes · 5 unique items')).toBeInTheDocument()
-    fireEvent.click(canvas.getByRole('button', { name: 'Show more branches for 宽树案例：512 条独立采纳路径' }))
+    fireEvent.click(canvasQueries.getByRole('button', { name: 'Show more branches for 宽树案例：512 条独立采纳路径' }))
     expect(titleButtons()).toHaveLength(9)
     fireEvent.click(screen.getByRole('button', { name: 'Expand all' }))
     expect(titleButtons()).toHaveLength(500)
@@ -30,9 +32,9 @@ describe('knowledge tree branch controls', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Collapse all' }))
     expect(titleButtons()).toHaveLength(1)
     expect(screen.getByText('1 displayed node · 1 unique item')).toBeInTheDocument()
-    fireEvent.click(canvas.getByRole('button', { name: 'Expand branches for 宽树案例：512 条独立采纳路径' }))
+    fireEvent.click(canvasQueries.getByRole('button', { name: 'Expand branches for 宽树案例：512 条独立采纳路径' }))
     expect(titleButtons()).toHaveLength(5)
-  })
+  }, 15_000)
 
   it('expands repeated lattice paths across multiple batches and resets when re-rooted', () => {
     const view = render(<KnowledgeTree key="lattice" index={index} rootId={knowledgePreviewRoots.lattice} direction="predecessors" onSelect={vi.fn()} />)
