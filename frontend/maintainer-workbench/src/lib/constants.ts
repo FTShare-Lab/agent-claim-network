@@ -35,9 +35,9 @@ export const navSections: NavSection[] = [
         href: '/',
         icon: LayoutDashboard,
       },
-      { label: 'Claims Flow', description: 'Knowledge sources and impact', href: '/knowledge-tree', icon: GitFork },
-      { label: 'Claims', description: 'Claim corpus', href: '/claims', icon: Files },
       { label: 'Agents', description: 'Agent inventory', href: '/agents', icon: Users },
+      { label: 'Claims', description: 'Claim corpus', href: '/claims', icon: Files },
+      { label: 'Claims Flow', description: 'Knowledge sources and impact', href: '/knowledge-tree', icon: GitFork },
     ],
   },
   {
