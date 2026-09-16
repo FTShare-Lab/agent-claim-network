@@ -1,18 +1,20 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { saveAdminSession } from '../features/auth/session'
+import { readAdminSession } from '../features/auth/session'
+import { seedAdminSession } from '../test/adminSession'
 import { renderWorkbenchRoute } from './test-utils'
 
 describe('workbench routes', () => {
   beforeEach(() => {
     window.sessionStorage.clear()
+    window.localStorage.clear()
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: RequestInfo | URL) => {
         const path = typeof input === 'string' ? input : input.toString()
         if (path.endsWith('/api/admin-auth/status')) {
-          return new Response(JSON.stringify({ enabled: true }))
+          return new Response(JSON.stringify({ enabled: true, session: readAdminSession() }))
         }
         if (path.endsWith('/api/claims')) {
           return new Response(
@@ -101,7 +103,7 @@ describe('workbench routes', () => {
   })
 
   it('renders the claims page inside the app shell', async () => {
-    saveAdminSession('admin', 'Basic test')
+    seedAdminSession()
     render(renderWorkbenchRoute('/claims'))
 
     expect((await screen.findAllByRole('heading', { name: 'Claims' })).length).toBeGreaterThan(0)
@@ -110,7 +112,7 @@ describe('workbench routes', () => {
   })
 
   it('renders the overview route by default', async () => {
-    saveAdminSession('admin', 'Basic test')
+    seedAdminSession()
     render(renderWorkbenchRoute('/'))
 
     expect(await screen.findByRole('heading', { name: 'Network Operations Overview' })).toBeInTheDocument()
@@ -144,13 +146,13 @@ describe('workbench routes', () => {
   })
 
   it('returns to login when stored credentials are rejected by the API', async () => {
-    saveAdminSession('admin', 'Basic stale')
+    seedAdminSession('stale')
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: RequestInfo | URL) => {
         const path = typeof input === 'string' ? input : input.toString()
         if (path.endsWith('/api/admin-auth/status')) {
-          return new Response(JSON.stringify({ enabled: true }))
+          return new Response(JSON.stringify({ enabled: true, session: null }))
         }
         if (path.endsWith('/api/claims')) {
           return new Response('admin auth required', { status: 401 })
@@ -170,9 +172,9 @@ describe('workbench routes', () => {
       vi.fn(async (input: RequestInfo | URL) => {
         const path = typeof input === 'string' ? input : input.toString()
         if (path.endsWith('/api/admin-auth/status')) {
-          return new Response(JSON.stringify({ enabled: true }))
+          return new Response(JSON.stringify({ enabled: true, session: readAdminSession() }))
         }
-        if (path.endsWith('/api/admin-auth/check')) {
+        if (path.endsWith('/api/admin-auth/login')) {
           return new Response('invalid', { status: 401 })
         }
         return new Response(JSON.stringify([]))

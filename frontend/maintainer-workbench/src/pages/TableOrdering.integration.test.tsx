@@ -2,7 +2,8 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { renderWorkbenchRoute } from '../app/test-utils'
-import { saveAdminSession } from '../features/auth/session'
+import { readAdminSession } from '../features/auth/session'
+import { seedAdminSession } from '../test/adminSession'
 import { formatDateTime } from '../lib/format'
 
 function hexId(prefix: string, value: number) {
@@ -34,7 +35,8 @@ function policyRecord(value: number, createdAt: string) {
 describe('workbench page table ordering', () => {
   beforeEach(() => {
     window.sessionStorage.clear()
-    saveAdminSession('admin', 'Basic test')
+    window.localStorage.clear()
+    seedAdminSession()
   })
 
   afterEach(() => {
@@ -98,7 +100,7 @@ describe('workbench page table ordering', () => {
       vi.fn(async (input: RequestInfo | URL) => {
         const path = typeof input === 'string' ? input : input.toString()
         if (path.endsWith('/api/admin-auth/status')) {
-          return new Response(JSON.stringify({ enabled: true }))
+          return new Response(JSON.stringify({ enabled: true, session: readAdminSession() }))
         }
         if (path.endsWith('/api/claims')) {
           return new Response(JSON.stringify(allClaims))
@@ -182,7 +184,7 @@ describe('workbench page table ordering', () => {
       vi.fn(async (input: RequestInfo | URL) => {
         const path = typeof input === 'string' ? input : input.toString()
         if (path.endsWith('/api/admin-auth/status')) {
-          return new Response(JSON.stringify({ enabled: true }))
+          return new Response(JSON.stringify({ enabled: true, session: readAdminSession() }))
         }
         if (path.endsWith('/api/agents')) {
           return new Response(JSON.stringify([...agents, mostRecent]))
@@ -240,7 +242,7 @@ describe('workbench page table ordering', () => {
       vi.fn(async (input: RequestInfo | URL) => {
         const path = typeof input === 'string' ? input : input.toString()
         if (path.endsWith('/api/admin-auth/status')) {
-          return new Response(JSON.stringify({ enabled: true }))
+          return new Response(JSON.stringify({ enabled: true, session: readAdminSession() }))
         }
         if (path.endsWith('/api/agents')) {
           return new Response(JSON.stringify(agents))
@@ -404,7 +406,7 @@ describe('workbench page table ordering', () => {
       vi.fn(async (input: RequestInfo | URL) => {
         const path = typeof input === 'string' ? input : input.toString()
         if (path.endsWith('/api/admin-auth/status')) {
-          return new Response(JSON.stringify({ enabled: true }))
+          return new Response(JSON.stringify({ enabled: true, session: readAdminSession() }))
         }
         if (path.endsWith('/api/policies')) {
           return new Response(

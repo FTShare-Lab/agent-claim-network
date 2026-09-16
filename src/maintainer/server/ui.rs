@@ -53,8 +53,11 @@ pub async fn docs_asset(
     serve_file(asset_path, content_type).await
 }
 
-pub async fn health() -> StatusCode {
-    StatusCode::OK
+pub async fn health(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    crate::health::respond(state.maintainer_team_auth_enabled, &state.auth_store, body).await
 }
 
 async fn serve_file(

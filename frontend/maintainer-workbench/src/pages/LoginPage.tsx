@@ -1,5 +1,6 @@
 import { type FormEvent, type ReactNode, useEffect, useMemo, useState } from 'react'
 import { ArrowRight, Eye, ShieldCheck } from 'lucide-react'
+import { useQueryClient } from '@tanstack/react-query'
 import { Navigate, useLocation, useNavigate } from 'react-router'
 
 import { getAdminAuthStatus, readAdminSession, subscribeAdminSession, verifyAdminCredentials } from '../features/auth/session'
@@ -19,14 +20,15 @@ export function RequireAdminAuth({ children }: { children: ReactNode }) {
 
 function AdminAuthGuard({ children }: { children: ReactNode }) {
   const location = useLocation()
+  const queryClient = useQueryClient()
   const [session, setSession] = useState(() => readAdminSession())
   const [authEnabled, setAuthEnabled] = useState<boolean | null>(null)
 
-  useEffect(() => subscribeAdminSession(() => setSession(readAdminSession())), [])
+  useEffect(() => subscribeAdminSession(() => {
+    queryClient.clear()
+    setSession(readAdminSession())
+  }), [queryClient])
   useEffect(() => {
-    if (session) {
-      return
-    }
     let active = true
     getAdminAuthStatus()
       .then((status) => {
@@ -38,11 +40,18 @@ function AdminAuthGuard({ children }: { children: ReactNode }) {
     return () => {
       active = false
     }
-  }, [session])
+  }, [])
 
-  if (session) {
-    return children
-  }
+  useEffect(() => {
+    const refresh = () => { void getAdminAuthStatus().catch(() => {}) }
+    window.addEventListener('focus', refresh)
+    const timer = session ? window.setTimeout(refresh,
+      Math.max(0, Math.min(session.expires_at * 1000 - Date.now(), 2_147_483_647))) : undefined
+    return () => {
+      window.removeEventListener('focus', refresh)
+      window.clearTimeout(timer)
+    }
+  }, [session])
 
   if (authEnabled === null) {
     return (
@@ -55,7 +64,7 @@ function AdminAuthGuard({ children }: { children: ReactNode }) {
     )
   }
 
-  if (authEnabled) {
+  if (authEnabled && !session) {
     return <Navigate to="/login" state={{ from: location }} replace />
   }
 
@@ -70,7 +79,8 @@ export function LoginPage() {
 function AdminLoginPage() {
   const location = useLocation()
   const navigate = useNavigate()
-  const session = readAdminSession()
+  const [session, setSession] = useState(() => readAdminSession())
+  useEffect(() => subscribeAdminSession(() => setSession(readAdminSession())), [])
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [isPasswordVisible, setIsPasswordVisible] = useState(false)
@@ -111,6 +121,7 @@ function AdminLoginPage() {
         setError('Incorrect username or password')
         return
       }
+      setPassword('')
       navigate(redirectTo, { replace: true })
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Sign-in failed. Please try again later.')

@@ -177,6 +177,10 @@ Policy 消息自包含完整 payload；Agent 不需要也不允许直接读取 M
 
 - LLM、Web、MCP bearer 与 Team Auth secret 从环境变量读取；通过 `acn mcp login` 获得的 MCP OAuth token 按 server 配置保存在系统 keyring，或 selected upstream runtime 下权限受限的 `.mcp-oauth/` 目录。
 - Team Auth 请求使用带 `agent_id` 与 key 的信封；服务端可按配置启用校验。
-- Maintainer 管理页面与管理 API 可以启用独立 Basic Auth。
+- Maintainer 管理页面与管理 API 可启用独立的管理员鉴权。Workbench 登录后通过 Cookie 保持登录，不保存管理员密码；Agent 仍使用团队 Key 鉴权。
 - Router/Maintainer 网络错误按可重试性分类并进入 warning；本地持久化失败仍是当前操作的硬错误。
 - Router 派生状态、session search SQLite 和 history current 文件都可从权威数据恢复。
+
+### 公开健康检查
+
+Maintainer 与 Router 的 `/health` 无需登录，返回服务状态和团队鉴权是否开启。携带 Agent ID 和团队 Key 时，还会返回鉴权是否通过；鉴权失败不影响健康检查的 HTTP 状态码。用法见 [健康检查说明](health.md)。

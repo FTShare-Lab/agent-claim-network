@@ -2,7 +2,8 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { renderWorkbenchRoute } from '../app/test-utils'
-import { saveAdminSession } from '../features/auth/session'
+import { readAdminSession } from '../features/auth/session'
+import { seedAdminSession } from '../test/adminSession'
 import type { ClaimView } from '../features/claims/types'
 import type {
   ArbitrationAnalysisDetail,
@@ -345,6 +346,7 @@ function buildFetch(overrides?: {
 }) {
   return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = typeof input === 'string' ? input : input.toString()
+        if (path.endsWith('/api/admin-auth/status')) return new Response(JSON.stringify({ enabled: true, session: readAdminSession() }))
     const method = init?.method ?? 'GET'
     if (path === '/api/disputes') return new Response(JSON.stringify([resolvedDispute, openDispute]))
     if (path === '/api/claims') return new Response(JSON.stringify(claimsResponse))
@@ -431,7 +433,8 @@ function buildFetch(overrides?: {
 describe('DisputesPage', () => {
   beforeEach(() => {
     window.sessionStorage.clear()
-    saveAdminSession('admin', 'Basic test')
+    window.localStorage.clear()
+    seedAdminSession()
     vi.stubGlobal('fetch', buildFetch())
   })
 
@@ -541,6 +544,7 @@ describe('DisputesPage', () => {
     let analysisStarted = false
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = typeof input === 'string' ? input : input.toString()
+        if (path.endsWith('/api/admin-auth/status')) return new Response(JSON.stringify({ enabled: true, session: readAdminSession() }))
       const method = init?.method ?? 'GET'
       if (path === '/api/disputes/dispute_open/analyses' && method === 'POST') {
         analysisStarted = true

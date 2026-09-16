@@ -1,7 +1,8 @@
 import { cleanup, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { saveAdminSession } from '../features/auth/session'
+import { readAdminSession } from '../features/auth/session'
+import { seedAdminSession } from '../test/adminSession'
 import { renderWorkbenchRoute } from './test-utils'
 
 const agent = {
@@ -184,13 +185,14 @@ const overviewResponse = {
 describe('route state shortcuts', () => {
   beforeEach(() => {
     window.sessionStorage.clear()
-    saveAdminSession('admin', 'Basic test')
+    window.localStorage.clear()
+    seedAdminSession()
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: RequestInfo | URL) => {
         const path = typeof input === 'string' ? input : input.toString()
         if (path.endsWith('/api/admin-auth/status')) {
-          return new Response(JSON.stringify({ enabled: true }))
+          return new Response(JSON.stringify({ enabled: true, session: readAdminSession() }))
         }
         if (path.endsWith('/api/agents')) {
           return new Response(JSON.stringify([agent]))

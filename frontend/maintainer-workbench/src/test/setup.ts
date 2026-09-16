@@ -27,3 +27,13 @@ if (NativeRequest) {
   }
   globalThis.Request = CompatibleRequest
 }
+
+// jsdom 未提供 Web Locks；以串行队列模拟同源锁，不跳过并发顺序。
+let authLock = Promise.resolve<unknown>(undefined)
+Object.defineProperty(navigator, 'locks', { configurable: true, value: {
+  request: (_name: string, callback: () => Promise<unknown>) => {
+    const result = authLock.then(callback)
+    authLock = result.catch(() => {})
+    return result
+  },
+} })

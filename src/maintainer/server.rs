@@ -222,7 +222,7 @@ pub(crate) fn build_app() -> AxumRouter<AppState> {
         .route("/app/assets/{*path}", get(ui::asset))
         .route("/favicon.svg", get(ui::favicon))
         .route("/app/favicon.svg", get(ui::favicon))
-        .route("/health", get(ui::health))
+        .route("/health", get(ui::health).post(ui::health))
         .route("/status", get(api::status_snapshot))
         .route("/actions", get(api::actions))
         .route("/send_log", get(api::send_log))
@@ -240,6 +240,8 @@ pub(crate) fn build_app() -> AxumRouter<AppState> {
         .route("/maintenance/sweep", post(api::run_sweep))
         .route("/disputes/{id}/resolve", post(api::resolve_dispute))
         .route("/api/admin-auth/check", post(auth::check_admin_auth))
+        .route("/api/admin-auth/login", post(auth::login_admin))
+        .route("/api/admin-auth/logout", post(auth::logout_admin))
         .route("/api/admin-auth/status", get(auth::admin_auth_status))
         .route("/api/overview", get(api::overview))
         .route("/api/disputes", get(api::list_disputes))
@@ -320,6 +322,26 @@ mod tests {
     use crate::config::MaintainerAdminAuthConfig;
     use crate::router::Router;
 
+    #[tokio::test]
+    async fn health_reports_maintainer_team_auth_independently_of_admin_auth() {
+        for enabled in [false, true] {
+            let team = tempfile::tempdir().unwrap();
+            let (mut state, _) = admin_auth_state(&team);
+            state.maintainer_team_auth_enabled = enabled;
+            state.auth = AuthVerifier::from_key_store_path(state.auth_store.path(), enabled)
+                .await
+                .unwrap();
+            let store = state.auth_store.clone();
+            let app = build_app()
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    auth::admin_auth_middleware,
+                ))
+                .with_state(state);
+            crate::health::tests::assert_health_routes(app, &store, enabled).await;
+        }
+    }
+
     #[test]
     fn default_frontend_path_falls_back_beside_install_prefix() {
         let executable = Path::new("/opt/homebrew/Cellar/acn/0.2.0/bin/acn-maintainer");
@@ -351,7 +373,7 @@ mod tests {
         );
     }
 
-    fn admin_auth_state(team: &tempfile::TempDir) -> (AppState, Arc<Maintainer>) {
+    pub(super) fn admin_auth_state(team: &tempfile::TempDir) -> (AppState, Arc<Maintainer>) {
         let maintainer = Arc::new(Maintainer::new(
             team.path().to_path_buf(),
             chrono::Duration::days(7),
@@ -376,13 +398,14 @@ mod tests {
                 username: "admin".to_string(),
                 password_env: "TEST_ADMIN_PASSWORD".to_string(),
                 password: Some("secret".to_string()),
+                ..Default::default()
             })
             .unwrap(),
         };
         (state, maintainer)
     }
 
-    fn basic_auth(username: &str, password: &str) -> String {
+    pub(super) fn basic_auth(username: &str, password: &str) -> String {
         let encoded =
             base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
         format!("Basic {encoded}")
@@ -1057,3 +1080,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "server/auth_session_tests.rs"]
+mod auth_session_tests;

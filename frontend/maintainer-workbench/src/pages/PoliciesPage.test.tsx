@@ -2,7 +2,8 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { renderWorkbenchRoute } from '../app/test-utils'
-import { saveAdminSession } from '../features/auth/session'
+import { readAdminSession } from '../features/auth/session'
+import { seedAdminSession } from '../test/adminSession'
 import { formatDateTime } from '../lib/format'
 
 const targetedPolicy = {
@@ -146,12 +147,14 @@ const overviewResponse = {
 describe('PoliciesPage', () => {
   beforeEach(() => {
     window.sessionStorage.clear()
-    saveAdminSession('admin', 'Basic test')
+    window.localStorage.clear()
+    seedAdminSession()
     vi.spyOn(Date, 'now').mockReturnValue(new Date('2026-05-20T00:00:00Z').getTime())
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const path = typeof input === 'string' ? input : input.toString()
+        if (path.endsWith('/api/admin-auth/status')) return new Response(JSON.stringify({ enabled: true, session: readAdminSession() }))
         if (path.endsWith('/api/policies')) {
           return new Response(JSON.stringify(policiesResponse))
         }

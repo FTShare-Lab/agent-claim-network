@@ -1657,6 +1657,11 @@ pub struct MaintainerAdminAuthConfig {
     /// 仅由环境变量注入，配置文件不持久化。
     #[serde(skip)]
     pub password: Option<String>,
+    /// 管理台 Cookie 的绝对有效期，不随请求续期。
+    #[serde(default = "default_admin_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+    #[serde(default = "default_admin_cookie_secure")]
+    pub cookie_secure: bool,
 }
 
 impl std::fmt::Debug for MaintainerAdminAuthConfig {
@@ -1665,9 +1670,18 @@ impl std::fmt::Debug for MaintainerAdminAuthConfig {
             .field("enabled", &self.enabled)
             .field("username", &self.username)
             .field("password_env", &self.password_env)
+            .field("session_ttl_secs", &self.session_ttl_secs)
+            .field("cookie_secure", &self.cookie_secure)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .finish()
     }
+}
+
+fn default_admin_session_ttl_secs() -> u64 {
+    7 * 24 * 60 * 60
+}
+fn default_admin_cookie_secure() -> bool {
+    false
 }
 
 impl Default for MaintainerAdminAuthConfig {
@@ -1677,6 +1691,8 @@ impl Default for MaintainerAdminAuthConfig {
             username: default_maintainer_admin_auth_username(),
             password_env: default_maintainer_admin_auth_password_env(),
             password: None,
+            session_ttl_secs: default_admin_session_ttl_secs(),
+            cookie_secure: default_admin_cookie_secure(),
         }
     }
 }
@@ -5044,6 +5060,7 @@ retry_max_delay_ms = 20
             username: "admin".to_string(),
             password_env: "ACN_MAINTAINER_ADMIN_PASSWORD".to_string(),
             password: Some("secret".to_string()),
+            ..Default::default()
         };
 
         let debug = format!("{cfg:?}");

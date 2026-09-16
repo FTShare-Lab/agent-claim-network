@@ -13,6 +13,22 @@ Workbench 面向 Maintainer 管理员，提供以下区域：
 - Team Auth：Agent 团队访问 key
 - HTTP Audits / Settings：请求审计、运行状态和 endpoint 目录
 
+## 管理员登录与验收
+
+启用管理员鉴权后，Workbench 使用服务端签发的 HttpOnly Cookie，默认有效期为 7 天。有效期内关闭标签、重开或重启浏览器均可恢复登录；退出会撤销会话并同步其他同源标签。前端不保存管理员密码。配置与服务重启失效边界见 [配置说明](../../docs/config_parameters.md#maintainerauthadmin)。
+
+在仓库根目录运行以下命令。需已安装 `agent-browser` 及其浏览器运行时；验收会创建临时服务、独立 profile 和测试密码，结束后清理，不读取真实团队配置。
+
+```bash
+if [[ -f export_env.sh ]]; then source export_env.sh; fi
+cargo build --bins --examples
+npm --prefix frontend/maintainer-workbench run build
+target/debug/examples/auth_cookie_smoke
+target/debug/examples/auth_cookie_smoke --localhost
+```
+
+默认通过指向本机的保留域名测试真正的普通 HTTP（确认无 Web Locks 和 randomUUID），并验证跨标签的 IndexedDB 协调；`--localhost` 复验安全上下文路径。脚本覆盖 HttpOnly / 无密码存储、新标签共享、标签关闭重开、浏览器进程重启、仅凭 Cookie 恢复、退出同步、服务重启失效、空闲过期和重新登录。迟到 401 与并发登录/注销顺序由前端会话测试覆盖，服务端撤销和 Agent 团队鉴权隔离由 Rust 路由测试覆盖。
+
 ## 知识树
 
 侧栏 Claims 上方的 **Claims Flow**（`/app/knowledge-tree`）提供团队知识的树状视图：

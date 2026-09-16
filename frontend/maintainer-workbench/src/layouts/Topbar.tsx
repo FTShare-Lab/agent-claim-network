@@ -6,7 +6,7 @@ import { useLocation, useNavigate } from 'react-router'
 import { formatDateTime } from '../lib/format'
 import { isStaticDemo } from '../lib/runtime'
 import { useWorkbenchUiStore } from '../app/store'
-import { clearAdminSession } from '../features/auth/session'
+import { logoutAdmin } from '../features/auth/session'
 
 export function Topbar() {
   const queryClient = useQueryClient()
@@ -15,6 +15,8 @@ export function Topbar() {
   const lastUpdatedAt = useWorkbenchUiStore((state) => state.lastUpdatedAt)
   const markUpdated = useWorkbenchUiStore((state) => state.markUpdated)
   const openMobileNav = useWorkbenchUiStore((state) => state.openMobileNav)
+  const [signOutError, setSignOutError] = useState<string | null>(null)
+  const [isSigningOut, setIsSigningOut] = useState(false)
   const [isRefreshing, setIsRefreshing] = useState(false)
   const daemonPort =
     window.location.port || (window.location.protocol === 'https:' ? '443' : '80')
@@ -34,10 +36,18 @@ export function Topbar() {
     }
   }
 
-  function handleSignOut() {
-    clearAdminSession()
-    queryClient.clear()
-    navigate('/login', { replace: true })
+  async function handleSignOut() {
+    setIsSigningOut(true)
+    setSignOutError(null)
+    try {
+      await logoutAdmin()
+      queryClient.clear()
+      navigate('/login', { replace: true })
+    } catch (error) {
+      setSignOutError(error instanceof Error ? error.message : 'Sign-out failed. Please retry.')
+    } finally {
+      setIsSigningOut(false)
+    }
   }
 
   return (
@@ -101,6 +111,7 @@ export function Topbar() {
             <button
               type="button"
               onClick={handleSignOut}
+              disabled={isSigningOut}
               title="Sign out"
               className="acn-interactive inline-flex h-10 items-center justify-center gap-1.5 rounded-xl px-2.5 text-xs font-semibold text-slate-500 hover:bg-rose-50 hover:text-rose-700 sm:px-3"
             >
@@ -108,6 +119,7 @@ export function Topbar() {
               <span className="hidden sm:inline">Sign out</span>
             </button>
           ) : null}
+          {signOutError ? <span role="alert">{signOutError}</span> : null}
           <span className="sr-only" aria-live="polite">
             {isRefreshing ? 'Refreshing workbench data' : 'Workbench data ready'}
           </span>

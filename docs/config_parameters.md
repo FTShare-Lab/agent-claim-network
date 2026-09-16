@@ -351,8 +351,12 @@ background-shell 其余时序、容量和 PTY 参数是 `config.rs` 内部默认
 ### `[maintainer.auth.admin]`
 
 - `enabled`：是否启用 maintainer 管理台管理员鉴权。默认值：`false`。
-- `username`：Basic Auth 用户名。默认值：`admin`。
-- `password_env`：Basic Auth 密码所在的环境变量名；启用鉴权时该环境变量必须存在且非空。默认值：`ACN_MAINTAINER_ADMIN_PASSWORD`。
+- `username`：管理员用户名。默认值：`admin`。
+- `password_env`：管理员密码所在的环境变量名；启用鉴权时该环境变量必须存在且非空。默认值：`ACN_MAINTAINER_ADMIN_PASSWORD`。
+- `session_ttl_secs`：登录有效期，单位秒，默认 `604800`（7 天），范围 `1`～`31536000`；到期后需重新登录，访问不续期。
+- `cookie_secure`：默认 `false`，允许 HTTP 和 HTTPS；设为 `true` 后，登录 Cookie 仅通过 HTTPS 发送。
+
+Workbench 不保存管理员密码。有效期内，关闭页面、重启浏览器后仍保持登录；退出登录会同步其他标签页。Maintainer 服务重启后需要重新登录。其他管理客户端仍可使用 Basic Auth，Agent 的团队 Key 鉴权不受影响。
 
 ### `[maintainer.auth.team]`
 
@@ -418,3 +422,7 @@ Maintainer 启动时会自动 ensure `router-service` 内部 key：hash 写在 `
 - `[router.embedding].api_key_env`：真实 embedding 路径必需，配置为要读取的 embedding API key 环境变量名。
 - `[router.rerank].api_key_env`：`provider = "openai_chat"`、`provider = "openai_responses"` 或 `provider = "anthropic"` 时必需，配置为要读取的远端重排服务 API key 环境变量名。
 - `[maintainer.auth.admin].password_env`：启用 maintainer 管理台管理员鉴权时必需，配置为要读取的 Basic Auth 密码环境变量名。
+
+## 服务健康检查
+
+Maintainer 与 Router 的 `/health` 无需登录，可查看服务状态、团队鉴权开关及所提供凭据是否有效。请求示例见 [健康检查说明](health.md)。

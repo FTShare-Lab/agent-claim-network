@@ -1876,6 +1876,7 @@ mod tests {
             username: "admin".to_string(),
             password_env: "TEST_ADMIN_PASSWORD".to_string(),
             password: Some("secret".to_string()),
+            ..Default::default()
         })
         .unwrap()
     }

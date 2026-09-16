@@ -35,7 +35,7 @@ pub async fn serve(router: Arc<Router>, listen: &str, auth: AuthVerifier) -> any
 fn build_app(router: Arc<Router>, auth: AuthVerifier) -> AxumRouter {
     let auth_store = TeamAuthStore::new(paths::team_store_auth_keys_path(router.team_root()));
     AxumRouter::new()
-        .route("/health", get(health))
+        .route("/health", get(health).post(health))
         .route("/claims/query", post(query_claims))
         .route("/claims/scopes/overview", post(scopes_overview))
         .with_state(RouterState {
@@ -45,8 +45,11 @@ fn build_app(router: Arc<Router>, auth: AuthVerifier) -> AxumRouter {
         })
 }
 
-async fn health() -> StatusCode {
-    StatusCode::OK
+async fn health(
+    State(state): State<RouterState>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    crate::health::respond(state.auth.is_enabled(), &state.auth_store, body).await
 }
 
 async fn query_claims(
@@ -165,6 +168,19 @@ mod tests {
     use crate::claim::{AgentId, Claim, ClaimId, ClaimStatus, Confidence};
     use crate::router::derived_views::RouterDerivedViewsSnapshot;
     use crate::storage::{paths, read_yaml, write_yaml_atomic};
+
+    #[tokio::test]
+    async fn health_reports_router_team_auth_without_enforcing_access() {
+        for enabled in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = TeamAuthStore::new(paths::team_store_auth_keys_path(dir.path()));
+            let verifier = AuthVerifier::from_key_store_path(store.path(), enabled)
+                .await
+                .unwrap();
+            let app = build_app(Arc::new(Router::new(dir.path().to_path_buf())), verifier);
+            crate::health::tests::assert_health_routes(app, &store, enabled).await;
+        }
+    }
 
     fn sample_claim(agent: &AgentId) -> Claim {
         Claim {

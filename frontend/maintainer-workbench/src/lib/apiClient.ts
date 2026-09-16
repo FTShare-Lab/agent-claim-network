@@ -42,17 +42,19 @@ async function request<T>(
   const session = readAdminSession()
   const response = await fetch(`${path}${buildQuery(query)}`, {
     ...init,
+    credentials: 'same-origin',
+    cache: 'no-store',
     headers: {
       'Content-Type': 'application/json',
       'X-ACN-Workbench': '1',
-      ...(session ? { Authorization: session.authorization } : {}),
+      ...(session ? { 'X-ACN-Admin-Session': session.id } : {}),
       ...(init?.headers ?? {}),
     },
   })
 
   if (!response.ok) {
     if (response.status === 401) {
-      clearAdminSession()
+      clearAdminSession(session?.id)
     }
     const text = await response.text()
     throw new ApiError(
