@@ -51,9 +51,10 @@ use super::{
     SessionFinalizeOnceOutcome, SessionFinalizePreemptionControl,
     SessionRecapBackgroundProcessProjection, SessionRecapPreemptionControl,
     SessionTurnCommittedPostCommitError, TurnJournalEmitter, TurnJournalSink,
-    COMPACTED_FILE_WORKSET_MAX_JSON_CHARS_PER_KIND, COMPACTED_FILE_WORKSET_MAX_PATHS_PER_KIND,
-    COMPACTED_FILE_WORKSET_MAX_PATH_CHARS, COMPACTION_CHECKPOINT_SCHEMA_VERSION,
-    DELEGATION_PROJECTION_MAX_CHARS, DELEGATION_PROJECTION_MAX_ITEMS, MEDIA_BLOCK_ESTIMATED_TOKENS,
+    CLAIM_CATALOG_HEADING, COMPACTED_FILE_WORKSET_MAX_JSON_CHARS_PER_KIND,
+    COMPACTED_FILE_WORKSET_MAX_PATHS_PER_KIND, COMPACTED_FILE_WORKSET_MAX_PATH_CHARS,
+    COMPACTION_CHECKPOINT_SCHEMA_VERSION, DELEGATION_PROJECTION_MAX_CHARS,
+    DELEGATION_PROJECTION_MAX_ITEMS, MEDIA_BLOCK_ESTIMATED_TOKENS,
 };
 use crate::agent::{
     InboxReader, LocalClaimStore, MemoryStore, ReportedDisputeClaimSetStore, SessionRuntimeStatus,
@@ -2525,8 +2526,9 @@ async fn claim_catalog_is_bounded_and_details_remain_readable_after_startup() {
     let frozen = tokio::fs::read_to_string(&report.session.paths.system_prompt)
         .await
         .unwrap();
+    // 与 resume 旧快照判定共用同一个标题常量，模板改标题时这里会先失败。
     let catalog = frozen
-        .split_once("# 你的自有 claims 目录\n")
+        .split_once(&format!("{CLAIM_CATALOG_HEADING}\n"))
         .unwrap()
         .1
         .split_once("```json\n")
@@ -2769,6 +2771,29 @@ async fn resume_inbox_refresh_reports_configured_team_status() {
         SessionEvent::TeamServicesConnectionUpdated { status }
             if *status == report.team_services
     )));
+}
+
+#[tokio::test]
+async fn resume_warns_only_when_frozen_prompt_predates_claim_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (engine, store) = build_test_engine(&dir, provider);
+    let is_legacy_warning = |event: &SessionEvent| matches!(event, SessionEvent::Warning { message } if message.contains("创建于旧版本"));
+
+    // create_test_session 写入的固定 prompt 不含 claim 目录标题，等价于升级前的冻结快照。
+    let legacy = create_test_session(&store, "session_1234abcd").await;
+    let mut events = Vec::new();
+    engine
+        .process_inbox_for_resume(&legacy, |event| events.push(event))
+        .await;
+    assert!(events.iter().any(is_legacy_warning));
+
+    let current = engine.start_session(1, |_| {}).await.unwrap().session;
+    let mut events = Vec::new();
+    engine
+        .process_inbox_for_resume(&current, |event| events.push(event))
+        .await;
+    assert!(!events.iter().any(is_legacy_warning));
 }
 
 fn test_message(

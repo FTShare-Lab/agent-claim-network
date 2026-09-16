@@ -734,14 +734,15 @@ impl SessionTuiState {
     pub(super) fn claim_panel_visible(&self) -> bool {
         self.claim_panel.visible()
     }
-    pub(super) fn paste_claim_panel(&mut self, pasted: &str) -> bool {
-        self.claim_panel.handle_paste(pasted)
+    pub(super) fn paste_claim_panel(&mut self, pasted: &str) {
+        self.claim_panel.handle_paste(pasted);
     }
     pub(super) fn handle_claim_panel_key(
         &mut self,
         key: crossterm::event::KeyEvent,
+        width: u16,
     ) -> ClaimPanelAction {
-        self.claim_panel.handle_key(key)
+        self.claim_panel.handle_key(key, width)
     }
     pub(super) fn set_claim_panel_claim_page(&mut self, page: crate::agent::claims::ClaimListPage) {
         self.claim_panel.set_claim_page(page);

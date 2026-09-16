@@ -1025,6 +1025,9 @@ fn assistant_turn_message(
                 .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
                 .filter_map(|block| api_block_to_session_turn_block(block).ok()),
         );
+        if turn.final_stop_reason == "max_tokens" {
+            mark_token_limited_tool_use(&turn.final_blocks, &mut content);
+        }
         content
     } else if !turn.merged_text.trim().is_empty() {
         vec![SessionTurnContentBlock::text(turn.merged_text.clone())]
@@ -1085,6 +1088,35 @@ fn assistant_turn_message(
         }),
         content,
     })
+}
+
+/// max_tokens 打断 tool_use 时，Anthropic 仍以合法 JSON 返回该 block，但 `input` 只是残缺或空
+/// 对象。最后一个 block 若是 tool_use，就把它标成可恢复的 InvalidToolUse：工具循环回一条错误
+/// tool_result 让模型重试，结构化输出调用方按形状错误处理，而不是把残缺参数当作完整结果。
+fn mark_token_limited_tool_use(final_blocks: &[Value], content: &mut [SessionTurnContentBlock]) {
+    let last_is_tool_use = final_blocks
+        .last()
+        .is_some_and(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"));
+    if !last_is_tool_use {
+        return;
+    }
+    let Some(last_call) = content.iter_mut().rev().find(|block| {
+        matches!(
+            block,
+            SessionTurnContentBlock::ToolUse { .. }
+                | SessionTurnContentBlock::InvalidToolUse { .. }
+        )
+    }) else {
+        return;
+    };
+    if let SessionTurnContentBlock::ToolUse { id, name, .. } = last_call {
+        let (id, name) = (std::mem::take(id), std::mem::take(name));
+        *last_call = SessionTurnContentBlock::InvalidToolUse {
+            id,
+            name,
+            error: "tool_use 参数在 max_tokens 处被截断，不是完整调用".into(),
+        };
+    }
 }
 
 /// Anthropic 要求历史中的 `tool_use.input` 也是 object。模型若返回合法 JSON
@@ -2056,7 +2088,7 @@ mod tests {
         let turn = ContinuedAssistantTurn {
             final_response: json!({}),
             final_blocks: replay_message["content"].as_array().unwrap().clone(),
-            final_stop_reason: "max_tokens".into(),
+            final_stop_reason: "tool_use".into(),
             merged_text: String::new(),
             replay_messages: vec![replay_message],
         };
@@ -2861,6 +2893,73 @@ mod tests {
             provider_stop_from_turn(&turn).unwrap(),
             ProviderStop::ToolUse
         );
+    }
+
+    #[test]
+    fn max_tokens_truncated_trailing_tool_use_becomes_recoverable_invalid_call() {
+        let turn = ContinuedAssistantTurn {
+            final_response: json!({}),
+            final_blocks: vec![
+                json!({
+                    "type": "tool_use",
+                    "id": "toolu_done",
+                    "name": "file_read",
+                    "input": {"path": "README.md"}
+                }),
+                json!({
+                    "type": "tool_use",
+                    "id": "toolu_cut",
+                    "name": "return_structured_result",
+                    "input": {}
+                }),
+            ],
+            final_stop_reason: "max_tokens".into(),
+            merged_text: String::new(),
+            replay_messages: Vec::new(),
+        };
+
+        let message = assistant_turn_message(&turn, "test-model").unwrap();
+
+        assert!(matches!(
+            message.content.as_slice(),
+            [
+                SessionTurnContentBlock::ToolUse { id: done, .. },
+                SessionTurnContentBlock::InvalidToolUse { id: cut, error, .. },
+            ] if done == "toolu_done" && cut == "toolu_cut" && error.contains("max_tokens")
+        ));
+        assert_eq!(
+            provider_stop_from_turn(&turn).unwrap(),
+            ProviderStop::ToolUse
+        );
+    }
+
+    #[test]
+    fn max_tokens_after_complete_tool_use_keeps_the_call_executable() {
+        let turn = ContinuedAssistantTurn {
+            final_response: json!({}),
+            final_blocks: vec![
+                json!({
+                    "type": "tool_use",
+                    "id": "toolu_done",
+                    "name": "file_read",
+                    "input": {"path": "README.md"}
+                }),
+                json!({"type": "text", "text": "然后"}),
+            ],
+            final_stop_reason: "max_tokens".into(),
+            merged_text: "然后".into(),
+            replay_messages: Vec::new(),
+        };
+
+        let message = assistant_turn_message(&turn, "test-model").unwrap();
+
+        assert!(matches!(
+            message.content.as_slice(),
+            [
+                SessionTurnContentBlock::Text { .. },
+                SessionTurnContentBlock::ToolUse { id, .. },
+            ] if id == "toolu_done"
+        ));
     }
 
     #[test]

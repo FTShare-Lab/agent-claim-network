@@ -7,7 +7,7 @@ use std::ops::Range;
 
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct VisualLine {
@@ -108,6 +108,54 @@ fn hard_wrap_styled_line(line: Line<'static>, width: usize) -> Vec<Line<'static>
         out.push(Line::from(current_spans).style(line_style));
     }
     out
+}
+
+/// 按显示宽度截断，超出时以 `…` 结尾；面板的单行 row 用它保证 row 不被折成多行。
+pub(super) fn truncate_width(text: &str, width: u16) -> String {
+    let width = usize::from(width.max(1));
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_string();
+    }
+    if width <= 1 {
+        return "…".into();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let next = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used.saturating_add(next) >= width {
+            break;
+        }
+        out.push(ch);
+        used = used.saturating_add(next);
+    }
+    out.push('…');
+    out
+}
+
+/// 把一组 span 压成恰好不超过 `width` 显示列的一行，越界的 span 被截断或丢弃。
+pub(super) fn fit_spans_to_width(spans: Vec<Span<'static>>, width: u16) -> Line<'static> {
+    let max_width = usize::from(width.max(1));
+    let mut used = 0usize;
+    let mut fitted = Vec::new();
+    for span in spans {
+        let content = span.content.as_ref();
+        let span_width = UnicodeWidthStr::width(content);
+        if used.saturating_add(span_width) <= max_width {
+            used = used.saturating_add(span_width);
+            fitted.push(span);
+            continue;
+        }
+        let remaining = max_width.saturating_sub(used);
+        if remaining > 0 {
+            fitted.push(Span::styled(
+                truncate_width(content, u16::try_from(remaining).unwrap_or(u16::MAX)),
+                span.style,
+            ));
+        }
+        break;
+    }
+    Line::from(fitted)
 }
 
 fn push_wrapped_logical_line(

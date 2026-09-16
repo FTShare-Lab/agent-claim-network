@@ -10,7 +10,7 @@ use crate::claim::{ClaimId, ClaimStatus, Confidence, TraceId};
 
 use super::composer::ComposerState;
 use super::theme::{accent_style, blue_style, muted_style, surface_style};
-use super::wrapping::hard_wrap_styled_lines;
+use super::wrapping::{fit_spans_to_width, hard_wrap_styled_lines, truncate_width};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ClaimPanelAction {
@@ -203,19 +203,17 @@ impl Default for ClaimPanelState {
 }
 
 impl ClaimPanelState {
-    pub(super) fn handle_paste(&mut self, pasted: &str) -> bool {
+    pub(super) fn handle_paste(&mut self, pasted: &str) {
         if self.loading {
-            return false;
+            return;
         }
         if let Some(search) = &mut self.search {
             search.push_text(pasted);
-            return true;
+            return;
         }
         if let ClaimPanelView::Edit(edit) = &mut self.view {
             edit.composer.push_text(pasted);
-            return true;
         }
-        false
     }
     pub(super) fn visible(&self) -> bool {
         self.visible
@@ -226,10 +224,8 @@ impl ClaimPanelState {
         self.loading = true;
     }
     pub(super) fn close(&mut self) {
+        // 面板不可见时没有任何读取点：渲染和响应内化都以 `visible` 为门，`open()` 会整体重置。
         self.visible = false;
-        self.loading = false;
-        self.view = ClaimPanelView::List;
-        self.notice = None;
     }
     pub(super) fn set_claim_page(&mut self, page: crate::agent::claims::ClaimListPage) {
         if page.offset == 0 {
@@ -293,11 +289,13 @@ impl ClaimPanelState {
         if let Some(row) = self.rows.iter_mut().find(|row| row.id == claim.claim.id) {
             *row = ClaimSummary::from_claim(&claim.claim);
         }
+        self.scroll.set(0);
         self.view = ClaimPanelView::Detail(claim);
         self.notice = notice.or_else(|| Some("Claim 已保存。".into()));
     }
 
-    pub(super) fn handle_key(&mut self, key: KeyEvent) -> ClaimPanelAction {
+    /// `width` 是当前终端渲染宽度，Edit 视图的竖直光标移动按它折行定位。
+    pub(super) fn handle_key(&mut self, key: KeyEvent, width: u16) -> ClaimPanelAction {
         if self.loading {
             if key.code == KeyCode::Esc
                 || (matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
@@ -394,7 +392,10 @@ impl ClaimPanelState {
                 _ => scroll_key(&self.scroll, key),
             },
             ClaimPanelView::Traces { claim, rows } => match key.code {
-                KeyCode::Esc => self.view = ClaimPanelView::Detail(claim.clone()),
+                KeyCode::Esc => {
+                    let claim = claim.clone();
+                    self.set_claim(claim);
+                }
                 KeyCode::Up => self.trace_selected = self.trace_selected.saturating_sub(1),
                 KeyCode::Down => {
                     self.trace_selected =
@@ -421,7 +422,7 @@ impl ClaimPanelState {
             ClaimPanelView::Trace { claim, trace } => match key.code {
                 KeyCode::Esc => {
                     let claim = claim.clone();
-                    self.view = ClaimPanelView::Detail(claim);
+                    self.set_claim(claim);
                 }
                 KeyCode::Char('n') if key.modifiers == KeyModifiers::NONE => {
                     if let Some(task_offset) = trace.next_task_offset {
@@ -450,7 +451,11 @@ impl ClaimPanelState {
                     }
                 } else {
                     match key.code {
-                        KeyCode::Esc => self.view = ClaimPanelView::Detail(edit.original.clone()),
+                        KeyCode::Esc => {
+                            // 回到详情要从头显示：Edit/Traces 渲染写入的 scroll 不属于详情视图。
+                            let original = edit.original.clone();
+                            self.set_claim(original);
+                        }
                         KeyCode::Tab => edit.switch(1),
                         KeyCode::BackTab => edit.switch(-1),
                         KeyCode::Char(c)
@@ -463,6 +468,12 @@ impl ClaimPanelState {
                         KeyCode::Delete => edit.composer.delete_char(),
                         KeyCode::Left => edit.composer.move_left(),
                         KeyCode::Right => edit.composer.move_right(),
+                        KeyCode::Up => {
+                            edit.composer.move_up(width);
+                        }
+                        KeyCode::Down => {
+                            edit.composer.move_down(width);
+                        }
                         KeyCode::Home => edit.composer.move_home(),
                         KeyCode::End => edit.composer.move_end(),
                         KeyCode::Enter => edit.composer.push_newline(),
@@ -525,31 +536,32 @@ impl ClaimPanelState {
                     lines.push(Line::styled("No local claims.", muted_style()));
                 }
                 for (index, row) in self.rows.iter().enumerate() {
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            if index == self.selected { "> " } else { "  " },
-                            if index == self.selected {
-                                blue_style()
-                            } else {
-                                muted_style()
-                            },
-                        ),
-                        Span::styled(
-                            truncate_chars(
-                                &row.name.text,
-                                usize::from(width).saturating_sub(24).max(8),
+                    // 每条 row 压成恰好一行，选中行的滚动偏移才能按 row 索引推导。
+                    lines.push(fit_spans_to_width(
+                        vec![
+                            Span::styled(
+                                if index == self.selected { "> " } else { "  " },
+                                if index == self.selected {
+                                    blue_style()
+                                } else {
+                                    muted_style()
+                                },
                             ),
-                            surface_style(),
-                        ),
-                        Span::styled(
-                            format!(
-                                "  {}  {}",
-                                confidence_label(row.confidence),
-                                status_label(row.status)
+                            Span::styled(
+                                truncate_width(&row.name.text, width.saturating_sub(24).max(8)),
+                                surface_style(),
                             ),
-                            muted_style(),
-                        ),
-                    ]));
+                            Span::styled(
+                                format!(
+                                    "  {}  {}",
+                                    confidence_label(row.confidence),
+                                    status_label(row.status)
+                                ),
+                                muted_style(),
+                            ),
+                        ],
+                        width,
+                    ));
                 }
                 lines.push(Line::styled(
                     format!("/ search · d toggle deprecated · n next page ({} remaining) · ↑↓ select · Enter details · Esc close", self.claim_omitted),
@@ -568,25 +580,26 @@ impl ClaimPanelState {
                     lines.push(Line::styled("No related traces.", muted_style()));
                 }
                 for (index, trace) in rows.iter().enumerate() {
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            if index == self.trace_selected {
-                                "> "
-                            } else {
-                                "  "
-                            },
-                            if index == self.trace_selected {
-                                blue_style()
-                            } else {
-                                muted_style()
-                            },
-                        ),
-                        Span::raw(truncate_chars(
-                            &trace.name,
-                            usize::from(width).saturating_sub(28).max(8),
-                        )),
-                        Span::styled(format!("  {}", trace.created_at), muted_style()),
-                    ]));
+                    // 同 list 视图：trace 名可能是宽字符，必须按显示宽度压成一行。
+                    lines.push(fit_spans_to_width(
+                        vec![
+                            Span::styled(
+                                if index == self.trace_selected {
+                                    "> "
+                                } else {
+                                    "  "
+                                },
+                                if index == self.trace_selected {
+                                    blue_style()
+                                } else {
+                                    muted_style()
+                                },
+                            ),
+                            Span::raw(truncate_width(&trace.name, width.saturating_sub(28).max(8))),
+                            Span::styled(format!("  {}", trace.created_at), muted_style()),
+                        ],
+                        width,
+                    ));
                 }
                 lines.push(Line::styled(
                     format!(
@@ -754,17 +767,6 @@ fn edit_field(lines: &mut Vec<Line<'static>>, label: &str, value: &str, selected
         ])
     }));
 }
-fn truncate_chars(value: &str, max: usize) -> String {
-    if value.chars().count() <= max {
-        return value.to_string();
-    }
-    let mut text = value
-        .chars()
-        .take(max.saturating_sub(1))
-        .collect::<String>();
-    text.push('…');
-    text
-}
 fn confidence_label(value: Confidence) -> &'static str {
     match value {
         Confidence::High => "high",
@@ -797,8 +799,23 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::*;
-    use crate::agent::claims::{BoundedText, ClaimListPage};
+    use crate::agent::claims::{BoundedText, ClaimListPage, TraceListPage};
     use crate::claim::{AgentId, Claim};
+
+    /// 选中行在渲染结果中的行号；不存在时返回 `None`。
+    fn selected_row_index(lines: &[Line<'static>]) -> Option<usize> {
+        lines
+            .iter()
+            .position(|line| line.to_string().starts_with("> "))
+    }
+
+    /// Edit 视图光标所在的 visual line 序号；非 Edit 视图返回 `None`。
+    fn edit_cursor_line(panel: &ClaimPanelState, width: u16) -> Option<usize> {
+        match &panel.view {
+            ClaimPanelView::Edit(edit) => Some(edit.composer.cursor_visual_position(width).0),
+            _ => None,
+        }
+    }
 
     fn detail() -> ClaimDetail {
         ClaimDetail {
@@ -845,12 +862,12 @@ mod tests {
             next_offset: None,
         });
         assert!(matches!(
-            panel.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            panel.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 80),
             ClaimPanelAction::LoadClaim(_)
         ));
         panel.set_claim(detail.clone());
         assert_eq!(
-            panel.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE)),
+            panel.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE), 80),
             ClaimPanelAction::LoadTraces {
                 claim_id: detail.claim.id,
                 offset: 0
@@ -863,21 +880,43 @@ mod tests {
         let mut panel = ClaimPanelState::default();
         panel.open();
         panel.set_claim(detail());
-        panel.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
-        panel.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
-        let action = panel.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        panel.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE), 80);
+        panel.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), 80);
+        let action = panel.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL), 80);
         assert!(matches!(action, ClaimPanelAction::Save(_)));
         panel.fail("revision conflict");
         assert!(matches!(panel.view, ClaimPanelView::Edit(_)));
-        panel.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        panel.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 80);
         assert!(matches!(panel.view, ClaimPanelView::Detail(_)));
+    }
+
+    #[test]
+    fn returning_to_detail_from_edit_starts_at_the_top() {
+        let mut detail = detail();
+        detail.claim.statement = (0..40)
+            .map(|index| format!("row {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut panel = ClaimPanelState::default();
+        panel.open();
+        panel.set_claim(detail);
+        panel.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE), 80);
+        panel.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 80);
+        // Edit 渲染把视口对准末尾光标，scroll 不再是 0。
+        panel.render_lines(60, 8);
+        assert!(panel.scroll.get() > 0);
+
+        panel.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 80);
+
+        let first = panel.render_lines(60, 8)[0].to_string();
+        assert!(first.contains("Claims detail"), "{first}");
     }
 
     #[test]
     fn loading_escape_closes_panel_so_stale_response_is_not_visible() {
         let mut panel = ClaimPanelState::default();
         panel.open();
-        panel.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        panel.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 80);
         assert!(!panel.visible());
     }
 
@@ -900,7 +939,7 @@ mod tests {
         let mut panel = ClaimPanelState::default();
         panel.open();
         panel.set_claim(detail);
-        panel.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        panel.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE), 80);
         panel.fail("revision conflict");
         let text = panel
             .render_lines(60, 8)
@@ -928,7 +967,7 @@ mod tests {
         detail.claim.name = "renamed".into();
         detail.claim.status = ClaimStatus::Stale;
         panel.finish_save(detail, None);
-        panel.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        panel.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 80);
         assert!(matches!(panel.view, ClaimPanelView::List));
         assert_eq!(panel.rows[0].name.text, "renamed");
         assert_eq!(panel.rows[0].status, ClaimStatus::Stale);
@@ -944,10 +983,10 @@ mod tests {
         let mut panel = ClaimPanelState::default();
         panel.open();
         panel.finish_save(detail, Some("saved".into()));
-        panel.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        panel.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), 80);
         let bottom = panel.render_lines(60, 8);
         assert!(bottom.iter().any(|line| line.to_string().contains("saved")));
-        panel.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        panel.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), 80);
         let home = panel.render_lines(60, 8);
         let text = home
             .iter()
@@ -963,18 +1002,18 @@ mod tests {
         let mut panel = ClaimPanelState::default();
         panel.open();
         panel.set_claim(detail());
-        panel.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        panel.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE), 80);
         for _ in 0..4 {
-            panel.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            panel.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 80);
         }
-        panel.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        panel.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), 80);
         assert!(matches!(
-            panel.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            panel.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL), 80),
             ClaimPanelAction::None
         ));
-        panel.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        panel.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), 80);
         assert!(matches!(
-            panel.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            panel.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL), 80),
             ClaimPanelAction::Save(_)
         ));
         panel.fail("revision conflict");
@@ -987,6 +1026,92 @@ mod tests {
         assert!(text.contains("revision conflict"));
         assert!(!text.contains("confidence 必须"));
         assert!(matches!(panel.view, ClaimPanelView::Edit(_)));
+    }
+
+    #[test]
+    fn wide_char_list_rows_stay_one_line_so_the_selection_stays_visible() {
+        let mut panel = ClaimPanelState::default();
+        panel.open();
+        panel.set_claim_page(ClaimListPage {
+            items: (0..30)
+                .map(|index| ClaimSummary {
+                    id: ClaimId::random(),
+                    name: BoundedText {
+                        text: format!("第{index}条关于终端宽字符折行与滚动的本地判断"),
+                        truncated: false,
+                    },
+                    scope: BoundedText {
+                        text: "终端渲染".into(),
+                        truncated: false,
+                    },
+                    confidence: Confidence::High,
+                    status: ClaimStatus::Active,
+                    updated_at: Utc::now(),
+                })
+                .collect(),
+            offset: 0,
+            limit: 30,
+            omitted: 0,
+            next_offset: None,
+        });
+        for _ in 0..29 {
+            panel.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), 40);
+        }
+
+        let lines = panel.render_lines(40, 10);
+
+        assert!(lines.iter().all(|line| line.width() <= 40));
+        let selected = selected_row_index(&lines).expect("selected row should stay visible");
+        assert!(selected < lines.len());
+        assert!(lines[selected].to_string().contains("第29条"));
+    }
+
+    #[test]
+    fn wide_char_trace_rows_stay_one_line_so_the_selection_stays_visible() {
+        let mut panel = ClaimPanelState::default();
+        panel.open();
+        panel.set_claim(detail());
+        panel.set_trace_page(TraceListPage {
+            items: (0..30)
+                .map(|index| TraceSummary {
+                    id: TraceId::random(),
+                    name: format!("第{index}个任务：核对终端宽字符下的折行与滚动"),
+                    created_at: Utc::now(),
+                    input_claims: Vec::new(),
+                    output_claims: Vec::new(),
+                })
+                .collect(),
+            offset: 0,
+            limit: 30,
+            omitted: 0,
+            next_offset: None,
+        });
+        for _ in 0..29 {
+            panel.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), 40);
+        }
+
+        let lines = panel.render_lines(40, 10);
+
+        assert!(lines.iter().all(|line| line.width() <= 40));
+        let selected = selected_row_index(&lines).expect("selected trace row should stay visible");
+        assert!(selected < lines.len());
+        assert!(lines[selected].to_string().contains("第29个"));
+    }
+
+    #[test]
+    fn edit_up_moves_the_cursor_one_line_up_in_a_multiline_statement() {
+        let mut detail = detail();
+        detail.claim.statement = "第一行\n第二行\n第三行".into();
+        let mut panel = ClaimPanelState::default();
+        panel.open();
+        panel.set_claim(detail);
+        panel.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE), 80);
+        panel.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 80);
+        assert_eq!(edit_cursor_line(&panel, 80), Some(2));
+
+        panel.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), 80);
+
+        assert_eq!(edit_cursor_line(&panel, 80), Some(1));
     }
 
     #[test]

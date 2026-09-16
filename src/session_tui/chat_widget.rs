@@ -133,7 +133,7 @@ impl ChatWidget {
         }
 
         if self.state.claim_panel_visible() {
-            let action = self.state.handle_claim_panel_key(key);
+            let action = self.state.handle_claim_panel_key(key, width);
             if !matches!(action, ClaimPanelAction::None) {
                 self.app_event_tx.claim_panel_action(action);
             }

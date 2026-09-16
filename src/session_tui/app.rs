@@ -1960,9 +1960,6 @@ impl SessionTuiApp {
     }
 
     fn start_claim_panel_action(&mut self, action: ClaimPanelAction) {
-        if matches!(action, ClaimPanelAction::None) {
-            return;
-        }
         self.claim_operation_generation = self.claim_operation_generation.wrapping_add(1);
         let generation = self.claim_operation_generation;
         let runner = self.engine.claim_runner();

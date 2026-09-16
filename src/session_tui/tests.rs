@@ -2155,6 +2155,7 @@ fn help_lists_slash_commands_alphabetically() {
     state.push_help();
 
     let text = state.transcript_text();
+    let claim = text.find("/claim").expect("/claim should render");
     let compact = text.find("/compact").expect("/compact should render");
     let copy = text.find("/copy").expect("/copy should render");
     let exit = text.find("/exit").expect("/exit should render");
@@ -2167,6 +2168,7 @@ fn help_lists_slash_commands_alphabetically() {
     let skills = text.find("/skills").expect("/skills should render");
     let subagents = text.find("/subagents").expect("/subagents should render");
 
+    assert!(claim < compact);
     assert!(compact < copy);
     assert!(copy < exit);
     assert!(exit < help);

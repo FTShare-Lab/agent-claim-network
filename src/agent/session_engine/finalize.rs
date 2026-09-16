@@ -1160,7 +1160,7 @@ impl SessionEngine {
                 }
                 None => knowledge_guard.await?,
             };
-            self.runner.recover_pending_claim_edit_locked().await?;
+            let pending_edit_warning = self.recover_pending_claim_edit_warning().await;
             let prepare = self.prepare_finalize_segment_with_background(
                 segment,
                 background_process_completions,
@@ -1254,10 +1254,26 @@ impl SessionEngine {
             if !committed {
                 return Err(SessionRecapPreemptedBeforePrepared.into());
             }
-            self.apply_finalize_checkpoint_local_and_commit(session, checkpoint)
-                .await?
+            let mut report = self
+                .apply_finalize_checkpoint_local_and_commit(session, checkpoint)
+                .await?;
+            report.warnings.extend(pending_edit_warning);
+            report
         };
         self.finish_finalize_upload(report).await
+    }
+
+    /// 调用方必须已持有 knowledge lock。恢复失败与 inbox 一致按 warning 降级，不阻断 finalize：
+    /// 记录只补完已落盘修订的上传入队，checkpoint 对已生效修订另有 revision 校验。
+    async fn recover_pending_claim_edit_warning(&self) -> Option<String> {
+        let error = self
+            .runner
+            .recover_pending_claim_edit_locked()
+            .await
+            .err()?;
+        let warning = format!("恢复待完成的 claim 编辑失败，finalize 继续: {error:#}");
+        log::warn!(target: "agent", "{warning}");
+        Some(warning)
     }
 
     async fn apply_finalize_checkpoint(
@@ -1271,9 +1287,12 @@ impl SessionEngine {
                     self.runner.maintainer_upload_queue.agent_home(),
                 ))
                 .await?;
-            self.runner.recover_pending_claim_edit_locked().await?;
-            self.apply_finalize_checkpoint_local_and_commit(session, checkpoint)
-                .await?
+            let pending_edit_warning = self.recover_pending_claim_edit_warning().await;
+            let mut report = self
+                .apply_finalize_checkpoint_local_and_commit(session, checkpoint)
+                .await?;
+            report.warnings.extend(pending_edit_warning);
+            report
         };
         self.finish_finalize_upload(report).await
     }
@@ -1358,24 +1377,24 @@ impl SessionEngine {
         let mut claims_to_upload = Vec::with_capacity(prepared_claims.len());
         for claim in prepared_claims {
             let current = current_by_id.get(&claim.id);
-            let should_apply = match expected_by_id.get(&claim.id) {
-                None if current.is_some_and(|current| {
-                    current
-                        .updated_at
-                        .is_some_and(|updated_at| updated_at > trace_created_at)
-                }) =>
-                {
-                    false
-                }
-                None => true,
-                Some(_) if current == Some(&claim) => false,
-                Some(None) => current.is_none(),
-                Some(Some(expected_hash)) => current
-                    .map(claim_revision)
-                    .transpose()?
-                    .is_some_and(|current_hash| current_hash == *expected_hash),
-            };
             let already_applied = current == Some(&claim);
+            let should_apply = !already_applied
+                && match expected_by_id.get(&claim.id) {
+                    None if current.is_some_and(|current| {
+                        current
+                            .updated_at
+                            .is_some_and(|updated_at| updated_at > trace_created_at)
+                    }) =>
+                    {
+                        false
+                    }
+                    None => true,
+                    Some(None) => current.is_none(),
+                    Some(Some(expected_hash)) => current
+                        .map(claim_revision)
+                        .transpose()?
+                        .is_some_and(|current_hash| current_hash == *expected_hash),
+                };
             if !should_apply && !already_applied {
                 let warning = format!(
                     "session={} claim={} 在 finalize checkpoint prepared 后已变更，旧更新已 superseded",

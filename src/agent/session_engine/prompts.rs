@@ -15,6 +15,10 @@ use crate::router::ScopesOverviewSnapshot;
 
 use super::{SessionEngine, PROMPT_AGENT_SYSTEM, PROMPT_MEMORY_REVIEW_SYSTEM};
 
+/// `agent_system.j2` 中 claim 目录段的标题。resume 用它判断冻结 system prompt 是否早于
+/// `claim` 工具：旧快照仍要求会话内不修改 claim。
+pub(crate) const CLAIM_CATALOG_HEADING: &str = "# 你的自有 claims 目录";
+
 const SOLO_TEAM_SERVICES_OVERVIEW: &str = "【当前团队服务状态】用户未配置 maintainer_endpoint 和 router_endpoint，本 session 以单人模式运行；团队 maintainer、router 与 consult_router 均不可用，不会进行任何团队服务交互。请忽略本 prompt 下文关于团队服务和 consult_router 的通用操作说明。如需访问团队服务，请参考 docs/config_parameters.md，同时配置 maintainer_endpoint 和 router_endpoint。";
 
 #[derive(Debug, Serialize)]
@@ -117,7 +121,7 @@ impl SessionEngine {
         } else {
             (String::new(), String::new())
         };
-        let local_claims_snapshot = self.render_local_claims_catalog().await?;
+        let local_claims_snapshot = self.render_local_claims_catalog().await;
         let context = SessionSystemPromptContext {
             agent_id: &self.agent.agent_id,
             memory_enabled,
@@ -157,7 +161,7 @@ impl SessionEngine {
         }
     }
 
-    async fn render_local_claims_catalog(&self) -> anyhow::Result<String> {
+    async fn render_local_claims_catalog(&self) -> String {
         let page = match self
             .runner
             .list_claims(None, false, 0, DEFAULT_CLAIM_LIST_LIMIT)
@@ -178,8 +182,10 @@ impl SessionEngine {
                 }
             }
         };
-        let catalog = serde_json::to_string(&page).context("序列化本地 claim 目录失败")?;
-        Ok(format!("```json\n{catalog}\n```"))
+        // ClaimListPage 只含字符串、整数、枚举与 UTC 时间，JSON 序列化没有失败路径。
+        let catalog =
+            serde_json::to_string(&page).expect("ClaimListPage 的 JSON 序列化没有失败路径");
+        format!("```json\n{catalog}\n```")
     }
 
     pub(super) async fn render_memory_review_system_prompt(&self) -> anyhow::Result<String> {

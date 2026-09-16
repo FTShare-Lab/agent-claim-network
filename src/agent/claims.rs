@@ -84,6 +84,8 @@ pub struct ClaimUpdateResult {
     pub sync_pending: bool,
 }
 
+/// 团队模式修订的提交记录：先写记录，再写本地正文，再入队上传，最后清除。
+/// 恢复只补完“正文已落盘、尚未入队”这一步；正文未落盘说明修订没有返回成功，直接丢弃记录。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingClaimEdit {
     expected_revision: String,
@@ -139,8 +141,7 @@ impl AgentRunner {
         self.recover_pending_claim_edit().await?;
         let mut claims = self.claim_store.list_local_claims().await?;
         claims.retain(|claim| {
-            claim.holder == self.agent_id
-                && (include_deprecated || claim.status != ClaimStatus::Deprecated)
+            (include_deprecated || claim.status != ClaimStatus::Deprecated)
                 && query.as_ref().is_none_or(|query| {
                     claim.name.to_lowercase().contains(query)
                         || claim.scope.to_lowercase().contains(query)
@@ -351,7 +352,7 @@ impl AgentRunner {
         Ok(claim)
     }
 
-    pub async fn recover_pending_claim_edit(&self) -> anyhow::Result<()> {
+    pub(super) async fn recover_pending_claim_edit(&self) -> anyhow::Result<()> {
         if !self.team_services_configured() {
             return Ok(());
         }
@@ -368,7 +369,7 @@ impl AgentRunner {
     }
 
     /// 调用方必须已持有 `agent_home_knowledge_apply_lock_path` 的独占锁。
-    pub async fn recover_pending_claim_edit_locked(&self) -> anyhow::Result<()> {
+    pub(super) async fn recover_pending_claim_edit_locked(&self) -> anyhow::Result<()> {
         if !self.team_services_configured() {
             return Ok(());
         }
@@ -385,23 +386,27 @@ impl AgentRunner {
         };
         let current = self.read_owned_claim(&pending.target.id).await?;
         let current_revision = claim_revision(&current)?;
-        let staged = if current_revision == pending.expected_revision {
-            self.claim_store.write_claim(&pending.target).await?;
-            pending.target
-        } else {
-            // 本地已不是编辑前版本：要么目标已经写入，要么记录写入后又有持锁写入者覆盖。
-            // 两种情况都以当前本地版本为准并同步它。不按 updated_at 比较：同秒写入会让
-            // 比较恒定失败，使每次 claim 操作、finalize 与 session 启动都卡在这条记录上。
-            if current_revision != claim_revision(&pending.target)? {
-                log::warn!(
-                    target: "agent",
-                    "pending claim edit {} 已被更新的本地版本取代，保留当前版本",
-                    pending.target.id
-                );
-            }
-            current
-        };
-        self.stage_maintainer_batch_with_durable_claims(vec![staged], Vec::new())
+        if current_revision == pending.expected_revision {
+            // 正文仍是编辑前版本：修订在写入本地前失败或被取消，调用方已经收到失败结果，
+            // 不能在事后替它生效。
+            log::warn!(
+                target: "agent",
+                "pending claim edit {} 的本地正文未写入，按未完成修订丢弃",
+                pending.target.id
+            );
+            return clear_pending_claim_edit(self.maintainer_upload_queue.agent_home()).await;
+        }
+        // 本地已不是编辑前版本：要么目标已经写入，要么记录写入后又有持锁写入者覆盖。
+        // 两种情况都以当前本地版本为准并同步它。不按 updated_at 比较：同秒写入会让
+        // 比较恒定失败，使每次 claim 操作、finalize 与 session 启动都卡在这条记录上。
+        if current_revision != claim_revision(&pending.target)? {
+            log::warn!(
+                target: "agent",
+                "pending claim edit {} 已被更新的本地版本取代，保留当前版本",
+                pending.target.id
+            );
+        }
+        self.stage_maintainer_batch_with_durable_claims(vec![current], Vec::new())
             .await?;
         clear_pending_claim_edit(self.maintainer_upload_queue.agent_home()).await
     }
@@ -442,7 +447,7 @@ fn validate_shared_claim_text(claim: &Claim) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn claim_revision(claim: &Claim) -> anyhow::Result<String> {
+pub(super) fn claim_revision(claim: &Claim) -> anyhow::Result<String> {
     let canonical = serde_json::to_string(claim)?;
     Ok(format!("sha256-v1:{}", crate::auth::sha256_hex(&canonical)))
 }
@@ -728,7 +733,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn pending_edit_recovery_fills_local_and_queue_gap_without_overwriting_newer_claim() {
+    async fn pending_edit_recovery_discards_unwritten_edit_and_completes_landed_one() {
         let dir = TempDir::new().unwrap();
         let runner = team_runner(&dir);
         let original = sample_claim(ClaimId::random(), runner.agent_id().clone());
@@ -747,25 +752,27 @@ pub(crate) mod tests {
         .await
         .unwrap();
 
+        // 模拟记录已写、本地正文尚未写入就失败或被取消：调用方已收到失败，不能事后生效。
         runner.recover_pending_claim_edit().await.unwrap();
         assert_eq!(
             runner.claim_store.read_claim(&original.id).await.unwrap(),
-            target
+            original
         );
-        let queued: crate::agent::maintainer_upload::PendingMaintainerUploads = read_yaml(
-            &paths::agent_home_pending_maintainer_uploads_path(dir.path()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(queued.claims, vec![target.clone()]);
-        assert!(queued.durable_claim_ids.contains(&target.id));
+        assert!(
+            !tokio::fs::try_exists(paths::agent_home_pending_maintainer_uploads_path(
+                dir.path()
+            ))
+            .await
+            .unwrap()
+        );
+        assert!(
+            !tokio::fs::try_exists(paths::agent_home_claim_edit_pending_path(dir.path()))
+                .await
+                .unwrap()
+        );
 
         // 模拟本地 target 已写、尚未 stage 就崩溃。
-        tokio::fs::remove_file(paths::agent_home_pending_maintainer_uploads_path(
-            dir.path(),
-        ))
-        .await
-        .unwrap();
+        runner.claim_store.write_claim(&target).await.unwrap();
         write_yaml_atomic(
             &paths::agent_home_claim_edit_pending_path(dir.path()),
             &pending,
@@ -779,6 +786,7 @@ pub(crate) mod tests {
         .await
         .unwrap();
         assert_eq!(queued.claims, vec![target.clone()]);
+        assert!(queued.durable_claim_ids.contains(&target.id));
 
         // 模拟 durable stage 已完成、尚未清 pending 就崩溃；重放不得重复条目。
         write_yaml_atomic(
@@ -934,18 +942,24 @@ pub(crate) mod tests {
             );
 
             team.recover_pending_claim_edit().await.unwrap();
-            assert_eq!(
-                team.claim_store.read_claim(&original.id).await.unwrap(),
-                target
-            );
-            let queued: crate::agent::maintainer_upload::PendingMaintainerUploads = read_yaml(
-                &paths::agent_home_pending_maintainer_uploads_path(dir.path()),
-            )
-            .await
-            .unwrap();
-            assert_eq!(queued.claims.len(), 1);
-            assert_eq!(queued.claims[0].id, original.id);
-            assert!(queued.durable_claim_ids.contains(&original.id));
+            let uploads_path = paths::agent_home_pending_maintainer_uploads_path(dir.path());
+            if local_target_written {
+                assert_eq!(
+                    team.claim_store.read_claim(&original.id).await.unwrap(),
+                    target
+                );
+                let queued: crate::agent::maintainer_upload::PendingMaintainerUploads =
+                    read_yaml(&uploads_path).await.unwrap();
+                assert_eq!(queued.claims, vec![target.clone()]);
+                assert!(queued.durable_claim_ids.contains(&original.id));
+            } else {
+                // 正文未落盘的记录按未完成修订丢弃，不补写、不入队。
+                assert_eq!(
+                    team.claim_store.read_claim(&original.id).await.unwrap(),
+                    original
+                );
+                assert!(!tokio::fs::try_exists(&uploads_path).await.unwrap());
+            }
             assert!(
                 !tokio::fs::try_exists(paths::agent_home_claim_edit_pending_path(dir.path()))
                     .await

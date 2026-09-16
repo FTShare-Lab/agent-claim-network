@@ -1209,6 +1209,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn function_output_treats_truncated_function_call_as_retryable_shape() {
+        let response = block_response(
+            vec![SessionTurnContentBlock::InvalidToolUse {
+                id: "output-call".into(),
+                name: super::STRUCTURED_OUTPUT_FUNCTION.into(),
+                error: "tool_use 参数在 max_tokens 处被截断，不是完整调用".into(),
+            }],
+            ProviderStop::ToolUse,
+        );
+        let provider = Arc::new(FakeProvider::new(vec![response]));
+        let error =
+            StructuredJsonCaller::new(provider.clone(), 512, 0, Duration::ZERO, Duration::ZERO)
+                .with_function_output(json!({"type": "object"}))
+                .generate_json(
+                    "system".into(),
+                    vec![SessionTurnMessage::user_text("payload")],
+                )
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("参数无法解析"));
+        assert!(error.to_string().contains("max_tokens"));
+        assert!(!error.to_string().contains("收到 ToolUse response"));
+        assert_eq!(provider.requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
     async fn function_output_also_accepts_valid_text_json() {
         let provider = Arc::new(FakeProvider::new(vec![text_response(r#"{"ok":true}"#)]));
         let value = caller(provider)

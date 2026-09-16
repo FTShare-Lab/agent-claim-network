@@ -211,7 +211,7 @@ handoff 成功后的目标 startup、历史加载和 inbox 期间允许继续输
 
 普通 session 的启动目录只含前 20 条摘要；完整判断和 trace 由工具按需读取。目录不会在会话中重写，后续读取能看到最新版本。历史 trace 记录形成和使用背景，不能证明后来修订的判断已通过验证。团队模式保存后通过既有同步流程上传 claim；单人模式只保存在当前 Agent 本地。
 
-升级前创建的 session 在 resume 时仍保留原 system prompt，可能包含旧的 claim 操作限制。要使用完整的新工具指引，请开启新 session；`/claim` 面板可以直接操作现有本地条目。
+升级前创建的 session 在 resume 时仍保留原 system prompt，其中包含旧的 claim 操作限制；resume 时聊天区会提示这一点。要使用完整的新工具指引，请开启新 session；`/claim` 面板可以直接操作现有本地条目。
 
 ## 团队连接状态
 

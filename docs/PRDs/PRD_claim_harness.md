@@ -36,7 +36,9 @@ Claim 与 Trace 的 YAML 格式和存储目录不迁移。目录与 trace 分页
 
 具体资源边界：claim/trace 列表默认每页 20 条、最多 100 条；claim 目录的 name/scope 分别最多展示 120/240 个字符，并标记是否截断。trace 任务正文默认每页 4,000 个字符、最多 16,000 个字符。完整 claim 正文通过单条读取保留原数据，不改变既有 Claim 容量契约。
 
-团队模式的跨文件提交在 `<agent_home>/claim_edit_pending.yaml` 保存预期 revision 和目标 claim，依次完成本地原子写、既有 durable 上传入队、清除待完成记录。启动同步、后续 claim 操作和 finalize 在相同知识锁内恢复该记录；遇到较新的本地版本保留并同步新版本。单人模式只有本地单文件写入，不创建团队待完成记录；从团队模式切换而遗留的记录保留原样，恢复团队配置后再处理。队列交付仍由既有 inbox/finalize 流程触发，保存不等待网络。
+团队模式的跨文件提交在 `<agent_home>/claim_edit_pending.yaml` 保存预期 revision 和目标 claim，依次完成本地原子写、既有 durable 上传入队、清除记录。该记录只用于补完“正文已落盘、尚未入队”这一步：启动同步、后续 claim 操作和 finalize 在相同知识锁内检查它，正文仍是编辑前版本时说明修订没有返回成功，直接丢弃记录而不补写；遇到较新的本地版本保留并同步新版本。恢复失败在 inbox 与 finalize 中都按 warning 降级，不阻断 session 启动或 finalize。单人模式只有本地单文件写入，不创建团队待完成记录；从团队模式切换而遗留的记录保留原样，恢复团队配置后再处理。队列交付仍由既有 inbox/finalize 流程触发，保存不等待网络。
+
+升级前创建的 session 保留旧的冻结 system prompt，其中仍要求会话内不修改 claim，而 `claim` 工具按 registry 对所有 session 可用。resume 时按冻结 prompt 是否包含当前 claim 目录段落判断，缺失时在聊天区提示该限制来自旧快照，并指向 `/claim` 面板与新 session。
 
 ## 验收
 
