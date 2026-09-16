@@ -643,7 +643,8 @@ mod tests {
         assert!(out.contains("transcript 中可能包含 router 工具调用结果"));
         assert!(out.contains("candidate_claims"));
         assert!(out.contains("disputes"));
-        assert!(out.contains("transcript 中真实出现过的 claim id"));
+        assert!(out.contains("目录摘要中的 ID 仅供发现"));
+        assert!(out.contains("没有读取正文时，不能据此计入使用、来源或 dispute"));
         assert!(out.contains("\"updated_claims\""));
         assert!(out.contains("必须输出完整属性和 `status`"));
         assert!(out.contains("仍相关的来源 id 需要一并返回"));
