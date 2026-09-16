@@ -45,7 +45,7 @@ claim/dispute 的生成应基于 transcript、`background_process_completions` �
 - 已显著消耗探索成本，并形成了可验证结论的重要成功或失败路径。
 - 尚未充分验证但会显著影响后续行动的关键假设；如果确有保留价值，必须按证据降低 `confidence` 并明确适用边界。
 
-上述内容只是候选检查清单。应先把候选提炼成可独立理解的判断，再按下方 claim 标准筛选；不要把检查过程、任务流水或 transcript 摘要写入 claim。不要为了覆盖清单而为每一类凑 claim，也不要为了记录“做过什么”而生成 claim；没有足够高价值的新增或更新时，相应数组应为空。
+上述内容只是候选检查清单。应先把候选提炼成可独立理解的判断，再按下方 claim 标准筛选；不要把检查过程、任务流水或 transcript 摘要、测试 pass/fail、临时测试结果结论写入 claim。不要为了覆盖清单而为每一类凑 claim，也不要为了记录“做过什么”而生成 claim；没有足够高价值的新增或更新时，相应数组应为空。如果某条临时结果你觉得非常重要、必须得写成 claim，务必在 statement 中注明当前日期、其为临时结论、注意时效性与后续使用前验证。
 
 避免为通用环境噪音生成claim，例如:围绕 Git identity/commit author、离线、网络或沙箱测试环境的内容。
 
@@ -120,7 +120,6 @@ claim/dispute 的生成应基于 transcript、`background_process_completions` �
 - `new_claims` 不要返回 `status`；即使误传，后端也会忽略并把新 claim 初始化为 `active`
 - `updated_claims` 只能更新 `local_claims` 中已有的 claim，必须输出完整属性和 `status`；更新后的状态可以是 `active`、`stale` 或 `deprecated`
 - 更新已有 claim 时，`source_claim_ids` 是更新后的完整来源列表；仍相关的来源 id 需要一并返回
-- `new_disputes[*].claims`：至少 2 条，且每条要么是真实已存在的 claim id，要么是本次新生成
-  claim 的占位符——**不要写现实中不存在的 id**
+- `new_disputes[*].claims`：至少 2 条，且每条要么是真实已存在的 claim id，要么是本次新生成 claim 的占位符——**不要写现实中不存在的 id** 
 - 没有新增内容时各数组就给空 `[]`；不要硬塞
 - 不要返回 holder / created_at / updated_at；这些字段由后端维护
