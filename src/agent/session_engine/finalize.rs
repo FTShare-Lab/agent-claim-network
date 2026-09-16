@@ -37,6 +37,70 @@ use super::{
     STABLE_HASH_OFFSET,
 };
 
+/// 函数参数显式描述复盘 DTO，避免数组被编码成字符串；领域约束仍由 prepare 校验。
+fn recap_output_schema() -> serde_json::Value {
+    use serde_json::json;
+
+    let claim_schema = |updated: bool| {
+        let mut properties = serde_json::Map::from_iter([
+            ("id".into(), json!({"type": "string"})),
+            ("name".into(), json!({"type": "string"})),
+            ("statement".into(), json!({"type": "string"})),
+            ("scope".into(), json!({"type": "string"})),
+            (
+                "confidence".into(),
+                json!({"type": "string", "enum": ["high", "medium", "low"]}),
+            ),
+            ("evidence_summary".into(), json!({"type": "string"})),
+            (
+                "source_claim_ids".into(),
+                json!({"type": "array", "items": {"type": "string"}}),
+            ),
+        ]);
+        let mut required = vec![
+            "id",
+            "name",
+            "statement",
+            "scope",
+            "confidence",
+            "evidence_summary",
+            "source_claim_ids",
+        ];
+        if updated {
+            properties.insert(
+                "status".into(),
+                json!({"type": "string", "enum": ["active", "stale", "deprecated"]}),
+            );
+            required.push("status");
+        }
+        json!({"type": "object", "properties": properties, "required": required, "additionalProperties": false})
+    };
+    json!({
+        "type": "object",
+        "properties": {
+            "new_claims": {"type": "array", "items": claim_schema(false)},
+            "updated_claims": {"type": "array", "items": claim_schema(true)},
+            "used_claim_ids": {"type": "array", "items": {"type": "string"}},
+            "new_disputes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "name": {"type": "string"},
+                        "claims": {"type": "array", "items": {"type": "string"}, "minItems": 2},
+                        "summary": {"type": "string"}
+                    },
+                    "required": ["id", "name", "claims", "summary"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["new_claims", "updated_claims", "used_claim_ids", "new_disputes"],
+        "additionalProperties": false
+    })
+}
+
 const FINALIZE_BACKGROUND_COMPLETION_MAX_ITEMS: usize = 64;
 const FINALIZE_BACKGROUND_COMPLETION_ID_MAX_CHARS: usize = 256;
 
@@ -998,9 +1062,9 @@ impl SessionEngine {
         let user_text = serde_json::to_string_pretty(&payload)?;
         let agent_id = self.agent.agent_id.clone();
         let messages = vec![SessionTurnMessage::user_text(user_text)];
+        let caller = self.json_caller.with_function_output(recap_output_schema());
         let result = match retry_mode {
-            RecapRetryMode::Configured => self
-                .json_caller
+            RecapRetryMode::Configured => caller
                 .generate_json_streaming_validated_with_retry_notice(
                     system_prompt,
                     messages,
@@ -1014,8 +1078,7 @@ impl SessionEngine {
                     },
                 )
                 .await,
-            RecapRetryMode::SingleAttempt => self
-                .json_caller
+            RecapRetryMode::SingleAttempt => caller
                 .generate_json_streaming_validated_once(
                     system_prompt,
                     messages,
