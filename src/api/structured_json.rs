@@ -193,7 +193,7 @@ impl StructuredJsonCaller {
             }];
             request
                 .system_prompt
-                .push_str("\n通过 return_structured_result 函数的参数返回要求的 JSON 对象。");
+                .push_str("\n结构化输出函数为 return_structured_result。只调用一次，将要求的 JSON 对象作为函数参数提交，不附加解释文字；该函数仅提交结果，不执行其他业务动作。");
         }
         request
     }

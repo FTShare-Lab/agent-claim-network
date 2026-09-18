@@ -55,6 +55,8 @@ enum ClaimPanelView {
     Trace {
         claim: ClaimDetail,
         trace: TraceDetail,
+        rows: Vec<TraceSummary>,
+        list_scroll: usize,
     },
     Edit(ClaimEditState),
 }
@@ -270,10 +272,12 @@ impl ClaimPanelState {
                 current.task_omitted = trace.task_omitted;
                 current.next_task_offset = trace.next_task_offset;
             }
-        } else if let ClaimPanelView::Traces { claim, .. } = &self.view {
+        } else if let ClaimPanelView::Traces { claim, rows } = &self.view {
             self.view = ClaimPanelView::Trace {
                 claim: claim.clone(),
                 trace,
+                rows: rows.clone(),
+                list_scroll: self.scroll.get(),
             };
         }
         self.loading = false;
@@ -419,10 +423,17 @@ impl ClaimPanelState {
                 }
                 _ => {}
             },
-            ClaimPanelView::Trace { claim, trace } => match key.code {
+            ClaimPanelView::Trace {
+                claim,
+                trace,
+                rows,
+                list_scroll,
+            } => match key.code {
                 KeyCode::Esc => {
                     let claim = claim.clone();
-                    self.set_claim(claim);
+                    let rows = std::mem::take(rows);
+                    self.scroll.set(*list_scroll);
+                    self.view = ClaimPanelView::Traces { claim, rows };
                 }
                 KeyCode::Char('n') if key.modifiers == KeyModifiers::NONE => {
                     if let Some(task_offset) = trace.next_task_offset {
@@ -635,7 +646,7 @@ impl ClaimPanelState {
                         .join(", "),
                 );
                 lines.push(Line::styled(
-                    "Trace 是历史任务记录，不代表修改后的验证证据。 · n next page · Esc back",
+                    "Trace 是历史任务记录，不代表修改后的验证证据。 · n next page · Esc traces",
                     muted_style(),
                 ));
             }
@@ -1096,6 +1107,85 @@ mod tests {
         let selected = selected_row_index(&lines).expect("selected trace row should stay visible");
         assert!(selected < lines.len());
         assert!(lines[selected].to_string().contains("第29个"));
+    }
+
+    #[test]
+    fn trace_escape_restores_paginated_list_selection_and_scroll() {
+        let mut panel = ClaimPanelState::default();
+        panel.open();
+        panel.set_claim(detail());
+        for offset in [0, 20] {
+            panel.set_trace_page(TraceListPage {
+                items: (offset..offset + 20)
+                    .map(|index| TraceSummary {
+                        id: TraceId::random(),
+                        name: format!("task {index}"),
+                        created_at: Utc::now(),
+                        input_claims: Vec::new(),
+                        output_claims: Vec::new(),
+                    })
+                    .collect(),
+                offset,
+                limit: 20,
+                omitted: 60 - offset - 20,
+                next_offset: Some(offset + 20),
+            });
+        }
+        for _ in 0..25 {
+            panel.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), 80);
+        }
+        let before = panel.render_lines(80, 12);
+        let list_scroll = panel.scroll.get();
+        assert!(list_scroll > 0);
+        let ClaimPanelAction::LoadTrace { trace_id, .. } =
+            panel.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 80)
+        else {
+            panic!("selected trace should open");
+        };
+        let trace = TraceDetail {
+            id: trace_id.clone(),
+            name: "task 25".into(),
+            agent: AgentId::new("agent-a").unwrap(),
+            created_at: Utc::now(),
+            input_claims: Vec::new(),
+            output_claims: Vec::new(),
+            task: "first page\n".repeat(30),
+            task_offset: 0,
+            task_limit: 4000,
+            task_omitted: 20,
+            next_task_offset: Some(4000),
+        };
+        panel.set_trace(trace.clone());
+        assert_eq!(
+            panel.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), 80),
+            ClaimPanelAction::LoadTrace {
+                trace_id,
+                task_offset: 4000,
+            }
+        );
+        panel.set_trace(TraceDetail {
+            task: "last page".into(),
+            task_offset: 4000,
+            task_omitted: 0,
+            next_task_offset: None,
+            ..trace
+        });
+        panel.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), 80);
+        panel.render_lines(80, 12);
+
+        panel.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 80);
+
+        assert_eq!(panel.trace_selected, 25);
+        assert_eq!(panel.scroll.get(), list_scroll);
+        assert_eq!(panel.render_lines(80, 12), before);
+        assert!(matches!(
+            &panel.view,
+            ClaimPanelView::Traces { rows, .. } if rows.len() == 40
+        ));
+        assert!(matches!(
+            panel.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), 80),
+            ClaimPanelAction::LoadTraces { offset: 40, .. }
+        ));
     }
 
     #[test]
