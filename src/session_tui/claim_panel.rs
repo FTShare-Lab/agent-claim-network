@@ -516,16 +516,12 @@ impl ClaimPanelState {
             lines.push(Line::from(vec![
                 Span::styled("Search: ", blue_style()),
                 Span::raw(text),
-                Span::styled("  Enter apply · Esc cancel", muted_style()),
             ]));
         }
         if self.loading {
-            lines.push(Line::styled(
-                "Loading... · Esc/Ctrl+C close (save continues in background)",
-                muted_style(),
-            ));
+            lines.push(Line::styled("Loading...", muted_style()));
         }
-        match &self.view {
+        let help = match &self.view {
             ClaimPanelView::List => {
                 lines.push(Line::styled(
                     format!(
@@ -574,17 +570,17 @@ impl ClaimPanelState {
                         width,
                     ));
                 }
-                lines.push(Line::styled(
+                Line::styled(
                     format!("/ search · d toggle deprecated · n next page ({} remaining) · ↑↓ select · Enter details · Esc close", self.claim_omitted),
                     muted_style(),
-                ));
+                )
             }
             ClaimPanelView::Detail(row) => {
                 render_claim(&mut lines, row);
-                lines.push(Line::styled(
+                Line::styled(
                     "e edit · t related traces · ↑↓/Pg scroll · Esc back",
                     muted_style(),
-                ));
+                )
             }
             ClaimPanelView::Traces { rows, .. } => {
                 if rows.is_empty() {
@@ -612,13 +608,13 @@ impl ClaimPanelState {
                         width,
                     ));
                 }
-                lines.push(Line::styled(
+                Line::styled(
                     format!(
                         "↑↓ select · Enter task · n next page ({} remaining) · Esc claim",
                         self.trace_omitted
                     ),
                     muted_style(),
-                ));
+                )
             }
             ClaimPanelView::Trace { trace, .. } => {
                 field(&mut lines, "id", trace.id.to_string());
@@ -646,9 +642,10 @@ impl ClaimPanelState {
                         .join(", "),
                 );
                 lines.push(Line::styled(
-                    "Trace 是历史任务记录，不代表修改后的验证证据。 · n next page · Esc traces",
+                    "Trace 是历史任务记录，不代表修改后的验证证据。",
                     muted_style(),
                 ));
+                Line::styled("n next page · ↑↓/Pg scroll · Esc traces", muted_style())
             }
             ClaimPanelView::Edit(edit) => {
                 field(
@@ -673,12 +670,12 @@ impl ClaimPanelState {
                         index == edit.selected,
                     );
                 }
-                lines.push(Line::styled(
+                Line::styled(
                     "Tab/Shift+Tab field · Ctrl+S save · Esc cancel",
                     muted_style(),
-                ));
+                )
             }
-        }
+        };
         let wrapped = hard_wrap_styled_lines(lines, usize::from(width.max(1)));
         let max = usize::from(height.max(1));
         let fixed_notice = match &self.view {
@@ -695,9 +692,22 @@ impl ClaimPanelState {
                 .as_ref()
                 .map(|notice| Line::styled(notice.clone(), muted_style()))
         });
-        let footer = fixed_notice
+        let mut footer = fixed_notice
             .map(|line| hard_wrap_styled_lines(vec![line], usize::from(width.max(1))))
             .unwrap_or_default();
+        // 操作提示始终占据状态栏上方的一行，错误提示在它上方，正文单独滚动。
+        footer.truncate(max.saturating_sub(2));
+        let help = if self.loading {
+            Line::from("Esc/Ctrl+C close (save continues in background)")
+        } else if self.search.is_some() {
+            Line::from("Enter apply · Esc cancel")
+        } else {
+            help
+        };
+        footer.push(Line::styled(
+            truncate_width(&help.to_string(), width),
+            muted_style(),
+        ));
         let body_max = max.saturating_sub(footer.len().min(max));
         let requested = match &self.view {
             ClaimPanelView::List => self.selected.saturating_sub(body_max.saturating_sub(5)),
@@ -718,6 +728,8 @@ impl ClaimPanelState {
             .skip(offset)
             .take(body_max)
             .collect::<Vec<_>>();
+        // 管理面板占满 live viewport，短内容也不能露出上方会话历史。
+        visible.resize(body_max, Line::default());
         let footer_room = max.saturating_sub(visible.len());
         visible.extend(footer.into_iter().take(footer_room));
         visible
@@ -845,6 +857,87 @@ mod tests {
             },
             revision: "rev-1".into(),
         }
+    }
+
+    #[test]
+    fn every_view_keeps_its_controls_on_the_last_panel_row() {
+        let mut claim = detail();
+        claim.claim.statement = "long statement\n".repeat(60);
+        let trace = TraceDetail {
+            id: TraceId::random(),
+            name: "trace".into(),
+            agent: claim.claim.holder.clone(),
+            created_at: Utc::now(),
+            input_claims: Vec::new(),
+            output_claims: Vec::new(),
+            task: "long task\n".repeat(60),
+            task_offset: 0,
+            task_limit: 4000,
+            task_omitted: 0,
+            next_task_offset: None,
+        };
+        for (view, controls) in [
+            (ClaimPanelView::List, "/ search"),
+            (ClaimPanelView::Detail(claim.clone()), "e edit"),
+            (
+                ClaimPanelView::Traces {
+                    claim: claim.clone(),
+                    rows: Vec::new(),
+                },
+                "↑↓ select",
+            ),
+            (
+                ClaimPanelView::Trace {
+                    claim: claim.clone(),
+                    trace,
+                    rows: Vec::new(),
+                    list_scroll: 0,
+                },
+                "n next page",
+            ),
+            (
+                ClaimPanelView::Edit(ClaimEditState::new(claim)),
+                "Tab/Shift+Tab",
+            ),
+        ] {
+            let mut panel = ClaimPanelState::default();
+            panel.open();
+            panel.loading = false;
+            panel.view = view;
+            for (width, height) in [(160, 40), (80, 12), (48, 8)] {
+                for notice in [None, Some("save failed".to_string())] {
+                    panel.notice = notice;
+                    panel.scroll.set(0);
+                    for end in [false, true] {
+                        if end {
+                            panel.scroll.set(usize::MAX);
+                        }
+                        let lines = panel.render_lines(width, height);
+                        assert_eq!(lines.len(), usize::from(height));
+                        assert!(lines[lines.len() - 1].to_string().starts_with(controls));
+                        assert!(lines[..lines.len() - 1]
+                            .iter()
+                            .all(|line| !line.to_string().starts_with(controls)));
+                        assert!(lines.iter().all(|line| line.width() <= usize::from(width)));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn loading_and_search_controls_stay_below_the_content() {
+        let mut panel = ClaimPanelState::default();
+        panel.open();
+        let loading = panel.render_lines(80, 12);
+        assert!(loading[11].to_string().starts_with("Esc/Ctrl+C close"));
+        assert!(loading[1].to_string().contains("Loading..."));
+        panel.loading = false;
+        panel.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE), 80);
+        let search = panel.render_lines(80, 12);
+        assert_eq!(search[11].to_string(), "Enter apply · Esc cancel");
+        assert!(search[1].to_string().contains("Search:"));
+        assert!(!search[1].to_string().contains("Esc cancel"));
     }
 
     #[test]

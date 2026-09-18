@@ -1872,6 +1872,48 @@ mod tests {
     }
 
     #[test]
+    fn claim_panel_fills_viewport_and_closing_restores_conversation() {
+        let (sender, _) = AppEventSender::channel();
+        let mut chat = ChatWidget::new(sender);
+        chat.state_mut().push_help();
+        chat.state_mut().push_input_text("unsent draft");
+        let scrollback = chat.state().scrollback_lines(96);
+        chat.state_mut()
+            .mark_scrollback_flushed(scrollback.entry_count);
+        chat.state_mut().mark_start_separator_flushed();
+        let history = chat.state().history_render_lines_with_width(96);
+        chat.state_mut().open_claim_panel();
+        // 加载态和空列表均需占满显示区域，不能让先前的 /help 露在面板上方。
+        for loaded in [false, true] {
+            if loaded {
+                chat.state_mut()
+                    .set_claim_panel_claim_page(crate::agent::claims::ClaimListPage {
+                        items: Vec::new(),
+                        offset: 0,
+                        limit: 20,
+                        omitted: 0,
+                        next_offset: None,
+                    });
+            }
+            for (width, height) in [(96, 40), (80, 24), (48, 12)] {
+                let render = chat.render_inline(width, height);
+                assert!(render.scrollback_lines.is_empty());
+                assert_eq!(render.live_lines.len(), usize::from(height));
+                assert!(render.live_lines[0].to_string().contains("Claims"));
+                assert!(!render
+                    .live_lines
+                    .iter()
+                    .any(|line| line.to_string().contains("ACN commands")));
+            }
+        }
+        chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!chat.state().claim_panel_visible());
+        assert_eq!(chat.state().input(), "unsent draft");
+        assert_eq!(chat.state().history_render_lines_with_width(96), history);
+        assert!(chat.render_inline(96, 40).live_lines.len() < 40);
+    }
+
+    #[test]
     fn management_panels_fill_live_height_over_existing_history() {
         let (mcp_sender, _) = AppEventSender::channel();
         let mut mcp_chat = ChatWidget::new(mcp_sender);
