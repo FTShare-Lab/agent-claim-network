@@ -2,11 +2,9 @@
 
 状态：已实现并通过本地验收（2026-09-05）。本文只覆盖 ACN 运行时能力；DeepSWE 评测侧的适配不在本文范围。
 
-## 问题与证据
+## 问题背景
 
 当前普通 session 把全部有效本地 claim 的 statement 注入冻结 system prompt，却没有按需读取完整 evidence、来源 trace 或在主流程修订 claim 的工具。随着本地知识积累，启动上下文会持续增长；错误或过时的判断只能等待后台知识流程处理。trace 已经持久化，但没有本地检视入口。
-
-DeepSWE Full-113 报告中，`B_empty` 为 48/113，`B_claim` 为 46/113，`B_forced_claim` 为 50/113。强制披露比空白组只多通过 2 题，尚不能证明稳定收益。全体 attempt 的平均 steps/input token 较低，也不能替代同题均成功样本的效率比较。本地小样本周报还记录了自主 claim 组经常未查询 Router；这是发现与触发不足的证据，不能据此认定 claim 内容有害。
 
 因此这次先改善知识的可发现性、可核对性和可修订性。不会宣称这些产品能力已经提高 DeepSWE 成绩，也不把历史 provider、并发或 compaction 故障未经复现地当成当前 bug。
 
