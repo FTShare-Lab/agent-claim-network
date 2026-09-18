@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
+use super::super::claims::claim_revision;
 use super::super::fs::{
     LocalFsClaimStore, LocalFsInboxReader, LocalFsMemoryStore, LocalFsReportedDisputeClaimSetStore,
 };
@@ -27,8 +28,9 @@ use super::{
     assistant_turn_end_text_after, auto_compact_should_trigger,
     auto_compact_trigger_threshold_tokens, auto_compact_trigger_tokens,
     build_memory_review_transcript, compacted_committed_summary_message,
-    compacted_context_for_turn, compaction_tail_token_limit, compaction_transcript_projection,
-    delegation_summary_projection, estimate_compacted_committed_summary_message_tokens,
+    compacted_context_for_turn, compacted_file_workset_from_turn_messages,
+    compaction_tail_token_limit, compaction_transcript_projection, delegation_summary_projection,
+    estimate_compacted_committed_summary_message_tokens,
     estimated_session_message_tokens_projected, finish_cancelled_turn_journal,
     hash_session_segment, is_canonical_messages_committed_error,
     journal_failure_overrides_turn_result, latest_model_context_matches,
@@ -40,8 +42,8 @@ use super::{
     session_messages_to_provider_turn_messages, session_messages_to_turn_messages,
     session_messages_to_turn_transcript, session_messages_to_turn_transcript_with_memory_mode,
     should_emit_compaction_retry_warning, spawn_turn_control_journal_forwarder,
-    write_provider_rejection_recovery, ActiveProjectionContext, CompactionAuditScope,
-    CompactionAuditSummaryContext, CompactionAuditTrigger, CompactionRanges,
+    write_provider_rejection_recovery, ActiveProjectionContext, CompactedFileWorkset,
+    CompactionAuditScope, CompactionAuditSummaryContext, CompactionAuditTrigger, CompactionRanges,
     CompactionSummaryInputs, DelegationProjectionBaseline, MainModelContextAppender,
     ManualCompactionOutcome, PreflightCompactionRequest, PreflightCompactor,
     ProviderContextUsageAnchor, ProviderProjectionBudget, ProviderRejectionRecoveryRecord,
@@ -49,6 +51,8 @@ use super::{
     SessionFinalizeOnceOutcome, SessionFinalizePreemptionControl,
     SessionRecapBackgroundProcessProjection, SessionRecapPreemptionControl,
     SessionTurnCommittedPostCommitError, TurnJournalEmitter, TurnJournalSink,
+    CLAIM_CATALOG_HEADING, COMPACTED_FILE_WORKSET_MAX_JSON_CHARS_PER_KIND,
+    COMPACTED_FILE_WORKSET_MAX_PATHS_PER_KIND, COMPACTED_FILE_WORKSET_MAX_PATH_CHARS,
     COMPACTION_CHECKPOINT_SCHEMA_VERSION, DELEGATION_PROJECTION_MAX_CHARS,
     DELEGATION_PROJECTION_MAX_ITEMS, MEDIA_BLOCK_ESTIMATED_TOKENS,
 };
@@ -69,7 +73,7 @@ use crate::api::{
 };
 use crate::claim::{
     AgentId, Claim, ClaimId, ClaimStatus, Confidence, Dispute, DisputeId, InboxId, InboxMessage,
-    InboxMessageKind, Policy, PolicyId, PolicyMessageType, PolicyStatus, SessionId,
+    InboxMessageKind, Policy, PolicyId, PolicyMessageType, PolicyStatus, SessionId, TraceId,
 };
 use crate::config::{
     AgentSessionTurnJournalConfig, SessionCompactionConfig, ToolConfig, UserShellConfig,
@@ -85,7 +89,7 @@ use crate::router::{AgentQuery, RouterClient, RouterQueryResult, ScopesOverviewS
 use crate::session::{
     canonical_user_content_hash, replay_turn_journal, ActiveTurnCompactionCursor,
     CompactedProviderHistory, CompactionCheckpoint, CompactionCheckpointStatus, FinalizeCheckpoint,
-    FinalizeCheckpointStatus, NewSessionMessage, PendingProviderHistoryTurn,
+    FinalizeCheckpointStatus, FinalizeClaimRevision, NewSessionMessage, PendingProviderHistoryTurn,
     SessionCompactionState, SessionContentBlock, SessionMessage, SessionMessageRole,
     SessionMetadata, SessionStatus, SessionStore, TurnJournalEventKind, TurnJournalFlush,
     TurnJournalModelContext, TurnJournalNonStreamingFallbackState, TurnJournalProjection,
@@ -1024,6 +1028,7 @@ fn prepared_empty_finalize_checkpoint(
         recap_end_index,
         recap_segment_hash,
         prepared_claims: Vec::new(),
+        expected_claim_revisions: Vec::new(),
         prepared_disputes: Vec::new(),
         used_claim_ids: Vec::new(),
         trace_text: "prepared recap trace".into(),
@@ -2494,6 +2499,85 @@ async fn manual_inbox_processes_local_pending_in_solo_mode() {
 }
 
 #[tokio::test]
+async fn claim_catalog_is_bounded_and_details_remain_readable_after_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (engine, _) = build_local_test_engine(&dir, provider);
+    let created_at = "2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+    let mut claims = Vec::new();
+    for index in 0..25 {
+        let claim = Claim {
+            id: ClaimId::random(),
+            name: format!("catalog-{index}-{}", "目录".repeat(200)),
+            statement: format!("DETAIL_ONLY_{index}: {}", "evidence ".repeat(2_000)),
+            scope: "project/example/".repeat(100),
+            holder: engine.agent.agent_id.clone(),
+            confidence: Confidence::Medium,
+            status: ClaimStatus::Active,
+            created_at: created_at + chrono::Duration::seconds(index),
+            updated_at: None,
+            source_claim_ids: Vec::new(),
+            evidence_summary: "EVIDENCE_ONLY: observed test result".into(),
+        };
+        engine.agent.claim_store.write_claim(&claim).await.unwrap();
+        claims.push(claim);
+    }
+    let report = engine.start_session(1, |_| {}).await.unwrap();
+    let frozen = tokio::fs::read_to_string(&report.session.paths.system_prompt)
+        .await
+        .unwrap();
+    // 与 resume 旧快照判定共用同一个标题常量，模板改标题时这里会先失败。
+    let catalog = frozen
+        .split_once(&format!("{CLAIM_CATALOG_HEADING}\n"))
+        .unwrap()
+        .1
+        .split_once("```json\n")
+        .unwrap()
+        .1
+        .split_once("\n```")
+        .unwrap()
+        .0;
+    let page: serde_json::Value = serde_json::from_str(catalog).unwrap();
+    assert_eq!(page["items"].as_array().unwrap().len(), 20);
+    assert_eq!(page["omitted"], 5);
+    assert_eq!(page["next_offset"], 20);
+    assert!(catalog.chars().count() < 20_000);
+    assert!(!frozen.contains("DETAIL_ONLY_"));
+    assert!(!frozen.contains("EVIDENCE_ONLY"));
+
+    let hidden = &claims[0];
+    assert!(!catalog.contains(hidden.id.as_str()));
+    let found = engine
+        .runner
+        .list_claims(Some("DETAIL_ONLY_0:"), false, 0, 20)
+        .await
+        .unwrap();
+    assert_eq!(found.items.len(), 1);
+    assert_eq!(found.items[0].id, hidden.id);
+    let detail = engine.runner.read_claim(&hidden.id).await.unwrap();
+    assert_eq!(detail.claim, *hidden);
+
+    let mut revised = hidden.clone();
+    revised.statement = "LATEST_DETAIL".into();
+    revised.updated_at = Some(Utc::now());
+    engine
+        .agent
+        .claim_store
+        .write_claim(&revised)
+        .await
+        .unwrap();
+    let latest = engine.runner.read_claim(&hidden.id).await.unwrap();
+    assert_eq!(latest.claim, revised);
+    assert_ne!(latest.revision, detail.revision);
+    assert_eq!(
+        tokio::fs::read_to_string(&report.session.paths.system_prompt)
+            .await
+            .unwrap(),
+        frozen
+    );
+}
+
+#[tokio::test]
 async fn solo_mode_session_start_reports_unknown_team_status() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(Vec::new()));
@@ -2687,6 +2771,29 @@ async fn resume_inbox_refresh_reports_configured_team_status() {
         SessionEvent::TeamServicesConnectionUpdated { status }
             if *status == report.team_services
     )));
+}
+
+#[tokio::test]
+async fn resume_warns_only_when_frozen_prompt_predates_claim_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (engine, store) = build_test_engine(&dir, provider);
+    let is_legacy_warning = |event: &SessionEvent| matches!(event, SessionEvent::Warning { message } if message.contains("创建于旧版本"));
+
+    // create_test_session 写入的固定 prompt 不含 claim 目录标题，等价于升级前的冻结快照。
+    let legacy = create_test_session(&store, "session_1234abcd").await;
+    let mut events = Vec::new();
+    engine
+        .process_inbox_for_resume(&legacy, |event| events.push(event))
+        .await;
+    assert!(events.iter().any(is_legacy_warning));
+
+    let current = engine.start_session(1, |_| {}).await.unwrap().session;
+    let mut events = Vec::new();
+    engine
+        .process_inbox_for_resume(&current, |event| events.push(event))
+        .await;
+    assert!(!events.iter().any(is_legacy_warning));
 }
 
 fn test_message(
@@ -8280,6 +8387,7 @@ async fn legacy_prepared_finalize_checkpoint_recovers_before_completion_cursor_m
             recap_end_index: 2,
             recap_segment_hash: checkpoint_hash,
             prepared_claims: Vec::new(),
+            expected_claim_revisions: Vec::new(),
             prepared_disputes: Vec::new(),
             used_claim_ids: Vec::new(),
             trace_text: "legacy frozen trace".into(),
@@ -8405,6 +8513,7 @@ async fn legacy_applied_completion_only_checkpoint_closes_without_llm_retry() {
             recap_end_index: 2,
             recap_segment_hash: checkpoint_hash,
             prepared_claims: Vec::new(),
+            expected_claim_revisions: Vec::new(),
             prepared_disputes: Vec::new(),
             used_claim_ids: Vec::new(),
             trace_text: "legacy completion-only trace".into(),
@@ -8474,6 +8583,7 @@ async fn legacy_stale_finalize_checkpoint_is_discarded_before_recapping_new_mess
             recap_end_index: 2,
             recap_segment_hash: old_hash,
             prepared_claims: Vec::new(),
+            expected_claim_revisions: Vec::new(),
             prepared_disputes: Vec::new(),
             used_claim_ids: Vec::new(),
             trace_text: "old lifecycle trace".into(),
@@ -8634,6 +8744,7 @@ async fn legacy_same_range_checkpoint_with_new_completion_is_discarded_without_l
             recap_end_index: 2,
             recap_segment_hash: old_hash,
             prepared_claims: Vec::new(),
+            expected_claim_revisions: Vec::new(),
             prepared_disputes: Vec::new(),
             used_claim_ids: Vec::new(),
             trace_text: "old completion-only trace".into(),
@@ -8738,6 +8849,7 @@ async fn prepared_finalize_checkpoint_hash_mismatch_is_not_overwritten() {
         recap_end_index: 2,
         recap_segment_hash: "different-prepared-hash".into(),
         prepared_claims: Vec::new(),
+        expected_claim_revisions: Vec::new(),
         prepared_disputes: Vec::new(),
         used_claim_ids: Vec::new(),
         trace_text: "prepared frozen trace".into(),
@@ -10612,6 +10724,86 @@ async fn finalize_recovers_prepared_recap_prefix_before_processing_remaining_mes
     assert_eq!(checkpoint.recap_start_index, 2);
     assert_eq!(checkpoint.recap_end_index, 4);
     assert_eq!(checkpoint.status, FinalizeCheckpointStatus::Applied);
+}
+
+#[tokio::test]
+async fn finalize_recovery_does_not_overwrite_claim_edited_after_prepared_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (engine, store) = build_test_engine(&dir, provider);
+    let mut session = create_test_session(&store, "session_face0021").await;
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "prepared request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "prepared answer"),
+        ])
+        .await
+        .unwrap();
+    let messages = session.read_messages().await.unwrap();
+    let created_at = Utc::now() - chrono::Duration::seconds(10);
+    let original = Claim {
+        id: "claim_22222222".parse().unwrap(),
+        name: "original".into(),
+        statement: "original statement".into(),
+        scope: "test".into(),
+        holder: AgentId::new("agent-a").unwrap(),
+        confidence: Confidence::Medium,
+        status: ClaimStatus::Active,
+        created_at,
+        updated_at: None,
+        source_claim_ids: Vec::new(),
+        evidence_summary: "original evidence".into(),
+    };
+    let trace_created_at = Utc::now() - chrono::Duration::seconds(5);
+    let mut prepared = original.clone();
+    prepared.statement = "prepared finalize statement".into();
+    prepared.updated_at = Some(trace_created_at);
+    let mut edited = original.clone();
+    edited.statement = "new interactive edit".into();
+    edited.updated_at = Some(Utc::now());
+    let claim_store = LocalFsClaimStore::new(dir.path().join("agents").join("agent-a"));
+    claim_store.write_claim(&edited).await.unwrap();
+
+    let checkpoint = FinalizeCheckpoint {
+        recap_start_index: 0,
+        recap_end_index: 2,
+        recap_segment_hash: hash_session_segment(&messages).unwrap(),
+        prepared_claims: vec![prepared],
+        expected_claim_revisions: vec![FinalizeClaimRevision {
+            claim_id: original.id.clone(),
+            preimage_hash: Some(claim_revision(&original).unwrap()),
+        }],
+        prepared_disputes: Vec::new(),
+        used_claim_ids: Vec::new(),
+        trace_text: "prepared recap trace".into(),
+        trace_created_at,
+        trace_id: Some(TraceId::random()),
+        status: FinalizeCheckpointStatus::Prepared,
+    };
+    session
+        .write_finalize_checkpoint(&checkpoint)
+        .await
+        .unwrap();
+    session.mark_finalizing(Utc::now()).await.unwrap();
+
+    let report = engine
+        .finalize_existing_session_once(&session.metadata.id, |_| {})
+        .await
+        .unwrap();
+
+    let claims = claim_store.list_local_claims().await.unwrap();
+    assert_eq!(claims, vec![edited]);
+    assert!(report.updated_claim_ids.is_empty());
+    assert!(report.trace_id.is_none());
+    assert!(report.warnings.iter().any(|warning| {
+        warning.contains("session=session_face0021")
+            && warning.contains("claim=claim_22222222")
+            && warning.contains("superseded")
+    }));
+    let applied = session.read_finalize_checkpoint().await.unwrap().unwrap();
+    assert_eq!(applied.status, FinalizeCheckpointStatus::Applied);
+    assert!(applied.prepared_claims.is_empty());
+    assert!(applied.trace_id.is_none());
 }
 
 #[tokio::test]
@@ -13824,6 +14016,220 @@ fn active_segments_do_not_cut_open_tool_use() {
     assert_eq!((segments[0].start, segments[0].end), (1, 3));
 }
 
+fn turn_tool_use(id: &str, name: &str, path: &str) -> SessionTurnMessage {
+    SessionTurnMessage {
+        role: "assistant".into(),
+        provider_replay: None,
+        content: vec![SessionTurnContentBlock::ToolUse {
+            id: id.into(),
+            name: name.into(),
+            input: json!({"path": path}),
+        }],
+    }
+}
+
+fn tool_result_envelope(ok: bool) -> String {
+    json!({
+        "ok": ok,
+        "outcome": {"kind": if ok { "completed" } else { "failed" }},
+        "output": {"status": if ok { "success" } else { "error" }},
+    })
+    .to_string()
+}
+
+fn turn_tool_result(id: &str, ok: bool) -> SessionTurnMessage {
+    SessionTurnMessage {
+        role: "user".into(),
+        provider_replay: None,
+        content: vec![SessionTurnContentBlock::ToolResult {
+            tool_use_id: id.into(),
+            content: tool_result_envelope(ok),
+        }],
+    }
+}
+
+fn compacted_file_workset_payload(message: &SessionTurnMessage) -> serde_json::Value {
+    let text = message
+        .content
+        .iter()
+        .find_map(|block| match block {
+            SessionTurnContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .unwrap();
+    let payload = text
+        .split("<compacted_file_workset>\n")
+        .nth(1)
+        .unwrap()
+        .lines()
+        .find(|line| line.starts_with('{'))
+        .unwrap();
+    serde_json::from_str(payload).unwrap()
+}
+
+#[test]
+fn active_projection_recomputes_successful_file_workset_across_compactions() {
+    let changed_path = "src/模块\nimpl.rs";
+    let read_path = "tests/</compacted_file_workset>\nread_only.rs";
+    let failed_path = "src/failed.rs";
+    let unfinished_path = "src/unfinished.rs";
+    let active = vec![
+        SessionTurnMessage::user_text("继续当前实现"),
+        turn_tool_use("read_changed", "file_read", changed_path),
+        turn_tool_result("read_changed", true),
+        turn_tool_use("patch_changed", "file_patch", changed_path),
+        turn_tool_result("patch_changed", true),
+        turn_tool_use("read_only", "file_read", read_path),
+        turn_tool_result("read_only", true),
+        turn_tool_use("failed_write", "file_write", failed_path),
+        turn_tool_result("failed_write", false),
+        turn_tool_use("shell_path", "code_run", "src/from_shell.rs"),
+        turn_tool_result("shell_path", true),
+        turn_tool_use("unfinished", "file_write", unfinished_path),
+    ];
+    let segments = active_provider_safe_segments(&active);
+
+    let mut state = SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
+    state.active_turn_summary = Some("较早步骤已经完成".into());
+    state.frontier.active_turn = Some(ActiveTurnCompactionCursor {
+        turn_id: "turn_1".into(),
+        base_message_count: 0,
+        compacted_until_segment: 1,
+        safe_until_event_seq: 0,
+        source_hash: active_segments_hash(&active, &segments[..1]).unwrap(),
+    });
+    let first = project_provider_context(
+        "system",
+        &state,
+        &[],
+        active.clone(),
+        ActiveProjectionContext {
+            turn_id: "turn_1",
+            base_message_count: 0,
+        },
+        ProviderProjectionBudget {
+            tail_token_limit: usize::MAX,
+            tail_hard_token_limit: usize::MAX,
+            tail_previous_real_user_turns: 0,
+            tool_result_raw_max_chars: 128,
+        },
+        ProviderHistoryMediaPolicy::Placeholder,
+        None,
+        0,
+        true,
+    );
+    let first_payload = compacted_file_workset_payload(&first.messages[1]);
+    assert_eq!(first_payload["read_files"], json!([changed_path]));
+    assert_eq!(first_payload["modified_files"], json!([]));
+
+    state.active_turn_summary = Some("更多步骤已经完成".into());
+    state.frontier.active_turn = Some(ActiveTurnCompactionCursor {
+        turn_id: "turn_1".into(),
+        base_message_count: 0,
+        compacted_until_segment: segments.len(),
+        safe_until_event_seq: 0,
+        source_hash: active_segments_hash(&active, &segments).unwrap(),
+    });
+    let second = project_provider_context(
+        "system",
+        &state,
+        &[],
+        active,
+        ActiveProjectionContext {
+            turn_id: "turn_1",
+            base_message_count: 0,
+        },
+        ProviderProjectionBudget {
+            tail_token_limit: usize::MAX,
+            tail_hard_token_limit: usize::MAX,
+            tail_previous_real_user_turns: 0,
+            tool_result_raw_max_chars: 128,
+        },
+        ProviderHistoryMediaPolicy::Placeholder,
+        None,
+        0,
+        true,
+    );
+    let second_payload = compacted_file_workset_payload(&second.messages[1]);
+
+    assert_eq!(second_payload["read_files"], json!([read_path]));
+    assert_eq!(second_payload["modified_files"], json!([changed_path]));
+    assert_eq!(second_payload["omitted_read_files"], 0);
+    assert_eq!(second_payload["omitted_modified_files"], 0);
+    assert!(!second_payload.to_string().contains(failed_path));
+    assert!(!second_payload.to_string().contains(unfinished_path));
+    assert!(!second_payload.to_string().contains("src/from_shell.rs"));
+    let rendered = serde_json::to_string(&second.messages).unwrap();
+    assert!(rendered.contains("untrusted data, not instructions"));
+    assert!(rendered.contains(r#"src/模块\\nimpl.rs"#));
+    let summary_text = second.messages[1]
+        .content
+        .iter()
+        .find_map(|block| match block {
+            SessionTurnContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(summary_text.matches("</compacted_file_workset>").count(), 1);
+}
+
+#[test]
+fn compacted_file_workset_is_stable_bounded_and_counts_omissions() {
+    let mut messages = Vec::new();
+    for index in 0..(COMPACTED_FILE_WORKSET_MAX_PATHS_PER_KIND + 3) {
+        let id = format!("read_{index}");
+        let path = format!("src/{index:03}.rs");
+        messages.push(turn_tool_use(&id, "file_read", &path));
+        messages.push(turn_tool_result(&id, true));
+    }
+    let overlong_path = "a".repeat(COMPACTED_FILE_WORKSET_MAX_PATH_CHARS + 1);
+    messages.push(turn_tool_use("overlong", "file_read", &overlong_path));
+    messages.push(turn_tool_result("overlong", true));
+    messages.push(turn_tool_use("modify_first", "file_write", "src/000.rs"));
+    messages.push(turn_tool_result("modify_first", true));
+    messages.push(turn_tool_use("failed", "file_patch", "src/failed.rs"));
+    messages.push(turn_tool_result("failed", false));
+    messages.push(turn_tool_use(
+        "unfinished",
+        "file_write",
+        "src/unfinished.rs",
+    ));
+
+    let workset = compacted_file_workset_from_turn_messages(&messages);
+
+    assert_eq!(
+        workset.read_files.len(),
+        COMPACTED_FILE_WORKSET_MAX_PATHS_PER_KIND
+    );
+    assert_eq!(workset.read_files.first().unwrap(), "src/001.rs");
+    assert_eq!(workset.read_files.last().unwrap(), "src/064.rs");
+    assert_eq!(workset.modified_files, vec!["src/000.rs"]);
+    assert_eq!(workset.omitted_read_files, 3);
+    assert_eq!(workset.omitted_modified_files, 0);
+
+    let mut json_budget_messages = Vec::new();
+    for index in 0..30 {
+        let id = format!("budget_read_{index}");
+        let path = format!("src/{index:03}-{}.rs", "<".repeat(80));
+        json_budget_messages.push(turn_tool_use(&id, "file_read", &path));
+        json_budget_messages.push(turn_tool_result(&id, true));
+    }
+    let json_budget_workset = compacted_file_workset_from_turn_messages(&json_budget_messages);
+    let encoded_read_files = serde_json::Value::Array(
+        json_budget_workset
+            .read_files
+            .iter()
+            .cloned()
+            .map(serde_json::Value::String)
+            .collect(),
+    )
+    .to_string()
+    .replace('<', "\\u003c");
+    assert_eq!(json_budget_workset.read_files.len(), 4);
+    assert_eq!(json_budget_workset.omitted_read_files, 26);
+    assert!(encoded_read_files.chars().count() <= COMPACTED_FILE_WORKSET_MAX_JSON_CHARS_PER_KIND);
+}
+
 #[test]
 fn provider_projection_preserves_current_anchor_and_omits_large_tool_result_raw() {
     let active = vec![
@@ -14146,6 +14552,134 @@ async fn committed_compacted_context_projects_large_tool_results() {
 }
 
 #[tokio::test]
+async fn committed_projection_recomputes_file_workset_across_compactions() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(Vec::new()));
+    let (_engine, store) = build_test_engine(&dir, provider);
+    let mut session = create_test_session(&store, "session_c0ffee38").await;
+    let changed_path = "src/核心\nstate.rs";
+    let failed_path = "src/failed.rs";
+    session
+        .append_messages(&[
+            NewSessionMessage::text(SessionMessageRole::User, "完成这次修改"),
+            NewSessionMessage::new(
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::tool_use(
+                    "read_changed",
+                    "file_read",
+                    json!({"path": changed_path}),
+                )],
+            ),
+            NewSessionMessage::new(
+                SessionMessageRole::User,
+                vec![SessionContentBlock::tool_result(
+                    "read_changed",
+                    tool_result_envelope(true),
+                )],
+            ),
+            NewSessionMessage::new(
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::tool_use(
+                    "patch_changed",
+                    "file_patch",
+                    json!({"path": changed_path}),
+                )],
+            ),
+            NewSessionMessage::new(
+                SessionMessageRole::User,
+                vec![SessionContentBlock::tool_result(
+                    "patch_changed",
+                    tool_result_envelope(true),
+                )],
+            ),
+            NewSessionMessage::new(
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::tool_use(
+                    "failed_write",
+                    "file_write",
+                    json!({"path": failed_path}),
+                )],
+            ),
+            NewSessionMessage::new(
+                SessionMessageRole::User,
+                vec![SessionContentBlock::tool_result(
+                    "failed_write",
+                    tool_result_envelope(false),
+                )],
+            ),
+        ])
+        .await
+        .unwrap();
+    let messages = session.read_messages().await.unwrap();
+
+    session
+        .update_compaction(SessionCompactionState::from_committed_summary(
+            3,
+            "读取阶段已完成".into(),
+            Utc::now(),
+        ))
+        .await
+        .unwrap();
+    let (_, first_history) = compacted_context_for_turn(
+        "system",
+        &session.read_metadata().await.unwrap(),
+        messages.clone(),
+        0,
+        usize::MAX,
+        0,
+        128,
+        ProviderHistoryMediaPolicy::Placeholder,
+        None,
+        true,
+    )
+    .unwrap();
+    let first_payload = compacted_file_workset_payload(&first_history[0]);
+    assert_eq!(first_payload["read_files"], json!([changed_path]));
+    assert_eq!(first_payload["modified_files"], json!([]));
+
+    session
+        .update_compaction(SessionCompactionState::from_committed_summary(
+            messages.len(),
+            "实现阶段已完成".into(),
+            Utc::now(),
+        ))
+        .await
+        .unwrap();
+    let (_, second_history) = compacted_context_for_turn(
+        "system",
+        &session.read_metadata().await.unwrap(),
+        messages,
+        0,
+        usize::MAX,
+        0,
+        128,
+        ProviderHistoryMediaPolicy::Placeholder,
+        None,
+        true,
+    )
+    .unwrap();
+    let second_payload = compacted_file_workset_payload(&second_history[0]);
+
+    assert_eq!(second_payload["read_files"], json!([]));
+    assert_eq!(second_payload["modified_files"], json!([changed_path]));
+    assert!(!second_payload.to_string().contains(failed_path));
+    let workset = CompactedFileWorkset {
+        read_files: Vec::new(),
+        modified_files: vec![changed_path.into()],
+        omitted_read_files: 0,
+        omitted_modified_files: 0,
+    };
+    assert!(
+        estimate_compacted_committed_summary_message_tokens("实现阶段已完成", true, &workset)
+            > estimate_compacted_committed_summary_message_tokens(
+                "实现阶段已完成",
+                true,
+                &CompactedFileWorkset::default(),
+            )
+    );
+}
+
+#[tokio::test]
 async fn persisted_provider_window_replays_new_canonical_tail_without_reprojection() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(RecordingProvider::new(Vec::new()));
@@ -14306,7 +14840,12 @@ async fn disabled_authority_filters_historical_compaction_notice_without_rewriti
     let provider = Arc::new(RecordingProvider::new(Vec::new()));
     let (_engine, store) = build_test_engine(&dir, provider);
     let mut session = create_test_session(&store, "session_c0ffee28").await;
-    let historical = compacted_committed_summary_message("historical summary", true).unwrap();
+    let historical = compacted_committed_summary_message(
+        "historical summary",
+        true,
+        &CompactedFileWorkset::default(),
+    )
+    .unwrap();
     let mut compaction =
         SessionCompactionState::from_committed_summary(0, String::new(), Utc::now());
     compaction.provider_history = Some(Box::new(CompactedProviderHistory {
@@ -14751,10 +15290,11 @@ fn provider_projection_prunes_committed_preserves_to_respect_global_hard_budget(
         SessionTurnMessage::assistant_text("latest progress stays raw"),
     ];
     let summary = "summary covers previous turn";
-    let summary_tokens = compacted_committed_summary_message(summary, true)
-        .as_ref()
-        .map(|message| estimate_session_turn_messages_tokens(std::slice::from_ref(message)))
-        .unwrap_or(0);
+    let summary_tokens =
+        compacted_committed_summary_message(summary, true, &CompactedFileWorkset::default())
+            .as_ref()
+            .map(|message| estimate_session_turn_messages_tokens(std::slice::from_ref(message)))
+            .unwrap_or(0);
     let mandatory_tokens =
         summary_tokens.saturating_add(estimate_session_turn_messages_tokens(&active));
     let state = SessionCompactionState::from_committed_summary(2, summary.into(), Utc::now());
@@ -14934,13 +15474,23 @@ async fn preflight_committed_tail_selection_reserves_budget_for_committed_summar
     let mut session = create_test_session(&store, "session_c0ffee10").await;
     session
         .append_messages(&[
-            NewSessionMessage::text(SessionMessageRole::User, "already summarized request"),
-            NewSessionMessage::text(SessionMessageRole::Assistant, "already summarized answer"),
-            NewSessionMessage::text(SessionMessageRole::User, "recent raw request ".repeat(8)),
-            NewSessionMessage::text(
+            NewSessionMessage::new(
                 SessionMessageRole::Assistant,
-                "recent raw answer ".repeat(8),
+                vec![SessionContentBlock::tool_use(
+                    "summarized_read",
+                    "file_read",
+                    json!({"path": "src/already_read.rs"}),
+                )],
             ),
+            NewSessionMessage::new(
+                SessionMessageRole::User,
+                vec![SessionContentBlock::tool_result(
+                    "summarized_read",
+                    tool_result_envelope(true),
+                )],
+            ),
+            NewSessionMessage::text(SessionMessageRole::User, "recent raw request"),
+            NewSessionMessage::text(SessionMessageRole::Assistant, "recent raw answer"),
         ])
         .await
         .unwrap();
@@ -14958,7 +15508,17 @@ async fn preflight_committed_tail_selection_reserves_budget_for_committed_summar
     let messages = session.read_messages().await.unwrap();
     let active = vec![SessionTurnMessage::user_text("current anchor")];
     let active_tokens = estimate_session_turn_messages_tokens(&active);
-    let summary_tokens = estimate_compacted_committed_summary_message_tokens(&prior_summary, true);
+    let committed_workset = CompactedFileWorkset {
+        read_files: vec!["src/already_read.rs".into()],
+        modified_files: Vec::new(),
+        omitted_read_files: 0,
+        omitted_modified_files: 0,
+    };
+    let summary_tokens = estimate_compacted_committed_summary_message_tokens(
+        &prior_summary,
+        true,
+        &committed_workset,
+    );
     let recent_tail_tokens = SessionEngine::estimated_projected_message_tokens(
         messages[2..].iter(),
         engine.compaction.tool_result_raw_max_chars,

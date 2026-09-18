@@ -75,6 +75,7 @@ mod events;
 mod finalize;
 mod memory_review;
 mod prompts;
+use prompts::CLAIM_CATALOG_HEADING;
 mod transcript;
 mod turn_control;
 mod turn_journal;
@@ -1899,6 +1900,11 @@ impl SessionEngine {
         self.mcp_manager.clone()
     }
 
+    /// TUI 管理面板复用当前 session 的领域服务与存储边界。
+    pub fn claim_runner(&self) -> Arc<AgentRunner> {
+        Arc::clone(&self.runner)
+    }
+
     pub(crate) async fn bind_delegation_runtime_lease(
         &self,
         session_id: &SessionId,
@@ -3024,6 +3030,9 @@ impl SessionEngine {
     where
         F: FnMut(SessionEvent) + Send,
     {
+        if let Some(message) = self.frozen_prompt_resume_warning(session).await {
+            emit(SessionEvent::Warning { message });
+        }
         let inbox_generator = SessionInboxJsonGenerator {
             prompt_registry: &self.prompt_registry,
             json_caller: &self.json_caller,
@@ -3046,6 +3055,25 @@ impl SessionEngine {
         )
         .await;
         report
+    }
+
+    /// 已创建 session 的 system prompt 是冻结快照。`claim` 工具对所有 session 可用，而升级前的
+    /// 快照仍要求会话内不修改 claim；resume 时提示这条限制来自旧快照，读取失败只记日志。
+    async fn frozen_prompt_resume_warning(&self, session: &SessionHandle) -> Option<String> {
+        let frozen = match tokio::fs::read_to_string(&session.paths.system_prompt).await {
+            Ok(frozen) => frozen,
+            Err(error) => {
+                log::warn!(
+                    target: "agent",
+                    "session {} 读取冻结 system prompt 失败，跳过旧快照提示: {error}",
+                    session.metadata.id
+                );
+                return None;
+            }
+        };
+        (!frozen.contains(CLAIM_CATALOG_HEADING)).then(|| {
+            "此 session 的 system prompt 创建于旧版本，仍要求会话内不修改 claim；`claim` 工具与 `/claim` 面板可用，需要新的工具指引请开启新 session".to_string()
+        })
     }
 
     pub async fn load_existing_session(
@@ -4683,6 +4711,9 @@ impl SessionEngine {
             .as_ref()
             .map(SessionCompactionState::committed_message_until)
             .unwrap_or(0);
+        let committed_file_workset = compacted_file_workset_from_session_messages(
+            &session_messages[..summary_start.min(session_messages.len())],
+        );
         let committed_summary_tokens = metadata
             .compaction
             .as_ref()
@@ -4692,6 +4723,7 @@ impl SessionEngine {
                 estimate_compacted_committed_summary_message_tokens(
                     summary,
                     self.turn_loop.tool_registry().file_edit_authority_enabled(),
+                    &committed_file_workset,
                 )
             })
             .unwrap_or(0);

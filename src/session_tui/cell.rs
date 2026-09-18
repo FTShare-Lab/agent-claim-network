@@ -249,6 +249,7 @@ impl HistoryCell for HistoryEntry {
 
 const HELP_COMMAND_COL_WIDTH: usize = 12;
 const HELP_ENTRIES: &[(&str, &str)] = &[
+    ("/claim", "browse and revise local claims"),
     ("/compact", "compact session history"),
     ("/copy", "copy the last Assistant response"),
     ("/exit", "finalize and exit"),

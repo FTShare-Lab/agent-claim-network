@@ -451,7 +451,9 @@ mod tests {
         assert!(!out.contains("# 你看到的输入"));
         assert!(!out.contains("available_skills：当前工作区内可用"));
         assert!(out.contains("router scope overview 快照"));
-        assert!(out.contains("# 你的自有 claims 快照"));
+        assert!(out.contains("# 你的自有 claims 目录"));
+        assert!(out.contains("expected_revision"));
+        assert!(out.contains("不包含当时 claim 的版本快照"));
         assert!(out.contains("self claims 快照"));
         assert!(out.contains("```jsonl"));
         assert!(out.contains("\"id\":\"claim_1234abcd\""));
@@ -641,7 +643,8 @@ mod tests {
         assert!(out.contains("transcript 中可能包含 router 工具调用结果"));
         assert!(out.contains("candidate_claims"));
         assert!(out.contains("disputes"));
-        assert!(out.contains("transcript 中真实出现过的 claim id"));
+        assert!(out.contains("目录摘要中的 ID 仅供发现"));
+        assert!(out.contains("没有读取正文时，不能据此计入使用、来源或 dispute"));
         assert!(out.contains("\"updated_claims\""));
         assert!(out.contains("必须输出完整属性和 `status`"));
         assert!(out.contains("仍相关的来源 id 需要一并返回"));

@@ -1,21 +1,23 @@
 //! SessionEngine prompt 渲染辅助。
 //!
 //! 本模块负责构造 session/memory review system prompt 的上下文，
-//! 渲染本地 claim 快照、router scope 概览，并把 ACN.md 附加到 prompt 尾部。
+//! 渲染本地 claim 目录、router scope 概览，并把 ACN.md 附加到 prompt 尾部。
 //! 它不执行 turn、compaction 或 finalize。
 
 use anyhow::Context;
-use chrono::Utc;
 use serde::Serialize;
 
-use crate::agent::prepare::llm_visible_claims;
+use crate::agent::claims::{ClaimListPage, DEFAULT_CLAIM_LIST_LIMIT};
 use crate::agent::{InboxProcessReport, TeamServiceConnectionStatus};
 use crate::api::AvailableSkill;
-use crate::claim::{Claim, ClaimId};
 use crate::memory::{render_prompt_block, MemoryTarget};
 use crate::router::ScopesOverviewSnapshot;
 
 use super::{SessionEngine, PROMPT_AGENT_SYSTEM, PROMPT_MEMORY_REVIEW_SYSTEM};
+
+/// `agent_system.j2` 中 claim 目录段的标题。resume 用它判断冻结 system prompt 是否早于
+/// `claim` 工具：旧快照仍要求会话内不修改 claim。
+pub(crate) const CLAIM_CATALOG_HEADING: &str = "# 你的自有 claims 目录";
 
 const SOLO_TEAM_SERVICES_OVERVIEW: &str = "【当前团队服务状态】用户未配置 maintainer_endpoint 和 router_endpoint，本 session 以单人模式运行；团队 maintainer、router 与 consult_router 均不可用，不会进行任何团队服务交互。请忽略本 prompt 下文关于团队服务和 consult_router 的通用操作说明。如需访问团队服务，请参考 docs/config_parameters.md，同时配置 maintainer_endpoint 和 router_endpoint。";
 
@@ -33,51 +35,10 @@ struct SessionSystemPromptContext<'a> {
 }
 
 #[derive(Debug, Serialize)]
-struct PromptLocalClaimRow<'a> {
-    id: &'a ClaimId,
-    name: &'a str,
-    scope: &'a str,
-    statement: &'a str,
-    status: crate::claim::ClaimStatus,
-    confidence: crate::claim::Confidence,
-    created_at: chrono::DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize)]
 struct MemoryReviewSystemPromptContext<'a> {
     agent_id: &'a crate::claim::AgentId,
     memory_md: &'a str,
     user_md: &'a str,
-}
-
-pub(super) fn format_local_claims_snapshot(claims: &[Claim]) -> String {
-    if claims.is_empty() {
-        return "当前 agent 暂无 status == active 或 status == stale 的本地 claims。".into();
-    }
-    let mut sorted_claims = claims.iter().collect::<Vec<_>>();
-    sorted_claims.sort_by(|left, right| {
-        right
-            .created_at
-            .cmp(&left.created_at)
-            .then_with(|| left.id.as_str().cmp(right.id.as_str()))
-    });
-    let lines = sorted_claims
-        .into_iter()
-        .map(|claim| {
-            serde_json::to_string(&PromptLocalClaimRow {
-                id: &claim.id,
-                name: &claim.name,
-                scope: &claim.scope,
-                statement: &claim.statement,
-                status: claim.status,
-                confidence: claim.confidence,
-                created_at: claim.created_at,
-            })
-            .unwrap_or_else(|_| "{\"error\":\"<unrenderable claim>\"}".into())
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    format!("```jsonl\n{lines}\n```")
 }
 
 pub(super) fn format_router_scopes_overview(snapshot: &ScopesOverviewSnapshot) -> String {
@@ -160,7 +121,7 @@ impl SessionEngine {
         } else {
             (String::new(), String::new())
         };
-        let local_claims_snapshot = self.render_local_claims_snapshot().await;
+        let local_claims_snapshot = self.render_local_claims_catalog().await;
         let context = SessionSystemPromptContext {
             agent_id: &self.agent.agent_id,
             memory_enabled,
@@ -200,17 +161,31 @@ impl SessionEngine {
         }
     }
 
-    pub(super) async fn render_local_claims_snapshot(&self) -> String {
-        match self.agent.claim_store.list_local_claims().await {
-            Ok(claims) => format_local_claims_snapshot(&llm_visible_claims(claims)),
+    async fn render_local_claims_catalog(&self) -> String {
+        let page = match self
+            .runner
+            .list_claims(None, false, 0, DEFAULT_CLAIM_LIST_LIMIT)
+            .await
+        {
+            Ok(page) => page,
             Err(err) => {
                 log::warn!(
                     target: "agent",
-                    "渲染本地 self claims 快照失败，降级为空快照: {err}"
+                    "渲染本地 claim 目录失败，降级为空目录: {err:#}"
                 );
-                format_local_claims_snapshot(&[])
+                ClaimListPage {
+                    items: Vec::new(),
+                    offset: 0,
+                    limit: DEFAULT_CLAIM_LIST_LIMIT,
+                    omitted: 0,
+                    next_offset: None,
+                }
             }
-        }
+        };
+        // ClaimListPage 只含字符串、整数、枚举与 UTC 时间，JSON 序列化没有失败路径。
+        let catalog =
+            serde_json::to_string(&page).expect("ClaimListPage 的 JSON 序列化没有失败路径");
+        format!("```json\n{catalog}\n```")
     }
 
     pub(super) async fn render_memory_review_system_prompt(&self) -> anyhow::Result<String> {

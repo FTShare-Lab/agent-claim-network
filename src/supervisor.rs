@@ -3843,6 +3843,7 @@ mod tests {
             recap_end_index,
             recap_segment_hash: "test-segment-hash".into(),
             prepared_claims: Vec::new(),
+            expected_claim_revisions: Vec::new(),
             prepared_disputes: Vec::new(),
             used_claim_ids: Vec::new(),
             trace_text: "test checkpoint".into(),

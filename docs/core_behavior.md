@@ -32,6 +32,10 @@ Claim 是某个 Agent 愿意作为 holder 维护、可被团队检索和引用�
 - `USER.md` 内容永不进入 claim。私有 Memory 也不能作为可反查的条目身份上传。
 - stale 表示需要复核，不等于自动失效；deprecated 表示 holder 已不再推荐使用。
 
+普通 session 的启动上下文只包含有界本地 claim 目录。主 Agent 通过 `claim` 工具搜索目录、读取正文，再按当前任务的 scope、证据与时间判断是否采用。目录在 session 内冻结，工具读取的是最新本地内容；打开条目不等于验证或采纳它。
+
+主 Agent 与用户的 `/claim` 面板可以修订 holder 为当前 Agent 的已有 claim，包括名称、判断、范围、证据摘要、置信度和状态；不能修改 id、holder、创建时间或来源链，也不能直接新建或删除。修订要求读取时的完整内容 revision，在 `knowledge_apply.lock` 内重新校验，冲突时保留较新的版本并要求重新读取。团队同步沿用既有 Maintainer 上传队列；单人模式不发团队请求、不累积待补传队列。
+
 ## Policy
 
 Policy 是 Maintainer 发布的行动约束或 claim 属性更新建议，不是客观事实，也不自动覆盖 Agent 的私有判断。
@@ -57,6 +61,8 @@ Trace 记录一次任务使用了哪些来源、产出了哪些本地 claim：
 Trace 不区分“借用”与“内化”状态，也不替代 session transcript。它用于解释知识产出链路，而不是把每个工具调用或推理步骤永久化。
 
 Trace 保存在 holder Agent 本地，不上传 Maintainer，也不进入 Router 派生视图。
+
+`claim` 工具与 `/claim` 面板可按 claim ID 回查关联 trace，再分页展开任务正文。历史 trace 没有对应的 claim 版本快照，不能证明后来修订的 statement 已获验证；人工或工具编辑本身不额外生成任务 trace，也不按引用次数自动改变 confidence。
 
 ## Dispute
 
@@ -107,9 +113,15 @@ Agent 在这些情形应考虑查询 Router：
 - 需要核对已有 claim 是否冲突或过时
 - 即使本地已有较高置信度，任务仍明确要求团队视角或冲突检查
 
-Router 返回完整候选 claim，而不是服务端文件路径。Agent 只能引用本次上下文中已经出现的候选 ID；模型凭空生成的 ID 会被校验拒绝。
+Router 返回完整候选 claim，而不是服务端文件路径。Agent 的引用与使用必须来自已展示完整正文的 claim；目录摘要中的 ID 仅用于发现，不能仅据摘要计为使用或来源。模型凭空生成的 ID 会被校验拒绝。
 
 查询无结果不是错误，Agent 可以继续使用本地知识和工具完成任务。
+
+## 压缩后的文件工作集
+
+SessionEngine 在模型摘要之外保留成功 `file_read/file_write/file_patch` 的文件工作集，从已压缩的 canonical 消息和 active 消息确定性重算。失败或尚未返回的工具调用不计入，shell 操作不做路径猜测；修改过的路径不再重复列为只读路径。工作集有数量、路径长度及总字符边界，超量明确报告 omitted，并计入 provider 上下文预算。
+
+这些路径记录历史操作，不表示当前文件仍存在、内容正确或已取得修改许可。模型仍需遵守现有文件读取与编辑授权；工作集不新增持久化文件，恢复时复用 session 与 turn journal。
 
 ## Session 的 provider 私有 replay
 
@@ -120,6 +132,8 @@ Provider 私有 replay 不属于用户可见 transcript，不进入 TUI、sessio
 `openai_chat` 当前没有 provider 私有 Reasoning replay；厂商扩展的 Reasoning 字段会被丢弃。
 
 请求发送结果不明确时，Agent 保留 Provider WAL 供恢复；收到并接受完整响应（包括内部续写前的 `max_tokens` 中间响应）后，该次发送的歧义结束。上下文窗口拒绝只取决于请求内容，不受该歧义影响，仍进入压缩重试。后续确定性拒绝按自身结果回滚：本轮尚无已确认响应时丢弃失败 turn，已有已确认进度时保留此前进度。拒绝回滚的 sidecar 记录只在崩溃窗口内有效，对应 turn 写下终态后下一 turn 只删除记录，不再重放回滚。HTTP、流式和非流式错误分类都利用已知外层错误类别，未知细粒度 code 不会遮蔽它，也不会仅因未知 code 就清除 WAL。
+
+`anthropic` 在 `max_tokens` 打断最后一个 `tool_use` 时，把该调用视为参数无法解析的调用：工具循环返回错误 tool_result 让模型重试，结构化输出调用按可重试的形状错误处理，不把残缺参数当作完整结果。
 
 内部续写前，已接受的响应独立形成恢复快照，不包含下一次续写触发消息；非流式 fallback 的已接受正文同时进入 journal，即使续写被拒绝或 Provider WAL 丢失也能恢复。手动 `/compact` 在生成新摘要前先完成残留的拒绝恢复，后续输入不会再用旧拒绝快照覆盖新摘要。
 
