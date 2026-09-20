@@ -7,7 +7,7 @@
 `check_version_consistency.sh` 将 `Cargo.toml` 的 package version 视为 ACN 产品版本的唯一来源，并检查：
 
 - `Cargo.lock` 与 manifest 是否同步。
-- README 版本徽章与角色说明页展示的版本是否和 Cargo 一致。
+- README 版本徽章与角色说明页的当前版本标识是否和 Cargo 一致；正文允许引用历史 Release、评测基线和第三方版本。
 - 其他持续更新的项目文档和静态页面是否误写产品版本字面量。
 - 私有 Maintainer Workbench 包是否保持非产品版本 `0.0.0`，且 lockfile 根包元数据一致。
 - `ACN_RELEASE_TAG`、GitLab `CI_COMMIT_TAG`、GitHub tag ref 或当前提交上的语义化版本 tag 是否与 Cargo 版本一致。
