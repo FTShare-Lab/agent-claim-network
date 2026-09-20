@@ -19,6 +19,7 @@
 <p align="center">
   <a href="#introduction">Introduction</a> ·
   <a href="#capabilities">Capabilities</a> ·
+  <a href="#deepswe-evaluation">DeepSWE Evaluation</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="#memory-and-claims">Memory and Claims</a> ·
   <a href="#team-mode">Team Mode</a> ·
@@ -59,6 +60,28 @@ Router and Maintainer are separate executables included in this repository and c
 - Support Anthropic Messages, OpenAI-compatible Chat Completions, and Responses for the main conversation; interrupted streaming automatically retries in non-streaming mode within the same protocol
 
 See the [User Guide](docs/user_guide.md) for detailed interaction behavior.
+
+## DeepSWE Evaluation
+
+The evaluation design, results, and tools for reproducing the runs, based on **[ACN v0.2.5](https://github.com/FTShare-Lab/agent-claim-network/releases/tag/v0.2.5)**, are open source in [acn-deepswe-eval](https://github.com/FTShare-Lab/acn-deepswe-eval). The evaluation uses real software engineering tasks from DeepSWE v1.1 to examine ACN's independent problem-solving ability and whether Claims produced by one Agent can help a fresh Agent pass more tasks with fewer model interactions.
+
+For each task, one Agent first solves it independently and produces Claims. Three fresh Agents then tackle the same task under three settings: **no Claims, on-demand Claim retrieval, and full Claim text injected into the initial context**.
+
+Key results:
+
+- **On-demand Claim reuse passes 10 more tasks.** In the 111-task main experiment using DeepSeek-V4.1-Flash, the on-demand group passed **73/111 (65.77%)**, compared with **63/111 (56.76%)** for the no-Claim group: an increase of **9.0 percentage points** and the highest pass rate among all four groups.
+- **More tasks passed with fewer model interactions.** In the same experiment, the on-demand group used **15.9%** fewer input tokens, **10.3%** fewer model requests, and **3.7%** fewer output tokens. These figures compare the subsequent solving groups and exclude the cost of the preceding Agent's Claim generation.
+
+Results for all four groups in the main experiment (DeepSeek-V4.1-Flash, 111 tasks, Claim quality gating enabled, scored by Pier pass):
+
+| Group | Passed | Input tokens | Output tokens | Model requests | Requests per task |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Initial solver and Claim producer (`A`) | 72/111 (64.86%) | 2,183,995,907 | 18,908,933 | 13,221 | 119.1 |
+| No Claims (`B_empty`) | 63/111 (56.76%) | 2,290,656,202 | 19,728,252 | 13,532 | 121.9 |
+| On-demand Claim retrieval (`B_claim`) | **73/111 (65.77%)** | **1,927,317,486** | **19,002,375** | **12,141** | **109.4** |
+| Full Claims injected into the initial context (`B_forced_claim`) | 65/111 (58.56%) | 1,893,296,192 | 18,986,467 | 12,124 | 109.2 |
+
+See the [evaluation report](https://github.com/FTShare-Lab/acn-deepswe-eval#readme) for the full comparisons, subgroup results, and experimental limitations, and the [methodology](https://github.com/FTShare-Lab/acn-deepswe-eval/blob/main/docs/methodology.md) for isolation and reproduction details.
 
 ## Quick Start
 

@@ -19,6 +19,7 @@
 <p align="center">
   <a href="#简介">简介</a> ·
   <a href="#能干什么">能干什么</a> ·
+  <a href="#deepswe-评测">DeepSWE 评测</a> ·
   <a href="#快速开始">快速开始</a> ·
   <a href="#记忆与-claim">记忆与 Claim</a> ·
   <a href="#接入团队之后">接入团队之后</a> ·
@@ -59,6 +60,28 @@
 - 主对话支持 Anthropic Messages、OpenAI-compatible Chat Completions 与 Responses；流式中断会自动改走同协议非流式重试
 
 更详细的交互说明见 [使用指南](docs/user_guide.md)。
+
+## DeepSWE 评测
+
+基于 **[ACN v0.2.5](https://github.com/FTShare-Lab/agent-claim-network/releases/tag/v0.2.5)** 的评测设计、结果和复跑工具已在 [acn-deepswe-eval](https://github.com/FTShare-Lab/acn-deepswe-eval) 开源。评测使用 DeepSWE v1.1 的真实软件工程任务，考察 ACN 的独立解题能力，以及一个 Agent 沉淀的 Claim 能否帮助另一个全新 Agent 提高通过率、减少模型交互。
+
+每道题先由一个 Agent 独立解题并产出 Claim，再让三个全新 Agent 在同一道题上分别使用**无 Claim、按需检索 Claim、首轮注入 Claim 全文**三种设置。
+
+主要结果：
+
+- **按需复用 Claim，多通过 10 道题。** DeepSeek-V4.1-Flash 的 111 题主实验中，按需检索组通过 **73/111（65.77%）**，无 Claim 组为 **63/111（56.76%）**，提高 **9.0 个百分点**，也是四组中最高的通过率。
+- **通过更多题，同时减少模型交互。** 同一主实验中，按需检索组的输入 token 减少 **15.9%**，模型请求减少 **10.3%**，输出 token 减少 **3.7%**。这些是后续解题组之间的用量比较，未计入前序 Agent 生成 Claim 的成本。
+
+主实验四组结果（DeepSeek-V4.1-Flash，111 题，开启 Claim 质量门控，以 Pier 通过计分）：
+
+| 实验组 | 通过 | 输入 token | 输出 token | 模型请求 | 题均请求 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 首次解题并产出 Claim（`A`） | 72/111（64.86%） | 2,183,995,907 | 18,908,933 | 13,221 | 119.1 |
+| 无 Claim（`B_empty`） | 63/111（56.76%） | 2,290,656,202 | 19,728,252 | 13,532 | 121.9 |
+| 按需检索 Claim（`B_claim`） | **73/111（65.77%）** | **1,927,317,486** | **19,002,375** | **12,141** | **109.4** |
+| 首轮注入 Claim 全文（`B_forced_claim`） | 65/111（58.56%） | 1,893,296,192 | 18,986,467 | 12,124 | 109.2 |
+
+完整对照、分层结果与实验限制见[评测报告](https://github.com/FTShare-Lab/acn-deepswe-eval#readme)，隔离与复跑设计见[评测方法](https://github.com/FTShare-Lab/acn-deepswe-eval/blob/main/docs/methodology.md)。
 
 ## 快速开始
 
