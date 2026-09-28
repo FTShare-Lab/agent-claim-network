@@ -17,7 +17,8 @@ use crate::time::{serde_utc, serde_utc_opt};
 
 pub const ARBITRATION_SCHEMA_VERSION: u32 = 2;
 pub const ARBITRATION_PROMPT_VERSION: &str = "maintainer-dispute-arbitration-v8";
-pub const CURRENT_SEMANTIC_PROJECTION_VERSION: u32 = 5;
+// v6 区分未配置推理与显式关闭，避免复用旧 none 语义下的分析结果。
+pub const CURRENT_SEMANTIC_PROJECTION_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]

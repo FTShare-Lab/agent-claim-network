@@ -170,13 +170,12 @@ The directory in which ACN starts becomes the working directory and the cwd for 
 provider = "anthropic"
 endpoint = "https://your-llm-endpoint"
 model = "your-model"
-reasoning_effort = "none"                # none | low | medium | high | xhigh | max
 anthropic_thinking = "auto"              # auto | enabled | adaptive | disabled
 # anthropic_thinking_budget_tokens = 4096 # optional when enabled
 api_key_env = "ACN_LLM_API_KEY"
 ```
 
-`reasoning_effort` is sent using the corresponding protocol field. ACN does not check whether the selected model supports it.
+Agent, Router, and Maintainer share the same `reasoning_effort` semantics: omitting it leaves the parameter out of the request and uses the upstream default; explicit `none` requests thinking to be disabled. For Anthropic, `none` maps to `thinking.type = "disabled"` and takes precedence over `anthropic_thinking`; other levels are sent as `output_config.effort`.
 
 </details>
 
@@ -188,7 +187,6 @@ api_key_env = "ACN_LLM_API_KEY"
 provider = "openai_chat"
 endpoint = "https://your-llm-endpoint/v1"
 model = "your-model"
-reasoning_effort = "none"                # none | low | medium | high | xhigh | max
 api_key_env = "ACN_LLM_API_KEY"
 ```
 

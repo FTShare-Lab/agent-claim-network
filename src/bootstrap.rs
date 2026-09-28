@@ -729,7 +729,7 @@ mod tests {
                     provider: LlmProvider::Anthropic,
                     endpoint: "http://127.0.0.1:1".into(),
                     model: "test-model".into(),
-                    reasoning_effort: crate::config::ReasoningEffort::None,
+                    reasoning_effort: None,
                     anthropic_thinking: crate::config::AnthropicThinking::Auto,
                     anthropic_thinking_budget_tokens: None,
                     supports_websockets: false,

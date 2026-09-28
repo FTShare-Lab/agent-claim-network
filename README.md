@@ -170,13 +170,12 @@ acn
 provider = "anthropic"
 endpoint = "https://your-llm-endpoint"
 model = "your-model"
-reasoning_effort = "none"                # none | low | medium | high | xhigh | max
 anthropic_thinking = "auto"              # auto | enabled | adaptive | disabled
 # anthropic_thinking_budget_tokens = 4096 # enabled 时可选
 api_key_env = "ACN_LLM_API_KEY"
 ```
 
-`reasoning_effort` 会按协议字段发出去；ACN 不检查模型是否真支持。
+Agent、Router、Maintainer 的 `reasoning_effort` 语义一致：未配置时不传该参数，采用上游默认行为；显式 `none` 请求关闭思考。Anthropic 会转换为 `thinking.type = "disabled"`，优先于 `anthropic_thinking`；其他强度按 `output_config.effort` 发送。
 
 </details>
 
@@ -188,7 +187,6 @@ api_key_env = "ACN_LLM_API_KEY"
 provider = "openai_chat"
 endpoint = "https://your-llm-endpoint/v1"
 model = "your-model"
-reasoning_effort = "none"                # none | low | medium | high | xhigh | max
 api_key_env = "ACN_LLM_API_KEY"
 ```
 

@@ -158,6 +158,10 @@ impl ProviderReranker {
     pub fn new(cfg: &RouterRerankConfig) -> anyhow::Result<Self> {
         let api_key = std::env::var(&cfg.api_key_env)
             .with_context(|| format!("{} 未设置，无法调用 rerank API", cfg.api_key_env))?;
+        Self::with_api_key(cfg, api_key)
+    }
+
+    fn with_api_key(cfg: &RouterRerankConfig, api_key: String) -> anyhow::Result<Self> {
         let timeout = Duration::from_secs(cfg.timeout_secs);
         let retry_base_delay = Duration::from_millis(cfg.retry_base_delay_ms);
         let retry_max_delay = Duration::from_millis(cfg.retry_max_delay_ms);
@@ -174,7 +178,8 @@ impl ProviderReranker {
                         retry_base_delay,
                         retry_max_delay,
                     )?
-                    .with_temperature(0.0),
+                    .with_temperature(0.0)
+                    .with_reasoning_effort(cfg.reasoning_effort),
                 ),
                 "Chat",
             ),
@@ -189,21 +194,26 @@ impl ProviderReranker {
                         retry_base_delay,
                         retry_max_delay,
                     )?
-                    .with_reasoning_replay(false),
+                    .with_reasoning_replay(false)
+                    .with_reasoning_effort(cfg.reasoning_effort),
                 ),
                 "Responses",
             ),
             RerankProvider::Anthropic => (
-                Arc::new(AnthropicProviderAdapter::new(
-                    api_key,
-                    cfg.endpoint.clone(),
-                    cfg.model.clone(),
-                    cfg.max_tokens,
-                    timeout,
-                    cfg.retry_count,
-                    retry_base_delay,
-                    retry_max_delay,
-                )?),
+                Arc::new(
+                    AnthropicProviderAdapter::new(
+                        api_key,
+                        cfg.endpoint.clone(),
+                        cfg.model.clone(),
+                        cfg.max_tokens,
+                        timeout,
+                        cfg.retry_count,
+                        retry_base_delay,
+                        retry_max_delay,
+                    )?
+                    .with_reasoning_effort(cfg.reasoning_effort)
+                    .with_thinking(cfg.anthropic_thinking, cfg.anthropic_thinking_budget_tokens),
+                ),
                 "Anthropic",
             ),
         };
@@ -452,7 +462,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_reranker_sends_stateless_streaming_request_without_reasoning() {
+    async fn responses_reranker_sends_stateless_streaming_request_with_reasoning_disabled() {
         let body = json!({
             "status": "completed",
             "output": [
@@ -499,7 +509,7 @@ mod tests {
         assert_eq!(request["max_output_tokens"], 77);
         assert_eq!(request["tools"], json!([]));
         assert!(request.get("include").is_none());
-        assert!(request.get("reasoning").is_none());
+        assert_eq!(request["reasoning"], json!({"effort": "none"}));
         assert_eq!(request["input"][0]["type"], "message");
         assert_eq!(request["input"][0]["role"], "user");
         assert_eq!(request["input"][0]["content"][0]["type"], "input_text");
@@ -572,28 +582,101 @@ mod tests {
     }
 
     fn responses_reranker(endpoint: String, max_tokens: u32) -> ProviderReranker {
-        let provider: Arc<dyn ProviderAdapter> = Arc::new(
-            OpenAiCompatibleResponsesProviderAdapter::new(
-                "test-key".into(),
+        ProviderReranker::with_api_key(
+            &RouterRerankConfig {
                 endpoint,
-                "test-model".into(),
-                Duration::from_secs(5),
-                0,
-                Duration::ZERO,
-                Duration::ZERO,
-            )
-            .unwrap()
-            .with_reasoning_replay(false),
-        );
-        ProviderReranker {
-            caller: StructuredJsonCaller::new(
-                provider,
+                model: "test-model".into(),
                 max_tokens,
-                0,
-                Duration::ZERO,
-                Duration::ZERO,
-            ),
-            provider_name: "Responses",
+                reasoning_effort: Some(crate::config::ReasoningEffort::None),
+                timeout_secs: 5,
+                retry_count: 0,
+                ..Default::default()
+            },
+            "test-key".into(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reranker_passes_configured_reasoning_to_each_provider() {
+        use crate::config::{AnthropicThinking, ReasoningEffort};
+        for provider in [
+            RerankProvider::OpenAiChat,
+            RerankProvider::OpenAiResponses,
+            RerankProvider::Anthropic,
+        ] {
+            for effort in [
+                None,
+                Some(ReasoningEffort::None),
+                Some(ReasoningEffort::High),
+            ] {
+                let requests = Arc::new(tokio::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+                let captured = requests.clone();
+                let app = axum::Router::new().fallback(axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let captured = captured.clone();
+                    async move {
+                        captured.lock().await.push(body);
+                        (axum::http::StatusCode::BAD_REQUEST, axum::Json(json!({"error":{"message":"invalid request","type":"invalid_request_error"}})))
+                    }
+                }));
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let endpoint = format!("http://{}", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let cfg = RouterRerankConfig {
+                    provider,
+                    endpoint,
+                    reasoning_effort: effort,
+                    anthropic_thinking: if effort.is_some() {
+                        AnthropicThinking::Adaptive
+                    } else {
+                        AnthropicThinking::Auto
+                    },
+                    retry_count: 0,
+                    timeout_secs: 2,
+                    ..Default::default()
+                };
+                let reranker = ProviderReranker::with_api_key(&cfg, "test-key".into()).unwrap();
+                // 确定性拒绝避免重试；断言生产装配实际发出的请求，而非独立构造 adapter。
+                assert!(reranker
+                    .rerank(
+                        &AgentQuery::from_task("scope", "rank them"),
+                        &[candidate("claim_0000000a")]
+                    )
+                    .await
+                    .is_err());
+                let requests = requests.lock().await;
+                assert!(!requests.is_empty());
+                for request in requests.iter() {
+                    if effort.is_none() {
+                        assert!(request.get("reasoning_effort").is_none());
+                        assert!(request.get("reasoning").is_none());
+                    }
+                    let expected = serde_json::to_value(effort).unwrap();
+                    match provider {
+                        RerankProvider::OpenAiChat => {
+                            assert_eq!(request["reasoning_effort"], expected)
+                        }
+                        RerankProvider::OpenAiResponses => {
+                            assert_eq!(request["reasoning"]["effort"], expected);
+                            assert!(request.get("include").is_none());
+                        }
+                        RerankProvider::Anthropic => {
+                            if effort == Some(ReasoningEffort::None) {
+                                assert_eq!(request["thinking"], json!({"type":"disabled"}));
+                                assert!(request.get("output_config").is_none());
+                            } else if effort.is_some() {
+                                assert_eq!(request["thinking"], json!({"type":"adaptive"}));
+                                assert_eq!(request["output_config"]["effort"], expected);
+                            } else {
+                                assert!(request.get("thinking").is_none());
+                                assert!(request.get("output_config").is_none());
+                            }
+                        }
+                        RerankProvider::Heuristic => unreachable!(),
+                    }
+                }
+                server.abort();
+            }
         }
     }
 

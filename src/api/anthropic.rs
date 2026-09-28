@@ -101,7 +101,7 @@ pub struct AnthropicMessagesClient {
     retry_base_delay: Duration,
     retry_max_delay: Duration,
     timeout: Duration,
-    reasoning_effort: ReasoningEffort,
+    reasoning_effort: Option<ReasoningEffort>,
     thinking: AnthropicThinking,
     thinking_budget_tokens: Option<u32>,
     temperature: Option<f64>,
@@ -245,7 +245,7 @@ impl AnthropicMessagesClient {
             retry_base_delay,
             retry_max_delay,
             timeout,
-            reasoning_effort: ReasoningEffort::None,
+            reasoning_effort: None,
             thinking: AnthropicThinking::Auto,
             thinking_budget_tokens: None,
             temperature: None,
@@ -266,12 +266,16 @@ impl AnthropicMessagesClient {
             max_tokens,
             messages,
             system: system.to_owned(),
-            output_config: (self.reasoning_effort != ReasoningEffort::None).then_some(
-                ApiOutputConfig {
-                    effort: self.reasoning_effort,
-                },
-            ),
-            thinking: match self.thinking {
+            output_config: self
+                .reasoning_effort
+                .filter(|effort| *effort != ReasoningEffort::None)
+                .map(|effort| ApiOutputConfig { effort }),
+            // 显式 none 优先关闭 thinking，不能因独立 thinking 配置而重新开启。
+            thinking: match if self.reasoning_effort == Some(ReasoningEffort::None) {
+                AnthropicThinking::Disabled
+            } else {
+                self.thinking
+            } {
                 AnthropicThinking::Auto => None,
                 AnthropicThinking::Enabled => Some(ApiThinkingConfig {
                     kind: "enabled".into(),
@@ -895,8 +899,8 @@ impl AnthropicProviderAdapter {
         })
     }
 
-    /// 设置 Messages 请求的推理强度；`none` 会在序列化时省略 `output_config`。
-    pub fn with_reasoning_effort(mut self, reasoning_effort: ReasoningEffort) -> Self {
+    /// 未配置时省略 effort；显式 none 通过 thinking.disabled 关闭推理。
+    pub fn with_reasoning_effort(mut self, reasoning_effort: Option<ReasoningEffort>) -> Self {
         self.client.reasoning_effort = reasoning_effort;
         self
     }
@@ -1682,7 +1686,9 @@ mod tests {
         }
     }
 
-    fn client_with_reasoning_effort(reasoning_effort: ReasoningEffort) -> AnthropicMessagesClient {
+    fn client_with_reasoning_effort(
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> AnthropicMessagesClient {
         let mut client = AnthropicMessagesClient::new(
             "key".into(),
             "http://127.0.0.1:1".into(),
@@ -1701,7 +1707,7 @@ mod tests {
     #[test]
     fn history_media_policy_preserves_uncompacted_images_and_documents() {
         let adapter = AnthropicProviderAdapter {
-            client: client_with_reasoning_effort(ReasoningEffort::None),
+            client: client_with_reasoning_effort(None),
         };
 
         assert_eq!(
@@ -1791,20 +1797,49 @@ mod tests {
     }
 
     #[test]
-    fn none_reasoning_effort_omits_anthropic_output_config() {
-        let client = client_with_reasoning_effort(ReasoningEffort::None);
+    fn unset_reasoning_effort_omits_anthropic_output_config() {
+        let client = client_with_reasoning_effort(None);
         let request = client.request_for("system", Vec::new(), None, 128, None);
         let body = serde_json::to_value(request).unwrap();
 
         assert!(body.get("output_config").is_none());
+        assert!(body.get("thinking").is_none());
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("temperature").is_none());
         assert!(body.get("top_p").is_none());
     }
 
     #[test]
+    fn explicit_none_disables_thinking_even_with_an_enabled_mode_and_budget() {
+        for mode in [
+            AnthropicThinking::Auto,
+            AnthropicThinking::Enabled,
+            AnthropicThinking::Adaptive,
+            AnthropicThinking::Disabled,
+        ] {
+            let adapter = AnthropicProviderAdapter {
+                client: client_with_reasoning_effort(None),
+            }
+            .with_reasoning_effort(Some(ReasoningEffort::None))
+            .with_thinking(mode, Some(4096));
+            for stream in [None, Some(true)] {
+                let body = serde_json::to_value(adapter.client.request_for(
+                    "system",
+                    Vec::new(),
+                    None,
+                    8192,
+                    stream,
+                ))
+                .unwrap();
+                assert_eq!(body["thinking"], json!({"type": "disabled"}));
+                assert!(body.get("output_config").is_none());
+            }
+        }
+    }
+
+    #[test]
     fn configured_reasoning_effort_is_nested_for_anthropic_streaming_and_non_streaming() {
-        let client = client_with_reasoning_effort(ReasoningEffort::Xhigh);
+        let client = client_with_reasoning_effort(Some(ReasoningEffort::Xhigh));
 
         for stream in [None, Some(true)] {
             let request = client.request_for("system", Vec::new(), None, 128, stream);
@@ -1816,7 +1851,7 @@ mod tests {
 
     #[test]
     fn configured_sampling_parameters_are_sent_for_streaming_and_non_streaming_requests() {
-        let mut client = client_with_reasoning_effort(ReasoningEffort::None);
+        let mut client = client_with_reasoning_effort(None);
         client.temperature = Some(0.55);
         client.top_p = Some(0.8);
 
@@ -1855,7 +1890,7 @@ mod tests {
         ];
 
         for (mode, budget, expected) in cases {
-            let mut client = client_with_reasoning_effort(ReasoningEffort::None);
+            let mut client = client_with_reasoning_effort(None);
             client.thinking = mode;
             client.thinking_budget_tokens = budget;
             for stream in [None, Some(true)] {

@@ -35,6 +35,7 @@ api_key_env = "EMBEDDING_API_KEY"
 provider = "openai_responses"
 endpoint = "https://api.openai.com/v1"
 model = "gpt-5.6-luna"
+reasoning_effort = "none" # 显式关闭思考；删除此项则采用上游默认行为
 api_key_env = "ACN_LLM_API_KEY"
 
 # 默认只监听本机；对外部署时按实际网络边界修改。
@@ -60,7 +61,6 @@ max_source_claims = 20
 # provider = "openai_responses"
 # endpoint = "https://api.openai.com/v1"
 # model = "gpt-5.6-luna"
-# reasoning_effort = "high"
 # api_key_env = "ACN_LLM_API_KEY"
 # max_tokens = 65536
 # context_window = 200000
@@ -73,7 +73,6 @@ max_source_claims = 20
 provider = "openai_responses"
 endpoint = "https://api.openai.com/v1"
 model = "gpt-5.6-luna"
-reasoning_effort = "none"
 api_key_env = "ACN_LLM_API_KEY"
 max_tokens = 65536
 context_window = 200000

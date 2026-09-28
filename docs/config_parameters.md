@@ -82,7 +82,7 @@ agent_id = "agent-a"
 - `endpoint`：与所选 provider 兼容的 LLM HTTP 地址，必须是绝对 HTTP(S) URL。可以填写服务 base URL，也可以填写完整请求 URL；OpenAI-compatible 的常见 base URL 形如 `https://llm.example.com/v1`，Anthropic-compatible 的常见 base URL 形如 `https://llm.example.com`。根 URL 会分别补全为 `/v1/chat/completions`、`/v1/responses` 或 `/v1/messages`；已有路径的 base URL 会追加相应末段，完整请求 URL 保持不变。
 - `model`：模型名，以配置文件为准。
 - `supports_websockets`：可选，默认 `false`。仅 `openai_responses` 可设为 `true`；请只在 endpoint 明确支持 Responses WebSocket 协议时开启。
-- `reasoning_effort`：控制 agent 主 LLM 的推理强度，可选值为 `none`、`low`、`medium`、`high`、`xhigh`、`max`，未配置时默认 `none`。未配置或设为 `none` 时不发送推理强度参数。
+- `reasoning_effort`：可选推理强度，接受 `none`、`low`、`medium`、`high`、`xhigh`、`max`。未配置时不发送推理强度参数，采用上游默认行为。
 - `temperature`：浮点数，作用于所有使用 `[agent.llm]` 的 Agent LLM 请求。未配置时不发送该参数。
 - `top_p`：浮点数，作用范围与 `temperature` 相同。未配置时不发送该参数。
 - `anthropic_thinking`：只作用于 `provider = "anthropic"`，可选值为 `auto`、`enabled`、`adaptive`、`disabled`，默认 `auto`。`auto` 不发送 `thinking`，沿用上游默认行为；其他值显式发送对应 `thinking.type`。不作用于 Responses 或 Chat。
@@ -96,6 +96,7 @@ agent_id = "agent-a"
 - `retry_max_delay_ms`：重试退避等待上限，默认 `5000`ms。
 
 特别说明：`openai_chat` 会丢弃厂商扩展 Reasoning 字段，要求 Reasoning 回传的模型应改用 `openai_responses` 或 `anthropic`。
+
 
 ### `[agent.inbox]`
 
@@ -324,6 +325,9 @@ background-shell 其余时序、容量和 PTY 参数是 `config.rs` 内部默认
 
 ### `[router.rerank]`
 
+- `reasoning_effort`：未配置时省略参数、采用上游默认行为；显式 `none` 请求关闭思考，其余可选值为 `low`、`medium`、`high`、`xhigh`、`max`。
+- `anthropic_thinking`：仅用于 Anthropic Messages，语义与 Agent 相同，默认 `auto`（省略 thinking 字段）。可显式配置 `enabled`、`adaptive` 或 `disabled`。
+- `anthropic_thinking_budget_tokens`：仅在实际发送 `thinking.type = "enabled"` 时发送可选 token budget。Anthropic 的非 `none` 推理强度通过 `output_config.effort` 发送；显式 `none` 通过 `thinking.type = "disabled"` 关闭思考。
 - `provider`：候选 Claim 的重排方式，默认 `openai_responses`。`heuristic` 使用本地启发式规则；`openai_chat` 使用 Chat Completions；`openai_responses` 使用 Responses；`anthropic` 使用 Anthropic Messages。远端协议都把 query 和候选 Claim 交给通用模型排序，不要求使用专用 rerank 模型。
 - `endpoint`：远端重排服务地址，必须是绝对 HTTP(S) URL。可以填写 host root、常见的 `/v1` base URL 或完整的 `/v1/chat/completions`、`/v1/responses`、`/v1/messages` 请求 URL；ACN 按所选 provider 补全缺失路径，不在协议间自动切换。
 - `model`：执行重排任务的模型名。
@@ -334,7 +338,7 @@ background-shell 其余时序、容量和 PTY 参数是 `config.rs` 内部默认
 - `retry_base_delay_ms`：rerank 请求重试退避基础间隔毫秒数。
 - `retry_max_delay_ms`：rerank 请求重试退避上限毫秒数。
 
-远端 rerank 默认使用流式请求；流式不可用时会尝试普通请求。rerank 不启用模型的 reasoning/thinking；最终失败时，Router 继续使用原有检索排序。
+远端 rerank 默认使用流式请求；流式不可用时会尝试普通请求，推理参数保持一致。未配置推理参数时沿用上游默认行为
 
 ### `[maintainer.sweep]`
 
