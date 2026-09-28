@@ -17,6 +17,7 @@ pub mod runner;
 mod runner_finalize;
 mod runner_trace;
 mod session_engine;
+pub(crate) use session_engine::dream::{DreamControl, DreamStopped, DreamYield};
 pub mod traits;
 mod user_shell;
 

@@ -7,6 +7,8 @@ use super::{safe_responses_error_code, ResponsesError};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponsesRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<Value>,
     pub model: String,
     pub instructions: String,
     pub input: Vec<Value>,
@@ -488,6 +490,7 @@ mod tests {
     #[test]
     fn request_omits_reasoning_when_not_configured_and_flattens_tools() {
         let request = ResponsesRequest {
+            text: None,
             model: "test-model".into(),
             instructions: "system".into(),
             input: vec![json!({"role":"user","content":[{"type":"input_text","text":"hi"}]})],

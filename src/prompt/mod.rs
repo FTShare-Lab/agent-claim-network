@@ -14,6 +14,14 @@ use crate::config::PromptConfig;
 const BUNDLED_PROMPT_ROOT_LABEL: &str = "<bundled-prompts>";
 const BUNDLED_TEMPLATES: &[(&str, &str)] = &[
     (
+        "dream_compaction.j2",
+        include_str!("../../prompts/dream_compaction.j2"),
+    ),
+    (
+        "claim_dream.j2",
+        include_str!("../../prompts/claim_dream.j2"),
+    ),
+    (
         "agent_system.j2",
         include_str!("../../prompts/agent_system.j2"),
     ),

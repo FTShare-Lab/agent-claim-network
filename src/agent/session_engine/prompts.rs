@@ -124,7 +124,7 @@ impl SessionEngine {
     pub(super) async fn render_session_system_prompt_for_inbox(
         &self,
         inbox_report: &InboxProcessReport,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<(String, Vec<Claim>)> {
         let router_scopes_overview = match inbox_report.team_services.router {
             TeamServiceConnectionStatus::Unknown => SOLO_TEAM_SERVICES_OVERVIEW.into(),
             TeamServiceConnectionStatus::Connected => inbox_report
@@ -141,7 +141,7 @@ impl SessionEngine {
     async fn render_session_system_prompt_with_router_overview(
         &self,
         router_scopes_overview: &str,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<(String, Vec<Claim>)> {
         let memory_enabled = self.turn_loop.tool_registry().memory_enabled();
         let (memory_text, user_text) = if memory_enabled {
             let memory_snapshot = self.agent.memory_store.read_snapshot().await?;
@@ -160,7 +160,25 @@ impl SessionEngine {
         } else {
             (String::new(), String::new())
         };
-        let local_claims_snapshot = self.render_local_claims_snapshot().await;
+        let (prompt_claims, local_claims_snapshot) =
+            match self.agent.claim_store.list_local_claims().await {
+                Ok(claims) => {
+                    let snapshot =
+                        format_local_claims_snapshot(&llm_visible_claims(claims.clone()));
+                    (claims, snapshot)
+                }
+                Err(error) => {
+                    log::warn!(
+                        target: "agent",
+                        "读取本地 Claim 快照失败，以空快照继续启动: {error:#}"
+                    );
+                    // 基线必须与实际注入内容一致，读取恢复后由 runtime_context 补充。
+                    (
+                        Vec::new(),
+                        "本次会话未载入本地 Claim 快照；后续变化通过 runtime_context 补充。".into(),
+                    )
+                }
+            };
         let context = SessionSystemPromptContext {
             agent_id: &self.agent.agent_id,
             memory_enabled,
@@ -179,7 +197,10 @@ impl SessionEngine {
             .prompt_registry
             .render(PROMPT_AGENT_SYSTEM, context)
             .context("渲染 session system prompt 失败")?;
-        Ok(append_acn_md(system_prompt, self.read_acn_md().await?))
+        Ok((
+            append_acn_md(system_prompt, self.read_acn_md().await?),
+            prompt_claims,
+        ))
     }
 
     pub(super) async fn read_acn_md(&self) -> anyhow::Result<Option<String>> {
@@ -197,19 +218,6 @@ impl SessionEngine {
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err).with_context(|| format!("读取 ACN.md 失败: {}", path.display())),
-        }
-    }
-
-    pub(super) async fn render_local_claims_snapshot(&self) -> String {
-        match self.agent.claim_store.list_local_claims().await {
-            Ok(claims) => format_local_claims_snapshot(&llm_visible_claims(claims)),
-            Err(err) => {
-                log::warn!(
-                    target: "agent",
-                    "渲染本地 self claims 快照失败，降级为空快照: {err}"
-                );
-                format_local_claims_snapshot(&[])
-            }
         }
     }
 

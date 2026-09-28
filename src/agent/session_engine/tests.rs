@@ -22,6 +22,8 @@ use super::super::fs::{
 use super::super::inbox::InboxJsonGenerator;
 use super::super::maintainer_upload::{LocalFsMaintainerUploadQueue, PendingMaintainerUploads};
 use super::super::runner::AgentRunner;
+use super::dream;
+use super::dream_review;
 use super::{
     active_provider_safe_segments, active_segments_hash, append_acn_md,
     assistant_turn_end_text_after, auto_compact_should_trigger,
@@ -94,9 +96,15 @@ use crate::session::{
 use crate::skill::{SkillInstructions, SkillSummary};
 use crate::storage::{paths, write_yaml_atomic, FileLockGuard};
 use crate::tool::{ProcessCompletion, ToolDispatchContext, ToolRegistry};
-use serde_json::json;
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
 enum ProviderStep {
+    DreamSelfReview,
+    DreamGroupSelfReview,
+    Wait {
+        entered: Arc<tokio::sync::Notify>,
+    },
     Response {
         response: ProviderResponse,
         events: Vec<ProviderEvent>,
@@ -246,6 +254,16 @@ impl ProviderAdapter for RecordingProvider {
             steps.pop_front()
         };
         match next_step {
+            Some(ProviderStep::DreamGroupSelfReview) => {
+                Ok(dream_apply_response(&request_for_kind, false))
+            }
+            Some(ProviderStep::DreamSelfReview) => {
+                Ok(dream_apply_response(&request_for_kind, true))
+            }
+            Some(ProviderStep::Wait { entered }) => {
+                entered.notify_one();
+                std::future::pending().await
+            }
             Some(ProviderStep::Response { response, events }) => {
                 for event in events {
                     emit(event);
@@ -2733,7 +2751,7 @@ async fn session_system_prompt_renders_configured_subagent_concurrency_limit() {
         router_scopes_overview: Some(ScopesOverviewSnapshot::default()),
         ..Default::default()
     };
-    let prompt = engine
+    let (prompt, _) = engine
         .render_session_system_prompt_for_inbox(&inbox_report)
         .await
         .unwrap();
@@ -2761,7 +2779,7 @@ async fn resume_keeps_frozen_system_prompt_when_file_edit_authority_changes() {
     let tools = Arc::new(ToolRegistry::new(&tool_config).unwrap());
     let (engine, store) = build_test_engine_with_tools(&dir, provider.clone(), tools);
     let inbox_report = crate::agent::InboxProcessReport::default();
-    let current_prompt = engine
+    let (current_prompt, _) = engine
         .render_session_system_prompt_for_inbox(&inbox_report)
         .await
         .unwrap();
@@ -2821,7 +2839,7 @@ async fn disabled_memory_omits_new_prompt_and_tools_but_resume_keeps_frozen_syst
     tokio::fs::write(memory_dir.join("MEMORY.md"), "PRIVATE_MEMORY_MARKER")
         .await
         .unwrap();
-    let current_prompt = engine
+    let (current_prompt, _) = engine
         .render_session_system_prompt_for_inbox(&crate::agent::InboxProcessReport::default())
         .await
         .unwrap();
@@ -11890,6 +11908,7 @@ async fn cached_delegation_baseline_replaces_stale_snapshot_after_compaction_wit
         },
     )])));
     let mut appender = MainModelContextAppender {
+        claim_runtime: None,
         tools,
         session_id,
         session_dir,
@@ -11966,6 +11985,7 @@ async fn changed_delegation_revision_with_same_semantics_does_not_append_snapsho
         },
     )])));
     let mut appender = MainModelContextAppender {
+        claim_runtime: None,
         tools: engine.turn_loop.tool_registry(),
         session_id: session.metadata.id.clone(),
         session_dir: session.paths.dir.clone(),
@@ -12056,6 +12076,7 @@ async fn multiple_delegation_changes_coalesce_into_one_next_snapshot() {
         },
     )])));
     let mut appender = MainModelContextAppender {
+        claim_runtime: None,
         tools: engine.turn_loop.tool_registry(),
         session_id: session.metadata.id.clone(),
         session_dir: session.paths.dir.clone(),
@@ -16701,4 +16722,912 @@ fn persisted_compaction_estimate_counts_provider_replay() {
     );
 
     assert!(replay_tokens > canonical_tokens);
+}
+
+#[path = "dream_integration_tests.rs"]
+mod dream_integration_tests;
+
+#[path = "dream_stop_tests.rs"]
+mod dream_stop_tests;
+
+fn dream_fixture_claim(id: &str) -> Claim {
+    Claim {
+        id: id.parse().unwrap(),
+        name: "queue recovery".into(),
+        statement: "A persisted queued item can be retried after restart.".into(),
+        scope: "example / queue".into(),
+        holder: AgentId::new("agent-a").unwrap(),
+        confidence: Confidence::Medium,
+        status: ClaimStatus::Active,
+        created_at: crate::time::now_seconds(),
+        updated_at: None,
+        source_claim_ids: vec![],
+        evidence_summary: "Existing queue recovery test covers persisted items only.".into(),
+    }
+}
+
+const DREAM_NOOP_PLAN: &str = r#"{"review":{"quality":"reusable","evidence":"only observed boundaries covered","consolidation":"no duplicates"},"groups":[]}"#;
+
+fn build_dream_test_engine(
+    dir: &tempfile::TempDir,
+    provider: Arc<dyn ProviderAdapter>,
+) -> SessionEngine {
+    let home = dir.path().join("agents/agent-a");
+    let store = Arc::new(crate::agent::fs::LocalFsClaimStore::new(home.clone()));
+    let tools = ToolRegistry::new(&ToolConfig {
+        workspace_root: dir.path().into(),
+        ..Default::default()
+    })
+    .unwrap()
+    .with_local_knowledge(store, home, AgentId::new("agent-a").unwrap());
+    build_test_engine_with_team_mode(dir, provider, Arc::new(tools), vec![], false).0
+}
+
+fn dream_finish_from_request(request: &ProviderRequest) -> Value {
+    fn collect(value: &Value, found: &mut BTreeMap<String, Value>) {
+        if let Some(groups) = value.get("validated_groups").and_then(Value::as_array) {
+            for group in groups {
+                if let Some(id) = group["input"]["group_id"].as_str() {
+                    found.insert(id.into(), group.clone());
+                }
+            }
+        }
+        match value {
+            Value::Object(map) => {
+                for v in map.values() {
+                    collect(v, found);
+                }
+            }
+            Value::Array(items) => {
+                for v in items {
+                    collect(v, found);
+                }
+            }
+            Value::String(text) => {
+                if let Ok(value) = serde_json::from_str::<Value>(text) {
+                    if value.is_object() || value.is_array() {
+                        collect(&value, found);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut found = BTreeMap::new();
+    collect(&json!(request.messages), &mut found);
+    assert!(
+        !found.is_empty(),
+        "Test agent must receive real dream_validate output first: {:?}",
+        request.messages.last()
+    );
+    json!({"group_ids":found.keys().collect::<Vec<_>>(),"review":{"quality":"reviewed","evidence":"supported boundaries","consolidation":"conditions retained"},"validations":found.values().collect::<Vec<_>>(),"self_reviews":found.values().map(|v| dream_review::fixture_review(&serde_json::from_value(v.clone()).unwrap())).collect::<Vec<_>>()})
+}
+
+fn dream_apply_response(request: &ProviderRequest, finish: bool) -> ProviderResponse {
+    let data = dream_finish_from_request(request);
+    let mut content = Vec::new();
+    for v in data["validations"].as_array().unwrap() {
+        let input = &v["input"];
+        let entries = input["before"].as_array().unwrap().iter().map(|before| {
+            let after = input["after"].as_array().unwrap().iter().find(|a| a["id"]==before["id"]).unwrap();
+            let outputs = if input["kind"]=="consolidation" {
+                input["coverage"].as_array().unwrap().iter().find(|c|c["input_id"]==before["id"]).unwrap()["output_ids"].clone()
+            } else if after["status"]!="deprecated" { json!([before["id"]]) } else { json!([]) };
+            let evidence = input["change_basis"].as_array().unwrap().iter().find(|b|b["claim_id"]==before["id"]).map(|b|b["evidence_ids"].clone()).unwrap_or(json!([]));
+            json!({"claim_id":before["id"],"final_name":after["name"],"name_reason":"Checked final name against the retained statement.","information_preserved":format!("Checked original conditions and destination: {}",before["statement"]),"removal_or_correction":"Checked changed facts against the versioned evidence; episodic material does not replace reusable conditions.","factual_correction":input["kind"]=="evidence","output_ids":outputs,"evidence_ids":evidence})
+        }).collect::<Vec<_>>();
+        content.push(SessionTurnContentBlock::ToolUse {id:format!("apply_{}",input["group_id"].as_str().unwrap()),name:"dream_apply_group".into(),input:json!({"group_id":input["group_id"],"validation_id":v["validation_id"],"review":{"claims":entries,"scope_and_certainty":"Name and scope match retained conditions; certainty does not extend beyond the cited evidence."}})});
+    }
+    if finish {
+        content.push(SessionTurnContentBlock::ToolUse {
+            id: "finish_execution".into(),
+            name: "dream_finish".into(),
+            input: json!({"group_ids":[],"review":data["review"]}),
+        });
+    }
+    ProviderResponse {
+        assistant_message: SessionTurnMessage {
+            role: "assistant".into(),
+            content,
+            provider_replay: None,
+        },
+        stop: ProviderStop::ToolUse,
+    }
+}
+
+fn dream_add_basis(mut group: Value) -> Value {
+    let items = group
+        .get("operations")
+        .or_else(|| group.get("updates"))
+        .unwrap()
+        .as_array()
+        .unwrap();
+    group["change_basis"] = json!(items.iter().filter(|op| op.get("action").is_none_or(|a| a != "keep")).map(|op| json!({
+        "claim_id":op["id"],"removed_or_changed":"Only the indicated fields change; original conditions are preserved.",
+        "added":"", "justification":"The quoted input and supplied evidence support this bounded change.","evidence_ids":group["evidence_ids"]
+    })).collect::<Vec<_>>());
+    group
+}
+
+fn dream_evidence_plan(claim: &Claim) -> String {
+    let mut plan = json!({"review":{"quality":"reusable","evidence":"read independent file","consolidation":"no duplicates"},"groups":[{
+        "kind":"evidence","reason":"independent file confirms bounded assertion","evidence_ids":["evidence_1"],"coverage":[],
+        "updates":[{"id":claim.id,"name":claim.name,"statement":claim.statement,"scope":claim.scope,"confidence":"high","status":"active","source_claim_ids":[],"evidence_summary":"evidence.txt confirms restart recovery for persisted queue items only."}]
+    }]});
+    plan["groups"][0] = dream_add_basis(plan["groups"][0].clone());
+    plan.to_string()
+}
+
+#[tokio::test]
+async fn dream_explores_beyond_old_limits_with_all_thirty_claims() {
+    let dir = tempfile::tempdir().unwrap();
+    tokio::fs::write(
+        dir.path().join("evidence.txt"),
+        "Persisted queue survives restart.",
+    )
+    .await
+    .unwrap();
+    let mut steps: Vec<_> = (0..18)
+        .map(|i| {
+            tool_use_step(
+                &format!("read_{i}"),
+                "file_read",
+                json!({"path":"evidence.txt"}),
+            )
+        })
+        .collect();
+    steps.push(response_step(DREAM_NOOP_PLAN, vec![]));
+    let provider = Arc::new(RecordingProvider::new(steps));
+    let mut engine = build_dream_test_engine(&dir, provider.clone());
+    engine.turn_loop = Arc::new(AgentTurnLoop::new(
+        provider.clone(),
+        engine.turn_loop.tool_registry(),
+        24_000,
+    ));
+    for i in 1..=30 {
+        engine
+            .agent
+            .claim_store
+            .write_claim(&dream_fixture_claim(&format!("claim_{i:08x}")))
+            .await
+            .unwrap();
+    }
+    let jobs = dir.path().join("agents/agent-a/runtime/supervisor/jobs");
+    engine
+        .run_dream_job("job_bounded", dir.path(), &jobs, true, true)
+        .await
+        .unwrap();
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 19);
+    assert!(requests
+        .iter()
+        .all(|r| r.tools.len() == 12 && r.max_tokens == 24_000));
+    let text = serde_json::to_string(&requests[18].messages).unwrap();
+    assert!(text.contains("evidence_18"));
+    for i in 1..=30 {
+        assert!(text.contains(&format!("claim_{i:08x}")));
+    }
+}
+
+#[tokio::test]
+async fn dream_does_not_interrupt_exploration_at_old_time_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let provider = Arc::new(RecordingProvider::new(vec![
+        ProviderStep::Wait {
+            entered: entered.clone(),
+        },
+        response_step(DREAM_NOOP_PLAN, vec![]),
+    ]));
+    let engine = build_dream_test_engine(&dir, provider.clone());
+    engine
+        .agent
+        .claim_store
+        .write_claim(&dream_fixture_claim("claim_11111111"))
+        .await
+        .unwrap();
+    let workspace = dir.path().to_path_buf();
+    let task = tokio::spawn(async move {
+        engine
+            .run_dream_job(
+                "job_slow",
+                &workspace,
+                &workspace.join("agents/agent-a/runtime/supervisor/jobs"),
+                true,
+                true,
+            )
+            .await
+    });
+    entered.notified().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(601)).await;
+    tokio::time::resume();
+    assert!(!task.is_finished());
+    assert_eq!(provider.requests().await.len(), 1);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn dream_retry_reuses_versioned_evidence_and_rejects_changed_inputs() {
+    for change in ["none", "file", "claim"] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("evidence.txt");
+        tokio::fs::write(&file, "Persisted queue survives restart.")
+            .await
+            .unwrap();
+        let mut claim = dream_fixture_claim("claim_11111111");
+        let mut steps = vec![
+            tool_use_step("read_evidence", "file_read", json!({"path":"evidence.txt"})),
+            ProviderStep::TerminalFailure {
+                message: "temporary provider failure",
+            },
+            response_step(&dream_evidence_plan(&claim), vec![]),
+        ];
+        if change == "none" {
+            steps.push(tool_use_step("validate", "dream_validate", json!({})));
+            steps.push(ProviderStep::DreamSelfReview);
+        } else {
+            steps.push(response_step(DREAM_NOOP_PLAN, vec![]));
+            steps.push(tool_use_step("confirm_no_change", "dream_finish", json!({"review":{"quality":"retain reusable rules","evidence":"prior evidence is no longer current; no new verification","consolidation":"retain separate knowledge"},"group_ids":[]})));
+        }
+        let provider = Arc::new(RecordingProvider::new(steps));
+        let engine = build_dream_test_engine(&dir, provider.clone());
+        engine.agent.claim_store.write_claim(&claim).await.unwrap();
+        let jobs = dir.path().join("agents/agent-a/runtime/supervisor/jobs");
+        assert!(engine
+            .run_dream_job("job_resume", dir.path(), &jobs, true, true)
+            .await
+            .is_err());
+        if change == "file" {
+            tokio::fs::write(&file, "Unpersisted items are lost.")
+                .await
+                .unwrap();
+        }
+        if change == "claim" {
+            claim.statement = "Only persisted items are covered by recovery.".into();
+            engine.agent.claim_store.write_claim(&claim).await.unwrap();
+        }
+        let result = engine
+            .run_dream_job("job_resume", dir.path(), &jobs, true, false)
+            .await;
+        let requests = provider.requests().await;
+        assert_eq!(requests.len(), 5);
+        let wire = serde_json::to_string(&requests[2].messages).unwrap();
+        if change == "none" {
+            result.unwrap();
+            assert!(wire.contains("evidence_1"));
+            assert_eq!(
+                engine.agent.claim_store.list_local_claims().await.unwrap()[0].confidence,
+                Confidence::High
+            );
+        } else {
+            assert!(result.unwrap().updated_claim_ids.is_empty());
+            assert!(serde_json::to_string(&requests[3].messages)
+                .unwrap()
+                .contains("evidence never read"));
+            assert!(!wire.contains("evidence_1"));
+            assert_eq!(
+                engine.agent.claim_store.list_local_claims().await.unwrap()[0],
+                claim
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn dream_invalid_plan_retry_repairs_without_repeating_exploration() {
+    let dir = tempfile::tempdir().unwrap();
+    tokio::fs::write(
+        dir.path().join("evidence.txt"),
+        "Persisted queue survives restart.",
+    )
+    .await
+    .unwrap();
+    let claim = dream_fixture_claim("claim_11111111");
+    let provider = Arc::new(RecordingProvider::new(vec![
+        tool_use_step("read_evidence", "file_read", json!({"path":"evidence.txt"})),
+        response_step("not a JSON plan", vec![]),
+        response_step(&dream_evidence_plan(&claim), vec![]),
+        tool_use_step("validate", "dream_validate", json!({})),
+        ProviderStep::DreamSelfReview,
+    ]));
+    let engine = build_dream_test_engine(&dir, provider.clone());
+    engine.agent.claim_store.write_claim(&claim).await.unwrap();
+    let jobs = dir.path().join("agents/agent-a/runtime/supervisor/jobs");
+    engine
+        .run_dream_job("job_repair", dir.path(), &jobs, true, true)
+        .await
+        .unwrap();
+    let rejected: Value = serde_json::from_slice(
+        &tokio::fs::read(
+            dir.path()
+                .join("agents/agent-a/dream/job_repair/revisions/000001.json"),
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(rejected["event"]["kind"], "invalid_legacy_plan");
+    assert_eq!(rejected["event"]["proposal"], "not a JSON plan");
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 5);
+    assert_eq!(requests[2].tools.len(), 12);
+    let wire = serde_json::to_string(&requests[2].messages).unwrap();
+    assert!(wire.contains("invalid Dream plan JSON") && wire.contains("evidence_1"));
+}
+
+#[tokio::test]
+async fn dream_large_invalid_plans_do_not_exhaust_retry_context() {
+    let dir = tempfile::tempdir().unwrap();
+    tokio::fs::write(
+        dir.path().join("evidence.txt"),
+        "Persisted queue survives restart.",
+    )
+    .await
+    .unwrap();
+    let claim = dream_fixture_claim("claim_11111111");
+    let invalid_plan = json!({"review":{
+        "quality":"未".repeat(12_000),"evidence":"pending","consolidation":"none","groups":[]
+    }})
+    .to_string();
+    let mut steps = vec![tool_use_step(
+        "read_evidence",
+        "file_read",
+        json!({"path":"evidence.txt"}),
+    )];
+    steps.extend((0..4).map(|_| response_step(&invalid_plan, vec![])));
+    steps.push(response_step(&dream_evidence_plan(&claim), vec![]));
+    steps.push(tool_use_step("validate", "dream_validate", json!({})));
+    steps.push(ProviderStep::DreamSelfReview);
+    let provider = Arc::new(RecordingProvider::new(steps));
+    let mut engine = build_dream_test_engine(&dir, provider.clone());
+    // 预留完整 Dream prompt / 工具后仍能装入 Claim；四份失败输出累积则会超窗。
+    engine.context_window = 72_000;
+    engine.agent.claim_store.write_claim(&claim).await.unwrap();
+    let jobs = dir.path().join("agents/agent-a/runtime/supervisor/jobs");
+    for attempt in 0..1 {
+        let error = engine
+            .run_dream_job("job_large_plan", dir.path(), &jobs, true, attempt == 0)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("invalid Dream plan JSON"),
+            "{error:#}"
+        );
+        assert_eq!(
+            engine.agent.claim_store.list_local_claims().await.unwrap()[0],
+            claim
+        );
+        let input: Value = serde_json::from_slice(
+            &tokio::fs::read(
+                dir.path()
+                    .join("agents/agent-a/dream/job_large_plan/input.json"),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(input["input"]["context"]["coverage"]["included"], 1);
+    }
+    engine
+        .run_dream_job("job_large_plan", dir.path(), &jobs, true, false)
+        .await
+        .unwrap();
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 8);
+    for request in &requests[2..6] {
+        assert_eq!(request.tools.len(), 12);
+        let wire = serde_json::to_string(&request.messages).unwrap();
+        assert!(wire.contains("evidence_1") && wire.contains("invalid Dream plan JSON"));
+        assert!(!wire.contains(&"未".repeat(100)));
+        assert!(wire.matches("上一份输出未通过宿主校验").count() <= 1);
+    }
+    assert_eq!(
+        engine.agent.claim_store.list_local_claims().await.unwrap()[0].confidence,
+        Confidence::High
+    );
+}
+
+#[tokio::test]
+async fn dream_staged_groups_survive_provider_retry_and_finish_without_extra_sampling() {
+    let dir = tempfile::tempdir().unwrap();
+    let claim = dream_fixture_claim("claim_11111111");
+    let mut stage = json!({"group_id":"quality","group":{"kind":"quality","reason":"episodic only","evidence_ids":[],"coverage":[],
+        "operations":[{"id":claim.id,"action":"deprecate","changes":{"evidence_summary":"Only delivery history; no reusable judgment."}}]}});
+    stage["group"] = dream_add_basis(stage["group"].clone());
+    let mut invalid = stage.clone();
+    invalid["group"]["operations"][0]["id"] = json!("claim_ffffffff");
+    let finish = json!({"review":{"quality":"episode removed","evidence":"no task result inferred","consolidation":"no duplicate"},"group_ids":["quality"]});
+    let provider = Arc::new(RecordingProvider::new(vec![
+        tool_use_step("stage", "dream_stage_group", stage.clone()),
+        tool_use_step("invalid", "dream_stage_group", invalid),
+        ProviderStep::TerminalFailure {
+            message: "temporary failure",
+        },
+        tool_use_step(
+            "inspect_draft",
+            "dream_read_draft",
+            json!({"group_ids":["quality"]}),
+        ),
+        tool_use_step("repair", "dream_stage_group", stage),
+        tool_use_step("finish", "dream_finish", finish),
+        tool_use_step("validate", "dream_validate", json!({})),
+        ProviderStep::DreamSelfReview,
+    ]));
+    let engine = build_dream_test_engine(&dir, provider.clone());
+    engine.agent.claim_store.write_claim(&claim).await.unwrap();
+    let jobs = dir.path().join("agents/agent-a/runtime/supervisor/jobs");
+    assert!(engine
+        .run_dream_job("job_staged", dir.path(), &jobs, true, true)
+        .await
+        .is_err());
+    assert_eq!(
+        engine.agent.claim_store.list_local_claims().await.unwrap()[0],
+        claim
+    );
+    engine
+        .run_dream_job("job_staged", dir.path(), &jobs, true, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.agent.claim_store.list_local_claims().await.unwrap()[0].status,
+        ClaimStatus::Deprecated
+    );
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 8);
+    let last = serde_json::to_string(&requests[3].messages).unwrap();
+    assert!(last.contains("claim_ffffffff") && last.contains("completely read"));
+    assert!(last.contains("staged_group_ids") && last.contains("quality"));
+    assert!(last.contains("draft_state") && last.contains("pending_rejections"));
+    let after_read = serde_json::to_string(&requests[4].messages).unwrap();
+    assert!(
+        after_read.contains("operations")
+            && after_read.contains("Only delivery history; no reusable judgment.")
+    );
+    let exploration: serde_json::Value = crate::storage::read_yaml(
+        &jobs
+            .parent()
+            .unwrap()
+            .join("dream_exploration/job_staged.yaml"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        exploration["draft"]["finished"]["groups"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn dream_noop_confirmation_advances_cooldown_and_recovery_needs_no_model_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        response_step(
+            r#"{"review":{"quality":"reusable","evidence":"task outcome unknown; existing scope retained","consolidation":"no duplicates"},"groups":[]}"#,
+            vec![],
+        ),
+        tool_use_step(
+            "confirm",
+            "dream_finish",
+            json!({"review":{"quality":"reusable rules retained","evidence":"no selected evidence question","consolidation":"separate scopes retained"},"group_ids":[]}),
+        ),
+    ]));
+    let (engine, _) = build_local_test_engine(&dir, provider.clone());
+    for id in [
+        "claim_11111111",
+        "claim_22222222",
+        "claim_33333333",
+        "claim_44444444",
+        "claim_55555555",
+    ] {
+        engine
+            .agent
+            .claim_store
+            .write_claim(&dream_fixture_claim(id))
+            .await
+            .unwrap();
+    }
+    assert!(engine.dream_eligible(false).await.unwrap());
+    let jobs = dir.path().join("agents/agent-a/runtime/supervisor/jobs");
+    let result = engine
+        .run_dream_job("job_noop", dir.path(), &jobs, false, true)
+        .await
+        .unwrap();
+    assert!(result.updated_claim_ids.is_empty());
+    assert!(!engine.dream_eligible(false).await.unwrap());
+    assert!(engine.dream_eligible(true).await.unwrap());
+    engine
+        .run_dream_job("job_noop", dir.path(), &jobs, true, false)
+        .await
+        .unwrap();
+    assert_eq!(provider.requests().await.len(), 2);
+    assert!(!dir
+        .path()
+        .join("agents/agent-a/maintainer_uploads/pending.yaml")
+        .exists());
+
+    let state_path = jobs.parent().unwrap().join("dream_state.yaml");
+    let mut state: dream::DreamState = crate::storage::read_yaml(&state_path).await.unwrap();
+    state.last_success_at = Some(chrono::Utc::now() - chrono::Duration::hours(25));
+    crate::storage::write_yaml_atomic(&state_path, &state)
+        .await
+        .unwrap();
+    let mut claims = engine.agent.claim_store.list_local_claims().await.unwrap();
+    for (index, claim) in claims.iter_mut().enumerate() {
+        // 即使时间戳相同，内容变化也能识别；同一 ID 多次修改不重复计数。
+        claim
+            .statement
+            .push_str(" Scope is limited to persisted items.");
+        engine.agent.claim_store.write_claim(claim).await.unwrap();
+        engine.agent.claim_store.write_claim(claim).await.unwrap();
+        assert_eq!(engine.dream_eligible(false).await.unwrap(), index == 4);
+    }
+    state.last_success_at = Some(chrono::Utc::now());
+    crate::storage::write_yaml_atomic(&state_path, &state)
+        .await
+        .unwrap();
+    assert!(!engine.dream_eligible(false).await.unwrap());
+}
+
+#[tokio::test]
+async fn dream_consolidates_contents_then_deprecates_covered_input_and_excludes_foreign_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut plan: Value = serde_json::from_str(r#"{"review":{"quality":"both reusable","evidence":"only persisted queue covered","consolidation":"retain recovery and ordering conditions"},"groups":[{"kind":"consolidation","reason":"same queue scope","evidence_ids":[],"coverage":[{"input_id":"claim_11111111","output_ids":["claim_11111111"],"note":"restart recovery retained"},{"input_id":"claim_22222222","output_ids":["claim_11111111"],"note":"ordering retained"}],"updates":[{"id":"claim_11111111","name":"queue recovery","statement":"Persisted queue items survive restart and are retried in FIFO order; in-memory items are not covered.","scope":"example / queue","confidence":"medium","status":"active","source_claim_ids":[],"evidence_summary":"Existing tests cover restart and ordering for persisted items."},{"id":"claim_22222222","name":"queue ordering","statement":"Persisted queue items are retried in FIFO order.","scope":"example / queue","confidence":"medium","status":"deprecated","source_claim_ids":[],"evidence_summary":"Information consolidated into claim_11111111."}]}]}"#).unwrap();
+    plan["groups"][0] = dream_add_basis(plan["groups"][0].clone());
+    let provider = Arc::new(RecordingProvider::new(vec![
+        response_step(&plan.to_string(), vec![]),
+        tool_use_step("validate", "dream_validate", json!({})),
+        ProviderStep::DreamSelfReview,
+    ]));
+    let (engine, _) = build_local_test_engine(&dir, provider.clone());
+    let first = dream_fixture_claim("claim_11111111");
+    let mut second = dream_fixture_claim("claim_22222222");
+    second.statement = "Persisted queue items are retried in FIFO order.".into();
+    let mut foreign = dream_fixture_claim("claim_33333333");
+    foreign.holder = AgentId::new("agent-b").unwrap();
+    let mut deprecated = dream_fixture_claim("claim_44444444");
+    deprecated.status = ClaimStatus::Deprecated;
+    for claim in [&first, &second, &foreign, &deprecated] {
+        engine.agent.claim_store.write_claim(claim).await.unwrap();
+    }
+    let jobs = dir.path().join("agents/agent-a/runtime/supervisor/jobs");
+    let report = engine
+        .run_dream_job("job_merge", dir.path(), &jobs, true, true)
+        .await
+        .unwrap();
+    assert_eq!(report.updated_claim_ids.len(), 2);
+    let claims = engine.agent.claim_store.list_local_claims().await.unwrap();
+    assert!(claims
+        .iter()
+        .find(|c| c.id == first.id)
+        .unwrap()
+        .statement
+        .contains("FIFO"));
+    assert_eq!(
+        claims.iter().find(|c| c.id == second.id).unwrap().status,
+        ClaimStatus::Deprecated
+    );
+    assert_eq!(
+        claims.iter().find(|c| c.id == foreign.id).unwrap(),
+        &foreign
+    );
+    let wire = serde_json::to_string(&provider.requests().await[0].messages).unwrap();
+    assert!(!wire.contains("claim_33333333") && !wire.contains("claim_44444444"));
+    // 同一 Prepared/Applied job 恢复不产生第二次模型调用或不同时间戳。
+    engine
+        .run_dream_job("job_merge", dir.path(), &jobs, true, false)
+        .await
+        .unwrap();
+    assert_eq!(provider.requests().await.len(), 3);
+    assert_eq!(
+        engine.agent.claim_store.list_local_claims().await.unwrap(),
+        claims
+    );
+    let checkpoint_path = jobs.parent().unwrap().join("dream/job_merge.yaml");
+    let mut prepared: serde_json::Value =
+        crate::storage::read_yaml(&checkpoint_path).await.unwrap();
+    prepared["applied"] = serde_json::json!(false);
+    prepared["success_at"] = serde_json::Value::Null;
+    prepared["self_versions"] = serde_json::json!({});
+    prepared["groups"][0]["completed"] = serde_json::json!(false);
+    // 模拟已写存活项、尚未废弃旧项即崩溃；恢复完成剩余步骤，不再请求模型。
+    engine.agent.claim_store.write_claim(&second).await.unwrap();
+    crate::storage::write_yaml_atomic(&checkpoint_path, &prepared)
+        .await
+        .unwrap();
+    engine
+        .run_dream_job("job_merge", dir.path(), &jobs, true, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        engine
+            .agent
+            .claim_store
+            .list_local_claims()
+            .await
+            .unwrap()
+            .iter()
+            .find(|c| c.id == second.id)
+            .unwrap()
+            .status,
+        ClaimStatus::Deprecated
+    );
+    // 若恢复前出现第三个版本，则保留该修改，也保留尚未安全废弃的输入。
+    engine.agent.claim_store.write_claim(&second).await.unwrap();
+    let mut concurrent = first.clone();
+    concurrent.statement = "A new externally verified boundary must survive.".into();
+    engine
+        .agent
+        .claim_store
+        .write_claim(&concurrent)
+        .await
+        .unwrap();
+    crate::storage::write_yaml_atomic(&checkpoint_path, &prepared)
+        .await
+        .unwrap();
+    engine
+        .run_dream_job("job_merge", dir.path(), &jobs, true, false)
+        .await
+        .unwrap();
+    let current = engine.agent.claim_store.list_local_claims().await.unwrap();
+    assert_eq!(
+        current.iter().find(|c| c.id == first.id).unwrap(),
+        &concurrent
+    );
+    assert_eq!(current.iter().find(|c| c.id == second.id).unwrap(), &second);
+    let report: serde_json::Value = crate::storage::read_yaml(&checkpoint_path).await.unwrap();
+    assert_eq!(report["groups"][0]["skipped"], true);
+    assert_eq!(provider.requests().await.len(), 3);
+}
+
+#[tokio::test]
+async fn dream_disabled_or_only_deprecated_never_calls_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![]));
+    let (mut engine, _) = build_local_test_engine(&dir, provider.clone());
+    let mut claim = dream_fixture_claim("claim_11111111");
+    claim.status = ClaimStatus::Deprecated;
+    engine.agent.claim_store.write_claim(&claim).await.unwrap();
+    assert!(!engine.dream_eligible(true).await.unwrap());
+    claim.status = ClaimStatus::Active;
+    engine.agent.claim_store.write_claim(&claim).await.unwrap();
+    engine.dream_config.enable = false;
+    assert!(!engine.dream_eligible(true).await.unwrap());
+    engine
+        .run_dream_job("job_off", dir.path(), &dir.path().join("jobs"), true, true)
+        .await
+        .unwrap();
+    assert!(provider.requests().await.is_empty());
+}
+
+#[tokio::test]
+async fn claim_runtime_is_session_specific_and_independent_of_dream() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![]));
+    let (mut engine, _) = build_local_test_engine(&dir, provider);
+    engine.dream_config.enable = false;
+    let first = dir.path().join("first_session");
+    let second = dir.path().join("second_session");
+    engine
+        .save_claim_prompt_baseline(&first, &[])
+        .await
+        .unwrap();
+    let mut claim = dream_fixture_claim("claim_11111111");
+    engine.agent.claim_store.write_claim(&claim).await.unwrap();
+    engine
+        .save_claim_prompt_baseline(&second, &[claim.clone()])
+        .await
+        .unwrap();
+    let created = engine.claim_runtime_context(&first).await.unwrap().unwrap();
+    assert!(created.text.contains("created") && created.text.contains("claim_11111111"));
+    assert!(!created.text.contains(&claim.statement));
+    assert!(!engine
+        .claim_runtime_context(&second)
+        .await
+        .unwrap()
+        .unwrap()
+        .text
+        .contains("created"));
+    // 读取不推进游标；失败 turn 可重放同一投影，不影响另一个会话。
+    assert_eq!(
+        created,
+        engine.claim_runtime_context(&first).await.unwrap().unwrap()
+    );
+    claim.confidence = Confidence::Low;
+    engine.agent.claim_store.write_claim(&claim).await.unwrap();
+    let updated = engine
+        .claim_runtime_context(&second)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(updated.text.contains("updated"));
+    assert_ne!(created, updated);
+    claim.status = ClaimStatus::Deprecated;
+    engine.agent.claim_store.write_claim(&claim).await.unwrap();
+    assert!(engine
+        .claim_runtime_context(&second)
+        .await
+        .unwrap()
+        .unwrap()
+        .text
+        .contains("deprecated"));
+}
+
+#[tokio::test]
+async fn claim_snapshot_read_failure_starts_empty_and_reports_recovered_claims() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        response_step("while unavailable", vec![]),
+        response_step("after recovery", vec![]),
+        response_step("after update", vec![]),
+    ]));
+    let (engine, _) = build_local_test_engine(&dir, provider.clone());
+    let agent_home = dir.path().join("agents/agent-a");
+    let claims_dir = agent_home.join("claims");
+    tokio::fs::create_dir_all(&agent_home).await.unwrap();
+    // 用占位文件模拟目录读取失败，避免依赖当前进程的文件权限。
+    tokio::fs::write(&claims_dir, "unavailable").await.unwrap();
+    assert!(engine.agent.claim_store.list_local_claims().await.is_err());
+
+    let report = engine.start_session(1, |_| {}).await.unwrap();
+    let mut session = report.session;
+    let frozen = tokio::fs::read_to_string(&session.paths.system_prompt)
+        .await
+        .unwrap();
+    let baseline: super::claim_context::ClaimIndex =
+        crate::storage::read_yaml(&session.paths.dir.join("claim_prompt_baseline.yaml"))
+            .await
+            .unwrap();
+    assert!(baseline.is_empty());
+    engine
+        .run_turn(&mut session, "while unavailable", |_| {})
+        .await
+        .unwrap();
+
+    tokio::fs::remove_file(&claims_dir).await.unwrap();
+    let mut claim = dream_fixture_claim("claim_11111111");
+    engine.agent.claim_store.write_claim(&claim).await.unwrap();
+    engine
+        .run_turn(&mut session, "after recovery", |_| {})
+        .await
+        .unwrap();
+    claim.name = "恢复后更新的知识名称".into();
+    engine.agent.claim_store.write_claim(&claim).await.unwrap();
+    engine
+        .run_turn(&mut session, "after update", |_| {})
+        .await
+        .unwrap();
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 3);
+    for request in &requests {
+        assert_eq!(request.system_prompt, frozen);
+        assert!(!request.system_prompt.contains(claim.id.as_str()));
+    }
+    for (index, request) in requests.iter().enumerate() {
+        let notice = request
+            .messages
+            .iter()
+            .filter_map(SessionTurnMessage::model_context_snapshot)
+            .filter(|(source, _, text)| {
+                **source == ModelContextSource::Runtime
+                    && text.contains("claim_changes_since_system_prompt")
+            })
+            .map(|(_, _, text)| text)
+            .last();
+        if index == 0 {
+            assert!(notice.is_none());
+        } else {
+            let notice = notice.unwrap();
+            assert!(notice.contains("created") && notice.contains(claim.id.as_str()));
+            assert!(!notice.contains(&claim.statement));
+            if index == 2 {
+                assert!(notice.contains(&claim.name));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn claim_notice_keeps_frozen_system_and_deduplicates_across_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![
+        response_step("first", vec![]),
+        response_step("second", vec![]),
+        response_step("third", vec![]),
+    ]));
+    let (engine, _) = build_local_test_engine(&dir, provider.clone());
+    let report = engine.start_session(1, |_| {}).await.unwrap();
+    let mut session = report.session;
+    let frozen = tokio::fs::read_to_string(&session.paths.system_prompt)
+        .await
+        .unwrap();
+    let baseline: super::claim_context::ClaimIndex =
+        crate::storage::read_yaml(&session.paths.dir.join("claim_prompt_baseline.yaml"))
+            .await
+            .unwrap();
+    assert!(baseline.is_empty());
+    let claim = dream_fixture_claim("claim_11111111");
+    engine.agent.claim_store.write_claim(&claim).await.unwrap();
+    engine
+        .run_turn(&mut session, "first", |_| {})
+        .await
+        .unwrap();
+    engine
+        .run_turn(&mut session, "second", |_| {})
+        .await
+        .unwrap();
+    tokio::fs::remove_file(dir.path().join("agents/agent-a/claims/claim_11111111.yaml"))
+        .await
+        .unwrap();
+    engine
+        .run_turn(&mut session, "third", |_| {})
+        .await
+        .unwrap();
+    let requests = provider.requests().await;
+    for request in &requests {
+        assert_eq!(request.system_prompt, frozen);
+    }
+    let notices = |r: &ProviderRequest| {
+        r.messages
+            .iter()
+            .filter_map(SessionTurnMessage::model_context_snapshot)
+            .filter(|(source, _, text)| {
+                **source == ModelContextSource::Runtime
+                    && text.contains("claim_changes_since_system_prompt")
+            })
+            .map(|(_, _, text)| text.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(notices(&requests[0]).len(), 1);
+    assert_eq!(notices(&requests[1]).len(), 1);
+    let last = notices(&requests[2]).last().unwrap().clone();
+    assert!(last.contains("removed") && last.contains("claim_11111111"));
+    assert!(last.contains("timezone:") && last.contains("cwd:"));
+}
+
+#[test]
+fn dream_input_drops_oldest_and_leaves_oversized_claim_for_tools() {
+    let old = dream_fixture_claim("claim_11111111");
+    let mut new = dream_fixture_claim("claim_22222222");
+    new.updated_at = Some(old.created_at + chrono::Duration::hours(1));
+    let (loaded, used) = dream::claim_input(vec![old.clone(), new.clone()], 700).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].id, new.id);
+    assert!(used <= 700);
+    new.statement = "判断".repeat(1000);
+    let (loaded, used) = dream::claim_input(vec![old.clone(), new], 700).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].id, old.id);
+    assert!(used <= 700);
+}
+
+#[tokio::test]
+async fn dream_yields_before_model_when_finalize_is_queued() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![]));
+    let (engine, _) = build_local_test_engine(&dir, provider.clone());
+    engine
+        .agent
+        .claim_store
+        .write_claim(&dream_fixture_claim("claim_11111111"))
+        .await
+        .unwrap();
+    let jobs = dir.path().join("agents/agent-a/runtime/supervisor/jobs");
+    let now = chrono::Utc::now();
+    crate::storage::write_yaml_atomic(&jobs.join("job_priority.yaml"), &json!({
+        "id":"job_priority","agent_id":"agent-a","kind":{"type":"finalize","session_id":"session_11111111"},
+        "status":"queued","attempts":0,"created_at":now,"updated_at":now
+    })).await.unwrap();
+    let error = engine
+        .run_dream_job("job_yield", dir.path(), &jobs, true, true)
+        .await
+        .unwrap_err();
+    assert!(error.is::<dream::DreamYield>(), "{error:#}");
+    assert!(provider.requests().await.is_empty());
+    assert!(!jobs.parent().unwrap().join("dream/job_yield.yaml").exists());
 }

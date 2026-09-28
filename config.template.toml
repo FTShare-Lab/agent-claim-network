@@ -69,6 +69,11 @@ max_source_claims = 20
 # retry_base_delay_ms = 500
 # retry_max_delay_ms = 5000
 
+# Dream 后台整理自有 Claim；自动检查周期固定为 4 小时，至少 5 条变化。
+[agent.dream]
+enable = true
+min_interval_hours = 24
+
 [agent.llm]
 provider = "openai_responses"
 endpoint = "https://api.openai.com/v1"

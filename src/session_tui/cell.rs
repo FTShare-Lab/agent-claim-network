@@ -251,6 +251,7 @@ const HELP_COMMAND_COL_WIDTH: usize = 12;
 const HELP_ENTRIES: &[(&str, &str)] = &[
     ("/compact", "compact session history"),
     ("/copy", "copy the last Assistant response"),
+    ("/dream", "review and consolidate claims in background"),
     ("/exit", "finalize and exit"),
     ("/help", "show this help"),
     ("/inbox", "sync and process inbox"),

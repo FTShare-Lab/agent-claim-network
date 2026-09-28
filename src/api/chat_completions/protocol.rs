@@ -5,6 +5,8 @@ use crate::config::ReasoningEffort;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatCompletionRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<Value>,
     pub model: String,
     pub messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]

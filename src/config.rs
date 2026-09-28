@@ -1559,6 +1559,8 @@ impl Default for AgentInboxConfig {
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     #[serde(default)]
+    pub dream: AgentDreamConfig,
+    #[serde(default)]
     pub llm: LlmChatConfig,
     #[serde(default)]
     pub inbox: AgentInboxConfig,
@@ -1570,6 +1572,23 @@ pub struct AgentConfig {
     pub tool: ToolConfig,
     #[serde(default)]
     pub attachment: AttachmentConfig,
+}
+
+/// 后台 Claim 整理的用户配置；扫描频率和执行预算由运行时统一管理。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentDreamConfig {
+    pub enable: bool,
+    pub min_interval_hours: u64,
+}
+
+impl Default for AgentDreamConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            min_interval_hours: 24,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2434,6 +2453,13 @@ fn validate_config(
     config_path: Option<&Path>,
     options: ConfigLoadOptions,
 ) -> Result<(), ConfigError> {
+    if cfg.agent.dream.min_interval_hours == 0
+        || cfg.agent.dream.min_interval_hours > u64::MAX / 3600
+    {
+        return Err(ConfigError::Validation(
+            "agent.dream.min_interval_hours must be positive and fit seconds".into(),
+        ));
+    }
     if options.validate_upstreams {
         if cfg.upstreams.is_empty() {
             return Err(ConfigError::Validation(

@@ -544,6 +544,11 @@ pub trait SessionTurnEventRecorder: Send {
 /// 的 compaction 边界。
 #[async_trait]
 pub trait SessionTurnContextAppender: Send {
+    /// 补充已有 runtime context，日期、时区和工作区仍由 turn loop 的同一快照提供。
+    fn runtime_context_suffix(&self, _provider_messages: &[SessionTurnMessage]) -> Option<String> {
+        None
+    }
+
     async fn observe_context(
         &mut self,
         provider_messages: &[SessionTurnMessage],
@@ -816,6 +821,7 @@ trait ToolDispatchReservationHook: Send + Sync {
 }
 
 pub struct AgentTurnLoop {
+    json_output: bool,
     provider: Arc<dyn ProviderAdapter>,
     tools: Arc<ToolRegistry>,
     max_tool_loop_turns: Option<usize>,
@@ -839,6 +845,7 @@ impl AgentTurnLoop {
         Self {
             provider,
             tools,
+            json_output: false,
             // 主 session 不设 tool 回环次数上限；长程交互由用户取消或上下文管理收束。
             max_tool_loop_turns: None,
             max_tokens,
@@ -920,6 +927,11 @@ impl AgentTurnLoop {
         self
     }
 
+    /// Dream 暂不设独立轮数和输出上限，沿用所选模型的配置。
+    pub(crate) fn for_dream(&self, tools: Arc<ToolRegistry>) -> Self {
+        Self::new(self.provider.clone(), tools, self.max_tokens)
+    }
+
     fn now(&self) -> DateTime<Utc> {
         (self.now)()
     }
@@ -930,12 +942,23 @@ impl AgentTurnLoop {
         context_appender: &mut Option<&mut dyn SessionTurnContextAppender>,
     ) -> anyhow::Result<Vec<CompletedSessionTurnMessage>> {
         let observed_at = self.now();
+        let runtime_text = (self.runtime_context)(observed_at);
         let mut candidates = vec![SessionTurnMessage::model_context(
             ModelContextSource::Runtime,
-            (self.runtime_context)(observed_at),
+            runtime_text.clone(),
         )];
         if let Some(context_appender) = context_appender.as_mut() {
-            candidates.extend(context_appender.observe_context(provider_messages).await?);
+            let extra = context_appender.observe_context(provider_messages).await?;
+            if let Some(suffix) = context_appender.runtime_context_suffix(provider_messages) {
+                let base = &runtime_text;
+                let text = match base.strip_suffix("</runtime_context>") {
+                    Some(prefix) => format!("{prefix}{suffix}\n</runtime_context>"),
+                    None => format!("{base}\n{suffix}"),
+                };
+                candidates[0] =
+                    SessionTurnMessage::model_context(ModelContextSource::Runtime, text);
+            }
+            candidates.extend(extra);
         }
         let candidates = candidates
             .into_iter()
@@ -2542,7 +2565,6 @@ impl AgentTurnLoop {
                     anyhow::bail!("run_session_turn 达到最大 tool 循环轮数: {max_turns}");
                 }
             }
-
             let Some(executed_tool_uses) = self
                 .execute_tool_uses_in_batches(
                     &tool_uses,
@@ -2690,6 +2712,7 @@ impl AgentTurnLoop {
             };
 
             let request = ProviderRequest {
+                json_output: self.json_output,
                 system_prompt: system_prompt.to_string(),
                 messages: streaming_attempt_base.clone(),
                 tools: tools.clone(),
@@ -2834,6 +2857,7 @@ impl AgentTurnLoop {
                             .fallback_replacement_text(&assistant_message_text(&prior_output)),
                     );
                     let fallback_request = ProviderRequest {
+                        json_output: self.json_output,
                         system_prompt: system_prompt.to_string(),
                         messages: fallback_attempt_base.clone(),
                         tools: tools.clone(),

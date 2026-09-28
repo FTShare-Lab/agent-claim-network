@@ -128,6 +128,7 @@ impl OpenAiCompatibleChatProviderAdapter {
         }
         chat_messages.extend(messages);
         ChatCompletionRequest {
+            response_format: None,
             model: self.model.clone(),
             messages: chat_messages,
             reasoning_effort: (self.reasoning_effort != ReasoningEffort::None)
@@ -154,6 +155,7 @@ impl OpenAiCompatibleChatProviderAdapter {
         base_messages: &[SessionTurnMessage],
         tools: Vec<ChatTool>,
         max_tokens: u32,
+        json_output: bool,
         stream: bool,
         retry_count: u32,
         allow_continuation: bool,
@@ -207,13 +209,14 @@ impl OpenAiCompatibleChatProviderAdapter {
                 }
                 return Err(ChatCompletionsError::RecoveryInterrupted.into());
             }
-            let request = self.request_for(
+            let mut request = self.request_for(
                 system_prompt,
                 messages.clone(),
                 tools.clone(),
                 max_tokens,
                 stream,
             );
+            request.response_format = json_output.then(|| json!({"type":"json_object"}));
             let mut request_start_recorded = false;
             let response_result = {
                 let mut request_started = |previous_attempt_ambiguous| {
@@ -312,6 +315,19 @@ impl OpenAiCompatibleChatProviderAdapter {
             let assistant = choice.message;
             let finish_reason = require_finish_reason(choice.finish_reason)?;
             reject_unsupported_finish_reason(&finish_reason)?;
+            if finish_reason == ChatFinishReason::Length
+                && assistant.tool_calls.is_empty()
+                && assistant
+                    .content
+                    .as_deref()
+                    .is_none_or(|text| text.trim().is_empty())
+            {
+                // 推理耗尽输出预算时没有可重放内容，追加空 assistant 会使后续请求非法。
+                return Err(OpenAiCompatibleChatError::OutputShape {
+                    reason: "output token limit reached without visible text or tool calls; increase the configured output budget".into(),
+                    raw: String::new(),
+                });
+            }
             if assistant
                 .refusal
                 .as_deref()
@@ -513,6 +529,7 @@ impl OpenAiCompatibleChatProviderAdapter {
                 &base_messages,
                 tools,
                 request.max_tokens,
+                request.json_output,
                 request.stream,
                 retry_count,
                 allow_continuation,
@@ -528,6 +545,12 @@ impl OpenAiCompatibleChatProviderAdapter {
                 return Err(ProviderRequestPreparationFailure::new(reason).into());
             }
             Err(error) => {
+                if request.json_output
+                    && matches!(&error, OpenAiCompatibleChatError::Client(ChatCompletionsError::Status { status, body })
+                        if super::provider::json_output_unsupported(*status, body))
+                {
+                    return Err(super::provider::ProviderJsonOutputUnsupported.into());
+                }
                 if matches!(
                     &error,
                     OpenAiCompatibleChatError::Client(ChatCompletionsError::RecoveryInterrupted)
@@ -622,17 +645,30 @@ fn session_turn_messages_to_chat(
         }) = message.provider_replay
         {
             if replay_model == model {
-                let replay = messages
-                    .into_iter()
-                    .map(|message| {
-                        serde_json::from_value::<ChatMessage>(message).map_err(|error| {
-                            OpenAiCompatibleChatError::OutputShape {
-                                reason: format!("Chat continuation replay 反序列化失败: {error}"),
-                                raw: String::new(),
+                let replay =
+                    messages
+                        .into_iter()
+                        .map(|message| {
+                            let mut message = serde_json::from_value::<ChatMessage>(message)
+                                .map_err(|error| OpenAiCompatibleChatError::OutputShape {
+                                    reason: format!(
+                                        "Chat continuation replay 反序列化失败: {error}"
+                                    ),
+                                    raw: String::new(),
+                                })?;
+                            // 保留原始 replay 作来源记录，wire 上与 InvalidToolUse 的 canonical
+                            // 投影一致。工具不会执行这些参数；对应错误结果仍告诉模型需修复。
+                            // 否则严格校验历史 arguments 的服务会在模型看到反馈前持续拒绝。
+                            for call in message.tool_calls.iter_mut().flatten() {
+                                if call.function.arguments.trim().is_empty()
+                                    || parse_tool_arguments(&call.function.arguments).is_err()
+                                {
+                                    call.function.arguments = "{}".into();
+                                }
                             }
+                            Ok::<_, OpenAiCompatibleChatError>(message)
                         })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                        .collect::<Result<Vec<_>, _>>()?;
                 out.extend(replay);
                 continue;
             }
@@ -1382,6 +1418,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_json_output_is_opt_in_on_the_wire() {
+        let success = json!({"choices":[{"message":{"role":"assistant","content":"{}"},"finish_reason":"stop"}]});
+        let (endpoint, captured) = spawn_chat_json_sequence(vec![success.clone(), success]).await;
+        let adapter = OpenAiCompatibleChatProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            Duration::from_secs(5),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        for json_output in [false, true] {
+            adapter
+                .send(
+                    ProviderRequest {
+                        json_output,
+                        system_prompt: "Return a JSON object".into(),
+                        messages: vec![SessionTurnMessage::user_text("Evaluate")],
+                        tools: vec![],
+                        max_tokens: 128,
+                        stream: false,
+                        stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                        runtime_chain_id: None,
+                        runtime_fallback_scope: None,
+                        recovery_interrupt: None,
+                        allow_continuation: true,
+                        retry_count_override: Some(0),
+                    },
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+        }
+        let requests = captured.await.unwrap();
+        assert!(requests[0].get("response_format").is_none());
+        assert_eq!(
+            requests[1]["response_format"],
+            json!({"type":"json_object"})
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_length_response_is_not_replayed_as_empty_assistant() {
+        let (endpoint, captured) = spawn_chat_json_sequence(vec![json!({
+            "choices":[{"message":{"role":"assistant","content":""},"finish_reason":"length"}]
+        })])
+        .await;
+        let adapter = OpenAiCompatibleChatProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            Duration::from_secs(5),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let error = adapter
+            .send(
+                ProviderRequest {
+                    json_output: false,
+                    system_prompt: "system".into(),
+                    messages: vec![SessionTurnMessage::user_text("hello")],
+                    tools: vec![],
+                    max_tokens: 32,
+                    stream: false,
+                    stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                    runtime_chain_id: None,
+                    runtime_fallback_scope: None,
+                    recovery_interrupt: None,
+                    allow_continuation: true,
+                    retry_count_override: Some(0),
+                },
+                &mut |_| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("without visible text or tool calls"));
+        assert_eq!(captured.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn max_token_continuation_replay_keeps_second_request_as_third_prefix() {
         let bodies = vec![
             json!({
@@ -1418,6 +1540,7 @@ mod tests {
         let first = adapter
             .send_with_request_observer(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("first question")],
                     tools: Vec::new(),
@@ -1444,6 +1567,7 @@ mod tests {
         adapter
             .send(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![
                         SessionTurnMessage::user_text("first question"),
@@ -1508,6 +1632,7 @@ mod tests {
         let response = adapter
             .send(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("hello")],
                     tools: Vec::new(),
@@ -1558,6 +1683,7 @@ mod tests {
         let response = adapter
             .send_with_request_observer(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("hello")],
                     tools: Vec::new(),
@@ -1616,6 +1742,7 @@ mod tests {
         let response = adapter
             .send_with_request_observer(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("hello")],
                     tools: Vec::new(),
@@ -1708,6 +1835,13 @@ mod tests {
                 Some(ProviderReplayState::OpenAiChatCompletions { messages, .. })
                     if messages[0]["tool_calls"][0]["function"]["arguments"] == arguments
             ));
+            let wire =
+                session_turn_messages_to_chat(vec![response.assistant_message], "test-model")
+                    .unwrap();
+            assert_eq!(
+                wire[0].tool_calls.as_ref().unwrap()[0].function.arguments,
+                "{}"
+            );
         }
     }
 
@@ -1868,6 +2002,7 @@ mod tests {
         let error = adapter
             .send(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("hello")],
                     tools: Vec::new(),
@@ -1913,6 +2048,7 @@ mod tests {
         let error = adapter
             .send(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("request")],
                     tools: Vec::new(),

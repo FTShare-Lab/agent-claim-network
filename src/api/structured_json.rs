@@ -173,6 +173,16 @@ impl StructuredJsonCaller {
         }
     }
 
+    pub(crate) fn with_output_limit(&self, max_tokens: u32) -> Self {
+        Self::new(
+            self.provider.clone(),
+            self.max_tokens.min(max_tokens),
+            self.retry_count,
+            self.retry_base_delay,
+            self.retry_max_delay,
+        )
+    }
+
     pub(crate) fn max_tokens(&self) -> u32 {
         self.max_tokens
     }
@@ -581,6 +591,7 @@ impl StructuredJsonCaller {
         messages: Vec<SessionTurnMessage>,
     ) -> Result<Value, JsonCallError> {
         let request = ProviderRequest {
+            json_output: false,
             system_prompt,
             messages,
             tools: Vec::new(),
@@ -624,6 +635,7 @@ impl StructuredJsonCaller {
             )
         });
         let request = ProviderRequest {
+            json_output: false,
             system_prompt,
             messages,
             tools: Vec::new(),
@@ -861,7 +873,7 @@ fn raw_text_for_audit(message: &SessionTurnMessage) -> Option<String> {
     Some(text)
 }
 
-fn strip_code_fence(text: &str) -> &str {
+pub(crate) fn strip_code_fence(text: &str) -> &str {
     let trimmed = text.trim();
     if let Some(rest) = strip_json_fence_prefix(trimmed) {
         rest.trim_start().trim_end().trim_end_matches("```").trim()

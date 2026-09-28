@@ -339,3 +339,41 @@ acn session cleanup --apply
 团队模式下，打开 Maintainer 地址的 `/app` 即可进入 Workbench。管理页面用于浏览团队 Claim 与 Agent、处理 Dispute 与 Policy、查看通知投递和 Sweep 历史，以及进行 Router 查询和请求审计。
 
 处理 Claim 争议时，可在 Disputes 页面进行人工处理，或启用 Maintainer 自裁决辅助分析。模式选择、操作流程与结果查看见 [Maintainer 自裁决说明](maintainer_auto_arbitration.md)。管理员鉴权与团队 key 配置见 [配置参数](config_parameters.md)。
+
+## Dream：后台整理 Claim
+
+Dream 在已有 Claim 上执行质量清理、证据校准和主题整合，只修改当前 Agent 自己的 Claim，不处理 dispute。它会提炼和整合可复用判断，将已完整整合或没有复用价值的内容标记 deprecated。
+
+证据校准仅对原置信度 medium / low 的 Claim 按需进行，不要求逐条验证；high 仍可参与质量清理和主题整合。只有找到明确适用的证据、能确定修订方向时才修改；每项修改（包括提高置信度、废弃或收窄 scope）都必须附带新证据摘要和对应文件读取记录。查不到证据或仍不确定就保持原样，不因此降置信度、标为过时/废弃或刷新依据；Dream 只整理已有 Claim，不建立问题裁决状态或待办清单。缺少任务评审反馈仍然表示“未知”，免于查证也不代表已经证明正确。
+
+新建或恢复会话时检查，supervisor 此后每 4 小时检查一次。自动执行要求距上次成功 Dream 至少 24 小时，并且至少 5 条自有 Claim 有变化；`/dream` 可手动入队并绕过这两项门槛。后台队列优先级为 Finalize、Recap、Dream。手动请求显示 job ID、运行与重试次数、上次失败原因以及最终状态，`acn supervisor jobs` 可查看任务，失败任务可按 job ID retry。
+
+`/dream` 完成通知同时显示实际修改条目数与工具读取/运行记录数。它们来自后端记录，不采用模型自报数量；有读取记录不代表相关 Claim 已查证通过，没有变化也可以正常完成。旧任务缺少统计时只显示完成状态。首次未取得探索记录、也未提出修改就结束时，Dream 会收到一次提示以确认 ABC 的判断理由，之后仍可选择保持全部 Claim 原样。
+
+```toml
+[agent.dream]
+enable = true
+min_interval_hours = 24
+```
+
+开关默认开启；关闭后手动与自动 Dream 都不执行。开启时 supervisor 保持运行，显式 `acn supervisor stop` 可以停止。不会安装开机服务。输入优先包含全部非 deprecated 自有 Claim，预算不足时舍弃较旧内容；Trace 和代码按需读取，报告保留未覆盖范围。白名单命令用于读取证据，不会运行任意测试或构建脚本。
+
+停止 supervisor 时，Dream 会中断模型等待并停止派发后续操作，保存草稿与探索进度；已进入持久化提交的修改组会先安全完成。未完成的 Dream 保留在队列中，不消耗失败次数，也不更新整轮成功时间。下次启动 supervisor 后继续同一个任务，保留已生效修改并避免重复执行。
+
+普通会话启动不额外渲染校验 Dream 专用模板；相关渲染错误在执行 Dream 时报告。若 Dream 有未完成的本地提交，后台先恢复该提交，再运行 Recap / Finalize；恢复失败时这两个任务保持等待，不消耗各自的尝试次数。恢复只处理本地落盘，远端同步沿用已有的持久上传队列；正常 Dream 提交仍会尝试同步远端。
+
+Claim 变化通知是独立能力：不论由 Recap、Finalize、Inbox 或 Dream 引起，主会话每 turn 都会观察本地变化，通过 `<runtime_context>` 补充 ID、名称和 scope。各会话以自己的初始 system prompt 为基线，`read_claim` 用于读取最新正文；system prompt 本身保持不变。
+
+首次使用没有 Claim 时，以空快照正常启动。启动时若 Claim 快照读取失败，会记录警告并以空快照和空基线继续；读取恢复后，下一个 turn 会通过 `<runtime_context>` 补充可用 Claim，后续新增或变化也沿用这一机制。
+
+Dream 的命令隔离在 macOS 使用系统 sandbox-exec，Linux 需要 bubblewrap 及可用的 user namespaces。隔离器不可用时，命令返回错误，Dream 仍可通过 file_read、read_claim 和 read_trace 查证，不会降级为无隔离命令执行。
+
+探索较长时，Dream 会在输入超过 160k token 后自动压缩上下文；模型窗口扣除输出预留后不足时会提前压缩。原始 Claim、草稿与证据版本由后端保留，完整旧工具历史归档，模型可按需查询。压缩失败会保留现场并进入现有重试，不会因此提交或丢弃 Claim。
+
+### 查看 Dream 的修改依据
+
+每次 Dream 的记录位于 `<agent_home>/dream/<job_id>/`。`executions/` 保存每组执行的 YAML 恢复检查点、JSON 完整证据和 Markdown 修改说明；即使整轮还未结束或后续出错，已经执行的修改也有记录。`revisions/` 保留候选登记、保留理由、暂存、校验失败、修订与撤回；`history/` 保存压缩前的完整上下文。结束后 `report.md` 和 `result.json` 汇总实际成果。草稿不代表修改已经执行；本地生效不表示远端同步已经成功。
+
+Dream 将已经识别的修改或查证疑点登记为本轮候选，逐项处理。当前候选必须执行，或说明具体的保留理由，才能进入下一项；其他任务的优先级不能成为跳过理由。仍有登记项时不能结束，不确定时可以保留，不要求最低修改数量。
+
+Dream 对一组候选调用 `dream_validate`，根据实际前后对照自行复核，再调用 `dream_apply_group` 执行。成功后继续处理其他候选；`dream_finish` 只汇总。后续失败不会撤销已有成果，重试会读取执行回执避免重复写入。主题整合的存续结果和来源废弃作为一个完整组处理。不确定时保持原 Claim，硬规则通过不保证所有语义判断正确。

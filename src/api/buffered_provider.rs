@@ -92,6 +92,7 @@ mod tests {
 
     fn request() -> ProviderRequest {
         ProviderRequest {
+            json_output: false,
             system_prompt: "system".into(),
             messages: vec![SessionTurnMessage::user_text("payload")],
             tools: Vec::<ToolSpec>::new(),

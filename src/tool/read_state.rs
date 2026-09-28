@@ -14,7 +14,7 @@ use crate::claim::SessionId;
 const READ_STATE_MAX_ENTRIES: usize = 1024;
 const READ_STATE_MAX_RANGES_PER_FILE: usize = 256;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ContentRevision {
     sha256: String,
     byte_len: u64,

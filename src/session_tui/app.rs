@@ -619,6 +619,10 @@ impl SessionTuiApp {
 
     fn handle_worker_event(&mut self, worker_event: WorkerEvent) -> anyhow::Result<bool> {
         match worker_event {
+            WorkerEvent::DreamNotice(message) => {
+                self.chat_widget.state_mut().push_system(message);
+                self.tui.render_requester().schedule_render();
+            }
             WorkerEvent::Session { task_id, event } => {
                 if !self.session_task.current_task_matches(task_id) {
                     return Ok(false);
@@ -676,6 +680,7 @@ impl SessionTuiApp {
             }
             WorkerEvent::StartFinished(result) => match result {
                 Ok(report) => {
+                    self.request_dream(false);
                     self.invalidate_process_panel_snapshot();
                     self.chat_widget.handle_session_event(
                         SessionEvent::TeamServicesConnectionUpdated {
@@ -844,6 +849,7 @@ impl SessionTuiApp {
                 session,
                 had_notices,
             } => {
+                self.request_dream(false);
                 self.resume_handle = None;
                 self.session = Some(session);
                 self.current_session_has_real_user_input = true;
@@ -1658,6 +1664,21 @@ impl SessionTuiApp {
         Ok(())
     }
 
+    fn request_dream(&mut self, manual: bool) {
+        if let Some(config) = self.supervisor.clone() {
+            super::runtime::spawn_dream_worker(
+                config,
+                self.engine.dream_workspace().to_path_buf(),
+                manual,
+                self.worker_tx.clone(),
+            );
+        } else if manual {
+            self.chat_widget
+                .state_mut()
+                .push_system("Dream 需要 supervisor");
+        }
+    }
+
     fn dispatch_input(&mut self, input: QueuedInput) -> anyhow::Result<()> {
         let action = classify_input(
             input.command_text(),
@@ -1669,6 +1690,7 @@ impl SessionTuiApp {
                 .push_command_echo(input.text().to_string());
         }
         match action {
+            InputAction::Dream => self.request_dream(true),
             InputAction::Send(_) => self.start_turn(input)?,
             InputAction::ShellCommand(command) => {
                 let state = self.chat_widget.state_mut();
@@ -2856,7 +2878,7 @@ fn route_input_submission(
         InputSubmissionRoute::Reject
     } else if matches!(
         action,
-        InputAction::Mcp | InputAction::Ps | InputAction::Subagents
+        InputAction::Dream | InputAction::Mcp | InputAction::Ps | InputAction::Subagents
     ) {
         // 管理面板只是前台 live view；运行中的 turn 不能把它们排入 queued input。
         InputSubmissionRoute::Dispatch
@@ -3735,7 +3757,7 @@ done
 
     #[test]
     fn management_panels_dispatch_immediately_while_turn_is_running() {
-        for command in ["/mcp", "/ps", "/subagents"] {
+        for command in ["/dream", "/mcp", "/ps", "/subagents"] {
             let action = classify_input(command, &Default::default());
             assert_eq!(
                 route_input_submission(&action, false, true, false, true),

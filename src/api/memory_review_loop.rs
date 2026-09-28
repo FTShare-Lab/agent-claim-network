@@ -174,6 +174,7 @@ impl MemoryReviewLoop {
         runtime: &BufferedProviderRuntime,
     ) -> anyhow::Result<ProviderResponse> {
         let mut request = ProviderRequest {
+            json_output: false,
             system_prompt: system_prompt.to_string(),
             messages: messages.to_vec(),
             tools: tools.to_vec(),

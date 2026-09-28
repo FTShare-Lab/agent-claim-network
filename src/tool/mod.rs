@@ -8,8 +8,12 @@ mod command;
 mod concurrency;
 mod delegation;
 pub mod diff;
+mod dream_sandbox;
 mod file;
 mod file_text;
+mod knowledge;
+pub(crate) use knowledge::dream_evidence_is_current;
+pub(crate) use knowledge::DreamPlanTools;
 mod mcp;
 pub mod memory;
 mod process;
@@ -404,6 +408,9 @@ impl DelegationToolHost {
 
 #[derive(Clone)]
 pub struct ToolRegistry {
+    knowledge: Option<knowledge::KnowledgeAccess>,
+    dream_plan_tools: Option<Arc<dyn DreamPlanTools>>,
+    dream_read_only: bool,
     workspace_root: PathBuf,
     http: reqwest::Client,
     direct_http: reqwest::Client,

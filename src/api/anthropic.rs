@@ -2427,6 +2427,7 @@ mod tests {
         let response = adapter
             .send(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("hello")],
                     tools: Vec::new(),
@@ -2477,6 +2478,7 @@ mod tests {
         let response = adapter
             .send_with_request_observer(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("hello")],
                     tools: Vec::new(),
@@ -2535,6 +2537,7 @@ mod tests {
         let response = adapter
             .send_with_request_observer(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("hello")],
                     tools: Vec::new(),
@@ -2599,6 +2602,7 @@ mod tests {
         adapter
             .send_with_request_observer(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("hello")],
                     tools: Vec::new(),
@@ -2662,6 +2666,7 @@ mod tests {
         let error = adapter
             .send_with_request_observer(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("hello")],
                     tools: Vec::new(),
@@ -2771,6 +2776,7 @@ mod tests {
         let response = adapter
             .send(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("hello")],
                     tools: vec![ToolSpec {

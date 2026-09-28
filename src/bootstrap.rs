@@ -140,6 +140,11 @@ pub fn build_agent_cli_session_engine_with_mcp(
         ))
         .with_process_id_attempts(cfg.agent.session.id_mint_max_attempts())
         .with_process_owner_agent_id(context.agent_id.clone())
+        .with_local_knowledge(
+            context.claim_store.clone(),
+            cfg.agent_home(&context.agent_id),
+            context.agent_id.clone(),
+        )
         .with_memory_store(context.memory_store.clone())
         .with_memory_enabled(cfg.agent.memory.enabled)
         .with_session_search(session_search)
@@ -242,7 +247,8 @@ pub fn build_agent_cli_session_engine_with_mcp(
     ))
     .with_fork_memory_review(cfg.agent.session.memory_review.enabled)
     .with_fork_memory_review_interval_turns(cfg.agent.session.memory_review.interval_turns)
-    .with_attachment_config(cfg.agent.attachment.clone());
+    .with_attachment_config(cfg.agent.attachment.clone())
+    .with_dream_config(cfg.agent.dream.clone());
     if let Some(mcp_manager) = engine_mcp_manager {
         engine = engine.with_mcp_manager(mcp_manager);
     }
@@ -766,6 +772,36 @@ mod tests {
     fn write_session_prompts(root: &std::path::Path) {
         for name in REQUIRED_SESSION_PROMPTS {
             std::fs::write(root.join(format!("{name}.j2")), format!("test {name}")).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn session_start_does_not_require_dream_templates() {
+        for dream_enabled in [false, true] {
+            for content in [None, Some("{% invalid_dream_tag %}")] {
+                let team = tempfile::tempdir().unwrap();
+                let hosts = tempfile::tempdir().unwrap();
+                let prompts = tempfile::tempdir().unwrap();
+                write_session_prompts(prompts.path());
+                for name in ["claim_dream", "dream_compaction"] {
+                    let path = prompts.path().join(format!("{name}.j2"));
+                    if let Some(content) = content {
+                        tokio::fs::write(path, content).await.unwrap();
+                    }
+                }
+                let mut c = cfg(
+                    team.path().to_path_buf(),
+                    hosts.path().to_path_buf(),
+                    prompts.path().to_path_buf(),
+                );
+                c.agent.dream.enable = dream_enabled;
+                let upstream = c.upstreams.get_mut("dev").unwrap();
+                upstream.router_endpoint.clear();
+                upstream.maintainer_endpoint.clear();
+                let upstream = c.resolve_upstream(None).unwrap();
+                let engine = build_agent_cli_session_engine(&c, &upstream).unwrap();
+                engine.start_session(1, |_| {}).await.unwrap();
+            }
         }
     }
 
