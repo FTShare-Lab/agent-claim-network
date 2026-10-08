@@ -41,6 +41,7 @@ const AT_PATH_FG: Color = Color::Rgb(121, 116, 110);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputAction {
     Dream,
+    Claim,
     Send(String),
     ShellCommand(String),
     Help,
@@ -1289,6 +1290,7 @@ pub fn classify_input(raw: &str, catalog: &SlashCommandCatalog) -> InputAction {
         return match entry.kind {
             SlashCommandEntryKind::Native(action) => match action {
                 SlashCommandAction::Dream => InputAction::Dream,
+                SlashCommandAction::Claim => InputAction::Claim,
                 SlashCommandAction::Compact => InputAction::Compact,
                 SlashCommandAction::Copy => InputAction::Copy,
                 SlashCommandAction::Exit => InputAction::Exit,

@@ -59,7 +59,7 @@ impl ClaimRuntimeProjection {
             }
             changes.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
         }
-        format!("claim_changes_since_system_prompt: {}\nThis cumulative identity snapshot supersedes earlier claim notices. Assess relevance from name/scope; use read_claim for current content only when the current task needs to cite or rely on that Claim. Do not read every changed Claim merely because it is listed. Deprecated/removed entries must not be relied on; no content read is needed to stop using them.",current)
+        format!("claim_changes_since_system_prompt: {}\nThis cumulative identity snapshot supersedes earlier claim notices. Assess relevance from name/scope; use claim action=\"read\" for current content only when the current task needs to cite or rely on that Claim. Do not read every changed Claim merely because it is listed. Deprecated/removed entries must not be relied on; no content read is needed to stop using them.",current)
     }
 }
 
@@ -128,7 +128,7 @@ impl SessionEngine {
         let has_changes = !changes.is_empty();
         let notice = json!({"revision":revision,"refresh_all":legacy,"changes":changes});
         Ok(Some(ClaimRuntimeProjection {
-            text: format!("claim_changes_since_system_prompt: {}\nThis cumulative identity snapshot supersedes earlier claim notices. Assess relevance from name/scope; use read_claim for current content only when the current task needs to cite or rely on that Claim. Do not read every changed Claim merely because it is listed. Deprecated/removed entries must not be relied on; no content read is needed to stop using them.", serde_json::to_string(&notice)?),
+            text: format!("claim_changes_since_system_prompt: {}\nThis cumulative identity snapshot supersedes earlier claim notices. Assess relevance from name/scope; use claim action=\"read\" for current content only when the current task needs to cite or rely on that Claim. Do not read every changed Claim merely because it is listed. Deprecated/removed entries must not be relied on; no content read is needed to stop using them.", serde_json::to_string(&notice)?),
             has_changes,
             present_ids: current.keys().map(ToString::to_string).collect(),
         }))

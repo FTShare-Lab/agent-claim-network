@@ -10,6 +10,7 @@ use super::completion_menu::{render_completion_menu, CompletionMenuEntry, Comple
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SlashCommandAction {
     Dream,
+    Claim,
     Compact,
     Copy,
     Exit,
@@ -31,6 +32,11 @@ struct SlashCommandSpec {
 }
 
 const SLASH_COMMANDS: &[SlashCommandSpec] = &[
+    SlashCommandSpec {
+        command: "/claim",
+        description: "查看和编辑本地 claims",
+        action: SlashCommandAction::Claim,
+    },
     SlashCommandSpec {
         command: "/compact",
         description: "压缩当前 session 历史",
@@ -304,6 +310,7 @@ mod tests {
         assert_eq!(
             commands,
             vec![
+                "/claim",
                 "/compact",
                 "/copy",
                 "/dream",
@@ -333,6 +340,7 @@ mod tests {
             vec![
                 "/tui-smoke-test-with-tmux",
                 "/verify",
+                "/claim",
                 "/compact",
                 "/copy",
                 "/dream",
@@ -463,9 +471,14 @@ mod tests {
         assert!(text.contains("/verify"));
         assert!(!text.contains("/resume"));
 
-        // 选中第 8 项（/inbox）时窗口滚动，选中行加粗可见
-        for _ in 0..7 {
-            assert!(state.select_next(catalog.matching("/").len()));
+        // 选中 /inbox 时窗口滚动，选中行加粗可见
+        let entries = catalog.matching("/");
+        let inbox_index = entries
+            .iter()
+            .position(|entry| entry.command == "/inbox")
+            .unwrap();
+        for _ in 0..inbox_index {
+            assert!(state.select_next(entries.len()));
         }
         let lines = render_slash_menu(&catalog, "/", &state, 96);
         assert_eq!(

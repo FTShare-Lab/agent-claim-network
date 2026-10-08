@@ -28,6 +28,14 @@ pub fn now_seconds() -> DateTime<Utc> {
     truncate_to_second(Utc::now())
 }
 
+/// 自有 Claim 的每次修订都严格晚于原版本，避免上传队列把新内容当成旧版本。
+pub(crate) fn next_claim_update_at(now: DateTime<Utc>, previous: DateTime<Utc>) -> DateTime<Utc> {
+    std::cmp::max(
+        truncate_to_second(now),
+        previous + chrono::Duration::seconds(1),
+    )
+}
+
 /// serde with 模块：把 `DateTime<Utc>` 字段以 RFC 3339 (UTC, Z 后缀) 写入 / 读取。
 pub mod serde_utc {
     use super::format_utc;

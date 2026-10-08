@@ -1499,6 +1499,19 @@ async fn dream_write_error_keeps_unknown_commit_until_durable_recovery() {
     }
     #[async_trait::async_trait]
     impl crate::agent::LocalClaimStore for FailAfterFirstWrite {
+        async fn read_claim(&self, id: &ClaimId) -> anyhow::Result<Claim> {
+            self.inner.read_claim(id).await
+        }
+        async fn list_local_traces(&self) -> anyhow::Result<Vec<crate::claim::Trace>> {
+            self.inner.list_local_traces().await
+        }
+        async fn read_trace(
+            &self,
+            id: &crate::claim::TraceId,
+        ) -> anyhow::Result<crate::claim::Trace> {
+            self.inner.read_trace(id).await
+        }
+
         async fn write_claim(&self, claim: &Claim) -> anyhow::Result<()> {
             self.inner.write_claim(claim).await?;
             if self.fail.swap(false, std::sync::atomic::Ordering::SeqCst) {

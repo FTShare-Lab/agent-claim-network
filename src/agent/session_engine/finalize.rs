@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::claim_alignment;
+use crate::agent::claims::claim_revision;
 use crate::agent::prepare::{allowed_claim_ids_for_recap, llm_visible_claims};
 use crate::agent::runner_finalize::prepare_recap_value;
 use crate::agent::runner_trace::trace_name_from_task;
@@ -36,6 +37,70 @@ use super::{
     SessionRecapPayload, SessionRuntimeStatus, PROMPT_SESSION_RECAP, RECAP_INSTRUCTION,
     STABLE_HASH_OFFSET,
 };
+
+/// 函数参数显式描述复盘 DTO，避免数组被编码成字符串；领域约束仍由 prepare 校验。
+fn recap_output_schema() -> serde_json::Value {
+    use serde_json::json;
+
+    let claim_schema = |updated: bool| {
+        let mut properties = serde_json::Map::from_iter([
+            ("id".into(), json!({"type": "string"})),
+            ("name".into(), json!({"type": "string"})),
+            ("statement".into(), json!({"type": "string"})),
+            ("scope".into(), json!({"type": "string"})),
+            (
+                "confidence".into(),
+                json!({"type": "string", "enum": ["high", "medium", "low"]}),
+            ),
+            ("evidence_summary".into(), json!({"type": "string"})),
+            (
+                "source_claim_ids".into(),
+                json!({"type": "array", "items": {"type": "string"}}),
+            ),
+        ]);
+        let mut required = vec![
+            "id",
+            "name",
+            "statement",
+            "scope",
+            "confidence",
+            "evidence_summary",
+            "source_claim_ids",
+        ];
+        if updated {
+            properties.insert(
+                "status".into(),
+                json!({"type": "string", "enum": ["active", "stale", "deprecated"]}),
+            );
+            required.push("status");
+        }
+        json!({"type": "object", "properties": properties, "required": required, "additionalProperties": false})
+    };
+    json!({
+        "type": "object",
+        "properties": {
+            "new_claims": {"type": "array", "items": claim_schema(false)},
+            "updated_claims": {"type": "array", "items": claim_schema(true)},
+            "used_claim_ids": {"type": "array", "items": {"type": "string"}},
+            "new_disputes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "name": {"type": "string"},
+                        "claims": {"type": "array", "items": {"type": "string"}, "minItems": 2},
+                        "summary": {"type": "string"}
+                    },
+                    "required": ["id", "name", "claims", "summary"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["new_claims", "updated_claims", "used_claim_ids", "new_disputes"],
+        "additionalProperties": false
+    })
+}
 
 const FINALIZE_BACKGROUND_COMPLETION_MAX_ITEMS: usize = 64;
 const FINALIZE_BACKGROUND_COMPLETION_ID_MAX_CHARS: usize = 256;
@@ -1006,9 +1071,9 @@ impl SessionEngine {
         let user_text = serde_json::to_string_pretty(&payload)?;
         let agent_id = self.agent.agent_id.clone();
         let messages = vec![SessionTurnMessage::user_text(user_text)];
+        let caller = self.json_caller.with_function_output(recap_output_schema());
         let result = match retry_mode {
-            RecapRetryMode::Configured => self
-                .json_caller
+            RecapRetryMode::Configured => caller
                 .generate_json_streaming_validated_with_retry_notice(
                     system_prompt,
                     messages,
@@ -1022,8 +1087,7 @@ impl SessionEngine {
                     },
                 )
                 .await,
-            RecapRetryMode::SingleAttempt => self
-                .json_caller
+            RecapRetryMode::SingleAttempt => caller
                 .generate_json_streaming_validated_once(
                     system_prompt,
                     messages,
@@ -1116,6 +1180,7 @@ impl SessionEngine {
                 self.runner.maintainer_upload_queue.agent_home(),
             )
             .await?;
+            let pending_edit_warning = self.recover_pending_claim_edit_warning().await;
             let prepare = self.prepare_finalize_segment_with_background(
                 segment,
                 background_process_completions,
@@ -1167,6 +1232,7 @@ impl SessionEngine {
                 recap_end_index,
                 recap_segment_hash: segment_hash,
                 prepared_claims,
+                expected_claim_revisions: Vec::new(),
                 prepared_disputes,
                 used_claim_ids,
                 trace_text,
@@ -1191,10 +1257,26 @@ impl SessionEngine {
             if !committed {
                 return Err(SessionRecapPreemptedBeforePrepared.into());
             }
-            self.apply_finalize_checkpoint_local_and_commit(session, checkpoint)
-                .await?
+            let mut report = self
+                .apply_finalize_checkpoint_local_and_commit(session, checkpoint)
+                .await?;
+            report.warnings.extend(pending_edit_warning);
+            report
         };
         self.finish_finalize_upload(report).await
+    }
+
+    /// 调用方必须已持有 knowledge lock。恢复失败与 inbox 一致按 warning 降级，不阻断 finalize：
+    /// 记录只补完已落盘修订的上传入队，checkpoint 对已生效修订另有 revision 校验。
+    async fn recover_pending_claim_edit_warning(&self) -> Option<String> {
+        let error = self
+            .runner
+            .recover_pending_claim_edit_locked()
+            .await
+            .err()?;
+        let warning = format!("恢复待完成的 claim 编辑失败，finalize 继续: {error:#}");
+        log::warn!(target: "agent", "{warning}");
+        Some(warning)
     }
 
     async fn apply_finalize_checkpoint(
@@ -1208,8 +1290,12 @@ impl SessionEngine {
                     self.runner.maintainer_upload_queue.agent_home(),
                 ))
                 .await?;
-            self.apply_finalize_checkpoint_local_and_commit(session, checkpoint)
-                .await?
+            let pending_edit_warning = self.recover_pending_claim_edit_warning().await;
+            let mut report = self
+                .apply_finalize_checkpoint_local_and_commit(session, checkpoint)
+                .await?;
+            report.warnings.extend(pending_edit_warning);
+            report
         };
         self.finish_finalize_upload(report).await
     }
@@ -1257,6 +1343,31 @@ impl SessionEngine {
             &current,
             &mut checkpoint.applied_claims,
         );
+        // 兼容旧版本仅保存目标内容哈希的检查点；先核对整批，不能逐条跳过后继续弃用来源。
+        if checkpoint.analysis_claims.is_none() && !checkpoint.expected_claim_revisions.is_empty() {
+            let revisions = checkpoint
+                .expected_claim_revisions
+                .iter()
+                .map(|revision| (&revision.claim_id, &revision.preimage_hash))
+                .collect::<FxHashMap<_, _>>();
+            let mut valid = true;
+            for target in &checkpoint.prepared_claims {
+                if checkpoint.applied_claims.contains(target) {
+                    continue;
+                }
+                let actual = current.iter().find(|claim| claim.id == target.id);
+                valid &= match revisions.get(&target.id) {
+                    Some(None) => actual.is_none(),
+                    Some(Some(expected)) => {
+                        actual.map(claim_revision).transpose()?.as_ref() == Some(expected)
+                    }
+                    None => false,
+                };
+            }
+            if valid {
+                return Ok(());
+            }
+        }
         let differences = claim_alignment::changes(
             checkpoint.analysis_claims.as_deref(),
             &checkpoint.prepared_claims,
@@ -1323,7 +1434,7 @@ impl SessionEngine {
         }
         let prepared_claims = checkpoint.applied_claims.clone();
         let used_claim_ids = checkpoint.used_claim_ids.clone();
-        let trace_text = &checkpoint.trace_text;
+        let trace_text = checkpoint.trace_text.clone();
         let trace_created_at = checkpoint.trace_created_at;
         let checkpoint_trace_id = checkpoint.trace_id.clone();
         let prepared_disputes = checkpoint.prepared_disputes.clone();
@@ -1344,7 +1455,6 @@ impl SessionEngine {
             }
         }
 
-        let trace_text = trace_text.to_string();
         let trace_id = if !output_claim_ids.is_empty() || !used_claim_ids.is_empty() {
             let trace_name = trace_name_from_task(&trace_text);
             let input_claims = used_claim_ids

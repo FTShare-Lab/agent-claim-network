@@ -105,7 +105,7 @@ impl ArbitrationContextBuilder {
             prior_resolutions,
             warnings,
         };
-        let semantic = SemanticInputV5::from_frozen(&frozen, &self.arbitration, &self.llm);
+        let semantic = SemanticInputV6::from_frozen(&frozen, &self.arbitration, &self.llm);
         let semantic_fingerprint = versioned_sha256(&semantic)?;
         let context_snapshot_hash = versioned_sha256(&frozen)?;
         Ok(BuiltArbitrationContext {
@@ -299,7 +299,7 @@ fn semantic_dispute(dispute: &crate::claim::Dispute) -> SemanticDisputeV2 {
 }
 
 #[derive(Serialize)]
-struct SemanticInputV5 {
+struct SemanticInputV6 {
     schema_version: u32,
     prompt_version: &'static str,
     dispute: SemanticDisputeV2,
@@ -310,7 +310,7 @@ struct SemanticInputV5 {
     router_disputes: Vec<SemanticRouterDisputeV3>,
     prior_resolutions: Vec<SemanticPriorResolutionV2>,
     warning_codes: Vec<String>,
-    evaluator: SemanticEvaluatorConfigV2,
+    evaluator: SemanticEvaluatorConfigV3,
 }
 
 #[derive(Serialize, PartialEq, Eq)]
@@ -370,17 +370,17 @@ struct SemanticPriorResolutionV2 {
 }
 
 #[derive(Serialize)]
-struct SemanticEvaluatorConfigV2 {
+struct SemanticEvaluatorConfigV3 {
     provider: LlmProvider,
     model: String,
-    reasoning_effort: ReasoningEffort,
+    reasoning_effort: Option<ReasoningEffort>,
     max_tokens: u32,
     context_window: usize,
     confidence_threshold: f64,
     max_source_claims: usize,
 }
 
-impl SemanticInputV5 {
+impl SemanticInputV6 {
     fn from_frozen(
         frozen: &FrozenArbitrationContext,
         arbitration: &MaintainerArbitrationConfig,
@@ -426,7 +426,7 @@ impl SemanticInputV5 {
             router_disputes: semantic_router_disputes(&frozen.router_disputes),
             prior_resolutions,
             warning_codes,
-            evaluator: SemanticEvaluatorConfigV2 {
+            evaluator: SemanticEvaluatorConfigV3 {
                 provider: llm.provider,
                 model: llm.model.clone(),
                 reasoning_effort: llm.reasoning_effort,
@@ -835,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_v5_ignores_router_lifecycle_metadata_but_tracks_knowledge() {
+    fn semantic_v6_ignores_router_lifecycle_metadata_but_tracks_knowledge() {
         let holder = AgentId::new("agent-a").unwrap();
         let direct = claim(&holder, "direct");
         let policy = Policy {
@@ -903,8 +903,22 @@ mod tests {
         let arbitration = MaintainerArbitrationConfig::default();
         let llm = LlmChatConfig::default();
         let fingerprint = |context: &FrozenArbitrationContext| {
-            versioned_sha256(&SemanticInputV5::from_frozen(context, &arbitration, &llm)).unwrap()
+            versioned_sha256(&SemanticInputV6::from_frozen(context, &arbitration, &llm)).unwrap()
         };
+
+        let explicitly_disabled = LlmChatConfig {
+            reasoning_effort: Some(ReasoningEffort::None),
+            ..llm.clone()
+        };
+        assert_ne!(
+            fingerprint(&base),
+            versioned_sha256(&SemanticInputV6::from_frozen(
+                &base,
+                &arbitration,
+                &explicitly_disabled,
+            ))
+            .unwrap()
+        );
 
         let mut runtime_churn = base.clone();
         runtime_churn.generated_at += chrono::Duration::hours(1);

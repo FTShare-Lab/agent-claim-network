@@ -139,7 +139,7 @@ Agent 进程使用 `<acn_home>/<upstream>/data/agents/<agent_id>/`。Router 和 
 5. 后台 Recap 从 canonical `messages.jsonl` 的最新 `recapped_until` 处理到 job 的冻结 target。退出后的 Finalize 从最新 cursor 继续到最终 `message_count`，并额外消费未处理的后台进程终态；团队模式下在本地知识应用后上传 claim mirror，并报告符合条件的 dispute。
 6. 已 finalize 的 session 关闭；空 session 可以直接清理。
 
-已创建 session 的 system prompt 是冻结快照。修改 `ACN.md`、Memory、Skill 或本地 claim 只影响后续新 session。
+已创建 session 的 system prompt 是冻结快照。修改 `ACN.md`、Memory、Skill 或本地 claim 不会改写该快照；普通 session 的 claim 目录只包含有界摘要，`claim` 工具按需读取最新本地正文、修订自有判断并回查 trace。`/claim` 面板与工具复用 `AgentRunner` 的同一个领域入口。
 
 ## Claim 协作流
 
@@ -199,10 +199,10 @@ Maintainer 与 Router 的 `/health` 无需登录，返回服务状态和团队�
 
 `dream_execution.rs` 负责版本化的逐组执行与回执。`dream_validate` 返回宿主生成的原文、目标、差异和版本；`dream_apply_group` 接收逐 Claim 简要语义复核，先保存执行计划再复用现有 Prepared 写入路径。修改立即生效，`dream_finish` 只汇总。`dream_review.rs` 的旧全文映射协议保留供历史记录校验，新模型工具不暴露该入口。
 
-执行记录落在 `<agent_home>/dream/<job_id>/executions/`，包含原文、目标、具体依据、版本化证据、硬校验和实际结果，并生成 JSON/Markdown 人工视图。全局 pending 标记使 read_claim 和运行时投影避开恢复中的组；supervisor 在执行下一任务前优先恢复已经开始的写入。执行只复用现有原子文件写、知识锁和持久化同步暂存；没有跨模型调用持锁，也没有将多个文件宣称为数据库原子事务。组内先保存存续结果再废弃来源，遇到第三方版本则停止本组剩余修改。
+执行记录落在 `<agent_home>/dream/<job_id>/executions/`，包含原文、目标、具体依据、版本化证据、硬校验和实际结果，并生成 JSON/Markdown 人工视图。全局 pending 标记使专用 read_claim 和运行时投影避开恢复中的组；普通 claim 工具和面板读取前后核对 pending 与持久提交状态，不等待长时间分析锁；supervisor 在执行下一任务前优先恢复已经开始的写入。执行只复用现有原子文件写、知识锁和持久化同步暂存；没有跨模型调用持锁，也没有将多个文件宣称为数据库原子事务。组内先保存存续结果再废弃来源，遇到第三方版本则停止本组剩余修改。
 
 已完成执行通过 validation_id 幂等返回回执；自己产生的修改不使探索恢复指纹失效，也不计作新的触发变化。外部变化仍使旧草稿版本失效。仅整轮结束推进 last_success_at，部分完成后的模型失败保留所有实际成果。事实纠正的 high 门槛同时检查本轮原始状态，不能通过前一组降级绕过。新执行记录可随每组写入进入现有远程同步流程，单人模式仍不积累团队任务。
 
-`src/tool/knowledge.rs` 提供 `read_claim`、按 Claim 定位来源的 `read_trace`，以及 Dream 只读工具 profile。宿主校验 holder、完整读取的原版本、信息去向、证据收据和来源关系；先写整合后的存活 Claim，再废弃被覆盖项。版本冲突跳过关联操作组。团队上传通过原有 durable staging，单人模式不创建上传队列。
+`src/tool/knowledge.rs` 提供 Dream 专用 `read_claim`、按 Claim 定位来源的 `read_trace`，以及 Dream 只读工具 profile；旧冻结会话和子代理保留只读兼容入口，新主会话使用 `claim` 工具。宿主校验 holder、完整读取的原版本、信息去向、证据收据和来源关系；先写整合后的存活 Claim，再废弃被覆盖项。版本冲突跳过关联操作组。团队上传通过原有 durable staging，单人模式不创建上传队列。
 
 `src/agent/session_engine/claim_context.rs` 保存与 system prompt 同源的会话 Claim 索引。每 turn 冻结相对此索引的累计身份差异并生成 revision，作为已有 Runtime ModelContext 的补充。它复用 fingerprint 去重、Provider WAL 与 compaction 投影，不另设会因失败而提前推进的已读游标，也不依赖 Dream 开关。

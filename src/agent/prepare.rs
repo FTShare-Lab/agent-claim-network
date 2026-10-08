@@ -200,7 +200,6 @@ pub(super) fn prepare_claim_updates(
     allowed_source_claim_ids: Option<&FxHashSet<ClaimId>>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<Vec<Claim>> {
-    let updated_at = truncate_to_second(now);
     let mut out = Vec::with_capacity(drafts.len());
     let mut seen_ids = FxHashSet::default();
     for (idx, draft) in drafts.into_iter().enumerate() {
@@ -258,7 +257,10 @@ pub(super) fn prepare_claim_updates(
             confidence: draft.confidence,
             status,
             created_at: existing.created_at,
-            updated_at: Some(updated_at),
+            updated_at: Some(crate::time::next_claim_update_at(
+                now,
+                existing.effective_updated_at(),
+            )),
             source_claim_ids: sources,
             evidence_summary: draft.evidence_summary,
         });

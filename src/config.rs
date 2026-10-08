@@ -697,7 +697,7 @@ fn default_llm_api_key_env() -> String {
     String::new()
 }
 
-/// router top-K rerank 配置。
+/// Router 重排独立配置，复用通用模型的推理参数类型。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouterRerankConfig {
@@ -707,6 +707,13 @@ pub struct RouterRerankConfig {
     pub endpoint: String,
     #[serde(default = "default_rerank_model")]
     pub model: String,
+    /// 未配置时省略；显式 none 请求关闭推理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub anthropic_thinking: AnthropicThinking,
+    #[serde(default)]
+    pub anthropic_thinking_budget_tokens: Option<u32>,
     #[serde(default = "default_rerank_timeout_secs")]
     pub timeout_secs: u64,
     #[serde(default = "default_rerank_max_tokens")]
@@ -727,6 +734,9 @@ impl Default for RouterRerankConfig {
             provider: default_rerank_provider(),
             endpoint: default_rerank_endpoint(),
             model: default_rerank_model(),
+            reasoning_effort: None,
+            anthropic_thinking: AnthropicThinking::Auto,
+            anthropic_thinking_budget_tokens: None,
             timeout_secs: default_rerank_timeout_secs(),
             max_tokens: default_rerank_max_tokens(),
             api_key_env: default_rerank_api_key_env(),
@@ -786,8 +796,9 @@ pub struct LlmChatConfig {
     /// 仅 `openai_responses` 可用；显式声明 endpoint 支持 Responses WebSocket transport。
     #[serde(default)]
     pub supports_websockets: bool,
-    #[serde(default)]
-    pub reasoning_effort: ReasoningEffort,
+    /// 未配置时省略；显式 none 请求关闭推理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// 可选采样温度；未配置时沿用上游默认值。
     #[serde(default)]
     pub temperature: Option<f64>,
@@ -830,7 +841,7 @@ impl Default for LlmChatConfig {
             endpoint: "https://api.anthropic.com".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
             supports_websockets: false,
-            reasoning_effort: ReasoningEffort::None,
+            reasoning_effort: None,
             temperature: None,
             top_p: None,
             anthropic_thinking: AnthropicThinking::Auto,
@@ -859,7 +870,7 @@ pub enum AnthropicThinking {
     Disabled,
 }
 
-/// Agent 主 LLM 请求的推理强度。
+/// 通用模型请求的显式推理强度；None 表示关闭，未配置由 Option 表达。
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
@@ -3381,10 +3392,40 @@ router_endpoint = "http://127.0.0.1:8061"
     }
 
     #[test]
-    fn reasoning_effort_defaults_to_none_when_omitted() {
+    fn reasoning_effort_is_unset_when_omitted() {
         let cfg = parse_and_validate(minimal_config_without_optional_defaults()).unwrap();
 
-        assert_eq!(cfg.agent.llm.reasoning_effort, ReasoningEffort::None);
+        assert_eq!(cfg.agent.llm.reasoning_effort, None);
+    }
+
+    #[test]
+    fn reasoning_effort_preserves_unset_and_explicit_values_for_all_roles() {
+        for (setting, expected) in [
+            ("", None),
+            ("reasoning_effort = \"none\"", Some(ReasoningEffort::None)),
+            ("reasoning_effort = \"high\"", Some(ReasoningEffort::High)),
+        ] {
+            let config = minimal_config_without_optional_defaults().replace(
+                "model = \"example-anthropic-model\"",
+                &format!("model = \"example-anthropic-model\"\n{setting}"),
+            );
+            let config = format!(
+                "{config}\n[router.rerank]\n{setting}\n[maintainer.llm]\nprovider = \"openai_responses\"\nendpoint = \"https://llm.example.com/v1\"\nmodel = \"test-model\"\napi_key_env = \"EXAMPLE_API_KEY\"\n{setting}\n"
+            );
+            let cfg = parse_and_validate(&config).unwrap();
+            for llm in [&cfg.agent.llm, cfg.maintainer.llm.as_ref().unwrap()] {
+                assert_eq!(llm.reasoning_effort, expected);
+                let serialized = toml::to_string(llm).unwrap();
+                assert_eq!(serialized.contains("reasoning_effort"), expected.is_some());
+                let restored: LlmChatConfig = toml::from_str(&serialized).unwrap();
+                assert_eq!(restored.reasoning_effort, expected);
+            }
+            assert_eq!(cfg.router.rerank.reasoning_effort, expected);
+            let serialized = toml::to_string(&cfg.router.rerank).unwrap();
+            assert_eq!(serialized.contains("reasoning_effort"), expected.is_some());
+            let restored: RouterRerankConfig = toml::from_str(&serialized).unwrap();
+            assert_eq!(restored.reasoning_effort, expected);
+        }
     }
 
     #[test]
@@ -3572,13 +3613,35 @@ router_endpoint = "http://127.0.0.1:8061"
     }
 
     #[test]
-    fn router_rerank_rejects_reasoning_effort_parameter() {
+    fn router_rerank_accepts_reasoning_and_defaults_to_unset() {
+        let cfg = parse_and_validate(&minimal_config_without_optional_defaults()).unwrap();
+        assert_eq!(cfg.router.rerank.reasoning_effort, None);
+        assert_eq!(
+            cfg.router.rerank.anthropic_thinking,
+            AnthropicThinking::Auto
+        );
+        for effort in ["none", "low", "medium", "high", "xhigh", "max"] {
+            let config = format!(
+                "{}\n[router.rerank]\nreasoning_effort = \"{effort}\"\nanthropic_thinking = \"adaptive\"\n",
+                minimal_config_without_optional_defaults()
+            );
+            let cfg = parse_and_validate(&config).unwrap();
+            assert_eq!(
+                serde_json::to_value(cfg.router.rerank.reasoning_effort).unwrap(),
+                effort
+            );
+            assert_eq!(
+                cfg.router.rerank.anthropic_thinking,
+                AnthropicThinking::Adaptive
+            );
+            assert_eq!(cfg.agent.llm.reasoning_effort, None);
+        }
         expect_parse_err_contains(
             format!(
-                "{}\n[router.rerank]\nreasoning_effort = \"low\"\n",
+                "{}\n[router.rerank]\nreasoning_effort = \"extreme\"\n",
                 minimal_config_without_optional_defaults()
             ),
-            "unknown field `reasoning_effort`",
+            "unknown variant `extreme`",
         );
     }
 
@@ -3600,7 +3663,7 @@ reasoning_effort = "{raw}""#
                 ),
             );
             let cfg = parse_and_validate(&config).unwrap();
-            assert_eq!(cfg.agent.llm.reasoning_effort, expected);
+            assert_eq!(cfg.agent.llm.reasoning_effort, Some(expected));
         }
 
         expect_parse_err_contains(

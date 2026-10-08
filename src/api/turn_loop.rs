@@ -2658,7 +2658,8 @@ impl AgentTurnLoop {
         runtime_fallback_scope: &crate::api::ProviderRuntimeFallbackScope,
         request_progress: &mut ProviderRequestProgress<'_, '_>,
     ) -> anyhow::Result<ProviderCallOutcome> {
-        let (tool_definitions, provider_mcp_routes) = self.tools.definitions_with_mcp_routes();
+        let (tool_definitions, provider_mcp_routes) =
+            self.tools.definitions_for_prompt(system_prompt);
         let provider_mcp_routes = Arc::new(provider_mcp_routes);
         let tools = tool_definitions
             .into_iter()
@@ -3108,7 +3109,8 @@ impl AgentTurnLoop {
         let messages = normalize_provider_messages(messages);
         let tools = self
             .tools
-            .definitions()
+            .definitions_for_prompt(system_prompt)
+            .0
             .into_iter()
             .map(Into::into)
             .collect::<Vec<_>>();

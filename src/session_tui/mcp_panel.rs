@@ -23,7 +23,7 @@ use crate::mcp::tool::tool_catalog;
 
 use super::runtime::McpOperationOutcome;
 use super::theme::{accent_style, blue_style, muted_style, surface_style};
-use super::wrapping::hard_wrap_styled_lines;
+use super::wrapping::{fit_spans_to_width, hard_wrap_styled_lines, truncate_width};
 
 const TOOL_NAME_COL: usize = 28;
 const TOOL_STATUS_COL: usize = 13;
@@ -1124,30 +1124,6 @@ fn server_table_header(width: u16) -> Line<'static> {
     )
 }
 
-fn fit_spans_to_width(spans: Vec<Span<'static>>, width: u16) -> Line<'static> {
-    let max_width = usize::from(width.max(1));
-    let mut used = 0usize;
-    let mut fitted = Vec::new();
-    for span in spans {
-        let content = span.content.as_ref();
-        let span_width = UnicodeWidthStr::width(content);
-        if used.saturating_add(span_width) <= max_width {
-            used = used.saturating_add(span_width);
-            fitted.push(span);
-            continue;
-        }
-        let remaining = max_width.saturating_sub(used);
-        if remaining > 0 {
-            fitted.push(Span::styled(
-                truncate_width(content, u16::try_from(remaining).unwrap_or(u16::MAX)),
-                span.style,
-            ));
-        }
-        break;
-    }
-    Line::from(fitted)
-}
-
 fn tool_table_layout(width: u16) -> ToolTableLayout {
     let total = usize::from(width.max(1));
     if total < 24 {
@@ -1485,28 +1461,6 @@ fn redacted_keys<'a>(keys: Option<impl Iterator<Item = &'a String>>) -> String {
     } else {
         values.join(",")
     }
-}
-
-fn truncate_width(text: &str, width: u16) -> String {
-    let width = usize::from(width.max(1));
-    if UnicodeWidthStr::width(text) <= width {
-        return text.to_string();
-    }
-    if width <= 1 {
-        return "…".into();
-    }
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in text.chars() {
-        let next = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used.saturating_add(next) >= width {
-            break;
-        }
-        out.push(ch);
-        used = used.saturating_add(next);
-    }
-    out.push('…');
-    out
 }
 
 fn pad_width(text: &str, width: usize) -> String {

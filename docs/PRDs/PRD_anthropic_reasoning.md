@@ -1,5 +1,7 @@
 # Anthropic Reasoning 保存与原样回传
 
+> 2026-09-28 补充：Agent、Router、Maintainer 的推理配置现已统一：未配置 `reasoning_effort` 时省略参数，显式 `none` 请求关闭思考（Anthropic 映射为 `thinking.type = "disabled"`）。本文历史上的 `none` 省略及 Router 不支持推理参数的约定由[当前配置](../config_parameters.md#agentllm)取代。Router 仍不请求或回传 reasoning replay。
+
 > 状态：阶段 0–15 已完成（2026-08-07）。本文定义 Anthropic Messages thinking/reasoning 的请求、解析、私有落盘、resume、工具回环、compaction 与原样回传边界，并同时把 OpenAI Responses replay 从“仅协议”收紧为“协议 + model + 连续 replay 世代”。Reasoning 的 TUI 展示与 OpenAI Chat reasoning 不在本期范围内。
 
 > 2026-08-27 补充：本文的 Reasoning/replay 与 provider-triggered compaction 边界继续有效；compact recap 已由 [PRD_recap_in_supervisor.md](PRD_recap_in_supervisor.md) 改为异步 Supervisor job。Summary 失败仍阻断当前 context recovery，Recap 失败不再阻断或回滚 summary。
@@ -60,7 +62,7 @@ Anthropic Messages 的 thinking 不是普通 assistant 文本：
 - 不在 Chat streaming 异常恢复问题上顺带扩大改造；tool-only、缺终态、损坏 SSE 等作为独立 Chat P2 hardening 后续处理。
 - 不把 Anthropic raw block 转换成 Responses reasoning item，也不反向转换。
 - 不实现跨厂商、跨 endpoint 的加密 reasoning 转换、解密、重新签名或兼容性探测。
-- 不新增 Router Reasoning。Router rerank 仍是单次调用，不请求、不保存、不回传 reasoning。
+- Router rerank 支持可选推理参数，仍是单次调用，不保存或回传 reasoning。
 - 不改变 TUI 的用户可见渲染、composer、timeline 或 turn event 类型。
 - 不实现 WebSocket transport 或 `supports_websockets`。
 - 不实现模型生成图片、文件、音频等输出的 TUI/canonical 展示。
@@ -81,7 +83,7 @@ Anthropic Messages 的 thinking 不是普通 assistant 文本：
 
 ### 4.2 Anthropic 请求侧配置语义（原 2A）
 
-- 保留现有 `reasoning_effort`，Anthropic adapter 继续把非 `none` 值映射为 `output_config.effort`；`none` 时省略该字段。
+- 保留现有 `reasoning_effort`，Anthropic adapter 继续把非 `none` 值映射为 `output_config.effort`；显式 `none` 时省略该字段并发送 `thinking.type = "disabled"`，未配置 effort 时不干预独立 thinking 配置。
 - Anthropic 的 `thinking.type` 必须允许显式配置，也必须允许完全省略，让 endpoint 使用自身默认行为。
 - `budget_tokens` 是独立、可选配置，不能从 `reasoning_effort` 或 `max_tokens` 自动推导。
 - 选择 `enabled` 时，只有用户配置了 budget 才发送 `budget_tokens`；不因为 Anthropic 官方某些 model 要求 budget，就强迫所有兼容 endpoint 都携带它。
@@ -239,7 +241,7 @@ Reasoning 不进入 compaction summary 的可读输入，也不会被压缩成�
 
 - Agent Responses 的 streaming、non-streaming fallback、工具回环与 max-token continuation 统一携带该 `include`。
 - 返回的 reasoning item 仍按 4.1、4.6–4.11 的边界原样保存、按 identity/连续世代回传且不展示。
-- Router Responses rerank 是单次无状态排序，不保存或回传 reasoning，因此继续省略 `include` 与 `reasoning`。
+- Router Responses rerank 是单次无状态排序，不保存或回传 reasoning，省略 `include`；`reasoning` 按显式配置发送，未配置时省略。
 - 不增加用户 TOML 开关，避免允许配置出 `store = false` 却拿不到可重放 reasoning 的不完整 Agent 语义。
 
 该补充修复已拍板“Responses Reasoning 保存并在下轮原样回传”的请求侧必要条件，不改变 replay identity、隐私或 TUI 边界。

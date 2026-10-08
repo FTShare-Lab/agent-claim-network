@@ -219,9 +219,9 @@ dream_finish { group_ids: [], review: { quality, evidence, consolidation } }
 
 此能力面向 **所有 Claim 变化来源**，独立于 Dream 开关。
 
-- 每个 session 保存与其 system prompt 使用的同一份 Claim 快照索引，原 system prompt 保持固定。
+- 主会话 system prompt 沿用有界 Claim 目录（默认 20 条）；每个 session 的变化基线覆盖同一次受保护读取获得的全部本地 Claim，不把未展示的条目当成新增。原 system prompt 保持固定。
 - 每个主 turn 观察本地库，生成相对初始快照的累计差异；具体项只有 ID、name、scope，以 change 标明 created / updated / deprecated / removed。
-- 放入已有 `<runtime_context>`，沿用 Asia/Shanghai（UTC+8）时间及工作区信息。需要正文时模型调用 `read_claim`。
+- 放入已有 `<runtime_context>`，沿用 Asia/Shanghai（UTC+8）时间及工作区信息。需要引用或依赖正文时主会话调用 `claim` 的 `action="read"`。
 - 最新差异快照覆盖旧通知；既有 ModelContext fingerprint 去重，相同内容不会反复注入。先新增后删除的条目保留 removed 提示。
 - 不设置 Agent 级共享消费游标。多个会话各有基准，各自收到变化；Resume 继续使用该会话的 baseline 与已持久化 ModelContext。
 - 复用 Provider WAL、失败恢复和 compaction 投影，没有“通知未送出、已读游标却提前推进”的窗口。
@@ -307,3 +307,11 @@ A 的准入先判断记忆层级：真实的交付记录、功能现状、源码
 冻结 v4 的 trial-07 使用原 API 与 `gpt-5.6-luna`，首个 attempt 完成，80 条自有非 deprecated Claim 全部输入。7 条纯记录废弃、3 条错误判断修订、1 条正确 CAS 判断补证据并从 low 提至 medium；CAS 正文完整保留。未观察到实际有用判断误废弃或有效条件丢失。草稿/执行校验拒绝为 0，仍有 2 次复杂探索命令被白名单拒绝后恢复。C 未提出整合，属于允许结果；整合回来源规则仅由回归验证，本轮未覆盖实际整合。
 
 两组修改均在整轮结束前落盘；真实 TUI 的 `/dream`、后台 `/help`、同会话 11 条 runtime_context 通知和最新 Claim 读取通过。单轮语义检查由实验助手完成，不能证明稳定收益或绝对安全。未实测本轮压缩或远程镜像同步。实验与完整前后对照保存在 Git 忽略的 `target/experiments/dream/realistic-system-v4/runs/trial-07/`。
+
+## main 整合完成说明（2026-10-08）
+
+- 新主会话使用统一 `claim` 工具及 `/claim` 面板；旧冻结会话和子代理保留只读兼容入口，Dream 仍使用专用读取、证据记录与逐项审核执行工具，不能调用普通修订绕过审核。
+- 普通 Claim/Trace 读取不等待 Inbox/Recap 的分析锁；读取前后核对 Dream pending 与持久提交状态，提交重叠或待恢复时返回 `knowledge_busy`。修订在知识锁内核对 pending 和内容 revision；runtime_context 继续非阻塞扫描。
+- Recap/Finalize 使用整批执行前检查和已执行进度；兼容旧检查点的目标哈希，必须覆盖全部待执行目标且均匹配才继续。状态变化或依据不足时放弃剩余关联修改，不额外调用模型。新记录不重复保存两套依据。
+- 各本地 Claim 修订采用相同的单调更新时间，审核目标与落盘、上传版本一致。C 的弃用依然等待精确承接版本确认；前台改写承接或恢复来源也遵守已有交付依赖。
+- 保留 main 的结构化函数输出、推理配置、命令尾部预览和压缩文件工作集；Dream 触发、输入预算、压缩、证据门槛与保守边界不变。

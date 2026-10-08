@@ -145,6 +145,7 @@ pub fn build_agent_cli_session_engine_with_mcp(
             cfg.agent_home(&context.agent_id),
             context.agent_id.clone(),
         )
+        .with_claim_runner(runner.clone())
         .with_memory_store(context.memory_store.clone())
         .with_memory_enabled(cfg.agent.memory.enabled)
         .with_session_search(session_search)
@@ -734,7 +735,7 @@ mod tests {
                     provider: LlmProvider::Anthropic,
                     endpoint: "http://127.0.0.1:1".into(),
                     model: "test-model".into(),
-                    reasoning_effort: crate::config::ReasoningEffort::None,
+                    reasoning_effort: None,
                     anthropic_thinking: crate::config::AnthropicThinking::Auto,
                     anthropic_thinking_budget_tokens: None,
                     supports_websockets: false,

@@ -279,6 +279,10 @@ impl AgentRunner {
     ) -> InboxProcessReport {
         let _guard = self.inbox_process_lock.lock().await;
         let mut report = InboxProcessReport::default();
+        // 团队模式下未完成的 claim 编辑先于 inbox 内化恢复；失败按本地失败降级，不阻断 session。
+        if let Err(error) = self.recover_pending_claim_edit().await {
+            record_inbox_failure(&mut report, error.context("恢复待完成的 claim 编辑失败"));
+        }
         if self.team_services_configured() {
             let sync_report = self.sync_inbox_to_local().await;
             report.team_services.maintainer = if sync_report.pull_succeeded {
@@ -588,7 +592,6 @@ impl AgentRunner {
         .await?;
         claim_alignment::ensure_knowledge_ready(self.maintainer_upload_queue.agent_home()).await?;
         let now = Utc::now();
-        let updated_at = crate::time::truncate_to_second(now);
         let policy_source = SourceId::Policy(policy.id.clone());
         let mut deprecated_claim_ids = Vec::new();
         let mut claims_to_upload = Vec::new();
@@ -598,7 +601,10 @@ impl AgentRunner {
             }
             if claim.status != ClaimStatus::Deprecated {
                 claim.status = ClaimStatus::Deprecated;
-                claim.updated_at = Some(updated_at);
+                claim.updated_at = Some(crate::time::next_claim_update_at(
+                    now,
+                    claim.effective_updated_at(),
+                ));
                 deprecated_claim_ids.push(claim.id.clone());
             }
             // trace 是本地审计线索；这里优先保证 claim 状态和 maintainer mirror 可重试收敛。
@@ -6083,9 +6089,7 @@ mod tests {
             .unwrap();
         let report = runner.process_inbox_with(generator.as_ref()).await;
         assert_eq!(report.failures.len(), 1);
-        assert!(report.failures[0]
-            .error
-            .contains("Dream local commit needs recovery"));
+        assert!(report.failures[0].error.contains("知识库忙碌"));
         tokio::fs::remove_file(pending).await.unwrap();
         let report = runner.process_inbox_with(generator.as_ref()).await;
         assert!(report.failures.is_empty());

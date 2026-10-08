@@ -423,15 +423,8 @@ impl SessionEngine {
         let audit = Audit::new(self.runner.maintainer_upload_queue.agent_home(), job_id)?;
         audit.checkpoint(json!(checkpoint)).await?;
         if !checkpoint.applied {
-            if checkpoint.operation.is_some() {
-                write_yaml_atomic(
-                    &super::dream_execution::pending_path(
-                        self.runner.maintainer_upload_queue.agent_home(),
-                    ),
-                    &path,
-                )
-                .await?;
-            }
+            // 历史批次与逐组执行共用读取边界，不能让普通读取看到旧批次的中间状态。
+            write_yaml_atomic(&pending, &path).await?;
             for index in 0..checkpoint.groups.len() {
                 if checkpoint.groups[index].completed {
                     continue;
@@ -590,15 +583,6 @@ impl SessionEngine {
                 .known_versions
                 .extend(checkpoint.self_versions.clone());
             write_yaml_atomic(&self.dream_state_path(), &state).await?;
-            match tokio::fs::remove_file(super::dream_execution::pending_path(
-                self.runner.maintainer_upload_queue.agent_home(),
-            ))
-            .await
-            {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
         } else if previous.last_success_at <= checkpoint.success_at {
             write_yaml_atomic(
                 &self.dream_state_path(),
@@ -609,6 +593,22 @@ impl SessionEngine {
                 },
             )
             .await?;
+        } else {
+            // 旧批次不能倒退冷却时间，但其实际提交仍必须改变持久版本边界。
+            let mut state = previous;
+            state
+                .known_versions
+                .extend(checkpoint.self_versions.clone());
+            write_yaml_atomic(&self.dream_state_path(), &state).await?;
+        }
+        match tokio::fs::remove_file(super::dream_execution::pending_path(
+            self.runner.maintainer_upload_queue.agent_home(),
+        ))
+        .await
+        {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
         drop(guard);
         Ok(SessionFinalizeReport {

@@ -349,6 +349,11 @@ pub fn agent_home_knowledge_apply_lock_path(agent_home: &Path) -> PathBuf {
     agent_home.join("knowledge_apply.lock")
 }
 
+/// `<agent_home>/claim_edit_pending.yaml`：Claim 工具编辑在本地文件与同步队列间的恢复记录。
+pub fn agent_home_claim_edit_pending_path(agent_home: &Path) -> PathBuf {
+    agent_home.join("claim_edit_pending.yaml")
+}
+
 pub fn agent_home_supervisor_dir(agent_home: &Path) -> PathBuf {
     agent_home_runtime_dir(agent_home).join("supervisor")
 }

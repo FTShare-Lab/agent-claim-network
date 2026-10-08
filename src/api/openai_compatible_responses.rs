@@ -58,7 +58,7 @@ pub enum OpenAiCompatibleResponsesError {
 pub struct OpenAiCompatibleResponsesProviderAdapter {
     client: ResponsesClient,
     model: String,
-    reasoning_effort: ReasoningEffort,
+    reasoning_effort: Option<ReasoningEffort>,
     include_reasoning_replay: bool,
     temperature: Option<f64>,
     top_p: Option<f64>,
@@ -88,15 +88,15 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                 retry_max_delay,
             )?,
             model,
-            reasoning_effort: ReasoningEffort::None,
+            reasoning_effort: None,
             include_reasoning_replay: true,
             temperature: None,
             top_p: None,
         })
     }
 
-    /// 设置 Responses `reasoning.effort`；`none` 会省略整个 reasoning 字段。
-    pub fn with_reasoning_effort(mut self, reasoning_effort: ReasoningEffort) -> Self {
+    /// 未配置时省略推理参数；显式 none 请求关闭推理。
+    pub fn with_reasoning_effort(mut self, reasoning_effort: Option<ReasoningEffort>) -> Self {
         self.reasoning_effort = reasoning_effort;
         self
     }
@@ -148,10 +148,8 @@ impl OpenAiCompatibleResponsesProviderAdapter {
             include: self
                 .include_reasoning_replay
                 .then(|| vec!["reasoning.encrypted_content".into()]),
-            reasoning: reasoning_effort_name(self.reasoning_effort).map(|effort| {
-                ResponsesReasoning {
-                    effort: effort.to_string(),
-                }
+            reasoning: self.reasoning_effort.map(|effort| ResponsesReasoning {
+                effort: reasoning_effort_name(effort).to_string(),
             }),
             temperature: self.temperature,
             top_p: self.top_p,
@@ -956,14 +954,14 @@ fn replay_item_types(items: &[Value]) -> String {
     }
 }
 
-fn reasoning_effort_name(effort: ReasoningEffort) -> Option<&'static str> {
+fn reasoning_effort_name(effort: ReasoningEffort) -> &'static str {
     match effort {
-        ReasoningEffort::None => None,
-        ReasoningEffort::Low => Some("low"),
-        ReasoningEffort::Medium => Some("medium"),
-        ReasoningEffort::High => Some("high"),
-        ReasoningEffort::Xhigh => Some("xhigh"),
-        ReasoningEffort::Max => Some("max"),
+        ReasoningEffort::None => "none",
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::Xhigh => "xhigh",
+        ReasoningEffort::Max => "max",
     }
 }
 
@@ -1087,7 +1085,7 @@ mod tests {
     use crate::tool::ToolRegistry;
 
     fn adapter_with_reasoning_effort(
-        reasoning_effort: ReasoningEffort,
+        reasoning_effort: Option<ReasoningEffort>,
     ) -> OpenAiCompatibleResponsesProviderAdapter {
         OpenAiCompatibleResponsesProviderAdapter {
             client: ResponsesClient::new(
@@ -1104,6 +1102,23 @@ mod tests {
             include_reasoning_replay: true,
             temperature: None,
             top_p: None,
+        }
+    }
+
+    #[test]
+    fn explicit_none_is_sent_for_streaming_and_non_streaming_requests() {
+        let adapter =
+            adapter_with_reasoning_effort(None).with_reasoning_effort(Some(ReasoningEffort::None));
+        for stream in [false, true] {
+            let body = serde_json::to_value(adapter.request_for(
+                "system",
+                Vec::new(),
+                Vec::new(),
+                128,
+                stream,
+            ))
+            .unwrap();
+            assert_eq!(body["reasoning"], json!({"effort": "none"}));
         }
     }
 
@@ -1266,7 +1281,7 @@ mod tests {
     #[test]
     fn history_media_policy_preserves_uncompacted_images_and_documents() {
         assert_eq!(
-            adapter_with_reasoning_effort(ReasoningEffort::None).history_media_policy(),
+            adapter_with_reasoning_effort(None).history_media_policy(),
             ProviderHistoryMediaPolicy::Preserve
         );
     }
@@ -1652,7 +1667,7 @@ mod tests {
 
     #[test]
     fn request_uses_store_false_strict_false_and_optional_reasoning() {
-        let adapter = adapter_with_reasoning_effort(ReasoningEffort::High);
+        let adapter = adapter_with_reasoning_effort(Some(ReasoningEffort::High));
         let request = adapter.request_for(
             "system",
             vec![user_text_item("hello")],
@@ -1677,13 +1692,8 @@ mod tests {
         assert_eq!(value["tools"][0]["strict"], false);
         assert_eq!(value["tools"][0]["type"], "function");
 
-        let none = adapter_with_reasoning_effort(ReasoningEffort::None).request_for(
-            "",
-            Vec::new(),
-            Vec::new(),
-            1,
-            false,
-        );
+        let none =
+            adapter_with_reasoning_effort(None).request_for("", Vec::new(), Vec::new(), 1, false);
         assert!(serde_json::to_value(none)
             .unwrap()
             .get("reasoning")
@@ -1692,8 +1702,8 @@ mod tests {
 
     #[test]
     fn configured_sampling_parameters_are_sent_for_streaming_and_non_streaming_requests() {
-        let adapter = adapter_with_reasoning_effort(ReasoningEffort::None)
-            .with_sampling_parameters(Some(0.6), Some(0.85));
+        let adapter =
+            adapter_with_reasoning_effort(None).with_sampling_parameters(Some(0.6), Some(0.85));
 
         for stream in [false, true] {
             let request = adapter.request_for("system", Vec::new(), Vec::new(), 128, stream);

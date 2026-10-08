@@ -101,7 +101,7 @@ pub struct AnthropicMessagesClient {
     retry_base_delay: Duration,
     retry_max_delay: Duration,
     timeout: Duration,
-    reasoning_effort: ReasoningEffort,
+    reasoning_effort: Option<ReasoningEffort>,
     thinking: AnthropicThinking,
     thinking_budget_tokens: Option<u32>,
     temperature: Option<f64>,
@@ -245,7 +245,7 @@ impl AnthropicMessagesClient {
             retry_base_delay,
             retry_max_delay,
             timeout,
-            reasoning_effort: ReasoningEffort::None,
+            reasoning_effort: None,
             thinking: AnthropicThinking::Auto,
             thinking_budget_tokens: None,
             temperature: None,
@@ -266,12 +266,16 @@ impl AnthropicMessagesClient {
             max_tokens,
             messages,
             system: system.to_owned(),
-            output_config: (self.reasoning_effort != ReasoningEffort::None).then_some(
-                ApiOutputConfig {
-                    effort: self.reasoning_effort,
-                },
-            ),
-            thinking: match self.thinking {
+            output_config: self
+                .reasoning_effort
+                .filter(|effort| *effort != ReasoningEffort::None)
+                .map(|effort| ApiOutputConfig { effort }),
+            // 显式 none 优先关闭 thinking，不能因独立 thinking 配置而重新开启。
+            thinking: match if self.reasoning_effort == Some(ReasoningEffort::None) {
+                AnthropicThinking::Disabled
+            } else {
+                self.thinking
+            } {
                 AnthropicThinking::Auto => None,
                 AnthropicThinking::Enabled => Some(ApiThinkingConfig {
                     kind: "enabled".into(),
@@ -895,8 +899,8 @@ impl AnthropicProviderAdapter {
         })
     }
 
-    /// 设置 Messages 请求的推理强度；`none` 会在序列化时省略 `output_config`。
-    pub fn with_reasoning_effort(mut self, reasoning_effort: ReasoningEffort) -> Self {
+    /// 未配置时省略 effort；显式 none 通过 thinking.disabled 关闭推理。
+    pub fn with_reasoning_effort(mut self, reasoning_effort: Option<ReasoningEffort>) -> Self {
         self.client.reasoning_effort = reasoning_effort;
         self
     }
@@ -1025,6 +1029,9 @@ fn assistant_turn_message(
                 .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
                 .filter_map(|block| api_block_to_session_turn_block(block).ok()),
         );
+        if turn.final_stop_reason == "max_tokens" {
+            mark_token_limited_tool_use(&turn.final_blocks, &mut content);
+        }
         content
     } else if !turn.merged_text.trim().is_empty() {
         vec![SessionTurnContentBlock::text(turn.merged_text.clone())]
@@ -1085,6 +1092,35 @@ fn assistant_turn_message(
         }),
         content,
     })
+}
+
+/// max_tokens 打断 tool_use 时，Anthropic 仍以合法 JSON 返回该 block，但 `input` 只是残缺或空
+/// 对象。最后一个 block 若是 tool_use，就把它标成可恢复的 InvalidToolUse：工具循环回一条错误
+/// tool_result 让模型重试，结构化输出调用方按形状错误处理，而不是把残缺参数当作完整结果。
+fn mark_token_limited_tool_use(final_blocks: &[Value], content: &mut [SessionTurnContentBlock]) {
+    let last_is_tool_use = final_blocks
+        .last()
+        .is_some_and(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"));
+    if !last_is_tool_use {
+        return;
+    }
+    let Some(last_call) = content.iter_mut().rev().find(|block| {
+        matches!(
+            block,
+            SessionTurnContentBlock::ToolUse { .. }
+                | SessionTurnContentBlock::InvalidToolUse { .. }
+        )
+    }) else {
+        return;
+    };
+    if let SessionTurnContentBlock::ToolUse { id, name, .. } = last_call {
+        let (id, name) = (std::mem::take(id), std::mem::take(name));
+        *last_call = SessionTurnContentBlock::InvalidToolUse {
+            id,
+            name,
+            error: "tool_use 参数在 max_tokens 处被截断，不是完整调用".into(),
+        };
+    }
 }
 
 /// Anthropic 要求历史中的 `tool_use.input` 也是 object。模型若返回合法 JSON
@@ -1650,7 +1686,9 @@ mod tests {
         }
     }
 
-    fn client_with_reasoning_effort(reasoning_effort: ReasoningEffort) -> AnthropicMessagesClient {
+    fn client_with_reasoning_effort(
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> AnthropicMessagesClient {
         let mut client = AnthropicMessagesClient::new(
             "key".into(),
             "http://127.0.0.1:1".into(),
@@ -1669,7 +1707,7 @@ mod tests {
     #[test]
     fn history_media_policy_preserves_uncompacted_images_and_documents() {
         let adapter = AnthropicProviderAdapter {
-            client: client_with_reasoning_effort(ReasoningEffort::None),
+            client: client_with_reasoning_effort(None),
         };
 
         assert_eq!(
@@ -1759,20 +1797,49 @@ mod tests {
     }
 
     #[test]
-    fn none_reasoning_effort_omits_anthropic_output_config() {
-        let client = client_with_reasoning_effort(ReasoningEffort::None);
+    fn unset_reasoning_effort_omits_anthropic_output_config() {
+        let client = client_with_reasoning_effort(None);
         let request = client.request_for("system", Vec::new(), None, 128, None);
         let body = serde_json::to_value(request).unwrap();
 
         assert!(body.get("output_config").is_none());
+        assert!(body.get("thinking").is_none());
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("temperature").is_none());
         assert!(body.get("top_p").is_none());
     }
 
     #[test]
+    fn explicit_none_disables_thinking_even_with_an_enabled_mode_and_budget() {
+        for mode in [
+            AnthropicThinking::Auto,
+            AnthropicThinking::Enabled,
+            AnthropicThinking::Adaptive,
+            AnthropicThinking::Disabled,
+        ] {
+            let adapter = AnthropicProviderAdapter {
+                client: client_with_reasoning_effort(None),
+            }
+            .with_reasoning_effort(Some(ReasoningEffort::None))
+            .with_thinking(mode, Some(4096));
+            for stream in [None, Some(true)] {
+                let body = serde_json::to_value(adapter.client.request_for(
+                    "system",
+                    Vec::new(),
+                    None,
+                    8192,
+                    stream,
+                ))
+                .unwrap();
+                assert_eq!(body["thinking"], json!({"type": "disabled"}));
+                assert!(body.get("output_config").is_none());
+            }
+        }
+    }
+
+    #[test]
     fn configured_reasoning_effort_is_nested_for_anthropic_streaming_and_non_streaming() {
-        let client = client_with_reasoning_effort(ReasoningEffort::Xhigh);
+        let client = client_with_reasoning_effort(Some(ReasoningEffort::Xhigh));
 
         for stream in [None, Some(true)] {
             let request = client.request_for("system", Vec::new(), None, 128, stream);
@@ -1784,7 +1851,7 @@ mod tests {
 
     #[test]
     fn configured_sampling_parameters_are_sent_for_streaming_and_non_streaming_requests() {
-        let mut client = client_with_reasoning_effort(ReasoningEffort::None);
+        let mut client = client_with_reasoning_effort(None);
         client.temperature = Some(0.55);
         client.top_p = Some(0.8);
 
@@ -1823,7 +1890,7 @@ mod tests {
         ];
 
         for (mode, budget, expected) in cases {
-            let mut client = client_with_reasoning_effort(ReasoningEffort::None);
+            let mut client = client_with_reasoning_effort(None);
             client.thinking = mode;
             client.thinking_budget_tokens = budget;
             for stream in [None, Some(true)] {
@@ -2056,7 +2123,7 @@ mod tests {
         let turn = ContinuedAssistantTurn {
             final_response: json!({}),
             final_blocks: replay_message["content"].as_array().unwrap().clone(),
-            final_stop_reason: "max_tokens".into(),
+            final_stop_reason: "tool_use".into(),
             merged_text: String::new(),
             replay_messages: vec![replay_message],
         };
@@ -2867,6 +2934,73 @@ mod tests {
             provider_stop_from_turn(&turn).unwrap(),
             ProviderStop::ToolUse
         );
+    }
+
+    #[test]
+    fn max_tokens_truncated_trailing_tool_use_becomes_recoverable_invalid_call() {
+        let turn = ContinuedAssistantTurn {
+            final_response: json!({}),
+            final_blocks: vec![
+                json!({
+                    "type": "tool_use",
+                    "id": "toolu_done",
+                    "name": "file_read",
+                    "input": {"path": "README.md"}
+                }),
+                json!({
+                    "type": "tool_use",
+                    "id": "toolu_cut",
+                    "name": "return_structured_result",
+                    "input": {}
+                }),
+            ],
+            final_stop_reason: "max_tokens".into(),
+            merged_text: String::new(),
+            replay_messages: Vec::new(),
+        };
+
+        let message = assistant_turn_message(&turn, "test-model").unwrap();
+
+        assert!(matches!(
+            message.content.as_slice(),
+            [
+                SessionTurnContentBlock::ToolUse { id: done, .. },
+                SessionTurnContentBlock::InvalidToolUse { id: cut, error, .. },
+            ] if done == "toolu_done" && cut == "toolu_cut" && error.contains("max_tokens")
+        ));
+        assert_eq!(
+            provider_stop_from_turn(&turn).unwrap(),
+            ProviderStop::ToolUse
+        );
+    }
+
+    #[test]
+    fn max_tokens_after_complete_tool_use_keeps_the_call_executable() {
+        let turn = ContinuedAssistantTurn {
+            final_response: json!({}),
+            final_blocks: vec![
+                json!({
+                    "type": "tool_use",
+                    "id": "toolu_done",
+                    "name": "file_read",
+                    "input": {"path": "README.md"}
+                }),
+                json!({"type": "text", "text": "然后"}),
+            ],
+            final_stop_reason: "max_tokens".into(),
+            merged_text: "然后".into(),
+            replay_messages: Vec::new(),
+        };
+
+        let message = assistant_turn_message(&turn, "test-model").unwrap();
+
+        assert!(matches!(
+            message.content.as_slice(),
+            [
+                SessionTurnContentBlock::Text { .. },
+                SessionTurnContentBlock::ToolUse { id, .. },
+            ] if id == "toolu_done"
+        ));
     }
 
     #[test]

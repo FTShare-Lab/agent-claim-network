@@ -245,7 +245,10 @@ pub(super) fn validate_plan(
                         update.id
                     );
                 }
-                target.updated_at = Some(now);
+                target.updated_at = Some(crate::time::next_claim_update_at(
+                    now,
+                    original.effective_updated_at(),
+                ));
             }
             before.push(original.clone());
             after.push(target);

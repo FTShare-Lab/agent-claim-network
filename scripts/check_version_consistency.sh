@@ -11,8 +11,8 @@ fail() {
   exit 1
 }
 
-# --locked 会在 Cargo.toml 与 Cargo.lock 根包版本不一致时直接失败，避免检查过程
-# 自己更新 lockfile 后掩盖漂移。
+# 只读取元数据，不允许检查过程更新锁文件；根包版本另行显式核对。
+# --no-deps 不保证检查到根包在锁文件中的版本漂移。
 cargo metadata --locked --no-deps --format-version 1 >/dev/null
 
 PACKAGE_ID="$(cargo pkgid)"
@@ -24,6 +24,16 @@ if [[ "$PACKAGE_VERSION" == "$PACKAGE_ID" ]] \
   || [[ ! "$PACKAGE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
   fail "无法从 cargo pkgid 解析产品版本: $PACKAGE_ID"
 fi
+
+LOCK_VERSION="$(
+  awk '
+    /^\[\[package\]\]/ { root_package = 0 }
+    /^name = "agent-claim-network"$/ { root_package = 1 }
+    root_package && /^version = "/ { split($0, fields, "\""); print fields[2]; exit }
+  ' Cargo.lock
+)"
+[[ "$LOCK_VERSION" == "$PACKAGE_VERSION" ]] \
+  || fail "Cargo.lock 根包版本 ${LOCK_VERSION:-<missing>} 与 Cargo 版本 $PACKAGE_VERSION 不一致"
 
 VERSION_FREE_FILES=(
   AGENTS.md
@@ -58,16 +68,18 @@ VERSION_PRESENTATION_FILES=(
   "${README_FILES[@]}"
   frontend/static/acn_roles_interaction.html
 )
+# 只校验当前产品版本标识；正文可以引用历史 Release、评测基线或第三方版本。
+# 保留逐项检查，避免正确徽章旁另有一个过期徽章时被漏过。
 while IFS= read -r displayed_version; do
   [[ -z "$displayed_version" ]] && continue
   displayed_version="${displayed_version#v}"
   if [[ "$displayed_version" != "$PACKAGE_VERSION" ]]; then
-    fail "中英文 README 或角色说明页存在漂移版本 $displayed_version，Cargo 版本为 $PACKAGE_VERSION"
+    fail "中英文 README 或角色说明页存在漂移版本 ${displayed_version}，Cargo 版本为 $PACKAGE_VERSION"
   fi
 done < <(
-  grep -Eho \
+  grep -hE '<img alt="version |角色与知识流转 · v' "${VERSION_PRESENTATION_FILES[@]}" \
+    | grep -Eo \
     '(^|[^[:alnum:]_.-])v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?([^[:alnum:]_.-]|$)' \
-    "${VERSION_PRESENTATION_FILES[@]}" \
     | grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?'
 )
 

@@ -1863,13 +1863,15 @@ fn slash_menu_lists_matching_commands_and_bolds_first_match() {
     assert!(text.contains("/copy"));
     assert!(text.contains("/dream"));
     assert!(!text.contains("/inbox"));
+    assert!(text.contains("/claim"));
     assert!(!text.contains("/skills"));
+    assert!(text.find("/claim").unwrap() < text.find("/compact").unwrap());
     assert!(text.find("/compact").unwrap() < text.find("/copy").unwrap());
     assert!(text.find("/copy").unwrap() < text.find("/exit").unwrap());
     let compact_span = lines
         .iter()
         .flat_map(|line| line.spans.iter())
-        .find(|span| span.content.starts_with("/compact"))
+        .find(|span| span.content.starts_with("/claim"))
         .expect("First slash command should render");
     assert!(compact_span.style.add_modifier.contains(Modifier::BOLD));
 }
@@ -1898,7 +1900,16 @@ fn slash_menu_puts_skills_first_and_scrolls_window_with_selection() {
     assert!(!text.contains("/inbox"));
 
     // 连续向下移动选中，窗口跟随滚动，末尾的原生命令进入视野
-    for _ in 0..12 {
+    let catalog = super::slash_command::SlashCommandCatalog::with_skills([
+        ("verify", "运行完整验证"),
+        ("tui-smoke-test-with-tmux", "tmux 冒烟测试"),
+    ]);
+    let skills_index = catalog
+        .matching("/")
+        .iter()
+        .position(|entry| entry.command == "/skills")
+        .unwrap();
+    for _ in 0..skills_index {
         assert!(state.select_next_slash_completion());
     }
     let text = super::composer_lines_with_width(&state, 96)
@@ -2155,6 +2166,7 @@ fn help_lists_slash_commands_alphabetically() {
     state.push_help();
 
     let text = state.transcript_text();
+    let claim = text.find("/claim").expect("/claim should render");
     let compact = text.find("/compact").expect("/compact should render");
     let copy = text.find("/copy").expect("/copy should render");
     let exit = text.find("/exit").expect("/exit should render");
@@ -2167,6 +2179,7 @@ fn help_lists_slash_commands_alphabetically() {
     let skills = text.find("/skills").expect("/skills should render");
     let subagents = text.find("/subagents").expect("/subagents should render");
 
+    assert!(claim < compact);
     assert!(compact < copy);
     assert!(copy < exit);
     assert!(exit < help);
@@ -2242,6 +2255,7 @@ fn slash_commands_are_classified_for_tui_loop() {
     let classify = |raw: &str| super::classify_input(raw, &catalog);
     assert_eq!(classify("/help"), super::InputAction::Help);
     assert_eq!(classify("/dream"), super::InputAction::Dream);
+    assert_eq!(classify("/claim"), super::InputAction::Claim);
     assert_eq!(classify("/inbox"), super::InputAction::Inbox);
     assert_eq!(classify("/mcp"), super::InputAction::Mcp);
     assert_eq!(classify("/new"), super::InputAction::New);

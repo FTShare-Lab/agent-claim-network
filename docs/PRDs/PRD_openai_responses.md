@@ -1,5 +1,7 @@
 # OpenAI Responses API 支持
 
+> 2026-09-28 补充：Agent、Router、Maintainer 的推理配置现已统一：未配置 `reasoning_effort` 时省略参数，显式 `none` 请求关闭思考（Anthropic 映射为 `thinking.type = "disabled"`）。本文历史上的 `none` 省略及 Router 不支持推理参数的约定由[当前配置](../config_parameters.md#agentllm)取代。Router 仍不请求或回传 reasoning replay。
+
 > 状态：已完成（2026-08-06；Agent Responses 主链路、15A 修订、provider 公开名称收敛与 Router Responses rerank 增补均已验收；历史媒体策略随后由 Anthropic Reasoning PRD 统一扩展到三个主对话 adapter）。本文定义 HTTP JSON/SSE Responses 协议、provider replay、session 恢复、多媒体历史与验收边界；WebSocket 和统一 Reasoning 展示不在本期范围内。
 >
 > 当前补充：后续 `PRD_anthropic_reasoning.md` 已把 Responses replay identity 收紧为“wire protocol + 精确 model + 连续 replay 世代”。本文涉及“只按协议匹配、replay 不保存 model、切回后复活旧 replay”的旧决策均由该 PRD 覆盖，以下当前行为说明已同步修订。
@@ -127,7 +129,7 @@ enum ProviderReplayState {
 
 ### 4.5 Reasoning 第一阶段边界（5A、10A）
 
-- `reasoning_effort = none` 或未配置时，不发送 `reasoning` 请求字段。
+- 未配置 `reasoning_effort` 时，不发送 `reasoning` 请求字段；显式 `none` 发送 `reasoning.effort = "none"`。
 - 其他值映射为 Responses `reasoning.effort`；ACN 不静默改写或降级不受上游支持的 effort 值。
 - 本期不主动发送 `reasoning.summary`。
 - 返回的 reasoning item 无论包含 summary、明文、加密内容或兼容厂商扩展字段，都完整保留并在下一次 Responses 请求原样回传。
@@ -203,7 +205,7 @@ enum ProviderReplayState {
 - Agent 主对话公开 provider 名称收敛为 `anthropic`、`openai_chat`、`openai_responses`。旧名称只作为代码中的隐藏解析 alias，不在用户文档和配置模板中说明；内部 adapter 模块和类型名称不做无收益的机械重命名。
 - Router rerank 公开 provider 名称为 `heuristic`、`openai_chat`、`openai_responses`，旧名称同样只作为隐藏解析 alias。Router embedding 不属于 Chat/Responses 协议，本增补不改变 embedding provider。
 - Router Responses rerank 固定使用 non-streaming JSON 请求，不建立 SSE、TUI delta 或 non-streaming fallback；它没有用户可见的增量输出消费者。
-- `[router.rerank]` 不新增 `reasoning_effort`。请求不发送 `reasoning` 字段；上游即使返回 reasoning item，Router 也只消费最终 `output_text`，不展示、不落盘、不回传。
+- `[router.rerank]` 支持可选 `reasoning_effort`，与 Agent、Maintainer 语义一致；上游即使返回 reasoning item，Router 也只消费最终 `output_text`，不展示、不落盘、不回传。
 - Router Responses rerank 固定 `store = false`，不使用 `previous_response_id`，不同 query 之间不共享 response state。
 - 排序输出继续使用现有 prompt 与宽容 JSON parser，不要求 endpoint 支持 Responses Structured Outputs。合法对象形态为 `{"claim_ids":["..."]}`；现有 JSON 数组、代码围栏、未知 ID 过滤、重复 ID 去重与遗漏候选追加语义保持不变。
 - 复用现有 `[router.rerank].max_tokens`：Chat 映射为 `max_tokens`，Responses 映射为 `max_output_tokens`。Responses 仅接受 `status = completed` 且存在合法排序 JSON 的结果；`incomplete`、`max_output_tokens`、非法 JSON、HTTP/认证/超时错误沿用现有 retry 后降级到 lexical/vector 顺序，不做 continuation。
@@ -223,7 +225,7 @@ enum ProviderReplayState {
 - `max_output_tokens`；
 - `stream`；
 - `store = false`；
-- 非 `none` 时的 `reasoning.effort`。
+- 显式配置时的 `reasoning.effort`，包括用于关闭思考的 `none`。
 
 系统提示映射为 `instructions`，每次请求都按 ACN 当前 system prompt/compaction 结果重新发送，不依赖服务端 response state。
 

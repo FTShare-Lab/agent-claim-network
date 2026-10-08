@@ -8,6 +8,7 @@
 //! 具体运行方式由 bootstrap 装配；agent 业务代码只看这层抽象，不接触 PathBuf。
 
 pub(crate) mod claim_alignment;
+pub mod claims;
 mod consolidation_delivery;
 mod context;
 mod dispute_report;

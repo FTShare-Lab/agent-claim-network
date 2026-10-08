@@ -2,7 +2,6 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::ensure;
 use serde_json::{json, Value};
 
 use crate::claim::Claim;
@@ -10,13 +9,44 @@ use crate::claim::Claim;
 pub(crate) const STALE_PLAN_WARNING: &str =
     "恢复时 Claim 已变化或缺少分析快照，已放弃本批尚未执行的 Claim 修改及 Dispute；已执行结果保留。";
 
+#[derive(Debug, thiserror::Error)]
+#[error("知识库忙碌：Dream 关联提交正在执行或等待恢复，请稍后使用相同参数重试")]
+pub(crate) struct KnowledgeBusy;
+
 /// 调用者必须持有知识锁，并在这次检查后保持锁直到本地提交结束。
 pub(crate) async fn ensure_knowledge_ready(home: &std::path::Path) -> anyhow::Result<()> {
-    ensure!(
-        !tokio::fs::try_exists(home.join("runtime/supervisor/dream_pending.yaml")).await?,
-        "Dream local commit needs recovery; defer knowledge analysis and retry after recovery"
-    );
+    if tokio::fs::try_exists(home.join("runtime/supervisor/dream_pending.yaml")).await? {
+        return Err(KnowledgeBusy.into());
+    }
     Ok(())
+}
+
+/// 普通读取不等待分析锁；提交结束会先更新持久状态再清除 pending，因此前后核对能识别
+/// 整个 Dream 提交恰好发生在读取期间的窗口。专用 Dream 读取仍使用知识锁。
+pub(crate) struct DreamReadBoundary(Option<Vec<u8>>);
+
+impl DreamReadBoundary {
+    pub(crate) async fn begin(home: &std::path::Path) -> anyhow::Result<Self> {
+        let state = Self::state(home).await?;
+        ensure_knowledge_ready(home).await?;
+        Ok(Self(state))
+    }
+
+    pub(crate) async fn finish(self, home: &std::path::Path) -> anyhow::Result<()> {
+        ensure_knowledge_ready(home).await?;
+        if self.0 != Self::state(home).await? {
+            return Err(KnowledgeBusy.into());
+        }
+        Ok(())
+    }
+
+    async fn state(home: &std::path::Path) -> anyhow::Result<Option<Vec<u8>>> {
+        match tokio::fs::read(home.join("runtime/supervisor/dream_state.yaml")).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 /// 精确目标匹配补齐写盘后、进度保存前的中断；其他版本绝不推定为执行成功。
@@ -88,6 +118,32 @@ pub(crate) fn analysis_is_stale(analysis: Option<&[Claim]>, changes: &Value) -> 
 mod tests {
     use super::*;
     use crate::claim::{AgentId, ClaimStatus, Confidence};
+
+    #[tokio::test]
+    async fn ordinary_read_detects_pending_and_a_commit_completed_during_read() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let home = dir.path();
+        let before = DreamReadBoundary::begin(home).await?;
+        let state = home.join("runtime/supervisor/dream_state.yaml");
+        crate::storage::write_yaml_atomic(
+            &state,
+            &json!({"known_versions": {"claim_11111111": "new"}}),
+        )
+        .await?;
+        assert!(before.finish(home).await.unwrap_err().is::<KnowledgeBusy>());
+        DreamReadBoundary::begin(home).await?.finish(home).await?;
+        let before = DreamReadBoundary::begin(home).await?;
+        let pending = home.join("runtime/supervisor/dream_pending.yaml");
+        tokio::fs::write(&pending, "pending").await?;
+        assert!(DreamReadBoundary::begin(home)
+            .await
+            .err()
+            .unwrap()
+            .is::<KnowledgeBusy>());
+        assert!(before.finish(home).await.unwrap_err().is::<KnowledgeBusy>());
+        Ok(())
+    }
 
     fn claim() -> Claim {
         Claim {

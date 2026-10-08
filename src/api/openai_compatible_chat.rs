@@ -60,7 +60,7 @@ pub enum OpenAiCompatibleChatError {
 pub struct OpenAiCompatibleChatProviderAdapter {
     client: ChatCompletionsClient,
     model: String,
-    reasoning_effort: ReasoningEffort,
+    reasoning_effort: Option<ReasoningEffort>,
     temperature: Option<f64>,
     top_p: Option<f64>,
 }
@@ -85,14 +85,14 @@ impl OpenAiCompatibleChatProviderAdapter {
                 retry_max_delay,
             )?,
             model,
-            reasoning_effort: ReasoningEffort::None,
+            reasoning_effort: None,
             temperature: None,
             top_p: None,
         })
     }
 
-    /// 设置 Chat Completions 请求的推理强度；`none` 会在序列化时省略。
-    pub fn with_reasoning_effort(mut self, reasoning_effort: ReasoningEffort) -> Self {
+    /// 未配置时省略推理参数；显式 none 请求关闭推理。
+    pub fn with_reasoning_effort(mut self, reasoning_effort: Option<ReasoningEffort>) -> Self {
         self.reasoning_effort = reasoning_effort;
         self
     }
@@ -131,8 +131,7 @@ impl OpenAiCompatibleChatProviderAdapter {
             response_format: None,
             model: self.model.clone(),
             messages: chat_messages,
-            reasoning_effort: (self.reasoning_effort != ReasoningEffort::None)
-                .then_some(self.reasoning_effort),
+            reasoning_effort: self.reasoning_effort,
             tools: if tools.is_empty() { None } else { Some(tools) },
             max_tokens,
             stream,
@@ -1184,11 +1183,11 @@ mod tests {
     }
 
     fn adapter() -> OpenAiCompatibleChatProviderAdapter {
-        adapter_with_reasoning_effort(ReasoningEffort::None)
+        adapter_with_reasoning_effort(None)
     }
 
     fn adapter_with_reasoning_effort(
-        reasoning_effort: ReasoningEffort,
+        reasoning_effort: Option<ReasoningEffort>,
     ) -> OpenAiCompatibleChatProviderAdapter {
         OpenAiCompatibleChatProviderAdapter {
             client: ChatCompletionsClient::new(
@@ -1914,7 +1913,23 @@ mod tests {
     }
 
     #[test]
-    fn none_reasoning_effort_is_omitted_from_request_body() {
+    fn explicit_none_is_sent_for_streaming_and_non_streaming_requests() {
+        let adapter = adapter().with_reasoning_effort(Some(ReasoningEffort::None));
+        for stream in [false, true] {
+            let body = serde_json::to_value(adapter.request_for(
+                "system",
+                Vec::new(),
+                Vec::new(),
+                128,
+                stream,
+            ))
+            .unwrap();
+            assert_eq!(body["reasoning_effort"], "none");
+        }
+    }
+
+    #[test]
+    fn unset_reasoning_effort_is_omitted_from_request_body() {
         let req = adapter().request_for("system", Vec::new(), Vec::new(), 128, false);
         let body = serde_json::to_value(req).unwrap();
 
@@ -1938,7 +1953,7 @@ mod tests {
 
     #[test]
     fn configured_reasoning_effort_is_sent_for_streaming_and_non_streaming_requests() {
-        let adapter = adapter_with_reasoning_effort(ReasoningEffort::High);
+        let adapter = adapter_with_reasoning_effort(Some(ReasoningEffort::High));
 
         for stream in [false, true] {
             let req = adapter.request_for("system", Vec::new(), Vec::new(), 128, stream);
