@@ -85,7 +85,7 @@ impl DreamControl {
         Ok(guard)
     }
 
-    async fn snapshot_guard(&self, path: &Path) -> anyhow::Result<FileLockGuard> {
+    pub(super) async fn snapshot_guard(&self, path: &Path) -> anyhow::Result<FileLockGuard> {
         loop {
             self.check()?;
             // 前台 Inbox 可能持锁等待模型；不能留下无法取消的 blocking 锁等待线程。
@@ -284,7 +284,7 @@ impl SessionEngine {
         let (loaded, used) = claim_input(visible, budget)?;
         let coverage = json!({"total":total,"included":loaded.len(),"omitted":total-loaded.len(),"order":"effective_updated_at descending; oldest omitted first","estimated_tokens":used,"budget_tokens":budget});
         let previous: DreamState = optional_yaml(&self.dream_state_path()).await?;
-        let mut input = json!({"dream_context":{"agent_id":self.agent.agent_id,"snapshot_at":snapshot_at,"workspace_root":workspace,"last_success_at":previous.last_success_at,"trigger":if manual {"manual"} else {"automatic"}},"coverage":coverage,"claims":loaded,"policy_context":{"available":false,"complete":false,"note":"Policy provenance may appear in claim source_claim_ids; no independent active Policy cache is available. Do not infer missing policy content."},"evidence_access":{"tools":["read_claim","read_trace","file_read","code_run","dream_record_candidates","dream_keep_candidate","dream_stage_group","dream_read_draft","dream_validate","dream_apply_group","dream_read_history","dream_finish"],"workspace_root":workspace}});
+        let mut input = json!({"dream_context":{"agent_id":self.agent.agent_id,"snapshot_at":snapshot_at,"workspace_root":workspace,"last_success_at":previous.last_success_at,"trigger":if manual {"manual"} else {"automatic"}},"coverage":coverage,"claims":loaded,"policy_context":{"available":false,"complete":false,"note":"Policy provenance may appear in claim source_claim_ids; no independent active Policy cache is available. Do not infer missing policy content."},"evidence_access":{"tools":["read_claim","read_trace","file_read","code_run","dream_record_candidates","dream_keep_candidate","dream_stage_group","dream_read_draft","dream_validate","dream_apply_group","dream_review_sync","dream_read_history","dream_finish"],"workspace_root":workspace}});
         let tools = Arc::new(
             self.turn_loop
                 .tool_registry()
@@ -293,6 +293,7 @@ impl SessionEngine {
                 .for_dream(workspace.to_path_buf()),
         );
         input["evidence_access"]["command_environment"] = tools.dream_command_environment().await;
+        input["pending_consolidation_sync"] = json!(self.runner.pending_consolidations().await?.iter().map(|group| json!({"source_id":group.retired.id,"carrier_ids":group.carriers.iter().map(|c| &c.id).collect::<Vec<_>>() })).collect::<Vec<_>>());
         let execution = Arc::new(
             super::dream_execution::Execution::new(
                 self.clone(),
@@ -510,8 +511,41 @@ impl SessionEngine {
                             .cloned(),
                     );
                 }
+                let mut dependencies = Vec::new();
+                if checkpoint.plan.groups[index].kind == super::dream_plan::Kind::Consolidation {
+                    for retired in staged
+                        .iter()
+                        .filter(|c| c.status == ClaimStatus::Deprecated)
+                    {
+                        let before = group
+                            .before
+                            .iter()
+                            .find(|c| c.id == retired.id)
+                            .context("Missing consolidation source")?;
+                        let carriers = checkpoint.plan.groups[index]
+                            .coverage
+                            .iter()
+                            .filter(|c| c.input_id == retired.id)
+                            .flat_map(|c| &c.output_ids)
+                            .filter_map(|id| {
+                                group
+                                    .after
+                                    .iter()
+                                    .find(|c| &c.id == id && c.status != ClaimStatus::Deprecated)
+                            })
+                            .cloned()
+                            .collect();
+                        dependencies.push(
+                            crate::agent::consolidation_delivery::ConsolidationDelivery {
+                                before: before.clone(),
+                                retired: retired.clone(),
+                                carriers,
+                            },
+                        );
+                    }
+                }
                 self.runner
-                    .stage_maintainer_batch_with_durable_claims(staged.clone(), vec![])
+                    .stage_consolidation_batch(staged.clone(), dependencies)
                     .await?;
                 for claim in staged {
                     if group.before.iter().any(|before| before == &claim) {

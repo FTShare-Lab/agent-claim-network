@@ -4006,6 +4006,9 @@ mod tests {
         status: FinalizeCheckpointStatus,
     ) -> FinalizeCheckpoint {
         FinalizeCheckpoint {
+            analysis_claims: Some(Vec::new()),
+            applied_claims: Vec::new(),
+            warnings: Vec::new(),
             recap_start_index,
             recap_end_index,
             recap_segment_hash: "test-segment-hash".into(),

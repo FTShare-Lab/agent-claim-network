@@ -1,7 +1,9 @@
 //! Dream 逐组执行与版本化回执；先记录再写入，重试复用同一执行结果。
 use super::claim_context::content_hash;
 use super::dream::{Checkpoint, DreamControl, DreamYield};
-use super::dream_plan::{validate_plan, Kind, OperationGroup, Plan, Review};
+use super::dream_plan::{
+    check_factual_correction_eligible, validate_plan, Kind, OperationGroup, Plan, Review,
+};
 use super::dream_review::{review_input, Validation};
 use super::SessionEngine;
 use crate::claim::{Claim, ClaimId, ClaimStatus, Confidence, TraceId};
@@ -34,6 +36,31 @@ pub(super) struct ClaimReview {
 pub(super) struct SemanticReview {
     pub claims: Vec<ClaimReview>,
     pub scope_and_certainty: String,
+}
+
+impl SemanticReview {
+    fn check_inputs(&self, ids: BTreeSet<ClaimId>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.scope_and_certainty.trim().is_empty(),
+            "Explain name/body consistency, scope, certainty and evidence boundaries"
+        );
+        anyhow::ensure!(
+            self.claims.len() == ids.len()
+                && self
+                    .claims
+                    .iter()
+                    .map(|r| r.claim_id.clone())
+                    .collect::<BTreeSet<_>>()
+                    == ids,
+            "Review must describe every input Claim exactly once"
+        );
+        for item in &self.claims {
+            anyhow::ensure!(!item.information_preserved.trim().is_empty()
+                && !item.removal_or_correction.trim().is_empty(),
+                "Describe retained rules/conditions/alternatives and removal/correction basis for {}", item.claim_id);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,15 +286,8 @@ impl Execution {
         input: &Value,
         review: &SemanticReview,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !review.scope_and_certainty.trim().is_empty(),
-            "Explain name/body consistency, scope, certainty and evidence boundaries"
-        );
-        let ids: BTreeSet<_> = group.updates.iter().map(|u| u.id.clone()).collect();
-        anyhow::ensure!(review.claims.len() == ids.len() && review.claims.iter().map(|r|r.claim_id.clone()).collect::<BTreeSet<_>>() == ids,
-            "Review must describe every input Claim exactly once, including consolidation keep inputs");
+        review.check_inputs(group.updates.iter().map(|u| u.id.clone()).collect())?;
         for item in &review.claims {
-            anyhow::ensure!(!item.information_preserved.trim().is_empty() && !item.removal_or_correction.trim().is_empty(), "Describe retained rules/conditions/alternatives and why information can be removed or corrected for {}", item.claim_id);
             let before: Claim = serde_json::from_value(
                 input["before"]
                     .as_array()
@@ -322,7 +342,11 @@ impl Execution {
                 .flatten()
                 .any(|c| c["id"] == json!(item.claim_id) && c["action"] != "keep");
             if item.factual_correction || (changed && group.kind == Kind::Evidence) {
-                anyhow::ensure!(before.confidence != Confidence::High && !self.original_high_confidence(&item.claim_id), "B correction cannot bypass the original high confidence gate through earlier A/C edits");
+                check_factual_correction_eligible(
+                    &item.claim_id,
+                    before.confidence == Confidence::High
+                        || self.original_high_confidence(&item.claim_id),
+                )?;
                 let basis = group
                     .change_basis
                     .iter()
@@ -332,6 +356,97 @@ impl Execution {
             }
         }
         Ok(())
+    }
+
+    pub(super) async fn review_sync(&self, input: Value) -> anyhow::Result<Value> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Request {
+            source_id: ClaimId,
+            carrier_ids: Vec<ClaimId>,
+            #[serde(default)]
+            review: Option<SemanticReview>,
+            #[serde(default)]
+            validation_id: Option<String>,
+        }
+        let request: Request = serde_json::from_value(input)?;
+        let home = self.engine.runner.maintainer_upload_queue.agent_home();
+        let _guard = self
+            .control
+            .snapshot_guard(&crate::storage::paths::agent_home_knowledge_apply_lock_path(home))
+            .await?;
+        crate::agent::claim_alignment::ensure_knowledge_ready(home).await?;
+        let current = self.current().await?;
+        let groups = self.engine.runner.pending_consolidations().await?;
+        let original = groups
+            .iter()
+            .find(|g| g.retired.id == request.source_id)
+            .context("No pending consolidation for this source")?;
+        anyhow::ensure!(
+            original.retired.holder == self.engine.agent.agent_id
+                && current.get(&request.source_id) == Some(&original.retired),
+            "Source changed; cannot review old retirement"
+        );
+        let mut carriers = Vec::new();
+        for id in &request.carrier_ids {
+            let claim = current.get(id).context("Carrier not found")?;
+            anyhow::ensure!(
+                claim.holder == self.engine.agent.agent_id
+                    && claim.status != ClaimStatus::Deprecated
+                    && !carriers.contains(claim),
+                "Carriers must be distinct surviving owned Claims"
+            );
+            carriers.push(claim.clone());
+        }
+        anyhow::ensure!(!carriers.is_empty(), "At least one carrier is required");
+        let validation = Validation::new(json!({
+            "before":original.before,"carriers":carriers,
+            "previous_dependency":original,"current_source":original.retired
+        }))?;
+        let Some(review) = request.review else {
+            return Ok(
+                json!({"accepted":true,"committed":false,"validation":validation,
+                "next":"Review the source's original rules, conditions, exceptions and provenance against these carriers. Resubmit source_id/carrier_ids, validation_id and the same semantic review format as dream_apply_group, with one claims entry for the source and all carrier IDs as output_ids. No correction or new evidence is allowed here. If uncertain leave delivery pending."}),
+            );
+        };
+        anyhow::ensure!(
+            request.validation_id.as_deref() == Some(&validation.validation_id),
+            "Sync input changed; reread and review the current versions"
+        );
+        review.check_inputs(BTreeSet::from([request.source_id]))?;
+        for item in &review.claims {
+            anyhow::ensure!(item.final_name == original.retired.name
+                && !item.name_reason.trim().is_empty()
+                && !item.factual_correction && item.evidence_ids.is_empty()
+                && item.output_ids.iter().cloned().collect::<BTreeSet<_>>()
+                    == carriers.iter().map(|c| c.id.clone()).collect::<BTreeSet<_>>(),
+                "Sync review only confirms complete preservation in the listed carriers; keep the source's historical name and do not correct or remove knowledge");
+        }
+        super::dream_plan::validate_consolidation_sources(
+            &original.before,
+            &carriers,
+            &request.carrier_ids,
+        )?;
+        let _prepare = self.control.prepare_guard().await?;
+        let path = self
+            .root
+            .join("sync_reviews")
+            .join(format!("{}.yaml", validation.validation_id));
+        let mut record = json!({"validation":validation,"review":review,"applied":false});
+        write_yaml_atomic(&path, &record).await?;
+        let revised = crate::agent::consolidation_delivery::ConsolidationDelivery {
+            carriers,
+            ..original.clone()
+        };
+        self.engine
+            .runner
+            .rebind_consolidation(original, revised)
+            .await?;
+        record["applied"] = json!(true);
+        write_yaml_atomic(&path, &record).await?;
+        Ok(
+            json!({"accepted":true,"committed":true,"claim_changes":[],"next":"Sync dependencies updated and recorded; delivery still waits for exact carrier acknowledgements."}),
+        )
     }
 
     pub async fn replay(
@@ -366,10 +481,18 @@ impl Execution {
 
     async fn receipt(&self, record: &Checkpoint, replayed: bool) -> anyhow::Result<Value> {
         let current = self.current().await?;
+        let accepted = !record.groups.iter().any(|g| g.skipped);
+        let before: Vec<_> = record
+            .groups
+            .iter()
+            .flat_map(|g| g.before.iter().cloned())
+            .collect();
+        let actual: Vec<_> = current.values().cloned().collect();
+        let changes = crate::agent::claim_alignment::changes(Some(&before), &[], &[], &actual);
         Ok(
-            json!({"accepted":!record.groups.iter().any(|g|g.skipped),"committed":!record.self_versions.is_empty(),"replayed":replayed,"operation":record.operation,
+            json!({"accepted":accepted,"committed":!record.self_versions.is_empty(),"replayed":replayed,"operation":record.operation,
             "actual_changed_ids":record.self_versions.keys().collect::<Vec<_>>(),"current_claims":record.groups.iter().flat_map(|g|g.before.iter()).filter_map(|c|current.get(&c.id)).collect::<Vec<_>>(),
-            "sync":"Existing durable sync staging used; local success is not remote acknowledgement.","next":"These results are already stored. Continue another independent group, or finish with a factual ABC summary. Version conflicts require rereading and revalidating the affected group."}),
+            "analysis_claims":before,"changes":changes,"sync":"Existing durable sync staging used; local success is not remote acknowledgement.","next":if accepted {"This group completed. Continue another candidate or finish with a factual ABC summary."} else {"This candidate is still pending. Preserve the original intent and actual_changed_ids already committed. Compare analysis_claims with current_claims; repair only remaining work and validate/review again, or explicitly keep it. Do not move on or report full success."}}),
         )
     }
 
@@ -386,10 +509,15 @@ impl Execution {
             .context("Missing group id")?
             .to_owned();
         self.review_check(&group, &validation.input, &review)?;
-        anyhow::ensure!(
-            validation.input == review_input(&group_id, &group, readable, receipts),
-            "Draft or input changed; validate this group again"
-        );
+        if validation.input != review_input(&group_id, &group, readable, receipts) {
+            let before: Vec<Claim> = serde_json::from_value(validation.input["before"].clone())?;
+            let current: Vec<_> = readable.values().cloned().collect();
+            return Ok(
+                json!({"accepted":false,"committed":false,"actual_changed_ids":[],"analysis_claims":before,"current_claims":current,
+                "changes":crate::agent::claim_alignment::changes(Some(&before), &[], &[], &current),
+                "error":"Draft or input changed; original candidate remains pending. Compare the current state, repair or explicitly keep, and validate again."}),
+            );
+        }
         if crate::supervisor::dream_has_priority_work(&self.jobs).await? {
             return Err(DreamYield.into());
         }

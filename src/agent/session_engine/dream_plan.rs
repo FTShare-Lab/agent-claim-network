@@ -81,6 +81,42 @@ fn confidence_rank(value: Confidence) -> u8 {
         Confidence::High => 2,
     }
 }
+
+/// 权限拒绝与可修复的参数错误分开反馈，避免把不可执行方案反复改成另一种格式。
+#[derive(Debug, thiserror::Error)]
+#[error("B factual correction blocked for {claim_id}: original confidence=high; factual corrections only accept original medium/low Claims, including corrections mixed into A/C. More evidence, changing kind, deprecating the Claim, or lowering confidence cannot authorize this correction in this Dream. Keep its factual knowledge unchanged. For C, either preserve it unchanged with its own coverage destination while safely integrating compatible inputs, or keep this candidate with a concrete reason and continue the next candidate.")]
+pub(super) struct FactualCorrectionBlocked {
+    pub(super) claim_id: ClaimId,
+}
+
+pub(super) fn check_factual_correction_eligible(
+    claim_id: &ClaimId,
+    original_high: bool,
+) -> anyhow::Result<()> {
+    if original_high {
+        return Err(FactualCorrectionBlocked {
+            claim_id: claim_id.clone(),
+        }
+        .into());
+    }
+    Ok(())
+}
+/// 原整合与后续同步复核共用来源保留规则；合并回来源自身时不制造自引用。
+pub(super) fn validate_consolidation_sources(
+    input: &Claim,
+    after: &[Claim],
+    output_ids: &[ClaimId],
+) -> anyhow::Result<()> {
+    for source in &input.source_claim_ids {
+        anyhow::ensure!(after.iter().any(|c| output_ids.contains(&c.id)
+            && c.status != ClaimStatus::Deprecated
+            && (c.source_claim_ids.contains(source) || source == &SourceId::Claim(c.id.clone()))),
+            "Consolidation must retain input source references in a surviving destination: input {}, missing source {:?}, destinations {:?}. Inherit this existing source in a destination's source_claim_ids; when the source IS that surviving destination, omit the self-reference and preserve the relationship in coverage and the execution record",
+            input.id, source, output_ids);
+    }
+    Ok(())
+}
+
 pub(super) fn validate_plan(
     plan: &Plan,
     readable: &BTreeMap<ClaimId, Claim>,
@@ -175,13 +211,12 @@ pub(super) fn validate_plan(
                 .filter_map(|u| readable.get(&u.id))
                 .flat_map(|c| c.source_claim_ids.iter().cloned())
                 .collect();
-            anyhow::ensure!(
-                update
-                    .source_claim_ids
-                    .iter()
-                    .all(|id| sources.contains(id) && id != &SourceId::Claim(update.id.clone())),
-                "Dream claim {} source is unsupported or self-referential; inherit existing sources, put merge relationships in coverage", update.id
-            );
+            for source in &update.source_claim_ids {
+                anyhow::ensure!(source != &SourceId::Claim(update.id.clone()),
+                    "Dream claim {} source {} is self-referential. Remove this source; represent its information destination in coverage. Preserve other inherited sources.", update.id, source);
+                anyhow::ensure!(sources.contains(source),
+                    "Dream claim {} source {} is unsupported. Permitted inherited source IDs from this group's inputs: {:?}. Do not add input IDs merely because they are consolidated; merge relationships belong in coverage. Repair source_claim_ids without dropping knowledge.", update.id, source, sources);
+            }
             let mut target = original.clone();
             target.name = update.name.clone();
             target.statement = update.statement.clone();
@@ -192,11 +227,12 @@ pub(super) fn validate_plan(
             target.evidence_summary = update.evidence_summary.clone();
             if target != *original {
                 // B 的资格看磁盘原文，不允许先在草稿里降低 high 再绕过门槛；A/C 仍可整理 high。
-                anyhow::ensure!(
-                    group.kind != Kind::Evidence || original.confidence != Confidence::High,
-                    "Dream B evidence calibration only accepts original medium/low claims: {}; keep the high claim unchanged, do not lower confidence to bypass the gate",
-                    update.id
-                );
+                if group.kind == Kind::Evidence {
+                    check_factual_correction_eligible(
+                        &update.id,
+                        original.confidence == Confidence::High,
+                    )?;
+                }
                 if group.kind == Kind::Evidence {
                     anyhow::ensure!(
                         update.evidence_summary.trim() != original.evidence_summary.trim(),
@@ -242,14 +278,7 @@ pub(super) fn validate_plan(
                     .iter()
                     .find(|c| c.id == coverage.input_id)
                     .ok_or_else(|| anyhow::anyhow!("Missing consolidation input"))?;
-                for source in &input.source_claim_ids {
-                    // 合并回既有来源本身时不制造自引用。before/coverage 随执行计划落盘，
-                    // 保留原始输入到来源的关系；其他来源仍必须显式继承到承接项。
-                    anyhow::ensure!(after.iter().any(|c| coverage.output_ids.contains(&c.id)
-                        && (c.source_claim_ids.contains(source) || source == &SourceId::Claim(c.id.clone()))),
-                        "Consolidation must retain input source references in a surviving destination: input {}, missing source {:?}, destinations {:?}. Inherit this existing source in a destination's source_claim_ids; when the source IS that surviving destination, omit the self-reference and preserve the relationship in coverage and the execution record",
-                        input.id, source, coverage.output_ids);
-                }
+                validate_consolidation_sources(input, &after, &coverage.output_ids)?;
                 for output in after.iter().filter(|c| coverage.output_ids.contains(&c.id)) {
                     // 较弱知识合入强 Claim 不能自动继承强置信度；需要该输出自己的新证据。
                     if confidence_rank(output.confidence) > confidence_rank(input.confidence) {

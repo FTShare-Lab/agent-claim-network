@@ -43,10 +43,10 @@ impl KnowledgeAccess {
         let path = crate::storage::paths::agent_home_knowledge_apply_lock_path(&self.home);
         let guard = crate::storage::FileLockGuard::try_lock_exclusive(&path)
             .await
-            .map_err(|e| ToolError::InvalidArgs(e.to_string()))?
+            .map_err(|e| ToolError::Io(std::io::Error::other(e)))?
             .ok_or_else(|| {
-                ToolError::InvalidArgs(
-                    "Claim store is being updated; retry this read shortly".into(),
+                ToolError::KnowledgeBusy(
+                    "Claim store is in use by another knowledge task; retry this read shortly with the same arguments".into(),
                 )
             })?;
         if fs::try_exists(
@@ -57,7 +57,7 @@ impl KnowledgeAccess {
         )
         .await?
         {
-            return Err(ToolError::InvalidArgs("A Dream group is being recovered; retry after recovery, do not read a partially applied group".into()));
+            return Err(ToolError::KnowledgeBusy("A Dream group has a pending local commit; retry after recovery with the same arguments, do not read a partially applied group".into()));
         }
         Ok(guard)
     }
@@ -226,6 +226,7 @@ impl ToolRegistry {
             | "dream_validate"
             | "dream_review_group"
             | "dream_apply_group"
+            | "dream_review_sync"
             | "dream_read_history"
             | "dream_record_candidates"
             | "dream_keep_candidate"
@@ -263,6 +264,7 @@ impl ToolRegistry {
                 | "dream_validate"
                 | "dream_review_group"
                 | "dream_apply_group"
+                | "dream_review_sync"
                 | "dream_read_history"
                 | "dream_record_candidates"
                 | "dream_keep_candidate"
@@ -595,6 +597,63 @@ mod tests {
             source_claim_ids: vec![],
             evidence_summary: "Recovery test.".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn knowledge_reads_report_temporary_busy_and_recover() -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let dir = tempfile::tempdir()?;
+        let home = dir.path().join("agent");
+        let owner = AgentId::new("agent-test")?;
+        let store = Arc::new(LocalFsClaimStore::new(home.clone()));
+        let own = claim(owner.clone(), "claim_11111111");
+        store.write_claim(&own).await?;
+        let registry = ToolRegistry::new(&ToolConfig::default())?.with_local_knowledge(
+            store,
+            home.clone(),
+            owner,
+        );
+        let lock_path = crate::storage::paths::agent_home_knowledge_apply_lock_path(&home);
+        let pending_path = home.join("runtime/supervisor/dream_pending.yaml");
+
+        for pending_recovery in [false, true] {
+            let guard = if pending_recovery {
+                fs::create_dir_all(home.join("runtime/supervisor")).await?;
+                fs::write(&pending_path, "{}").await?;
+                None
+            } else {
+                Some(crate::storage::FileLockGuard::lock_exclusive(&lock_path).await?)
+            };
+            for (name, input) in [
+                ("read_claim", json!({"id":own.id})),
+                ("read_trace", json!({"claim_id":own.id})),
+            ] {
+                let error = registry
+                    .dispatch(name, input)
+                    .await
+                    .err()
+                    .context("knowledge read must defer while the store is busy")?;
+                assert_eq!(error.code(), Some("knowledge_busy"));
+                assert!(error.to_string().contains("retry"));
+                assert!(!error.to_string().contains("工具参数非法"));
+            }
+            drop(guard);
+            if pending_recovery {
+                fs::remove_file(&pending_path).await?;
+            }
+            registry
+                .dispatch("read_claim", json!({"id":own.id}))
+                .await?;
+            registry
+                .dispatch("read_trace", json!({"claim_id":own.id}))
+                .await?;
+        }
+        let invalid = registry
+            .dispatch("read_claim", json!({"unknown_argument":true}))
+            .await;
+        assert!(matches!(invalid, Err(ToolError::InvalidArgs(_))));
+        Ok(())
     }
 
     #[test]

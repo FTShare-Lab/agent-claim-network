@@ -171,6 +171,7 @@ dream_finish { group_ids: [], review: { quality, evidence, consolidation } }
 - 每个输入 Claim 都要说明保留的有效规则/条件/例外、删除或纠正原因、信息去向；C 的 keep 输入也不省略。name/body、scope、确定性与来源边界在组级说明。
 - 不再要求模型重复抄写四个字段并覆盖全文，也不引入复核条目 ID。失去逐字覆盖的机械防漏能力是明确取舍，保留逐 Claim 依据与整合去向，语义质量需要实验评估。
 - B 修改及混合在 A/C 中的事实纠正必须有该 Claim 的新 evidence_summary 和版本化直接 file_read 证据；high 门槛同时检查本轮原始状态，不能通过先前操作降级绕过。
+- 参数错误反馈列出具体字段、缺失依据或允许继承的来源 ID；high 事实纠正的权限拒绝另返回 `boundary_feedback`（Claim ID、原始置信度及不可执行原因）。模型须安全调整原组或明确保留候选后继续，不能用改参数、换分类或降置信度重复尝试同一项禁止修改。该反馈不放宽 A/B/C 门槛，不限制工具轮数。
 - 置信度提升必须有该输出自己的新证据；C 不得无依据继承较强置信度或丢失来源引用。所有权、不可变字段、来源环、完整读取及证据版本检查继续复用原校验。
 - 新证据只支持具体适用对象和条件；旧 Claim、Trace、本轮执行回执不能自证。后端不能证明语义正确，模型不确定时应通过 keep 工具说明具体理由并保持原 Claim。
 - 旧完整 JSON 计划可导入草稿，但必须继续 validate/apply；已经 Prepared 的旧任务保留原提交恢复兼容。
@@ -189,13 +190,30 @@ dream_finish { group_ids: [], review: { quality, evidence, consolidation } }
 - 已执行 Claim 可在后续组继续处理，但必须依据最新原文重新校验。不能把本轮结果作为新的独立证据或绕过原始 high 门槛。
 - 每组持久化后复用已有团队 staging/upload；单人模式仍不请求团队服务、不创建待补传队列。本地成功和远端上传成功分开描述。
 
+### 5.2.1 分析与执行对齐（2026-09-28 已实现）
+
+- Dream 版本或证据冲突返回分析快照、当前状态和实际已写入结果。候选仍待处理，草稿保留、旧校验失效；同一 Agent 可原地调整或明确 keep。重复回执和探索检查点恢复遵循同一规则。
+- Inbox effect 与 Recap/Finalize checkpoint 保留可选分析快照、逐项写入进度和 warning。正常持锁分析与写入不新增模型请求；恢复旧方案时先检查整个关联方案，再执行任何剩余写入。
+- **2026-09-29 收窄恢复机制**：版本变化或旧记录缺少依据时，直接放弃本批尚未执行的 Claim 修改及 Dispute，保留实际已执行结果；整批处理，避免承接失败但来源被弃用。记录放弃原因，结束原批次并按现有流程推进 cursor；移除专用续接提示词、额外模型调用及其专用任务输入/决策历史。持久化失败仍重试。
+- 状态未变时继续原方案，等于目标内容时识别为已完成，沿用原 ID；兼容旧检查点，不重复创建 Claim、Dispute 或 Trace。Dream 正在运行时仍通过工具反馈让同一 Agent 调整，不采用上述放弃旧批次的恢复规则。
+- 不增加 Claim DTO 状态、远端协议、配置或独立复核模型。旧裁决尚未内化时仍由模型结合当前 Claim 自主处理；本次不改变 Dispute 治理规则。
+- 启动与 Inbox 入口尝试恢复未完成 Dream 本地提交；持知识锁后再次检查 pending 标记。恢复失败时启动降级为空 Claim 基线，Inbox/读取/运行时扫描延后，不读取半完成状态。
+
+### 5.2.2 C 类整合的远端交付依赖（2026-09-28 已实现）
+
+复用现有持久队列、单飞投递与重试，记录被弃用来源、原来源内容、承接版本及远端确认。先上传承接内容，收到成功确认后才发送依赖性弃用；无关条目仍可交付，恢复不要求远端事务。
+
+当前承接内容变化后不能用时间戳代替信息保留判断。仅当存在版本匹配的后续整合关系时沿承接链继续交付；否则保留受阻弃用，后续 Dream 可重新判断。来源恢复时取消旧弃用；明确 Policy 撤销则原子取消对应旧依赖并暂存弃用，普通 deprecated 更新仍受整合保护。队列不得重传旧承接快照覆盖最新本地内容。
+
+`dream_review_sync { source_id, carrier_ids, validation_id?, review? }` 首次返回真实内容与 validation；再次调用携带对应 validation_id，复用 `dream_apply_group` 的简洁语义复核格式。review.claims 只描述原来源，output_ids 列出全部当前承接项，说明规则、条件、例外和来源的完整保留；禁止事实纠正或引入新证据。它只更新同步依赖，不写 Claim、不处理 dispute，版本变化时拒绝旧复核，并复用 C 整合的来源继承硬校验（保留合并回来源本身的自引用豁免）。复核与更新记录保存在本轮 `sync_reviews/`，交付仍需远端确认；不确定时继续保留待同步，不声称后端证明语义等价。
+
 ### 5.3 审计和上下文
 
 `origin.yaml` 保存本轮起点，`input.json` / `inputs/` 保存输入，`revisions/` 保存草稿和反馈，`executions/` 是逐组实际执行依据，`history/` 保存压缩前历史。`dream_read_draft` 同时展示未执行草稿和已经生效的操作及最新 Claim。压缩和恢复保留准确执行状态，模型摘要不能覆盖它。
 
 `dream_finish` 要求已登记候选全部执行或明确保留，同时没有未执行组及待处理错误，只提交 ABC 实际范围说明。完成其他组不能绕过该检查。候选进度保存在草稿、每步反馈、审计和准确压缩/恢复输入中；旧检查点缺少此字段时从已有草稿组补齐。后端不能观察模型尚未登记的想法，所以不宣称全面覆盖所有 Claim。`result.json` 和 `report.md` 汇总执行结果；失败或未结束时仍可直接查 executions。记录的是可核查理由，不要求模型内部思考。没有 Claim 裁决状态或仲裁待办。
 
-实现分工：`dream_execution.rs` 编排逐组执行与回执；`dream.rs` 复用 Prepared 写入和调度状态；`dream_draft.rs` 暂存/校验/执行工具；`dream_candidates.rs` 本轮候选顺序及处理结果；`dream_plan.rs` 权限、证据与整合约束；`dream_audit.rs` 人工视图；`dream_exploration.rs` 与 `dream_compaction.rs` 保存和恢复上下文。`dream_review.rs` 的旧全文引用协议仅保留历史兼容路径。
+实现分工：`dream_execution.rs` 编排逐组执行与回执；`dream.rs` 复用 Prepared 写入和调度状态；`dream_draft.rs` 暂存/校验/执行工具；`dream_candidates.rs` 本轮候选顺序及处理结果；`dream_plan.rs` 权限、证据与整合约束；`dream_audit.rs` 人工视图；`dream_exploration.rs` 与 `dream_compaction.rs` 保存和恢复上下文。`dream_review.rs` 的全文引用协议仅用于历史兼容；新执行和同步依赖复核共用简洁语义复核格式。
 
 ## 6. 通用的会话 Claim 变化通知
 
@@ -237,6 +255,7 @@ dream_finish { group_ids: [], review: { quality, evidence, consolidation } }
 
 ### 验收结果
 
+- 分析与执行对齐改进（2026-09-28）：新增 14 项回归，全量 3011 项测试通过；版本一致性、格式、规定范围的 Clippy 和类型检查通过。标准 tmux 与专项验收通过：启动自动 Dream、`/dream`、后台运行期间前台响应、完成通知及同会话 runtime_context 更新；前台 system prompt 保持不变。使用本地模拟模型与真实临时文件验证，不作为语义质量实验结论。详细记录保存在 Git 忽略的 `target/experiments/dream/claim-alignment-20260928/VERIFICATION.md`。
 - 版本一致性、`cargo fmt --check`、`cargo clippy -- -D warnings`、`cargo test`、`cargo check` 通过；全量测试包含 2857 个库测试和 67 个其他测试。这组数字为分组提交改进前的历史验收；后续改进另行验证。
 - 标准 tmux 冒烟通过；专项验证手动绕过门槛、前台忙时触发、重复入队合并、任务完成和单人上传边界。
 - 实测后的执行修复另通过标准 tmux 与重试专项：运行次数、上次原因和最终状态可见，该次验收对应当时的无工具收束；当前已改为保留探索工具的分组修复。

@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::sync::Mutex;
 
+use super::consolidation_delivery::{self, ConsolidationDelivery};
 use super::runner::AgentRunner;
-use crate::claim::{Claim, ClaimId, Dispute, DisputeId};
+use crate::claim::{Claim, ClaimId, Dispute, DisputeId, PolicyId, SourceId};
 use crate::maintainer::traits::MaintainerClientError;
 use crate::storage::{paths, read_yaml, write_yaml_atomic, StorageError};
 
@@ -24,6 +25,10 @@ const MAINTAINER_UPLOAD_MAX_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct PendingMaintainerUploads {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consolidations: Vec<ConsolidationDelivery>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acknowledgements: Vec<Claim>,
     #[serde(default)]
     pub claims: Vec<Claim>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
@@ -111,7 +116,7 @@ impl AgentRunner {
         claims: Vec<Claim>,
         disputes: Vec<Dispute>,
     ) -> anyhow::Result<()> {
-        self.stage_maintainer_batch_inner(claims, disputes, false)
+        self.stage_maintainer_batch_inner(claims, disputes, false, Vec::new(), None)
             .await
     }
 
@@ -120,8 +125,68 @@ impl AgentRunner {
         claims: Vec<Claim>,
         disputes: Vec<Dispute>,
     ) -> anyhow::Result<()> {
-        self.stage_maintainer_batch_inner(claims, disputes, true)
+        self.stage_maintainer_batch_inner(claims, disputes, true, Vec::new(), None)
             .await
+    }
+
+    /// Policy 撤回废止的是知识本身，不再依赖原 C 整合的承接版本。
+    pub(super) async fn stage_policy_deprecation(
+        &self,
+        claims: Vec<Claim>,
+        policy_id: &PolicyId,
+    ) -> anyhow::Result<()> {
+        self.stage_maintainer_batch_inner(claims, vec![], false, vec![], Some(policy_id))
+            .await
+    }
+
+    pub(super) async fn stage_consolidation_batch(
+        &self,
+        claims: Vec<Claim>,
+        groups: Vec<ConsolidationDelivery>,
+    ) -> anyhow::Result<()> {
+        self.stage_maintainer_batch_inner(claims, vec![], true, groups, None)
+            .await
+    }
+
+    pub(crate) async fn pending_consolidations(
+        &self,
+    ) -> anyhow::Result<Vec<ConsolidationDelivery>> {
+        if self.maintainer_client.is_none() {
+            return Ok(Vec::new());
+        }
+        Ok(self.maintainer_upload_queue.read().await?.consolidations)
+    }
+
+    pub(crate) async fn rebind_consolidation(
+        &self,
+        previous: &ConsolidationDelivery,
+        revised: ConsolidationDelivery,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.maintainer_client.is_some(),
+            "Team delivery is disabled"
+        );
+        let _guard = self.maintainer_upload_queue.lock.lock().await;
+        let _file_guard =
+            crate::storage::FileLockGuard::lock_exclusive(&self.maintainer_upload_queue.lock_path)
+                .await?;
+        let mut pending = self.maintainer_upload_queue.read().await?;
+        anyhow::ensure!(
+            pending.claims.contains(&previous.retired) && pending.consolidations.contains(previous),
+            "Sync dependency changed or already delivered; reread it"
+        );
+        pending
+            .consolidations
+            .retain(|g| g.retired.id != revised.retired.id);
+        pending
+            .claims
+            .retain(|c| !revised.carriers.iter().any(|carrier| carrier.id == c.id));
+        pending.claims.extend(revised.carriers.clone());
+        pending
+            .durable_claim_ids
+            .extend(revised.carriers.iter().map(|c| c.id.clone()));
+        pending.consolidations.push(revised);
+        self.maintainer_upload_queue.write_or_clear(&pending).await
     }
 
     async fn stage_maintainer_batch_inner(
@@ -129,6 +194,8 @@ impl AgentRunner {
         claims: Vec<Claim>,
         disputes: Vec<Dispute>,
         durable_claims: bool,
+        groups: Vec<ConsolidationDelivery>,
+        withdrawn_policy: Option<&PolicyId>,
     ) -> anyhow::Result<()> {
         if self.maintainer_client.is_none() {
             return Ok(());
@@ -137,10 +204,32 @@ impl AgentRunner {
         let _file_guard =
             crate::storage::FileLockGuard::lock_exclusive(&self.maintainer_upload_queue.lock_path)
                 .await?;
-        let merged = self
+        let mut merged = self
             .maintainer_upload_queue
             .merged_with(claims, disputes, durable_claims)
             .await?;
+        if let Some(policy_id) = withdrawn_policy {
+            let source = SourceId::Policy(policy_id.clone());
+            // 与弃用载荷在同一次队列写入中取消失效依赖，普通 deprecated 更新不走此分支。
+            merged.consolidations.retain(|group| {
+                !merged.claims.iter().any(|claim| {
+                    claim.id == group.retired.id
+                        && claim.status == crate::claim::ClaimStatus::Deprecated
+                        && claim.source_claim_ids.contains(&source)
+                })
+            });
+            consolidation_delivery::prune(
+                &mut merged.consolidations,
+                &mut merged.acknowledgements,
+                &merged.claims,
+            );
+        }
+        for group in groups {
+            merged
+                .consolidations
+                .retain(|g| g.retired.id != group.retired.id);
+            merged.consolidations.push(group);
+        }
         self.maintainer_upload_queue.write_or_clear(&merged).await
     }
 
@@ -173,14 +262,14 @@ impl AgentRunner {
         };
         // 新批次先进入 durable pending；网络交付再按 agent 单飞。这样后到的新版本可在
         // 旧请求进行时继续落盘，但不会先于旧请求写入 Maintainer mirror。
-        self.stage_maintainer_batch_inner(claims, disputes, durable_claims)
+        self.stage_maintainer_batch_inner(claims, disputes, durable_claims, Vec::new(), None)
             .await?;
         let _delivery_guard = self.maintainer_upload_queue.delivery_lock.lock().await;
         let _delivery_file_guard = crate::storage::FileLockGuard::lock_exclusive(
             &self.maintainer_upload_queue.delivery_lock_path,
         )
         .await?;
-        let attempted = {
+        let mut attempted = {
             let _guard = self.maintainer_upload_queue.lock.lock().await;
             let _file_guard = crate::storage::FileLockGuard::lock_exclusive(
                 &self.maintainer_upload_queue.lock_path,
@@ -192,6 +281,46 @@ impl AgentRunner {
             }
             pending
         };
+
+        if !attempted.consolidations.is_empty() {
+            if let Some(_knowledge_guard) = crate::storage::FileLockGuard::try_lock_exclusive(
+                &paths::agent_home_knowledge_apply_lock_path(
+                    self.maintainer_upload_queue.agent_home(),
+                ),
+            )
+            .await?
+            {
+                if super::claim_alignment::ensure_knowledge_ready(
+                    self.maintainer_upload_queue.agent_home(),
+                )
+                .await
+                .is_ok()
+                {
+                    let local = self.claim_store.list_local_claims().await?;
+                    let _guard = self.maintainer_upload_queue.lock.lock().await;
+                    let _file_guard = crate::storage::FileLockGuard::lock_exclusive(
+                        &self.maintainer_upload_queue.lock_path,
+                    )
+                    .await?;
+                    attempted = self.maintainer_upload_queue.read().await?;
+                    let related = consolidation_delivery::related_ids(&attempted.consolidations);
+                    for queued in &mut attempted.claims {
+                        if related.contains(&queued.id) {
+                            if let Some(actual) = local.iter().find(|c| c.id == queued.id) {
+                                *queued = actual.clone();
+                                consolidation_delivery::supersede(
+                                    &mut attempted.consolidations,
+                                    actual,
+                                );
+                            }
+                        }
+                    }
+                    self.maintainer_upload_queue
+                        .write_or_clear(&attempted)
+                        .await?;
+                }
+            }
+        }
 
         if attempted.claims.is_empty() && attempted.disputes.is_empty() {
             return Ok(MaintainerUploadReport::default());
@@ -209,8 +338,52 @@ impl AgentRunner {
         let mut conflicting_dispute_ids = Vec::new();
         let mut deprecated_direct_claim_conflicts = 0usize;
 
-        let mut claim_results =
-            futures::stream::iter(attempted.claims.clone().into_iter().map(|claim| {
+        let mut remaining = attempted.claims.clone();
+        loop {
+            let related = consolidation_delivery::related_ids(&attempted.consolidations);
+            let local = if related.is_empty() {
+                Some(Vec::new())
+            } else if let Some(_guard) = crate::storage::FileLockGuard::try_lock_exclusive(
+                &paths::agent_home_knowledge_apply_lock_path(
+                    self.maintainer_upload_queue.agent_home(),
+                ),
+            )
+            .await?
+            {
+                if super::claim_alignment::ensure_knowledge_ready(
+                    self.maintainer_upload_queue.agent_home(),
+                )
+                .await
+                .is_ok()
+                {
+                    Some(self.claim_store.list_local_claims().await?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let ready: Vec<_> = remaining
+                .iter()
+                .filter(|claim| {
+                    !related.contains(&claim.id)
+                        || local.as_ref().is_some_and(|local| {
+                            local.contains(claim)
+                                && consolidation_delivery::ready(
+                                    claim,
+                                    &attempted.consolidations,
+                                    &attempted.acknowledgements,
+                                    local,
+                                )
+                        })
+                })
+                .cloned()
+                .collect();
+            if ready.is_empty() {
+                break;
+            }
+            remaining.retain(|claim| !ready.contains(claim));
+            let mut claim_results = futures::stream::iter(ready.into_iter().map(|claim| {
                 let maintainer = maintainer_client.clone();
                 async move {
                     let result = maintainer.upload_claim(&claim).await;
@@ -218,40 +391,47 @@ impl AgentRunner {
                 }
             }))
             .buffer_unordered(MAINTAINER_UPLOAD_MAX_CONCURRENCY);
-        while let Some((claim, result)) = claim_results.next().await {
-            if let Err(err) = result {
-                match classify_upload_error(&err) {
-                    UploadErrorKind::Retryable => {
-                        timeout_secs = timeout_secs.or_else(|| upload_error_timeout_secs(&err));
-                        timed_out |= upload_error_timed_out(&err);
-                        retryable_failures += 1;
-                        let durable = attempted.durable_claim_ids.contains(&claim.id);
-                        retain_failed_claim(&mut failed, claim, durable);
-                    }
-                    UploadErrorKind::Auth => {
-                        auth_failures += 1;
-                        if attempted.durable_claim_ids.contains(&claim.id) {
-                            retain_failed_claim(&mut failed, claim, true);
+            while let Some((claim, result)) = claim_results.next().await {
+                if let Err(err) = result {
+                    match classify_upload_error(&err) {
+                        UploadErrorKind::Retryable => {
+                            timeout_secs = timeout_secs.or_else(|| upload_error_timeout_secs(&err));
+                            timed_out |= upload_error_timed_out(&err);
+                            retryable_failures += 1;
+                            let durable = attempted.durable_claim_ids.contains(&claim.id);
+                            retain_failed_claim(&mut failed, claim, durable);
+                        }
+                        UploadErrorKind::Auth => {
+                            auth_failures += 1;
+                            if attempted.durable_claim_ids.contains(&claim.id) {
+                                retain_failed_claim(&mut failed, claim, true);
+                            }
+                        }
+                        UploadErrorKind::Forbidden => {
+                            forbidden_failures += 1;
+                            forbidden_sample.get_or_insert_with(|| err.to_string());
+                            if attempted.durable_claim_ids.contains(&claim.id) {
+                                retain_failed_claim(&mut failed, claim, true);
+                            }
+                        }
+                        // 其他 client/未知错误继续保留本地待传并记 warning，绝不中断会话。
+                        UploadErrorKind::Conflict
+                        | UploadErrorKind::Client
+                        | UploadErrorKind::Unknown => {
+                            rejected_failures += 1;
+                            rejected_sample.get_or_insert_with(|| err.to_string());
+                            let durable = attempted.durable_claim_ids.contains(&claim.id);
+                            retain_failed_claim(&mut failed, claim, durable);
                         }
                     }
-                    UploadErrorKind::Forbidden => {
-                        forbidden_failures += 1;
-                        forbidden_sample.get_or_insert_with(|| err.to_string());
-                        if attempted.durable_claim_ids.contains(&claim.id) {
-                            retain_failed_claim(&mut failed, claim, true);
-                        }
-                    }
-                    // 其他 client/未知错误继续保留本地待传并记 warning，绝不中断会话。
-                    UploadErrorKind::Conflict
-                    | UploadErrorKind::Client
-                    | UploadErrorKind::Unknown => {
-                        rejected_failures += 1;
-                        rejected_sample.get_or_insert_with(|| err.to_string());
-                        let durable = attempted.durable_claim_ids.contains(&claim.id);
-                        retain_failed_claim(&mut failed, claim, durable);
-                    }
+                } else {
+                    consolidation_delivery::acknowledge(&mut attempted.acknowledgements, claim);
                 }
             }
+        }
+        let blocked_claims = remaining.len();
+        for claim in remaining {
+            retain_failed_claim(&mut failed, claim, true);
         }
 
         let mut dispute_results =
@@ -316,6 +496,9 @@ impl AgentRunner {
         };
         // 任何上传/上报失败都只降级为 warning，绝不向调用方返回 Err 中断会话。
         let mut warnings: Vec<String> = Vec::new();
+        if blocked_claims > 0 {
+            warnings.push(format!("{blocked_claims} consolidation uploads await acknowledged knowledge carriers or current-state review; source retirement remains pending."));
+        }
         if auth_failures > 0 {
             warnings.push(format!(
                 "Maintainer upload unauthorized for {auth_failures} items. Team sync was skipped; fix current upstream acn_key_env before retrying from local source."
@@ -425,6 +608,8 @@ fn merge_pending_uploads(
     claims: Vec<Claim>,
     disputes: Vec<Dispute>,
 ) -> PendingMaintainerUploads {
+    let mut consolidations = pending.consolidations;
+    let acknowledgements = pending.acknowledgements;
     let mut durable_claim_ids = pending.durable_claim_ids;
     let mut claims_by_id: BTreeMap<ClaimId, Claim> = BTreeMap::new();
     for claim in pending.claims {
@@ -435,6 +620,7 @@ fn merge_pending_uploads(
             .get(&claim.id)
             .is_none_or(|existing| claim.effective_updated_at() >= existing.effective_updated_at());
         if should_replace {
+            consolidation_delivery::supersede(&mut consolidations, &claim);
             claims_by_id.insert(claim.id.clone(), claim);
         }
     }
@@ -454,6 +640,8 @@ fn merge_pending_uploads(
     durable_claim_ids.retain(|claim_id| claims_by_id.contains_key(claim_id));
 
     PendingMaintainerUploads {
+        consolidations,
+        acknowledgements,
         claims: claims_by_id.into_values().collect(),
         durable_claim_ids,
         disputes: disputes_by_id.into_values().collect(),
@@ -465,6 +653,11 @@ fn reconcile_pending_uploads_after_attempt(
     attempted: &PendingMaintainerUploads,
     failed: &PendingMaintainerUploads,
 ) -> PendingMaintainerUploads {
+    let mut consolidations = current.consolidations;
+    let mut acknowledgements = current.acknowledgements;
+    for claim in &attempted.acknowledgements {
+        consolidation_delivery::acknowledge(&mut acknowledgements, claim.clone());
+    }
     let mut durable_claim_ids = current.durable_claim_ids;
     let failed_claims = failed
         .claims
@@ -528,8 +721,12 @@ fn reconcile_pending_uploads_after_attempt(
         }
     }
 
+    let claims: Vec<_> = claims_by_id.into_values().collect();
+    consolidation_delivery::prune(&mut consolidations, &mut acknowledgements, &claims);
     PendingMaintainerUploads {
-        claims: claims_by_id.into_values().collect(),
+        consolidations,
+        acknowledgements,
+        claims,
         durable_claim_ids,
         disputes: disputes_by_id.into_values().collect(),
     }
@@ -849,6 +1046,8 @@ mod tests {
     #[test]
     fn merge_pending_uploads_keeps_newer_claim_and_dispute() {
         let pending = PendingMaintainerUploads {
+            consolidations: Vec::new(),
+            acknowledgements: Vec::new(),
             claims: vec![claim(
                 "claim_11111111",
                 ClaimStatus::Active,
@@ -894,6 +1093,8 @@ mod tests {
 
         let merged = merge_pending_uploads(
             PendingMaintainerUploads {
+                consolidations: Vec::new(),
+                acknowledgements: Vec::new(),
                 claims: vec![pending_claim],
                 durable_claim_ids: Default::default(),
                 disputes: Vec::new(),
@@ -912,6 +1113,8 @@ mod tests {
     #[test]
     fn reconcile_pending_uploads_preserves_concurrent_newer_items() {
         let attempted = PendingMaintainerUploads {
+            consolidations: Vec::new(),
+            acknowledgements: Vec::new(),
             claims: vec![claim(
                 "claim_11111111",
                 ClaimStatus::Active,
@@ -921,6 +1124,8 @@ mod tests {
             disputes: vec![dispute("dispute_11111111", "2026-06-22T00:00:00Z")],
         };
         let current = PendingMaintainerUploads {
+            consolidations: Vec::new(),
+            acknowledgements: Vec::new(),
             claims: vec![
                 claim(
                     "claim_11111111",
@@ -1631,6 +1836,8 @@ mod tests {
         write_yaml_atomic(
             &path,
             &PendingMaintainerUploads {
+                consolidations: Vec::new(),
+                acknowledgements: Vec::new(),
                 claims: vec![pending_claim.clone()],
                 durable_claim_ids: Default::default(),
                 disputes: Vec::new(),
@@ -1664,6 +1871,8 @@ mod tests {
         write_yaml_atomic(
             &path,
             &PendingMaintainerUploads {
+                consolidations: Vec::new(),
+                acknowledgements: Vec::new(),
                 claims: vec![pending_claim.clone()],
                 durable_claim_ids: Default::default(),
                 disputes: Vec::new(),
@@ -1715,5 +1924,173 @@ mod tests {
         assert!(report.warnings[0].contains("Maintainer inbox 拉取被拒绝"));
         assert!(report.warnings[0].contains("status=403"));
         assert!(!report.warnings[0].contains("拉取失败"));
+    }
+    async fn consolidation_fixture(runner: &AgentRunner) -> ConsolidationDelivery {
+        let before = claim(
+            "claim_11111111",
+            ClaimStatus::Active,
+            "2026-01-01T00:00:00Z",
+        );
+        let mut retired = before.clone();
+        retired.status = ClaimStatus::Deprecated;
+        let mut carrier = claim(
+            "claim_22222222",
+            ClaimStatus::Active,
+            "2026-01-02T00:00:00Z",
+        );
+        carrier.statement = "Carries the source conditions and exceptions".into();
+        runner.claim_store.write_claim(&retired).await.unwrap();
+        runner.claim_store.write_claim(&carrier).await.unwrap();
+        let group = ConsolidationDelivery {
+            before,
+            retired: retired.clone(),
+            carriers: vec![carrier.clone()],
+        };
+        runner
+            .stage_consolidation_batch(vec![retired, carrier], vec![group.clone()])
+            .await
+            .unwrap();
+        group
+    }
+
+    #[tokio::test]
+    async fn consolidation_failure_blocks_only_retirement_and_restart_delivers_carrier_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = Arc::new(TestMaintainerClient::default());
+        let runner = build_runner(&dir, remote.clone());
+        let group = consolidation_fixture(&runner).await;
+        let carrier = &group.carriers[0];
+        remote
+            .retryable_claims
+            .lock()
+            .unwrap()
+            .insert(carrier.id.to_string());
+        let unrelated = claim(
+            "claim_33333333",
+            ClaimStatus::Active,
+            "2026-01-01T00:00:00Z",
+        );
+        let report = runner
+            .upload_maintainer_batch(vec![unrelated.clone()], vec![])
+            .await
+            .unwrap();
+        assert_eq!(report.pending_claims, 2);
+        assert_eq!(
+            *remote.uploaded_claims.lock().unwrap(),
+            vec![unrelated.id.to_string()]
+        );
+        assert_eq!(
+            runner.pending_consolidations().await.unwrap(),
+            vec![group.clone()]
+        );
+        drop(runner);
+        remote.retryable_claims.lock().unwrap().clear();
+        let restarted = build_runner(&dir, remote.clone());
+        let report = restarted
+            .upload_maintainer_batch(vec![], vec![])
+            .await
+            .unwrap();
+        assert_eq!(report.pending_claims, 0);
+        assert_eq!(
+            *remote.uploaded_claims.lock().unwrap(),
+            vec![
+                unrelated.id.to_string(),
+                carrier.id.to_string(),
+                group.retired.id.to_string()
+            ]
+        );
+        assert!(
+            !tokio::fs::try_exists(paths::agent_home_pending_maintainer_uploads_path(
+                dir.path()
+            ))
+            .await
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn consolidation_newer_carrier_requires_review_and_restored_source_cancels_retirement() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = Arc::new(TestMaintainerClient::default());
+        let runner = build_runner(&dir, remote.clone());
+        let group = consolidation_fixture(&runner).await;
+        let mut changed = group.carriers[0].clone();
+        changed.statement = "New narrower conclusion; cannot infer preservation".into();
+        runner.claim_store.write_claim(&changed).await.unwrap();
+        // 即使新内容尚未进入队列，也不得从旧队列回传旧版本。
+        runner
+            .upload_maintainer_batch(vec![], vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            *remote.uploaded_claim_statements.lock().unwrap(),
+            vec![changed.statement.clone()]
+        );
+        assert!(!remote
+            .uploaded_claims
+            .lock()
+            .unwrap()
+            .contains(&group.retired.id.to_string()));
+        runner.claim_store.write_claim(&group.before).await.unwrap();
+        runner
+            .upload_maintainer_batch(vec![], vec![])
+            .await
+            .unwrap();
+        assert!(runner.pending_consolidations().await.unwrap().is_empty());
+        assert_eq!(
+            remote.uploaded_claim_statements.lock().unwrap().last(),
+            Some(&group.before.statement)
+        );
+    }
+
+    #[tokio::test]
+    async fn consolidation_explicit_chain_waits_for_final_carrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = Arc::new(TestMaintainerClient::default());
+        let runner = build_runner(&dir, remote.clone());
+        let first = consolidation_fixture(&runner).await;
+        let mut retired = first.carriers[0].clone();
+        retired.status = ClaimStatus::Deprecated;
+        let mut last = claim(
+            "claim_33333333",
+            ClaimStatus::Active,
+            "2026-01-03T00:00:00Z",
+        );
+        last.statement = "Final combined knowledge".into();
+        runner.claim_store.write_claim(&retired).await.unwrap();
+        runner.claim_store.write_claim(&last).await.unwrap();
+        let second = ConsolidationDelivery {
+            before: first.carriers[0].clone(),
+            retired: retired.clone(),
+            carriers: vec![last.clone()],
+        };
+        runner
+            .stage_consolidation_batch(vec![retired.clone(), last.clone()], vec![second])
+            .await
+            .unwrap();
+        let report = runner
+            .upload_maintainer_batch(vec![], vec![])
+            .await
+            .unwrap();
+        assert_eq!(report.pending_claims, 0);
+        let sent = remote.uploaded_claims.lock().unwrap();
+        assert_eq!(sent.first(), Some(&last.id.to_string()));
+        assert!(sent.contains(&first.retired.id.to_string()));
+        assert!(sent.contains(&retired.id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn consolidation_solo_does_not_persist_delivery_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = build_local_runner(&dir);
+        consolidation_fixture(&runner).await;
+        assert!(runner.pending_consolidations().await.unwrap().is_empty());
+        assert!(
+            !tokio::fs::try_exists(paths::agent_home_pending_maintainer_uploads_path(
+                dir.path()
+            ))
+            .await
+            .unwrap()
+        );
     }
 }

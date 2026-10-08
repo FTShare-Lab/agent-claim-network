@@ -1038,6 +1038,9 @@ fn prepared_empty_finalize_checkpoint(
     recap_segment_hash: String,
 ) -> FinalizeCheckpoint {
     FinalizeCheckpoint {
+        analysis_claims: Some(Vec::new()),
+        applied_claims: Vec::new(),
+        warnings: Vec::new(),
         recap_start_index,
         recap_end_index,
         recap_segment_hash,
@@ -8294,6 +8297,9 @@ async fn legacy_prepared_finalize_checkpoint_recovers_before_completion_cursor_m
         .unwrap();
     session
         .write_finalize_checkpoint(&FinalizeCheckpoint {
+            analysis_claims: Some(Vec::new()),
+            applied_claims: Vec::new(),
+            warnings: Vec::new(),
             recap_start_index: 0,
             recap_end_index: 2,
             recap_segment_hash: checkpoint_hash,
@@ -8419,6 +8425,9 @@ async fn legacy_applied_completion_only_checkpoint_closes_without_llm_retry() {
         .unwrap();
     session
         .write_finalize_checkpoint(&FinalizeCheckpoint {
+            analysis_claims: Some(Vec::new()),
+            applied_claims: Vec::new(),
+            warnings: Vec::new(),
             recap_start_index: 2,
             recap_end_index: 2,
             recap_segment_hash: checkpoint_hash,
@@ -8488,6 +8497,9 @@ async fn legacy_stale_finalize_checkpoint_is_discarded_before_recapping_new_mess
     session.advance_recapped_until(2).await.unwrap();
     session
         .write_finalize_checkpoint(&FinalizeCheckpoint {
+            analysis_claims: Some(Vec::new()),
+            applied_claims: Vec::new(),
+            warnings: Vec::new(),
             recap_start_index: 0,
             recap_end_index: 2,
             recap_segment_hash: old_hash,
@@ -8648,6 +8660,9 @@ async fn legacy_same_range_checkpoint_with_new_completion_is_discarded_without_l
         super::finalize::hash_finalize_recap_input(&messages[2..2], &first_background).unwrap();
     session
         .write_finalize_checkpoint(&FinalizeCheckpoint {
+            analysis_claims: Some(Vec::new()),
+            applied_claims: Vec::new(),
+            warnings: Vec::new(),
             recap_start_index: 2,
             recap_end_index: 2,
             recap_segment_hash: old_hash,
@@ -8752,6 +8767,9 @@ async fn prepared_finalize_checkpoint_hash_mismatch_is_not_overwritten() {
         .unwrap();
     drop(writer);
     let checkpoint = FinalizeCheckpoint {
+        analysis_claims: Some(Vec::new()),
+        applied_claims: Vec::new(),
+        warnings: Vec::new(),
         recap_start_index: 2,
         recap_end_index: 2,
         recap_segment_hash: "different-prepared-hash".into(),
@@ -10658,6 +10676,8 @@ async fn finalize_applied_checkpoint_recovery_flushes_durable_pending_uploads() 
     write_yaml_atomic(
         &pending_path,
         &PendingMaintainerUploads {
+            consolidations: Vec::new(),
+            acknowledgements: Vec::new(),
             claims: vec![Claim {
                 id: "claim_11111111".parse().unwrap(),
                 name: "pending recap claim".into(),
@@ -16901,7 +16921,7 @@ async fn dream_explores_beyond_old_limits_with_all_thirty_claims() {
     assert_eq!(requests.len(), 19);
     assert!(requests
         .iter()
-        .all(|r| r.tools.len() == 12 && r.max_tokens == 24_000));
+        .all(|r| r.tools.len() == 13 && r.max_tokens == 24_000));
     let text = serde_json::to_string(&requests[18].messages).unwrap();
     assert!(text.contains("evidence_18"));
     for i in 1..=30 {
@@ -17052,7 +17072,7 @@ async fn dream_invalid_plan_retry_repairs_without_repeating_exploration() {
     assert_eq!(rejected["event"]["proposal"], "not a JSON plan");
     let requests = provider.requests().await;
     assert_eq!(requests.len(), 5);
-    assert_eq!(requests[2].tools.len(), 12);
+    assert_eq!(requests[2].tools.len(), 13);
     let wire = serde_json::to_string(&requests[2].messages).unwrap();
     assert!(wire.contains("invalid Dream plan JSON") && wire.contains("evidence_1"));
 }
@@ -17117,7 +17137,7 @@ async fn dream_large_invalid_plans_do_not_exhaust_retry_context() {
     let requests = provider.requests().await;
     assert_eq!(requests.len(), 8);
     for request in &requests[2..6] {
-        assert_eq!(request.tools.len(), 12);
+        assert_eq!(request.tools.len(), 13);
         let wire = serde_json::to_string(&request.messages).unwrap();
         assert!(wire.contains("evidence_1") && wire.contains("invalid Dream plan JSON"));
         assert!(!wire.contains(&"未".repeat(100)));
@@ -17630,4 +17650,201 @@ async fn dream_yields_before_model_when_finalize_is_queued() {
     assert!(error.is::<dream::DreamYield>(), "{error:#}");
     assert!(provider.requests().await.is_empty());
     assert!(!jobs.parent().unwrap().join("dream/job_yield.yaml").exists());
+}
+
+#[tokio::test]
+async fn recap_finalize_saved_plan_discards_stale_remainder_without_model_calls() {
+    for recap in [false, true] {
+        for case in [
+            "unchanged",
+            "changed",
+            "legacy",
+            "occupied",
+            "applied_changed",
+            "not_applied",
+        ] {
+            let stale = case != "unchanged";
+            let dir = tempfile::tempdir().unwrap();
+            let before = dream_fixture_claim("claim_11111111");
+            let source = dream_fixture_claim("claim_33333333");
+            let mut target = before.clone();
+            target.statement = "Original plan's useful addition".into();
+            target.updated_at = Some(crate::time::now_seconds());
+            let already = dream_fixture_claim("claim_22222222");
+            let mut retired = source.clone();
+            retired.status = ClaimStatus::Deprecated;
+            retired.updated_at = Some(crate::time::now_seconds());
+            let mut current = before.clone();
+            if case == "changed" || case == "not_applied" {
+                current.scope = "project / narrowed tenant boundary".into();
+            } else if case == "applied_changed" || case == "occupied" {
+                current.statement = "later independent correction".into();
+            }
+            let provider = Arc::new(RecordingProvider::new(vec![]));
+            let (engine, store) = build_test_engine(&dir, provider.clone());
+            for claim in [&current, &already, &source] {
+                if case != "not_applied" || claim.id != already.id {
+                    engine.agent.claim_store.write_claim(claim).await.unwrap();
+                }
+            }
+            let mut session = create_test_session(&store, "session_face0101").await;
+            session
+                .append_messages(&[NewSessionMessage::with_created_at_and_model(
+                    SessionMessageRole::User,
+                    vec![SessionContentBlock::text("retain the import retry rule")],
+                    Utc::now(),
+                    "test-model",
+                )])
+                .await
+                .unwrap();
+            let messages = session.read_messages().await.unwrap();
+            let background = SessionRecapBackgroundProcessProjection {
+                consumed_through_seq: 0,
+                omitted_older_count: 0,
+                items: vec![],
+            };
+            let hash = super::finalize::hash_finalize_recap_input(&messages, &background).unwrap();
+            let mut checkpoint = prepared_empty_finalize_checkpoint(0, messages.len(), hash);
+            checkpoint.analysis_claims = Some(if case == "occupied" {
+                vec![source.clone()]
+            } else {
+                vec![before.clone(), source.clone()]
+            });
+            if case == "applied_changed" {
+                checkpoint.applied_claims.push(target.clone());
+            }
+            checkpoint.prepared_claims = vec![target.clone(), already.clone(), retired.clone()];
+            checkpoint.trace_id = Some(crate::claim::TraceId::random());
+            if stale {
+                checkpoint.prepared_disputes.push(Dispute {
+                    id: DisputeId::random(),
+                    name: "pending_conflict".into(),
+                    reporter_agent_id: before.holder.clone(),
+                    claims: vec![before.id.clone(), already.id.clone()],
+                    summary: "original pending conflict".into(),
+                    status: crate::claim::DisputeStatus::Open,
+                    created_at: crate::time::now_seconds(),
+                    resolved_at: None,
+                });
+            }
+            let mut saved = serde_json::to_value(&checkpoint).unwrap();
+            if case == "legacy" {
+                saved.as_object_mut().unwrap().remove("analysis_claims");
+                saved.as_object_mut().unwrap().remove("warnings");
+                saved["original_input"] = json!({"transcript":"retain the import retry rule"});
+                saved["continuations"] = json!([]);
+            }
+            let checkpoint: FinalizeCheckpoint = serde_json::from_value(saved).unwrap();
+            session
+                .write_finalize_checkpoint(&checkpoint)
+                .await
+                .unwrap();
+            let report = if recap {
+                engine
+                    .recap_existing_session_until(&session.metadata.id, messages.len())
+                    .await
+                    .unwrap()
+            } else {
+                engine.finalize_session(&mut session, |_| {}).await.unwrap()
+            };
+            let metadata = session.read_metadata().await.unwrap();
+            assert_eq!(
+                metadata.status,
+                if recap {
+                    SessionStatus::Open
+                } else {
+                    SessionStatus::Closed
+                }
+            );
+            assert_eq!(metadata.recapped_until, messages.len());
+            assert!(report.advanced_recapped_until);
+            let claims = engine.agent.claim_store.list_local_claims().await.unwrap();
+            assert_eq!(claims.len(), if case == "not_applied" { 2 } else { 3 });
+            assert_eq!(claims.contains(&already), case != "not_applied");
+            if stale {
+                assert!(claims.contains(&current), "{case}");
+                assert!(claims.contains(&source), "{case}");
+                assert!(report.warnings.iter().any(|w| w.contains("已放弃")));
+                assert!(report.new_dispute_ids.is_empty());
+                assert!(!report.updated_claim_ids.contains(&source.id));
+            } else {
+                assert!(claims.contains(&target));
+                assert!(claims.contains(&retired));
+                assert!(report.warnings.is_empty());
+            }
+            assert!(provider.requests().await.is_empty(), "{case}");
+            let checkpoint = session.read_finalize_checkpoint().await.unwrap().unwrap();
+            assert_eq!(checkpoint.status, FinalizeCheckpointStatus::Applied);
+            assert_eq!(
+                checkpoint.applied_claims.len(),
+                match case {
+                    "unchanged" => 3,
+                    "applied_changed" => 2,
+                    "not_applied" => 0,
+                    _ => 1,
+                }
+            );
+            assert!(checkpoint.prepared_disputes.is_empty());
+            if case == "not_applied" {
+                assert!(checkpoint.trace_id.is_none());
+                assert!(report.trace_id.is_none());
+            }
+            if stale {
+                assert!(checkpoint.prepared_claims.is_empty());
+                assert_eq!(checkpoint.warnings, report.warnings);
+                assert_eq!(
+                    super::report_from_finalize_checkpoint(&checkpoint, vec![]).warnings,
+                    report.warnings
+                );
+            }
+            if recap {
+                engine
+                    .recap_existing_session_until(&session.metadata.id, messages.len())
+                    .await
+                    .unwrap();
+            } else {
+                engine.finalize_session(&mut session, |_| {}).await.unwrap();
+            }
+            assert!(provider.requests().await.is_empty());
+            assert_eq!(
+                engine.agent.claim_store.list_local_claims().await.unwrap(),
+                claims
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn startup_pending_dream_recovery_uses_empty_baseline_then_runtime_context_catches_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RecordingProvider::new(vec![]));
+    let (engine, _) = build_local_test_engine(&dir, provider);
+    let claim = dream_fixture_claim("claim_11111111");
+    engine.agent.claim_store.write_claim(&claim).await.unwrap();
+    let home = dir.path().join("agents/agent-a");
+    let pending = home.join("runtime/supervisor/dream_pending.yaml");
+    write_yaml_atomic(&pending, &home.join("missing.yaml"))
+        .await
+        .unwrap();
+    let started = engine
+        .start_session_with_id_factory(|| "session_face0102".parse().unwrap(), 1, |_| {})
+        .await
+        .unwrap();
+    let baseline: Value =
+        crate::storage::read_yaml(&started.session.paths.dir.join("claim_prompt_baseline.yaml"))
+            .await
+            .unwrap();
+    assert_eq!(baseline, json!({}));
+    assert!(engine
+        .claim_runtime_context(&started.session.paths.dir)
+        .await
+        .unwrap()
+        .is_none());
+    tokio::fs::remove_file(pending).await.unwrap();
+    let projection = engine
+        .claim_runtime_context(&started.session.paths.dir)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(projection.text.contains(claim.id.as_str()));
 }

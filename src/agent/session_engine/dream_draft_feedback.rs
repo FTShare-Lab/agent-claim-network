@@ -1,8 +1,21 @@
 //! 将已接受草稿转换为可读、可重新提交的反馈；不修改草稿或放宽校验。
-use super::dream_plan::{OperationGroup, Update};
+use super::dream_plan::{FactualCorrectionBlocked, OperationGroup, Update};
 use crate::claim::{Claim, ClaimId, ClaimStatus};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+
+pub(super) fn boundary_error(error: &anyhow::Error) -> Value {
+    match error.downcast_ref::<FactualCorrectionBlocked>() {
+        Some(blocked) => json!({
+            "repair_type":"change_plan_or_keep",
+            "claim_id":blocked.claim_id,
+            "original_confidence":"high",
+            "factual_correction_allowed":false,
+            "next":"This factual correction is not authorized in this Dream; do not retry it by changing parameters, kind, action or confidence. Preserve the high Claim's factual knowledge. If a safe C plan can retain it unchanged with its own destination, revise the SAME group and review again; otherwise dream_keep_candidate with this concrete boundary reason, then continue the next candidate. High Claims can still undergo pure A cleanup or C reorganization without factual correction."
+        }),
+        None => Value::Null,
+    }
+}
 
 /// 一次指出所有动作字段错误；仅给出结构修复提示，不自动丢弃模型提出的内容变化。
 pub(super) fn operation_errors(attempted: &Value) -> Vec<Value> {
@@ -35,7 +48,7 @@ pub(super) fn operation_errors(attempted: &Value) -> Vec<Value> {
             .filter(|key| !allowed.contains(&key.as_str()))
             .collect::<Vec<_>>();
         if !unexpected.is_empty() {
-            errors.push(json!({"claim_id":op["id"],"action":op["action"],"unexpected_fields":unexpected,
+            errors.push(json!({"repair_type":"parameters","claim_id":op["id"],"action":op["action"],"unexpected_fields":unexpected,
                 "allowed_changes":allowed,"repair":"Remove these keys from changes; do not send null or repeat original values. For deprecate the host sets status and preserves original content. If content must survive elsewhere, put that content in a surviving update and describe it in coverage; do not silently drop intended knowledge."}));
         }
     }
@@ -115,6 +128,28 @@ pub(super) fn state(
         "For a cross-group conflict, read the named existing groups with dream_read_draft. Changing only the new group_id cannot fix it. In incremental Dream complete candidate_progress.current before another item.",
         "Replace the current group using its SAME group_id and retain all candidate claims, intended edits, evidence and coverage. If needed explicitly expand its candidate registration first; do not silently drop identified work.",
         "pending_rejections identifies groups needing repair or removal of an invalid proposal. group:null removes only the draft/error; a registered candidate remains pending until applied or kept with dream_keep_candidate and a concrete reason. Unknown group names change nothing.",
+        "Repair parameter/source/coverage errors using their named fields and permitted IDs. boundary_feedback is an authority limit, not a missing-parameter or insufficient-evidence error: change the intended plan safely or explicitly keep this candidate; repeating the same forbidden correction cannot succeed.",
         "Use dream_validate, then dream_apply_group with a concise semantic review. Finish with empty group_ids only after all candidates are executed or explicitly kept. No modification quota; uncertainty permits keeping. Unchanged independent claims need no keep group; consolidation inputs do. Use actual execution receipts for results."
     ]})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn high_correction_feedback_survives_error_context() -> anyhow::Result<()> {
+        let claim_id = ClaimId::from_str("claim_12345678")?;
+        let error = anyhow::Error::new(FactualCorrectionBlocked {
+            claim_id: claim_id.clone(),
+        })
+        .context("failed to apply group");
+        let feedback = boundary_error(&error);
+        assert_eq!(feedback["claim_id"], json!(claim_id));
+        assert_eq!(feedback["repair_type"], "change_plan_or_keep");
+        assert_eq!(feedback["factual_correction_allowed"], false);
+        assert!(boundary_error(&anyhow::anyhow!("invalid argument")).is_null());
+        Ok(())
+    }
 }

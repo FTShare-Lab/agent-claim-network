@@ -164,6 +164,10 @@ pub(super) fn prepare_claims(
                     "new_claims[{idx}].source_claim_ids[{j}]={raw:?} 解析失败 (期望 claim_/policy_ 前缀): {e}"
                 )
             })?;
+            anyhow::ensure!(
+                s != SourceId::Claim(id.clone()),
+                "new_claims[{idx}].source_claim_ids[{j}]={raw:?} 引用了自身 {id}；移除此来源，Claim 自身的历史版本不属于独立来源，保留其他相关来源"
+            );
             if let (Some(allowed), SourceId::Claim(id)) = (allowed_source_claim_ids, &s) {
                 if !allowed.contains(id) {
                     anyhow::bail!(
@@ -232,6 +236,10 @@ pub(super) fn prepare_claim_updates(
                     "updated_claims[{idx}].source_claim_ids[{j}]={raw:?} 解析失败 (期望 claim_/policy_ 前缀): {e}"
                 )
             })?;
+            anyhow::ensure!(
+                source != SourceId::Claim(id.clone()),
+                "updated_claims[{idx}].source_claim_ids[{j}]={raw:?} 引用了自身 {id}；移除此来源，Claim 自身的历史版本不属于独立来源，保留其他相关来源"
+            );
             if let (Some(allowed), SourceId::Claim(id)) = (allowed_source_claim_ids, &source) {
                 if !allowed.contains(id) {
                     anyhow::bail!(
@@ -371,6 +379,56 @@ mod tests {
         assert_eq!(claims[0].status, ClaimStatus::Active);
         assert_eq!(claims[0].updated_at, None);
         assert_eq!(claims[0].created_at.timestamp_subsec_nanos(), 0);
+    }
+
+    #[test]
+    fn prepare_new_claim_rejects_self_source_even_when_visible() -> anyhow::Result<()> {
+        let id = ClaimId::random();
+        let mut draft = sample_claim_draft(id.to_string(), None);
+        draft.source_claim_ids = vec![id.to_string()];
+        for allowed in [None, Some(FxHashSet::from_iter([id.clone()]))] {
+            let error = prepare_claims(
+                vec![draft.clone()],
+                allowed.as_ref(),
+                &AgentId::new("agent-example")?,
+                "2026-05-19T10:00:00Z".parse()?,
+            )
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("self source was accepted"))?;
+            assert!(error
+                .to_string()
+                .contains("new_claims[0].source_claim_ids[0]"));
+            assert!(error.to_string().contains("引用了自身"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_claim_update_rejects_self_source_and_accepts_other_sources() -> anyhow::Result<()> {
+        let existing = sample_claim(ClaimId::random());
+        let local = FxHashMap::from_iter([(existing.id.clone(), existing.clone())]);
+        let other = ClaimId::random();
+        let policy = PolicyId::random();
+        let allowed = FxHashSet::from_iter([existing.id.clone(), other.clone()]);
+        let mut draft = sample_claim_draft(existing.id.to_string(), Some("active"));
+        draft.source_claim_ids = vec![other.to_string(), existing.id.to_string()];
+        let now = "2026-05-19T10:00:00Z".parse()?;
+        let error = prepare_claim_updates(vec![draft.clone()], &local, Some(&allowed), now)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("self source was accepted"))?;
+        assert!(error
+            .to_string()
+            .contains("updated_claims[0].source_claim_ids[1]"));
+        assert!(error.to_string().contains("引用了自身"));
+
+        draft.source_claim_ids = vec![other.to_string(), policy.to_string(), other.to_string()];
+        let prepared = prepare_claim_updates(vec![draft], &local, Some(&allowed), now)?;
+        assert_eq!(
+            prepared[0].source_claim_ids,
+            vec![SourceId::Claim(other), SourceId::Policy(policy)]
+        );
+        assert!(local[&existing.id].source_claim_ids.is_empty());
+        Ok(())
     }
 
     #[test]

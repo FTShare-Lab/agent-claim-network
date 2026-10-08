@@ -41,6 +41,21 @@ pub(super) struct Draft {
     candidates: Candidates,
 }
 
+impl Draft {
+    fn finish_execution(&mut self, group_id: &str, validation_id: &str, accepted: bool) {
+        self.validations.remove(group_id);
+        self.self_reviews.remove(group_id);
+        if accepted {
+            self.groups.remove(group_id);
+            self.rejected.remove(group_id);
+            self.candidates.applied(group_id, validation_id);
+        } else {
+            // 业务拒绝不是完成：保留意图，让同一模型基于最新状态重新决定。
+            self.rejected.insert(group_id.into(), "Claim/evidence changed at commit; original draft retained. Read execution feedback, revise this candidate and validate again, or explicitly keep it.".into());
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Stage {
@@ -164,13 +179,11 @@ impl Reviewer {
                     .get(&operation.group_id)
                     .is_some_and(|v| v.validation_id == operation.validation_id)
                 {
-                    draft.groups.remove(&operation.group_id);
-                    draft.validations.remove(&operation.group_id);
-                    draft.self_reviews.remove(&operation.group_id);
-                    draft.rejected.remove(&operation.group_id);
-                    draft
-                        .candidates
-                        .applied(&operation.group_id, &operation.validation_id);
+                    draft.finish_execution(
+                        &operation.group_id,
+                        &operation.validation_id,
+                        !record.groups.iter().any(|group| group.skipped),
+                    );
                 }
             }
         }
@@ -244,7 +257,7 @@ impl Reviewer {
                     group.kind == Kind::Quality
                         && matches!(operation.action, Action::Deprecate)
                         && operation.changes.is_empty(),
-                    "operation {id}: reason shorthand is only for quality deprecate without changes; otherwise use change_basis"
+                    "operation {id}: reason shorthand is only for quality deprecate without changes. Repair parameters: remove operation.reason and add one group.change_basis entry for this changed Claim with claim_id, removed_or_changed, added (empty if none), justification, evidence_ids. Keep group.reason and intended knowledge; do not change kind merely to accept shorthand."
                 );
                 anyhow::ensure!(
                     !reason.trim().is_empty(),
@@ -344,6 +357,14 @@ impl Reviewer {
         receipts: BTreeMap<String, Value>,
         observed: BTreeMap<ClaimId, Claim>,
     ) -> anyhow::Result<Value> {
+        if name == "dream_review_sync" {
+            return self
+                .execution
+                .as_ref()
+                .context("Incremental executor unavailable")?
+                .review_sync(input)
+                .await;
+        }
         if name == "dream_read_history" {
             return self
                 .history
@@ -430,12 +451,11 @@ impl Reviewer {
                         .get(&apply.group_id)
                         .is_some_and(|v| v.validation_id == apply.validation_id)
                     {
-                        draft.groups.remove(&apply.group_id);
-                        draft.validations.remove(&apply.group_id);
-                        draft.self_reviews.remove(&apply.group_id);
-                        draft
-                            .candidates
-                            .applied(&apply.group_id, &apply.validation_id);
+                        draft.finish_execution(
+                            &apply.group_id,
+                            &apply.validation_id,
+                            result["accepted"] == true,
+                        );
                     }
                     return Ok(result);
                 }
@@ -458,12 +478,11 @@ impl Reviewer {
                 let result = execution
                     .apply(group, validation, apply.review, &readable, &receipts)
                     .await?;
-                draft.groups.remove(&apply.group_id);
-                draft.validations.remove(&apply.group_id);
-                draft.self_reviews.remove(&apply.group_id);
-                draft
-                    .candidates
-                    .applied(&apply.group_id, &apply.validation_id);
+                draft.finish_execution(
+                    &apply.group_id,
+                    &apply.validation_id,
+                    result["accepted"] == true,
+                );
                 Ok(result)
             }
             "dream_read_draft" => {
@@ -766,6 +785,11 @@ impl DreamPlanTools for Reviewer {
             definitions.retain(|d| d.name != "dream_review_group");
             definitions.extend(dream_candidates::definitions());
             definitions.push(ToolDefinition {
+                name: "dream_review_sync".into(),
+                description: "Reconsider only a blocked consolidation delivery, without changing Claim content/status. Call with source_id and current carrier_ids to read a version-bound validation. Then resubmit the validation_id and review using the same semantic schema as dream_apply_group, with one claims entry for the original source and all carrier_ids as output_ids. Explain complete preservation of its rules, conditions, exceptions and provenance; no factual correction or new evidence is allowed. Uncertainty leaves retirement pending. This cannot bypass A/B/C mutation rules or revive deprecated Claims.".into(),
+                input_schema: json!({"type":"object","properties":{"source_id":{"type":"string"},"carrier_ids":{"type":"array","items":{"type":"string"}},"validation_id":{"type":"string"},"review":super::dream_execution::review_schema()},"required":["source_id","carrier_ids"],"additionalProperties":false}),
+            });
+            definitions.push(ToolDefinition {
                 name:"dream_apply_group".into(),
                 description:"Execute ONE validated group after semantic self-review. Persists before/after, evidence and review before any Claim write, then records actual results in the agent dream directory. validation_id must match the current draft; repeat calls return the existing receipt. Review each input's useful rules, conditions, exceptions and removal/correction basis. Do not paste all original fields. On rejection repair this group or withdraw it. Successful execution is immediate: use returned current_claims for subsequent work, even if the run later fails.".into(),
                 input_schema:json!({"type":"object","properties":{"group_id":string,"validation_id":string,"review":super::dream_execution::review_schema()},"required":["group_id","validation_id","review"],"additionalProperties":false}),
@@ -838,7 +862,7 @@ impl DreamPlanTools for Reviewer {
                         })
                     })
                     .collect::<Vec<_>>();
-                json!({"accepted":false,"error":format!("{error:#}"),"operation_feedback":feedback::operation_errors(&input),"review_feedback":gaps,"staged_group_ids":draft.groups.keys().collect::<Vec<_>>(),"committed":false})
+                json!({"accepted":false,"error":format!("{error:#}"),"boundary_feedback":feedback::boundary_error(&error),"operation_feedback":feedback::operation_errors(&input),"review_feedback":gaps,"staged_group_ids":draft.groups.keys().collect::<Vec<_>>(),"committed":false})
             }
         };
         if let Some(execution) = &self.execution {

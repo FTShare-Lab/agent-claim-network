@@ -8,16 +8,17 @@ use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use rustc_hash::FxHashMap;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::claim_alignment;
 use crate::agent::prepare::{allowed_claim_ids_for_recap, llm_visible_claims};
 use crate::agent::runner_finalize::prepare_recap_value;
 use crate::agent::runner_trace::trace_name_from_task;
 use crate::api::SessionTurnMessage;
-use crate::claim::{Claim, ClaimId, Dispute, SessionId, SourceId, TraceId};
+use crate::claim::{Claim, ClaimId, Dispute, SessionId, SourceId};
 use crate::session::{
     finalize_checkpoint_covers_pending_range, replay_turn_journal, FinalizeCheckpoint,
     FinalizeCheckpointStatus, SessionHandle, SessionMessage, SessionStatus,
@@ -38,6 +39,14 @@ use super::{
 
 const FINALIZE_BACKGROUND_COMPLETION_MAX_ITEMS: usize = 64;
 const FINALIZE_BACKGROUND_COMPLETION_ID_MAX_CHARS: usize = 256;
+
+#[derive(Default)]
+struct PreparedFinalize {
+    used: Vec<ClaimId>,
+    claims: Vec<Claim>,
+    disputes: Vec<Dispute>,
+    analysis: Vec<Claim>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecapRetryMode {
@@ -960,7 +969,7 @@ impl SessionEngine {
         background_process_completions: &SessionRecapBackgroundProcessProjection,
         fallback_scope: crate::api::ProviderRuntimeFallbackScope,
         retry_mode: RecapRetryMode,
-    ) -> anyhow::Result<(Vec<ClaimId>, Vec<Claim>, Vec<Dispute>)> {
+    ) -> anyhow::Result<PreparedFinalize> {
         let memory_enabled = self.turn_loop.tool_registry().memory_enabled();
         let transcript =
             session_messages_to_turn_transcript_with_memory_mode(session_messages, memory_enabled);
@@ -970,7 +979,7 @@ impl SessionEngine {
                 "agent {} recap/finalize 跳过空有效输入",
                 self.agent.agent_id
             );
-            return Ok((Vec::new(), Vec::new(), Vec::new()));
+            return Ok(PreparedFinalize::default());
         }
         let local_claims = llm_visible_claims(self.agent.claim_store.list_local_claims().await?);
         let local_by_id: FxHashMap<ClaimId, Claim> = local_claims
@@ -1023,7 +1032,14 @@ impl SessionEngine {
                 )
                 .await,
         };
-        result.map_err(|source| RecoverableCompactionPreparationError::other(source).into())
+        result
+            .map(|(used, claims, disputes)| PreparedFinalize {
+                used,
+                claims,
+                disputes,
+                analysis: local_claims,
+            })
+            .map_err(|source| RecoverableCompactionPreparationError::other(source).into())
     }
 
     async fn finalize_message_segment_checkpointed(
@@ -1096,6 +1112,10 @@ impl SessionEngine {
                 }
                 None => knowledge_guard.await?,
             };
+            claim_alignment::ensure_knowledge_ready(
+                self.runner.maintainer_upload_queue.agent_home(),
+            )
+            .await?;
             let prepare = self.prepare_finalize_segment_with_background(
                 segment,
                 background_process_completions,
@@ -1114,7 +1134,7 @@ impl SessionEngine {
                 }
                 None => prepare.await,
             };
-            let (used_claim_ids, prepared_claims, prepared_disputes) = match prepared {
+            let prepared = match prepared {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     if let Some(preemption) = preemption {
@@ -1125,6 +1145,12 @@ impl SessionEngine {
                     return Err(error);
                 }
             };
+            let PreparedFinalize {
+                used: used_claim_ids,
+                claims: prepared_claims,
+                disputes: prepared_disputes,
+                analysis,
+            } = prepared;
             let trace_text = finalize_trace_text(segment, background_process_completions)?;
             let trace_created_at = Utc::now();
             let trace_id = checkpoint_trace_id(
@@ -1134,6 +1160,9 @@ impl SessionEngine {
                 trace_created_at,
             );
             let checkpoint = FinalizeCheckpoint {
+                analysis_claims: Some(analysis),
+                applied_claims: Vec::new(),
+                warnings: Vec::new(),
                 recap_start_index,
                 recap_end_index,
                 recap_segment_hash: segment_hash,
@@ -1190,7 +1219,14 @@ impl SessionEngine {
         session: &SessionHandle,
         checkpoint: FinalizeCheckpoint,
     ) -> anyhow::Result<SessionFinalizeReport> {
-        let mut pending = self.apply_finalize_checkpoint_local(checkpoint).await?;
+        claim_alignment::ensure_knowledge_ready(self.runner.maintainer_upload_queue.agent_home())
+            .await?;
+        let mut checkpoint = checkpoint;
+        self.discard_stale_finalize_checkpoint(session, &mut checkpoint)
+            .await?;
+        let mut pending = self
+            .apply_finalize_checkpoint_local(session, checkpoint)
+            .await?;
         self.runner
             .stage_maintainer_batch(
                 std::mem::take(&mut pending.local.claims),
@@ -1210,20 +1246,58 @@ impl SessionEngine {
         Ok(pending.local.report)
     }
 
+    async fn discard_stale_finalize_checkpoint(
+        &self,
+        session: &SessionHandle,
+        checkpoint: &mut FinalizeCheckpoint,
+    ) -> anyhow::Result<()> {
+        let current = self.agent.claim_store.list_local_claims().await?;
+        claim_alignment::observe_applied(
+            &checkpoint.prepared_claims,
+            &current,
+            &mut checkpoint.applied_claims,
+        );
+        let differences = claim_alignment::changes(
+            checkpoint.analysis_claims.as_deref(),
+            &checkpoint.prepared_claims,
+            &checkpoint.applied_claims,
+            &current,
+        );
+        if !claim_alignment::analysis_is_stale(checkpoint.analysis_claims.as_deref(), &differences)
+        {
+            return Ok(());
+        }
+        if checkpoint
+            .prepared_claims
+            .iter()
+            .any(|c| !checkpoint.applied_claims.iter().any(|a| a.id == c.id))
+            || !checkpoint.prepared_disputes.is_empty()
+        {
+            log::warn!(target: "agent", "recap/finalize: {}", claim_alignment::STALE_PLAN_WARNING);
+            checkpoint
+                .warnings
+                .push(claim_alignment::STALE_PLAN_WARNING.into());
+        }
+        // 不再为中断恢复调用模型；关联的剩余操作一起放弃，保留已执行结果。
+        checkpoint.prepared_claims.clear();
+        checkpoint.prepared_disputes.clear();
+        if checkpoint.applied_claims.is_empty() && checkpoint.used_claim_ids.is_empty() {
+            checkpoint.trace_id = None;
+        }
+        checkpoint.analysis_claims = Some(current);
+        session.write_finalize_checkpoint(checkpoint).await?;
+        Ok(())
+    }
+
     async fn apply_finalize_checkpoint_local(
         &self,
-        checkpoint: FinalizeCheckpoint,
+        session: &SessionHandle,
+        mut checkpoint: FinalizeCheckpoint,
     ) -> anyhow::Result<PendingFinalizeUpload> {
         let local = self
-            .apply_prepared_finalize_batch_local(
-                &checkpoint.trace_text,
-                checkpoint.used_claim_ids.clone(),
-                checkpoint.prepared_claims.clone(),
-                checkpoint.prepared_disputes.clone(),
-                checkpoint.trace_created_at,
-                checkpoint.trace_id.clone(),
-            )
+            .apply_prepared_finalize_batch_local(session, &mut checkpoint)
             .await?;
+        checkpoint.trace_id = local.report.trace_id.clone().or(checkpoint.trace_id);
         Ok(PendingFinalizeUpload {
             local,
             applied_checkpoint: FinalizeCheckpoint {
@@ -1235,26 +1309,39 @@ impl SessionEngine {
 
     async fn apply_prepared_finalize_batch_local(
         &self,
-        trace_text: &str,
-        used_claim_ids: Vec<ClaimId>,
-        prepared_claims: Vec<Claim>,
-        prepared_disputes: Vec<Dispute>,
-        trace_created_at: DateTime<Utc>,
-        checkpoint_trace_id: Option<TraceId>,
+        session: &SessionHandle,
+        checkpoint: &mut FinalizeCheckpoint,
     ) -> anyhow::Result<PendingFinalizeLocalApply> {
+        let mut targets = checkpoint.prepared_claims.clone();
+        targets.sort_by_key(|c| c.status == crate::claim::ClaimStatus::Deprecated);
+        for claim in targets {
+            if !checkpoint.applied_claims.iter().any(|c| c.id == claim.id) {
+                self.agent.claim_store.write_claim(&claim).await?;
+                checkpoint.applied_claims.push(claim);
+                session.write_finalize_checkpoint(checkpoint).await?;
+            }
+        }
+        let prepared_claims = checkpoint.applied_claims.clone();
+        let used_claim_ids = checkpoint.used_claim_ids.clone();
+        let trace_text = &checkpoint.trace_text;
+        let trace_created_at = checkpoint.trace_created_at;
+        let checkpoint_trace_id = checkpoint.trace_id.clone();
+        let prepared_disputes = checkpoint.prepared_disputes.clone();
+        let current = self.agent.claim_store.list_local_claims().await?;
         let mut new_claim_ids = Vec::with_capacity(prepared_claims.len());
         let mut updated_claim_ids = Vec::new();
         let mut output_claim_ids = Vec::with_capacity(prepared_claims.len());
         let mut claims_to_upload = Vec::with_capacity(prepared_claims.len());
         for claim in prepared_claims {
-            self.agent.claim_store.write_claim(&claim).await?;
             if claim.updated_at.is_some() {
                 updated_claim_ids.push(claim.id.clone());
             } else {
                 new_claim_ids.push(claim.id.clone());
             }
             output_claim_ids.push(claim.id.clone());
-            claims_to_upload.push(claim);
+            if current.contains(&claim) {
+                claims_to_upload.push(claim);
+            }
         }
 
         let trace_text = trace_text.to_string();
@@ -1312,7 +1399,7 @@ impl SessionEngine {
                 new_dispute_ids: Vec::new(),
                 advanced_recapped_until: false,
                 finalized_unrecapped_messages: false,
-                warnings: Vec::new(),
+                warnings: checkpoint.warnings.clone(),
             },
             claims: claims_to_upload,
             disputes: disputes_to_upload,

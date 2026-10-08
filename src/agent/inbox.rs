@@ -13,6 +13,7 @@ use opentelemetry::KeyValue;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
+use super::claim_alignment;
 use super::fs::reported_dispute_claim_set_key;
 use super::prepare::{
     llm_visible_claims, prepare_claim_updates, prepare_claims, prepare_disputes, sorted_source_ids,
@@ -216,6 +217,10 @@ struct InboxEffectPlan {
     batch_members: Vec<InboxEffectMember>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     batch_hash: Option<String>,
+    #[serde(default)]
+    analysis_claims: Option<Vec<Claim>>,
+    #[serde(default)]
+    applied_claims: Vec<Claim>,
     state: InboxEffectState,
     #[serde(with = "crate::time::serde_utc")]
     prepared_at: DateTime<Utc>,
@@ -581,6 +586,7 @@ impl AgentRunner {
             paths::agent_home_knowledge_apply_lock_path(self.maintainer_upload_queue.agent_home()),
         )
         .await?;
+        claim_alignment::ensure_knowledge_ready(self.maintainer_upload_queue.agent_home()).await?;
         let now = Utc::now();
         let updated_at = crate::time::truncate_to_second(now);
         let policy_source = SourceId::Policy(policy.id.clone());
@@ -614,7 +620,7 @@ impl AgentRunner {
                 .await?,
             )
         };
-        self.stage_maintainer_batch(claims_to_upload, Vec::new())
+        self.stage_policy_deprecation(claims_to_upload, &policy.id)
             .await?;
         drop(knowledge_guard);
         let upload_report = self.upload_maintainer_batch(Vec::new(), Vec::new()).await?;
@@ -698,6 +704,7 @@ impl AgentRunner {
             paths::agent_home_knowledge_apply_lock_path(self.maintainer_upload_queue.agent_home()),
         )
         .await?;
+        claim_alignment::ensure_knowledge_ready(self.maintainer_upload_queue.agent_home()).await?;
 
         let mut records = Vec::with_capacity(messages.len());
         for message in messages {
@@ -852,6 +859,7 @@ impl AgentRunner {
     ) -> anyhow::Result<AppliedInboxEffect> {
         self.repair_claim_attribute_update_refs(plan).await?;
         if plan.state == InboxEffectState::Prepared {
+            self.discard_stale_inbox_plan(plan, canonical_path).await?;
             let pending_upload = self.apply_claim_attribute_update_effect(plan).await?;
             self.stage_maintainer_batch_with_durable_claims(
                 pending_upload.claims,
@@ -1043,6 +1051,7 @@ impl AgentRunner {
             claim_attribute_updates: items,
             local_claims,
         };
+        let analysis_claims = request.local_claims.clone();
         let (now, new_claims, updated_claims, mut new_disputes) = self
             .claim_attribute_update_internalize_and_prepare_once(generator, request, &local_by_id)
             .await
@@ -1146,6 +1155,8 @@ impl AgentRunner {
             message_hash: canonical.message_hash.clone(),
             batch_members,
             batch_hash,
+            analysis_claims: Some(analysis_claims),
+            applied_claims: Vec::new(),
             state: InboxEffectState::Prepared,
             prepared_at: now,
             new_claims,
@@ -1269,6 +1280,56 @@ impl AgentRunner {
             .await
     }
 
+    async fn discard_stale_inbox_plan(
+        &self,
+        plan: &mut InboxEffectPlan,
+        path: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let current = self.claim_store.list_local_claims().await?;
+        let targets: Vec<_> = plan
+            .new_claims
+            .iter()
+            .cloned()
+            .chain(plan.updated_claims.iter().map(|u| u.target.clone()))
+            .collect();
+        claim_alignment::observe_applied(&targets, &current, &mut plan.applied_claims);
+        let differences = claim_alignment::changes(
+            plan.analysis_claims.as_deref(),
+            &targets,
+            &plan.applied_claims,
+            &current,
+        );
+        if !claim_alignment::analysis_is_stale(plan.analysis_claims.as_deref(), &differences) {
+            return Ok(());
+        }
+        if targets
+            .iter()
+            .any(|c| !plan.applied_claims.iter().any(|a| a.id == c.id))
+            || !plan.new_disputes.is_empty()
+        {
+            log::warn!(target: "agent", "inbox {}: {}", plan.inbox_id, claim_alignment::STALE_PLAN_WARNING);
+            plan.warnings
+                .push(claim_alignment::STALE_PLAN_WARNING.into());
+        }
+        // 剩余操作可能互相依赖，整批放弃，避免承接更新未执行却继续弃用来源。
+        // 已落盘的合法结果保留，并继续走既有上传和完成流程。
+        plan.new_claims.clear();
+        plan.updated_claims.clear();
+        plan.new_disputes.clear();
+        if plan.applied_claims.is_empty() {
+            plan.trace = None;
+        }
+        plan.deprecated_claim_ids = plan
+            .applied_claims
+            .iter()
+            .filter(|c| c.status == ClaimStatus::Deprecated)
+            .map(|c| c.id.clone())
+            .collect();
+        plan.analysis_claims = Some(current);
+        write_yaml_atomic(path, &InboxEffectRecord::Plan(Box::new(plan.clone()))).await?;
+        Ok(())
+    }
+
     async fn apply_claim_attribute_update_effect(
         &self,
         plan: &mut InboxEffectPlan,
@@ -1295,52 +1356,51 @@ impl AgentRunner {
             }
             plan.new_disputes = unreported;
         }
-        let mut current: FxHashMap<ClaimId, Claim> = self
-            .claim_store
-            .list_local_claims()
-            .await?
-            .into_iter()
-            .map(|claim| (claim.id.clone(), claim))
+        let current = self.claim_store.list_local_claims().await?;
+        let mut targets: Vec<_> = plan
+            .new_claims
+            .iter()
+            .cloned()
+            .chain(plan.updated_claims.iter().map(|u| u.target.clone()))
             .collect();
-        let mut claims_to_upload = Vec::new();
-        for target in &plan.new_claims {
-            match current.get(&target.id) {
-                Some(existing) if existing == target => claims_to_upload.push(target.clone()),
-                Some(_) => plan
-                    .warnings
-                    .push(format!("claim={} 已被其他本地操作占用，未覆盖", target.id)),
-                None => {
-                    self.claim_store.write_claim(target).await?;
-                    current.insert(target.id.clone(), target.clone());
-                    claims_to_upload.push(target.clone());
-                }
+        let differences = claim_alignment::changes(
+            plan.analysis_claims.as_deref(),
+            &targets,
+            &plan.applied_claims,
+            &current,
+        );
+        anyhow::ensure!(
+            targets
+                .iter()
+                .all(|c| plan.applied_claims.iter().any(|a| a.id == c.id))
+                || !claim_alignment::analysis_is_stale(
+                    plan.analysis_claims.as_deref(),
+                    &differences
+                ),
+            "Stale Inbox plan must be discarded before any write"
+        );
+        targets.sort_by_key(|c| c.status == ClaimStatus::Deprecated);
+        for target in targets {
+            if !plan.applied_claims.iter().any(|c| c.id == target.id) {
+                self.claim_store.write_claim(&target).await?;
+                plan.applied_claims.push(target);
+                write_yaml_atomic(
+                    &self.inbox_effect_path(&plan.inbox_id),
+                    &InboxEffectRecord::Plan(Box::new(plan.clone())),
+                )
+                .await?;
             }
         }
-        let mut applied_updated_claim_ids = FxHashSet::default();
-        for update in &plan.updated_claims {
-            match current.get(&update.target.id) {
-                Some(existing) if existing == &update.target => {
-                    applied_updated_claim_ids.insert(update.target.id.clone());
-                    claims_to_upload.push(update.target.clone());
-                }
-                Some(existing) if inbox_effect_hash(existing)? == update.preimage_hash => {
-                    self.claim_store.write_claim(&update.target).await?;
-                    current.insert(update.target.id.clone(), update.target.clone());
-                    applied_updated_claim_ids.insert(update.target.id.clone());
-                    claims_to_upload.push(update.target.clone());
-                }
-                Some(_) => plan.warnings.push(format!(
-                    "claim={} 在 effect prepared 后已变更，CAU 更新已 superseded",
-                    update.target.id
-                )),
-                None => plan.warnings.push(format!(
-                    "claim={} 在 effect prepared 后已缺失，CAU 更新已 superseded",
-                    update.target.id
-                )),
-            }
+        let latest = self.claim_store.list_local_claims().await?;
+        let claims_to_upload: Vec<_> = plan
+            .applied_claims
+            .iter()
+            .filter(|c| latest.contains(c))
+            .cloned()
+            .collect();
+        if let Some(trace) = &mut plan.trace {
+            trace.output_claims = plan.applied_claims.iter().map(|c| c.id.clone()).collect();
         }
-        plan.deprecated_claim_ids
-            .retain(|claim_id| applied_updated_claim_ids.contains(claim_id));
         if let Some(trace) = plan.trace.as_ref() {
             let path = paths::agent_home_traces_dir(self.maintainer_upload_queue.agent_home())
                 .join(format!("{}.yaml", trace.id));
@@ -1388,6 +1448,7 @@ impl AgentRunner {
             paths::agent_home_knowledge_apply_lock_path(self.maintainer_upload_queue.agent_home()),
         )
         .await?;
+        claim_alignment::ensure_knowledge_ready(self.maintainer_upload_queue.agent_home()).await?;
         let local = llm_visible_claims(self.claim_store.list_local_claims().await?);
         let source_policy_ids = inbox_policy_ids(&inbox_messages);
         let request = InternalizeRequest {
@@ -1977,35 +2038,37 @@ fn validate_effect_plan_message_member(
     Ok(())
 }
 
+/// CAU 来源约束：单一 Policy 可补齐，多 Policy 必须由模型指明。
+fn missing_cau_policy_source(
+    sources: &[String],
+    batch_policy_ids: &FxHashSet<PolicyId>,
+) -> anyhow::Result<Option<PolicyId>> {
+    if sources
+        .iter()
+        .any(|source| batch_policy_ids.iter().any(|id| source == id.as_str()))
+    {
+        return Ok(None);
+    }
+    if batch_policy_ids.len() == 1 {
+        return Ok(batch_policy_ids.iter().next().cloned());
+    }
+    anyhow::bail!("必须引用至少一个真正相关的本批 CAU PolicyId")
+}
+
 fn ensure_cau_policy_provenance(
     outcome: &mut InternalizeOutcome,
     batch_policy_ids: &FxHashSet<PolicyId>,
 ) -> anyhow::Result<()> {
-    let sole_policy = if batch_policy_ids.len() == 1 {
-        batch_policy_ids.iter().next().map(ToString::to_string)
-    } else {
-        None
-    };
     for (field, drafts) in [
         ("new_claims", &mut outcome.new_claims),
         ("updated_claims", &mut outcome.updated_claims),
     ] {
         for (index, draft) in drafts.iter_mut().enumerate() {
-            let has_batch_policy = draft.source_claim_ids.iter().any(|source| {
-                batch_policy_ids
-                    .iter()
-                    .any(|policy_id| source == &policy_id.to_string())
-            });
-            if has_batch_policy {
-                continue;
-            }
-            if let Some(policy_id) = sole_policy.as_ref() {
-                // 单一可归因 Policy 时沿用旧单条 CAU 的自动 provenance 行为。
-                draft.source_claim_ids.push(policy_id.clone());
-            } else {
-                anyhow::bail!(
-                    "ClaimAttributeUpdate {field}[{index}] 必须引用至少一个真正相关的本批 CAU PolicyId"
-                );
+            if let Some(id) = missing_cau_policy_source(&draft.source_claim_ids, batch_policy_ids)
+                .map_err(|error| {
+                anyhow::anyhow!("ClaimAttributeUpdate {field}[{index}]: {error}")
+            })? {
+                draft.source_claim_ids.push(id.to_string());
             }
         }
     }
@@ -2013,17 +2076,28 @@ fn ensure_cau_policy_provenance(
 }
 
 fn effect_summary(plan: &InboxEffectPlan) -> InternalizeSummary {
+    let mut claims: Vec<_> = plan
+        .new_claims
+        .iter()
+        .cloned()
+        .chain(plan.updated_claims.iter().map(|u| u.target.clone()))
+        .collect();
+    for claim in &plan.applied_claims {
+        if !claims.iter().any(|c| c.id == claim.id) {
+            claims.push(claim.clone());
+        }
+    }
     InternalizeSummary {
         trace_id: plan.trace.as_ref().map(|trace| trace.id.clone()),
-        new_claim_ids: plan
-            .new_claims
+        new_claim_ids: claims
             .iter()
-            .map(|claim| claim.id.clone())
+            .filter(|c| c.updated_at.is_none())
+            .map(|c| c.id.clone())
             .collect(),
-        updated_claim_ids: plan
-            .updated_claims
+        updated_claim_ids: claims
             .iter()
-            .map(|update| update.target.id.clone())
+            .filter(|c| c.updated_at.is_some())
+            .map(|c| c.id.clone())
             .collect(),
         deprecated_claim_ids: plan.deprecated_claim_ids.clone(),
         new_dispute_ids: plan
@@ -2774,6 +2848,67 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn policy_withdrawal_delivers_retirements_without_obsolete_consolidation_carriers() {
+        let dir = tempfile::tempdir().unwrap();
+        let InboxMessageKind::PolicyUpdate { policy } =
+            receipt_test_message(PolicyStatus::Deprecated).kind
+        else {
+            panic!("fixture policy");
+        };
+        let remote = Arc::new(PayloadRecordingMaintainerClient::default());
+        let runner = receipt_test_runner(
+            &dir,
+            Arc::new(LocalFsInboxReader::new(dir.path().into())),
+            remote.clone(),
+            empty_receipt_generator(),
+        );
+        let mut before = arbitration_claim("agent-a", "source", ClaimStatus::Active);
+        before.source_claim_ids = vec![SourceId::Policy(policy.id.clone())];
+        let mut retired = before.clone();
+        retired.status = ClaimStatus::Deprecated;
+        let mut carrier = arbitration_claim("agent-a", "carrier", ClaimStatus::Active);
+        carrier.source_claim_ids = before.source_claim_ids.clone();
+        runner.claim_store.write_claim(&retired).await.unwrap();
+        runner.claim_store.write_claim(&carrier).await.unwrap();
+        let dependency = super::super::consolidation_delivery::ConsolidationDelivery {
+            before,
+            retired: retired.clone(),
+            carriers: vec![carrier.clone()],
+        };
+        runner
+            .stage_consolidation_batch(
+                vec![retired.clone(), carrier.clone()],
+                vec![dependency.clone()],
+            )
+            .await
+            .unwrap();
+        // 普通 deprecated 更新不能解除整合保护，只有明确 Policy 撤回路径有此语义。
+        runner
+            .stage_maintainer_batch(vec![retired.clone()], vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            runner.pending_consolidations().await.unwrap(),
+            vec![dependency]
+        );
+        runner.apply_policy_deprecation(&policy).await.unwrap();
+        let uploaded = remote.claims.lock().unwrap();
+        assert_eq!(uploaded.len(), 2);
+        assert!(uploaded.iter().all(|c| c.status == ClaimStatus::Deprecated));
+        assert!(uploaded.iter().any(|c| c.id == retired.id));
+        assert!(uploaded.iter().any(|c| c.id == carrier.id));
+        drop(uploaded);
+        assert!(runner.pending_consolidations().await.unwrap().is_empty());
+        assert!(
+            !tokio::fs::try_exists(paths::agent_home_pending_maintainer_uploads_path(
+                dir.path()
+            ))
+            .await
+            .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -5772,5 +5907,188 @@ mod tests {
 
         assert_eq!(summary.new_dispute_ids.len(), 1);
         assert_eq!(maintainer.disputes.lock().unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn saved_inbox_plan_discards_stale_remainder_without_model_calls() {
+        for case in [
+            "unchanged",
+            "changed",
+            "legacy",
+            "applied_changed",
+            "not_applied",
+        ] {
+            let stale = case != "unchanged";
+            let dir = tempfile::tempdir().unwrap();
+            let inbox = Arc::new(LocalFsInboxReader::new(dir.path().into()));
+            let mut message = receipt_test_message(PolicyStatus::Active);
+            let InboxMessageKind::PolicyUpdate { mut policy } = message.kind else {
+                panic!("fixture policy")
+            };
+            policy.message_type = PolicyMessageType::ClaimAttributeUpdate;
+            message.kind = InboxMessageKind::ClaimAttributeUpdate {
+                policy,
+                arbitration_resolution: None,
+            };
+            inbox.accept_pulled(&message).await.unwrap();
+            let generator = Arc::new(RecordingClaimAttributeUpdateGenerator {
+                response: json!({"new_claims":[],"updated_claims":[],"new_disputes":[]}),
+                requests: Mutex::new(vec![]),
+            });
+            let remote = Arc::new(RecordingAckMaintainerClient::new(vec![], false));
+            let runner = receipt_test_runner(&dir, inbox, remote, generator.clone());
+            let carrier = arbitration_claim("agent-a", "carrier", ClaimStatus::Active);
+            let source = arbitration_claim("agent-a", "source", ClaimStatus::Active);
+            let already = arbitration_claim("agent-a", "already_created", ClaimStatus::Active);
+            runner.claim_store.write_claim(&carrier).await.unwrap();
+            runner.claim_store.write_claim(&source).await.unwrap();
+            let mut plan = runner
+                .prepare_claim_attribute_update_effect(
+                    generator.as_ref(),
+                    std::slice::from_ref(&message),
+                )
+                .await
+                .unwrap();
+            for before in [&carrier, &source] {
+                let mut target = before.clone();
+                target.updated_at = Some(crate::time::now_seconds());
+                if target.id == carrier.id {
+                    target.statement = "combined rule".into();
+                } else {
+                    target.status = ClaimStatus::Deprecated;
+                }
+                plan.updated_claims.push(PlannedClaimUpdate {
+                    target,
+                    preimage_hash: inbox_effect_hash(before).unwrap(),
+                });
+            }
+            plan.new_claims.push(already.clone());
+            plan.trace = Some(Trace {
+                id: TraceId::random(),
+                name: "inbox_claim_attribute_update".into(),
+                task: "review claim attributes".into(),
+                agent: carrier.holder.clone(),
+                input_claims: vec![SourceId::Claim(carrier.id.clone())],
+                output_claims: vec![carrier.id.clone(), source.id.clone(), already.id.clone()],
+                created_at: crate::time::now_seconds(),
+            });
+            plan.deprecated_claim_ids.push(source.id.clone());
+            if stale {
+                plan.new_disputes.push(Dispute {
+                    id: DisputeId::random(),
+                    name: "pending_conflict".into(),
+                    reporter_agent_id: carrier.holder.clone(),
+                    claims: vec![carrier.id.clone(), already.id.clone()],
+                    summary: "original pending conflict".into(),
+                    status: crate::claim::DisputeStatus::Open,
+                    created_at: crate::time::now_seconds(),
+                    resolved_at: None,
+                });
+            }
+            // 模拟写入成功但尚未保存逐项进度；恢复应识别为已完成。
+            if case != "not_applied" {
+                runner.claim_store.write_claim(&already).await.unwrap();
+            }
+            let mut current = carrier.clone();
+            if case == "changed" || case == "not_applied" {
+                current.scope = "knowledge / tenant imports".into();
+            } else if case == "applied_changed" {
+                plan.applied_claims
+                    .push(plan.updated_claims[0].target.clone());
+                current.statement = "later independent correction".into();
+            }
+            runner.claim_store.write_claim(&current).await.unwrap();
+            let path = runner.inbox_effect_path(&message.id);
+            let mut saved = serde_json::to_value(&plan).unwrap();
+            if case == "legacy" {
+                saved.as_object_mut().unwrap().remove("analysis_claims");
+                saved["original_input"] = json!({"local_claims":[]});
+                saved["continuations"] = json!([]);
+            }
+            write_yaml_atomic(&path, &saved).await.unwrap();
+            let report = runner.process_inbox_with(generator.as_ref()).await;
+            assert!(report.failures.is_empty(), "{case}: {:?}", report.failures);
+            assert_eq!(generator.requests.lock().unwrap().len(), 1, "{case}");
+            let claims = runner.claim_store.list_local_claims().await.unwrap();
+            assert_eq!(claims.len(), if case == "not_applied" { 2 } else { 3 });
+            assert_eq!(claims.contains(&already), case != "not_applied");
+            if stale {
+                assert!(claims.contains(&source), "{case}");
+                assert!(claims.contains(&current), "{case}");
+                assert!(report.warnings.iter().any(|w| w.contains("已放弃")));
+            } else {
+                assert!(plan
+                    .updated_claims
+                    .iter()
+                    .all(|u| claims.contains(&u.target)));
+                assert!(report.warnings.is_empty());
+            }
+            let applied: InboxEffectPlan = read_yaml(&path).await.unwrap();
+            assert_eq!(applied.state, InboxEffectState::Applied);
+            assert!(applied.new_disputes.is_empty());
+            if stale {
+                assert!(applied.updated_claims.is_empty());
+                assert!(applied.new_claims.is_empty());
+                assert!(applied.deprecated_claim_ids.is_empty());
+                assert_eq!(
+                    applied.applied_claims.len(),
+                    match case {
+                        "applied_changed" => 2,
+                        "not_applied" => 0,
+                        _ => 1,
+                    }
+                );
+            }
+            if case == "not_applied" {
+                assert!(applied.trace.is_none());
+            } else {
+                let trace = applied.trace.as_ref().unwrap();
+                let stored: Trace = read_yaml(
+                    &paths::agent_home_traces_dir(dir.path()).join(format!("{}.yaml", trace.id)),
+                )
+                .await
+                .unwrap();
+                assert_eq!(stored.output_claims.len(), applied.applied_claims.len());
+                if stale {
+                    assert!(!stored.output_claims.contains(&source.id));
+                }
+            }
+            // 放弃后结束原批次，重复处理不会重新分析、执行或生成对象。
+            let repeated = runner.process_inbox_with(generator.as_ref()).await;
+            assert!(repeated.failures.is_empty());
+            assert_eq!(repeated.total, 0);
+            assert_eq!(generator.requests.lock().unwrap().len(), 1);
+            assert_eq!(
+                runner.claim_store.list_local_claims().await.unwrap(),
+                claims
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_dream_commit_defers_inbox_without_consuming_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = Arc::new(LocalFsInboxReader::new(dir.path().into()));
+        let message = receipt_test_message(PolicyStatus::Active);
+        inbox.accept_pulled(&message).await.unwrap();
+        let generator = empty_receipt_generator();
+        let runner = receipt_test_runner(
+            &dir,
+            inbox,
+            Arc::new(RecordingAckMaintainerClient::new(vec![], false)),
+            generator.clone(),
+        );
+        let pending = dir.path().join("runtime/supervisor/dream_pending.yaml");
+        write_yaml_atomic(&pending, &dir.path().join("missing-checkpoint.yaml"))
+            .await
+            .unwrap();
+        let report = runner.process_inbox_with(generator.as_ref()).await;
+        assert_eq!(report.failures.len(), 1);
+        assert!(report.failures[0]
+            .error
+            .contains("Dream local commit needs recovery"));
+        tokio::fs::remove_file(pending).await.unwrap();
+        let report = runner.process_inbox_with(generator.as_ref()).await;
+        assert!(report.failures.is_empty());
+        assert_eq!(report.total, 1);
     }
 }

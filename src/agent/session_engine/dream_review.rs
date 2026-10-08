@@ -1,7 +1,7 @@
 //! 同一 Dream 上下文的双向内容复核协议；校验引用和版本，不声称证明语义正确。
 use super::claim_context::content_hash;
 use super::dream_draft_feedback;
-use super::dream_plan::{Kind, OperationGroup, Plan};
+use super::dream_plan::{check_factual_correction_eligible, Kind, OperationGroup, Plan};
 use crate::claim::{Claim, ClaimId};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -108,7 +108,7 @@ pub(super) fn basis_error(group: &OperationGroup, input: &Value) -> Option<Strin
         .map(|b| b.claim_id.clone())
         .collect();
     if explained != changed || group.change_basis.len() != changed.len() {
-        return Some(format!("change_basis must describe every changed/deprecated claim exactly once, excluding keep: {changed:?}. Explain removed_or_changed, added (empty if none), justification and evidence_ids."));
+        return Some(format!("change_basis must describe every changed/deprecated claim exactly once, excluding keep. Changed IDs: {changed:?}; missing entries: {:?}; unexpected/keep entries: {:?}; duplicate entries: {}. Repair parameters without dropping intended knowledge: each entry needs claim_id, removed_or_changed, added (empty if none), justification and evidence_ids.", changed.difference(&explained).collect::<Vec<_>>(), explained.difference(&changed).collect::<Vec<_>>(), group.change_basis.len() != explained.len()));
     }
     for basis in &group.change_basis {
         if basis.removed_or_changed.trim().is_empty() || basis.justification.trim().is_empty() {
@@ -335,7 +335,8 @@ pub(super) fn validate_review(validation: &Validation, review: &SelfReview) -> a
             Disposition::Corrected => {
                 anyhow::ensure!(!item.evidence.is_empty(), "Removing/changing a factual rule requires new direct evidence; absent verification is not counterevidence");
                 let original = input["before"].as_array().and_then(|v| v.iter().find(|c| c["id"] == json!(item.before.claim_id)));
-                anyhow::ensure!(original.is_some_and(|c| c["confidence"] != "high"), "B factual corrections only accept original medium/low Claims, including corrections mixed into A/C");
+                anyhow::ensure!(original.is_some(), "Missing original Claim {} for factual correction", item.before.claim_id);
+                check_factual_correction_eligible(&item.before.claim_id, original.is_some_and(|c| c["confidence"] == "high"))?;
                 let basis = input["change_basis"].as_array().and_then(|v| v.iter().find(|b| b["claim_id"] == json!(item.before.claim_id)));
                 anyhow::ensure!(basis.is_some_and(|b| item.evidence.iter().all(|e| b["evidence_ids"].as_array().is_some_and(|ids| ids.contains(&json!(e.evidence_id))))), "Corrected information must cite this Claim's change_basis evidence");
                 let target = input["after"].as_array().and_then(|v| v.iter().find(|c| c["id"] == json!(item.before.claim_id)));

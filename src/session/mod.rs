@@ -215,6 +215,12 @@ pub enum FinalizeCheckpointStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// Recap/Finalize 共用的单代 checkpoint；物理文件名保留为 `finalize_checkpoint.yaml`。
 pub struct FinalizeCheckpoint {
+    #[serde(default)]
+    pub analysis_claims: Option<Vec<Claim>>,
+    #[serde(default)]
+    pub applied_claims: Vec<Claim>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
     pub recap_start_index: usize,
     pub recap_end_index: usize,
     pub recap_segment_hash: String,
@@ -2835,6 +2841,9 @@ frontier:
             .unwrap();
         session
             .write_finalize_checkpoint(&FinalizeCheckpoint {
+                analysis_claims: Some(Vec::new()),
+                applied_claims: Vec::new(),
+                warnings: Vec::new(),
                 recap_start_index: 0,
                 recap_end_index: 0,
                 recap_segment_hash: "legacy-hash".into(),
@@ -3409,6 +3418,9 @@ frontier:
             .await
             .unwrap();
         let checkpoint = FinalizeCheckpoint {
+            analysis_claims: Some(Vec::new()),
+            applied_claims: Vec::new(),
+            warnings: Vec::new(),
             recap_start_index: 0,
             recap_end_index: 2,
             recap_segment_hash: "hash".into(),
@@ -4433,6 +4445,9 @@ frontier:
             .unwrap();
         handle.advance_recapped_until(2).await.unwrap();
         let checkpoint = FinalizeCheckpoint {
+            analysis_claims: Some(Vec::new()),
+            applied_claims: Vec::new(),
+            warnings: Vec::new(),
             recap_start_index: 0,
             recap_end_index: 2,
             recap_segment_hash: "hash".into(),

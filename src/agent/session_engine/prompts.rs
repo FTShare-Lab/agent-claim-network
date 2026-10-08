@@ -160,25 +160,34 @@ impl SessionEngine {
         } else {
             (String::new(), String::new())
         };
-        let (prompt_claims, local_claims_snapshot) =
-            match self.agent.claim_store.list_local_claims().await {
-                Ok(claims) => {
-                    let snapshot =
-                        format_local_claims_snapshot(&llm_visible_claims(claims.clone()));
-                    (claims, snapshot)
-                }
-                Err(error) => {
-                    log::warn!(
-                        target: "agent",
-                        "读取本地 Claim 快照失败，以空快照继续启动: {error:#}"
-                    );
-                    // 基线必须与实际注入内容一致，读取恢复后由 runtime_context 补充。
-                    (
-                        Vec::new(),
-                        "本次会话未载入本地 Claim 快照；后续变化通过 runtime_context 补充。".into(),
-                    )
-                }
-            };
+        let claims_result = async {
+            let home = self.runner.maintainer_upload_queue.agent_home();
+            let _guard = crate::storage::FileLockGuard::try_lock_exclusive(
+                &crate::storage::paths::agent_home_knowledge_apply_lock_path(home),
+            )
+            .await?
+            .context("Claim store is being updated")?;
+            crate::agent::claim_alignment::ensure_knowledge_ready(home).await?;
+            self.agent.claim_store.list_local_claims().await
+        }
+        .await;
+        let (prompt_claims, local_claims_snapshot) = match claims_result {
+            Ok(claims) => {
+                let snapshot = format_local_claims_snapshot(&llm_visible_claims(claims.clone()));
+                (claims, snapshot)
+            }
+            Err(error) => {
+                log::warn!(
+                    target: "agent",
+                    "读取本地 Claim 快照失败，以空快照继续启动: {error:#}"
+                );
+                // 基线必须与实际注入内容一致，读取恢复后由 runtime_context 补充。
+                (
+                    Vec::new(),
+                    "本次会话未载入本地 Claim 快照；后续变化通过 runtime_context 补充。".into(),
+                )
+            }
+        };
         let context = SessionSystemPromptContext {
             agent_id: &self.agent.agent_id,
             memory_enabled,

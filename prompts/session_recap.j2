@@ -120,6 +120,7 @@ claim/dispute 的生成应基于 transcript、`background_process_completions` �
 - `new_claims` 不要返回 `status`；即使误传，后端也会忽略并把新 claim 初始化为 `active`
 - `updated_claims` 只能更新 `local_claims` 中已有的 claim，必须输出完整属性和 `status`；更新后的状态可以是 `active`、`stale` 或 `deprecated`
 - 更新已有 claim 时，`source_claim_ids` 是更新后的完整来源列表；仍相关的来源 id 需要一并返回
+- **新增和更新的 `source_claim_ids` 都不得包含该 Claim 自己的 ID 或自己的新建占位符**。自身旧版本不是独立来源；更新已有 Claim 不需要把自身作为来源，保留其他仍相关的真实来源即可。
 - `new_disputes[*].claims`：至少 2 条，且每条要么是真实已存在的 claim id，要么是本次新生成 claim 的占位符——**不要写现实中不存在的 id** 
 - 没有新增内容时各数组就给空 `[]`；不要硬塞
 - 不要返回 holder / created_at / updated_at；这些字段由后端维护

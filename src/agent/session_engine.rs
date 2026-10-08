@@ -3063,6 +3063,9 @@ impl SessionEngine {
     where
         F: FnMut(SessionEvent) + Send,
     {
+        if let Err(error) = self.recover_pending_dream_execution().await {
+            log::warn!(target: "agent", "Dream local recovery deferred before inbox: {error:#}");
+        }
         let inbox_generator = SessionInboxJsonGenerator {
             prompt_registry: &self.prompt_registry,
             json_caller: &self.json_caller,
@@ -3125,6 +3128,9 @@ impl SessionEngine {
             label: "processing inbox...".into(),
         });
         let inbox_fallback_scope = crate::api::ProviderRuntimeFallbackScope::new_root();
+        if let Err(error) = self.recover_pending_dream_execution().await {
+            log::warn!(target: "agent", "Dream local recovery deferred before inbox: {error:#}");
+        }
         let inbox_generator = SessionInboxJsonGenerator {
             prompt_registry: &self.prompt_registry,
             json_caller: &self.json_caller,
@@ -3902,6 +3908,9 @@ impl SessionEngine {
         emit(SessionEvent::InboxStarted);
         self.append_session_event_log(session, "INFO", "Inbox sync started")
             .await;
+        if let Err(error) = self.recover_pending_dream_execution().await {
+            log::warn!(target: "agent", "Dream local recovery deferred before inbox: {error:#}");
+        }
         let inbox_generator = SessionInboxJsonGenerator {
             prompt_registry: &self.prompt_registry,
             json_caller: &self.json_caller,
@@ -6951,10 +6960,15 @@ fn validate_finalize_checkpoint_segment(
 
 fn report_from_finalize_checkpoint(
     checkpoint: &FinalizeCheckpoint,
-    warnings: Vec<String>,
+    mut warnings: Vec<String>,
 ) -> SessionFinalizeReport {
+    warnings.extend(checkpoint.warnings.clone());
     let (new_claim_ids, updated_claim_ids) =
-        partition_prepared_claim_ids(&checkpoint.prepared_claims);
+        partition_prepared_claim_ids(if checkpoint.applied_claims.is_empty() {
+            &checkpoint.prepared_claims
+        } else {
+            &checkpoint.applied_claims
+        });
     SessionFinalizeReport {
         trace_id: checkpoint.trace_id.clone(),
         new_claim_ids,

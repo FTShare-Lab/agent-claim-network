@@ -447,9 +447,11 @@ async fn dream_high_evidence_change_returns_feedback_and_can_finish_unchanged() 
     let requests = provider.requests().await;
     assert_eq!(requests.len(), 3);
     assert!(requests.iter().all(|r| !r.json_output));
-    assert!(serde_json::to_string(&requests[1].messages)
-        .unwrap()
-        .contains("original medium/low"));
+    let feedback = serde_json::to_string(&requests[1].messages).unwrap();
+    assert!(feedback.contains("original medium/low"));
+    assert!(feedback.contains("boundary_feedback"));
+    assert!(feedback.contains("change_plan_or_keep"));
+    assert!(feedback.contains("claim_11111111"));
 }
 
 fn stage_change(group: &str, id: &str, action: &str, changes: Value) -> Value {
@@ -504,7 +506,7 @@ async fn dream_self_review_repairs_in_same_context_and_writes_auditable_results(
     assert_eq!(requests.len(), 5, "No hidden independent model calls");
     assert!(requests
         .iter()
-        .all(|r| r.system_prompt == requests[0].system_prompt && r.tools.len() == 12));
+        .all(|r| r.system_prompt == requests[0].system_prompt && r.tools.len() == 13));
     let last = serde_json::to_string(&requests[4].messages).unwrap();
     assert!(last.contains("does not write Claims") && last.contains(&original.statement));
     let audit = home.join("dream/job_review");
@@ -1303,5 +1305,262 @@ async fn dream_candidate_retry_can_keep_uncertain_b_then_execute_a_through_real_
     assert_eq!(
         claims.iter().find(|c| c.id == record.id).unwrap().status,
         ClaimStatus::Deprecated
+    );
+}
+
+#[tokio::test]
+async fn dream_rejected_execution_replay_and_recovery_keep_candidate_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let claim = dream_fixture_claim("claim_11111111");
+    let (engine, execution, reviewer) =
+        incremental_reviewer(&dir, std::slice::from_ref(&claim)).await;
+    let apply = checked_deprecation(&reviewer, &claim).await;
+    let before_execution = reviewer.snapshot().await;
+    assert_eq!(
+        draft_call(&reviewer, "dream_apply_group", apply.clone()).await["accepted"],
+        true
+    );
+    // 模拟已落盘的版本冲突终态，以及探索状态保存前中断。
+    let (path, mut record) = execution.records().await.unwrap().remove(0);
+    record.groups[0].skipped = true;
+    record.self_versions.clear();
+    crate::storage::write_yaml_atomic(&path, &record)
+        .await
+        .unwrap();
+    let mut current = claim.clone();
+    current.scope = "new local scope".into();
+    engine
+        .agent
+        .claim_store
+        .write_claim(&current)
+        .await
+        .unwrap();
+    let restored = super::super::dream_draft::Reviewer::new(
+        engine.agent.agent_id.clone(),
+        vec![claim],
+        before_execution,
+        None,
+    )
+    .with_execution(execution);
+    restored.reconcile_executions().await.unwrap();
+    let state = restored.resume_input(&BTreeMap::new()).await;
+    assert_eq!(state["candidate_progress"]["current"]["group_id"], "a");
+    let replay = draft_call(&restored, "dream_apply_group", apply).await;
+    assert_eq!(replay["accepted"], false);
+    assert_eq!(replay["committed"], false);
+    assert_eq!(replay["current_claims"][0]["scope"], current.scope);
+    assert_eq!(
+        draft_call(&restored, "dream_finish", finish_groups(&[])).await["accepted"],
+        false
+    );
+    let fresh = checked_deprecation(&restored, &current).await;
+    let result = draft_call(&restored, "dream_apply_group", fresh).await;
+    assert_eq!(result["accepted"], true, "{result}");
+}
+
+#[tokio::test]
+async fn dream_sync_review_is_version_bound_audited_and_never_modifies_claims() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _) = build_test_engine(&dir, Arc::new(RecordingProvider::new(vec![])));
+    let mut before = dream_fixture_claim("claim_11111111");
+    let mut carrier = dream_fixture_claim("claim_22222222");
+    let policy_source = crate::claim::SourceId::Policy(crate::claim::PolicyId::random());
+    before.source_claim_ids = vec![
+        policy_source.clone(),
+        crate::claim::SourceId::Claim(carrier.id.clone()),
+    ];
+    carrier.source_claim_ids = vec![policy_source.clone()];
+    let mut retired = before.clone();
+    retired.status = ClaimStatus::Deprecated;
+    engine
+        .agent
+        .claim_store
+        .write_claim(&retired)
+        .await
+        .unwrap();
+    engine
+        .agent
+        .claim_store
+        .write_claim(&carrier)
+        .await
+        .unwrap();
+    let dependency = crate::agent::consolidation_delivery::ConsolidationDelivery {
+        before: before.clone(),
+        retired: retired.clone(),
+        carriers: vec![carrier.clone()],
+    };
+    engine
+        .runner
+        .stage_consolidation_batch(
+            vec![retired.clone(), carrier.clone()],
+            vec![dependency.clone()],
+        )
+        .await
+        .unwrap();
+    let execution = super::super::dream_execution::Execution::new(
+        engine.clone(),
+        "job_sync",
+        &dir.path().join("jobs"),
+        vec![carrier.clone()],
+        json!({}),
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    let query = json!({"source_id":retired.id,"carrier_ids":[carrier.id]});
+    let first = execution.review_sync(query.clone()).await.unwrap();
+    let first_validation: super::super::dream_review::Validation =
+        serde_json::from_value(first["validation"].clone()).unwrap();
+    let mut changed = carrier.clone();
+    changed.name = "updated_carrier_name".into();
+    engine
+        .agent
+        .claim_store
+        .write_claim(&changed)
+        .await
+        .unwrap();
+    let make_review = |validation_id: &str| {
+        json!({
+            "source_id":retired.id,"carrier_ids":[carrier.id],"validation_id":validation_id,
+            "review":{"claims":[{"claim_id":retired.id,"final_name":retired.name,
+                "name_reason":"Historical source name is retained",
+                "information_preserved":"Carrier preserves every source condition and exception",
+                "removal_or_correction":"No correction or loss of knowledge",
+                "factual_correction":false,"output_ids":[carrier.id],"evidence_ids":[]}],
+                "scope_and_certainty":"Same scope and evidence boundaries; only confirm the delivery relation"}
+        })
+    };
+    let stale_review = make_review(&first_validation.validation_id);
+    assert!(execution.review_sync(stale_review).await.is_err());
+    assert_eq!(
+        engine.runner.pending_consolidations().await.unwrap(),
+        vec![dependency]
+    );
+    // 名称可以改变，但 Policy 来源丢失时不能仅凭语义自述解除同步保护。
+    changed.source_claim_ids.clear();
+    engine
+        .agent
+        .claim_store
+        .write_claim(&changed)
+        .await
+        .unwrap();
+    let missing = execution.review_sync(query.clone()).await.unwrap();
+    let error = execution
+        .review_sync(make_review(
+            missing["validation"]["validation_id"].as_str().unwrap(),
+        ))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("missing source"));
+    assert_eq!(
+        engine.runner.pending_consolidations().await.unwrap()[0].carriers,
+        vec![carrier.clone()]
+    );
+    changed.source_claim_ids.push(policy_source);
+    engine
+        .agent
+        .claim_store
+        .write_claim(&changed)
+        .await
+        .unwrap();
+    let fresh = execution.review_sync(query.clone()).await.unwrap();
+    let validation: super::super::dream_review::Validation =
+        serde_json::from_value(fresh["validation"].clone()).unwrap();
+    let reviewed = make_review(&validation.validation_id);
+    let mut invalid = reviewed.clone();
+    invalid["review"]["claims"][0]["factual_correction"] = json!(true);
+    assert!(execution.review_sync(invalid).await.is_err());
+    assert_eq!(
+        execution.review_sync(reviewed).await.unwrap()["committed"],
+        true
+    );
+    let current = engine.agent.claim_store.list_local_claims().await.unwrap();
+    assert!(current.contains(&retired) && current.contains(&changed));
+    assert_eq!(current.len(), 2);
+    assert_eq!(
+        engine.runner.pending_consolidations().await.unwrap()[0].carriers,
+        vec![changed]
+    );
+    let record: Value = crate::storage::read_yaml(
+        &dir.path()
+            .join("agents/agent-a/dream/job_sync/sync_reviews")
+            .join(format!("{}.yaml", validation.validation_id)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(record["applied"], true);
+}
+
+#[tokio::test]
+async fn dream_write_error_keeps_unknown_commit_until_durable_recovery() {
+    struct FailAfterFirstWrite {
+        inner: Arc<dyn crate::agent::LocalClaimStore>,
+        fail: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl crate::agent::LocalClaimStore for FailAfterFirstWrite {
+        async fn write_claim(&self, claim: &Claim) -> anyhow::Result<()> {
+            self.inner.write_claim(claim).await?;
+            if self.fail.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("fixture: write reached disk before completion failed");
+            }
+            Ok(())
+        }
+        async fn list_local_claims(&self) -> anyhow::Result<Vec<Claim>> {
+            self.inner.list_local_claims().await
+        }
+        async fn write_trace(&self, trace: &crate::claim::Trace) -> anyhow::Result<()> {
+            self.inner.write_trace(trace).await
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = build_dream_test_engine(&dir, Arc::new(RecordingProvider::new(vec![])));
+    let claim = dream_fixture_claim("claim_11111111");
+    engine.agent.claim_store.write_claim(&claim).await.unwrap();
+    let store = Arc::new(FailAfterFirstWrite {
+        inner: engine.agent.claim_store.clone(),
+        fail: std::sync::atomic::AtomicBool::new(true),
+    });
+    Arc::make_mut(&mut engine.agent).claim_store = store;
+    let execution = Arc::new(
+        super::super::dream_execution::Execution::new(
+            engine.clone(),
+            "job_recovery_feedback",
+            &dir.path().join("jobs"),
+            vec![claim.clone()],
+            json!({}),
+            Utc::now(),
+        )
+        .await
+        .unwrap(),
+    );
+    let reviewer = super::super::dream_draft::Reviewer::new(
+        engine.agent.agent_id.clone(),
+        vec![claim.clone()],
+        Default::default(),
+        None,
+    )
+    .with_execution(execution.clone());
+    let apply = checked_deprecation(&reviewer, &claim).await;
+    let snapshot = reviewer.snapshot().await;
+    let failed = draft_call(&reviewer, "dream_apply_group", apply.clone()).await;
+    assert_eq!(failed["committed"], Value::Null, "{failed}");
+    assert_eq!(failed["recovery_required"], true);
+    engine.recover_pending_dream_execution().await.unwrap();
+    let restored = super::super::dream_draft::Reviewer::new(
+        engine.agent.agent_id.clone(),
+        vec![claim.clone()],
+        snapshot,
+        None,
+    )
+    .with_execution(execution);
+    restored.reconcile_executions().await.unwrap();
+    let result = draft_call(&restored, "dream_apply_group", apply).await;
+    assert_eq!(result["accepted"], true, "{result}");
+    assert_eq!(result["committed"], true);
+    assert_eq!(result["actual_changed_ids"], json!([claim.id]));
+    assert_eq!(
+        result["draft_state"]["candidate_progress"]["handled"][0]["outcome"]["status"],
+        "executed"
     );
 }
