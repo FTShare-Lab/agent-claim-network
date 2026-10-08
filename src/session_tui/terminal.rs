@@ -155,28 +155,21 @@ impl TerminalGuard {
         for line in scrollback_lines {
             write_line(stdout, line).context("写入 TUI scrollback 失败")?;
         }
-        if can_reuse_live_region {
-            write_live_region_in_place(stdout, live_lines, previous_live_region_height)
-                .context("绘制 TUI live region 失败")?;
-            move_cursor_after_in_place_live_region(
-                stdout,
-                live_lines.len(),
-                previous_live_region_height.max(live_lines.len()),
-                cursor,
-            )
-            .context("移动 TUI 光标失败")?;
-        } else {
-            for line in live_lines {
-                write_line(stdout, line).context("绘制 TUI live region 失败")?;
-            }
-            move_cursor_after_appended_live_region(stdout, live_lines.len(), cursor)
-                .context("移动 TUI 光标失败")?;
-        }
         let reserved_live_rows = if can_reuse_live_region {
             previous_live_region_height.max(live_lines.len())
         } else {
             live_lines.len()
         };
+        if can_reuse_live_region {
+            write_live_region_in_place(stdout, live_lines, previous_live_region_height)
+                .context("绘制 TUI live region 失败")?;
+        } else {
+            write_live_region_appended(stdout, live_lines).context("绘制 TUI live region 失败")?;
+        }
+        if !live_lines.is_empty() {
+            move_cursor_after_live_region(stdout, live_lines.len(), reserved_live_rows, cursor)
+                .context("移动 TUI 光标失败")?;
+        }
         self.live_region_line_widths = live_lines.iter().map(printed_line_width).collect();
         self.live_region_line_widths.extend(std::iter::repeat_n(
             0,
@@ -292,6 +285,17 @@ fn set_surface_background(stdout: &mut impl Write) -> io::Result<()> {
     Ok(())
 }
 
+// 实时区末行不换行，否则满屏重绘会把顶边框滚入无法逐帧清除的终端历史。
+fn write_live_region_appended(stdout: &mut impl Write, lines: &[Line<'static>]) -> io::Result<()> {
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            execute!(stdout, Print("\r\n"))?;
+        }
+        write_line_in_place(stdout, line)?;
+    }
+    Ok(())
+}
+
 fn write_live_region_in_place(
     stdout: &mut impl Write,
     lines: &[Line<'static>],
@@ -346,26 +350,8 @@ fn write_line_in_place(stdout: &mut impl Write, line: &Line<'static>) -> io::Res
     execute!(stdout, ResetColor, SetAttribute(Attribute::Reset))
 }
 
-fn move_cursor_after_appended_live_region(
-    stdout: &mut impl Write,
-    live_line_count: usize,
-    cursor: Option<(u16, u16)>,
-) -> io::Result<()> {
-    if let Some((column, row)) = cursor {
-        let up = live_line_count.saturating_sub(usize::from(row));
-        if up > 0 {
-            execute!(stdout, MoveUp(u16::try_from(up).unwrap_or(u16::MAX)))?;
-        }
-        execute!(stdout, MoveToColumn(column), Show)?;
-    } else if live_line_count > 0 {
-        // None（无 composer 光标）：append 末行的 \r\n 把光标留在 region 下方一行。上移回底行，
-        // 让下一帧 clear_live_region 有确定且在屏内的起点（满屏时不依赖会被 clamp 的越界位置）。
-        execute!(stdout, MoveUp(1), MoveToColumn(0), Hide)?;
-    }
-    Ok(())
-}
-
-fn move_cursor_after_in_place_live_region(
+// 追加和原地绘制都停在实际内容末行，以同一位置约定放置输入光标或隐藏光标。
+fn move_cursor_after_live_region(
     stdout: &mut impl Write,
     live_line_count: usize,
     reserved_rows: usize,
@@ -851,10 +837,11 @@ mod tests {
 
     use super::{
         clear_screen_with_surface_background, coalesce_paste_burst, commit_frame,
-        live_region_cursor_visual_row, live_region_visual_height, printed_line_width,
-        render_synchronized_frame, set_surface_background, terminal_safe_content,
-        tmux_should_enable_modify_other_keys_for, trailing_space_trimmed_spans,
-        visual_rows_for_width, write_line, DisableModifyOtherKeys, EnableModifyOtherKeys,
+        live_region_cursor_visual_row, live_region_visual_height, move_cursor_after_live_region,
+        printed_line_width, render_synchronized_frame, set_surface_background,
+        terminal_safe_content, tmux_should_enable_modify_other_keys_for,
+        trailing_space_trimmed_spans, visual_rows_for_width, write_line,
+        write_live_region_appended, DisableModifyOtherKeys, EnableModifyOtherKeys,
     };
     use crate::session_tui::theme::{DIFF_ADDED_BG, DIFF_REMOVED_BG};
 
@@ -931,6 +918,63 @@ mod tests {
         assert_eq!(output.bytes, frame);
         assert_eq!(output.write_calls, 1);
         assert_eq!(output.flush_calls, 1);
+    }
+
+    #[test]
+    fn appended_live_region_does_not_reserve_a_row_beyond_its_last_line() -> anyhow::Result<()> {
+        for lines in [
+            vec![],
+            vec![Line::from("header")],
+            vec![Line::from("header"), Line::from("body"), Line::default()],
+        ] {
+            let mut output = Vec::new();
+            write_live_region_appended(&mut output, &lines)?;
+            let ansi = String::from_utf8(output)?;
+            assert_eq!(ansi.matches("\r\n").count(), lines.len().saturating_sub(1));
+            assert!(!ansi.ends_with("\r\n"));
+            if lines.is_empty() {
+                assert!(ansi.is_empty());
+            } else {
+                assert!(ansi.contains("header"));
+                assert_eq!(ansi.matches("\x1b[2K").count(), lines.len());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn live_cursor_is_positioned_from_the_last_content_row() -> anyhow::Result<()> {
+        use crossterm::cursor::{MoveToColumn, MoveUp, Show};
+
+        let mut output = Vec::new();
+        move_cursor_after_live_region(&mut output, 4, 4, Some((3, 1)))?;
+        assert_eq!(
+            String::from_utf8(output)?,
+            format!(
+                "{}{}{}",
+                ansi_for(MoveUp(2)),
+                ansi_for(MoveToColumn(3)),
+                ansi_for(Show)
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hidden_live_cursor_stays_inside_reserved_rows() -> anyhow::Result<()> {
+        use crossterm::cursor::{Hide, MoveDown, MoveToColumn};
+
+        for (content_rows, reserved_rows, movement) in
+            [(4, 4, String::new()), (2, 4, ansi_for(MoveDown(2)))]
+        {
+            let mut output = Vec::new();
+            move_cursor_after_live_region(&mut output, content_rows, reserved_rows, None)?;
+            assert_eq!(
+                String::from_utf8(output)?,
+                format!("{movement}{}{}", ansi_for(MoveToColumn(0)), ansi_for(Hide))
+            );
+        }
+        Ok(())
     }
 
     #[test]

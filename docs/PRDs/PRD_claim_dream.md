@@ -225,7 +225,7 @@ dream_finish { group_ids: [], review: { quality, evidence, consolidation } }
 - 最新差异快照覆盖旧通知；既有 ModelContext fingerprint 去重，相同内容不会反复注入。先新增后删除的条目保留 removed 提示。
 - 不设置 Agent 级共享消费游标。多个会话各有基准，各自收到变化；Resume 继续使用该会话的 baseline 与已持久化 ModelContext。
 - 复用 Provider WAL、失败恢复和 compaction 投影，没有“通知未送出、已读游标却提前推进”的窗口。
-- 获取知识锁时不等待长任务；锁忙则保留先前通知，下个 turn 重试。read_claim / read_trace 也拒绝读取正在提交中的半完成快照。
+- 获取知识锁时不等待长任务；锁忙则保留先前通知，下个 turn 重试。主会话 `claim` 与 Dream 专用 `read_claim` / `read_trace` 都拒绝返回正在提交中的半完成知识快照；普通 `claim` 读取不等待后台分析锁。
 - 旧 session 没有 baseline 时发送 refresh_all 提示，不能静默将当前库当作已读。
 
 实现位于 `claim_context.rs`、主会话 context appender 和 provider-neutral turn loop。通知是运行状态，不代表 Claim 已获得验证。

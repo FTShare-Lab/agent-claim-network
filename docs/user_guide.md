@@ -375,7 +375,7 @@ min_interval_hours = 24
 
 普通会话启动不额外渲染校验 Dream 专用模板；相关渲染错误在执行 Dream 时报告。若 Dream 有未完成的本地提交，后台先恢复该提交，再运行 Recap / Finalize；恢复失败时这两个任务保持等待，不消耗各自的尝试次数。恢复只处理本地落盘，远端同步沿用已有的持久上传队列；正常 Dream 提交仍会尝试同步远端。
 
-Claim 变化通知是独立能力：不论由 Recap、Finalize、Inbox 或 Dream 引起，主会话每 turn 都会观察本地变化，通过 `<runtime_context>` 补充 ID、名称和 scope。各会话以自己的初始 system prompt 为基线，`claim` 的 `action="read"` 用于读取最新正文；system prompt 本身保持不变。
+Claim 变化通知是独立能力：不论由主会话修订、其他会话、Recap、Finalize、Inbox 或 Dream 引起，主会话每 turn 都会观察本地变化，通过 `<runtime_context>` 补充 ID、名称和 scope。各会话以启动时完整本地 Claim 基线比较变化，基线不限于目录展示的条目。仅在当前任务需要引用或依赖时，使用 `claim` 的 `action="read"` 读取最新正文；system prompt 本身保持不变。
 
 首次使用没有 Claim 时，以空快照正常启动。启动时若 Claim 快照读取失败，会记录警告并以空快照和空基线继续；读取恢复后，下一个 turn 会通过 `<runtime_context>` 补充可用 Claim，后续新增或变化也沿用这一机制。
 
