@@ -461,7 +461,11 @@ fn stage_change(group: &str, id: &str, action: &str, changes: Value) -> Value {
     }))})
 }
 fn finish_groups(groups: &[&str]) -> Value {
-    json!({"group_ids":groups,"review":{"quality":"reviewed","evidence":"unknown stays unknown","consolidation":"conditions retained"}})
+    let mut input = json!({"review":{"quality":"reviewed","evidence":"unknown stays unknown","consolidation":"conditions retained"}});
+    if !groups.is_empty() {
+        input["group_ids"] = json!(groups);
+    }
+    input
 }
 
 #[tokio::test]
@@ -676,6 +680,39 @@ pub(super) async fn draft_call(
     reviewer
         .call(tool, input, BTreeMap::new(), BTreeMap::new())
         .await
+}
+
+#[tokio::test]
+async fn dream_finish_only_requires_review_and_accepts_legacy_empty_groups() {
+    use crate::tool::DreamPlanTools;
+
+    for legacy_empty_groups in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (_engine, _execution, reviewer) = incremental_reviewer(&dir, &[]).await;
+        let definitions = reviewer.definitions();
+        let finish = definitions
+            .iter()
+            .find(|d| d.name == "dream_finish")
+            .unwrap();
+        assert_eq!(finish.input_schema["required"], json!(["review"]));
+        let properties = finish.input_schema["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), 1);
+        assert!(properties.contains_key("review"));
+        assert_eq!(finish.input_schema["additionalProperties"], false);
+        let rejected = draft_call(&reviewer, "dream_finish", finish_groups(&["old-group"])).await;
+        assert_eq!(rejected["accepted"], false);
+        assert!(reviewer.finished().await.is_none());
+        let feedback = rejected["draft_state"].to_string();
+        assert!(feedback.contains("Call dream_finish with only review"));
+        assert!(!feedback.contains("empty group_ids"));
+        let mut input = finish_groups(&[]);
+        if legacy_empty_groups {
+            input["group_ids"] = json!([]);
+        }
+        let accepted = draft_call(&reviewer, "dream_finish", input).await;
+        assert_eq!(accepted["accepted"], true, "{accepted}");
+        assert_eq!(accepted["finished"], true);
+    }
 }
 
 pub(super) async fn checked_deprecation(

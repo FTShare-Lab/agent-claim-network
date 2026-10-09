@@ -159,7 +159,7 @@ dream_apply_group { group_id, validation_id, review: {
   scope_and_certainty
 } }
 dream_read_draft { group_ids?: string[] }
-dream_finish { group_ids: [], review: { quality, evidence, consolidation } }
+dream_finish { review: { quality, evidence, consolidation } }
 ```
 
 - A/B 的独立 Claim 建议单独成组。C 的整合结果和来源 deprecated 必须在同一组，不能先废弃再补结果。

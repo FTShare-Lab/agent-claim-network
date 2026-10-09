@@ -16,7 +16,7 @@ fn finish() -> ProviderStep {
     tool_use_step(
         "finish",
         "dream_finish",
-        json!({"group_ids":[],"review":{"quality":"Reviewed delivery record","evidence":"No unsupported factual changes","consolidation":"Keep other knowledge separate"}}),
+        json!({"review":{"quality":"Reviewed delivery record","evidence":"No unsupported factual changes","consolidation":"Keep other knowledge separate"}}),
     )
 }
 

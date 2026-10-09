@@ -129,7 +129,7 @@ pub(super) fn state(
         "Replace the current group using its SAME group_id and retain all candidate claims, intended edits, evidence and coverage. If needed explicitly expand its candidate registration first; do not silently drop identified work.",
         "pending_rejections identifies groups needing repair or removal of an invalid proposal. group:null removes only the draft/error; a registered candidate remains pending until applied or kept with dream_keep_candidate and a concrete reason. Unknown group names change nothing.",
         "Repair parameter/source/coverage errors using their named fields and permitted IDs. boundary_feedback is an authority limit, not a missing-parameter or insufficient-evidence error: change the intended plan safely or explicitly keep this candidate; repeating the same forbidden correction cannot succeed.",
-        "Use dream_validate, then dream_apply_group with a concise semantic review. Finish with empty group_ids only after all candidates are executed or explicitly kept. No modification quota; uncertainty permits keeping. Unchanged independent claims need no keep group; consolidation inputs do. Use actual execution receipts for results."
+        "Use dream_validate, then dream_apply_group with a concise semantic review. Call dream_finish with only review after all candidates are executed or explicitly kept. No modification quota; uncertainty permits keeping. Unchanged independent claims need no keep group; consolidation inputs do. Use actual execution receipts for results."
     ]})
 }
 

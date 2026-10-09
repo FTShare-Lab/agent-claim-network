@@ -100,6 +100,8 @@ enum Action {
 #[serde(deny_unknown_fields)]
 struct Finish {
     review: Review,
+    // 兼容旧调用和批量结束流程；逐组执行模式不再向模型暴露此字段。
+    #[serde(default)]
     group_ids: Vec<String>,
     #[serde(default)]
     self_reviews: Vec<SelfReview>,
@@ -661,7 +663,7 @@ impl Reviewer {
                     serde_json::from_value(input).context("dream_finish arguments")?;
                 if let Some(execution) = &self.execution {
                     anyhow::ensure!(draft.groups.is_empty() && draft.rejected.is_empty(), "Unexecuted groups remain. Execute them with dream_apply_group or explicitly withdraw them; dream_finish does not write Claims");
-                    anyhow::ensure!(finish.group_ids.is_empty() && finish.self_reviews.is_empty(), "Executed groups are already recorded; finish with empty group_ids and an accurate ABC summary");
+                    anyhow::ensure!(finish.group_ids.is_empty() && finish.self_reviews.is_empty(), "Executed groups are already recorded; finish with only an accurate ABC review summary");
                     anyhow::ensure!(!draft.candidates.pending(), "Identified candidates remain: {}. Complete the current candidate or use dream_keep_candidate with a specific safety/no-change reason; prioritizing other tasks does not complete this Dream", draft.candidates.context()["pending"]);
                     anyhow::ensure!(
                         [
@@ -796,10 +798,12 @@ impl DreamPlanTools for Reviewer {
             });
             for d in &mut definitions {
                 if d.name == "dream_finish" {
-                    d.description = "Finish with an accurate ABC summary and empty group_ids only after every identified candidate is executed or kept with a concrete reason using dream_keep_candidate. Outstanding candidates block finish even after another group succeeded. group:null does not handle its candidate. Other tasks or priorities do not justify abandoning known work. Returns actual execution/candidate results, not self-reported counts. A first finish with no activity returns one reminder. Zero changes remain valid; no tool/modification quota. Committed operations survive later errors.".into();
+                    d.description = "Finish with only an accurate ABC review summary after every identified candidate is executed or kept with a concrete reason using dream_keep_candidate. Outstanding candidates block finish even after another group succeeded. group:null does not handle its candidate. Other tasks or priorities do not justify abandoning known work. Returns actual execution/candidate results, not self-reported counts. A first finish with no activity returns one reminder. Zero changes remain valid; no tool/modification quota. Committed operations survive later errors.".into();
                     if let Some(properties) = d.input_schema["properties"].as_object_mut() {
+                        properties.remove("group_ids");
                         properties.remove("self_reviews");
                     }
+                    d.input_schema["required"] = json!(["review"]);
                 } else if d.name == "dream_validate" {
                     d.description = "Check the current candidate's staged group without writing Claims. Returns version-bound real before/after, changes and evidence. Review the semantics including name/body/scope consistency, repair if needed, then execute this group with dream_apply_group using validation_id before continuing. Structural validity does not prove semantic correctness.".into();
                 } else if d.name == "dream_stage_group" {

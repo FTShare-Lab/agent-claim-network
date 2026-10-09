@@ -185,24 +185,10 @@ Policy 消息自包含完整 payload；Agent 不需要也不允许直接读取 M
 
 Maintainer 与 Router 的 `/health` 无需登录，返回服务状态和团队鉴权是否开启。携带 Agent ID 和团队 Key 时，还会返回鉴权是否通过；鉴权失败不影响健康检查的 HTTP 状态码。用法见 [健康检查说明](health.md)。
 
-### Dream 与会话 Claim 投影
+### Dream 与会话知识更新
 
-`src/agent/session_engine/dream.rs` 负责工具探索与 Prepared/Applied 恢复，`dream_plan.rs` 校验 ABC 结构化计划；`src/supervisor/dream.rs` 负责 Agent 级检查和入队。Dream job 无 session ID，沿用 supervisor 的尝试次数和恢复流程，排序低于 Finalize、Recap。知识应用锁只覆盖快照和提交，不跨越模型请求。
+Dream 由 Agent 在本地整理自己持有的 Claim，负责质量清理、证据校准和主题整合。它作为 Supervisor 的后台任务运行，优先级低于 Finalize 和 Recap；不读取私有 Memory，不处理 Dispute，也不代替 Policy 内化。
 
-`dream_candidates.rs` 保存本轮登记候选的顺序、当前项与执行/保留结果；`dream_record_candidates` 登记，`dream_keep_candidate` 记录具体保留理由，不改变 Claim。当前候选必须处理后才可暂存或执行下一项；仍有登记项时禁止结束。旧草稿加载时从已有组补齐候选，状态纳入审计和准确恢复上下文。
+修改按关联组逐步生效，执行前核对知识是否已变化，避免覆盖其他任务的更新。中断会保留已生效结果，重试继续未完成工作。团队同步时，先确认承接知识已送达，再同步被整合来源的废弃状态；单人模式不产生团队上传。
 
-`dream_exploration.rs` 保存完整请求边界的探索与分组草案，`dream_draft.rs` 通过 `dream_stage_group` / `dream_validate` / `dream_apply_group` / `dream_finish` 接收结构化计划并反馈局部错误。暂不设 Dream 专用轮数、总时长及输出上限，沿用模型输出配置、单次调用超时、复用前台请求估算器的上下文容量检查与任务让路。同一 job 重试可复用已接受组和证据；输入、prompt、模型、输出配置或证据版本变化则重新审查。暂存不等于 Prepared，不直接写 Claim。
-
-`dream_compaction.rs` 在完整工具边界按 160k 输入 token 阈值自动压缩（模型窗口扣除输出预留和安全余量不足时提前）。`dream_history.rs` 将压缩前完整历史不可覆盖归档，并通过当前 job 范围内的 `dream_read_history` 分页查询。新窗口由后端准确状态、模型探索摘要和最近完整交互构成；证据版本与草稿不由模型摘要重写。压缩失败保留旧探索 checkpoint，成功后沿用 turn loop 的 history replacement 和 provider chain 重置机制。
-
-`dream_draft_feedback.rs` 为下一次模型请求生成当前草稿状态、冲突 Claim 的所属组与已接受动作、待修复错误和调整说明。`dream_read_draft` 返回可重新暂存的完整组，供模型保留既有修改后调整计划；读取磁盘原文的 `read_claim` 不包含这些未提交改写。空撤销明确返回是否实际移除了状态，反馈增强不放宽原有校验。
-
-`dream_execution.rs` 负责版本化的逐组执行与回执。`dream_validate` 返回宿主生成的原文、目标、差异和版本；`dream_apply_group` 接收逐 Claim 简要语义复核，先保存执行计划再复用现有 Prepared 写入路径。修改立即生效，`dream_finish` 只汇总。`dream_review.rs` 的旧全文映射协议保留供历史记录校验，新模型工具不暴露该入口。
-
-执行记录落在 `<agent_home>/dream/<job_id>/executions/`，包含原文、目标、具体依据、版本化证据、硬校验和实际结果，并生成 JSON/Markdown 人工视图。全局 pending 标记使专用 read_claim 和运行时投影避开恢复中的组；普通 claim 工具和面板读取前后核对 pending 与持久提交状态，不等待长时间分析锁；supervisor 在执行下一任务前优先恢复已经开始的写入。执行只复用现有原子文件写、知识锁和持久化同步暂存；没有跨模型调用持锁，也没有将多个文件宣称为数据库原子事务。组内先保存存续结果再废弃来源，遇到第三方版本则停止本组剩余修改。
-
-已完成执行通过 validation_id 幂等返回回执；自己产生的修改不使探索恢复指纹失效，也不计作新的触发变化。外部变化仍使旧草稿版本失效。仅整轮结束推进 last_success_at，部分完成后的模型失败保留所有实际成果。事实纠正的 high 门槛同时检查本轮原始状态，不能通过前一组降级绕过。新执行记录可随每组写入进入现有远程同步流程，单人模式仍不积累团队任务。
-
-`src/tool/knowledge.rs` 提供 Dream 专用 `read_claim`、按 Claim 定位来源的 `read_trace`，以及 Dream 只读工具 profile；旧冻结会话和子代理保留只读兼容入口，新主会话使用 `claim` 工具。宿主校验 holder、完整读取的原版本、信息去向、证据收据和来源关系；先写整合后的存活 Claim，再废弃被覆盖项。版本冲突跳过关联操作组。团队上传通过原有 durable staging，单人模式不创建上传队列。
-
-`src/agent/session_engine/claim_context.rs` 保存与 system prompt 同源的会话 Claim 索引。每 turn 冻结相对此索引的累计身份差异并生成 revision，作为已有 Runtime ModelContext 的补充。它复用 fingerprint 去重、Provider WAL 与 compaction 投影，不另设会因失败而提前推进的已读游标，也不依赖 Dream 开关。
+会话会在后续输入时获知本地 Claim 的变化，并按当前任务需要读取最新内容。此前的会话历史和初始提示保持不变。这一能力也适用于 Inbox、Recap 和 Finalize 等其他修改来源，不依赖 Dream 开关。触发条件与操作方式见 [Dream 使用说明](user_guide.md#dream后台整理-claim)。

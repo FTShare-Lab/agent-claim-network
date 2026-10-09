@@ -17513,7 +17513,7 @@ fn dream_apply_response(request: &ProviderRequest, finish: bool) -> ProviderResp
         content.push(SessionTurnContentBlock::ToolUse {
             id: "finish_execution".into(),
             name: "dream_finish".into(),
-            input: json!({"group_ids":[],"review":data["review"]}),
+            input: json!({"review":data["review"]}),
         });
     }
     ProviderResponse {
@@ -17660,7 +17660,7 @@ async fn dream_retry_reuses_versioned_evidence_and_rejects_changed_inputs() {
             steps.push(ProviderStep::DreamSelfReview);
         } else {
             steps.push(response_step(DREAM_NOOP_PLAN, vec![]));
-            steps.push(tool_use_step("confirm_no_change", "dream_finish", json!({"review":{"quality":"retain reusable rules","evidence":"prior evidence is no longer current; no new verification","consolidation":"retain separate knowledge"},"group_ids":[]})));
+            steps.push(tool_use_step("confirm_no_change", "dream_finish", json!({"review":{"quality":"retain reusable rules","evidence":"prior evidence is no longer current; no new verification","consolidation":"retain separate knowledge"}})));
         }
         let provider = Arc::new(RecordingProvider::new(steps));
         let engine = build_dream_test_engine(&dir, provider.clone());
@@ -17904,7 +17904,7 @@ async fn dream_noop_confirmation_advances_cooldown_and_recovery_needs_no_model_c
         tool_use_step(
             "confirm",
             "dream_finish",
-            json!({"review":{"quality":"reusable rules retained","evidence":"no selected evidence question","consolidation":"separate scopes retained"},"group_ids":[]}),
+            json!({"review":{"quality":"reusable rules retained","evidence":"no selected evidence question","consolidation":"separate scopes retained"}}),
         ),
     ]));
     let (engine, _) = build_local_test_engine(&dir, provider.clone());
