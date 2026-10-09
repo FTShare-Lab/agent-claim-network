@@ -365,7 +365,7 @@ enable = true
 min_interval_hours = 24
 ```
 
-Dream 默认开启，关闭后手动和自动执行均停用。开启时 Supervisor 在退出 TUI 后仍保持运行，可用 `acn supervisor stop` 停止；不会安装开机服务。停止时保存进度，已进入提交的修改会安全完成，下次启动后继续未完成任务。
+Dream 默认开启，关闭后手动和自动执行均停用。开启时 Supervisor 在退出 TUI 后仍保持运行，可用 `acn supervisor stop` 停止。停止时保存进度，已进入提交的修改会安全完成，下次启动后继续未完成任务。
 
 证据校准仅针对原置信度为 medium / low 的 Claim 按需进行；high 仍可参与清理和整合。找到明确适用的新证据才修订，查不到或仍不确定就保留原样。没有最低修改数量，也不保证每次覆盖全部知识。
 
