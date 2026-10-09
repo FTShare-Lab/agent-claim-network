@@ -69,8 +69,20 @@ use tokio::task::JoinHandle;
 use tokio::time::{self, Instant};
 use tokio_util::sync::CancellationToken;
 
+mod claim_context;
 mod compaction_assets;
 mod compaction_projection;
+pub(crate) mod dream;
+mod dream_audit;
+mod dream_candidates;
+mod dream_compaction;
+mod dream_draft;
+mod dream_draft_feedback;
+mod dream_execution;
+mod dream_exploration;
+mod dream_history;
+mod dream_plan;
+mod dream_review;
 mod events;
 mod finalize;
 mod memory_review;
@@ -150,6 +162,7 @@ pub struct SessionEngine {
     attachment: AttachmentConfig,
     mcp_manager: Option<Arc<McpConnectionManager>>,
     subagent_max_concurrent: usize,
+    dream_config: crate::config::AgentDreamConfig,
 }
 
 /// 运行时直接 abort 会跳过 turn 的正常收束路径；此 guard 只回滚本轮新增或扩展的
@@ -535,6 +548,7 @@ async fn sync_parent_directory(path: &Path) -> anyhow::Result<()> {
 }
 
 struct MainModelContextAppender {
+    claim_runtime: Option<claim_context::ClaimRuntimeProjection>,
     tools: Arc<ToolRegistry>,
     session_id: SessionId,
     session_dir: PathBuf,
@@ -554,6 +568,30 @@ struct DelegationProjectionBaseline {
 
 #[async_trait]
 impl SessionTurnContextAppender for MainModelContextAppender {
+    fn runtime_context_suffix(&self, messages: &[SessionTurnMessage]) -> Option<String> {
+        let previous = messages
+            .iter()
+            .rev()
+            .filter_map(SessionTurnMessage::model_context_snapshot)
+            .filter(|(source, _, _)| **source == ModelContextSource::Runtime)
+            .find_map(|(_, _, text)| {
+                text.split_once("\nclaim_changes_since_system_prompt:")
+                    .map(|(_, suffix)| {
+                        format!(
+                            "claim_changes_since_system_prompt:{}",
+                            suffix.trim_end_matches("\n</runtime_context>")
+                        )
+                    })
+            });
+        match &self.claim_runtime {
+            Some(current) if current.has_changes || previous.is_some() => {
+                Some(current.with_previous(previous.as_deref()))
+            }
+            Some(_) => None,
+            None => previous,
+        }
+    }
+
     async fn observe_context(
         &mut self,
         provider_messages: &[SessionTurnMessage],
@@ -1874,6 +1912,7 @@ impl SessionEngine {
             turns_since_fork_memory_review: Arc::new(Mutex::new(0)),
             active_context_usage_anchor: Arc::new(Mutex::new(None)),
             delegation_projection_baselines: Arc::new(Mutex::new(HashMap::new())),
+            dream_config: crate::config::AgentDreamConfig::default(),
             attachment: AttachmentConfig::default(),
             mcp_manager: None,
             subagent_max_concurrent: options.subagent_max_concurrent,
@@ -3030,6 +3069,9 @@ impl SessionEngine {
     where
         F: FnMut(SessionEvent) + Send,
     {
+        if let Err(error) = self.recover_pending_dream_execution().await {
+            log::warn!(target: "agent", "Dream local recovery deferred before inbox: {error:#}");
+        }
         if let Some(message) = self.frozen_prompt_resume_warning(session).await {
             emit(SessionEvent::Warning { message });
         }
@@ -3114,6 +3156,9 @@ impl SessionEngine {
             label: "processing inbox...".into(),
         });
         let inbox_fallback_scope = crate::api::ProviderRuntimeFallbackScope::new_root();
+        if let Err(error) = self.recover_pending_dream_execution().await {
+            log::warn!(target: "agent", "Dream local recovery deferred before inbox: {error:#}");
+        }
         let inbox_generator = SessionInboxJsonGenerator {
             prompt_registry: &self.prompt_registry,
             json_caller: &self.json_caller,
@@ -3129,7 +3174,7 @@ impl SessionEngine {
         emit(SessionEvent::StartupProgress {
             label: "preparing session prompt...".into(),
         });
-        let system_prompt = self
+        let (system_prompt, prompt_claims) = self
             .render_session_system_prompt_for_inbox(&inbox_report)
             .await?;
         emit(SessionEvent::StartupProgress {
@@ -3147,6 +3192,8 @@ impl SessionEngine {
             )
             .await?;
         let mut session = runtime_session.session;
+        self.save_claim_prompt_baseline(&session.paths.dir, &prompt_claims)
+            .await?;
         session.replace_runtime_fallback_root(inbox_fallback_scope);
         emit(SessionEvent::SessionStarted {
             session_id: session.metadata.id.clone(),
@@ -3889,6 +3936,9 @@ impl SessionEngine {
         emit(SessionEvent::InboxStarted);
         self.append_session_event_log(session, "INFO", "Inbox sync started")
             .await;
+        if let Err(error) = self.recover_pending_dream_execution().await {
+            log::warn!(target: "agent", "Dream local recovery deferred before inbox: {error:#}");
+        }
         let inbox_generator = SessionInboxJsonGenerator {
             prompt_registry: &self.prompt_registry,
             json_caller: &self.json_caller,
@@ -3999,6 +4049,13 @@ impl SessionEngine {
             .context("订阅 subagent activity 失败")?;
         let background_completion_delivery_seq = Arc::new(AtomicU64::new(0));
         let mut context_appender = MainModelContextAppender {
+            claim_runtime: match self.claim_runtime_context(&session.paths.dir).await {
+                Ok(context) => context,
+                Err(error) => {
+                    log::warn!(target: "agent", "Claim runtime context deferred: {error:#}");
+                    None
+                }
+            },
             tools,
             session_id: metadata.id.clone(),
             session_dir: session.paths.dir.clone(),
@@ -6935,10 +6992,15 @@ fn validate_finalize_checkpoint_segment(
 
 fn report_from_finalize_checkpoint(
     checkpoint: &FinalizeCheckpoint,
-    warnings: Vec<String>,
+    mut warnings: Vec<String>,
 ) -> SessionFinalizeReport {
+    warnings.extend(checkpoint.warnings.clone());
     let (new_claim_ids, updated_claim_ids) =
-        partition_prepared_claim_ids(&checkpoint.prepared_claims);
+        partition_prepared_claim_ids(if checkpoint.applied_claims.is_empty() {
+            &checkpoint.prepared_claims
+        } else {
+            &checkpoint.applied_claims
+        });
     SessionFinalizeReport {
         trace_id: checkpoint.trace_id.clone(),
         new_claim_ids,

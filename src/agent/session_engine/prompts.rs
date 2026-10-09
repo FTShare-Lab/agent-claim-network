@@ -4,10 +4,11 @@
 //! 渲染本地 claim 目录、router scope 概览，并把 ACN.md 附加到 prompt 尾部。
 //! 它不执行 turn、compaction 或 finalize。
 
+use crate::claim::Claim;
 use anyhow::Context;
 use serde::Serialize;
 
-use crate::agent::claims::{ClaimListPage, DEFAULT_CLAIM_LIST_LIMIT};
+use crate::agent::claims::DEFAULT_CLAIM_LIST_LIMIT;
 use crate::agent::{InboxProcessReport, TeamServiceConnectionStatus};
 use crate::api::AvailableSkill;
 use crate::memory::{render_prompt_block, MemoryTarget};
@@ -17,7 +18,7 @@ use super::{SessionEngine, PROMPT_AGENT_SYSTEM, PROMPT_MEMORY_REVIEW_SYSTEM};
 
 /// `agent_system.j2` 中 claim 目录段的标题。resume 用它判断冻结 system prompt 是否早于
 /// `claim` 工具：旧快照仍要求会话内不修改 claim。
-pub(crate) const CLAIM_CATALOG_HEADING: &str = "# 你的自有 claims 目录";
+pub(crate) use crate::agent::claims::CLAIM_CATALOG_HEADING;
 
 const SOLO_TEAM_SERVICES_OVERVIEW: &str = "【当前团队服务状态】用户未配置 maintainer_endpoint 和 router_endpoint，本 session 以单人模式运行；团队 maintainer、router 与 consult_router 均不可用，不会进行任何团队服务交互。请忽略本 prompt 下文关于团队服务和 consult_router 的通用操作说明。如需访问团队服务，请参考 docs/config_parameters.md，同时配置 maintainer_endpoint 和 router_endpoint。";
 
@@ -85,7 +86,7 @@ impl SessionEngine {
     pub(super) async fn render_session_system_prompt_for_inbox(
         &self,
         inbox_report: &InboxProcessReport,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<(String, Vec<Claim>)> {
         let router_scopes_overview = match inbox_report.team_services.router {
             TeamServiceConnectionStatus::Unknown => SOLO_TEAM_SERVICES_OVERVIEW.into(),
             TeamServiceConnectionStatus::Connected => inbox_report
@@ -102,7 +103,7 @@ impl SessionEngine {
     async fn render_session_system_prompt_with_router_overview(
         &self,
         router_scopes_overview: &str,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<(String, Vec<Claim>)> {
         let memory_enabled = self.turn_loop.tool_registry().memory_enabled();
         let (memory_text, user_text) = if memory_enabled {
             let memory_snapshot = self.agent.memory_store.read_snapshot().await?;
@@ -121,7 +122,42 @@ impl SessionEngine {
         } else {
             (String::new(), String::new())
         };
-        let local_claims_snapshot = self.render_local_claims_catalog().await;
+        let claims_result = async {
+            let home = self.runner.maintainer_upload_queue.agent_home();
+            let _guard = crate::storage::FileLockGuard::try_lock_exclusive(
+                &crate::storage::paths::agent_home_knowledge_apply_lock_path(home),
+            )
+            .await?
+            .context("Claim store is being updated")?;
+            crate::agent::claim_alignment::ensure_knowledge_ready(home).await?;
+            self.runner.recover_pending_claim_edit_locked().await?;
+            self.agent.claim_store.list_local_claims().await
+        }
+        .await;
+        let (prompt_claims, local_claims_snapshot) = match claims_result {
+            Ok(claims) => {
+                let page = crate::agent::claims::claim_list_page(
+                    claims.clone(),
+                    None,
+                    false,
+                    0,
+                    DEFAULT_CLAIM_LIST_LIMIT,
+                );
+                let snapshot = format!("```json\n{}\n```", serde_json::to_string(&page)?);
+                (claims, snapshot)
+            }
+            Err(error) => {
+                log::warn!(
+                    target: "agent",
+                    "读取本地 Claim 快照失败，以空快照继续启动: {error:#}"
+                );
+                // 目录与完整基线来自同一次读取；读取恢复后由 runtime_context 补充。
+                (
+                    Vec::new(),
+                    "本次会话未载入本地 Claim 快照；后续变化通过 runtime_context 补充。".into(),
+                )
+            }
+        };
         let context = SessionSystemPromptContext {
             agent_id: &self.agent.agent_id,
             memory_enabled,
@@ -140,7 +176,10 @@ impl SessionEngine {
             .prompt_registry
             .render(PROMPT_AGENT_SYSTEM, context)
             .context("渲染 session system prompt 失败")?;
-        Ok(append_acn_md(system_prompt, self.read_acn_md().await?))
+        Ok((
+            append_acn_md(system_prompt, self.read_acn_md().await?),
+            prompt_claims,
+        ))
     }
 
     pub(super) async fn read_acn_md(&self) -> anyhow::Result<Option<String>> {
@@ -159,33 +198,6 @@ impl SessionEngine {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err).with_context(|| format!("读取 ACN.md 失败: {}", path.display())),
         }
-    }
-
-    async fn render_local_claims_catalog(&self) -> String {
-        let page = match self
-            .runner
-            .list_claims(None, false, 0, DEFAULT_CLAIM_LIST_LIMIT)
-            .await
-        {
-            Ok(page) => page,
-            Err(err) => {
-                log::warn!(
-                    target: "agent",
-                    "渲染本地 claim 目录失败，降级为空目录: {err:#}"
-                );
-                ClaimListPage {
-                    items: Vec::new(),
-                    offset: 0,
-                    limit: DEFAULT_CLAIM_LIST_LIMIT,
-                    omitted: 0,
-                    next_offset: None,
-                }
-            }
-        };
-        // ClaimListPage 只含字符串、整数、枚举与 UTC 时间，JSON 序列化没有失败路径。
-        let catalog =
-            serde_json::to_string(&page).expect("ClaimListPage 的 JSON 序列化没有失败路径");
-        format!("```json\n{catalog}\n```")
     }
 
     pub(super) async fn render_memory_review_system_prompt(&self) -> anyhow::Result<String> {

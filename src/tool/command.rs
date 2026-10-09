@@ -458,7 +458,11 @@ impl ToolRegistry {
         let code_type = args.r#type.unwrap_or_else(|| "bash".into());
         let cwd = resolve_tool_path(&self.workspace_root, args.cwd.as_deref().unwrap_or("."));
         let cwd_display = cwd.display().to_string();
-        let (program, command_args) = self.code_run_spec(&code_type, &args.script)?;
+        let (program, command_args) = if self.dream_read_only {
+            self.dream_command_spec(&args.script, &cwd).await?
+        } else {
+            self.code_run_spec(&code_type, &args.script)?
+        };
         let mut environment = Vec::<(String, String)>::new();
         let mut removed_environment = Vec::<String>::new();
         if self.access.delegation_child {
@@ -560,6 +564,13 @@ impl ToolRegistry {
         } else {
             let mut cmd = Command::new(&program);
             cmd.args(&command_args).current_dir(&cwd);
+            if self.dream_read_only {
+                // 受限后台读取命令不继承凭据或可注入额外命令的 shell / 搜索配置。
+                cmd.env_clear()
+                    .env("PATH", super::dream_sandbox::COMMAND_PATH)
+                    .env("LANG", "en_US.UTF-8")
+                    .env("HOME", "/nonexistent");
+            }
             if self.access.delegation_child {
                 cmd.env_remove("ACN_DELEGATION_ID");
             }

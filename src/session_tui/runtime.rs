@@ -29,6 +29,7 @@ const UNALIGNED_JOURNAL_TURN_NOTICE: &str =
 const RESUME_HISTORY_REAL_USER_TURNS: usize = 10;
 
 pub(super) enum WorkerEvent {
+    DreamNotice(String),
     ClaimListLoaded(u64, anyhow::Result<crate::agent::claims::ClaimListPage>),
     ClaimLoaded(u64, anyhow::Result<crate::agent::claims::ClaimDetail>),
     ClaimTracesLoaded(u64, anyhow::Result<crate::agent::claims::TraceListPage>),
@@ -2746,4 +2747,178 @@ mod tests {
         assert_eq!(restored.expanded_text(), pasted);
         active.handle.abort();
     }
+}
+
+/// 后台请求不占用前台 turn，也不把自动检查结果刷入聊天记录。
+pub(super) fn spawn_dream_worker(
+    config: SupervisorLaunchConfig,
+    workspace: std::path::PathBuf,
+    manual: bool,
+    tx: mpsc::UnboundedSender<WorkerEvent>,
+) {
+    tokio::spawn(async move {
+        let report = match supervisor::check_dream(&config, workspace, manual).await {
+            Ok(report) => report,
+            Err(error) => {
+                if manual {
+                    let _ = tx.send(WorkerEvent::DreamNotice(format!(
+                        "Dream 请求失败：{error:#}"
+                    )));
+                } else {
+                    log::warn!(target:"session_tui","Dream startup check failed: {error:#}");
+                }
+                return;
+            }
+        };
+        if !manual {
+            return;
+        }
+        let _ = tx.send(WorkerEvent::DreamNotice(match &report.job_id {
+            Some(id) => format!("{} · {id}", report.message),
+            None => report.message.clone(),
+        }));
+        let Some(id) = report.job_id else {
+            return;
+        };
+        let mut previous = ("queued".to_string(), 0, None);
+        loop {
+            tokio::select! {
+                _=tx.closed()=>return,
+                _=tokio::time::sleep(std::time::Duration::from_secs(2))=>{}
+            }
+            match supervisor::supervisor_jobs(&config.agent_home).await {
+                Ok(jobs) => {
+                    if let Some(job) = jobs.iter().find(|job| job.id == id) {
+                        let current = (job.status.clone(), job.attempts, job.last_error.clone());
+                        if current != previous {
+                            let completion = if job.status == "succeeded" {
+                                match supervisor::dream_completion_summary(
+                                    &config.agent_home,
+                                    &job.id,
+                                )
+                                .await
+                                {
+                                    Ok(summary) => summary,
+                                    Err(error) => {
+                                        log::warn!(target:"session_tui", "Dream completion summary unavailable: {error:#}");
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            let _ = tx.send(WorkerEvent::DreamNotice(dream_progress_notice(
+                                job,
+                                completion.as_ref(),
+                            )));
+                            previous = current;
+                        }
+                        if job.status == "succeeded" || job.status == "failed" {
+                            return;
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(WorkerEvent::DreamNotice(format!(
+                        "Dream 状态读取失败：{error:#}"
+                    )));
+                    return;
+                }
+            }
+        }
+    });
+}
+
+fn dream_progress_notice(
+    job: &supervisor::SupervisorJobView,
+    completion: Option<&supervisor::DreamCompletionSummary>,
+) -> String {
+    let max = crate::config::DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS;
+    let state = match job.status.as_str() {
+        "running" => format!("运行中（第 {}/{max} 次）", job.attempts),
+        "queued" if job.attempts > 0 => format!("等待重试（已尝试 {}/{max} 次）", job.attempts),
+        "queued" => "等待执行".into(),
+        "succeeded" => match completion {
+            Some(summary) => format!(
+                "已完成 · 修改 {} 条 · 读取/运行记录 {} 份",
+                summary.changed_claims, summary.exploration_receipts
+            ),
+            None => "已完成".into(),
+        },
+        "failed" => "失败".into(),
+        other => other.to_string(),
+    };
+    let error = if job.status == "succeeded" {
+        None
+    } else {
+        job.last_error.as_ref()
+    };
+    format!(
+        "Dream {} · {state}{}",
+        job.id,
+        error
+            .map(|e| {
+                let hint = if e.contains("Dream safety")
+                    && (e.contains("JSON") || e.contains("output invalid"))
+                {
+                    "内容复核输出未通过校验；"
+                } else {
+                    ""
+                };
+                format!("；上次原因：{hint}{e}")
+            })
+            .unwrap_or_default()
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn dream_progress_keeps_retry_reason_and_clears_it_on_success() {
+    let mut job = supervisor::SupervisorJobView {
+        id: "job_example".into(),
+        agent_id: None,
+        kind: "dream".into(),
+        session_id: None,
+        recap_end_index: None,
+        status: "running".into(),
+        created_at: chrono::Utc::now(),
+        started_at: None,
+        finished_at: None,
+        attempts: 2,
+        manual_retries: 0,
+        last_error: Some("temporary provider failure".into()),
+    };
+    let notice = dream_progress_notice(&job, None);
+    assert!(
+        notice.contains("运行中（第 2/5 次）") && notice.contains("temporary provider failure")
+    );
+    job.status = "queued".into();
+    assert!(dream_progress_notice(&job, None).contains("等待重试"));
+    job.status = "succeeded".into();
+    assert_eq!(
+        dream_progress_notice(&job, None),
+        "Dream job_example · 已完成"
+    );
+    let summary = supervisor::DreamCompletionSummary {
+        changed_claims: 0,
+        exploration_receipts: 0,
+    };
+    assert_eq!(
+        dream_progress_notice(&job, Some(&summary)),
+        "Dream job_example · 已完成 · 修改 0 条 · 读取/运行记录 0 份"
+    );
+    let summary = supervisor::DreamCompletionSummary {
+        changed_claims: 2,
+        exploration_receipts: 3,
+    };
+    let notice = dream_progress_notice(&job, Some(&summary));
+    assert!(
+        notice.contains("修改 2 条")
+            && notice.contains("记录 3 份")
+            && !notice.contains("temporary provider failure")
+    );
+    job.status = "failed".into();
+    job.last_error = Some("Dream safety output invalid after one calibration".into());
+    let notice = dream_progress_notice(&job, None);
+    assert!(notice.contains("失败") && notice.contains("内容复核输出未通过校验"));
 }

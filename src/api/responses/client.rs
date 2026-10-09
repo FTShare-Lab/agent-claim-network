@@ -928,6 +928,7 @@ mod tests {
 
     fn request(stream: bool) -> ResponsesRequest {
         ResponsesRequest {
+            text: None,
             model: "test-model".into(),
             instructions: "system".into(),
             input: vec![json!({"role":"user","content":[{"type":"input_text","text":"hello"}]})],

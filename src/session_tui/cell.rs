@@ -252,6 +252,7 @@ const HELP_ENTRIES: &[(&str, &str)] = &[
     ("/claim", "browse and revise local claims"),
     ("/compact", "compact session history"),
     ("/copy", "copy the last Assistant response"),
+    ("/dream", "review and consolidate claims in background"),
     ("/exit", "finalize and exit"),
     ("/help", "show this help"),
     ("/inbox", "sync and process inbox"),

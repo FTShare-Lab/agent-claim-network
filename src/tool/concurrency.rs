@@ -18,16 +18,57 @@ enum OptionValueKind {
 
 /// 以 tree-sitter Bash AST 和 PRD 白名单判断脚本是否可并发执行。
 pub(crate) fn bash_script_is_concurrency_safe(script: &str) -> bool {
+    safe_bash_tree(script).is_some()
+}
+
+fn safe_bash_tree(script: &str) -> Option<tree_sitter::Tree> {
     let mut parser = Parser::new();
-    let language = tree_sitter_bash::LANGUAGE;
-    if parser.set_language(&language.into()).is_err() {
-        return false;
-    }
-    let Some(tree) = parser.parse(script, None) else {
-        return false;
-    };
+    parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(script, None)?;
     let root = tree.root_node();
-    !root.has_error() && !root.is_missing() && is_safe_script_node(root, script)
+    (!root.has_error() && !root.is_missing() && is_safe_script_node(root, script)).then_some(tree)
+}
+
+/// 在同一 AST 与白名单校验之后取字面量，供受限工作区路径校验使用。
+pub(crate) fn safe_bash_literals(script: &str) -> Option<Vec<String>> {
+    fn collect(node: Node<'_>, source: &str, values: &mut Vec<String>) {
+        if let Some(literal) = literal_from_node(node, source) {
+            values.push(literal.value);
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect(child, source, values);
+        }
+    }
+    let tree = safe_bash_tree(script)?;
+    let mut values = Vec::new();
+    collect(tree.root_node(), script, &mut values);
+    Some(values)
+}
+
+/// 复用同一白名单 AST 区分命令名与参数，供后台检查运行环境。
+pub(crate) fn safe_bash_commands(script: &str) -> Option<Vec<String>> {
+    fn collect(node: Node<'_>, source: &str, names: &mut Vec<String>) {
+        if node.kind() == "command_name" {
+            if let Some(literal) = literal_from_node(node, source) {
+                names.push(literal.value);
+            }
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect(child, source, names);
+        }
+    }
+    let tree = safe_bash_tree(script)?;
+    let mut names = Vec::new();
+    collect(tree.root_node(), script, &mut names);
+    names.sort();
+    names.dedup();
+    Some(names)
 }
 
 fn is_safe_script_node(node: Node<'_>, source: &str) -> bool {

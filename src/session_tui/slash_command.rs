@@ -9,6 +9,7 @@ use super::completion_menu::{render_completion_menu, CompletionMenuEntry, Comple
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SlashCommandAction {
+    Dream,
     Claim,
     Compact,
     Copy,
@@ -45,6 +46,11 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         command: "/copy",
         description: "复制最后一条 Assistant 回复",
         action: SlashCommandAction::Copy,
+    },
+    SlashCommandSpec {
+        command: "/dream",
+        description: "后台整理当前 Agent 的 Claim",
+        action: SlashCommandAction::Dream,
     },
     SlashCommandSpec {
         command: "/exit",
@@ -307,6 +313,7 @@ mod tests {
                 "/claim",
                 "/compact",
                 "/copy",
+                "/dream",
                 "/exit",
                 "/help",
                 "/inbox",
@@ -336,6 +343,7 @@ mod tests {
                 "/claim",
                 "/compact",
                 "/copy",
+                "/dream",
                 "/exit",
                 "/help",
                 "/inbox",
@@ -464,8 +472,13 @@ mod tests {
         assert!(!text.contains("/resume"));
 
         // 选中 /inbox 时窗口滚动，选中行加粗可见
-        for _ in 0..7 {
-            assert!(state.select_next(catalog.matching("/").len()));
+        let entries = catalog.matching("/");
+        let inbox_index = entries
+            .iter()
+            .position(|entry| entry.command == "/inbox")
+            .unwrap();
+        for _ in 0..inbox_index {
+            assert!(state.select_next(entries.len()));
         }
         let lines = render_slash_menu(&catalog, "/", &state, 96);
         assert_eq!(

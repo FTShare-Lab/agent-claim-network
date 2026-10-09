@@ -52,6 +52,12 @@ impl ToolBoundaryControl {
         self.set_cancel_reason(reason, false);
     }
 
+    /// 后台停机中断模型和协作工具，但等待已派发的持久化工具收尾，不走强制 drop。
+    pub(crate) fn cancel_after_running_tools(&self, reason: ToolCallSkipReason) {
+        self.set_cancel_reason(reason, false);
+        self.inner.cancellation.cancel();
+    }
+
     /// 预留一次工具派发。
     ///
     /// 成功返回即是该工具的 dispatch linearization point；之后的取消只能中断

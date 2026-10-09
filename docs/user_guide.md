@@ -352,3 +352,31 @@ acn session cleanup --apply
 团队模式下，打开 Maintainer 地址的 `/app` 即可进入 Workbench。管理页面用于浏览团队 Claim 与 Agent、处理 Dispute 与 Policy、查看通知投递和 Sweep 历史，以及进行 Router 查询和请求审计。
 
 处理 Claim 争议时，可在 Disputes 页面进行人工处理，或启用 Maintainer 自裁决辅助分析。模式选择、操作流程与结果查看见 [Maintainer 自裁决说明](maintainer_auto_arbitration.md)。管理员鉴权与团队 key 配置见 [配置参数](config_parameters.md)。
+
+## Dream：后台整理 Claim
+
+Dream 在后台清理、查证和整合当前 Agent 自己持有的 Claim，提炼可复用知识，将没有复用价值或已完整整合的内容标记为废弃。它不读取私有 Memory，不处理 Dispute，也不代替 Policy 内化。
+
+在会话中输入 `/dream` 可手动启动。自动检查发生在新建或恢复会话时，此后每 4 小时检查一次；默认要求距上次成功执行至少 24 小时，且至少 5 条不同自有 Claim 有变化。手动执行绕过时间和数量门槛。后台优先处理 Finalize、Recap，再处理 Dream。
+
+```toml
+[agent.dream]
+enable = true
+min_interval_hours = 24
+```
+
+Dream 默认开启，关闭后手动和自动执行均停用。开启时 Supervisor 在退出 TUI 后仍保持运行，可用 `acn supervisor stop` 停止。停止时保存进度，已进入提交的修改会安全完成，下次启动后继续未完成任务。
+
+证据校准仅针对原置信度为 medium / low 的 Claim 按需进行；high 仍可参与清理和整合。找到明确适用的新证据才修订，查不到或仍不确定就保留原样。没有最低修改数量，也不保证每次覆盖全部知识。
+
+Dream 会自动应用通过检查和模型自复核的修改，无需逐项人工确认。每组成功后立即生效，后续失败会保留已有成果，重试避免重复执行。模型判断仍可能有误，可以通过修改记录核查。团队同步会先交付承接知识，再交付来源的废弃状态；本地生效与远端送达可能存在时间差。
+
+会话在后续输入时会获知 Claim 变化，并按当前任务需要读取最新内容，此前对话保持不变。其他会话、Inbox、Recap 和 Finalize 等引起的本地变化也适用这一行为。
+
+### 查看进度与结果
+
+`/dream` 会显示任务进度和完成状态；也可用 `acn supervisor jobs` 查看任务，用 `acn supervisor retry <job_id>` 重试失败任务。完成通知中的修改条目数与工具读取/运行记录数用于了解实际工作量，不代表查证通过数量。
+
+每次执行的记录位于 `<agent_home>/dream/<job_id>/`：`report.md` 汇总结果，`executions/` 中的 Markdown 说明可查看各组修改及依据。即使整轮失败，已经生效的修改仍有记录。
+
+较长的探索会自动压缩上下文，保留修改进度和证据，旧探索历史仍可按需查询。命令仅用于受限制的证据读取；macOS 使用系统隔离，Linux 需要 bubblewrap 及可用的 user namespaces。隔离不可用时仍可读取文件、Claim 和 Trace，命令执行不会退回无隔离模式。

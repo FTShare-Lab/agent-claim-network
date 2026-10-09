@@ -77,6 +77,20 @@ assert_box_inner_rows() {
   fi
 }
 
+# 旧顶边框可能已滚出可见屏；验收必须包含终端历史，不能只检查当前 viewport。
+assert_working_history_count() {
+  local capture="$1"
+  local expected="$2"
+  local path="$TUI_OUT_DIR_ABS/${capture}_history.txt"
+  local actual
+  tmux capture-pane -t "$TUI_SESSION" -p -S -1000 > "$path"
+  actual="$(rg -c '^┌ Working .*Streaming response' "$path" || true)"
+  if [[ "${actual:-0}" != "$expected" ]]; then
+    echo "$capture has ${actual:-0} working headers including history, expected $expected" >&2
+    return 1
+  fi
+}
+
 tui_build_if_needed
 ACN_BINARY="$(tui_resolve_binary TUI_ACN_BINARY acn bin)"
 FAKE_SERVER_BINARY="$(tui_resolve_binary TUI_FAKE_SERVER_BINARY fake_anthropic_sse_server example)"
@@ -164,6 +178,7 @@ tui_assert_contains "during_turn" "\\[fake stream\\]" "streaming preview is not 
 assert_occurrences_at_most "during_turn" "$WORKING_PATTERN" 1
 assert_prompt_before_live_box "during_turn"
 assert_box_inner_rows "during_turn" 15
+assert_working_history_count "during_turn" 1
 
 tmux resize-window -t "$TUI_SESSION" -x 80 -y 22
 sleep "$TUI_RESIZE_WAIT"
@@ -171,6 +186,7 @@ tui_capture "after_resize"
 tui_assert_contains "after_resize" "$WORKING_PATTERN" "live working box disappeared after resize"
 assert_occurrences_at_most "after_resize" "$WORKING_PATTERN" 1
 assert_box_inner_rows "after_resize" 15
+assert_working_history_count "after_resize" 1
 
 tmux resize-window -t "$TUI_SESSION" -x 110 -y 28
 sleep "$TUI_RESIZE_WAIT"
@@ -180,6 +196,7 @@ tui_assert_contains "after_expand" "$WORKING_PATTERN" "live working box disappea
 assert_occurrences_at_most "after_expand" "$WORKING_PATTERN" 1
 assert_prompt_before_live_box "after_expand"
 assert_box_inner_rows "after_expand" 15
+assert_working_history_count "after_expand" 1
 
 tmux resize-window -t "$TUI_SESSION" -x 72 -y 12
 sleep "$TUI_RESIZE_WAIT"
@@ -187,11 +204,13 @@ tui_capture "after_shrink_height"
 tui_assert_contains "after_shrink_height" "$WORKING_PATTERN" "live working box disappeared after shrinking height"
 assert_occurrences_at_most "after_shrink_height" "$WORKING_PATTERN" 1
 assert_box_inner_rows "after_shrink_height" 7
+assert_working_history_count "after_shrink_height" 1
 
 sleep 4
 tui_capture "after_commit"
 tui_assert_not_contains "after_commit" "$WORKING_PATTERN" "live working box remained after commit"
 tui_assert_contains "after_commit" "open" "session did not return to open after commit"
+assert_working_history_count "after_commit" 0
 
 tmux resize-window -t "$TUI_SESSION" -x 110 -y 28
 sleep "$TUI_RESIZE_WAIT"
@@ -205,9 +224,19 @@ for _ in $(seq 1 50); do
   sleep 0.2
   if "$ACN_BINARY" supervisor jobs --config "$FAKE_CONFIG" -l 0 \
     > "$SUPERVISOR_JOBS_CAPTURE" 2>&1 \
-    && [[ "$(rg -c '^job_[0-9]' "$SUPERVISOR_JOBS_CAPTURE" || true)" == "1" ]] \
-    && rg -q '^job_[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+session_[0-9a-f]{8}[[:space:]]+succeeded[[:space:]]+' "$SUPERVISOR_JOBS_CAPTURE" \
-    && ! rg -q '^job_[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+session_[0-9a-f]{8}[[:space:]]+(queued|running|failed)[[:space:]]+' "$SUPERVISOR_JOBS_CAPTURE"
+    && awk '
+      $1 == "job_id" {
+        for (i = 1; i <= NF; i++) {
+          if ($i == "kind") kind = i
+          if ($i == "status") status = i
+        }
+      }
+      /^job_[0-9]/ {
+        count++
+        if (!kind || !status || $kind != "finalize" || $status != "succeeded") invalid = 1
+      }
+      END { exit !(count == 1 && !invalid) }
+    ' "$SUPERVISOR_JOBS_CAPTURE"
   then
     FINALIZE_SUCCEEDED="1"
     break

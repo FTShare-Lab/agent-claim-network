@@ -170,7 +170,11 @@ fn parse_claim_id(value: &str) -> Result<ClaimId, ToolError> {
 }
 
 fn domain_error(error: anyhow::Error) -> ToolError {
-    ToolError::Claim(format!("{error:#}"))
+    if error.is::<crate::agent::claim_alignment::KnowledgeBusy>() {
+        ToolError::KnowledgeBusy(format!("{error:#}"))
+    } else {
+        ToolError::Claim(format!("{error:#}"))
+    }
 }
 
 #[cfg(test)]

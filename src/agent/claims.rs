@@ -1,7 +1,7 @@
 //! 当前 agent 自有 Claim 与 Trace 的浏览、CAS 编辑和同步编排。
 
 use anyhow::Context;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::runner::AgentRunner;
@@ -9,6 +9,8 @@ use crate::claim::{AgentId, Claim, ClaimId, ClaimStatus, Confidence, SourceId, T
 use crate::memory_safety::scan_memory_content;
 use crate::storage::{paths, read_yaml, write_yaml_atomic, FileLockGuard, StorageError};
 use crate::time::now_seconds;
+
+pub(crate) const CLAIM_CATALOG_HEADING: &str = "# 你的自有 claims 目录";
 
 pub const DEFAULT_CLAIM_LIST_LIMIT: usize = 20;
 pub const MAX_CLAIM_PAGE_LIMIT: usize = 100;
@@ -127,6 +129,48 @@ pub struct TraceDetail {
     pub next_task_offset: Option<usize>,
 }
 
+pub(crate) fn claim_list_page(
+    mut claims: Vec<Claim>,
+    query: Option<&str>,
+    include_deprecated: bool,
+    offset: usize,
+    limit: usize,
+) -> ClaimListPage {
+    let query = query
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .map(str::to_lowercase);
+    claims.retain(|claim| {
+        (include_deprecated || claim.status != ClaimStatus::Deprecated)
+            && query.as_ref().is_none_or(|query| {
+                claim.name.to_lowercase().contains(query)
+                    || claim.scope.to_lowercase().contains(query)
+                    || claim.statement.to_lowercase().contains(query)
+            })
+    });
+    claims.sort_by(|left, right| {
+        right
+            .effective_updated_at()
+            .cmp(&left.effective_updated_at())
+            .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+    });
+    let total = claims.len();
+    let items = claims
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|claim| ClaimSummary::from_claim(&claim))
+        .collect::<Vec<_>>();
+    let (omitted, next_offset) = page_tail(offset, items.len(), total);
+    ClaimListPage {
+        items,
+        offset,
+        limit,
+        omitted,
+        next_offset,
+    }
+}
+
 impl AgentRunner {
     pub async fn list_claims(
         &self,
@@ -136,44 +180,26 @@ impl AgentRunner {
         limit: usize,
     ) -> anyhow::Result<ClaimListPage> {
         validate_page_limit(limit)?;
-        let query = query.map(str::trim).filter(|query| !query.is_empty());
-        let query = query.map(str::to_lowercase);
+        let home = self.maintainer_upload_queue.agent_home();
+        let boundary = super::claim_alignment::DreamReadBoundary::begin(home).await?;
         self.recover_pending_claim_edit().await?;
-        let mut claims = self.claim_store.list_local_claims().await?;
-        claims.retain(|claim| {
-            (include_deprecated || claim.status != ClaimStatus::Deprecated)
-                && query.as_ref().is_none_or(|query| {
-                    claim.name.to_lowercase().contains(query)
-                        || claim.scope.to_lowercase().contains(query)
-                        || claim.statement.to_lowercase().contains(query)
-                })
-        });
-        claims.sort_by(|left, right| {
-            right
-                .effective_updated_at()
-                .cmp(&left.effective_updated_at())
-                .then_with(|| left.id.as_str().cmp(right.id.as_str()))
-        });
-        let total = claims.len();
-        let items = claims
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|claim| ClaimSummary::from_claim(&claim))
-            .collect::<Vec<_>>();
-        let (omitted, next_offset) = page_tail(offset, items.len(), total);
-        Ok(ClaimListPage {
-            items,
+        let claims = self.claim_store.list_local_claims().await?;
+        boundary.finish(home).await?;
+        Ok(claim_list_page(
+            claims,
+            query,
+            include_deprecated,
             offset,
             limit,
-            omitted,
-            next_offset,
-        })
+        ))
     }
 
     pub async fn read_claim(&self, id: &ClaimId) -> anyhow::Result<ClaimDetail> {
+        let home = self.maintainer_upload_queue.agent_home();
+        let boundary = super::claim_alignment::DreamReadBoundary::begin(home).await?;
         self.recover_pending_claim_edit().await?;
         let claim = self.read_owned_claim(id).await?;
+        boundary.finish(home).await?;
         Ok(ClaimDetail {
             revision: claim_revision(&claim)?,
             claim,
@@ -185,6 +211,8 @@ impl AgentRunner {
         let lock_path =
             paths::agent_home_knowledge_apply_lock_path(self.maintainer_upload_queue.agent_home());
         let _guard = FileLockGuard::lock_exclusive(lock_path).await?;
+        super::claim_alignment::ensure_knowledge_ready(self.maintainer_upload_queue.agent_home())
+            .await?;
         self.recover_pending_claim_edit_locked().await?;
         let current = self.read_owned_claim(&update.id).await?;
         let current_revision = claim_revision(&current)?;
@@ -217,9 +245,9 @@ impl AgentRunner {
             next.status = value;
         }
         validate_shared_claim_text(&next)?;
-        next.updated_at = Some(std::cmp::max(
+        next.updated_at = Some(crate::time::next_claim_update_at(
             now_seconds(),
-            current.effective_updated_at() + Duration::seconds(1),
+            current.effective_updated_at(),
         ));
 
         if self.team_services_configured() {
@@ -259,8 +287,11 @@ impl AgentRunner {
         limit: usize,
     ) -> anyhow::Result<TraceListPage> {
         validate_page_limit(limit)?;
+        let home = self.maintainer_upload_queue.agent_home();
+        let boundary = super::claim_alignment::DreamReadBoundary::begin(home).await?;
         self.recover_pending_claim_edit().await?;
         let mut traces = self.claim_store.list_local_traces().await?;
+        boundary.finish(home).await?;
         traces.retain(|trace| {
             trace.agent == self.agent_id
                 && claim_id.is_none_or(|claim_id| {
@@ -308,12 +339,15 @@ impl AgentRunner {
         if !(1..=MAX_TRACE_TASK_PAGE_LIMIT).contains(&task_limit) {
             anyhow::bail!("task_limit 必须在 1..={MAX_TRACE_TASK_PAGE_LIMIT} 范围内");
         }
+        let home = self.maintainer_upload_queue.agent_home();
+        let boundary = super::claim_alignment::DreamReadBoundary::begin(home).await?;
         self.recover_pending_claim_edit().await?;
         let trace = self
             .claim_store
             .read_trace(id)
             .await
             .with_context(|| format!("读取 trace {id} 失败"))?;
+        boundary.finish(home).await?;
         if trace.agent != self.agent_id {
             anyhow::bail!("trace {id} 不属于当前 agent {}", self.agent_id);
         }
@@ -375,6 +409,8 @@ impl AgentRunner {
         }
         let path =
             paths::agent_home_claim_edit_pending_path(self.maintainer_upload_queue.agent_home());
+        super::claim_alignment::ensure_knowledge_ready(self.maintainer_upload_queue.agent_home())
+            .await?;
         let pending: PendingClaimEdit = match read_yaml(&path).await {
             Ok(pending) => pending,
             Err(StorageError::Io { source, .. })
@@ -478,6 +514,7 @@ fn page_tail(offset: usize, returned: usize, total: usize) -> (usize, Option<usi
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use chrono::Duration;
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -687,6 +724,202 @@ pub(crate) mod tests {
         assert_eq!(
             runner.read_claim(&claim.id).await.unwrap().revision,
             detail.revision
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_tools_gate_unfinished_dream_but_read_normally_while_analysis_is_locked() {
+        let dir = TempDir::new().unwrap();
+        let runner = runner(&dir);
+        let claim = sample_claim(ClaimId::random(), runner.agent_id().clone());
+        runner.claim_store.write_claim(&claim).await.unwrap();
+        let revision = claim_revision(&claim).unwrap();
+        let tools = crate::tool::ToolRegistry::new(&crate::config::ToolConfig::default())
+            .unwrap()
+            .with_claim_runner(runner.clone())
+            .with_local_knowledge(
+                runner.claim_store.clone(),
+                dir.path().into(),
+                runner.agent_id().clone(),
+            );
+        let _guard =
+            FileLockGuard::lock_exclusive(paths::agent_home_knowledge_apply_lock_path(dir.path()))
+                .await
+                .unwrap();
+        let input = serde_json::json!({"action":"read", "id":claim.id});
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            tools.dispatch("claim", input.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(_guard);
+        let pending = dir.path().join("runtime/supervisor/dream_pending.yaml");
+        write_yaml_atomic(&pending, &"pending").await.unwrap();
+        for input in [
+            input,
+            serde_json::json!({"action":"list"}),
+            serde_json::json!({"action":"update","id":claim.id,"expected_revision":revision,"name":"new"}),
+        ] {
+            let error = tools.dispatch("claim", input).await.unwrap_err();
+            assert_eq!(error.code(), Some("knowledge_busy"));
+        }
+        assert_eq!(
+            runner.claim_store.read_claim(&claim.id).await.unwrap(),
+            claim
+        );
+        tokio::fs::remove_file(pending).await.unwrap();
+        tools
+            .dispatch("claim", serde_json::json!({"action":"read","id":claim.id}))
+            .await
+            .unwrap();
+
+        let modern = tools.definitions_for_prompt(CLAIM_CATALOG_HEADING).0;
+        assert!(modern.iter().any(|tool| tool.name == "claim"));
+        assert!(!modern
+            .iter()
+            .any(|tool| matches!(tool.name.as_str(), "read_claim" | "read_trace")));
+        assert!(tools
+            .definitions_for_prompt("old frozen prompt")
+            .0
+            .iter()
+            .any(|tool| tool.name == "read_claim"));
+        let child = tools
+            .clone()
+            .for_delegation(None)
+            .definitions_for_prompt(CLAIM_CATALOG_HEADING)
+            .0;
+        assert!(!child.iter().any(|tool| tool.name == "claim"));
+        assert!(child.iter().any(|tool| tool.name == "read_claim"));
+        let dream = tools
+            .for_dream(dir.path().into())
+            .definitions_for_prompt(CLAIM_CATALOG_HEADING)
+            .0;
+        assert!(!dream.iter().any(|tool| tool.name == "claim"));
+        assert!(dream.iter().any(|tool| tool.name == "read_claim"));
+    }
+
+    #[tokio::test]
+    async fn prepared_update_after_future_dated_front_edit_stages_the_latest_version() {
+        let dir = TempDir::new().unwrap();
+        let runner = team_runner(&dir);
+        let mut claim = sample_claim(ClaimId::random(), runner.agent_id().clone());
+        claim.updated_at = Some(now_seconds() + Duration::seconds(20));
+        runner.claim_store.write_claim(&claim).await.unwrap();
+        let front = runner
+            .update_claim(ClaimUpdate {
+                id: claim.id.clone(),
+                expected_revision: claim_revision(&claim).unwrap(),
+                name: Some("front edit".into()),
+                statement: None,
+                scope: None,
+                evidence_summary: None,
+                confidence: None,
+                status: None,
+            })
+            .await
+            .unwrap()
+            .claim;
+        let draft = serde_json::from_value::<crate::api::ClaimDraft>(serde_json::json!({
+            "id":front.id, "name":"background edit", "statement":"Preserve the validated retry boundary.",
+            "scope":front.scope, "confidence":"medium", "status":"active", "source_claim_ids":[], "evidence_summary":"Current contract retained."
+        })).unwrap();
+        let prepared = crate::agent::prepare::prepare_claim_updates(
+            vec![draft],
+            &[(front.id.clone(), front.clone())].into_iter().collect(),
+            None,
+            now_seconds(),
+        )
+        .unwrap();
+        assert!(prepared[0].effective_updated_at() > front.effective_updated_at());
+        runner.claim_store.write_claim(&prepared[0]).await.unwrap();
+        runner
+            .stage_maintainer_batch_with_durable_claims(prepared.clone(), Vec::new())
+            .await
+            .unwrap();
+        let pending: crate::agent::maintainer_upload::PendingMaintainerUploads = read_yaml(
+            &paths::agent_home_pending_maintainer_uploads_path(dir.path()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pending.claims, prepared);
+    }
+
+    #[tokio::test]
+    async fn front_edit_preserves_carrier_dependency_and_source_restore_cancels_retirement() {
+        use crate::agent::consolidation_delivery::{ready, ConsolidationDelivery};
+        let dir = TempDir::new().unwrap();
+        let runner = team_runner(&dir);
+        let before = sample_claim("claim_11111111".parse().unwrap(), runner.agent_id().clone());
+        let mut carrier =
+            sample_claim("claim_22222222".parse().unwrap(), runner.agent_id().clone());
+        carrier.statement = "Retain both retry and recovery conditions.".into();
+        let mut retired = before.clone();
+        retired.status = ClaimStatus::Deprecated;
+        retired.updated_at = Some(now_seconds());
+        for claim in [&carrier, &retired] {
+            runner.claim_store.write_claim(claim).await.unwrap();
+        }
+        runner
+            .stage_consolidation_batch(
+                vec![carrier.clone(), retired.clone()],
+                vec![ConsolidationDelivery {
+                    before,
+                    retired: retired.clone(),
+                    carriers: vec![carrier.clone()],
+                }],
+            )
+            .await
+            .unwrap();
+        let changed = runner
+            .update_claim(ClaimUpdate {
+                id: carrier.id.clone(),
+                expected_revision: claim_revision(&carrier).unwrap(),
+                name: None,
+                statement: Some("Retain the revised boundary.".into()),
+                scope: None,
+                evidence_summary: None,
+                confidence: None,
+                status: None,
+            })
+            .await
+            .unwrap()
+            .claim;
+        let path = paths::agent_home_pending_maintainer_uploads_path(dir.path());
+        let pending: crate::agent::maintainer_upload::PendingMaintainerUploads =
+            read_yaml(&path).await.unwrap();
+        assert_eq!(pending.consolidations.len(), 1);
+        assert!(!ready(
+            &retired,
+            &pending.consolidations,
+            std::slice::from_ref(&changed),
+            &[changed.clone(), retired.clone()]
+        ));
+        runner
+            .update_claim(ClaimUpdate {
+                id: retired.id.clone(),
+                expected_revision: claim_revision(&retired).unwrap(),
+                name: None,
+                statement: None,
+                scope: None,
+                evidence_summary: None,
+                confidence: None,
+                status: Some(ClaimStatus::Active),
+            })
+            .await
+            .unwrap();
+        let pending: crate::agent::maintainer_upload::PendingMaintainerUploads =
+            read_yaml(&path).await.unwrap();
+        assert!(pending.consolidations.is_empty());
+        assert_eq!(
+            pending
+                .claims
+                .iter()
+                .find(|c| c.id == retired.id)
+                .unwrap()
+                .status,
+            ClaimStatus::Active
         );
     }
 

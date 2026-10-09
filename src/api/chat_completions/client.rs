@@ -876,6 +876,7 @@ mod tests {
 
     fn request(stream: bool) -> ChatCompletionRequest {
         ChatCompletionRequest {
+            response_format: None,
             model: "test-model".into(),
             messages: vec![ChatMessage::user("hello")],
             reasoning_effort: None,

@@ -1788,7 +1788,7 @@ Session 维护命令:
 Supervisor 排障命令:
   acn supervisor status       查看后台 supervisor 是否在运行、PID、uptime 和队列概况
   acn supervisor jobs [-l n]  查看最近 recap/finalize job；默认 5 条，-l 0 显示全部
-  acn supervisor retry <id>   按 session_id（推荐）或 job_id 重试失败的 finalize
+  acn supervisor retry <id>   按 session_id 重试 finalize，或按 job_id 重试 finalize / Dream
   acn supervisor stop         优雅停止后台 supervisor
 
 MCP 配置命令:
@@ -1949,7 +1949,7 @@ fn supervisor_usage() -> &'static str {
   acn supervisor stop [options]
   acn supervisor run [options]
 
-管理 ACN recap/finalize supervisor。普通用户无需手动启动；`run` 是 ACN 自动拉起的后台内部命令，开发和排障时主要使用 status/jobs/retry/stop。
+管理 ACN finalize/recap/dream supervisor。普通用户无需手动启动；`run` 是 ACN 自动拉起的后台内部命令，开发和排障时主要使用 status/jobs/retry/stop。
 
 选项:
   --config <path>      指定 config.toml；应与启动 TUI 时使用的配置一致
@@ -2039,7 +2039,7 @@ fn supervisor_status_text(
                 .as_ref()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| "-".to_string()),
-            job.session_id,
+            job.session_id.as_ref().map(ToString::to_string).unwrap_or_else(|| "-".into()),
             job.recap_end_index
                 .map(|target| target.to_string())
                 .unwrap_or_else(|| "-".to_string()),
@@ -2082,7 +2082,7 @@ fn supervisor_jobs_text(jobs: &[supervisor::SupervisorJobView], limit: usize) ->
                         .map(ToString::to_string)
                         .unwrap_or_else(|| "-".to_string()),
                 ),
-                clean_table_field(job.session_id.as_str()),
+                clean_table_field(job.session_id.as_ref().map(|id| id.as_str()).unwrap_or("-")),
                 job.recap_end_index
                     .map(|target| target.to_string())
                     .unwrap_or_else(|| "-".to_string()),
@@ -2167,8 +2167,20 @@ fn supervisor_stop_report_text(report: &supervisor::SupervisorStopReport) -> Str
 
 fn supervisor_retry_report_text(report: &supervisor::SupervisorRetryReport) -> String {
     format!(
-        "finalize retry queued\nsession_id: {}\njob_id: {}\nattempts: {} -> 0\nmanual_retries: {}\n",
-        report.session_id, report.job_id, report.previous_attempts, report.manual_retries
+        "{} retry queued\nsession_id: {}\njob_id: {}\nattempts: {} -> 0\nmanual_retries: {}\n",
+        if report.session_id.is_some() {
+            "finalize"
+        } else {
+            "dream"
+        },
+        report
+            .session_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "-".into()),
+        report.job_id,
+        report.previous_attempts,
+        report.manual_retries
     )
 }
 
@@ -3790,7 +3802,7 @@ retry_max_delay_ms = 5000
                 id: "job_1".to_string(),
                 agent_id: Some(AgentId::new("agent-a").unwrap()),
                 kind: "finalize".to_string(),
-                session_id: SessionId::from_str("session_1234abcd").unwrap(),
+                session_id: Some(SessionId::from_str("session_1234abcd").unwrap()),
                 recap_end_index: None,
                 status: "running".to_string(),
                 created_at: now,
@@ -3835,7 +3847,7 @@ retry_max_delay_ms = 5000
                 id: "job_1".to_string(),
                 agent_id: Some(AgentId::new("agent-a").unwrap()),
                 kind: "finalize".to_string(),
-                session_id: SessionId::from_str("session_1234abcd").unwrap(),
+                session_id: Some(SessionId::from_str("session_1234abcd").unwrap()),
                 recap_end_index: None,
                 status: "running".to_string(),
                 created_at: now,
@@ -3869,7 +3881,7 @@ retry_max_delay_ms = 5000
             id: "job_1".to_string(),
             agent_id: Some(AgentId::new("agent-a").unwrap()),
             kind: "recap".to_string(),
-            session_id: SessionId::from_str("session_1234abcd").unwrap(),
+            session_id: Some(SessionId::from_str("session_1234abcd").unwrap()),
             recap_end_index: Some(42),
             status: "failed".to_string(),
             created_at: now,
@@ -3902,7 +3914,7 @@ retry_max_delay_ms = 5000
                 id: format!("job_{idx}"),
                 agent_id: Some(AgentId::new("agent-a").unwrap()),
                 kind: "finalize".to_string(),
-                session_id: SessionId::from_str("session_1234abcd").unwrap(),
+                session_id: Some(SessionId::from_str("session_1234abcd").unwrap()),
                 recap_end_index: None,
                 status: "succeeded".to_string(),
                 created_at: now + chrono::Duration::seconds(i64::from(idx)),
@@ -3938,7 +3950,7 @@ retry_max_delay_ms = 5000
                 id: format!("job_{idx}"),
                 agent_id: Some(AgentId::new("agent-a").unwrap()),
                 kind: "finalize".to_string(),
-                session_id: SessionId::from_str("session_1234abcd").unwrap(),
+                session_id: Some(SessionId::from_str("session_1234abcd").unwrap()),
                 recap_end_index: None,
                 status: "succeeded".to_string(),
                 created_at: now + chrono::Duration::seconds(i64::from(idx)),
@@ -3978,7 +3990,7 @@ retry_max_delay_ms = 5000
     #[test]
     fn supervisor_retry_output_is_identical_after_session_or_job_resolution() {
         let report = agent_claim_network::supervisor::SupervisorRetryReport {
-            session_id: "session_1234abcd".parse().unwrap(),
+            session_id: Some("session_1234abcd".parse().unwrap()),
             job_id: "job_123_abcdef01".to_string(),
             previous_attempts: 5,
             manual_retries: 2,

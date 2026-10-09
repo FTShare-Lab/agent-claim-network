@@ -9,8 +9,12 @@ mod command;
 mod concurrency;
 mod delegation;
 pub mod diff;
+mod dream_sandbox;
 mod file;
 mod file_text;
+mod knowledge;
+pub(crate) use knowledge::dream_evidence_is_current;
+pub(crate) use knowledge::DreamPlanTools;
 mod mcp;
 pub mod memory;
 mod process;
@@ -97,6 +101,8 @@ pub enum ToolError {
     UnknownTool(String),
     #[error("工具参数非法: {0}")]
     InvalidArgs(String),
+    #[error("知识库暂时忙碌: {0}")]
+    KnowledgeBusy(String),
     #[error("缺少 {env}，无法执行 web_search")]
     MissingWebSearchApiKey { env: String },
     #[error("命令超时: {0}s")]
@@ -128,6 +134,7 @@ pub enum ToolError {
 impl ToolError {
     pub(crate) fn code(&self) -> Option<&'static str> {
         match self {
+            Self::KnowledgeBusy(_) => Some("knowledge_busy"),
             Self::RuntimeResourceExhausted(_) => Some("runtime_resource_exhausted"),
             Self::CodeRunInternalTimeout { .. } => Some("code_run_internal_timeout"),
             _ => None,
@@ -412,6 +419,9 @@ impl DelegationToolHost {
 
 #[derive(Clone)]
 pub struct ToolRegistry {
+    knowledge: Option<knowledge::KnowledgeAccess>,
+    dream_plan_tools: Option<Arc<dyn DreamPlanTools>>,
+    dream_read_only: bool,
     workspace_root: PathBuf,
     http: reqwest::Client,
     direct_http: reqwest::Client,

@@ -14,6 +14,14 @@ use crate::config::PromptConfig;
 const BUNDLED_PROMPT_ROOT_LABEL: &str = "<bundled-prompts>";
 const BUNDLED_TEMPLATES: &[(&str, &str)] = &[
     (
+        "dream_compaction.j2",
+        include_str!("../../prompts/dream_compaction.j2"),
+    ),
+    (
+        "claim_dream.j2",
+        include_str!("../../prompts/claim_dream.j2"),
+    ),
+    (
         "agent_system.j2",
         include_str!("../../prompts/agent_system.j2"),
     ),
@@ -276,7 +284,7 @@ mod tests {
             memory_enabled,
             memory_md: "agent memory",
             user_md: "user profile",
-            local_claims_snapshot: "以下是当前 agent 已内化且仍有效的 self claims 快照，不是团队真理；当任务涉及团队共享知识、复用或冲突时，仍应 consult_router。\n\n```jsonl\n{\"id\":\"claim_1234abcd\",\"name\":\"claim name\",\"scope\":\"scope/a\",\"statement\":\"statement\",\"status\":\"active\",\"confidence\":\"high\",\"created_at\":\"2026-05-20T00:00:00Z\"}\n```",
+            local_claims_snapshot: "```json\n{\"items\":[{\"id\":\"claim_1234abcd\",\"name\":{\"text\":\"claim_name\",\"truncated\":false},\"scope\":{\"text\":\"scope/a\",\"truncated\":false},\"status\":\"active\",\"confidence\":\"high\",\"updated_at\":\"2026-05-20T00:00:00Z\"}],\"offset\":0,\"limit\":20,\"omitted\":0,\"next_offset\":null}\n```",
             available_skills: vec![AgentSystemSkillContext {
                 name: "consult_router",
                 description: "根据 claim 候选判断是否继续查询 router",
@@ -454,8 +462,9 @@ mod tests {
         assert!(out.contains("# 你的自有 claims 目录"));
         assert!(out.contains("expected_revision"));
         assert!(out.contains("不包含当时 claim 的版本快照"));
-        assert!(out.contains("self claims 快照"));
-        assert!(out.contains("```jsonl"));
+        assert!(out.contains("不包含判断正文或证据"));
+        assert!(out.contains("```json"));
+        assert!(out.contains("\"items\""));
         assert!(out.contains("\"id\":\"claim_1234abcd\""));
         assert!(out.contains("candidate_claims"));
         assert!(out.contains("disputes"));
@@ -473,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_agent_system_uses_runtime_context_for_relative_dates() {
+    fn repository_agent_system_uses_runtime_context_for_relative_dates_and_claim_reads() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
         let reg = PromptRegistry::new(&root).unwrap();
         let out = reg
@@ -486,6 +495,11 @@ mod tests {
         assert!(out.contains("应直接查证相关事实来源，而不是先机械查询系统时间"));
         assert!(!out.contains("本 prompt 不提供可靠的当前日期"));
         assert!(!out.contains("务必先单独使用 `code_run` 获取当前时间与时区"));
+        assert!(out.contains("才用 `claim` 的 `action=\"read\"`"));
+        assert!(out.contains("基线不限于目录展示的条目"));
+        assert!(out.contains("包括前台修订"));
+        assert!(!out.contains("`read_claim`"));
+        assert!(!out.contains("`read_trace`"));
     }
 
     #[test]
@@ -654,6 +668,8 @@ mod tests {
         assert!(out.contains("不要把这些要素单独摘成缺少判断含义的碎片"));
         assert!(out.contains("已显著消耗探索成本"));
         assert!(out.contains("不要为了覆盖清单而为每一类凑 claim"));
+        assert!(out.contains("经证据支持的可复用失败机制、约束或决策规则可以成为 claim"));
+        assert!(!out.contains("如果某条临时结果"));
         assert!(out.contains("反斜杠写成 `\\\\`"));
         assert!(out.contains("换行写成 `\\n`"));
         assert!(out.contains("U+0000–U+001F"));

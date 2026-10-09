@@ -177,6 +177,12 @@ impl StructuredJsonCaller {
         }
     }
 
+    pub(crate) fn with_output_limit(&self, max_tokens: u32) -> Self {
+        let mut caller = self.clone();
+        caller.max_tokens = self.max_tokens.min(max_tokens);
+        caller
+    }
+
     /// 复盘允许用函数参数承载 JSON；这里仅提取输出，不派发工具执行。
     pub(crate) fn with_function_output(&self, input_schema: Value) -> Self {
         let mut caller = self.clone();
@@ -652,6 +658,7 @@ impl StructuredJsonCaller {
         messages: Vec<SessionTurnMessage>,
     ) -> Result<Value, JsonCallError> {
         let request = self.prepare_output_request(ProviderRequest {
+            json_output: false,
             system_prompt,
             messages,
             tools: Vec::new(),
@@ -698,6 +705,7 @@ impl StructuredJsonCaller {
             )
         });
         let request = self.prepare_output_request(ProviderRequest {
+            json_output: false,
             system_prompt,
             messages,
             tools: Vec::new(),
@@ -935,7 +943,7 @@ fn raw_text_for_audit(message: &SessionTurnMessage) -> Option<String> {
     Some(text)
 }
 
-fn strip_code_fence(text: &str) -> &str {
+pub(crate) fn strip_code_fence(text: &str) -> &str {
     let trimmed = text.trim();
     if let Some(rest) = strip_json_fence_prefix(trimmed) {
         rest.trim_start().trim_end().trim_end_matches("```").trim()
@@ -1092,6 +1100,7 @@ mod tests {
         ]));
         let value = caller(provider.clone())
             .with_function_output(json!({"type": "object"}))
+            .with_output_limit(256)
             .generate_json_streaming_validated_with_retry_notice(
                 "system".into(),
                 vec![SessionTurnMessage::user_text("payload")],
@@ -1109,6 +1118,7 @@ mod tests {
         let requests = provider.requests.lock().await;
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].tools.len(), 1);
+        assert_eq!(requests[0].max_tokens, 256);
         assert_eq!(requests[0].tools, requests[1].tools);
         assert_eq!(requests[0].tools[0].name, super::STRUCTURED_OUTPUT_FUNCTION);
         assert_eq!(requests[1].messages.len(), 2);

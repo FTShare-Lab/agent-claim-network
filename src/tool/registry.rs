@@ -53,6 +53,9 @@ impl ToolRegistry {
             ));
         }
         Ok(Self {
+            knowledge: None,
+            dream_read_only: false,
+            dream_plan_tools: None,
             workspace_root: cfg.workspace_root.clone(),
             http: crate::http_client_builder().build()?,
             direct_http: crate::direct_http_client_builder().build()?,
@@ -193,6 +196,26 @@ impl ToolRegistry {
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.definitions_with_mcp_routes().0
+    }
+
+    /// 新会话只公开统一 Claim 工具；旧冻结提示词与子代理继续使用只读兼容入口。
+    /// 请求与 token 估算共用该投影，且 MCP 路由仍与工具定义在一次采样中冻结。
+    pub(crate) fn definitions_for_prompt(
+        &self,
+        system_prompt: &str,
+    ) -> (
+        Vec<ToolDefinition>,
+        BTreeMap<String, crate::mcp::tool::McpToolRoute>,
+    ) {
+        let (mut definitions, routes) = self.definitions_with_mcp_routes();
+        if self.access.claim
+            && self.claim_runner.is_some()
+            && !self.dream_read_only
+            && system_prompt.contains(crate::agent::claims::CLAIM_CATALOG_HEADING)
+        {
+            definitions.retain(|tool| !matches!(tool.name.as_str(), "read_claim" | "read_trace"));
+        }
+        (definitions, routes)
     }
 
     pub(crate) fn file_edit_authority_enabled(&self) -> bool {
@@ -566,6 +589,27 @@ impl ToolRegistry {
             "ask_user" => self.access.ask_user,
             _ => true,
         });
+        if self.knowledge.is_some() && (self.access.local_tools || self.dream_read_only) {
+            definitions.extend(super::knowledge::definitions());
+        }
+        if self.dream_read_only {
+            definitions.retain(|tool| {
+                matches!(
+                    tool.name.as_str(),
+                    "file_read" | "code_run" | "read_claim" | "read_trace"
+                )
+            });
+            if let Some(command) = definitions.iter_mut().find(|tool| tool.name == "code_run") {
+                command.description = super::knowledge::DREAM_COMMAND_GUIDANCE.into();
+                command.input_schema["properties"]["type"]["enum"] = json!(["bash"]);
+                command.input_schema["properties"]["tty"] = json!({"type":"boolean","enum":[false],"description":"Dream only supports non-interactive commands."});
+                command.input_schema["properties"]["cwd"]["description"] = json!("An existing directory inside the declared workspace. Omit to use the workspace root.");
+            }
+            if let Some(handler) = self.dream_plan_tools.as_ref() {
+                definitions.extend(handler.definitions());
+            }
+            return (definitions, BTreeMap::new());
+        }
         if self.memory_enabled && self.access.memory && self.memory_store.is_some() {
             definitions.extend(memory::definitions());
         }
@@ -795,7 +839,12 @@ impl ToolRegistry {
         context: ToolDispatchContext,
         require_mcp_read_only: bool,
     ) -> Result<ToolExecution, ToolError> {
+        if self.dream_read_only {
+            return self.dispatch_dream(name, input, &context).await;
+        }
         match name {
+            "read_claim" if self.access.local_tools => self.read_claim(input, &context).await,
+            "read_trace" if self.access.local_tools => self.read_trace(input, &context).await,
             "code_run" if self.access.local_tools => self.code_run(input, &context).await,
             "write_stdin" if self.access.local_tools => self.write_stdin(input, &context).await,
             "process_list" if self.access.local_tools => self.process_list(input, &context).await,

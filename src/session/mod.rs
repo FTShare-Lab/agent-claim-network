@@ -222,12 +222,19 @@ pub struct FinalizeClaimRevision {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// Recap/Finalize 共用的单代 checkpoint；物理文件名保留为 `finalize_checkpoint.yaml`。
 pub struct FinalizeCheckpoint {
+    #[serde(default)]
+    pub analysis_claims: Option<Vec<Claim>>,
+    #[serde(default)]
+    pub applied_claims: Vec<Claim>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
     pub recap_start_index: usize,
     pub recap_end_index: usize,
     pub recap_segment_hash: String,
     #[serde(default)]
     pub prepared_claims: Vec<Claim>,
-    #[serde(default)]
+    /// 兼容旧检查点；新记录使用 analysis_claims，不再重复保存哈希。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expected_claim_revisions: Vec<FinalizeClaimRevision>,
     #[serde(default)]
     pub prepared_disputes: Vec<Dispute>,
@@ -2844,6 +2851,9 @@ frontier:
             .unwrap();
         session
             .write_finalize_checkpoint(&FinalizeCheckpoint {
+                analysis_claims: Some(Vec::new()),
+                applied_claims: Vec::new(),
+                warnings: Vec::new(),
                 recap_start_index: 0,
                 recap_end_index: 0,
                 recap_segment_hash: "legacy-hash".into(),
@@ -3419,6 +3429,9 @@ frontier:
             .await
             .unwrap();
         let checkpoint = FinalizeCheckpoint {
+            analysis_claims: Some(Vec::new()),
+            applied_claims: Vec::new(),
+            warnings: Vec::new(),
             recap_start_index: 0,
             recap_end_index: 2,
             recap_segment_hash: "hash".into(),
@@ -3441,6 +3454,9 @@ frontier:
     #[test]
     fn legacy_finalize_checkpoint_without_claim_revisions_deserializes() {
         let checkpoint = FinalizeCheckpoint {
+            analysis_claims: None,
+            applied_claims: Vec::new(),
+            warnings: Vec::new(),
             recap_start_index: 0,
             recap_end_index: 2,
             recap_segment_hash: "hash".into(),
@@ -4472,6 +4488,9 @@ frontier:
             .unwrap();
         handle.advance_recapped_until(2).await.unwrap();
         let checkpoint = FinalizeCheckpoint {
+            analysis_claims: Some(Vec::new()),
+            applied_claims: Vec::new(),
+            warnings: Vec::new(),
             recap_start_index: 0,
             recap_end_index: 2,
             recap_segment_hash: "hash".into(),

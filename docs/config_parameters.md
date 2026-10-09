@@ -102,6 +102,13 @@ agent_id = "agent-a"
 
 - `processing_stale_after_secs`：agent 本地 inbox processing lease 的 stale 阈值。超过该秒数仍未 ack 的 `*.processing.*.yaml` 会在下次扫描前恢复为 pending，以便重试。
 
+### `[agent.dream]`
+
+- `enable`：是否开启当前 Agent 的后台 Claim 整理，默认 `true`；设为 `false` 后自动检查和手动 `/dream` 均不执行。
+- `min_interval_hours`：自动执行距上次成功 Dream 的最小小时数，默认 `24`，必须大于 `0`。手动 `/dream` 不受此限制。
+
+新建或恢复会话时检查，之后 supervisor 每 4 小时检查一次；自动执行还要求至少 5 条不同自有 Claim 相比上次输入快照发生变化。手动 `/dream` 绕过时间和数量门槛。后台启停与使用方式见 [Dream 使用说明](user_guide.md#dream后台整理-claim)。
+
 ### `[agent.session]`
 
 - `id_mint_max_retries`：session id 创建时的最大重抽次数。总尝试次数为 `1 + id_mint_max_retries`。

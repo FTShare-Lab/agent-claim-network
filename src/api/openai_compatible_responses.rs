@@ -137,6 +137,7 @@ impl OpenAiCompatibleResponsesProviderAdapter {
         stream: bool,
     ) -> ResponsesRequest {
         ResponsesRequest {
+            text: None,
             model: self.model.clone(),
             instructions: system_prompt.to_string(),
             input,
@@ -166,6 +167,7 @@ impl OpenAiCompatibleResponsesProviderAdapter {
         base_messages: &[SessionTurnMessage],
         tools: Vec<ResponsesTool>,
         max_tokens: u32,
+        json_output: bool,
         stream: bool,
         retry_count: u32,
         allow_continuation: bool,
@@ -239,13 +241,14 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                 }
                 return Err(ResponsesError::RecoveryInterrupted.into());
             }
-            let request = self.request_for(
+            let mut request = self.request_for(
                 system_prompt,
                 input.clone(),
                 tools.clone(),
                 max_tokens,
                 stream,
             );
+            request.text = json_output.then(|| json!({"format":{"type":"json_object"}}));
             let mut request_start_recorded = false;
             let response_result = {
                 let mut request_started = |previous_attempt_ambiguous| {
@@ -519,6 +522,7 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                 &base_messages,
                 tool_specs_to_responses(request.tools),
                 request.max_tokens,
+                request.json_output,
                 request.stream,
                 retry_count,
                 allow_continuation,
@@ -536,6 +540,12 @@ impl OpenAiCompatibleResponsesProviderAdapter {
                 return Err(ProviderRequestPreparationFailure::new(reason).into());
             }
             Err(error) => {
+                if request.json_output
+                    && matches!(&error, OpenAiCompatibleResponsesError::Client(ResponsesError::Status { status, body })
+                        if super::provider::json_output_unsupported(*status, body))
+                {
+                    return Err(super::provider::ProviderJsonOutputUnsupported.into());
+                }
                 if matches!(
                     &error,
                     OpenAiCompatibleResponsesError::Client(ResponsesError::RecoveryInterrupted)
@@ -1446,6 +1456,7 @@ mod tests {
         let response = adapter
             .send_with_request_observer(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("hello")],
                     tools: Vec::new(),
@@ -1498,6 +1509,7 @@ mod tests {
         let error = adapter
             .send_with_request_observer(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("hello")],
                     tools: Vec::new(),
@@ -1552,6 +1564,7 @@ mod tests {
         let error = adapter
             .send(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("hello")],
                     tools: Vec::new(),
@@ -2232,6 +2245,7 @@ mod tests {
         let response = adapter
             .send_with_request_observer(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("hello")],
                     tools: Vec::new(),
@@ -2347,6 +2361,7 @@ mod tests {
         let error = adapter
             .send_with_request_observer(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("hello")],
                     tools: Vec::new(),
@@ -2374,6 +2389,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_json_output_is_opt_in_on_the_wire() {
+        let success = json!({"status":"completed","output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"{}"}]}]});
+        let (endpoint, captured) = spawn_json_sequence(vec![success.clone(), success]).await;
+        let adapter = OpenAiCompatibleResponsesProviderAdapter::new(
+            "test-key".into(),
+            endpoint,
+            "test-model".into(),
+            Duration::from_secs(5),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        for json_output in [false, true] {
+            adapter
+                .send(
+                    ProviderRequest {
+                        json_output,
+                        system_prompt: "Return a JSON object".into(),
+                        messages: vec![SessionTurnMessage::user_text("Evaluate")],
+                        tools: vec![],
+                        max_tokens: 128,
+                        stream: false,
+                        stream_output_mode: crate::api::ProviderStreamOutputMode::Live,
+                        runtime_chain_id: None,
+                        runtime_fallback_scope: None,
+                        recovery_interrupt: None,
+                        allow_continuation: true,
+                        retry_count_override: Some(0),
+                    },
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+        }
+        let requests = captured.await.unwrap();
+        assert!(requests[0].get("text").is_none());
+        assert_eq!(
+            requests[1]["text"],
+            json!({"format":{"type":"json_object"}})
+        );
+    }
+
+    #[tokio::test]
     async fn max_token_response_does_not_continue_when_request_disables_it() {
         let (endpoint, requests) = spawn_json_sequence(vec![json!({
             "status":"incomplete",
@@ -2398,6 +2457,7 @@ mod tests {
         let response = adapter
             .send(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("hello")],
                     tools: Vec::new(),
@@ -2451,6 +2511,7 @@ mod tests {
         let response = adapter
             .send_with_request_observer(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("hello")],
                     tools: Vec::new(),
@@ -2513,6 +2574,7 @@ mod tests {
         let response = adapter
             .send_with_request_observer(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("hello")],
                     tools: Vec::new(),

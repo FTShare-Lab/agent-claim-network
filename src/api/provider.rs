@@ -336,6 +336,9 @@ impl Eq for ProviderRecoveryInterrupt {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRequest {
+    /// 请求 JSON 对象正文；支持此模式的 adapter 映射为原生协议字段。
+    /// 不支持的协议保留 prompt 约束，调用方仍须校验正文。
+    pub json_output: bool,
     pub system_prompt: String,
     pub messages: Vec<SessionTurnMessage>,
     pub tools: Vec<ToolSpec>,
@@ -353,6 +356,35 @@ pub struct ProviderRequest {
     pub allow_continuation: bool,
     /// 覆盖 adapter 内部的额外 HTTP retry 次数；`None` 使用 provider 配置。
     pub retry_count_override: Option<u32>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Provider explicitly does not support JSON output mode")]
+pub(crate) struct ProviderJsonOutputUnsupported;
+
+pub(super) fn json_output_unsupported(status: u16, body: &str) -> bool {
+    if !matches!(status, 400 | 422)
+        || super::provider_error_code(body)
+            .is_some_and(|code| super::is_provider_non_request_error_code(&code))
+    {
+        return false;
+    }
+    let message = crate::api::provider_error_message(body)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    ["response_format", "json_object", "text.format"]
+        .iter()
+        .any(|field| message.contains(field))
+        && [
+            "unsupported",
+            "not support",
+            "unknown",
+            "unrecognized",
+            "not available",
+            "not allowed",
+        ]
+        .iter()
+        .any(|reason| message.contains(reason))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -828,5 +860,59 @@ mod tests {
         assert!(main.websocket_sticky());
         assert!(subagent.websocket_sticky());
         assert!(root.new_child().websocket_sticky());
+    }
+
+    #[test]
+    fn json_output_fallback_requires_explicit_unsupported_request_error() {
+        let error = |kind: &str, message: &str| {
+            serde_json::json!({"error":{"type":kind,"message":message}}).to_string()
+        };
+        for (status, kind, message, expected) in [
+            (
+                400,
+                "invalid_request_error",
+                "response_format json_object is not supported",
+                true,
+            ),
+            (
+                422,
+                "invalid_request_error",
+                "Unknown parameter text.format",
+                true,
+            ),
+            (
+                500,
+                "invalid_request_error",
+                "response_format not supported",
+                false,
+            ),
+            (
+                400,
+                "authentication_error",
+                "response_format not supported",
+                false,
+            ),
+            (
+                400,
+                "invalid_request_error",
+                "messages must contain json for response_format",
+                false,
+            ),
+            (400, "invalid_request_error", "Unknown tool schema", false),
+        ] {
+            assert_eq!(
+                json_output_unsupported(status, &error(kind, message)),
+                expected,
+                "{message}"
+            );
+        }
+        assert!(json_output_unsupported(
+            400,
+            &serde_json::json!({
+                "error":{"code":"unsupported_value","type":"invalid_request_error",
+                    "message":"response_format json_object is not supported by this model"}
+            })
+            .to_string()
+        ));
     }
 }

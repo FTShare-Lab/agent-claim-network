@@ -1,7 +1,12 @@
 //! 轻量后台 supervisor。
 //!
-//! 承载 session recap / finalize job：TUI enqueue 后不等待后台模型执行，supervisor
-//! 按优先级串行处理。它是按需启动、空闲退出的普通子进程，不注册 OS service。
+//! 承载 Finalize / Recap / Dream job，TUI 入队后不等待后台模型执行。
+//! 按优先级串行处理；Dream 开启时常驻，否则空闲退出，不注册 OS service。
+
+mod dream;
+pub(crate) use dream::dream_has_priority_work;
+pub use dream::{check_dream, DreamCheckReport};
+pub(crate) use dream::{dream_completion_summary, DreamCompletionSummary};
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -214,7 +219,7 @@ pub struct SupervisorJobView {
     pub id: String,
     pub agent_id: Option<AgentId>,
     pub kind: String,
-    pub session_id: SessionId,
+    pub session_id: Option<SessionId>,
     pub recap_end_index: Option<usize>,
     pub status: String,
     pub created_at: DateTime<Utc>,
@@ -260,7 +265,7 @@ pub enum SupervisorRetryTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SupervisorRetryReport {
-    pub session_id: SessionId,
+    pub session_id: Option<SessionId>,
     pub job_id: String,
     pub previous_attempts: u32,
     pub manual_retries: u32,
@@ -299,6 +304,7 @@ impl SupervisorShutdownGuard {
 
 #[derive(Clone)]
 struct SupervisorSharedState {
+    dream_engine: Option<SessionEngine>,
     agent_id: AgentId,
     notify_tx: mpsc::UnboundedSender<()>,
     stop_requested: CancellationToken,
@@ -307,6 +313,7 @@ struct SupervisorSharedState {
     runtime_fingerprint: SupervisorRuntimeFingerprint,
     stopping: Arc<AtomicBool>,
     lifecycle_gate: Arc<Mutex<()>>,
+    dream_recovery_gate: Arc<Mutex<()>>,
     running_recap: Arc<Mutex<Option<RunningRecap>>>,
     running_finalize: Arc<Mutex<Option<RunningFinalize>>>,
 }
@@ -345,6 +352,10 @@ enum RunningFinalizeResumeResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum SupervisorRequest {
+    CheckDream {
+        workspace: PathBuf,
+        manual: bool,
+    },
     Ping,
     Status,
     Stop,
@@ -381,6 +392,10 @@ enum SupervisorRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum SupervisorResponse {
+    DreamChecked {
+        job_id: Option<String>,
+        message: String,
+    },
     Pong,
     Status {
         pid: u32,
@@ -394,7 +409,7 @@ enum SupervisorResponse {
         job_id: String,
     },
     Retried {
-        session_id: SessionId,
+        session_id: Option<SessionId>,
         job_id: String,
         previous_attempts: u32,
         manual_retries: u32,
@@ -431,6 +446,11 @@ impl SupervisorJobStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum SupervisorJobKind {
+    Dream {
+        workspace: PathBuf,
+        manual: bool,
+        input_fingerprint: String,
+    },
     Finalize {
         session_id: SessionId,
     },
@@ -1118,6 +1138,7 @@ pub async fn run_supervisor(
     let running_recap = Arc::new(Mutex::new(None));
     let running_finalize = Arc::new(Mutex::new(None));
     let shared_state = SupervisorSharedState {
+        dream_engine: Some(engine.clone()),
         agent_id,
         notify_tx,
         stop_requested: cancel.clone(),
@@ -1126,6 +1147,7 @@ pub async fn run_supervisor(
         runtime_fingerprint,
         stopping: stopping.clone(),
         lifecycle_gate,
+        dream_recovery_gate: Arc::new(Mutex::new(())),
         running_recap,
         running_finalize,
     };
@@ -1150,6 +1172,9 @@ pub async fn run_supervisor(
             _ = cancel.cancelled() => break,
             _ = sleep(Duration::from_secs(5)) => {}
         }
+        if let Err(e) = dream::tick(&paths, &shared_state).await {
+            append_supervisor_log(&paths, format!("Dream check failed: {e:#}")).await;
+        }
         if begin_idle_shutdown_if_due(&paths, &shared_state, &running_job, idle_timeout).await {
             append_supervisor_log(&paths, "supervisor idle timeout reached").await;
             break;
@@ -1159,6 +1184,9 @@ pub async fn run_supervisor(
     if let Err(err) = worker_handle.await {
         log::warn!(target: "supervisor", "worker loop join failed: {err}");
     }
+    // IPC 恢复不持生命周期锁，但其已开始的本地提交也必须在进程退出前完成。
+    // stop 已关闭新恢复的入口；本地提交完成后才释放恢复锁。
+    drop(shared_state.dream_recovery_gate.lock().await);
     accept_cancel.cancel();
     if let Err(err) = accept_handle.await {
         log::warn!(target: "supervisor", "accept loop join failed: {err}");
@@ -1175,7 +1203,11 @@ async fn begin_idle_shutdown_if_due(
     idle_timeout: Duration,
 ) -> bool {
     let _guard = shared.lifecycle_gate.lock().await;
-    if shared.stopping.load(Ordering::Acquire)
+    if shared
+        .dream_engine
+        .as_ref()
+        .is_some_and(SessionEngine::dream_enabled)
+        || shared.stopping.load(Ordering::Acquire)
         || shared.stop_requested.is_cancelled()
         || running_job.load(Ordering::Relaxed)
         || has_queued_jobs(paths).await.unwrap_or(true)
@@ -1233,6 +1265,17 @@ async fn handle_client(
     let mut should_stop = false;
     let response = match lines.next_line().await? {
         Some(line) => match serde_json::from_str::<SupervisorRequest>(&line) {
+            Ok(SupervisorRequest::CheckDream { workspace, manual }) => {
+                match dream::enqueue_check(paths, shared, workspace, manual).await {
+                    Ok(report) => SupervisorResponse::DreamChecked {
+                        job_id: report.job_id,
+                        message: report.message,
+                    },
+                    Err(e) => SupervisorResponse::Error {
+                        message: format!("{e:#}"),
+                    },
+                }
+            }
             Ok(SupervisorRequest::Ping) => SupervisorResponse::Pong,
             Ok(SupervisorRequest::Status) => SupervisorResponse::Status {
                 pid: std::process::id(),
@@ -1936,72 +1979,140 @@ async fn run_job(
         finalize_resume_target,
         finalize_result_tx,
     } = controls;
+    let previous_attempts = job.attempts;
+    let is_dream = matches!(job.kind, SupervisorJobKind::Dream { .. });
     job.status = SupervisorJobStatus::Running;
-    job.attempts = job.attempts.saturating_add(1);
+    if is_dream
+        && (!dream::has_checkpoint(paths, &job).await?
+            || job.attempts < DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS)
+    {
+        job.attempts = job.attempts.saturating_add(1);
+    }
     job.started_at = Some(Utc::now());
     job.updated_at = Utc::now();
-    job.last_error = None;
+    if !matches!(job.kind, SupervisorJobKind::Dream { .. }) {
+        job.last_error = None;
+    }
     write_job(paths, &job).await?;
 
     let kind = job.kind.clone();
     let mut finalize_finished_before_prepared = false;
-    let result = match &kind {
-        SupervisorJobKind::Finalize { session_id } => {
-            append_supervisor_log(paths, format!("finalize job {} started", job.id)).await;
-            let preemption = finalize_preemption
-                .as_ref()
-                .context("Finalize job 缺少 Prepared 前抢占控制器")?;
-            let outcome = engine
-                .finalize_existing_session_once_with_preemption(
-                    session_id,
-                    |event| {
-                        log_supervisor_session_event(&job.id, &event);
-                    },
-                    Arc::clone(preemption),
-                )
-                .await;
-            let _ = preemption.finish().await;
-            finalize_finished_before_prepared = preemption.finished_before_prepared().await;
-            match outcome {
-                Ok(SessionFinalizeOnceOutcome::Completed(report)) => {
-                    if let Some(result_tx) = &finalize_result_tx {
-                        let _ = result_tx.send(Some(RunningFinalizeResumeResult::WaitForFinalize));
-                    }
-                    Ok(report)
-                }
-                Ok(SessionFinalizeOnceOutcome::PreemptedBeforePrepared) => {
-                    let _guard = shared.lifecycle_gate.lock().await;
-                    let recap_end_index = *finalize_resume_target
-                        .as_ref()
-                        .context("Finalize resume preemption target is unavailable")?
-                        .lock()
-                        .await;
-                    let recap_end_index = recap_end_index
-                        .context("Finalize resume preemption target was not frozen")?;
-                    match convert_finalize_job_and_open(
-                        paths,
-                        &shared.agent_id,
-                        &job,
-                        recap_end_index,
+    let dream_control = crate::agent::DreamControl::new(
+        shared.stop_requested.clone(),
+        shared.lifecycle_gate.clone(),
+    );
+    let recovery = engine.recover_pending_dream_execution().await;
+    // 先发布 Running 以保留现有 resume/抢占语义；恢复完成后才计会话任务的尝试次数。
+    if !is_dream {
+        if let Err(error) = &recovery {
+            job.status = SupervisorJobStatus::Queued;
+            job.started_at = None;
+            job.finished_at = None;
+            job.updated_at = Utc::now();
+            let message = format!("Waiting for Dream commit recovery: {error:#}");
+            job.last_error = Some(message.clone());
+            write_job(paths, &job).await?;
+            if let Some(preemption) = &recap_preemption {
+                preemption.finish().await;
+            }
+            if let Some(preemption) = &finalize_preemption {
+                preemption.finish().await;
+            }
+            if let Some(result_tx) = &finalize_result_tx {
+                let _ = result_tx.send(Some(RunningFinalizeResumeResult::Failed(message.clone())));
+            }
+            append_supervisor_log(paths, format!("job {} deferred: {message}", job.id)).await;
+            return Ok(());
+        }
+        job.attempts = job.attempts.saturating_add(1);
+        write_job(paths, &job).await?;
+    }
+    let result = match recovery {
+        Err(error) => Err(error),
+        Ok(()) => match &kind {
+            SupervisorJobKind::Dream {
+                workspace, manual, ..
+            } => {
+                let result = engine
+                    .run_dream_job_with_control(
+                        &job.id,
+                        workspace,
+                        &paths.jobs_dir,
+                        *manual,
+                        job.attempts == 1,
+                        dream_control,
                     )
-                    .await
-                    {
-                        Ok(_) => {
-                            if let Some(result_tx) = &finalize_result_tx {
-                                let _ = result_tx.send(Some(RunningFinalizeResumeResult::Opened));
-                            }
-                            let _ = shared.notify_tx.send(());
-                            return Ok(());
+                    .await;
+                if result.as_ref().is_err_and(|e| {
+                    e.is::<crate::agent::DreamYield>() || e.is::<crate::agent::DreamStopped>()
+                }) {
+                    job.status = SupervisorJobStatus::Queued;
+                    job.attempts = previous_attempts;
+                    job.started_at = None;
+                    job.updated_at = Utc::now();
+                    write_job(paths, &job).await?;
+                    return Ok(());
+                }
+                result
+            }
+            SupervisorJobKind::Finalize { session_id } => {
+                append_supervisor_log(paths, format!("finalize job {} started", job.id)).await;
+                let preemption = finalize_preemption
+                    .as_ref()
+                    .context("Finalize job 缺少 Prepared 前抢占控制器")?;
+                let outcome = engine
+                    .finalize_existing_session_once_with_preemption(
+                        session_id,
+                        |event| {
+                            log_supervisor_session_event(&job.id, &event);
+                        },
+                        Arc::clone(preemption),
+                    )
+                    .await;
+                let _ = preemption.finish().await;
+                finalize_finished_before_prepared = preemption.finished_before_prepared().await;
+                match outcome {
+                    Ok(SessionFinalizeOnceOutcome::Completed(report)) => {
+                        if let Some(result_tx) = &finalize_result_tx {
+                            let _ =
+                                result_tx.send(Some(RunningFinalizeResumeResult::WaitForFinalize));
                         }
-                        Err(convert_error) => {
-                            let message = format!(
+                        Ok(report)
+                    }
+                    Ok(SessionFinalizeOnceOutcome::PreemptedBeforePrepared) => {
+                        let _guard = shared.lifecycle_gate.lock().await;
+                        let recap_end_index = *finalize_resume_target
+                            .as_ref()
+                            .context("Finalize resume preemption target is unavailable")?
+                            .lock()
+                            .await;
+                        let recap_end_index = recap_end_index
+                            .context("Finalize resume preemption target was not frozen")?;
+                        match convert_finalize_job_and_open(
+                            paths,
+                            &shared.agent_id,
+                            &job,
+                            recap_end_index,
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                if let Some(result_tx) = &finalize_result_tx {
+                                    let _ =
+                                        result_tx.send(Some(RunningFinalizeResumeResult::Opened));
+                                }
+                                let _ = shared.notify_tx.send(());
+                                return Ok(());
+                            }
+                            Err(convert_error) => {
+                                let message = format!(
                                 "This session is still finalizing; wait for finalization to complete before resuming. ({convert_error:#})"
                             );
-                            if let Some(result_tx) = &finalize_result_tx {
-                                let _ = result_tx
-                                    .send(Some(RunningFinalizeResumeResult::Failed(message)));
-                            }
-                            append_supervisor_log(
+                                if let Some(result_tx) = &finalize_result_tx {
+                                    let _ = result_tx
+                                        .send(Some(RunningFinalizeResumeResult::Failed(message)));
+                                }
+                                append_supervisor_log(
                                 paths,
                                 format!(
                                     "running finalize job {} resume conversion failed; continuing same attempt: {convert_error:#}",
@@ -2009,41 +2120,42 @@ async fn run_job(
                                 ),
                             )
                             .await;
+                            }
                         }
+                        drop(_guard);
+                        engine
+                            .finalize_existing_session_once(session_id, |event| {
+                                log_supervisor_session_event(&job.id, &event);
+                            })
+                            .await
                     }
-                    drop(_guard);
-                    engine
-                        .finalize_existing_session_once(session_id, |event| {
-                            log_supervisor_session_event(&job.id, &event);
-                        })
-                        .await
+                    Err(error) => Err(error),
                 }
-                Err(error) => Err(error),
             }
-        }
-        SupervisorJobKind::Recap {
-            session_id,
-            recap_end_index,
-        } => {
-            append_supervisor_log(
-                paths,
-                format!(
-                    "recap job {} started session={} target={} attempt={}",
-                    job.id, session_id, recap_end_index, job.attempts
-                ),
-            )
-            .await;
-            let preemption = recap_preemption
-                .as_ref()
-                .context("Recap job 缺少 Prepared 前抢占控制器")?;
-            engine
-                .recap_existing_session_until_with_preemption(
-                    session_id,
-                    *recap_end_index,
-                    Arc::clone(preemption),
+            SupervisorJobKind::Recap {
+                session_id,
+                recap_end_index,
+            } => {
+                append_supervisor_log(
+                    paths,
+                    format!(
+                        "recap job {} started session={} target={} attempt={}",
+                        job.id, session_id, recap_end_index, job.attempts
+                    ),
                 )
-                .await
-        }
+                .await;
+                let preemption = recap_preemption
+                    .as_ref()
+                    .context("Recap job 缺少 Prepared 前抢占控制器")?;
+                engine
+                    .recap_existing_session_until_with_preemption(
+                        session_id,
+                        *recap_end_index,
+                        Arc::clone(preemption),
+                    )
+                    .await
+            }
+        },
     };
 
     let recap_was_preempted = match recap_preemption.as_ref() {
@@ -2059,10 +2171,22 @@ async fn run_job(
     match result {
         Ok(report) => {
             job.status = SupervisorJobStatus::Succeeded;
+            job.last_error = None;
             job.finished_at = Some(Utc::now());
             job.updated_at = Utc::now();
             write_job(paths, &job).await?;
             match &kind {
+                SupervisorJobKind::Dream { .. } => {
+                    append_supervisor_log(
+                        paths,
+                        format!(
+                            "dream job {} succeeded updated_claims={}",
+                            job.id,
+                            report.updated_claim_ids.len()
+                        ),
+                    )
+                    .await;
+                }
                 SupervisorJobKind::Finalize { .. } => {
                     if job.notify_on_completion && finalize_report_should_notify_success(&report) {
                         notify_finalize_success(paths, &job, &report).await;
@@ -2137,6 +2261,12 @@ async fn run_job(
         Err(err) => {
             let message = err.to_string();
             apply_job_attempt_failure(&mut job, message.clone());
+            if let SupervisorJobKind::Dream {
+                input_fingerprint, ..
+            } = &mut job.kind
+            {
+                *input_fingerprint = engine.dream_input_fingerprint().await?;
+            }
             write_job(paths, &job).await?;
             if job.status == SupervisorJobStatus::Failed {
                 if matches!(&kind, SupervisorJobKind::Finalize { .. }) && job.notify_on_completion {
@@ -2217,7 +2347,8 @@ fn recover_stale_running_job(
             recovered.last_error = None;
         }
         (SupervisorJobKind::Finalize { .. }, SessionStatus::Finalizing)
-        | (SupervisorJobKind::Recap { .. }, SessionStatus::Open) => {
+        | (SupervisorJobKind::Recap { .. }, SessionStatus::Open)
+        | (SupervisorJobKind::Dream { .. }, _) => {
             if recovered.attempts >= DEFAULT_SUPERVISOR_JOB_MAX_ATTEMPTS {
                 recovered.status = SupervisorJobStatus::Failed;
                 recovered.finished_at = Some(now);
@@ -2247,7 +2378,16 @@ async fn reconcile_running_job_after_runner_error(
         return Ok(job.status == SupervisorJobStatus::Queued);
     }
 
-    let session_id = job_session_id_ref(job);
+    let Some(session_id) = job_session_id_ref(job) else {
+        return Ok(dream::recover_sessionless(
+            paths,
+            job,
+            format!("Dream runner recovery: {error:#}"),
+        )
+        .await?
+        .status
+            == SupervisorJobStatus::Queued);
+    };
     let session_status = read_yaml::<SessionMetadata>(
         &SessionPaths::new(&paths.agent_home, session_id).session_yaml,
     )
@@ -2292,6 +2432,7 @@ fn job_kind_label(kind: &SupervisorJobKind) -> &'static str {
     match kind {
         SupervisorJobKind::Finalize { .. } => "finalize",
         SupervisorJobKind::Recap { .. } => "recap",
+        SupervisorJobKind::Dream { .. } => "dream",
     }
 }
 
@@ -2342,6 +2483,9 @@ async fn retry_finalize_job(
                 .iter()
                 .find(|job| job.id == job_id)
                 .with_context(|| format!("未找到 supervisor job {job_id}"))?;
+            if matches!(job.kind, SupervisorJobKind::Dream { .. }) {
+                return dream::retry_dream_job(paths, agent_id, &jobs, job).await;
+            }
             let session_id = finalize_job_session_id(job)
                 .with_context(|| format!("supervisor job {job_id} 不是 finalize job"))?
                 .clone();
@@ -2386,7 +2530,7 @@ async fn retry_finalize_job(
                     )
                     .await;
                     return Ok(SupervisorRetryReport {
-                        session_id,
+                        session_id: Some(session_id),
                         job_id: job.id,
                         previous_attempts: 0,
                         manual_retries: job.manual_retries,
@@ -2429,7 +2573,7 @@ async fn retry_finalize_job(
     )
     .await;
     Ok(SupervisorRetryReport {
-        session_id,
+        session_id: Some(session_id),
         job_id: job.id,
         previous_attempts,
         manual_retries: job.manual_retries,
@@ -2515,14 +2659,15 @@ fn unresolved_job_invariant_error(session_id: &SessionId, jobs: &[&SupervisorJob
 fn finalize_job_session_id(job: &SupervisorJob) -> Option<&SessionId> {
     match &job.kind {
         SupervisorJobKind::Finalize { session_id } => Some(session_id),
-        SupervisorJobKind::Recap { .. } => None,
+        SupervisorJobKind::Recap { .. } | SupervisorJobKind::Dream { .. } => None,
     }
 }
 
-fn job_session_id_ref(job: &SupervisorJob) -> &SessionId {
+fn job_session_id_ref(job: &SupervisorJob) -> Option<&SessionId> {
     match &job.kind {
         SupervisorJobKind::Finalize { session_id }
-        | SupervisorJobKind::Recap { session_id, .. } => session_id,
+        | SupervisorJobKind::Recap { session_id, .. } => Some(session_id),
+        SupervisorJobKind::Dream { .. } => None,
     }
 }
 
@@ -2735,6 +2880,7 @@ fn supervisor_job_priority(kind: &SupervisorJobKind) -> u8 {
     match kind {
         SupervisorJobKind::Finalize { .. } => 0,
         SupervisorJobKind::Recap { .. } => 1,
+        SupervisorJobKind::Dream { .. } => 2,
     }
 }
 
@@ -2745,11 +2891,27 @@ async fn has_queued_jobs(paths: &SupervisorPaths) -> anyhow::Result<bool> {
 async fn reconcile_stale_running_jobs(paths: &SupervisorPaths) -> anyhow::Result<()> {
     let mut jobs = read_jobs(paths).await?;
     for job in &mut jobs {
+        if matches!(
+            job.status,
+            SupervisorJobStatus::Running | SupervisorJobStatus::Failed
+        ) && dream::has_checkpoint(paths, job).await?
+        {
+            *job = dream::recover_prepared(paths, job).await?;
+            continue;
+        }
         if job.status != SupervisorJobStatus::Running {
             continue;
         }
 
-        let session_id = job_session_id_ref(job).clone();
+        let Some(session_id) = job_session_id_ref(job).cloned() else {
+            *job = dream::recover_sessionless(
+                paths,
+                job,
+                "recovered Dream after supervisor restart".into(),
+            )
+            .await?;
+            continue;
+        };
         let session_paths = SessionPaths::new(&paths.agent_home, &session_id);
         let session_status = read_yaml::<SessionMetadata>(&session_paths.session_yaml)
             .await
@@ -2856,15 +3018,16 @@ fn sort_jobs_by_created_at(jobs: &mut [SupervisorJob]) {
 
 fn job_to_view(job: &SupervisorJob) -> SupervisorJobView {
     let (kind, session_id, recap_end_index) = match &job.kind {
+        SupervisorJobKind::Dream { .. } => ("dream".into(), None, None),
         SupervisorJobKind::Finalize { session_id } => {
-            ("finalize".to_string(), session_id.clone(), None)
+            ("finalize".to_string(), Some(session_id.clone()), None)
         }
         SupervisorJobKind::Recap {
             session_id,
             recap_end_index,
         } => (
             "recap".to_string(),
-            session_id.clone(),
+            Some(session_id.clone()),
             Some(*recap_end_index),
         ),
     };
@@ -3758,7 +3921,9 @@ fn truncate_notification(value: &str) -> String {
 }
 
 fn job_session_id(job: &SupervisorJob) -> String {
-    job_session_id_ref(job).to_string()
+    job_session_id_ref(job)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "-".into())
 }
 
 fn now_millis() -> u64 {
@@ -3820,6 +3985,7 @@ mod tests {
     fn test_shared_state(agent_id: AgentId) -> SupervisorSharedState {
         let (notify_tx, _notify_rx) = mpsc::unbounded_channel();
         SupervisorSharedState {
+            dream_engine: None,
             agent_id,
             notify_tx,
             stop_requested: CancellationToken::new(),
@@ -3828,6 +3994,7 @@ mod tests {
             runtime_fingerprint: test_runtime_fingerprint("current"),
             stopping: Arc::new(AtomicBool::new(false)),
             lifecycle_gate: Arc::new(Mutex::new(())),
+            dream_recovery_gate: Arc::new(Mutex::new(())),
             running_recap: Arc::new(Mutex::new(None)),
             running_finalize: Arc::new(Mutex::new(None)),
         }
@@ -3839,6 +4006,9 @@ mod tests {
         status: FinalizeCheckpointStatus,
     ) -> FinalizeCheckpoint {
         FinalizeCheckpoint {
+            analysis_claims: Some(Vec::new()),
+            applied_claims: Vec::new(),
+            warnings: Vec::new(),
             recap_start_index,
             recap_end_index,
             recap_segment_hash: "test-segment-hash".into(),
@@ -5651,6 +5821,7 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let shared = SupervisorSharedState {
+            dream_engine: None,
             agent_id,
             notify_tx,
             stop_requested: cancel,
@@ -5659,6 +5830,7 @@ mod tests {
             runtime_fingerprint: test_runtime_fingerprint("current"),
             stopping: Arc::new(AtomicBool::new(true)),
             lifecycle_gate: Arc::new(Mutex::new(())),
+            dream_recovery_gate: Arc::new(Mutex::new(())),
             running_recap: Arc::new(Mutex::new(None)),
             running_finalize: Arc::new(Mutex::new(None)),
         };
@@ -5705,6 +5877,7 @@ mod tests {
         write_test_session(&paths, &agent_id, &session_id, SessionStatus::Finalizing).await?;
         let (notify_tx, _notify_rx) = mpsc::unbounded_channel();
         let shared = SupervisorSharedState {
+            dream_engine: None,
             agent_id: agent_id.clone(),
             notify_tx,
             stop_requested: CancellationToken::new(),
@@ -5713,6 +5886,7 @@ mod tests {
             runtime_fingerprint: test_runtime_fingerprint("current"),
             stopping: Arc::new(AtomicBool::new(false)),
             lifecycle_gate: Arc::new(Mutex::new(())),
+            dream_recovery_gate: Arc::new(Mutex::new(())),
             running_recap: Arc::new(Mutex::new(None)),
             running_finalize: Arc::new(Mutex::new(None)),
         };
@@ -5796,6 +5970,7 @@ mod tests {
         let preemption = Arc::new(SessionRecapPreemptionControl::new());
         let (notify_tx, _notify_rx) = mpsc::unbounded_channel();
         let shared = SupervisorSharedState {
+            dream_engine: None,
             agent_id: AgentId::new("agent-a")?,
             notify_tx,
             stop_requested: CancellationToken::new(),
@@ -5804,6 +5979,7 @@ mod tests {
             runtime_fingerprint: test_runtime_fingerprint("current"),
             stopping: Arc::new(AtomicBool::new(false)),
             lifecycle_gate: Arc::new(Mutex::new(())),
+            dream_recovery_gate: Arc::new(Mutex::new(())),
             running_recap: Arc::new(Mutex::new(Some(RunningRecap {
                 job_id: "job_recap".into(),
                 session_id: recap_session.clone(),
@@ -5942,7 +6118,7 @@ mod tests {
         .await?;
         let stored = read_yaml::<SupervisorJob>(&job_path(&paths, &job.id)).await?;
 
-        assert_eq!(report.session_id, session_id);
+        assert_eq!(report.session_id, Some(session_id));
         assert_eq!(report.job_id, job.id);
         assert_eq!(
             report.previous_attempts,
@@ -5982,7 +6158,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(report.session_id, session_id);
+        assert_eq!(report.session_id, Some(session_id));
         assert_eq!(report.job_id, job.id);
         assert_eq!(report.previous_attempts, 4);
         assert_eq!(report.manual_retries, 1);
@@ -6008,7 +6184,7 @@ mod tests {
         .await?;
         let jobs = read_jobs(&paths).await?;
 
-        assert_eq!(report.session_id, session_id);
+        assert_eq!(report.session_id, Some(session_id));
         assert_eq!(report.previous_attempts, 0);
         assert_eq!(report.manual_retries, 1);
         assert_eq!(jobs.len(), 1);
@@ -6554,7 +6730,10 @@ updated_at: "2026-06-25T00:00:00Z"
         let view = job_to_view(&job);
 
         assert_eq!(view.agent_id.as_ref().unwrap().as_str(), "agent-a");
-        assert_eq!(view.session_id.as_str(), "session_1234abcd");
+        assert_eq!(
+            view.session_id.as_ref().unwrap().as_str(),
+            "session_1234abcd"
+        );
         assert_eq!(view.status, "running");
         assert_eq!(view.attempts, 2);
         assert_eq!(view.manual_retries, 1);

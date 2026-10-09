@@ -69,6 +69,10 @@ max_source_claims = 20
 # retry_base_delay_ms = 500
 # retry_max_delay_ms = 5000
 
+[agent.dream]
+enable = true
+min_interval_hours = 24
+
 [agent.llm]
 provider = "openai_responses"
 endpoint = "https://api.openai.com/v1"

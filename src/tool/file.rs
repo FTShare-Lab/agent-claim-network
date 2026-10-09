@@ -220,8 +220,12 @@ impl ToolRegistry {
         )
         .await?;
         match result {
-            TextPageOutcome::Page(result) => {
+            TextPageOutcome::Page(mut result) => {
                 if let Some(evidence) = result.evidence {
+                    if self.dream_read_only {
+                        result.output["file_version"] =
+                            json!({"path":evidence.path,"revision":evidence.revision});
+                    }
                     self.activate_file_read_evidence(context, evidence).await;
                 }
                 Ok(ToolExecution::completed(result.output))
@@ -679,7 +683,7 @@ async fn tool_path_lock_key(path: &Path) -> PathBuf {
     resolved
 }
 
-fn lexical_normalize_path(path: &Path) -> PathBuf {
+pub(super) fn lexical_normalize_path(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {

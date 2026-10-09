@@ -1945,6 +1945,7 @@ mod tests {
 
     fn request(input: Vec<Value>) -> ResponsesRequest {
         ResponsesRequest {
+            text: None,
             model: "test-model".into(),
             instructions: "system".into(),
             input,
@@ -2216,6 +2217,7 @@ mod tests {
         let response = adapter
             .send(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("hello")],
                     tools: Vec::new(),
@@ -2273,6 +2275,7 @@ mod tests {
         let response = adapter
             .send(
                 ProviderRequest {
+                    json_output: false,
                     system_prompt: "system".into(),
                     messages: vec![SessionTurnMessage::user_text("hello")],
                     tools: Vec::new(),
