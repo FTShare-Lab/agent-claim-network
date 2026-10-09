@@ -44,9 +44,6 @@ Claims add another layer. When ACN compacts context or closes a session, it revi
 
 Router and Maintainer are separate executables included in this repository and can be deployed when needed. Leaving both endpoints empty enables standalone mode: all local assistant capabilities remain available, but ACN does not connect to team services.
 
-> [!WARNING]
-> ACN executes commands and reads or writes files on your machine. It is **not a sandbox**. Stdio MCP servers also inherit the permissions of the ACN process. Use ACN only in trusted working directories and connect only trusted tools.
-
 ## Capabilities
 
 - Streaming conversations; attach text, images, or PDFs with `@path`; paste images with `Ctrl+V` and preview them with `Ctrl+O`
