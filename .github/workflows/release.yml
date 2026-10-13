@@ -84,6 +84,14 @@ jobs:
           rustup toolchain install 1.90 --profile minimal
           rustup target add --toolchain 1.90 "${{ matrix.target }}"
 
+      - name: Prepare Linux Dream command isolation
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+          bwrap --die-with-parent --unshare-all --new-session \
+            --ro-bind / / --proc /proc --dev /dev -- /bin/true
+
       - name: Test native target
         run: |
           if [[ "${RUNNER_OS}" == "macOS" ]]; then

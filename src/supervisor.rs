@@ -3396,7 +3396,9 @@ async fn append_supervisor_log(paths: &SupervisorPaths, message: impl AsRef<str>
             .append(true)
             .open(&paths.log_path)
             .await?;
-        file.write_all(line.as_bytes()).await
+        file.write_all(line.as_bytes()).await?;
+        // 等待 Tokio 的后台写入完成，避免返回后立即读取日志时遗漏最后一行。
+        file.flush().await
     }
     .await;
     if let Err(err) = result {
