@@ -1781,29 +1781,49 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Condvar, Mutex as StdMutex};
 
+        // 断言失败也要放行工作线程，避免全局 keyring 锁影响其余测试。
+        struct ReleaseGate(Arc<(StdMutex<bool>, Condvar)>);
+        impl Drop for ReleaseGate {
+            fn drop(&mut self) {
+                let (lock, ready) = &*self.0;
+                *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
+                ready.notify_one();
+            }
+        }
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new((StdMutex::new(false), Condvar::new()));
+        let release_gate = ReleaseGate(Arc::clone(&gate));
         let first_calls = Arc::clone(&calls);
         let first_gate = Arc::clone(&gate);
+        let (started_tx, started_rx) = oneshot::channel();
 
         let first = runtime.block_on(async {
-            time::timeout(
-                Duration::from_millis(20),
-                run_keyring_operation("docs", move || {
-                    first_calls.fetch_add(1, Ordering::SeqCst);
-                    let (lock, ready) = &*first_gate;
-                    let mut released = lock.lock().unwrap();
-                    while !*released {
-                        released = ready.wait(released).unwrap();
-                    }
-                    Ok(())
-                }),
-            )
-            .await
+            let operation = run_keyring_operation("docs", move || {
+                first_calls.fetch_add(1, Ordering::SeqCst);
+                let _ = started_tx.send(());
+                let (lock, ready) = &*first_gate;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = ready.wait(released).unwrap();
+                }
+                Ok(())
+            });
+            tokio::pin!(operation);
+            // CI 负载下线程启动可能超过 20ms；收到启动信号后才验证操作超时。
+            let started = time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    result = started_rx => result.map_err(|_| "keyring 启动信号丢失"),
+                    _ = &mut operation => Err("keyring 操作在放行前结束"),
+                }
+            })
+            .await;
+            assert!(matches!(started, Ok(Ok(()))), "{started:?}");
+            time::timeout(Duration::from_millis(20), operation).await
         });
         assert!(first.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1826,11 +1846,9 @@ mod tests {
             "前一次系统访问未完成时不得启动重复 keyring 调用"
         );
 
-        let (lock, ready) = &*gate;
-        *lock.lock().unwrap() = true;
-        ready.notify_one();
+        drop(release_gate);
         runtime.block_on(async {
-            time::timeout(Duration::from_secs(1), async {
+            time::timeout(Duration::from_secs(10), async {
                 while KEYRING_OPERATION_LOCK
                     .get()
                     .expect("keyring lock initialized")
