@@ -1,3 +1,4 @@
+import { useT } from '../i18n'
 import { useEffect, useMemo, useState } from 'react'
 import { ArrowUpRight, FileUp, Inbox, MessageSquareWarning } from 'lucide-react'
 import { Link, useLocation, useNavigate } from 'react-router'
@@ -100,6 +101,7 @@ function agentIdFromRouteState(state: unknown) {
 }
 
 export function AgentsPage() {
+  const t = useT()
   const location = useLocation()
   const navigate = useNavigate()
   const routeAgentId = agentIdFromRouteState(location.state)
@@ -216,17 +218,17 @@ export function AgentsPage() {
     [disputes],
   )
 
-  if (isLoading) return <div className="rounded-lg border border-slate-200 bg-white p-6 text-sm text-slate-500">Loading agents…</div>
+  if (isLoading) return <div className="rounded-lg border border-slate-200 bg-white p-6 text-sm text-slate-500">{t("Loading agents…")}</div>
   if (error) return <div className="rounded-lg border border-rose-200 bg-rose-50 p-6 text-sm text-rose-700">{String(error)}</div>
 
   return (
-    <PageContainer title="Agents" subtitle="Inspect registered agents, coordination state, activity, and claim propagation health.">
+    <PageContainer title={t("Agents")} subtitle={t("Inspect registered agents, coordination state, activity, and claim propagation health.")}>
       <FilterBar>
         <label className="space-y-1 text-xs text-slate-600">
-          <span className="font-medium text-slate-700">Agent Search</span>
+          <span className="font-medium text-slate-700">{t("Agent Search")}</span>
           <input
             className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none"
-            placeholder="agent id"
+            placeholder={t("agent id")}
             value={keyword}
             onChange={(event) => {
               setKeyword(event.target.value)
@@ -235,7 +237,7 @@ export function AgentsPage() {
           />
         </label>
         <label className="space-y-1 text-xs text-slate-600">
-          <span className="font-medium text-slate-700">Status</span>
+          <span className="font-medium text-slate-700">{t("Status")}</span>
           <select
             className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none"
             value={status}
@@ -244,14 +246,14 @@ export function AgentsPage() {
               setPage(1)
             }}
           >
-            <option value="all">All Status</option>
-            <option value="live">Live</option>
-            <option value="lagging">Lagging</option>
-            <option value="idle">Idle</option>
+            <option value="all">{t("All Status")}</option>
+            <option value="live">{t("Live")}</option>
+            <option value="lagging">{t("Lagging")}</option>
+            <option value="idle">{t("Idle")}</option>
           </select>
         </label>
         <label className="space-y-1 text-xs text-slate-600">
-          <span className="font-medium text-slate-700">Activity</span>
+          <span className="font-medium text-slate-700">{t("Activity")}</span>
           <select
             className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none"
             value={activityWindow}
@@ -261,10 +263,10 @@ export function AgentsPage() {
               setPage(1)
             }}
           >
-            <option value="all">All</option>
-            <option value="24h">Active in 24 hours</option>
-            <option value="7d">Active in 7 days</option>
-            <option value="30d">Active in 30 days</option>
+            <option value="all">{t("All")}</option>
+            <option value="24h">{t("Active in 24 hours")}</option>
+            <option value="7d">{t("Active in 7 days")}</option>
+            <option value="30d">{t("Active in 30 days")}</option>
           </select>
         </label>
         <button
@@ -276,66 +278,64 @@ export function AgentsPage() {
             setActivityWindow('all')
             setPage(1)
           }}
-        >
-          Reset
-        </button>
+        >{t("Reset")}</button>
       </FilterBar>
 
       <section className="space-y-3">
         <div className="flex items-center gap-2">
-          <h2 className="text-sm font-semibold tracking-tight text-slate-900">Registered Agents</h2>
+          <h2 className="text-sm font-semibold tracking-tight text-slate-900">{t("Registered Agents")}</h2>
           <StatusBadge tone="info">{filtered.length}</StatusBadge>
         </div>
         <DataTable
           columns={[
             {
               key: 'agent',
-              header: 'Agent',
+              header: t("Agent"),
               render: (row: AgentView) => <div className="font-mono text-xs font-medium text-slate-900">{row.agent_id}</div>,
             },
             {
               key: 'status',
-              header: 'Status',
+              header: t("Status"),
               render: (row: AgentView) => (
-                <StatusBadge tone={agentStatusTone(agentStatus(row))}>{agentStatus(row)}</StatusBadge>
+                <StatusBadge localizeStatus tone={agentStatusTone(agentStatus(row))}>{agentStatus(row)}</StatusBadge>
               ),
             },
             {
               key: 'claims',
-              header: 'Claims',
-              render: (row: AgentView) => <span className="font-mono text-xs">{row.mirror_claims} total · {row.active_claims} active</span>,
+              header: t("Claims"),
+              render: (row: AgentView) => <span className="font-mono text-xs">{t('{total} total · {active} active', { total: row.mirror_claims, active: row.active_claims })}</span>,
             },
             {
               key: 'inbox',
-              header: 'Inbox',
+              header: t("Inbox"),
               render: (row: AgentView) => {
                 const summary = deliverySummaryByAgent.get(row.agent_id)
                 if (!summary || (summary.deliveredCount === 0 && summary.openCount === 0)) {
-                  return <span className="text-xs text-slate-500">No delivery</span>
+                  return <span className="text-xs text-slate-500">{t("No delivery")}</span>
                 }
-                return <span className="font-mono text-xs">{summary.deliveredCount} received · {summary.openCount} pending</span>
+                return <span className="font-mono text-xs">{t('{received} received · {pending} pending', { received: summary.deliveredCount, pending: summary.openCount })}</span>
               },
             },
-            { key: 'lastIp', header: 'Last IP', render: (row: AgentView) => <span className="font-mono text-[11px] text-slate-500">{row.last_source_ip ?? 'Unavailable'}</span> },
+            { key: 'lastIp', header: t("Last IP"), render: (row: AgentView) => <span className="font-mono text-[11px] text-slate-500">{row.last_source_ip ?? t("Unavailable")}</span> },
             {
               key: 'lastActivity',
-              header: 'Last Activity',
+              header: t("Last Activity"),
               render: (row: AgentView) => (
                 <div>
                   <div className="text-xs font-medium text-slate-800">
-                    {agentActivityLabel(row.last_activity)}
+                    {t(agentActivityLabel(row.last_activity))}
                   </div>
                   <div className="mt-0.5 font-mono text-[11px] text-slate-500">
                     {row.last_activity
                       ? formatDateTime(row.last_activity.occurred_at)
-                      : 'No activity recorded'}
+                      : t("No activity recorded")}
                   </div>
                 </div>
               ),
             },
             {
               key: 'health',
-              header: 'Health',
+              header: t("Health"),
               render: (row: AgentView) => (
                 <div className="min-w-24">
                   <div className="h-1 overflow-hidden rounded-full bg-slate-100">
@@ -345,12 +345,12 @@ export function AgentsPage() {
                 </div>
               ),
             },
-            { key: 'actions', header: 'Actions', render: () => <span className="text-xs font-medium text-blue-700">View</span> },
+            { key: 'actions', header: t("Actions"), render: () => <span className="text-xs font-medium text-blue-700">{t("View")}</span> },
           ]}
           rows={pagedRows}
           getRowId={(row) => row.agent_id}
           onRowClick={(row) => setSelectedAgentId(row.agent_id)}
-          emptyState="No agents matched the current filters."
+          emptyState={t("No agents matched the current filters.")}
         />
         <PaginationBar
           page={page}
@@ -368,28 +368,28 @@ export function AgentsPage() {
         modal={false}
         open={Boolean(selected)}
         onClose={() => setSelectedAgentId(null)}
-        label="Agent"
+        label={t("Agent")}
         title={selected?.agent_id ?? 'Agent'}
         subtitle={selected?.last_source_ip ?? 'No source IP observed'}
       >
         {selected ? (
           <>
-            <DrawerSection title="Overview">
+            <DrawerSection title={t("Overview")}>
               <div className="flex items-center justify-between gap-3 rounded-lg border border-slate-100 bg-slate-50 px-3 py-2.5">
                 <div>
-                  <div className="text-[11px] font-medium text-slate-500">Coordination status</div>
-                  <div className="mt-1 text-xs text-slate-600">Active Claim ratio {agentHealth(selected)}%</div>
+                  <div className="text-[11px] font-medium text-slate-500">{t("Coordination status")}</div>
+                  <div className="mt-1 text-xs text-slate-600">{t("Active Claim ratio")} {agentHealth(selected)}%</div>
                 </div>
-                <StatusBadge tone={agentStatusTone(agentStatus(selected))}>{agentStatus(selected)}</StatusBadge>
+                <StatusBadge localizeStatus tone={agentStatusTone(agentStatus(selected))}>{agentStatus(selected)}</StatusBadge>
               </div>
               <dl className="mt-2.5 grid grid-cols-2 gap-2 text-xs sm:grid-cols-3">
                 {[
-                  ['Mirror Claims', selected.mirror_claims],
-                  ['Active Claims', selected.active_claims],
-                  ['Stale Claims', selected.stale_claims],
-                  ['Open Disputes', disputesLoading || claimsLoading ? '…' : disputesError || claimsError ? 'Unavailable' : openDisputeCount],
-                  ['Involved Disputes', disputesLoading || claimsLoading ? '…' : disputesError || claimsError ? 'Unavailable' : selectedDisputes.length],
-                  ['Reported Disputes', disputesLoading ? '…' : disputesError ? 'Unavailable' : reportedDisputeCount],
+                  [t("Mirror Claims"), selected.mirror_claims],
+                  [t("Active Claims"), selected.active_claims],
+                  [t("Stale Claims"), selected.stale_claims],
+                  [t("Open Disputes"), disputesLoading || claimsLoading ? '…' : disputesError || claimsError ? t("Unavailable") : openDisputeCount],
+                  [t("Involved Disputes"), disputesLoading || claimsLoading ? '…' : disputesError || claimsError ? t("Unavailable") : selectedDisputes.length],
+                  [t("Reported Disputes"), disputesLoading ? '…' : disputesError ? t("Unavailable") : reportedDisputeCount],
                 ].map(([label, value]) => (
                   <div key={label} className="rounded-lg border border-slate-100 bg-white px-2.5 py-2">
                     <dt className="text-slate-500">{label}</dt>
@@ -400,15 +400,13 @@ export function AgentsPage() {
             </DrawerSection>
 
             <DrawerSection
-              title={`Claims (${claimsLoading ? 'Loading' : claimsError ? 'Unavailable' : selectedClaims.length})`}
+              title={`${t('Claims')} (${claimsLoading ? t("Loading") : claimsError ? t("Unavailable") : selectedClaims.length})`}
               tone="claim"
             >
               {claimsError ? (
-                <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2.5 text-xs text-rose-700">
-                  Claim details are unavailable. Refresh the Workbench to try again.
-                </div>
+                <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2.5 text-xs text-rose-700">{t("Claim details are unavailable. Refresh the Workbench to try again.")}</div>
               ) : claimsLoading ? (
-                <div className="text-xs text-slate-500">Loading Claim details…</div>
+                <div className="text-xs text-slate-500">{t("Loading Claim details…")}</div>
               ) : selectedClaims.length ? (
                 <div className="space-y-2">
                   {selectedClaims.slice(0, 8).map(({ claim }) => (
@@ -422,33 +420,29 @@ export function AgentsPage() {
                         <span className="mt-0.5 block truncate font-mono text-[11px] text-slate-500">{claim.id}</span>
                       </span>
                       <span className="flex shrink-0 items-center gap-1.5">
-                        <StatusBadge>{claim.status}</StatusBadge>
+                        <StatusBadge localizeStatus>{claim.status}</StatusBadge>
                         <ArrowUpRight className="h-3.5 w-3.5 text-blue-600" aria-hidden="true" />
                       </span>
                     </Link>
                   ))}
                   {selectedClaims.length > 8 ? (
-                    <div className="text-xs text-slate-500">{selectedClaims.length - 8} more Claims are available on the Claims page.</div>
+                    <div className="text-xs text-slate-500">{selectedClaims.length - 8} {t("more Claims are available on the Claims page.")}</div>
                   ) : null}
                 </div>
               ) : (
-                <div className="text-xs text-slate-500">No mirrored Claims are held by this Agent.</div>
+                <div className="text-xs text-slate-500">{t("No mirrored Claims are held by this Agent.")}</div>
               )}
             </DrawerSection>
 
-            <DrawerSection title={`Disputes (${disputesLoading || claimsLoading ? 'Loading' : disputesError ? 'Unavailable' : claimsError ? 'Reported only' : selectedDisputes.length})`}>
+            <DrawerSection title={`${t('Disputes')} (${disputesLoading || claimsLoading ? t("Loading") : disputesError ? t("Unavailable") : claimsError ? t("Reported only") : selectedDisputes.length})`}>
               {disputesError ? (
-                <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2.5 text-xs text-rose-700">
-                  Dispute data is unavailable. Refresh the Workbench to try again.
-                </div>
+                <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2.5 text-xs text-rose-700">{t("Dispute data is unavailable. Refresh the Workbench to try again.")}</div>
               ) : disputesLoading || claimsLoading ? (
-                <div className="text-xs text-slate-500">Loading Dispute relationships…</div>
+                <div className="text-xs text-slate-500">{t("Loading Dispute relationships…")}</div>
               ) : (
                 <div className="space-y-2">
                   {claimsError ? (
-                    <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-800">
-                      Claim-related Disputes are unavailable because Claim data could not be loaded. Reported Disputes are shown below.
-                    </div>
+                    <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-800">{t("Claim-related Disputes are unavailable because Claim data could not be loaded. Reported Disputes are shown below.")}</div>
                   ) : null}
                   {selectedDisputes.length ? (
                     <>
@@ -462,29 +456,29 @@ export function AgentsPage() {
                           <span className="min-w-0">
                             <span className="block truncate text-xs font-semibold text-slate-900">{dispute.name}</span>
                             <span className="mt-0.5 block text-[11px] text-slate-500">
-                              {dispute.reporter_agent_id === selected.agent_id ? 'Reporter' : 'Direct Claim holder'}
+                              {dispute.reporter_agent_id === selected.agent_id ? t("Reporter") : t("Direct Claim holder")}
                             </span>
                           </span>
                           <span className="flex shrink-0 items-center gap-1.5">
-                            <StatusBadge tone={dispute.status === 'open' ? 'danger' : 'success'}>{dispute.status}</StatusBadge>
+                            <StatusBadge localizeStatus tone={dispute.status === 'open' ? 'danger' : 'success'}>{dispute.status}</StatusBadge>
                             <ArrowUpRight className="h-3.5 w-3.5 text-blue-600" aria-hidden="true" />
                           </span>
                         </Link>
                       ))}
                       {selectedDisputes.length > 8 ? (
-                        <div className="text-xs text-slate-500">{selectedDisputes.length - 8} more {claimsError ? 'reported ' : ''}Disputes are available on the Disputes page.</div>
+                        <div className="text-xs text-slate-500">{t(claimsError ? '{count} more reported Disputes are available on the Disputes page.' : '{count} more Disputes are available on the Disputes page.', { count: selectedDisputes.length - 8 })}</div>
                       ) : null}
                     </>
                   ) : (
                     <div className="text-xs text-slate-500">
-                      {claimsError ? 'No reported Disputes.' : 'No reported or Claim-related Disputes.'}
+                      {claimsError ? t("No reported Disputes.") : t("No reported or Claim-related Disputes.")}
                     </div>
                   )}
                 </div>
               )}
             </DrawerSection>
 
-            <DrawerSection title="Recent Activities">
+            <DrawerSection title={t("Recent Activities")}>
               <div className="space-y-2">
                 {selected.recent_activities.length ? (
                   selected.recent_activities.map((activity) => {
@@ -499,7 +493,7 @@ export function AgentsPage() {
                           <Icon className="h-4 w-4" aria-hidden="true" />
                         </span>
                         <span className="min-w-0 flex-1">
-                          <span className="block text-xs font-semibold text-slate-900">{agentActivityLabel(activity)}</span>
+                          <span className="block text-xs font-semibold text-slate-900">{t(agentActivityLabel(activity))}</span>
                           {resource ? (
                             <span className="mt-0.5 block truncate text-xs font-medium text-blue-700">
                               {resource.type === 'claim'
@@ -529,21 +523,21 @@ export function AgentsPage() {
                     )
                   })
                 ) : (
-                  <div className="text-xs text-slate-500">Registered, but no activity has been recorded yet.</div>
+                  <div className="text-xs text-slate-500">{t("Registered, but no activity has been recorded yet.")}</div>
                 )}
               </div>
             </DrawerSection>
 
-            <DrawerSection title="Delivery State">
+            <DrawerSection title={t("Delivery State")}>
               {(() => {
                 const summary = deliverySummaryByAgent.get(selected.agent_id)
                 return (
                   <dl className="space-y-2 text-sm">
-                    <div className="flex justify-between gap-3"><dt className="text-slate-500">Durably Received</dt><dd className="font-mono text-xs text-slate-900">{summary?.deliveredCount ?? 0}</dd></div>
-                    <div className="flex justify-between gap-3"><dt className="text-slate-500">Open Outbox Entries</dt><dd className="font-mono text-xs text-slate-900">{summary?.openCount ?? 0}</dd></div>
-                    <div className="flex justify-between gap-3"><dt className="text-slate-500">Recent Pulls</dt><dd className="font-mono text-xs text-slate-900">{summary?.recentPullCount ?? 0}</dd></div>
-                    <div className="flex justify-between gap-3"><dt className="text-slate-500">Last Pull</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(summary?.lastPullAt)}</dd></div>
-                    <div className="flex justify-between gap-3"><dt className="text-slate-500">Last Receipt ACK</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(summary?.lastDelivery)}</dd></div>
+                    <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Durably Received")}</dt><dd className="font-mono text-xs text-slate-900">{summary?.deliveredCount ?? 0}</dd></div>
+                    <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Open Outbox Entries")}</dt><dd className="font-mono text-xs text-slate-900">{summary?.openCount ?? 0}</dd></div>
+                    <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Recent Pulls")}</dt><dd className="font-mono text-xs text-slate-900">{summary?.recentPullCount ?? 0}</dd></div>
+                    <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Last Pull")}</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(summary?.lastPullAt)}</dd></div>
+                    <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Last Receipt ACK")}</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(summary?.lastDelivery)}</dd></div>
                   </dl>
                 )
               })()}

@@ -1,3 +1,4 @@
+import { useT } from '../../i18n'
 import { useState } from 'react'
 
 type ExpandableTextProps = {
@@ -13,6 +14,7 @@ export function ExpandableText({
   limit = 180,
   className = '',
 }: ExpandableTextProps) {
+  const t = useT()
   const [expanded, setExpanded] = useState(false)
   const value = children?.trim()
   if (!value) return <span className={className}>{emptyLabel}</span>
@@ -29,7 +31,7 @@ export function ExpandableText({
           aria-expanded={expanded}
           onClick={() => setExpanded((current) => !current)}
         >
-          {expanded ? 'Show less' : 'Show more'}
+          {expanded ? t("Show less") : t("Show more")}
         </button>
       ) : null}
     </span>

@@ -1,3 +1,4 @@
+import { translate, type Language } from '../../i18n'
 import type { MaintainerActionRow, Policy } from '../overview/types'
 import type { OutboxEntry, PolicyRecordsResponse } from './types'
 
@@ -101,10 +102,10 @@ export function findPolicyEvent(data: PolicyRecordsResponse, policyId: string) {
   return data.events.find((event) => event.policy_id === policyId) ?? null
 }
 
-export function deliverySummaryText(stats: ReturnType<typeof deriveDeliveryStats>) {
+export function deliverySummaryText(stats: ReturnType<typeof deriveDeliveryStats>, language: Language = 'en') {
   return stats.expected === null
-    ? `${stats.delivered} receipt ACKs for broadcast`
-    : `${stats.delivered} / ${stats.expected} receipt ACKs`
+    ? translate(language, '{count} receipt ACKs for broadcast', { count: stats.delivered })
+    : translate(language, '{count} / {expected} receipt ACKs', { count: stats.delivered, expected: stats.expected })
 }
 
 function latestOutboxCohort(entries: OutboxEntry[]) {

@@ -1,3 +1,4 @@
+import { useT } from '../../i18n'
 import { ChevronLeft, ChevronRight } from 'lucide-react'
 import { useId } from 'react'
 
@@ -20,6 +21,7 @@ export function PaginationBar({
   onPageSizeChange,
   pageSizeOptions = [10, 20, 50],
 }: PaginationBarProps) {
+  const t = useT()
   const pageSizeId = useId()
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
   const from = total === 0 ? 0 : (page - 1) * pageSize + 1
@@ -31,14 +33,14 @@ export function PaginationBar({
   })
 
   return (
-    <nav aria-label="Pagination" className="flex flex-col gap-3 text-xs text-slate-600 md:flex-row md:items-center md:justify-between">
+    <nav aria-label={t("Pagination")} className="flex flex-col gap-3 text-xs text-slate-600 md:flex-row md:items-center md:justify-between">
       <div className="font-mono" aria-live="polite">
         {from}–{to} / {total}
       </div>
       <div className="flex flex-wrap items-center gap-2">
         <button
           type="button"
-          aria-label="Previous page"
+          aria-label={t("Previous page")}
           className="acn-interactive inline-flex h-10 min-w-10 items-center justify-center rounded-lg bg-white text-slate-600 shadow-sm ring-1 ring-slate-200 hover:bg-slate-50 disabled:cursor-not-allowed disabled:text-slate-300 disabled:shadow-none disabled:ring-slate-100 disabled:hover:translate-y-0 disabled:hover:bg-white"
           onClick={() => onPageChange(page - 1)}
           disabled={page <= 1}
@@ -50,7 +52,7 @@ export function PaginationBar({
             key={item}
             type="button"
             aria-current={item === page ? 'page' : undefined}
-            aria-label={item === page ? `Page ${item}, current page` : `Go to page ${item}`}
+            aria-label={item === page ? t('Page {page}, current page', { page: item }) : t('Go to page {page}', { page: item })}
             onClick={() => onPageChange(item)}
             className={cn(
               'acn-interactive h-10 min-w-10 rounded-lg px-2 font-mono text-xs font-semibold',
@@ -64,7 +66,7 @@ export function PaginationBar({
         ))}
         <button
           type="button"
-          aria-label="Next page"
+          aria-label={t("Next page")}
           className="acn-interactive inline-flex h-10 min-w-10 items-center justify-center rounded-lg bg-white text-slate-600 shadow-sm ring-1 ring-slate-200 hover:bg-slate-50 disabled:cursor-not-allowed disabled:text-slate-300 disabled:shadow-none disabled:ring-slate-100 disabled:hover:translate-y-0 disabled:hover:bg-white"
           onClick={() => onPageChange(page + 1)}
           disabled={page >= totalPages}
@@ -73,7 +75,7 @@ export function PaginationBar({
         </button>
         {onPageSizeChange ? (
           <label htmlFor={pageSizeId} className="ml-1 inline-flex items-center gap-2 font-medium text-slate-600">
-            <span>Rows per page</span>
+            <span>{t("Rows per page")}</span>
             <select
               id={pageSizeId}
               className="h-10 rounded-lg border-0 bg-white px-2.5 text-xs text-slate-700 shadow-sm ring-1 ring-slate-200"

@@ -1,3 +1,4 @@
+import { useT } from '../i18n'
 import { ChevronLeft, X } from 'lucide-react'
 import { useEffect, useId, useRef } from 'react'
 import { createPortal } from 'react-dom'
@@ -22,17 +23,18 @@ function NavigationItems({
   mobile?: boolean
   onNavigate?: () => void
 }) {
+  const t = useT()
   return (
-    <nav aria-label={mobile ? 'Mobile workbench navigation' : 'Workbench navigation'} className="py-4">
+    <nav aria-label={mobile ? t("Mobile workbench navigation") : t("Workbench navigation")} className="py-4">
       {navSections.map((section) => (
-        <section key={section.title} className="mb-5 last:mb-0">
+        <section key={t(section.title)} className="mb-5 last:mb-0">
           <div
             className={cn(
               'px-4 text-[10px] font-bold uppercase tracking-[0.14em] text-slate-500',
               collapsed && 'sr-only',
             )}
           >
-            {section.title}
+            {t(section.title)}
           </div>
           <div className="mt-1.5 space-y-1 px-2">
             {section.items.map((item) => (
@@ -40,7 +42,7 @@ function NavigationItems({
                 key={item.href}
                 to={item.href}
                 end={item.href === '/'}
-                title={collapsed ? item.label : undefined}
+                title={collapsed ? t(item.label) : undefined}
                 onClick={onNavigate}
                 className={({ isActive }) =>
                   cn(
@@ -58,10 +60,10 @@ function NavigationItems({
                       <item.icon aria-hidden="true" className="h-4 w-4" />
                     </span>
                     <span className={cn('min-w-0 flex-1', collapsed && 'hidden')}>
-                      <span className="block truncate leading-5">{item.label}</span>
+                      <span className="block truncate leading-5">{t(item.label)}</span>
                       {mobile ? (
                         <span className="block truncate text-[11px] font-normal leading-4 text-slate-500">
-                          {item.description}
+                          {t(item.description)}
                         </span>
                       ) : null}
                     </span>
@@ -96,6 +98,7 @@ function trapFocus(event: KeyboardEvent, container: HTMLElement) {
 }
 
 export function Sidebar() {
+  const t = useT()
   const sidebarCollapsed = useWorkbenchUiStore((state) => state.sidebarCollapsed)
   const toggleSidebar = useWorkbenchUiStore((state) => state.toggleSidebar)
   const mobileNavOpen = useWorkbenchUiStore((state) => state.mobileNavOpen)
@@ -155,7 +158,7 @@ export function Sidebar() {
           <button
             type="button"
             onClick={toggleSidebar}
-            aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            aria-label={sidebarCollapsed ? t("Expand sidebar") : t("Collapse sidebar")}
             className={cn(
               'flex min-h-11 w-full items-center rounded-xl px-2 text-xs font-semibold text-slate-500 transition-colors duration-150 hover:bg-white hover:text-slate-900',
               sidebarCollapsed ? 'justify-center' : 'gap-2',
@@ -165,7 +168,7 @@ export function Sidebar() {
               aria-hidden="true"
               className={cn('h-4 w-4 transition-transform duration-150', sidebarCollapsed && 'rotate-180')}
             />
-            <span className={cn(sidebarCollapsed && 'hidden')}>Collapse sidebar</span>
+            <span className={cn(sidebarCollapsed && 'hidden')}>{t("Collapse sidebar")}</span>
           </button>
         </div>
       </aside>
@@ -176,7 +179,7 @@ export function Sidebar() {
               <button
                 type="button"
                 tabIndex={-1}
-                aria-label="Close navigation background"
+                aria-label={t("Close navigation background")}
                 onClick={closeMobileNav}
                 className="acn-overlay-enter absolute inset-0 h-full w-full cursor-default bg-slate-950/35 backdrop-blur-[2px]"
               />
@@ -190,14 +193,14 @@ export function Sidebar() {
               >
                 <div className="flex min-h-16 items-center justify-between border-b border-slate-200/70 px-4">
                   <div>
-                    <div id={mobileTitleId} className="text-sm font-[680] text-slate-900">Maintainer Workbench</div>
-                    <div className="font-mono text-[11px] text-slate-500">Agent Claim Network</div>
+                    <div id={mobileTitleId} className="text-sm font-[680] text-slate-900">{t("Maintainer Workbench")}</div>
+                    <div className="font-mono text-[11px] text-slate-500">{t("Agent Claim Network")}</div>
                   </div>
                   <button
                     ref={mobileCloseRef}
                     type="button"
                     onClick={closeMobileNav}
-                    aria-label="Close navigation"
+                    aria-label={t("Close navigation")}
                     className="acn-interactive inline-flex h-10 w-10 items-center justify-center rounded-xl bg-white text-slate-500 shadow-sm hover:text-slate-900"
                   >
                     <X aria-hidden="true" className="h-4 w-4" />
@@ -206,9 +209,7 @@ export function Sidebar() {
                 <div className="flex-1 overflow-y-auto overscroll-contain px-1.5">
                   <NavigationItems mobile onNavigate={closeMobileNav} />
                 </div>
-                <p className="m-3 rounded-xl bg-white px-3.5 py-3 text-xs leading-5 text-slate-500 shadow-sm">
-                  Maintainer publishes, suggests, and reviews. Agents retain ownership of local judgment.
-                </p>
+                <p className="m-3 rounded-xl bg-white px-3.5 py-3 text-xs leading-5 text-slate-500 shadow-sm">{t("Maintainer publishes, suggests, and reviews. Agents retain ownership of local judgment.")}</p>
               </aside>
             </div>,
             document.body,

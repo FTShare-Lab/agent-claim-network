@@ -1,3 +1,5 @@
+import { useT } from '../i18n'
+import { LanguageSwitch } from '../i18n/LanguageSwitch'
 import { type FormEvent, type ReactNode, useEffect, useMemo, useState } from 'react'
 import { ArrowRight, Eye, ShieldCheck } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
@@ -19,6 +21,7 @@ export function RequireAdminAuth({ children }: { children: ReactNode }) {
 }
 
 function AdminAuthGuard({ children }: { children: ReactNode }) {
+  const t = useT()
   const location = useLocation()
   const queryClient = useQueryClient()
   const [session, setSession] = useState(() => readAdminSession())
@@ -57,9 +60,7 @@ function AdminAuthGuard({ children }: { children: ReactNode }) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-[var(--bg-page)]" role="status" aria-live="polite">
         <div className="flex items-center gap-2 font-mono text-xs text-slate-600">
-          <span aria-hidden="true" className="h-2 w-2 animate-pulse rounded-full bg-blue-700" />
-          Checking workbench access…
-        </div>
+          <span aria-hidden="true" className="h-2 w-2 animate-pulse rounded-full bg-blue-700" />{t("Checking workbench access…")}</div>
       </div>
     )
   }
@@ -77,6 +78,7 @@ export function LoginPage() {
 }
 
 function AdminLoginPage() {
+  const t = useT()
   const location = useLocation()
   const navigate = useNavigate()
   const [session, setSession] = useState(() => readAdminSession())
@@ -132,32 +134,33 @@ function AdminLoginPage() {
 
   return (
     <main className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[var(--bg-page)] px-4 py-10 sm:px-6">
+      <div className="absolute right-4 top-4 z-10"><LanguageSwitch /></div>
       <div aria-hidden="true" className="absolute -left-24 top-[-15%] h-[420px] w-[420px] rounded-full bg-[var(--accent-weak)] blur-3xl" />
       <div aria-hidden="true" className="absolute -right-36 bottom-[-20%] h-[460px] w-[460px] rounded-full bg-[#eaf6f0] blur-3xl" />
       <div className="relative w-full max-w-[440px]">
         <header className="mb-6 flex items-center gap-3 px-1">
-          <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-[var(--accent)] font-mono text-[11px] font-bold tracking-tight text-white">ACN</div>
+          <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-xl bg-[var(--accent)] font-mono text-lg font-bold tracking-tight text-white">ACN</div>
           <div>
-            <div className="text-sm font-[700] text-slate-900">Maintainer Workbench</div>
-            <div className="text-[11px] text-slate-500">Agent Claim Network</div>
+            <div className="text-lg font-[700] text-slate-900 sm:text-xl">{t("Maintainer Workbench")}</div>
+            <div className="text-sm text-slate-500">{t("Agent Claim Network")}</div>
           </div>
         </header>
 
         <section className="rounded-2xl bg-white p-6 shadow-[var(--shadow-raised)] ring-1 ring-slate-200/70 sm:p-8">
           <form onSubmit={handleSubmit} className="w-full" aria-describedby="login-guidance">
             <div className="mb-7">
-              <div className="mb-4 flex h-10 w-10 items-center justify-center rounded-xl bg-[var(--accent-weak)] text-[var(--accent)]">
-                <ShieldCheck aria-hidden="true" className="h-[18px] w-[18px]" />
+              <div className="flex items-center gap-3">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[var(--accent-weak)] text-[var(--accent)]">
+                  <ShieldCheck aria-hidden="true" className="h-[18px] w-[18px]" />
+                </div>
+                <h1 className="text-xl font-[650] tracking-[-0.025em] text-slate-950 sm:text-2xl">{t("Admin credentials")}</h1>
               </div>
-              <h1 className="text-2xl font-[650] tracking-[-0.025em] text-slate-950">Admin credentials</h1>
-              <p id="login-guidance" className="mt-2 text-sm leading-6 text-slate-500">
-                Sign in to review provenance, resolve disputes, and publish guidance. Credentials are verified by the local Maintainer daemon.
-              </p>
+              <p id="login-guidance" className="mt-2 text-sm leading-6 text-slate-500">{t("Sign in to review provenance, resolve disputes, and publish guidance.")}</p>
             </div>
 
             <div className="space-y-4">
               <div>
-                <label htmlFor="admin-username" className="text-xs font-semibold text-slate-700">Username</label>
+                <label htmlFor="admin-username" className="text-xs font-semibold text-slate-700">{t("Username")}</label>
                 <input
                   id="admin-username"
                   autoComplete="username"
@@ -169,7 +172,7 @@ function AdminLoginPage() {
               </div>
 
               <div>
-                <label htmlFor="admin-password" className="text-xs font-semibold text-slate-700">Password</label>
+                <label htmlFor="admin-password" className="text-xs font-semibold text-slate-700">{t("Password")}</label>
                 <div className="relative mt-1.5">
                   <input
                     id="admin-password"
@@ -182,9 +185,9 @@ function AdminLoginPage() {
                   />
                   <button
                     type="button"
-                    aria-label={isPasswordVisible ? 'Hide password' : 'Show password'}
+                    aria-label={isPasswordVisible ? t("Hide password") : t("Show password")}
                     aria-pressed={isPasswordVisible}
-                    title={isPasswordVisible ? 'Hide password' : 'Show password'}
+                    title={isPasswordVisible ? t("Hide password") : t("Show password")}
                     onClick={() => setIsPasswordVisible((visible) => !visible)}
                     className="absolute right-1.5 top-1/2 flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-lg text-slate-500 transition-colors duration-150 hover:bg-slate-100 hover:text-slate-800"
                   >
@@ -196,7 +199,7 @@ function AdminLoginPage() {
 
             {error ? (
               <div role="alert" aria-live="assertive" className="mt-4 rounded-md border border-rose-200 bg-rose-50 px-3 py-2.5 text-xs font-semibold text-rose-800">
-                {error}
+                {t(error)}
               </div>
             ) : null}
 
@@ -206,17 +209,15 @@ function AdminLoginPage() {
               aria-busy={isSubmitting}
               className="mt-6 inline-flex min-h-11 w-full items-center justify-center gap-2 rounded-lg bg-[var(--accent)] px-3 text-sm font-semibold text-white transition-colors duration-150 hover:bg-[var(--accent-strong)] disabled:cursor-wait disabled:bg-slate-300"
             >
-              {isSubmitting ? 'Checking…' : 'Open Workbench'}
+              {isSubmitting ? t("Checking…") : t("Open Workbench")}
               <ArrowRight aria-hidden="true" className="h-4 w-4" />
             </button>
-            <p className="mt-4 text-center text-[11px] text-slate-500" aria-live="polite">
-              {isSubmitting ? 'Verifying credentials with the Maintainer daemon…' : 'Local admin session · Agent judgment remains private'}
-            </p>
+            {isSubmitting ? <p className="mt-4 text-center text-[11px] text-slate-500" role="status">
+              {t("Verifying credentials with the Maintainer daemon…")}
+            </p> : null}
           </form>
         </section>
-        <p className="mt-5 px-4 text-center text-xs leading-5 text-slate-500">
-          Maintainer governs shared policy and disputes; it cannot overwrite an Agent&apos;s private Memory or local Claim.
-        </p>
+        <p className="mt-5 px-4 text-center text-xs leading-5 text-slate-500">{t("Maintainer governs shared policy and disputes; it cannot overwrite an Agent's private Memory or local Claim.")}</p>
       </div>
     </main>
   )

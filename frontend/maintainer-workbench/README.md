@@ -13,6 +13,12 @@ Workbench 面向 Maintainer 管理员，提供以下区域：
 - Team Auth：Agent 团队访问 key
 - HTTP Audits / Settings：请求审计、运行状态和 endpoint 目录
 
+## 界面语言
+
+登录页和工作台右上角可即时切换中文 / English，首次访问默认中文。同一浏览器记住最后选择，刷新、重新打开、退出登录后均保留；同源标签也会同步切换。存储被禁用时仍可在当前页面切换。
+
+翻译覆盖界面标签、按钮、说明与提示语，Agent、Claim、Policy、Trace、Dispute、Maintainer、Router 保留英文。Claim / Policy / Dispute / Agent 的状态按当前语言显示，原始枚举值不变；名称、正文、证据、适用范围、ID 及其他业务字段内容保持原样；切换不提交业务请求，也不清空当前表单、筛选或详情。语言偏好独立保存在浏览器 localStorage 中，不写入团队数据或服务端配置。
+
 ## 管理员登录与验收
 
 启用管理员鉴权后，Workbench 使用服务端签发的 HttpOnly Cookie，默认有效期为 7 天。有效期内关闭标签、重开或重启浏览器均可恢复登录；退出会撤销会话并同步其他同源标签。前端不保存管理员密码。配置与服务重启失效边界见 [配置说明](../../docs/config_parameters.md#maintainerauthadmin)。
@@ -31,7 +37,13 @@ target/debug/examples/auth_cookie_smoke --localhost
 
 ## 知识树
 
-侧栏 Claims 上方的 **Claims Flow**（`/app/knowledge-tree`）提供团队知识的树状视图：
+侧栏 **Claim Flow**（`/app/knowledge-tree`）默认展示全部 Claim 的关系总览。每条 Claim 只画一次，保留所选 Claim 之间的全部有向来源关系，包括循环和自引用。总览还补充所选 Claim 直接引用的 Policy Update（PU）和 Claim Attribute Update（CAU），同一来源只画一次，保留其与所选 Claim 的全部连接；缺失来源不纳入总览。
+
+总览会依据连接关系比较横向、纵向的多个分层布局，综合减少交叉、重叠和不必要的折线；长链可自动折行，独立连通分量分开排布，连线绕开节点。复杂关系不保证完全无交叉。鼠标悬停或键盘聚焦节点时突出它的直接来源与引申关系。布局只影响显示，不修改 Claim 数据。
+
+超过 30 条时，总览最多显示 30 条：忽略方向划分连通分量，优先较大的分量，从连接数较多的节点起沿相邻关系扩展；同等情况下按 ID 稳定排序。这样优先保持连通，不承诺求得全局最大密度子图。关联 PU/CAU 合计最多 20 条，优先被当前所选 Claim 引用较多的，其次按最近更新时间（无更新时间时使用创建时间）降序、ID 稳定排序，总节点数最多 50 个。页面分别提示 Claim 和关联 PU/CAU 的显示数与总数，超限时说明截取规则；单条 Claim 视图仍可追溯其余来源。页面提示显示数、总数和截取规则，其余 Claim 仍可从列表检索。筛选只作用于左侧候选列表，总览始终基于全部 Claim。总览节点可打开详情，再从该节点展开来源或影响；再次点击左侧当前选中的根节点可返回总览，保留列表筛选与分页。
+
+选择根节点后进入团队知识树：
 
 1. 使用与 Claims 相同的标题、ID、正文、证据、scope、Agent、状态和争议筛选，再从结果中选择根节点。也可按知识类型选择 Policy 或属性更新建议。Agent 和争议筛选只匹配 Claim。
 2. 右上角切换 **Sources** 或 **Impact**：前驱递归沿 `source_claim_ids` 向上展示来源；后继反向查找引用该 ID 的 Claim，向下展示影响链。筛选只影响根节点候选列表，不裁剪已选节点的关系树。
@@ -59,7 +71,7 @@ npm run preview:knowledge -- 18063
 
 命令先构建正式前端，再在仓库 `target/knowledge-preview-*/` 下新建独立数据目录和配置，启动真实 Maintainer（默认 `127.0.0.1:18062`）。终端会打印数据目录和知识树网址；页面通过正式 API 读取测试数据。每次启动使用全新目录，不修改已有团队数据，也不会启用模型仲裁或启动 Router。按 Ctrl-C 停止后，测试目录保留供检查。
 
-案例的知识标题、正文和证据说明使用中文；前端界面文案使用英文。可按下表的 `root_id` 打开 `http://127.0.0.1:18062/app/knowledge-tree`，Impact 模式追加 `direction=successors`。
+案例的知识标题、正文和证据说明使用中文；前端界面文案支持中英文，原始案例内容保持不变。可按下表的 `root_id` 打开 `http://127.0.0.1:18062/app/knowledge-tree`，Impact 模式追加 `direction=successors`。
 
 | 案例 | root_id | 模式 | 完整树节点数 | 验收重点 |
 | --- | --- | --- | --- | --- |
@@ -71,7 +83,7 @@ npm run preview:knowledge -- 18063
 | 宽树案例 | `policy_c2000004` | Impact | 513 | 超过 500 节点预算后继续展开，检查最后一个采纳分支 |
 | 交叉引用压力案例 | `claim_c1000c1c` | Sources | 1535 | 20 个不同对象形成大量重复路径，按 500、1000、1500、1535 分批显示 |
 
-使用 Scope 筛选 `demo/knowledge/release`、`boundaries`、`isolated`、`deep`、`wide` 或 `lattice` 可定位对应记录。来源缺失和循环仅在边界案例中有意构造；它们不代表服务异常。**Fit** 可缩小到全图预览，点击放大后可查看局部分支和节点详情。
+使用 Scope 筛选 `demo/knowledge/release`、`boundaries`、`isolated`、`deep`、`wide` 、`lattice` 或 `demo/knowledge/statuses` 可定位对应记录。来源缺失和循环仅在边界案例中有意构造；它们不代表服务异常。**Fit** 可缩小到全图预览，点击放大后可查看局部分支和节点详情。
 
 ## 环境
 

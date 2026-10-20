@@ -1,3 +1,4 @@
+import { useT } from '../../i18n'
 // Claim 详情由列表和知识树共用，保持来源与争议跳转一致。
 import { StatusBadge } from '../../components/badges/StatusBadge'
 import { DrawerSection } from '../../components/drawer/DrawerSection'
@@ -11,20 +12,21 @@ export function ClaimDetails({ view, onOpenSource, onOpenDispute }: {
   onOpenSource: (id: string) => void
   onOpenDispute: (id: string) => void
 }) {
+  const t = useT()
   return (
     <>
-      <DrawerSection title="Overview">
+      <DrawerSection title={t("Overview")}>
         <dl className="space-y-2 text-sm">
-          <div className="flex justify-between gap-3"><dt className="text-slate-500">Holder Agent</dt><dd className="font-mono text-xs text-slate-900">{view.claim.holder}</dd></div>
-          <div className="flex justify-between gap-3"><dt className="text-slate-500">Status</dt><dd><StatusBadge>{view.claim.status}</StatusBadge></dd></div>
-          <div className="flex justify-between gap-3"><dt className="text-slate-500">Confidence</dt><dd className="font-medium capitalize text-slate-900">{view.claim.confidence}</dd></div>
-          <div className="flex justify-between gap-3"><dt className="text-slate-500">Created At</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(view.claim.created_at)}</dd></div>
+          <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Holder Agent")}</dt><dd className="font-mono text-xs text-slate-900">{view.claim.holder}</dd></div>
+          <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Status")}</dt><dd><StatusBadge localizeStatus>{view.claim.status}</StatusBadge></dd></div>
+          <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Confidence")}</dt><dd className="font-medium capitalize text-slate-900">{view.claim.confidence}</dd></div>
+          <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Created At")}</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(view.claim.created_at)}</dd></div>
           {view.claim.updated_at ? (
-            <div className="flex justify-between gap-3"><dt className="text-slate-500">Updated At</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(view.claim.updated_at)}</dd></div>
+            <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Updated At")}</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(view.claim.updated_at)}</dd></div>
           ) : null}
         </dl>
       </DrawerSection>
-      <DrawerSection title="Related Disputes">
+      <DrawerSection title={t("Related Disputes")}>
         {view.open_dispute_ids.length || view.resolved_dispute_ids.length ? (
           <div className="flex flex-wrap gap-1">
             {[...view.open_dispute_ids, ...view.resolved_dispute_ids].map((disputeId) => (
@@ -39,19 +41,19 @@ export function ClaimDetails({ view, onOpenSource, onOpenDispute }: {
             ))}
           </div>
         ) : (
-          <div className="text-xs text-slate-500">No disputes</div>
+          <div className="text-xs text-slate-500">{t("No disputes")}</div>
         )}
       </DrawerSection>
-      <DrawerSection title="Scope" tone="claim">
+      <DrawerSection title={t("Scope")} tone="claim">
         <div className="text-sm leading-6 text-slate-900">{view.claim.scope}</div>
       </DrawerSection>
-      <DrawerSection title="Statement" tone="claim">
+      <DrawerSection title={t("Statement")} tone="claim">
         <div className="whitespace-pre-wrap text-sm leading-6 text-slate-900">{view.claim.statement}</div>
       </DrawerSection>
-      <DrawerSection title="Evidence Summary" tone="claim">
+      <DrawerSection title={t("Evidence Summary")} tone="claim">
         <div className="whitespace-pre-wrap text-sm leading-6 text-slate-800">{view.claim.evidence_summary}</div>
       </DrawerSection>
-      <DrawerSection title="Source IDs" tone="claim">
+      <DrawerSection title={t("Source IDs")} tone="claim">
         {view.claim.source_claim_ids.length ? (
           <div className="flex flex-wrap gap-1">
             {[...new Set(view.claim.source_claim_ids)].map((sourceId) => (
@@ -66,7 +68,7 @@ export function ClaimDetails({ view, onOpenSource, onOpenDispute }: {
             ))}
           </div>
         ) : (
-          <div className="text-xs text-slate-500">No sources</div>
+          <div className="text-xs text-slate-500">{t("No sources")}</div>
         )}
       </DrawerSection>
     </>

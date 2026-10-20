@@ -1,3 +1,5 @@
+import { useT } from '../i18n'
+import { LanguageSwitch } from '../i18n/LanguageSwitch'
 import { useState } from 'react'
 import { LogOut, Menu, RefreshCw } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
@@ -9,6 +11,7 @@ import { useWorkbenchUiStore } from '../app/store'
 import { logoutAdmin } from '../features/auth/session'
 
 export function Topbar() {
+  const t = useT()
   const queryClient = useQueryClient()
   const navigate = useNavigate()
   const location = useLocation()
@@ -57,7 +60,7 @@ export function Topbar() {
           <button
             type="button"
             onClick={openMobileNav}
-            aria-label="Open navigation"
+            aria-label={t("Open navigation")}
             className="acn-interactive inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-slate-700 hover:bg-slate-200/70 xl:hidden"
           >
             <Menu aria-hidden="true" className="h-4 w-4" />
@@ -65,15 +68,15 @@ export function Topbar() {
           <button
             type="button"
             onClick={goHome}
-            aria-label="Go to overview"
-            title="Go to overview"
+            aria-label={t("Go to overview")}
+            title={t("Go to overview")}
             className="acn-interactive relative flex h-9 shrink-0 items-center rounded-[10px] border border-slate-300 bg-[linear-gradient(115deg,#5a35ff,#1f5bff_55%,#0c8c5e)] bg-clip-text px-2.5 text-transparent text-[17px] font-black tracking-[0.02em] hover:opacity-80"
           >
             ACN
           </button>
-          <button type="button" onClick={goHome} title="Go to overview" className="acn-interactive min-w-0 cursor-pointer rounded-md border-0 bg-transparent p-1 -m-1 text-left hover:bg-slate-100/70">
-            <div className="truncate text-sm font-[700] leading-5 text-slate-900">Maintainer Workbench</div>
-            <div className="hidden text-[10px] font-medium leading-3 tracking-wide text-slate-500 sm:block">Agent Claim Network</div>
+          <button type="button" onClick={goHome} title={t("Go to overview")} className="acn-interactive min-w-0 cursor-pointer rounded-md border-0 bg-transparent p-1 -m-1 text-left hover:bg-slate-100/70">
+            <div className="truncate text-sm font-[700] leading-5 text-slate-900">{t("Maintainer Workbench")}</div>
+            <div className="hidden text-[10px] font-medium leading-3 tracking-wide text-slate-500 sm:block">{t("Agent Claim Network")}</div>
           </button>
         </div>
         <div className="flex shrink-0 items-center gap-1.5 text-xs text-slate-500 sm:gap-2">
@@ -83,7 +86,7 @@ export function Topbar() {
                 ? 'hidden items-center gap-1.5 rounded-full bg-violet-50 px-2.5 py-1.5 text-violet-800 md:inline-flex'
                 : 'hidden items-center gap-1.5 rounded-full bg-emerald-50 px-2.5 py-1.5 text-emerald-800 md:inline-flex'
             }
-            title={isStaticDemo ? 'Synthetic data; no team service connection' : `Connected to daemon on port ${daemonPort}`}
+            title={isStaticDemo ? t("Synthetic data; no team service connection") : t('Connected to daemon on port {port}', { port: daemonPort })}
           >
             <span
               aria-hidden="true"
@@ -93,35 +96,36 @@ export function Topbar() {
                   : 'h-1.5 w-1.5 rounded-full bg-emerald-500 shadow-[0_0_0_3px_rgb(16_185_129_/_0.12)]'
               }
             />
-            <span className="text-[11px] font-semibold">{isStaticDemo ? 'Static preview' : 'Connected'}</span>
+            <span className="text-[11px] font-semibold">{isStaticDemo ? t("Static preview") : t("Connected")}</span>
           </span>
           <button
             type="button"
             onClick={handleRefresh}
             disabled={isRefreshing}
             aria-busy={isRefreshing}
-            aria-label={isRefreshing ? 'Refreshing workbench data' : `Refresh workbench data. Last updated ${formatDateTime(lastUpdatedAt)}`}
-            title={`Last updated ${formatDateTime(lastUpdatedAt)}`}
+            aria-label={isRefreshing ? t("Refreshing workbench data") : t('Refresh workbench data. Last updated {time}', { time: formatDateTime(lastUpdatedAt) })}
+            title={t('Last updated {time}', { time: formatDateTime(lastUpdatedAt) })}
             className="acn-interactive inline-flex h-10 items-center justify-center gap-1.5 rounded-xl bg-slate-100 px-2.5 text-xs font-semibold text-slate-700 hover:bg-slate-200/70 disabled:cursor-wait disabled:text-slate-400 sm:px-3"
           >
             <RefreshCw aria-hidden="true" className={`h-3.5 w-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
-            <span className="hidden sm:inline">{isRefreshing ? 'Refreshing' : 'Refresh'}</span>
+            <span className="hidden sm:inline">{isRefreshing ? t("Refreshing") : t("Refresh")}</span>
           </button>
+          <LanguageSwitch />
           {!isStaticDemo ? (
             <button
               type="button"
               onClick={handleSignOut}
               disabled={isSigningOut}
-              title="Sign out"
+              title={t("Sign out")}
               className="acn-interactive inline-flex h-10 items-center justify-center gap-1.5 rounded-xl px-2.5 text-xs font-semibold text-slate-500 hover:bg-rose-50 hover:text-rose-700 sm:px-3"
             >
               <LogOut aria-hidden="true" className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">Sign out</span>
+              <span className="hidden sm:inline">{t("Sign out")}</span>
             </button>
           ) : null}
-          {signOutError ? <span role="alert">{signOutError}</span> : null}
+          {signOutError ? <span role="alert">{t(signOutError)}</span> : null}
           <span className="sr-only" aria-live="polite">
-            {isRefreshing ? 'Refreshing workbench data' : 'Workbench data ready'}
+            {isRefreshing ? t("Refreshing workbench data") : t("Workbench data ready")}
           </span>
         </div>
       </div>

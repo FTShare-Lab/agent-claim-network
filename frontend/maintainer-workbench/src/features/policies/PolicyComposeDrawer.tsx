@@ -1,3 +1,4 @@
+import { useT } from '../../i18n'
 import { type ReactNode, useMemo, useState } from 'react'
 
 import { DetailDrawer } from '../../components/drawer/DetailDrawer'
@@ -59,18 +60,15 @@ function AgentTargetPicker({
   selectedAgents: string[]
   onChange: (next: string[]) => void
 }) {
+  const t = useT()
   const selectedSet = new Set(selectedAgents)
 
   return (
     <div>
-      <SectionLabel>Target Agents</SectionLabel>
+      <SectionLabel>{t("Target Agents")}</SectionLabel>
       <div className="rounded-md border border-slate-200 bg-slate-50 p-3">
-        <div className="rounded border border-dashed border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700">
-          Broadcast to all agents
-        </div>
-        <div className="mt-2 text-[11px] leading-5 text-slate-500">
-          Leave every agent unchecked to broadcast. Selecting one or more agents switches this action to targeted delivery.
-        </div>
+        <div className="rounded border border-dashed border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700">{t("Broadcast to all agents")}</div>
+        <div className="mt-2 text-[11px] leading-5 text-slate-500">{t("Leave every agent unchecked to broadcast. Selecting one or more agents switches this action to targeted delivery.")}</div>
         <div className="mt-2 space-y-1.5">
           {agents.length ? (
             agents.map((agent) => {
@@ -94,16 +92,13 @@ function AgentTargetPicker({
                   <span>
                     <span className="block font-mono font-medium text-slate-900">{agent.agent_id}</span>
                     <span className="mt-0.5 block text-[11px] text-slate-500">
-                      {agent.active_claims} active claims
-                    </span>
+                      {agent.active_claims} {t("active claims")}</span>
                   </span>
                 </label>
               )
             })
           ) : (
-            <div className="rounded border border-dashed border-slate-300 bg-white px-3 py-2 text-xs text-slate-500">
-              No registered agents found. This action will broadcast if you submit it.
-            </div>
+            <div className="rounded border border-dashed border-slate-300 bg-white px-3 py-2 text-xs text-slate-500">{t("No registered agents found. This action will broadcast if you submit it.")}</div>
           )}
         </div>
       </div>
@@ -121,6 +116,7 @@ export function PolicyComposeDrawer({
   policies,
   onClose,
 }: PolicyComposeDrawerProps) {
+  const t = useT()
   const { data: agents = [] } = useAgentsQuery()
   const createPolicy = useCreatePolicyMutation()
   const createClaimAttribute = useClaimAttributeSuggestionMutation()
@@ -226,82 +222,78 @@ export function PolicyComposeDrawer({
 
   const title =
     mode === 'chooser'
-      ? 'Choose an action'
+      ? t("Choose an action")
       : mode === 'new-pu'
-        ? 'New PU'
+        ? t("New PU")
         : mode === 'deprecate-pu'
-          ? 'Deprecate PU'
-          : 'CAU'
+          ? t("Deprecate PU")
+          : t("CAU")
   const subtitle =
     mode === 'chooser'
-      ? 'Open a focused workspace for publishing or policy lifecycle actions.'
+      ? t("Open a focused workspace for publishing or policy lifecycle actions.")
       : mode === 'new-pu'
-        ? 'Publish a new policy update to a targeted audience or the whole network.'
+        ? t("Publish a new policy update to a targeted audience or the whole network.")
         : mode === 'deprecate-pu'
-          ? 'Deprecate an existing active policy by selecting it from the current history.'
-          : 'Publish a claim attribute update with scoped delivery.'
+          ? t("Deprecate an existing active policy by selecting it from the current history.")
+          : t("Publish a claim attribute update with scoped delivery.")
 
   return (
     <DetailDrawer
       open={open}
       onClose={onClose}
-      label="Action"
-      ariaLabel="Policy action workspace"
+      label={t("Action")}
+      ariaLabel={t('Policy action workspace')}
       title={title}
       subtitle={subtitle}
       onBack={mode === 'chooser' ? undefined : goBack}
-      backLabel="Back"
+      backLabel={t('Back')}
       footer={
         mode === 'chooser' ? (
-          <button type="button" className={secondaryBtn + ' w-full'} onClick={onClose}>
-            Close
-          </button>
+          <button type="button" className={secondaryBtn + ' w-full'} onClick={onClose}>{t("Close")}</button>
         ) : mode === 'new-pu' ? (
           <div className="grid grid-cols-2 gap-2">
-            <button type="button" className={secondaryBtn} onClick={goBack}>Back</button>
+            <button type="button" className={secondaryBtn} onClick={goBack}>{t("Back")}</button>
             <button type="button" className={primaryBtn} disabled={isStaticDemo || createPolicy.isPending} onClick={submitNewPolicy}>
-              {createPolicy.isPending ? 'Publishing…' : 'Publish New PU'}
+              {createPolicy.isPending ? t("Publishing…") : t("Publish New PU")}
             </button>
           </div>
         ) : mode === 'deprecate-pu' ? (
           <div className="grid grid-cols-2 gap-2">
-            <button type="button" className={secondaryBtn} onClick={goBack}>Back</button>
+            <button type="button" className={secondaryBtn} onClick={goBack}>{t("Back")}</button>
             <button type="button" className={dangerBtn} disabled={isStaticDemo || deprecatePolicy.isPending} onClick={submitDeprecatePolicy}>
-              {deprecatePolicy.isPending ? 'Deprecating…' : 'Deprecate Policy'}
+              {deprecatePolicy.isPending ? t("Deprecating…") : t("Deprecate Policy")}
             </button>
           </div>
         ) : (
           <div className="grid grid-cols-2 gap-2">
-            <button type="button" className={secondaryBtn} onClick={goBack}>Back</button>
+            <button type="button" className={secondaryBtn} onClick={goBack}>{t("Back")}</button>
             <button type="button" className={primaryBtn} disabled={isStaticDemo || createClaimAttribute.isPending} onClick={submitClaimAttributeUpdate}>
-              {createClaimAttribute.isPending ? 'Publishing…' : 'Publish CAU'}
+              {createClaimAttribute.isPending ? t("Publishing…") : t("Publish CAU")}
             </button>
           </div>
         )
       }
     >
-      <ErrorBanner message={error} />
+      <ErrorBanner message={error ? t(error) : null} />
       {isStaticDemo ? (
-        <div className="rounded-md border border-violet-200 bg-violet-50 px-3 py-2 text-xs leading-5 text-violet-800">
-          Public preview is read-only. You can inspect the workflow, but publishing and deprecation are disabled.
-        </div>
+        <div className="rounded-md border border-violet-200 bg-violet-50 px-3 py-2 text-xs leading-5 text-violet-800">{t("Public preview is read-only. You can inspect the workflow, but publishing and deprecation are disabled.")}</div>
       ) : null}
 
       {mode === 'chooser' ? (
         <div className="space-y-2">
           <ActionCard
-            title="New PU"
-            description="Create a fresh policy update with name, statement, scope, and targeted delivery."
+            title={t("New PU")}
+            description={t("Create a fresh policy update with name, statement, scope, and targeted delivery.")}
             onClick={() => setMode('new-pu')}
           />
           <ActionCard
-            title="Deprecate PU"
-            description="Search active policies and deprecate the one you want to retire."
+            title={t("Deprecate PU")}
+            description={t("Search active policies and deprecate the one you want to retire.")}
             onClick={() => setMode('deprecate-pu')}
           />
           <ActionCard
-            title="CAU"
-            description="Publish a claim attribute update with statement text and optional target agents."
+            title={t("CAU")}
+            description={t("Publish a claim attribute update with statement text and optional target agents.")}
             onClick={() => setMode('cau')}
           />
         </div>
@@ -310,27 +302,27 @@ export function PolicyComposeDrawer({
       {mode === 'new-pu' ? (
         <div className="space-y-3">
           <label className="block">
-            <SectionLabel>Name</SectionLabel>
+            <SectionLabel>{t("Name")}</SectionLabel>
             <input
-              aria-label="Name"
+              aria-label={t("Name")}
               className={inputClass}
               value={newPuForm.name}
               onChange={(event) => setNewPuForm((state) => ({ ...state, name: event.target.value }))}
             />
           </label>
           <label className="block">
-            <SectionLabel>Scope</SectionLabel>
+            <SectionLabel>{t("Scope")}</SectionLabel>
             <input
-              aria-label="Scope"
+              aria-label={t("Scope")}
               className={inputClass}
               value={newPuForm.scope}
               onChange={(event) => setNewPuForm((state) => ({ ...state, scope: event.target.value }))}
             />
           </label>
           <label className="block">
-            <SectionLabel>Statement</SectionLabel>
+            <SectionLabel>{t("Statement")}</SectionLabel>
             <textarea
-              aria-label="Statement"
+              aria-label={t("Statement")}
               className="min-h-24 w-full resize-y rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none focus:border-slate-400"
               value={newPuForm.statement}
               onChange={(event) =>
@@ -349,10 +341,10 @@ export function PolicyComposeDrawer({
       {mode === 'deprecate-pu' ? (
         <div className="space-y-3">
           <label className="block">
-            <SectionLabel>Policy Search</SectionLabel>
+            <SectionLabel>{t("Policy Search")}</SectionLabel>
             <input
-              aria-label="Policy Search"
-              placeholder="Search active policies"
+              aria-label={t("Policy Search")}
+              placeholder={t("Search active policies")}
               className={inputClass}
               value={policySearch}
               onChange={(event) => setPolicySearch(event.target.value)}
@@ -377,7 +369,7 @@ export function PolicyComposeDrawer({
                     <div className="flex items-center justify-between gap-3">
                       <div className="text-sm font-semibold text-slate-900">{policy.name}</div>
                       <div className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-500">
-                        active
+                        {t("Active")}
                       </div>
                     </div>
                     <div className="mt-1 font-mono text-[11px] text-slate-500">{policy.id}</div>
@@ -386,9 +378,7 @@ export function PolicyComposeDrawer({
                 )
               })
             ) : (
-              <div className="rounded-md border border-dashed border-slate-300 bg-slate-50 px-3 py-3 text-xs text-slate-500">
-                No active policies match the current filter.
-              </div>
+              <div className="rounded-md border border-dashed border-slate-300 bg-slate-50 px-3 py-3 text-xs text-slate-500">{t("No active policies match the current filter.")}</div>
             )}
           </div>
         </div>
@@ -396,13 +386,11 @@ export function PolicyComposeDrawer({
 
       {mode === 'cau' ? (
         <div className="space-y-3">
-          <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">
-            This action publishes a <code className="font-mono text-slate-900">claim_attribute_update</code> policy message.
-          </div>
+          <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">{t("This action publishes a")} <code className="font-mono text-slate-900">claim_attribute_update</code> {t("policy message.")}</div>
           <label className="block">
-            <SectionLabel>Statement</SectionLabel>
+            <SectionLabel>{t("Statement")}</SectionLabel>
             <textarea
-              aria-label="Statement"
+              aria-label={t("Statement")}
               className="min-h-24 w-full resize-y rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none focus:border-slate-400"
               value={cauForm.statement}
               onChange={(event) => setCauForm((state) => ({ ...state, statement: event.target.value }))}

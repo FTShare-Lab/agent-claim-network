@@ -1,3 +1,4 @@
+import { useT } from '../../i18n'
 import { StatusBadge } from '../../components/badges/StatusBadge'
 import { formatDateTime } from '../../lib/format'
 import type {
@@ -60,6 +61,7 @@ export function AnalysisCard({
   isReferenceNavigable,
   onOpenReference,
 }: AnalysisCardProps) {
+  const t = useT()
   const detail = 'frozen_context' in analysis ? analysis : undefined
   const proposal = analysis.proposal
   const unresolved = analysis.state === 'unresolved'
@@ -76,29 +78,29 @@ export function AnalysisCard({
           <div className="mt-1 break-all font-mono text-[11px] text-slate-700">{analysis.analysis_id}</div>
         </div>
         <div className="flex flex-wrap gap-1.5">
-          <StatusBadge>{resolutionClosed ? 'Historical analysis' : formatValue(analysis.state)}</StatusBadge>
+          <StatusBadge>{resolutionClosed ? t("Historical analysis") : formatValue(analysis.state)}</StatusBadge>
         </div>
       </div>
 
       <dl className="mt-3 grid gap-2 text-xs sm:grid-cols-2">
         <div className="rounded bg-slate-50 px-2.5 py-2">
-          <dt className="font-medium text-slate-500">Created</dt>
+          <dt className="font-medium text-slate-500">{t("Created")}</dt>
           <dd className="mt-1 font-mono text-[11px] text-slate-800">{formatDateTime(analysis.created_at)}</dd>
         </div>
         <div className="rounded bg-slate-50 px-2.5 py-2">
-          <dt className="font-medium text-slate-500">Updated</dt>
+          <dt className="font-medium text-slate-500">{t("Updated")}</dt>
           <dd className="mt-1 font-mono text-[11px] text-slate-800">{formatDateTime(analysis.updated_at)}</dd>
         </div>
       </dl>
 
       {status ? (
         <div role="status" className="mt-3 rounded-md border border-amber-200 bg-amber-50 p-2.5 text-xs leading-5 text-amber-900">
-          <div className="font-semibold">{status}</div>
-          <div className="mt-1">Round {analysis.analysis_round ?? 1}; {analysis.context_change_count ?? 0} input changes detected.</div>
-          {analysis.next_retry_at ? <div>Next retry: {formatDateTime(analysis.next_retry_at)}</div> : null}
+          <div className="font-semibold">{t(status)}</div>
+          <div className="mt-1">{t("Round")} {analysis.analysis_round ?? 1}; {analysis.context_change_count ?? 0} {t("input changes detected.")}</div>
+          {analysis.next_retry_at ? <div>{t("Next retry:")} {formatDateTime(analysis.next_retry_at)}</div> : null}
           {analysis.context_change_reason ? (
             <div className="mt-1">
-              <span className="font-medium">Latest input change: </span>
+              <span className="font-medium">{t("Latest input change:")} </span>
               <ExpandableText limit={220}>{analysis.context_change_reason}</ExpandableText>
             </div>
           ) : null}
@@ -113,19 +115,19 @@ export function AnalysisCard({
       ) : null}
 
       {proposal ? (
-        <section aria-label={`${label} proposal`} className="mt-3 rounded-md border border-blue-100 bg-blue-50/60 p-3">
+        <section aria-label={`${label} ${t('proposal')}`} className="mt-3 rounded-md border border-blue-100 bg-blue-50/60 p-3">
           <div className="flex flex-wrap gap-1.5">
             <StatusBadge>{formatValue(proposal.resolution_type)}</StatusBadge>
             <StatusBadge>{formatValue(proposal.resolution_basis)}</StatusBadge>
-            <StatusBadge tone="info">confidence {confidence(proposal.confidence)}</StatusBadge>
+            <StatusBadge tone="info">{t("confidence")} {confidence(proposal.confidence)}</StatusBadge>
           </div>
-          <div className="mt-2 text-[11px] font-semibold uppercase tracking-wide text-blue-700">Conclusion</div>
+          <div className="mt-2 text-[11px] font-semibold uppercase tracking-wide text-blue-700">{t("Conclusion")}</div>
           <ExpandableText className="mt-1 block text-xs leading-5 text-slate-800" limit={compact ? 150 : 260}>
             {proposal.conclusion}
           </ExpandableText>
           {!compact && proposal.missing_evidence?.length ? (
             <div className="mt-3">
-              <div className="text-[11px] font-semibold uppercase tracking-wide text-amber-700">Missing evidence</div>
+              <div className="text-[11px] font-semibold uppercase tracking-wide text-amber-700">{t("Missing evidence")}</div>
               <ul className="mt-1 list-disc space-y-1 pl-4 text-xs leading-5 text-amber-900">
                 {proposal.missing_evidence.map((item) => <li key={item}>{item}</li>)}
               </ul>
@@ -133,26 +135,23 @@ export function AnalysisCard({
           ) : null}
           {!compact && proposal.human_review_reason ? (
             <div className="mt-3 rounded bg-amber-50 p-2 text-xs leading-5 text-amber-900">
-              <div className="text-[11px] font-semibold uppercase tracking-wide text-amber-700">Human review note</div>
+              <div className="text-[11px] font-semibold uppercase tracking-wide text-amber-700">{t("Human review note")}</div>
               <ExpandableText className="mt-1 block" limit={220}>{proposal.human_review_reason}</ExpandableText>
             </div>
           ) : null}
           {!compact && unresolved ? (
-            <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 p-2.5 text-xs leading-5 text-amber-900">
-              This analysis has no adoptable resolution and recommends no Claim changes. The Dispute remains open for human review.
-            </div>
+            <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 p-2.5 text-xs leading-5 text-amber-900">{t("This analysis has no adoptable resolution and recommends no Claim changes. The Dispute remains open for human review.")}</div>
           ) : null}
           {!compact && !unresolved ? (
             <details className="mt-3 rounded-md border border-blue-100 bg-white p-2.5" open>
-              <summary className="cursor-pointer text-xs font-medium text-blue-800">
-                Direct Claim assessments ({proposal.claim_assessments.length})
+              <summary className="cursor-pointer text-xs font-medium text-blue-800">{t("Direct Claim assessments (")}{proposal.claim_assessments.length})
               </summary>
               <div className="mt-2 space-y-2">
                 {proposal.claim_assessments.map((assessment) => (
                   <article key={assessment.claim_id} className="rounded border border-slate-200 p-2.5">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <span className="break-all font-mono text-[11px] text-slate-700">{assessment.claim_id}</span>
-                      <StatusBadge>{assessment.recommended_status}</StatusBadge>
+                      <StatusBadge localizeStatus>{assessment.recommended_status}</StatusBadge>
                     </div>
                     <ExpandableText className="mt-2 block text-xs font-medium leading-5 text-slate-800" limit={180}>
                       {assessment.assessment}
@@ -162,13 +161,13 @@ export function AnalysisCard({
                     </ExpandableText>
                     {assessment.recommended_scope ? (
                       <div className="mt-2 rounded bg-slate-50 px-2 py-1.5 text-xs text-slate-700">
-                        <span className="font-medium text-slate-500">Recommended scope: </span>
+                        <span className="font-medium text-slate-500">{t("Recommended scope:")} </span>
                         {assessment.recommended_scope}
                       </div>
                     ) : null}
                     {assessment.recommended_statement ? (
                       <div className="mt-2 rounded bg-slate-50 px-2 py-1.5 text-xs leading-5 text-slate-700">
-                        <span className="font-medium text-slate-500">Recommended statement: </span>
+                        <span className="font-medium text-slate-500">{t("Recommended statement:")} </span>
                         <ExpandableText limit={180}>{assessment.recommended_statement}</ExpandableText>
                       </div>
                     ) : null}
@@ -179,7 +178,7 @@ export function AnalysisCard({
           ) : null}
           {!compact && proposal.evidence_refs?.length ? (
             <details className="mt-2 rounded-md border border-blue-100 bg-white p-2.5">
-              <summary className="cursor-pointer text-xs font-medium text-blue-800">Evidence references ({proposal.evidence_refs.length})</summary>
+              <summary className="cursor-pointer text-xs font-medium text-blue-800">{t("Evidence references (")}{proposal.evidence_refs.length})</summary>
               <div className="mt-2 flex flex-wrap gap-1">
                 {proposal.evidence_refs.map((reference) => (
                   onOpenReference && isReferenceNavigable?.(reference) ? (
@@ -203,31 +202,30 @@ export function AnalysisCard({
           ) : null}
         </section>
       ) : (
-        <div className="mt-3 text-xs text-slate-500">No proposal has been produced yet.</div>
+        <div className="mt-3 text-xs text-slate-500">{t("No proposal has been produced yet.")}</div>
       )}
 
       {!compact && detail?.verification ? (
-        <section aria-label={`${label} verification`} className="mt-3 rounded-md border border-slate-200 bg-slate-50 p-3">
+        <section aria-label={`${label} ${t('verification')}`} className="mt-3 rounded-md border border-slate-200 bg-slate-50 p-3">
           <div className="flex flex-wrap items-center gap-1.5">
-            <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Verification</span>
+            <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">{t("Verification")}</span>
             <StatusBadge>{detail.verification.verdict}</StatusBadge>
-            <StatusBadge tone="info">confidence {confidence(detail.verification.confidence)}</StatusBadge>
+            <StatusBadge tone="info">{t("confidence")} {confidence(detail.verification.confidence)}</StatusBadge>
           </div>
           <dl className="mt-2 grid grid-cols-3 gap-1.5 text-[11px]">
-            <div className="rounded bg-white px-2 py-1.5"><dt className="text-slate-500">Type</dt><dd>{detail.verification.resolution_type_agreed ? 'Agreed' : 'Disagreed'}</dd></div>
-            <div className="rounded bg-white px-2 py-1.5"><dt className="text-slate-500">Basis</dt><dd>{detail.verification.resolution_basis_agreed ? 'Agreed' : 'Disagreed'}</dd></div>
-            <div className="rounded bg-white px-2 py-1.5"><dt className="text-slate-500">Conclusion</dt><dd>{detail.verification.conclusion_agreed ? 'Agreed' : 'Disagreed'}</dd></div>
+            <div className="rounded bg-white px-2 py-1.5"><dt className="text-slate-500">{t("Type")}</dt><dd>{detail.verification.resolution_type_agreed ? t("Agreed") : t("Disagreed")}</dd></div>
+            <div className="rounded bg-white px-2 py-1.5"><dt className="text-slate-500">{t("Basis")}</dt><dd>{detail.verification.resolution_basis_agreed ? t("Agreed") : t("Disagreed")}</dd></div>
+            <div className="rounded bg-white px-2 py-1.5"><dt className="text-slate-500">{t("Conclusion")}</dt><dd>{detail.verification.conclusion_agreed ? t("Agreed") : t("Disagreed")}</dd></div>
           </dl>
           <ExpandableText className="mt-2 block text-xs leading-5 text-slate-700" limit={220}>
             {detail.verification.reasoning}
           </ExpandableText>
           {detail.verification.verdict === 'unresolved' ? (
-            <div className="mt-2 text-[11px] text-slate-500">Verification recommends no Claim changes. Human review is required.</div>
+            <div className="mt-2 text-[11px] text-slate-500">{t("Verification recommends no Claim changes. Human review is required.")}</div>
           ) : (
             <div className="mt-2 text-[11px] text-slate-500">
               {detail.verification.claim_assessments.filter((assessment) => assessment.agreed).length}
-              /{detail.verification.claim_assessments.length} Claim assessments agreed
-            </div>
+              /{detail.verification.claim_assessments.length} {t("Claim assessments agreed")}</div>
           )}
           {detail.verification.missing_evidence?.length ? (
             <ul className="mt-2 list-disc space-y-1 pl-4 text-xs leading-5 text-amber-900">
@@ -239,35 +237,35 @@ export function AnalysisCard({
 
       {!compact && detail?.frozen_context ? (
         <details className="mt-3 rounded-md border border-slate-200 bg-slate-50 p-2.5 text-xs">
-          <summary className="cursor-pointer font-medium text-slate-700">Analysis context summary</summary>
+          <summary className="cursor-pointer font-medium text-slate-700">{t("Analysis context summary")}</summary>
           <dl className="mt-2 grid grid-cols-2 gap-2 text-[11px] sm:grid-cols-3">
-            <div><dt className="text-slate-500">Direct Claims</dt><dd className="font-semibold">{detail.frozen_context.direct_claims.length}</dd></div>
-            <div><dt className="text-slate-500">Source Claims</dt><dd className="font-semibold">{detail.frozen_context.source_claims.length}</dd></div>
-            <div><dt className="text-slate-500">Policies</dt><dd className="font-semibold">{detail.frozen_context.policies.length}</dd></div>
-            <div><dt className="text-slate-500">Related Claims in context</dt><dd className="font-semibold">{detail.frozen_context.router_candidate_claims.length}</dd></div>
-            <div><dt className="text-slate-500">Prior resolutions</dt><dd className="font-semibold">{detail.frozen_context.prior_resolutions.length}</dd></div>
-            <div><dt className="text-slate-500">Frozen at</dt><dd className="font-mono">{formatDateTime(detail.frozen_context.generated_at)}</dd></div>
+            <div><dt className="text-slate-500">{t("Direct Claims")}</dt><dd className="font-semibold">{detail.frozen_context.direct_claims.length}</dd></div>
+            <div><dt className="text-slate-500">{t("Source Claims")}</dt><dd className="font-semibold">{detail.frozen_context.source_claims.length}</dd></div>
+            <div><dt className="text-slate-500">{t("Policies")}</dt><dd className="font-semibold">{detail.frozen_context.policies.length}</dd></div>
+            <div><dt className="text-slate-500">{t("Related Claims in context")}</dt><dd className="font-semibold">{detail.frozen_context.router_candidate_claims.length}</dd></div>
+            <div><dt className="text-slate-500">{t("Prior resolutions")}</dt><dd className="font-semibold">{detail.frozen_context.prior_resolutions.length}</dd></div>
+            <div><dt className="text-slate-500">{t("Frozen at")}</dt><dd className="font-mono">{formatDateTime(detail.frozen_context.generated_at)}</dd></div>
           </dl>
           {detail.warnings.length ? (
             <ul className="mt-2 list-disc space-y-1 pl-4 text-amber-800">
               {detail.warnings.map((warning) => <li key={`${warning.code}:${warning.detail}`}>{warning.code}: {warning.detail}</li>)}
             </ul>
           ) : null}
-          <div className="mt-2 text-slate-500">Validation: {detail.validation_result}</div>
+          <div className="mt-2 text-slate-500">{t("Validation:")} {detail.validation_result}</div>
         </details>
       ) : null}
 
       {!compact && detail?.rounds?.length ? (
         <details className="mt-3 rounded-md border border-slate-200 bg-slate-50 p-2.5 text-xs">
-          <summary className="cursor-pointer font-medium text-slate-700">Analysis rounds ({detail.rounds.length})</summary>
+          <summary className="cursor-pointer font-medium text-slate-700">{t("Analysis rounds (")}{detail.rounds.length})</summary>
           <div className="mt-2 space-y-2">
             {detail.rounds.map((round) => (
               <div key={`${round.round}:${round.semantic_fingerprint}`} className="rounded bg-white p-2">
-                <div className="font-semibold">Round {round.round} · {formatValue(round.proposal.resolution_type)} · {round.verification.verdict}</div>
-                <div className="mt-1 text-slate-500">{formatDateTime(round.started_at)} → {round.completed_at ? formatDateTime(round.completed_at) : 'In progress'}</div>
+                <div className="font-semibold">{t("Round")} {round.round} · {formatValue(round.proposal.resolution_type)} · {round.verification.verdict}</div>
+                <div className="mt-1 text-slate-500">{formatDateTime(round.started_at)} → {round.completed_at ? formatDateTime(round.completed_at) : t("In progress")}</div>
                 {round.context_change_reason ? (
                   <div className="mt-1 text-amber-800">
-                    <span className="font-medium">Input change detected after this round: </span>
+                    <span className="font-medium">{t("Input change detected after this round:")} </span>
                     <ExpandableText limit={180}>{round.context_change_reason}</ExpandableText>
                   </div>
                 ) : null}
@@ -280,8 +278,8 @@ export function AnalysisCard({
 
       {!resolutionClosed && analysis.adoption_blocker && !analysis.adoptable ? (
         <div className="mt-3 text-xs leading-5 text-slate-500">
-          <span className="font-medium text-slate-700">Cannot adopt:</span>{' '}
-          {isTerminalContextChurn(analysis) ? terminalContextChurnMessage : analysis.adoption_blocker}
+          <span className="font-medium text-slate-700">{t("Cannot adopt:")}</span>{' '}
+          {isTerminalContextChurn(analysis) ? t(terminalContextChurnMessage) : analysis.adoption_blocker}
         </div>
       ) : null}
       {!resolutionClosed && analysis.adoptable && analysis.state === 'approved' && onAdopt ? (
@@ -291,7 +289,7 @@ export function AnalysisCard({
           disabled={adopting}
           onClick={() => onAdopt(analysis.analysis_id)}
         >
-          {adopting ? 'Adopting…' : 'Adopt analysis'}
+          {adopting ? t("Adopting…") : t("Adopt analysis")}
         </button>
       ) : null}
     </article>

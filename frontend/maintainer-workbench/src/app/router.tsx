@@ -1,3 +1,4 @@
+import { LoadingWorkbench } from './LoadingWorkbench'
 import type { RouteObject } from 'react-router'
 
 import { AppShell } from '../layouts/AppShell'
@@ -11,7 +12,7 @@ export const routes: RouteObject[] = [
   },
   {
     path: '/',
-    hydrateFallbackElement: <p role="status" className="p-6 text-sm text-slate-500">Loading workbench…</p>,
+    hydrateFallbackElement: <LoadingWorkbench />,
     element: (
       <RequireAdminAuth>
         <AppShell />

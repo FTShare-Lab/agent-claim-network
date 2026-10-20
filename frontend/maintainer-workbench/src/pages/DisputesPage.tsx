@@ -1,3 +1,5 @@
+import { useT } from '../i18n'
+import { useStatusLabel } from '../i18n/status'
 import { useEffect, useMemo, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router'
 
@@ -81,32 +83,32 @@ function formatResolutionValue(value: string | undefined) {
   return value ? value.replaceAll('_', ' ') : 'Not specified'
 }
 
-function analyzeResultMessage(analysis: ArbitrationAnalysisSummary) {
+function analyzeResultMessage(analysis: ArbitrationAnalysisSummary, t: ReturnType<typeof useT>) {
   const label = `${analysis.analysis_id} · ${formatResolutionValue(analysis.state)}`
   if (analysis.state === 'failed') {
     const failure = analysis.error
       ? `${analysis.error.code}: ${analysis.error.message}`
       : 'Open the analysis to inspect the failure.'
-    return { isError: true, text: `Analysis failed · ${label}. ${failure}` }
+    return { isError: true, text: t('Analysis failed · {label}. {failure}', { label, failure }) }
   }
   if (analysis.state === 'approved') {
     return {
       isError: false,
       text: analysis.adoptable
-        ? `Analysis completed and can be adopted · ${label}.`
-        : `Analysis completed · ${label}.`,
+        ? t('Analysis completed and can be adopted · {label}.', { label })
+        : t('Analysis completed · {label}.', { label }),
     }
   }
   if (analysis.state === 'unresolved') {
-    return { isError: false, text: `Analysis completed as unresolved · ${label}.` }
+    return { isError: false, text: t('Analysis completed as unresolved · {label}.', { label }) }
   }
-  return { isError: false, text: `Analysis started · ${label}.` }
+  return { isError: false, text: t('Analysis started · {label}.', { label }) }
 }
 
 function arbitrationMutationError(error: unknown, conflictMessage: string) {
   const detail = error instanceof Error ? error.message : String(error)
   if (error instanceof ApiError && error.status === 409) {
-    return `${conflictMessage} Current dispute data has been refreshed. ${detail}`
+    return { key: conflictMessage, detail }
   }
   return detail
 }
@@ -120,6 +122,7 @@ function DirectClaimCard({
   onOpen: () => void
   onOpenSource: (sourceId: string) => void
 }) {
+  const t = useT()
   return (
     <article aria-label={claim.name} className="rounded-lg border border-blue-100 bg-white p-3 shadow-sm">
       <div className="flex flex-wrap items-start justify-between gap-2">
@@ -133,34 +136,34 @@ function DirectClaimCard({
           </button>
           <div className="mt-0.5 break-all font-mono text-[11px] text-slate-500">{claim.id}</div>
         </div>
-        <StatusBadge>{claim.status}</StatusBadge>
+        <StatusBadge localizeStatus>{claim.status}</StatusBadge>
       </div>
 
       <dl className="mt-3 grid gap-2 text-xs sm:grid-cols-3">
         <div className="rounded bg-slate-50 px-2.5 py-2">
-          <dt className="font-medium text-slate-500">Holder</dt>
+          <dt className="font-medium text-slate-500">{t("Holder")}</dt>
           <dd className="mt-1 break-all font-mono text-[11px] text-slate-800">{claim.holder}</dd>
         </div>
         <div className="rounded bg-slate-50 px-2.5 py-2">
-          <dt className="font-medium text-slate-500">Confidence</dt>
+          <dt className="font-medium text-slate-500">{t("Confidence")}</dt>
           <dd className="mt-1 capitalize text-slate-800">{claim.confidence}</dd>
         </div>
         <div className="rounded bg-slate-50 px-2.5 py-2 sm:col-span-1">
-          <dt className="font-medium text-slate-500">Scope</dt>
+          <dt className="font-medium text-slate-500">{t("Scope")}</dt>
           <dd className="mt-1 break-words text-slate-800">{claim.scope}</dd>
         </div>
       </dl>
 
       <div className="mt-3">
-        <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Statement</div>
+        <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">{t("Statement")}</div>
         <p className="mt-1 whitespace-pre-wrap text-xs leading-5 text-slate-800">{claim.statement}</p>
       </div>
       <div className="mt-3 border-t border-slate-100 pt-3">
-        <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Evidence Summary</div>
+        <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">{t("Evidence Summary")}</div>
         <p className="mt-1 whitespace-pre-wrap text-xs leading-5 text-slate-700">{claim.evidence_summary}</p>
       </div>
       <div className="mt-3 border-t border-slate-100 pt-3">
-        <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Source IDs</div>
+        <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">{t("Source IDs")}</div>
         {claim.source_claim_ids.length ? (
           <div className="mt-1.5 flex flex-wrap gap-1">
             {claim.source_claim_ids.map((sourceId) => (
@@ -175,7 +178,7 @@ function DirectClaimCard({
             ))}
           </div>
         ) : (
-          <div className="mt-1 text-xs text-slate-500">No sources</div>
+          <div className="mt-1 text-xs text-slate-500">{t("No sources")}</div>
         )}
       </div>
     </article>
@@ -183,6 +186,8 @@ function DirectClaimCard({
 }
 
 function ResolutionDetail({ resolution, ariaLabel = 'Current resolution' }: { resolution: DisputeResolution; ariaLabel?: string }) {
+  const t = useT()
+  const statusText = useStatusLabel()
   return (
     <section aria-label={ariaLabel} className="mt-2 space-y-3">
       <div className="flex flex-wrap gap-1.5">
@@ -198,9 +203,7 @@ function ResolutionDetail({ resolution, ariaLabel = 'Current resolution' }: { re
       </div>
 
       <div className="rounded-md border border-blue-100 bg-blue-50/70 p-3">
-        <div className="text-[11px] font-semibold uppercase tracking-wide text-blue-700">
-          Conclusion
-        </div>
+        <div className="text-[11px] font-semibold uppercase tracking-wide text-blue-700">{t("Conclusion")}</div>
         <p className="mt-1.5 whitespace-pre-wrap text-sm leading-6 text-slate-800">
           {resolution.conclusion}
         </p>
@@ -208,20 +211,20 @@ function ResolutionDetail({ resolution, ariaLabel = 'Current resolution' }: { re
 
       <dl className="grid gap-2 text-xs sm:grid-cols-2">
         <div className="rounded-md bg-slate-50 p-2.5">
-          <dt className="font-medium text-slate-500">Resolution ID</dt>
+          <dt className="font-medium text-slate-500">{t("Resolution ID")}</dt>
           <dd className="mt-1 break-all font-mono text-[11px] text-slate-800">
             {resolution.resolution_id}
           </dd>
         </div>
         <div className="rounded-md bg-slate-50 p-2.5">
-          <dt className="font-medium text-slate-500">Resolved At</dt>
+          <dt className="font-medium text-slate-500">{t("Resolved At")}</dt>
           <dd className="mt-1 font-mono text-[11px] text-slate-800">
             {formatDateTime(resolution.resolved_at)}
           </dd>
         </div>
         {resolution.rejection_reason ? (
           <div className="rounded-md border border-amber-100 bg-amber-50 p-2.5 sm:col-span-2">
-            <dt className="font-medium text-amber-700">Replacement Reason</dt>
+            <dt className="font-medium text-amber-700">{t("Replacement Reason")}</dt>
             <dd className="mt-1 whitespace-pre-wrap leading-5 text-amber-950">
               {resolution.rejection_reason}
             </dd>
@@ -231,12 +234,8 @@ function ResolutionDetail({ resolution, ariaLabel = 'Current resolution' }: { re
 
       {resolution.claim_assessments?.length ? (
         <div className="rounded-lg border border-amber-200 bg-amber-50/60 p-3">
-          <div className="text-[11px] font-bold uppercase tracking-wide text-amber-900">
-            Resolution recommendations
-          </div>
-          <p className="mt-1 text-xs leading-5 text-amber-900">
-            These are governance recommendations from the Resolution, not the Claims&apos; current status.
-          </p>
+          <div className="text-[11px] font-bold uppercase tracking-wide text-amber-900">{t("Resolution recommendations")}</div>
+          <p className="mt-1 text-xs leading-5 text-amber-900">{t("These are governance recommendations from the Resolution, not the Claims' current status.")}</p>
           <div className="mt-2 space-y-2">
             {resolution.claim_assessments.map((assessment) => (
               <article
@@ -247,7 +246,7 @@ function ResolutionDetail({ resolution, ariaLabel = 'Current resolution' }: { re
                   <span className="break-all font-mono text-[11px] text-slate-700">
                     {assessment.claim_id}
                   </span>
-                  <StatusBadge tone="warning">Recommended · {assessment.recommended_status}</StatusBadge>
+                  <StatusBadge tone="warning">{t("Recommended ·")} {statusText(assessment.recommended_status)}</StatusBadge>
                 </div>
                 <p className="mt-2 text-xs font-medium leading-5 text-slate-800">
                   {assessment.assessment}
@@ -255,13 +254,13 @@ function ResolutionDetail({ resolution, ariaLabel = 'Current resolution' }: { re
                 <p className="mt-1 text-xs leading-5 text-slate-600">{assessment.reason}</p>
                 {assessment.recommended_scope ? (
                   <div className="mt-2 rounded bg-slate-50 px-2 py-1.5 text-xs text-slate-700">
-                    <span className="font-medium text-slate-500">Scope: </span>
+                    <span className="font-medium text-slate-500">{t("Scope:")} </span>
                     {assessment.recommended_scope}
                   </div>
                 ) : null}
                 {assessment.recommended_statement ? (
                   <div className="mt-1.5 rounded bg-slate-50 px-2 py-1.5 text-xs leading-5 text-slate-700">
-                    <span className="font-medium text-slate-500">Statement: </span>
+                    <span className="font-medium text-slate-500">{t("Statement:")} </span>
                     {assessment.recommended_statement}
                   </div>
                 ) : null}
@@ -275,6 +274,8 @@ function ResolutionDetail({ resolution, ariaLabel = 'Current resolution' }: { re
 }
 
 export function DisputesPage() {
+  const t = useT()
+  const statusText = useStatusLabel()
   const location = useLocation()
   const navigate = useNavigate()
   const routeDrawerResource = drawerResourceFromRouteState(location.state)
@@ -305,7 +306,7 @@ export function DisputesPage() {
   const [replacementConclusion, setReplacementConclusion] = useState('')
   const [replacementResolutionType, setReplacementResolutionType] = useState<Exclude<ResolutionType, 'unresolved'> | ''>('')
   const [replacementResolutionBasis, setReplacementResolutionBasis] = useState<ResolvedResolutionBasis | ''>('')
-  const [arbitrationError, setArbitrationError] = useState<string | null>(null)
+  const [arbitrationError, setArbitrationError] = useState<string | { key: string; detail: string } | null>(null)
   const [analyzeNotice, setAnalyzeNotice] = useState<{
     disputeId: string
     result: ArbitrationAnalysisSummary
@@ -353,7 +354,7 @@ export function DisputesPage() {
     const current = currentAnalysisSummary?.analysis_id === analyzeNotice.result.analysis_id
       ? currentAnalysisSummary
       : analyzeNotice.result
-    return analyzeResultMessage(current)
+    return analyzeResultMessage(current, t)
   })()
   const affectedAgentIds = useMemo(
     () => affectedAgentsForDispute(selectedDispute, claims),
@@ -489,7 +490,7 @@ export function DisputesPage() {
       onSuccess: (resolution) => {
         setAdoptingAnalysisId(undefined)
         setAnalyzeNotice(null)
-        setAdoptionNotice(`Analysis adopted as resolution ${resolution.resolution_id}.`)
+        setAdoptionNotice(resolution.resolution_id)
       },
       onError: (err) => {
         setAdoptingAnalysisId(undefined)
@@ -527,13 +528,13 @@ export function DisputesPage() {
 
   const currentAnalysisContent = (
     <>
-      {analyses.isLoading && !currentAnalysis ? <div className="text-xs text-slate-500">Loading current analysis…</div> : null}
+      {analyses.isLoading && !currentAnalysis ? <div className="text-xs text-slate-500">{t("Loading current analysis…")}</div> : null}
       {analyses.error ? <div className="text-xs text-rose-700">{String(analyses.error)}</div> : null}
       {currentAnalysisDetail.error ? <div className="text-xs text-rose-700">{String(currentAnalysisDetail.error)}</div> : null}
       {currentAnalysis ? (
         <AnalysisCard
           analysis={currentAnalysis}
-          label="Current analysis"
+          label={t("Current analysis")}
           onAdopt={selectedDispute?.status === 'open' ? adoptSelectedAnalysis : undefined}
           adopting={adoptMutation.isPending && adoptingAnalysisId === currentAnalysis.analysis_id}
           resolutionClosed={selectedDispute?.status === 'resolved'}
@@ -542,44 +543,42 @@ export function DisputesPage() {
           onOpenReference={openReference}
         />
       ) : (
-        <div className="text-xs text-slate-500">No analysis is recorded for this dispute.</div>
+        <div className="text-xs text-slate-500">{t("No analysis is recorded for this dispute.")}</div>
       )}
     </>
   )
 
-  if (isLoading) return <div className="rounded-lg border border-slate-200 bg-white p-6 text-sm text-slate-500">Loading disputes…</div>
+  if (isLoading) return <div className="rounded-lg border border-slate-200 bg-white p-6 text-sm text-slate-500">{t("Loading disputes…")}</div>
   if (error) return <div className="rounded-lg border border-rose-200 bg-rose-50 p-6 text-sm text-rose-700">{String(error)}</div>
 
   return (
-    <PageContainer title="Disputes" subtitle="Review, filter, and resolve coordination conflicts across your agent network.">
+    <PageContainer title={t("Disputes")} subtitle={t("Review, filter, and resolve coordination conflicts across your agent network.")}>
       <FilterBar>
         <label className="space-y-1 text-xs text-slate-600">
-          <span className="font-medium text-slate-700">Search</span>
-          <input className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none" placeholder="dispute id, name, summary" value={keyword} onChange={(event) => { setKeyword(event.target.value); setPage(1) }} />
+          <span className="font-medium text-slate-700">{t("Search")}</span>
+          <input className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none" placeholder={t("dispute id, name, summary")} value={keyword} onChange={(event) => { setKeyword(event.target.value); setPage(1) }} />
         </label>
         <label className="space-y-1 text-xs text-slate-600">
-          <span className="font-medium text-slate-700">Status</span>
+          <span className="font-medium text-slate-700">{t("Status")}</span>
           <select className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none" value={status} onChange={(event) => { setStatus(event.target.value); setPage(1) }}>
-            <option value="all">All</option>
-            <option value="open">Open</option>
-            <option value="resolved">Resolved</option>
+            <option value="all">{t("All")}</option>
+            <option value="open">{statusText("Open")}</option>
+            <option value="resolved">{t("Resolved")}</option>
           </select>
         </label>
-        <button type="button" className="self-end rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50" onClick={() => { setKeyword(''); setStatus('all'); setPage(1) }}>
-          Reset
-        </button>
+        <button type="button" className="self-end rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50" onClick={() => { setKeyword(''); setStatus('all'); setPage(1) }}>{t("Reset")}</button>
       </FilterBar>
 
       <section className="space-y-3">
         <div className="flex items-center gap-2">
-          <h2 className="text-sm font-semibold tracking-tight text-slate-900">All Disputes</h2>
+          <h2 className="text-sm font-semibold tracking-tight text-slate-900">{t("All Disputes")}</h2>
           <StatusBadge tone="info">{filtered.length}</StatusBadge>
         </div>
         <DataTable
           columns={[
             {
               key: 'dispute',
-              header: 'Dispute',
+              header: t("Dispute"),
               render: (row: Dispute) => (
                 <div>
                   <div className="font-medium text-slate-900">{row.name}</div>
@@ -587,10 +586,10 @@ export function DisputesPage() {
                 </div>
               ),
             },
-            { key: 'status', header: 'Status', render: (row: Dispute) => <StatusBadge tone={row.status === 'open' ? 'danger' : 'success'}>{row.status}</StatusBadge> },
+            { key: 'status', header: t("Status"), render: (row: Dispute) => <StatusBadge localizeStatus tone={row.status === 'open' ? 'danger' : 'success'}>{row.status}</StatusBadge> },
             {
               key: 'claims',
-              header: 'Direct Claim(s)',
+              header: t("Direct Claim(s)"),
               render: (row: Dispute) => (
                 <div className="flex flex-wrap gap-1">
                   {row.claims.map((claimId) => (
@@ -611,17 +610,17 @@ export function DisputesPage() {
             },
             {
               key: 'agent',
-              header: 'Agent',
+              header: t("Agent"),
               render: (row: Dispute) => <span className="font-mono text-xs">{row.reporter_agent_id}</span>,
             },
-            { key: 'created', header: 'Created At', render: (row: Dispute) => <span className="font-mono text-xs">{formatDateTime(row.created_at)}</span> },
-            { key: 'updated', header: 'Updated At', render: (row: Dispute) => <span className="font-mono text-xs">{formatDateTime(row.resolved_at ?? row.created_at)}</span> },
-            { key: 'actions', header: 'Actions', render: (row: Dispute) => <span className="text-xs font-medium text-blue-700">{row.status === 'open' ? 'View · Resolve' : 'View'}</span> },
+            { key: 'created', header: t("Created At"), render: (row: Dispute) => <span className="font-mono text-xs">{formatDateTime(row.created_at)}</span> },
+            { key: 'updated', header: t("Updated At"), render: (row: Dispute) => <span className="font-mono text-xs">{formatDateTime(row.resolved_at ?? row.created_at)}</span> },
+            { key: 'actions', header: t("Actions"), render: (row: Dispute) => <span className="text-xs font-medium text-blue-700">{row.status === 'open' ? t("View · Resolve") : t("View")}</span> },
           ]}
           rows={pagedRows}
           getRowId={(row) => row.id}
           onRowClick={(row) => openDispute(row.id)}
-          emptyState="No disputes matched the current filters."
+          emptyState={t("No disputes matched the current filters.")}
         />
         <PaginationBar page={page} pageSize={pageSize} total={filtered.length} onPageChange={setPage} onPageSizeChange={(size) => { setPageSize(size); setPage(1) }} />
       </section>
@@ -633,20 +632,18 @@ export function DisputesPage() {
         backLabel={
           drawerState?.previous
             ? drawerState.previous.type === 'dispute'
-              ? 'Back to dispute'
-              : 'Back to claim'
+              ? t("Back to dispute")
+              : t("Back to claim")
             : undefined
         }
-        label={selectedClaim ? 'Claim' : 'Dispute'}
+        label={selectedClaim ? t("Claim") : t("Dispute")}
         title={selectedClaim?.claim.name ?? selectedDispute?.name ?? 'Detail'}
         subtitle={selectedClaim?.claim.id ?? selectedDispute?.id}
         footer={
           selectedDispute ? (
             <div className="space-y-2">
               <div className="flex flex-wrap justify-end gap-2">
-                <button type="button" className="rounded-md border border-slate-200 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50" onClick={closeDrawer}>
-                  Close
-                </button>
+                <button type="button" className="rounded-md border border-slate-200 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50" onClick={closeDrawer}>{t("Close")}</button>
                 {selectedDispute.status === 'open' ? (
                   <>
                     <button
@@ -655,16 +652,16 @@ export function DisputesPage() {
                       disabled={isStaticDemo || analyzeMutation.isPending}
                       onClick={analyzeSelectedDispute}
                     >
-                      {analyzeMutation.isPending ? 'Starting…' : 'Analyze'}
+                      {analyzeMutation.isPending ? t("Starting…") : t("Analyze")}
                     </button>
                     <button
                       type="button"
                       className="rounded-md bg-blue-700 px-2.5 py-1.5 text-xs font-semibold text-white transition hover:bg-blue-800 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-500 disabled:hover:bg-slate-200"
                       disabled={isStaticDemo || resolveMutation.isPending}
-                      title={isStaticDemo ? 'Static preview is read-only' : undefined}
+                      title={isStaticDemo ? t("Static preview is read-only") : undefined}
                       onClick={resolveSelectedDispute}
                     >
-                      {resolveMutation.isPending ? 'Resolving…' : 'Resolve Dispute'}
+                      {resolveMutation.isPending ? t("Resolving…") : t("Resolve Dispute")}
                     </button>
                   </>
                 ) : null}
@@ -683,7 +680,7 @@ export function DisputesPage() {
               ) : null}
               {adoptionNotice ? (
                 <p className="rounded-md border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-xs leading-5 text-emerald-800" role="status">
-                  {adoptionNotice}
+                  {t('Analysis adopted as resolution {id}.', { id: adoptionNotice })}
                 </p>
               ) : null}
             </div>
@@ -692,16 +689,16 @@ export function DisputesPage() {
       >
         {selectedDispute ? (
           <>
-            <DrawerSection title="Overview">
+            <DrawerSection title={t("Overview")}>
               <dl className="space-y-2 text-sm">
-                <div className="flex justify-between gap-3"><dt className="text-slate-500">Status</dt><dd><StatusBadge tone={selectedDispute.status === 'open' ? 'danger' : 'success'}>{selectedDispute.status}</StatusBadge></dd></div>
-                <div className="flex justify-between gap-3"><dt className="text-slate-500">Reporter Agent</dt><dd className="font-mono text-xs text-slate-900">{selectedDispute.reporter_agent_id}</dd></div>
-                <div className="flex justify-between gap-3"><dt className="text-slate-500">Created At</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedDispute.created_at)}</dd></div>
-                <div className="flex justify-between gap-3"><dt className="text-slate-500">Updated At</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedDispute.resolved_at ?? selectedDispute.created_at)}</dd></div>
+                <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Status")}</dt><dd><StatusBadge localizeStatus tone={selectedDispute.status === 'open' ? 'danger' : 'success'}>{selectedDispute.status}</StatusBadge></dd></div>
+                <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Reporter Agent")}</dt><dd className="font-mono text-xs text-slate-900">{selectedDispute.reporter_agent_id}</dd></div>
+                <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Created At")}</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedDispute.created_at)}</dd></div>
+                <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Updated At")}</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedDispute.resolved_at ?? selectedDispute.created_at)}</dd></div>
               </dl>
             </DrawerSection>
-            <DrawerSection title="Direct Claim(s)" tone="claim">
-              <div aria-label="Direct claim details" className="space-y-2">
+            <DrawerSection title={t("Direct Claim(s)")} tone="claim">
+              <div aria-label={t("Direct claim details")} className="space-y-2">
                 {selectedDispute.claims.map((claimId) => {
                   const directClaim = claims.find((item) => item.claim.id === claimId)?.claim
                   if (directClaim) {
@@ -718,28 +715,26 @@ export function DisputesPage() {
                     <article key={claimId} aria-label={claimId} className="rounded-md border border-slate-200 bg-slate-50 p-3">
                       <div className="break-all font-mono text-[11px] text-slate-700">{claimId}</div>
                       <div className="mt-1.5 text-xs text-slate-500">
-                        {claimsLoading ? 'Loading claim details…' : 'Claim mirror unavailable'}
+                        {claimsLoading ? t("Loading claim details…") : t("Claim mirror unavailable")}
                       </div>
                     </article>
                   )
                 })}
               </div>
             </DrawerSection>
-            <DrawerSection title="Summary">
+            <DrawerSection title={t("Summary")}>
               <div className="whitespace-pre-wrap text-sm leading-6 text-slate-800">{selectedDispute.summary}</div>
             </DrawerSection>
             {selectedDispute.resolution ? (
-              <DrawerSection title="Current Resolution" tone="resolution">
+              <DrawerSection title={t("Current Resolution")} tone="resolution">
                 <ResolutionDetail resolution={selectedDispute.resolution} />
               </DrawerSection>
             ) : null}
             {selectedDispute.status === 'open' || currentAnalysis ? (
-              <DrawerSection title="Current Analysis" tone="analysis">
+              <DrawerSection title={t("Current Analysis")} tone="analysis">
                 {selectedDispute.status === 'resolved' ? (
                   <details className="rounded-lg border border-violet-200 bg-white p-3">
-                    <summary className="cursor-pointer text-xs font-semibold text-violet-800">
-                      View analysis process
-                    </summary>
+                    <summary className="cursor-pointer text-xs font-semibold text-violet-800">{t("View analysis process")}</summary>
                     <div className="mt-3">{currentAnalysisContent}</div>
                   </details>
                 ) : currentAnalysisContent}
@@ -751,50 +746,48 @@ export function DisputesPage() {
             />
             {selectedDispute.resolution?.resolved_by === 'automatic' ? (
               <div className="rounded-lg border border-amber-200 bg-amber-50 p-3">
-                <div className="text-xs font-semibold uppercase tracking-wide text-amber-800">Reject &amp; Replace Automatic Resolution</div>
-                <label className="mt-2 block text-xs font-medium text-amber-950" htmlFor="reject-resolution-reason">Rejection Reason (Required)</label>
-                <textarea id="reject-resolution-reason" className="mt-1 min-h-16 w-full rounded-md border border-amber-200 bg-white px-2.5 py-2 text-sm" placeholder="Why is the automatic resolution rejected?" value={rejectReason} onChange={(event) => setRejectReason(event.target.value)} />
-                <label className="mt-2 block text-xs font-medium text-amber-950" htmlFor="replacement-resolution-conclusion">Replacement Conclusion (Required)</label>
-                <textarea id="replacement-resolution-conclusion" className="mt-1 min-h-20 w-full rounded-md border border-amber-200 bg-white px-2.5 py-2 text-sm" placeholder="Replacement conclusion" value={replacementConclusion} onChange={(event) => setReplacementConclusion(event.target.value)} />
+                <div className="text-xs font-semibold uppercase tracking-wide text-amber-800">{t("Reject & Replace Automatic Resolution")}</div>
+                <label className="mt-2 block text-xs font-medium text-amber-950" htmlFor="reject-resolution-reason">{t("Rejection Reason (Required)")}</label>
+                <textarea id="reject-resolution-reason" className="mt-1 min-h-16 w-full rounded-md border border-amber-200 bg-white px-2.5 py-2 text-sm" placeholder={t("Why is the automatic resolution rejected?")} value={rejectReason} onChange={(event) => setRejectReason(event.target.value)} />
+                <label className="mt-2 block text-xs font-medium text-amber-950" htmlFor="replacement-resolution-conclusion">{t("Replacement Conclusion (Required)")}</label>
+                <textarea id="replacement-resolution-conclusion" className="mt-1 min-h-20 w-full rounded-md border border-amber-200 bg-white px-2.5 py-2 text-sm" placeholder={t("Replacement conclusion")} value={replacementConclusion} onChange={(event) => setReplacementConclusion(event.target.value)} />
                 <details className="mt-2 rounded-md border border-amber-200 bg-white/70 p-2.5">
-                  <summary className="cursor-pointer text-xs font-medium text-amber-900">Resolution Metadata (Optional)</summary>
+                  <summary className="cursor-pointer text-xs font-medium text-amber-900">{t("Resolution Metadata (Optional)")}</summary>
                   <div className="mt-2 grid gap-2 sm:grid-cols-2">
                     <label className="text-xs text-amber-900" htmlFor="replacement-resolution-type">
-                      <span className="font-medium">Replacement Resolution Type</span>
+                      <span className="font-medium">{t("Replacement Resolution Type")}</span>
                       <select id="replacement-resolution-type" className="mt-1 w-full rounded-md border border-amber-200 bg-white px-2.5 py-2 text-sm" value={replacementResolutionType} onChange={(event) => setReplacementResolutionType(event.target.value as Exclude<ResolutionType, 'unresolved'> | '')}>
-                        <option value="">Unspecified</option>
-                        <option value="coexist">Coexist</option>
-                        <option value="lifecycle_update">Lifecycle update</option>
-                        <option value="conflict_resolved">Conflict resolved</option>
+                        <option value="">{t("Unspecified")}</option>
+                        <option value="coexist">{t("Coexist")}</option>
+                        <option value="lifecycle_update">{t("Lifecycle update")}</option>
+                        <option value="conflict_resolved">{t("Conflict resolved")}</option>
                       </select>
                     </label>
                     <label className="text-xs text-amber-900" htmlFor="replacement-resolution-basis">
-                      <span className="font-medium">Replacement Resolution Basis</span>
+                      <span className="font-medium">{t("Replacement Resolution Basis")}</span>
                       <select id="replacement-resolution-basis" className="mt-1 w-full rounded-md border border-amber-200 bg-white px-2.5 py-2 text-sm" value={replacementResolutionBasis} onChange={(event) => setReplacementResolutionBasis(event.target.value as ResolvedResolutionBasis | '')}>
-                        <option value="">Unspecified</option>
-                        <option value="direct_analysis">Direct analysis</option>
-                        <option value="prior_resolution">Prior resolution</option>
-                        <option value="policy">Policy</option>
-                        <option value="evidence">Evidence</option>
+                        <option value="">{t("Unspecified")}</option>
+                        <option value="direct_analysis">{t("Direct analysis")}</option>
+                        <option value="prior_resolution">{t("Prior resolution")}</option>
+                        <option value="policy">{t("Policy")}</option>
+                        <option value="evidence">{t("Evidence")}</option>
                       </select>
                     </label>
                   </div>
                 </details>
                 <button type="button" className="mt-2 rounded-md bg-amber-700 px-3 py-1.5 text-sm font-semibold text-white disabled:bg-slate-300" disabled={isStaticDemo || rejectMutation.isPending} onClick={rejectSelectedResolution}>
-                  {rejectMutation.isPending ? 'Replacing…' : 'Reject & Replace'}
+                  {rejectMutation.isPending ? t("Replacing…") : t("Reject & Replace")}
                 </button>
               </div>
             ) : null}
-            {arbitrationError ? <p className="rounded-md border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-xs text-rose-700" role="alert">{arbitrationError}</p> : null}
+            {arbitrationError ? <p className="rounded-md border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-xs text-rose-700" role="alert">{typeof arbitrationError === 'string' ? t(arbitrationError) : `${t(arbitrationError.key)} ${t('Current dispute data has been refreshed.')} ${arbitrationError.detail}`}</p> : null}
             {selectedDispute.status === 'open' ? (
-              <DrawerSection title="Resolve Note">
-                <label className="sr-only" htmlFor="resolve-note">
-                  Resolve Note
-                </label>
+              <DrawerSection title={t("Resolve Note")}>
+                <label className="sr-only" htmlFor="resolve-note">{t("Resolve Note")}</label>
                 <textarea
                   id="resolve-note"
                   className="min-h-24 w-full resize-y rounded-md border border-slate-200 bg-white px-2.5 py-2 text-sm leading-5 text-slate-800 outline-none transition focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
-                  placeholder="Write the maintainer resolution before closing this dispute."
+                  placeholder={t("Write the maintainer resolution before closing this dispute.")}
                   value={resolveNote}
                   onChange={(event) => {
                     setResolveNote(event.target.value)
@@ -811,9 +804,9 @@ export function DisputesPage() {
                     disabled={isStaticDemo || resolveMutation.isPending}
                   />
                   <span>
-                    <span className="font-medium text-slate-900">Notify Affected Agents</span>
-                    <span className="block leading-5 text-slate-500">Send a ClaimAttributeUpdate to the holder agents of the direct Claims:</span>
-                    <span aria-label="Affected agents" className="mt-1.5 flex flex-wrap gap-1">
+                    <span className="font-medium text-slate-900">{t("Notify Affected Agents")}</span>
+                    <span className="block leading-5 text-slate-500">{t("Send a ClaimAttributeUpdate to the holder agents of the direct Claims:")}</span>
+                    <span aria-label={t("Affected agents")} className="mt-1.5 flex flex-wrap gap-1">
                       {affectedAgentIds.length ? (
                         affectedAgentIds.map((agentId) => (
                           <span key={agentId} className="rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 font-mono text-[11px] font-medium text-slate-700">
@@ -821,26 +814,26 @@ export function DisputesPage() {
                           </span>
                         ))
                       ) : (
-                        <span className="text-[11px] text-slate-500">{claimsLoading ? 'Loading affected agents…' : 'No direct Claim holders found'}</span>
+                        <span className="text-[11px] text-slate-500">{claimsLoading ? t("Loading affected agents…") : t("No direct Claim holders found")}</span>
                       )}
                     </span>
                   </span>
                 </label>
-                {resolveError ? <p className="mt-2 rounded-md border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-xs text-rose-700" role="alert">{resolveError}</p> : null}
+                {resolveError ? <p className="mt-2 rounded-md border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-xs text-rose-700" role="alert">{t(resolveError)}</p> : null}
               </DrawerSection>
             ) : null}
           </>
         ) : selectedClaim ? (
           <>
-            <DrawerSection title="Overview">
+            <DrawerSection title={t("Overview")}>
               <dl className="space-y-2 text-sm">
-                <div className="flex justify-between gap-3"><dt className="text-slate-500">Holder Agent</dt><dd className="font-mono text-xs text-slate-900">{selectedClaim.claim.holder}</dd></div>
-                <div className="flex justify-between gap-3"><dt className="text-slate-500">Status</dt><dd><StatusBadge>{selectedClaim.claim.status}</StatusBadge></dd></div>
-                <div className="flex justify-between gap-3"><dt className="text-slate-500">Confidence</dt><dd className="font-medium capitalize text-slate-900">{selectedClaim.claim.confidence}</dd></div>
-                <div className="flex justify-between gap-3"><dt className="text-slate-500">Created At</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedClaim.claim.created_at)}</dd></div>
+                <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Holder Agent")}</dt><dd className="font-mono text-xs text-slate-900">{selectedClaim.claim.holder}</dd></div>
+                <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Status")}</dt><dd><StatusBadge localizeStatus>{selectedClaim.claim.status}</StatusBadge></dd></div>
+                <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Confidence")}</dt><dd className="font-medium capitalize text-slate-900">{selectedClaim.claim.confidence}</dd></div>
+                <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Created At")}</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedClaim.claim.created_at)}</dd></div>
               </dl>
             </DrawerSection>
-            <DrawerSection title="Related Disputes">
+            <DrawerSection title={t("Related Disputes")}>
               {selectedClaim.open_dispute_ids.length || selectedClaim.resolved_dispute_ids.length ? (
                 <div className="flex flex-wrap gap-1">
                   {[...selectedClaim.open_dispute_ids, ...selectedClaim.resolved_dispute_ids].map((disputeId) => (
@@ -855,19 +848,19 @@ export function DisputesPage() {
                   ))}
                 </div>
               ) : (
-                <div className="text-xs text-slate-500">No disputes</div>
+                <div className="text-xs text-slate-500">{t("No disputes")}</div>
               )}
             </DrawerSection>
-            <DrawerSection title="Scope" tone="claim">
+            <DrawerSection title={t("Scope")} tone="claim">
               <div className="text-sm leading-6 text-slate-900">{selectedClaim.claim.scope}</div>
             </DrawerSection>
-            <DrawerSection title="Statement" tone="claim">
+            <DrawerSection title={t("Statement")} tone="claim">
               <div className="whitespace-pre-wrap text-sm leading-6 text-slate-900">{selectedClaim.claim.statement}</div>
             </DrawerSection>
-            <DrawerSection title="Evidence Summary" tone="claim">
+            <DrawerSection title={t("Evidence Summary")} tone="claim">
               <div className="whitespace-pre-wrap text-sm leading-6 text-slate-800">{selectedClaim.claim.evidence_summary}</div>
             </DrawerSection>
-            <DrawerSection title="Source IDs" tone="claim">
+            <DrawerSection title={t("Source IDs")} tone="claim">
               {selectedClaim.claim.source_claim_ids.length ? (
                 <div className="flex flex-wrap gap-1">
                   {selectedClaim.claim.source_claim_ids.map((sourceId) => (
@@ -882,7 +875,7 @@ export function DisputesPage() {
                   ))}
                 </div>
               ) : (
-                <div className="text-xs text-slate-500">No sources</div>
+                <div className="text-xs text-slate-500">{t("No sources")}</div>
               )}
             </DrawerSection>
           </>

@@ -1,3 +1,4 @@
+import { useT } from '../../i18n'
 // 状态独立于知识类型；争议只取未解决记录，不覆盖节点底色。
 import { CircleCheck, CircleSlash, Clock3, MessageCircleWarning } from 'lucide-react'
 
@@ -12,6 +13,7 @@ const statusStyles = {
 }
 
 export function KnowledgeStatusIcons({ knowledge }: { knowledge: Knowledge }) {
+  const t = useT()
   if (knowledge.kind === 'missing') return null
   const status = knowledge.kind === 'claim' ? knowledge.view.claim.status : knowledge.policy.status
   const statuses: (keyof typeof statusStyles)[] = [status]
@@ -20,18 +22,19 @@ export function KnowledgeStatusIcons({ knowledge }: { knowledge: Knowledge }) {
     <span className="absolute right-1.5 top-1 flex items-center gap-0.5">
       {statuses.map((value) => {
         const { label, Icon, color } = statusStyles[value]
-        return <span key={value} role="img" aria-label={label} title={label} className={cn('inline-flex', color)}><Icon size={14} aria-hidden="true" /></span>
+        return <span key={value} role="img" aria-label={t(label)} title={t(label)} className={cn('inline-flex', color)}><Icon size={14} aria-hidden="true" /></span>
       })}
     </span>
   )
 }
 
 export function KnowledgeStatusLegend() {
+  const t = useT()
   return (
-    <div role="group" aria-label="Status legend" className="flex flex-wrap items-center gap-2">
+    <div role="group" aria-label={t("Status legend")} className="flex flex-wrap items-center gap-2">
       {Object.entries(statusStyles).map(([value, { label, Icon, color, background }]) => (
         <span key={value} className={cn('inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium', color, background)}>
-          <Icon size={16} aria-hidden="true" />{label}
+          <Icon size={16} aria-hidden="true" />{t(label)}
         </span>
       ))}
     </div>

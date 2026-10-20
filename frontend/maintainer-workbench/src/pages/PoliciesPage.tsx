@@ -1,3 +1,4 @@
+import { useT, useLanguage } from '../i18n'
 import { type ReactNode, useEffect, useMemo, useState } from 'react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router'
 
@@ -100,6 +101,8 @@ function drawerResourceKey(resource: DrawerResource | null) {
 }
 
 export function PoliciesPage() {
+  const t = useT()
+  const language = useLanguage()
   const [searchParams, setSearchParams] = useSearchParams()
   const location = useLocation()
   const navigate = useNavigate()
@@ -164,7 +167,7 @@ export function PoliciesPage() {
   )
 
   if (isLoading) {
-    return <div className="rounded-lg border border-slate-200 bg-white p-6 text-sm text-slate-500">Loading policies…</div>
+    return <div className="rounded-lg border border-slate-200 bg-white p-6 text-sm text-slate-500">{t("Loading policies…")}</div>
   }
   if (error || !data) {
     return <div className="rounded-lg border border-rose-200 bg-rose-50 p-6 text-sm text-rose-700">{String(error)}</div>
@@ -188,8 +191,8 @@ export function PoliciesPage() {
   return (
     <>
       <PageContainer
-        title="Policies"
-        subtitle="Browse policy history, inspect delivery state, and open focused workspaces only when you need to publish or retire a policy."
+        title={t("Policies")}
+        subtitle={t("Browse policy history, inspect delivery state, and open focused workspaces only when you need to publish or retire a policy.")}
         actions={
           <button
             type="button"
@@ -198,21 +201,19 @@ export function PoliciesPage() {
               setComposeOpen(true)
             }}
             className="rounded-md bg-blue-700 px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-blue-800"
-          >
-            New Action
-          </button>
+          >{t("New Action")}</button>
         }
       >
         <section className="space-y-3">
           <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
             <div className="flex items-center gap-2">
-              <h2 className="text-sm font-semibold tracking-tight text-slate-900">Policy History</h2>
+              <h2 className="text-sm font-semibold tracking-tight text-slate-900">{t("Policy History")}</h2>
               <StatusBadge tone="info">{filteredPolicies.length}</StatusBadge>
             </div>
             <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
               <input
                 className="rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm"
-                placeholder="Search policies..."
+                placeholder={t("Search policies...")}
                 value={policySearch}
                 onChange={(event) => {
                   setPolicySearch(event.target.value)
@@ -227,9 +228,9 @@ export function PoliciesPage() {
                   setPage(1)
                 }}
               >
-                <option value="all">All Types</option>
-                <option value="policy_update">Policy Update</option>
-                <option value="claim_attribute_update">Claim Attribute Update</option>
+                <option value="all">{t("All Types")}</option>
+                <option value="policy_update">{t("Policy Update")}</option>
+                <option value="claim_attribute_update">{t("Claim Attribute Update")}</option>
               </select>
               <select
                 className="rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm"
@@ -239,9 +240,9 @@ export function PoliciesPage() {
                   setPage(1)
                 }}
               >
-                <option value="all">All Status</option>
-                <option value="active">Active</option>
-                <option value="deprecated">Deprecated</option>
+                <option value="all">{t("All Status")}</option>
+                <option value="active">{t("Active")}</option>
+                <option value="deprecated">{t("Deprecated")}</option>
               </select>
               <select
                 className="rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm"
@@ -251,10 +252,10 @@ export function PoliciesPage() {
                   setPage(1)
                 }}
               >
-                <option value="30">Last 30 days</option>
-                <option value="7">Last 7 days</option>
-                <option value="1">Last 24 hours</option>
-                <option value="all">All time</option>
+                <option value="30">{t("Last 30 days")}</option>
+                <option value="7">{t("Last 7 days")}</option>
+                <option value="1">{t("Last 24 hours")}</option>
+                <option value="all">{t("All time")}</option>
               </select>
             </div>
           </div>
@@ -262,7 +263,7 @@ export function PoliciesPage() {
             columns={[
               {
                 key: 'policy',
-                header: 'Policy',
+                header: t("Policy"),
                 render: (row: Policy) => (
                   <div>
                     <div className="font-medium text-slate-900">{row.name}</div>
@@ -272,22 +273,22 @@ export function PoliciesPage() {
               },
               {
                 key: 'messageType',
-                header: 'Type',
+                header: t("Type"),
                 render: (row: Policy) => <StatusBadge>{row.message_type.replaceAll('_', ' ')}</StatusBadge>,
               },
-              { key: 'status', header: 'Status', render: (row: Policy) => <StatusBadge>{row.status}</StatusBadge> },
-              { key: 'scope', header: 'Scope', render: (row: Policy) => <div className="max-w-xs text-xs leading-5">{row.scope}</div> },
+              { key: 'status', header: t("Status"), render: (row: Policy) => <StatusBadge localizeStatus>{row.status}</StatusBadge> },
+              { key: 'scope', header: t("Scope"), render: (row: Policy) => <div className="max-w-xs text-xs leading-5">{row.scope}</div> },
               {
                 key: 'deliveries',
-                header: 'Deliveries',
+                header: t("Deliveries"),
                 render: (row: Policy) => {
                   const stats = deriveDeliveryStats(row, data)
-                  return <span className="font-mono text-xs">{deliverySummaryText(stats)}</span>
+                  return <span className="font-mono text-xs">{deliverySummaryText(stats, language)}</span>
                 },
               },
               {
                 key: 'propagation',
-                header: 'Propagation',
+                header: t("Propagation"),
                 render: (row: Policy) => {
                   const stats = deriveDeliveryStats(row, data)
                   return stats.ratio !== null ? (
@@ -302,11 +303,11 @@ export function PoliciesPage() {
                   )
                 },
               },
-              { key: 'created', header: 'Published At', render: (row: Policy) => <span className="font-mono text-xs">{formatDateTime(row.created_at)}</span> },
+              { key: 'created', header: t("Published At"), render: (row: Policy) => <span className="font-mono text-xs">{formatDateTime(row.created_at)}</span> },
               {
                 key: 'actions',
-                header: 'Actions',
-                render: (row: Policy) => <span className="text-xs font-medium text-blue-700">{row.status === 'active' ? 'View · Deprecate' : 'View'}</span>,
+                header: t("Actions"),
+                render: (row: Policy) => <span className="text-xs font-medium text-blue-700">{row.status === 'active' ? t("View · Deprecate") : t("View")}</span>,
               },
             ]}
             rows={pagedPolicies}
@@ -315,7 +316,7 @@ export function PoliciesPage() {
               setComposeOpen(false)
               setDrawerResource({ type: 'policy', id: row.id })
             }}
-            emptyState="No policy records are available."
+            emptyState={t("No policy records are available.")}
           />
           <PaginationBar
             page={page}
@@ -331,25 +332,25 @@ export function PoliciesPage() {
 
         <section className="space-y-3">
           <div className="flex items-center gap-2">
-            <h2 className="text-sm font-semibold tracking-tight text-slate-900">Maintainer Activity</h2>
+            <h2 className="text-sm font-semibold tracking-tight text-slate-900">{t("Maintainer Activity")}</h2>
             <StatusBadge tone="info">{maintainerActions.length}</StatusBadge>
           </div>
 
           <div className="rounded-lg border border-slate-200 bg-white p-3">
             <div className="mb-2 flex items-center justify-between">
-              <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Maintainer Actions</h3>
+              <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">{t("Maintainer Actions")}</h3>
               <StatusBadge tone="info">{maintainerActions.length}</StatusBadge>
             </div>
             <DataTable
               columns={[
                 {
                   key: 'action',
-                  header: 'Action ID',
+                  header: t("Action ID"),
                   render: (row: MaintainerActionRow) => <span className="font-mono text-[11px] text-slate-500">{row.maintainer_action_id}</span>,
                 },
                 {
                   key: 'policy',
-                  header: 'Policy',
+                  header: t("Policy"),
                   render: (row: MaintainerActionRow) => (
                     <div>
                       <div className="font-medium text-slate-900">{row.policy_name}</div>
@@ -357,12 +358,12 @@ export function PoliciesPage() {
                     </div>
                   ),
                 },
-                { key: 'type', header: 'Type', render: (row: MaintainerActionRow) => <StatusBadge>{row.message_type.replaceAll('_', ' ')}</StatusBadge> },
-                { key: 'target', header: 'Target', render: (row: MaintainerActionRow) => <StatusBadge tone={row.target_kind === 'broadcast' ? 'info' : 'warning'}>{targetLabelFromAction(row)}</StatusBadge> },
-                { key: 'outboxEntries', header: 'Outbox', render: (row: MaintainerActionRow) => <span className="font-mono text-xs">{row.outbox_entries}</span> },
-                { key: 'deliveredAgents', header: 'Receipt ACKs', render: (row: MaintainerActionRow) => <span className="font-mono text-xs">{row.delivered_agents.length}</span> },
-                { key: 'sendEvents', header: 'Send Events', render: (row: MaintainerActionRow) => <span className="font-mono text-xs">{row.send_events}</span> },
-                { key: 'createdAt', header: 'Created At', render: (row: MaintainerActionRow) => <span className="font-mono text-xs">{formatDateTime(row.created_at)}</span> },
+                { key: 'type', header: t("Type"), render: (row: MaintainerActionRow) => <StatusBadge>{row.message_type.replaceAll('_', ' ')}</StatusBadge> },
+                { key: 'target', header: t("Target"), render: (row: MaintainerActionRow) => <StatusBadge tone={row.target_kind === 'broadcast' ? 'info' : 'warning'}>{targetLabelFromAction(row)}</StatusBadge> },
+                { key: 'outboxEntries', header: t("Outbox"), render: (row: MaintainerActionRow) => <span className="font-mono text-xs">{row.outbox_entries}</span> },
+                { key: 'deliveredAgents', header: t("Receipt ACKs"), render: (row: MaintainerActionRow) => <span className="font-mono text-xs">{row.delivered_agents.length}</span> },
+                { key: 'sendEvents', header: t("Send Events"), render: (row: MaintainerActionRow) => <span className="font-mono text-xs">{row.send_events}</span> },
+                { key: 'createdAt', header: t("Created At"), render: (row: MaintainerActionRow) => <span className="font-mono text-xs">{formatDateTime(row.created_at)}</span> },
               ]}
               rows={recentActions}
               getRowId={(row) => row.maintainer_action_id}
@@ -370,42 +371,42 @@ export function PoliciesPage() {
                 setComposeOpen(false)
                 setDrawerResource({ type: 'action', id: row.maintainer_action_id })
               }}
-              emptyState="No maintainer actions are available yet."
+              emptyState={t("No maintainer actions are available yet.")}
             />
           </div>
 
           <div className="grid gap-3 xl:grid-cols-2">
             <div className="rounded-lg border border-slate-200 bg-white p-3">
               <div className="mb-2 flex items-center justify-between">
-                <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Send Log</h3>
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">{t("Send Log")}</h3>
                 <StatusBadge tone="info">{data.send_log.length}</StatusBadge>
               </div>
               <DataTable
                 columns={[
-                  { key: 'sentAt', header: 'Sent At', render: (row: SendLogRow) => <span className="font-mono text-[11px]">{formatDateTime(row.sent_at)}</span> },
-                  { key: 'agent', header: 'Agent', render: (row: SendLogRow) => <span className="font-mono text-xs">{row.agent_id}</span> },
-                  { key: 'policy', header: 'Policy', render: (row: SendLogRow) => <span className="font-mono text-[11px] text-slate-500">{row.policy_id}</span> },
-                  { key: 'type', header: 'Message Type', render: (row: SendLogRow) => <StatusBadge>{row.message_type.replaceAll('_', ' ')}</StatusBadge> },
-                  { key: 'inbox', header: 'Inbox ID', render: (row: SendLogRow) => <span className="font-mono text-[11px] text-slate-500">{row.inbox_id}</span> },
-                  { key: 'action', header: 'Action ID', render: (row: SendLogRow) => <span className="font-mono text-[11px] text-slate-500">{row.maintainer_action_id}</span> },
+                  { key: 'sentAt', header: t("Sent At"), render: (row: SendLogRow) => <span className="font-mono text-[11px]">{formatDateTime(row.sent_at)}</span> },
+                  { key: 'agent', header: t("Agent"), render: (row: SendLogRow) => <span className="font-mono text-xs">{row.agent_id}</span> },
+                  { key: 'policy', header: t("Policy"), render: (row: SendLogRow) => <span className="font-mono text-[11px] text-slate-500">{row.policy_id}</span> },
+                  { key: 'type', header: t("Message Type"), render: (row: SendLogRow) => <StatusBadge>{row.message_type.replaceAll('_', ' ')}</StatusBadge> },
+                  { key: 'inbox', header: t("Inbox ID"), render: (row: SendLogRow) => <span className="font-mono text-[11px] text-slate-500">{row.inbox_id}</span> },
+                  { key: 'action', header: t("Action ID"), render: (row: SendLogRow) => <span className="font-mono text-[11px] text-slate-500">{row.maintainer_action_id}</span> },
                 ]}
                 rows={recentSendLog}
                 getRowId={(row) => `${row.inbox_id}-${row.agent_id}-${row.sent_at}`}
-                emptyState="No send log rows yet."
+                emptyState={t("No send log rows yet.")}
               />
             </div>
 
             <div className="rounded-lg border border-slate-200 bg-white p-3">
               <div className="mb-2 flex items-center justify-between">
-                <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Outbox</h3>
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">{t("Outbox")}</h3>
                 <StatusBadge tone="info">{data.outbox.length}</StatusBadge>
               </div>
               <DataTable
                 columns={[
-                  { key: 'inbox', header: 'Inbox ID', render: (row: OutboxEntry) => <span className="font-mono text-[11px] text-slate-500">{row.inbox_id}</span> },
+                  { key: 'inbox', header: t("Inbox ID"), render: (row: OutboxEntry) => <span className="font-mono text-[11px] text-slate-500">{row.inbox_id}</span> },
                   {
                     key: 'policy',
-                    header: 'Policy',
+                    header: t("Policy"),
                     render: (row: OutboxEntry) => (
                       <div>
                         <div className="font-medium text-slate-900">{policyFromOutbox(row).name}</div>
@@ -413,11 +414,11 @@ export function PoliciesPage() {
                       </div>
                     ),
                   },
-                  { key: 'target', header: 'Target Kind', render: (row: OutboxEntry) => <StatusBadge tone={row.target_kind === 'broadcast' ? 'info' : 'warning'}>{targetKindLabel(row.target_kind)}</StatusBadge> },
-                  { key: 'offered', header: 'Offered', render: (row: OutboxEntry) => <span className="font-mono text-xs">{offeredCountFromOutbox(row)}</span> },
-                  { key: 'delivered', header: 'Receipt ACKs', render: (row: OutboxEntry) => <span className="font-mono text-xs">{deliveredCountFromOutbox(row)}</span> },
-                  { key: 'state', header: 'Open State', render: (row: OutboxEntry) => <StatusBadge tone={isOutboxEntryOpen(row, data.outbox, data.policies) ? 'warning' : 'success'}>{openStateFromOutbox(row, data.outbox, data.policies)}</StatusBadge> },
-                  { key: 'created', header: 'Created At', render: (row: OutboxEntry) => <span className="font-mono text-xs">{formatDateTime(row.created_at)}</span> },
+                  { key: 'target', header: t("Target Kind"), render: (row: OutboxEntry) => <StatusBadge tone={row.target_kind === 'broadcast' ? 'info' : 'warning'}>{targetKindLabel(row.target_kind)}</StatusBadge> },
+                  { key: 'offered', header: t("Offered"), render: (row: OutboxEntry) => <span className="font-mono text-xs">{offeredCountFromOutbox(row)}</span> },
+                  { key: 'delivered', header: t("Receipt ACKs"), render: (row: OutboxEntry) => <span className="font-mono text-xs">{deliveredCountFromOutbox(row)}</span> },
+                  { key: 'state', header: t("Open State"), render: (row: OutboxEntry) => <StatusBadge tone={isOutboxEntryOpen(row, data.outbox, data.policies) ? 'warning' : 'success'}>{openStateFromOutbox(row, data.outbox, data.policies)}</StatusBadge> },
+                  { key: 'created', header: t("Created At"), render: (row: OutboxEntry) => <span className="font-mono text-xs">{formatDateTime(row.created_at)}</span> },
                 ]}
                 rows={recentOutbox}
                 getRowId={(row) => row.inbox_id}
@@ -425,7 +426,7 @@ export function PoliciesPage() {
                   setComposeOpen(false)
                   setDrawerResource({ type: 'outbox', id: row.inbox_id })
                 }}
-                emptyState="No outbox entries yet."
+                emptyState={t("No outbox entries yet.")}
               />
             </div>
           </div>
@@ -434,11 +435,11 @@ export function PoliciesPage() {
         <DetailDrawer
           open={Boolean(selectedPolicy || selectedAction || selectedOutbox)}
           onClose={closePolicyDrawer}
-          label={selectedPolicy ? 'Policy' : selectedAction ? 'Action' : 'Outbox'}
+          label={selectedPolicy ? t("Policy") : selectedAction ? t("Action") : t("Outbox")}
           title={
             selectedPolicy?.name ??
             selectedAction?.policy_name ??
-            (selectedOutbox ? policyFromOutbox(selectedOutbox).name : 'Detail')
+            (selectedOutbox ? policyFromOutbox(selectedOutbox).name : t("Detail"))
           }
           subtitle={selectedPolicy?.id ?? selectedAction?.maintainer_action_id ?? selectedOutbox?.inbox_id}
           footer={
@@ -448,17 +449,15 @@ export function PoliciesPage() {
                   type="button"
                   className="rounded-md border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-700"
                   onClick={closePolicyDrawer}
-                >
-                  Close
-                </button>
+                >{t("Close")}</button>
                 <button
                   type="button"
                   className="rounded-md bg-rose-600 px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-rose-700 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-500 disabled:hover:bg-slate-200"
                   disabled={isStaticDemo || selectedPolicy.status !== 'active' || deprecatePolicy.isPending}
-                  title={isStaticDemo ? 'Static preview is read-only' : undefined}
+                  title={isStaticDemo ? t("Static preview is read-only") : undefined}
                   onClick={() => deprecatePolicy.mutate(selectedPolicy.id)}
                 >
-                  {selectedPolicy.status === 'active' ? 'Deprecate Policy' : 'Deprecated'}
+                  {selectedPolicy.status === 'active' ? t("Deprecate Policy") : t("Deprecated")}
                 </button>
               </div>
             ) : (
@@ -466,48 +465,46 @@ export function PoliciesPage() {
                 type="button"
                 className="w-full rounded-md border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-700"
                 onClick={closePolicyDrawer}
-              >
-                Close
-              </button>
+              >{t("Close")}</button>
             )
           }
         >
           {selectedPolicy ? (
             <>
-              <DrawerSection title="Overview">
+              <DrawerSection title={t("Overview")}>
                 <dl className="space-y-2 text-sm">
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Type</dt><dd><StatusBadge>{selectedPolicy.message_type.replaceAll('_', ' ')}</StatusBadge></dd></div>
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Status</dt><dd><StatusBadge>{selectedPolicy.status}</StatusBadge></dd></div>
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Scope</dt><dd className="text-right text-slate-900">{selectedPolicy.scope}</dd></div>
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Published At</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedPolicy.created_at)}</dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Type")}</dt><dd><StatusBadge>{selectedPolicy.message_type.replaceAll('_', ' ')}</StatusBadge></dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Status")}</dt><dd><StatusBadge localizeStatus>{selectedPolicy.status}</StatusBadge></dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Scope")}</dt><dd className="text-right text-slate-900">{selectedPolicy.scope}</dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Published At")}</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedPolicy.created_at)}</dd></div>
                   {selectedPolicy.updated_at ? (
-                    <div className="flex justify-between gap-3"><dt className="text-slate-500">Updated At</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedPolicy.updated_at)}</dd></div>
+                    <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Updated At")}</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedPolicy.updated_at)}</dd></div>
                   ) : null}
                 </dl>
               </DrawerSection>
 
-              <DrawerSection title="Statement">
+              <DrawerSection title={t("Statement")}>
                 <DetailTextBlock>{selectedPolicy.statement.trim() || 'Unavailable'}</DetailTextBlock>
               </DrawerSection>
 
-              <DrawerSection title="Propagation Summary">
+              <DrawerSection title={t("Propagation Summary")}>
                 <dl className="space-y-2 text-sm">
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Deliveries</dt><dd className="font-mono text-xs text-slate-900">{selectedStats ? deliverySummaryText(selectedStats) : '—'}</dd></div>
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Failed Deliveries</dt><dd className="font-mono text-xs text-slate-900">{selectedStats?.failed ?? '—'}</dd></div>
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Last Delivery</dt><dd className="font-mono text-xs text-slate-900">{selectedStats?.lastDelivery ? formatDateTime(selectedStats.lastDelivery) : '—'}</dd></div>
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Propagation Lag</dt><dd className="font-mono text-xs text-slate-900">{selectedStats?.ratio !== null ? `${100 - (selectedStats?.ratio ?? 0)}% remaining` : '—'}</dd></div>
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Outbox Entries</dt><dd className="font-mono text-xs text-slate-900">{selectedStats?.outboxCount ?? 0}</dd></div>
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Send Events</dt><dd className="font-mono text-xs text-slate-900">{selectedStats?.sendCount ?? 0}</dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Deliveries")}</dt><dd className="font-mono text-xs text-slate-900">{selectedStats ? deliverySummaryText(selectedStats, language) : '—'}</dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Failed Deliveries")}</dt><dd className="font-mono text-xs text-slate-900">{selectedStats?.failed ?? '—'}</dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Last Delivery")}</dt><dd className="font-mono text-xs text-slate-900">{selectedStats?.lastDelivery ? formatDateTime(selectedStats.lastDelivery) : '—'}</dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Propagation Lag")}</dt><dd className="font-mono text-xs text-slate-900">{selectedStats?.ratio !== null ? t('{percent}% remaining', { percent: 100 - (selectedStats?.ratio ?? 0) }) : '—'}</dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Outbox Entries")}</dt><dd className="font-mono text-xs text-slate-900">{selectedStats?.outboxCount ?? 0}</dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Send Events")}</dt><dd className="font-mono text-xs text-slate-900">{selectedStats?.sendCount ?? 0}</dd></div>
                 </dl>
               </DrawerSection>
 
-              <DrawerSection title="Affected">
+              <DrawerSection title={t("Affected")}>
                 <dl className="space-y-2 text-sm">
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Target Agents</dt><dd className="text-right font-mono text-xs text-slate-900">{selectedEvent?.target_agents.length ? selectedEvent.target_agents.join(', ') : selectedPolicy.target_agents?.length ? selectedPolicy.target_agents.join(', ') : 'broadcast'}</dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Target Agents")}</dt><dd className="text-right font-mono text-xs text-slate-900">{selectedEvent?.target_agents.length ? selectedEvent.target_agents.join(', ') : selectedPolicy.target_agents?.length ? selectedPolicy.target_agents.join(', ') : 'broadcast'}</dd></div>
                 </dl>
               </DrawerSection>
 
-              <DrawerSection title="Related Policies">
+              <DrawerSection title={t("Related Policies")}>
                 {selectedRelated.length ? (
                   <div className="flex flex-wrap gap-1.5">
                     {selectedRelated.map((policy) => (
@@ -522,31 +519,31 @@ export function PoliciesPage() {
                     ))}
                   </div>
                 ) : (
-                  <div className="text-xs text-slate-500">No related policies in current snapshot.</div>
+                  <div className="text-xs text-slate-500">{t("No related policies in current snapshot.")}</div>
                 )}
               </DrawerSection>
             </>
           ) : selectedAction ? (
             <>
-              <DrawerSection title="Overview">
+              <DrawerSection title={t("Overview")}>
                 <dl className="space-y-2 text-sm">
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Action ID</dt><dd className="font-mono text-[11px] text-slate-500">{selectedAction.maintainer_action_id}</dd></div>
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Type</dt><dd><StatusBadge>{selectedAction.message_type.replaceAll('_', ' ')}</StatusBadge></dd></div>
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Target</dt><dd><StatusBadge tone={selectedAction.target_kind === 'broadcast' ? 'info' : 'warning'}>{targetLabelFromAction(selectedAction)}</StatusBadge></dd></div>
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Policy Status</dt><dd><StatusBadge>{selectedAction.policy_status}</StatusBadge></dd></div>
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Created At</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedAction.created_at)}</dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Action ID")}</dt><dd className="font-mono text-[11px] text-slate-500">{selectedAction.maintainer_action_id}</dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Type")}</dt><dd><StatusBadge>{selectedAction.message_type.replaceAll('_', ' ')}</StatusBadge></dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Target")}</dt><dd><StatusBadge tone={selectedAction.target_kind === 'broadcast' ? 'info' : 'warning'}>{targetLabelFromAction(selectedAction)}</StatusBadge></dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Policy Status")}</dt><dd><StatusBadge localizeStatus>{selectedAction.policy_status}</StatusBadge></dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Created At")}</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedAction.created_at)}</dd></div>
                 </dl>
               </DrawerSection>
 
-              <DrawerSection title="Delivery Summary">
+              <DrawerSection title={t("Delivery Summary")}>
                 <dl className="space-y-2 text-sm">
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Outbox Entries</dt><dd className="font-mono text-xs text-slate-900">{selectedAction.outbox_entries}</dd></div>
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Receipt-ACK Agents</dt><dd className="font-mono text-xs text-slate-900">{selectedAction.delivered_agents.length}</dd></div>
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Send Events</dt><dd className="font-mono text-xs text-slate-900">{selectedAction.send_events}</dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Outbox Entries")}</dt><dd className="font-mono text-xs text-slate-900">{selectedAction.outbox_entries}</dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Receipt-ACK Agents")}</dt><dd className="font-mono text-xs text-slate-900">{selectedAction.delivered_agents.length}</dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Send Events")}</dt><dd className="font-mono text-xs text-slate-900">{selectedAction.send_events}</dd></div>
                 </dl>
               </DrawerSection>
 
-              <DrawerSection title="Inbox IDs">
+              <DrawerSection title={t("Inbox IDs")}>
                 <div className="flex flex-wrap gap-1.5">
                   {selectedAction.inbox_ids.map((inboxId) => (
                     <button
@@ -561,38 +558,38 @@ export function PoliciesPage() {
                 </div>
               </DrawerSection>
 
-              <DrawerSection title="Agents">
+              <DrawerSection title={t("Agents")}>
                 <div className="space-y-2 text-sm text-slate-600">
                   <div>
-                    <div className="mb-1 text-xs font-medium text-slate-500">Target Agents</div>
+                    <div className="mb-1 text-xs font-medium text-slate-500">{t("Target Agents")}</div>
                     <div className="font-mono text-xs text-slate-900">{selectedAction.target_agents.length ? selectedAction.target_agents.join(', ') : 'broadcast'}</div>
                   </div>
                   <div>
-                    <div className="mb-1 text-xs font-medium text-slate-500">Receipt-ACK Agents</div>
-                    <div className="font-mono text-xs text-slate-900">{selectedAction.delivered_agents.length ? selectedAction.delivered_agents.join(', ') : 'No deliveries yet'}</div>
+                    <div className="mb-1 text-xs font-medium text-slate-500">{t("Receipt-ACK Agents")}</div>
+                    <div className="font-mono text-xs text-slate-900">{selectedAction.delivered_agents.length ? selectedAction.delivered_agents.join(', ') : t("No deliveries yet")}</div>
                   </div>
                 </div>
               </DrawerSection>
             </>
           ) : selectedOutbox ? (
             <>
-              <DrawerSection title="Overview">
+              <DrawerSection title={t("Overview")}>
                 <dl className="space-y-2 text-sm">
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Inbox ID</dt><dd className="font-mono text-[11px] text-slate-500">{selectedOutbox.inbox_id}</dd></div>
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Action ID</dt><dd className="font-mono text-[11px] text-slate-500">{selectedOutbox.maintainer_action_id}</dd></div>
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Type</dt><dd><StatusBadge>{messageTypeFromOutbox(selectedOutbox).replaceAll('_', ' ')}</StatusBadge></dd></div>
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Target</dt><dd><StatusBadge tone={selectedOutbox.target_kind === 'broadcast' ? 'info' : 'warning'}>{targetLabelFromOutbox(selectedOutbox)}</StatusBadge></dd></div>
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Open State</dt><dd><StatusBadge tone={isOutboxEntryOpen(selectedOutbox, data.outbox, data.policies) ? 'warning' : 'success'}>{openStateFromOutbox(selectedOutbox, data.outbox, data.policies)}</StatusBadge></dd></div>
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Created At</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedOutbox.created_at)}</dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Inbox ID")}</dt><dd className="font-mono text-[11px] text-slate-500">{selectedOutbox.inbox_id}</dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Action ID")}</dt><dd className="font-mono text-[11px] text-slate-500">{selectedOutbox.maintainer_action_id}</dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Type")}</dt><dd><StatusBadge>{messageTypeFromOutbox(selectedOutbox).replaceAll('_', ' ')}</StatusBadge></dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Target")}</dt><dd><StatusBadge tone={selectedOutbox.target_kind === 'broadcast' ? 'info' : 'warning'}>{targetLabelFromOutbox(selectedOutbox)}</StatusBadge></dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Open State")}</dt><dd><StatusBadge tone={isOutboxEntryOpen(selectedOutbox, data.outbox, data.policies) ? 'warning' : 'success'}>{openStateFromOutbox(selectedOutbox, data.outbox, data.policies)}</StatusBadge></dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Created At")}</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedOutbox.created_at)}</dd></div>
                 </dl>
               </DrawerSection>
 
-              <DrawerSection title="Delivery Facts">
+              <DrawerSection title={t("Delivery Facts")}>
                 <dl className="space-y-2 text-sm">
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Offered Agents</dt><dd className="font-mono text-xs text-slate-900">{offeredCountFromOutbox(selectedOutbox)}</dd></div>
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Last Offered At</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(lastOfferedAtFromOutbox(selectedOutbox))}</dd></div>
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Receipt ACK Count</dt><dd className="font-mono text-xs text-slate-900">{deliveredCountFromOutbox(selectedOutbox)}</dd></div>
-                  <div className="flex justify-between gap-3"><dt className="text-slate-500">Last Receipt At</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(lastSentAtFromOutbox(selectedOutbox))}</dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Offered Agents")}</dt><dd className="font-mono text-xs text-slate-900">{offeredCountFromOutbox(selectedOutbox)}</dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Last Offered At")}</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(lastOfferedAtFromOutbox(selectedOutbox))}</dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Receipt ACK Count")}</dt><dd className="font-mono text-xs text-slate-900">{deliveredCountFromOutbox(selectedOutbox)}</dd></div>
+                  <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Last Receipt At")}</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(lastSentAtFromOutbox(selectedOutbox))}</dd></div>
                 </dl>
                 <div className="mt-2 space-y-1.5">
                   {selectedOutbox.delivered_to.length ? (
@@ -603,12 +600,12 @@ export function PoliciesPage() {
                       </div>
                     ))
                   ) : (
-                    <div className="text-xs text-slate-500">No receipt ACKs yet.</div>
+                    <div className="text-xs text-slate-500">{t("No receipt ACKs yet.")}</div>
                   )}
                 </div>
               </DrawerSection>
 
-              <DrawerSection title="Inbox Message Snapshot">
+              <DrawerSection title={t("Inbox Message Snapshot")}>
                 <DetailTextBlock>{JSON.stringify(selectedOutbox.inbox_message, null, 2)}</DetailTextBlock>
               </DrawerSection>
             </>

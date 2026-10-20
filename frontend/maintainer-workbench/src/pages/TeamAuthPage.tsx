@@ -1,3 +1,4 @@
+import { useT } from '../i18n'
 import { useMemo, useState } from 'react'
 import { AlertCircle, Ban, Copy, KeyRound, Plus, ShieldCheck } from 'lucide-react'
 
@@ -13,6 +14,7 @@ import { ApiError } from '../lib/apiClient'
 import { isStaticDemo } from '../lib/runtime'
 
 export function TeamAuthPage() {
+  const t = useT()
   const statusQuery = useTeamAuthStatusQuery()
   const keysQuery = useTeamAuthKeysQuery()
   const createMutation = useCreateTeamAuthKeyMutation()
@@ -55,24 +57,24 @@ export function TeamAuthPage() {
   }
 
   const revokeKey = (key: TeamAuthKey) => {
-    const confirmed = window.confirm(`Revoke key ${key.key_id} for ${key.agent_id}?`)
+    const confirmed = window.confirm(t('Revoke key {key} for {agent}?', { key: key.key_id, agent: key.agent_id }))
     if (!confirmed) return
     revokeMutation.mutate(key.key_id)
   }
 
   return (
     <PageContainer
-      title="Team Auth"
-      subtitle="Create and revoke per-agent ACN keys for this team. Plain keys are only returned once after creation."
-      actions={<StatusBadge tone="info">{activeCount} active</StatusBadge>}
+      title={t("Team Auth")}
+      subtitle={t("Create and revoke per-agent ACN keys for this team. Plain keys are only returned once after creation.")}
+      actions={<StatusBadge tone="info">{t('{count} active', { count: activeCount })}</StatusBadge>}
     >
       <section className="rounded-lg border border-slate-300 bg-slate-950 px-3 py-3 text-white">
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div className="flex items-center gap-2">
             <ShieldCheck className="h-4 w-4 text-sky-300" />
             <div>
-              <div className="text-sm font-semibold">Team request authentication</div>
-              <div className="text-xs text-slate-300">Startup config controls whether agent-facing requests are checked against team keys.</div>
+              <div className="text-sm font-semibold">{t("Team request authentication")}</div>
+              <div className="text-xs text-slate-300">{t("Startup config controls whether agent-facing requests are checked against team keys.")}</div>
             </div>
           </div>
           <div className="flex flex-wrap gap-2">
@@ -89,7 +91,7 @@ export function TeamAuthPage() {
         {statusError ? (
           <div className="mt-3 flex items-start gap-2 rounded-md border border-rose-300 bg-rose-50 px-2.5 py-2 text-xs text-rose-800" role="alert">
             <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            <span>{statusError}</span>
+            <span>{t(statusError)}</span>
           </div>
         ) : null}
       </section>
@@ -99,12 +101,12 @@ export function TeamAuthPage() {
           <section className="rounded-lg border border-slate-200 bg-white p-3">
             <div className="flex items-center gap-2">
               <KeyRound className="h-4 w-4 text-blue-700" />
-              <h2 className="text-sm font-semibold tracking-tight text-slate-900">Create Key</h2>
+              <h2 className="text-sm font-semibold tracking-tight text-slate-900">{t("Create Key")}</h2>
             </div>
             <div className="mt-3 space-y-2">
               <input
                 className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none focus:border-slate-400"
-                placeholder="agent_id"
+                placeholder={t("agent_id")}
                 value={agentId}
                 disabled={isStaticDemo || managementUnavailable}
                 onChange={(event) => setAgentId(event.target.value)}
@@ -114,26 +116,24 @@ export function TeamAuthPage() {
                 className="inline-flex items-center gap-1.5 rounded-md bg-blue-700 px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-blue-800 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-500"
                 disabled={isStaticDemo || managementUnavailable || !agentId.trim() || createMutation.isPending}
                 title={isStaticDemo
-                  ? 'Static preview is read-only'
+                  ? t("Static preview is read-only")
                   : managementUnavailable
-                    ? 'Enable Maintainer admin auth to manage team auth keys.'
+                    ? t("Enable Maintainer admin auth to manage team auth keys.")
                     : undefined}
                 onClick={createKey}
               >
                 <Plus className="h-4 w-4" />
-                {createMutation.isPending ? 'Creating' : 'Create'}
+                {createMutation.isPending ? t("Creating") : t("Create")}
               </button>
               {createMutation.error ? (
-                <p className="text-xs text-rose-700">{createMutation.error.message}</p>
+                <p className="text-xs text-rose-700">{t(teamAuthErrorMessage(createMutation.error) ?? '')}</p>
               ) : null}
             </div>
           </section>
 
           {createdKey ? (
             <section className="rounded-lg border border-amber-200 bg-amber-50 p-3">
-              <div className="text-xs font-semibold uppercase tracking-wide text-amber-700">
-                Plain Key
-              </div>
+              <div className="text-xs font-semibold uppercase tracking-wide text-amber-700">{t("Plain Key")}</div>
               <div className="mt-2 max-w-full overflow-hidden break-all rounded border border-amber-200 bg-white px-2.5 py-2 font-mono text-xs leading-relaxed text-slate-900">
                 {createdKey.acn_key}
               </div>
@@ -144,7 +144,7 @@ export function TeamAuthPage() {
                   onClick={copyCreatedKey}
                 >
                   <Copy className="h-3.5 w-3.5" />
-                  {copyState === 'copied' ? 'Copied' : copyState === 'failed' ? 'Copy failed' : 'Copy'}
+                  {copyState === 'copied' ? t("Copied") : copyState === 'failed' ? t("Copy failed") : t("Copy")}
                 </button>
                 <button
                   type="button"
@@ -153,14 +153,10 @@ export function TeamAuthPage() {
                     setCreatedKey(null)
                     setCopyState('idle')
                   }}
-                >
-                  Dismiss
-                </button>
+                >{t("Dismiss")}</button>
               </div>
               {copyState === 'failed' ? (
-                <div className="mt-2 text-xs text-rose-700" role="status">
-                  Clipboard copy failed. Select and copy manually.
-                </div>
+                <div className="mt-2 text-xs text-rose-700" role="status">{t("Clipboard copy failed. Select and copy manually.")}</div>
               ) : null}
             </section>
           ) : null}
@@ -168,19 +164,19 @@ export function TeamAuthPage() {
 
         <div className="space-y-2">
           {revokeMutation.error ? (
-            <p className="text-xs text-rose-700">{revokeMutation.error.message}</p>
+            <p className="text-xs text-rose-700">{t(teamAuthErrorMessage(revokeMutation.error) ?? '')}</p>
           ) : null}
           {keysError ? (
             <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700" role="alert">
               <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              <span>{keysError}</span>
+              <span>{t(keysError)}</span>
             </div>
           ) : null}
           <DataTable
             columns={[
             {
               key: 'key',
-              header: 'Key',
+              header: t("Key"),
               render: (row: TeamAuthKey) => (
                 <div>
                   <div className="font-mono text-xs text-slate-900">{row.key_id}</div>
@@ -190,14 +186,14 @@ export function TeamAuthPage() {
             },
             {
               key: 'generated',
-              header: 'Generated',
+              header: t("Generated"),
               render: (row: TeamAuthKey) => (
                 <span className="font-mono text-xs">{formatDateTime(row.generated_time)}</span>
               ),
             },
             {
               key: 'status',
-              header: 'Status',
+              header: t("Status"),
               render: (row: TeamAuthKey) => (
                 <StatusBadge tone={row.status === 'revoked' ? 'neutral' : undefined}>
                   {row.status}
@@ -206,7 +202,7 @@ export function TeamAuthPage() {
             },
             {
               key: 'actions',
-              header: 'Actions',
+              header: t("Actions"),
               className: 'w-28 text-right',
               render: (row: TeamAuthKey) =>
                 row.status === 'active' ? (
@@ -214,15 +210,13 @@ export function TeamAuthPage() {
                     type="button"
                     className="inline-flex items-center gap-1 rounded-md border border-slate-200 px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:text-slate-400"
                     disabled={isStaticDemo || revokeMutation.isPending}
-                    title={isStaticDemo ? 'Static preview is read-only' : undefined}
+                    title={isStaticDemo ? t("Static preview is read-only") : undefined}
                     onClick={(event) => {
                       event.stopPropagation()
                       revokeKey(row)
                     }}
                   >
-                    <Ban className="h-3.5 w-3.5" />
-                    Revoke
-                  </button>
+                    <Ban className="h-3.5 w-3.5" />{t("Revoke")}</button>
                 ) : (
                   <span className="text-xs text-slate-400">-</span>
                 ),
@@ -230,7 +224,7 @@ export function TeamAuthPage() {
           ]}
             rows={sortedKeys}
             getRowId={(row) => row.key_id}
-            emptyState={keysError ? 'Team auth key management is unavailable.' : keysQuery.isLoading ? 'Loading keys...' : 'No team auth keys have been created.'}
+            emptyState={keysError ? t("Team auth key management is unavailable.") : keysQuery.isLoading ? t("Loading keys...") : t("No team auth keys have been created.")}
           />
         </div>
       </section>
@@ -250,7 +244,8 @@ function compareTeamAuthKeys(left: TeamAuthKey, right: TeamAuthKey) {
 }
 
 function AuthStatusPill({ label, enabled }: { label: string; enabled?: boolean }) {
-  const text = enabled === undefined ? 'Unknown' : enabled ? 'Enabled' : 'Disabled'
+  const t = useT()
+  const text = enabled === undefined ? t("Unknown") : enabled ? t("Enabled") : t("Disabled")
   return (
     <span className="inline-flex items-center gap-1.5 rounded-md border border-white/10 bg-white/10 px-2.5 py-1 text-xs font-semibold text-white">
       <span className="text-slate-300">{label}</span>

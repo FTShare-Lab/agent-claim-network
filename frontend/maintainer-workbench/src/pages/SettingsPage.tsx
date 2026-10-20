@@ -1,3 +1,4 @@
+import { useT } from '../i18n'
 import { useEffect, useState } from 'react'
 import { ChevronDown } from 'lucide-react'
 
@@ -623,6 +624,7 @@ function methodTone(method: 'GET' | 'POST') {
 }
 
 function EndpointToggle({ entry }: { entry: EndpointEntry }) {
+  const t = useT()
   const [open, setOpen] = useState(false)
   return (
     <div className="rounded-lg border border-slate-200 bg-white">
@@ -635,21 +637,21 @@ function EndpointToggle({ entry }: { entry: EndpointEntry }) {
           {entry.method}
         </span>
         <span className="min-w-0 flex-1 break-all font-mono text-xs text-slate-900">{entry.path}</span>
-        <span className="hidden truncate text-xs text-slate-500 md:inline">{entry.summary}</span>
+        <span className="hidden truncate text-xs text-slate-500 md:inline">{t(entry.summary)}</span>
         <ChevronDown className={`h-3.5 w-3.5 shrink-0 text-slate-400 transition ${open ? 'rotate-180' : ''}`} />
       </button>
       {open ? (
         <div className="space-y-2.5 border-t border-slate-100 px-3 py-2.5 text-xs">
-          <div><div className="text-slate-500">Summary</div><div className="text-slate-700">{entry.summary}</div></div>
-          <div><div className="text-slate-500">Caller</div><div className="text-slate-700">{entry.caller}</div></div>
+          <div><div className="text-slate-500">{t("Summary")}</div><div className="text-slate-700">{t(entry.summary)}</div></div>
+          <div><div className="text-slate-500">{t("Caller")}</div><div className="text-slate-700">{t(entry.caller)}</div></div>
           {entry.body ? (
             <div>
-              <div className="text-slate-500">Body</div>
+              <div className="text-slate-500">{t("Body")}</div>
               <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-words rounded-md border border-slate-200 bg-slate-50 px-2.5 py-2 font-mono text-[11px] leading-5 text-slate-700">{entry.body}</pre>
             </div>
           ) : null}
           <div>
-            <div className="text-slate-500">Response</div>
+            <div className="text-slate-500">{t("Response")}</div>
             <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-words rounded-md border border-slate-200 bg-slate-50 px-2.5 py-2 font-mono text-[11px] leading-5 text-slate-700">{entry.response}</pre>
           </div>
         </div>
@@ -659,6 +661,7 @@ function EndpointToggle({ entry }: { entry: EndpointEntry }) {
 }
 
 export function SettingsPage() {
+  const t = useT()
   const lastUpdatedAt = useWorkbenchUiStore((state) => state.lastUpdatedAt)
   const [authEnabled, setAuthEnabled] = useState<boolean | null>(null)
   const session = readAdminSession()
@@ -683,18 +686,18 @@ export function SettingsPage() {
   }, [])
 
   const runtimeCards: Array<[string, string]> = [
-    ['Daemon Host', daemonHost],
-    ['Daemon Port', daemonPort],
-    ['Admin Auth', authEnabled === null ? 'unknown' : authEnabled ? 'enabled' : 'disabled'],
-    ['Signed-in User', session?.username ?? '—'],
-    ['Last UI Refresh', formatDateTime(lastUpdatedAt)],
+    [t("Daemon Host"), daemonHost],
+    [t("Daemon Port"), daemonPort],
+    [t("Admin Auth"), authEnabled === null ? 'unknown' : authEnabled ? 'enabled' : 'disabled'],
+    [t("Signed-in User"), session?.username ?? '—'],
+    [t("Last UI Refresh"), formatDateTime(lastUpdatedAt)],
   ]
   const endpointGroups = ENDPOINT_GROUPS
 
   return (
-    <PageContainer title="Settings" subtitle="Read-only runtime information and the maintainer daemon endpoint catalog.">
+    <PageContainer title={t("Settings")} subtitle={t("Read-only runtime information and the maintainer daemon endpoint catalog.")}>
       <section>
-        <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Runtime</h2>
+        <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">{t("Runtime")}</h2>
         <div className="grid gap-2 md:grid-cols-3 xl:grid-cols-5">
           {runtimeCards.map(([label, value]) => (
             <div key={label} className="rounded-lg border border-slate-200 bg-white px-3 py-2.5">
@@ -706,10 +709,10 @@ export function SettingsPage() {
       </section>
 
       <section className="space-y-3">
-        <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Known Endpoints</h2>
+        <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-500">{t("Known Endpoints")}</h2>
         {endpointGroups.map((g) => (
-          <div key={g.group} className="space-y-2">
-            <div className="px-1 text-[11px] font-semibold uppercase tracking-wide text-slate-500">{g.group}</div>
+          <div key={t(g.group)} className="space-y-2">
+            <div className="px-1 text-[11px] font-semibold uppercase tracking-wide text-slate-500">{t(g.group)}</div>
             <div className="space-y-1.5">
               {g.endpoints.map((e) => (
                 <EndpointToggle key={`${e.method} ${e.path}`} entry={e} />

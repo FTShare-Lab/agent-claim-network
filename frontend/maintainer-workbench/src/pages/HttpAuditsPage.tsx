@@ -1,3 +1,4 @@
+import { useT } from '../i18n'
 import { useEffect, useMemo, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router'
 
@@ -32,6 +33,7 @@ function auditIdFromRouteState(state: unknown) {
 }
 
 export function HttpAuditsPage() {
+  const t = useT()
   const location = useLocation()
   const navigate = useNavigate()
   const routeAuditId = auditIdFromRouteState(location.state)
@@ -66,33 +68,33 @@ export function HttpAuditsPage() {
   const errorCount = filtered.filter((audit) => audit.status_code >= 400).length
   const latestSource = filtered[0]?.source_ip ?? 'Unavailable'
 
-  if (isLoading) return <div className="rounded-lg border border-slate-200 bg-white p-6 text-sm text-slate-500">Loading audits…</div>
+  if (isLoading) return <div className="rounded-lg border border-slate-200 bg-white p-6 text-sm text-slate-500">{t("Loading audits…")}</div>
   if (error) return <div className="rounded-lg border border-rose-200 bg-rose-50 p-6 text-sm text-rose-700">{String(error)}</div>
 
   return (
-    <PageContainer title="HTTP Audits" subtitle="Inspect maintainer daemon request traces, response metadata, and related operational resources.">
+    <PageContainer title={t("HTTP Audits")} subtitle={t("Inspect maintainer daemon request traces, response metadata, and related operational resources.")}>
       <FilterBar>
         <label className="space-y-1 text-xs text-slate-600">
-          <span className="font-medium text-slate-700">Path</span>
-          <input className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none" placeholder="/maintenance/sweep or /disputes/*" value={pathFilter} onChange={(event) => { setPathFilter(event.target.value); setPage(1) }} />
+          <span className="font-medium text-slate-700">{t("Path")}</span>
+          <input className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none" placeholder={t("/maintenance/sweep or /disputes/*")} value={pathFilter} onChange={(event) => { setPathFilter(event.target.value); setPage(1) }} />
         </label>
         <label className="space-y-1 text-xs text-slate-600">
-          <span className="font-medium text-slate-700">Status</span>
+          <span className="font-medium text-slate-700">{t("Status")}</span>
           <select className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none" value={statusFilter} onChange={(event) => { setStatusFilter(event.target.value); setPage(1) }}>
-            <option value="all">All Status</option>
+            <option value="all">{t("All Status")}</option>
             <option value="2">2xx</option>
             <option value="4">4xx</option>
             <option value="5">5xx</option>
           </select>
         </label>
         <label className="space-y-1 text-xs text-slate-600">
-          <span className="font-medium text-slate-700">Source IP</span>
+          <span className="font-medium text-slate-700">{t("Source IP")}</span>
           <input className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none" placeholder="127.0.0.1" value={sourceFilter} onChange={(event) => { setSourceFilter(event.target.value); setPage(1) }} />
         </label>
         <label className="space-y-1 text-xs text-slate-600">
-          <span className="font-medium text-slate-700">Method</span>
+          <span className="font-medium text-slate-700">{t("Method")}</span>
           <select className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none" value={methodFilter} onChange={(event) => { setMethodFilter(event.target.value); setPage(1) }}>
-            <option value="all">All Methods</option>
+            <option value="all">{t("All Methods")}</option>
             <option value="GET">GET</option>
             <option value="POST">POST</option>
           </select>
@@ -101,10 +103,10 @@ export function HttpAuditsPage() {
 
       <div className="grid gap-2.5 xl:grid-cols-4">
         {[
-          ['Audit Rows', filtered.length, 'Filtered results'],
-          ['Healthy', healthyCount, '2xx–3xx responses'],
-          ['Errors', errorCount, '4xx–5xx responses'],
-          ['Latest Source', latestSource, filtered[0] ? `${filtered[0].method} ${filtered[0].path}` : 'No matching rows'],
+          [t("Audit Rows"), filtered.length, t("Filtered results")],
+          [t("Healthy"), healthyCount, t("2xx–3xx responses")],
+          [t("Errors"), errorCount, t("4xx–5xx responses")],
+          [t("Latest Source"), latestSource, filtered[0] ? `${filtered[0].method} ${filtered[0].path}` : t("No matching rows")],
         ].map(([label, value, detail]) => (
           <div key={label as string} className="min-w-0 rounded-md border border-slate-200 bg-white px-3 py-2.5">
             <div className="text-[11px] text-slate-500">{label}</div>
@@ -116,22 +118,22 @@ export function HttpAuditsPage() {
 
       <section className="space-y-3">
         <div className="flex items-center gap-2">
-          <h2 className="text-sm font-semibold tracking-tight text-slate-900">HTTP Audit Log</h2>
+          <h2 className="text-sm font-semibold tracking-tight text-slate-900">{t("HTTP Audit Log")}</h2>
           <StatusBadge tone="info">{filtered.length}</StatusBadge>
         </div>
         <DataTable
           columns={[
-            { key: 'time', header: 'Time', render: (row: HttpAuditRecord) => <span className="font-mono text-xs">{formatDateTime(row.occurred_at)}</span> },
-            { key: 'request', header: 'Request', render: (row: HttpAuditRecord) => <span className="[overflow-wrap:anywhere] font-mono text-xs font-medium text-slate-900">{row.method} {row.path}</span> },
-            { key: 'status', header: 'Status', render: (row: HttpAuditRecord) => <StatusBadge tone={row.status_code < 400 ? 'success' : 'danger'}>{row.status_code}</StatusBadge> },
-            { key: 'source', header: 'Source', render: (row: HttpAuditRecord) => <span className="font-mono text-[11px] text-slate-500">{row.source_ip ?? 'Unavailable'}</span> },
-            { key: 'resource', header: 'Resource', render: (row: HttpAuditRecord) => <span className="[overflow-wrap:anywhere] font-mono text-[11px] text-slate-500">{row.resource_id ?? '—'}</span> },
-            { key: 'duration', header: 'Duration', render: (row: HttpAuditRecord) => <span className="font-mono text-xs">{row.duration_ms} ms</span> },
+            { key: 'time', header: t("Time"), render: (row: HttpAuditRecord) => <span className="font-mono text-xs">{formatDateTime(row.occurred_at)}</span> },
+            { key: 'request', header: t("Request"), render: (row: HttpAuditRecord) => <span className="[overflow-wrap:anywhere] font-mono text-xs font-medium text-slate-900">{row.method} {row.path}</span> },
+            { key: 'status', header: t("Status"), render: (row: HttpAuditRecord) => <StatusBadge tone={row.status_code < 400 ? 'success' : 'danger'}>{row.status_code}</StatusBadge> },
+            { key: 'source', header: t("Source"), render: (row: HttpAuditRecord) => <span className="font-mono text-[11px] text-slate-500">{row.source_ip ?? 'Unavailable'}</span> },
+            { key: 'resource', header: t("Resource"), render: (row: HttpAuditRecord) => <span className="[overflow-wrap:anywhere] font-mono text-[11px] text-slate-500">{row.resource_id ?? '—'}</span> },
+            { key: 'duration', header: t("Duration"), render: (row: HttpAuditRecord) => <span className="font-mono text-xs">{row.duration_ms} {t("ms")}</span> },
           ]}
           rows={pagedRows}
           getRowId={(row) => row.audit_id}
           onRowClick={(row) => setSelectedAuditId(row.audit_id)}
-          emptyState="No audit rows matched the current filters."
+          emptyState={t("No audit rows matched the current filters.")}
         />
         <PaginationBar page={page} pageSize={pageSize} total={filtered.length} onPageChange={setPage} onPageSizeChange={(size) => { setPageSize(size); setPage(1) }} />
       </section>
@@ -140,33 +142,33 @@ export function HttpAuditsPage() {
         modal={false}
         open={Boolean(selected)}
         onClose={() => setSelectedAuditId(null)}
-        label="HTTP Audit"
-        title={selected ? `${selected.method} ${selected.path}` : 'Audit'}
+        label={t("HTTP Audit")}
+        title={selected ? `${selected.method} ${selected.path}` : t("Audit")}
         subtitle={selected?.audit_id}
       >
         {selected ? (
           <>
             <div className="rounded-lg border border-slate-200 p-3">
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Overview</div>
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">{t("Overview")}</div>
               <div className="mt-2 space-y-1.5 text-xs text-slate-600">
-                <div className="flex justify-between"><span className="text-slate-500">Status</span> <span className="font-mono text-slate-900">{selected.status_code}</span></div>
-                <div className="flex justify-between"><span className="text-slate-500">Duration</span> <span className="font-mono text-slate-900">{selected.duration_ms} ms</span></div>
-                <div className="flex justify-between"><span className="text-slate-500">Source IP</span> <span className="font-mono text-slate-900">{selected.source_ip ?? 'Unavailable'}</span></div>
-                <div className="flex justify-between"><span className="text-slate-500">Occurred At</span> <span className="font-mono text-slate-900">{formatDateTime(selected.occurred_at)}</span></div>
+                <div className="flex justify-between"><span className="text-slate-500">{t("Status")}</span> <span className="font-mono text-slate-900">{selected.status_code}</span></div>
+                <div className="flex justify-between"><span className="text-slate-500">{t("Duration")}</span> <span className="font-mono text-slate-900">{selected.duration_ms} {t("ms")}</span></div>
+                <div className="flex justify-between"><span className="text-slate-500">{t("Source IP")}</span> <span className="font-mono text-slate-900">{selected.source_ip ?? 'Unavailable'}</span></div>
+                <div className="flex justify-between"><span className="text-slate-500">{t("Occurred At")}</span> <span className="font-mono text-slate-900">{formatDateTime(selected.occurred_at)}</span></div>
               </div>
             </div>
             <div className="rounded-lg border border-slate-200 p-3">
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Summary</div>
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">{t("Summary")}</div>
               <div className="mt-2 [overflow-wrap:anywhere] text-xs leading-5 text-slate-600">{selected.summary}</div>
             </div>
             <div className="rounded-lg border border-slate-200 p-3">
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Request Body</div>
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">{t("Request Body")}</div>
               <pre className="mt-2 max-w-full overflow-x-auto rounded-md border border-slate-700 bg-slate-900 px-2.5 py-2 font-mono text-[11px] leading-5 text-slate-100">
                 {formatJsonBody(selected.request_body)}
               </pre>
             </div>
             <div className="rounded-lg border border-slate-200 p-3">
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Response Body</div>
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">{t("Response Body")}</div>
               <pre className="mt-2 max-w-full overflow-x-auto rounded-md border border-slate-700 bg-slate-900 px-2.5 py-2 font-mono text-[11px] leading-5 text-slate-100">
                 {formatJsonBody(selected.response_body)}
               </pre>

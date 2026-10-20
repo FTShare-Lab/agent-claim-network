@@ -1,3 +1,4 @@
+import { useT } from '../i18n'
 import { useMemo, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 
@@ -49,6 +50,7 @@ type DrawerState = {
 const chipLinkClass = "rounded border border-blue-200 bg-blue-50 px-1.5 py-0.5 font-mono text-[11px] font-medium text-blue-700 transition hover:bg-blue-100"
 
 export function ClaimsPage() {
+  const t = useT()
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
   const claimIdFromUrl = searchParams.get('claim_id')
@@ -56,7 +58,10 @@ export function ClaimsPage() {
   const { data: disputes = [] } = useDisputesQuery()
   const [keyword, setKeyword] = useState('')
   const [agent, setAgent] = useState('all')
-  const [status, setStatus] = useState('all')
+  const statusFromUrl = searchParams.get('status')
+  const status = statusFromUrl && ['active', 'stale', 'deprecated'].includes(statusFromUrl)
+    ? statusFromUrl
+    : 'all'
   const [scope, setScope] = useState('')
   const [onlyDisputed, setOnlyDisputed] = useState(false)
   const [page, setPage] = useState(1)
@@ -146,18 +151,23 @@ export function ClaimsPage() {
     setSearchParams(next, { replace: true })
   }
 
-  if (isLoading) return <div className="rounded-lg border border-slate-200 bg-white p-6 text-sm text-slate-500">Loading claims…</div>
+  if (isLoading) return <div className="rounded-lg border border-slate-200 bg-white p-6 text-sm text-slate-500">{t("Loading claims…")}</div>
   if (error) return <div className="rounded-lg border border-rose-200 bg-rose-50 p-6 text-sm text-rose-700">{String(error)}</div>
 
   return (
-    <PageContainer title="Claims" subtitle="Browse mirrored claims published across your agent network.">
+    <PageContainer title={t("Claims")} subtitle={t("Browse mirrored claims published across your agent network.")}>
       <ClaimFilters
         filters={{ keyword, agent, status, scope, onlyDisputed }}
         agents={agents}
         onChange={(patch) => {
           if (patch.keyword !== undefined) setKeyword(patch.keyword)
           if (patch.agent !== undefined) setAgent(patch.agent)
-          if (patch.status !== undefined) setStatus(patch.status)
+          if (patch.status !== undefined) {
+            const next = new URLSearchParams(searchParams)
+            if (patch.status === 'all') next.delete('status')
+            else next.set('status', patch.status)
+            setSearchParams(next)
+          }
           if (patch.scope !== undefined) setScope(patch.scope)
           setPage(1)
         }}
@@ -166,19 +176,17 @@ export function ClaimsPage() {
       <section className="space-y-3">
         <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
           <div className="flex items-center gap-2">
-            <h2 className="text-sm font-semibold tracking-tight text-slate-900">All Claims</h2>
+            <h2 className="text-sm font-semibold tracking-tight text-slate-900">{t("All Claims")}</h2>
             <StatusBadge tone="info">{filtered.length}</StatusBadge>
           </div>
           <label className="inline-flex items-center gap-2 text-xs text-slate-600">
-            <input type="checkbox" checked={onlyDisputed} onChange={(event) => { setOnlyDisputed(event.target.checked); setPage(1) }} />
-            Only disputed claims
-          </label>
+            <input type="checkbox" checked={onlyDisputed} onChange={(event) => { setOnlyDisputed(event.target.checked); setPage(1) }} />{t("Only disputed claims")}</label>
         </div>
         <DataTable
           columns={[
             {
               key: 'claim',
-              header: 'Claim',
+              header: t("Claim"),
               render: (row: ClaimView) => (
                 <div>
                   <div className="font-medium text-slate-900">{row.claim.name}</div>
@@ -186,17 +194,17 @@ export function ClaimsPage() {
                 </div>
               ),
             },
-            { key: 'holder', header: 'Holder', render: (row: ClaimView) => <span className="font-mono text-xs">{row.claim.holder}</span> },
-            { key: 'status', header: 'Status', render: (row: ClaimView) => <StatusBadge>{row.claim.status}</StatusBadge> },
+            { key: 'holder', header: t("Holder"), render: (row: ClaimView) => <span className="font-mono text-xs">{row.claim.holder}</span> },
+            { key: 'status', header: t("Status"), render: (row: ClaimView) => <StatusBadge localizeStatus>{row.claim.status}</StatusBadge> },
             {
               key: 'scope',
-              header: 'Scope',
+              header: t("Scope"),
               mobileHidden: true,
               render: (row: ClaimView) => <div className="max-w-xs text-xs leading-5 text-slate-600">{row.claim.scope}</div>,
             },
             {
               key: 'disputes',
-              header: 'Related Disputes',
+              header: t("Related Disputes"),
               mobileHidden: true,
               render: (row: ClaimView) =>
                 row.open_dispute_ids.length || row.resolved_dispute_ids.length ? (
@@ -216,24 +224,24 @@ export function ClaimsPage() {
                     ))}
                   </div>
                 ) : (
-                  <span className="text-xs text-slate-500">No disputes</span>
+                  <span className="text-xs text-slate-500">{t("No disputes")}</span>
                 ),
             },
-            { key: 'created', header: 'Created At', render: (row: ClaimView) => <span className="font-mono text-xs">{formatDateTime(row.claim.created_at)}</span> },
-            { key: 'updated', header: 'Updated At', render: (row: ClaimView) => <span className="font-mono text-xs">{formatDateTime(row.claim.updated_at)}</span> },
-            { key: 'actions', header: 'Actions', mobileHidden: true, render: () => <span className="text-xs font-medium text-blue-700">View</span> },
+            { key: 'created', header: t("Created At"), render: (row: ClaimView) => <span className="font-mono text-xs">{formatDateTime(row.claim.created_at)}</span> },
+            { key: 'updated', header: t("Updated At"), render: (row: ClaimView) => <span className="font-mono text-xs">{formatDateTime(row.claim.updated_at)}</span> },
+            { key: 'actions', header: t("Actions"), mobileHidden: true, render: () => <span className="text-xs font-medium text-blue-700">{t("View")}</span> },
           ]}
           rows={pagedRows}
           getRowId={(row) => row.claim.id}
           onRowClick={(row) => openClaim(row.claim.id)}
-          emptyState="No claims matched the current filters."
+          emptyState={t("No claims matched the current filters.")}
         />
         <PaginationBar page={page} pageSize={pageSize} total={filtered.length} onPageChange={setPage} onPageSizeChange={(size) => { setPageSize(size); setPage(1) }} />
       </section>
 
       <DetailDrawer
         footer={selectedClaim.data ? (
-          <button type="button" className="text-sm font-semibold text-blue-700" onClick={() => navigate(`/knowledge-tree?root_id=${encodeURIComponent(selectedClaim.data.claim.id)}`)}>View claims flow</button>
+          <button type="button" className="text-sm font-semibold text-blue-700" onClick={() => navigate(`/knowledge-tree?root_id=${encodeURIComponent(selectedClaim.data.claim.id)}`)}>{t("View claims flow")}</button>
         ) : undefined}
         modal={false}
         open={Boolean(effectiveDrawerState?.current && (selectedClaim.data || selectedDispute))}
@@ -242,11 +250,11 @@ export function ClaimsPage() {
         backLabel={
           effectiveDrawerState?.previous
             ? effectiveDrawerState.previous.type === 'claim'
-              ? 'Back to claim'
-              : 'Back to dispute'
+              ? t("Back to claim")
+              : t("Back to dispute")
             : undefined
         }
-        label={selectedDispute ? 'Dispute' : 'Claim'}
+        label={selectedDispute ? t("Dispute") : t("Claim")}
         title={selectedDispute?.name ?? selectedClaim.data?.claim.name ?? 'Claim'}
         subtitle={selectedDispute?.id ?? selectedClaim.data?.claim.id}
       >
@@ -254,15 +262,15 @@ export function ClaimsPage() {
           <ClaimDetails view={selectedClaim.data} onOpenSource={openSource} onOpenDispute={openDispute} />
         ) : selectedDispute ? (
           <>
-            <DrawerSection title="Overview">
+            <DrawerSection title={t("Overview")}>
               <dl className="space-y-2 text-sm">
-                <div className="flex justify-between gap-3"><dt className="text-slate-500">Status</dt><dd><StatusBadge tone={selectedDispute.status === 'open' ? 'danger' : 'success'}>{selectedDispute.status}</StatusBadge></dd></div>
-                <div className="flex justify-between gap-3"><dt className="text-slate-500">Severity</dt><dd><StatusBadge tone={severityTone(selectedDispute)}>{severityFromDispute(selectedDispute)}</StatusBadge></dd></div>
-                <div className="flex justify-between gap-3"><dt className="text-slate-500">Created At</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedDispute.created_at)}</dd></div>
-                <div className="flex justify-between gap-3"><dt className="text-slate-500">Updated At</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedDispute.resolved_at ?? selectedDispute.created_at)}</dd></div>
+                <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Status")}</dt><dd><StatusBadge localizeStatus tone={selectedDispute.status === 'open' ? 'danger' : 'success'}>{selectedDispute.status}</StatusBadge></dd></div>
+                <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Severity")}</dt><dd><StatusBadge tone={severityTone(selectedDispute)}>{severityFromDispute(selectedDispute)}</StatusBadge></dd></div>
+                <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Created At")}</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedDispute.created_at)}</dd></div>
+                <div className="flex justify-between gap-3"><dt className="text-slate-500">{t("Updated At")}</dt><dd className="font-mono text-xs text-slate-900">{formatDateTime(selectedDispute.resolved_at ?? selectedDispute.created_at)}</dd></div>
               </dl>
             </DrawerSection>
-            <DrawerSection title="Direct Claim(s)" tone="claim">
+            <DrawerSection title={t("Direct Claim(s)")} tone="claim">
               <div className="flex flex-wrap gap-1">
                 {selectedDispute.claims.map((claimId) => (
                   <button
@@ -276,7 +284,7 @@ export function ClaimsPage() {
                 ))}
               </div>
             </DrawerSection>
-            <DrawerSection title="Summary">
+            <DrawerSection title={t("Summary")}>
               <div className="whitespace-pre-wrap text-sm leading-6 text-slate-800">{selectedDispute.summary}</div>
             </DrawerSection>
           </>

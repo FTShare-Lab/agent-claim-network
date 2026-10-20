@@ -1,3 +1,4 @@
+import { translate, type Language } from '../i18n'
 const dateFormatter = new Intl.DateTimeFormat('en-CA', {
   year: 'numeric',
   month: '2-digit',
@@ -13,18 +14,18 @@ export function formatDateTime(value: string | null | undefined) {
   return dateFormatter.format(new Date(value)).replace(',', '')
 }
 
-export function formatRelativeMinutes(value: string | null | undefined) {
-  if (!value) return 'Unavailable'
+export function formatRelativeMinutes(value: string | null | undefined, language: Language = 'en') {
+  if (!value) return translate(language, 'Unavailable')
   const minutes = Math.max(0, Math.round((Date.now() - new Date(value).getTime()) / 60000))
-  if (minutes < 1) return 'just now'
-  if (minutes < 60) return `${minutes}m ago`
+  if (minutes < 1) return translate(language, 'just now')
+  if (minutes < 60) return translate(language, '{value}m ago', { value: minutes })
   const hours = Math.round(minutes / 60)
-  if (hours < 24) return `${hours}h ago`
+  if (hours < 24) return translate(language, '{value}h ago', { value: hours })
   const days = Math.round(hours / 24)
-  if (days < 30) return `${days}d ago`
+  if (days < 30) return translate(language, '{value}d ago', { value: days })
   const months = Math.round(days / 30)
-  if (months < 12) return `${months}mo ago`
-  return `${Math.round(months / 12)}y ago`
+  if (months < 12) return translate(language, '{value}mo ago', { value: months })
+  return translate(language, '{value}y ago', { value: Math.round(months / 12) })
 }
 
 export function clampPercent(value: number) {

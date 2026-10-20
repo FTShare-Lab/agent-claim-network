@@ -1,7 +1,9 @@
+import { useT } from '../../i18n'
 // 可滚动和缩放的树形画布，箭头始终从知识来源指向派生知识。
 import { useId, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
 
 import { knowledgeStyles } from './styles'
+import { KnowledgeTypeLegend } from './KnowledgeTypeLegend'
 import { KnowledgeStatusIcons, KnowledgeStatusLegend } from './KnowledgeStatus'
 import { useCanvasPan } from './useCanvasPan'
 import { cn } from '../../lib/utils'
@@ -40,6 +42,7 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
   selectedId?: string
   onSelect: (knowledge: Knowledge) => void
 }) {
+  const t = useT()
   const [budget, setBudget] = useState(500)
   const [expansion, setExpansion] = useState<TreeExpansion>(() => ({ expandAll: false, childLimits: new Map() }))
   const [zoom, setZoom] = useState(1)
@@ -141,27 +144,17 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
   }
 
   return (
-    <section aria-label="Claims flow" className="overflow-hidden rounded-xl border border-slate-200 bg-white">
+    <section aria-label={t("Claims flow")} className="overflow-hidden rounded-xl border border-slate-200 bg-white">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
         <div className="space-y-2">
-          <div role="group" aria-label="Knowledge type legend" className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-slate-600">
-            {Object.entries(knowledgeStyles).map(([kind, style]) => (
-              <span key={kind} className="inline-flex items-center gap-1.5"><span className={cn('h-3 w-3 shrink-0 rounded border', style.className)} />{style.label}</span>
-            ))}
-            <span className="inline-flex items-center gap-1.5">
-              <span data-testid="other-holder-claim-marker" className="h-3.5 w-5 shrink-0" aria-hidden="true">
-                <svg viewBox="0 0 20 14" className="h-full w-full"><rect x="0.5" y="0.5" width="19" height="13" rx="3.5" fill="none" stroke="currentColor" strokeWidth="1" strokeDasharray="6 4" className="text-emerald-400" /></svg>
-              </span>
-              Claim held by others
-            </span>
-          </div>
+          <KnowledgeTypeLegend showOtherHolder />
           <KnowledgeStatusLegend />
         </div>
         <div className="flex items-center gap-1 text-xs text-slate-600">
-          <button type="button" aria-label="Zoom out" disabled={zoom <= 0.2} className="rounded px-2 py-1.5 hover:bg-slate-100 disabled:opacity-40" onClick={() => changeZoom(Math.max(0.2, zoom - 0.2))}>−</button>
-          <span aria-label="Zoom level" className="w-10 text-center font-mono">{Number((zoom * 100).toFixed(1))}%</span>
-          <button type="button" aria-label="Zoom in" disabled={zoom >= 1.6} className="rounded px-2 py-1.5 hover:bg-slate-100 disabled:opacity-40" onClick={() => changeZoom(Math.min(1.6, zoom + 0.2))}>+</button>
-          <button type="button" className="rounded px-2 py-1.5 hover:bg-slate-100" onClick={() => scrollToRoot(viewport.current, tree, zoom)}>Center root</button>
+          <button type="button" aria-label={t("Zoom out")} disabled={zoom <= 0.2} className="rounded px-2 py-1.5 hover:bg-slate-100 disabled:opacity-40" onClick={() => changeZoom(Math.max(0.2, zoom - 0.2))}>−</button>
+          <span aria-label={t("Zoom level")} className="w-10 text-center font-mono">{Number((zoom * 100).toFixed(1))}%</span>
+          <button type="button" aria-label={t("Zoom in")} disabled={zoom >= 1.6} className="rounded px-2 py-1.5 hover:bg-slate-100 disabled:opacity-40" onClick={() => changeZoom(Math.min(1.6, zoom + 0.2))}>+</button>
+          <button type="button" className="rounded px-2 py-1.5 hover:bg-slate-100" onClick={() => scrollToRoot(viewport.current, tree, zoom)}>{t("Center root")}</button>
           <button type="button" className="rounded px-2 py-1.5 hover:bg-slate-100" onClick={() => {
             const element = viewport.current
             if (!element || !tree.width || !tree.height) return
@@ -176,13 +169,13 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
             }
             zoomAnchor.current = center
             setZoom(nextZoom)
-          }}>Fit</button>
+          }}>{t("Fit")}</button>
           <span aria-hidden="true" className="mx-1 h-4 w-px bg-slate-200" />
-          <button type="button" disabled={fullyExpanded || (expansion.expandAll && expansion.childLimits.size === 0)} className="rounded px-2 py-1.5 font-medium text-blue-700 hover:bg-slate-100 disabled:text-slate-400" onClick={() => setExpansion({ expandAll: true, childLimits: new Map() })}>Expand all</button>
-          <button type="button" disabled={tree.nodes.length <= 1} className="rounded px-2 py-1.5 font-medium text-blue-700 hover:bg-slate-100 disabled:text-slate-400" onClick={() => { setExpansion({ expandAll: false, childLimits: new Map([[encodeURIComponent(rootId), 0]]) }); setBudget(500) }}>Collapse all</button>
+          <button type="button" disabled={fullyExpanded || (expansion.expandAll && expansion.childLimits.size === 0)} className="rounded px-2 py-1.5 font-medium text-blue-700 hover:bg-slate-100 disabled:text-slate-400" onClick={() => setExpansion({ expandAll: true, childLimits: new Map() })}>{t("Expand all")}</button>
+          <button type="button" disabled={tree.nodes.length <= 1} className="rounded px-2 py-1.5 font-medium text-blue-700 hover:bg-slate-100 disabled:text-slate-400" onClick={() => { setExpansion({ expandAll: false, childLimits: new Map([[encodeURIComponent(rootId), 0]]) }); setBudget(500) }}>{t("Collapse all")}</button>
         </div>
       </div>
-      <div ref={viewport} tabIndex={0} role="region" aria-label="Claims flow canvas" {...panHandlers} onDoubleClick={zoomAtPoint} className={cn('h-[560px] max-h-[65vh] min-h-72 overflow-auto overscroll-contain bg-[radial-gradient(#d9dce5_1px,transparent_1px)] bg-[size:20px_20px]', isPanning ? 'cursor-grabbing select-none' : 'cursor-grab')}>
+      <div ref={viewport} tabIndex={0} role="region" aria-label={t("Claims flow canvas")} {...panHandlers} onDoubleClick={zoomAtPoint} className={cn('h-[560px] max-h-[65vh] min-h-72 overflow-auto overscroll-contain bg-[radial-gradient(#d9dce5_1px,transparent_1px)] bg-[size:20px_20px]', isPanning ? 'cursor-grabbing select-none' : 'cursor-grab')}>
         <div className="relative" style={{ width: canvasLayout.width, height: canvasLayout.height }}>
           <div className="absolute overflow-hidden" style={{ left: canvasLayout.treeLeft, top: canvasLayout.treeTop, width: tree.width * zoom, height: tree.height * zoom }}>
             <div className="relative origin-top-left" style={{ width: tree.width, height: tree.height, transform: `scale(${zoom})` }}>
@@ -209,35 +202,35 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
                   <div key={node.path} data-tree-node={node.path} className="absolute" style={{ left: node.x, top: node.y, width: NODE_WIDTH }}>
                     <button
                       type="button"
-                      aria-label={`${style.label}: ${node.knowledge.name}${node.key === 0 ? ' (root)' : ''}${node.cycle ? ' (cycle ends here)' : ''}`}
+                      aria-label={`${t(style.label)}: ${node.knowledge.kind === 'missing' ? t('Unavailable source') : node.knowledge.name}${node.key === 0 ? ` ${t('(root)')}` : ''}${node.cycle ? ` ${t('(cycle ends here)')}` : ''}`}
                       aria-pressed={selectedId === node.knowledge.id}
-                      title={`${node.knowledge.name} · ${style.label} · ${node.knowledge.id}${node.cycle ? ' · Cycle ends here' : ''}`}
+                      title={`${node.knowledge.kind === 'missing' ? t('Unavailable source') : node.knowledge.name} · ${t(style.label)} · ${node.knowledge.id}${node.cycle ? t(' · Cycle ends here') : ''}`}
                       onClick={() => onSelect(node.knowledge)}
                       className={cn('relative flex w-full cursor-pointer items-center justify-center rounded-lg border px-3 text-center text-sm font-semibold shadow-sm transition-shadow hover:shadow-md focus-visible:outline-offset-4', node.knowledge.kind !== 'missing' && 'pt-4 pb-0.5', style.className, heldByAnotherAgent && 'border-transparent', node.key === 0 && 'ring-2 ring-slate-400 ring-offset-2', selectedId === node.knowledge.id && 'outline-2 outline-offset-2 outline-[var(--accent)]')}
                       style={{ height: NODE_HEIGHT }}
                     >
                       {heldByAnotherAgent ? <svg data-testid="other-holder-claim-border" aria-hidden="true" viewBox={`0 0 ${NODE_WIDTH} ${NODE_HEIGHT}`} preserveAspectRatio="none" className="pointer-events-none absolute inset-0 h-full w-full text-emerald-400"><rect x="0.5" y="0.5" width={NODE_WIDTH - 1} height={NODE_HEIGHT - 1} rx="7.5" fill="none" stroke="currentColor" strokeWidth="1" strokeDasharray="12 10" /></svg> : null}
                       <KnowledgeStatusIcons knowledge={node.knowledge} />
-                      <span className="line-clamp-2 [overflow-wrap:anywhere]">{node.knowledge.name}</span>
+                      <span className="line-clamp-2 [overflow-wrap:anywhere]">{node.knowledge.kind === 'missing' ? t('Unavailable source') : node.knowledge.name}</span>
                     </button>
                     {node.childCount > 0 ? (
                       <div className="absolute left-1/2 ml-4 flex cursor-pointer items-center gap-1" style={{ top: direction === 'predecessors' ? -30 : NODE_HEIGHT + 6 }}>
                         <button type="button" aria-expanded={node.expanded}
-                          aria-label={`${node.expanded ? 'Collapse' : 'Expand'} branches for ${node.knowledge.name}`}
-                          title={node.expanded ? 'Collapse this branch' : `Show ${Math.min(BRANCH_BATCH_SIZE, node.childCount)} of ${node.childCount} branches`}
+                          aria-label={t('{action} branches for {name}', { action: node.expanded ? t('Collapse') : t('Expand'), name: node.knowledge.name })}
+                          title={node.expanded ? t("Collapse this branch") : t('Show {count} of {total} branches', { count: Math.min(BRANCH_BATCH_SIZE, node.childCount), total: node.childCount })}
                           className="min-w-7 whitespace-nowrap rounded-full border border-slate-300 bg-white px-2 py-1 text-xs font-semibold text-slate-700 shadow-sm hover:border-blue-400 hover:text-blue-700"
                           onClick={() => changeBranch(node, node.expanded ? 0 : BRANCH_BATCH_SIZE)}
                         >{node.expanded ? '−' : `+ ${node.childCount}`}</button>
                         {node.expanded && node.children.length < node.childCount ? (
-                          <button type="button" aria-label={`Show more branches for ${node.knowledge.name}`}
-                            title={`Show next ${Math.min(BRANCH_BATCH_SIZE, node.childCount - node.children.length)} of ${node.childCount - node.children.length} hidden branches`}
+                          <button type="button" aria-label={t('Show more branches for {name}', { name: node.knowledge.name })}
+                            title={t('Show next {count} of {total} hidden branches', { count: Math.min(BRANCH_BATCH_SIZE, node.childCount - node.children.length), total: node.childCount - node.children.length })}
                             className="whitespace-nowrap rounded-full border border-blue-200 bg-white px-2 py-1 text-xs font-semibold text-blue-700 shadow-sm hover:bg-blue-50"
                             onClick={() => changeBranch(node, node.children.length + BRANCH_BATCH_SIZE)}
                           >+ {node.childCount - node.children.length}</button>
                         ) : null}
                       </div>
                     ) : null}
-                    {node.cycle ? <span className="mt-1 block text-center text-[11px] text-slate-600">↻ Cycle ends here</span> : null}
+                    {node.cycle ? <span className="mt-1 block text-center text-[11px] text-slate-600">{t("↻ Cycle ends here")}</span> : null}
                   </div>
                 )
               })}
@@ -245,12 +238,12 @@ export function KnowledgeTree({ index, rootId, direction, selectedId, onSelect }
           </div>
         </div>
       </div>
-      <div role="group" aria-label="Flow summary" className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200 px-4 py-3 text-xs text-slate-500">
+      <div role="group" aria-label={t("Flow summary")} className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200 px-4 py-3 text-xs text-slate-500">
         <div>
-          <p className="font-medium text-slate-700" aria-live="polite">{tree.nodes.length} displayed {tree.nodes.length === 1 ? 'node' : 'nodes'} · {tree.uniqueCount} unique {tree.uniqueCount === 1 ? 'item' : 'items'}</p>
-          <p className="mt-1">Counts cover visible nodes. Arrows point from source to derived knowledge.</p>
+          <p className="font-medium text-slate-700" aria-live="polite">{tree.nodes.length} {t("displayed")} {tree.nodes.length === 1 ? t("node") : t("nodes")} · {tree.uniqueCount} {t("unique")} {tree.uniqueCount === 1 ? t("item") : t("items")}</p>
+          <p className="mt-1">{t("Counts cover visible nodes. Arrows point from source to derived knowledge.")}</p>
         </div>
-        {tree.omitted > 0 ? <button type="button" className="font-semibold text-blue-700" onClick={() => setBudget(budget + 500)}>Show more nodes</button> : null}
+        {tree.omitted > 0 ? <button type="button" className="font-semibold text-blue-700" onClick={() => setBudget(budget + 500)}>{t("Show more nodes")}</button> : null}
       </div>
     </section>
   )

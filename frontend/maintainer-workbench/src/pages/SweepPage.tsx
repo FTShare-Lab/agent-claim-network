@@ -1,3 +1,4 @@
+import { useT, useLanguage } from '../i18n'
 import { type ReactNode, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router'
 
@@ -102,6 +103,7 @@ function DrawerSection({
 }
 
 function CandidateSection({ title, children }: { title: string; children: ReactNode }) {
+  const t = useT()
   const [expanded, setExpanded] = useState(false)
   const contentId = useId()
   return (
@@ -109,10 +111,10 @@ function CandidateSection({ title, children }: { title: string; children: ReactN
       <div className="flex items-center justify-between gap-3">
         <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">{title}</div>
         <button type="button" aria-expanded={expanded} aria-controls={contentId}
-          aria-label={`${expanded ? 'Collapse' : 'Expand'} ${title}`}
+          aria-label={`${expanded ? t("Collapse") : t("Expand")} ${title}`}
           onClick={() => setExpanded(!expanded)}
           className="rounded-md border border-slate-200 px-3 py-1.5 text-xs font-semibold text-blue-700 transition hover:bg-blue-50">
-          {expanded ? 'Collapse' : 'Expand'}
+          {expanded ? t("Collapse") : t("Expand")}
         </button>
       </div>
       <div id={contentId} hidden={!expanded} className="mt-2">{expanded ? children : null}</div>
@@ -147,14 +149,15 @@ function CandidateTable({
   rows: Array<[string, string]>
   empty: string
 }) {
+  const t = useT()
   if (!rows.length) return <div className="text-xs text-slate-500">{empty}</div>
   return (
     <FiveRowTable>
       <table className="w-full min-w-[440px] text-left text-xs leading-4">
         <thead className="border-b border-slate-200 text-[10px] font-semibold uppercase tracking-wide text-slate-500">
           <tr>
-            <th className="align-middle py-2 pr-4">Agent</th>
-            <th className="align-middle py-2 pr-4">Claim</th>
+            <th className="align-middle py-2 pr-4">{t("Agent")}</th>
+            <th className="align-middle py-2 pr-4">{t("Claim")}</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-100">
@@ -171,19 +174,20 @@ function CandidateTable({
 }
 
 function NotificationTable({ run }: { run: SweepRunRecord }) {
+  const t = useT()
   const notifications = notificationsOf(run)
-  if (!notifications.length) return <div className="text-xs text-slate-500">No ClaimAttributeUpdate notifications were sent.</div>
+  if (!notifications.length) return <div className="text-xs text-slate-500">{t("No ClaimAttributeUpdate notifications were sent.")}</div>
   return (
     <FiveRowTable>
       <table className="w-full min-w-[760px] table-fixed text-left text-xs leading-4">
         <colgroup><col className="w-[18%]" /><col className="w-[25%]" /><col className="w-[25%]" /><col className="w-[24%]" /><col className="w-[8%]" /></colgroup>
         <thead className="border-b border-slate-200 text-[10px] font-semibold uppercase tracking-wide text-slate-500">
           <tr>
-            <th className="align-middle py-2 pr-4">Agent</th>
-            <th className="align-middle py-2 pr-4">Stale Claims</th>
-            <th className="align-middle py-2 pr-4">Deprecated Claims</th>
-            <th className="align-middle py-2 pr-4">Policy</th>
-            <th className="align-middle py-2 pr-4">Pushed</th>
+            <th className="align-middle py-2 pr-4">{t("Agent")}</th>
+            <th className="align-middle py-2 pr-4">{t("Stale Claims")}</th>
+            <th className="align-middle py-2 pr-4">{t("Deprecated Claims")}</th>
+            <th className="align-middle py-2 pr-4">{t("Policy")}</th>
+            <th className="align-middle py-2 pr-4">{t("Pushed")}</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-100">
@@ -203,17 +207,18 @@ function NotificationTable({ run }: { run: SweepRunRecord }) {
 }
 
 function NotificationErrorTable({ run }: { run: SweepRunRecord }) {
+  const t = useT()
   const errors = notificationErrorsOf(run)
-  if (!errors.length) return <div className="text-xs text-slate-500">No notification errors were recorded for this run.</div>
+  if (!errors.length) return <div className="text-xs text-slate-500">{t("No notification errors were recorded for this run.")}</div>
   return (
     <div className="overflow-x-auto">
       <table className="w-full min-w-[760px] text-left text-xs">
         <thead className="border-b border-slate-200 text-[10px] font-semibold uppercase tracking-wide text-slate-500">
           <tr>
-            <th className="align-middle py-2 pr-4">Agent</th>
-            <th className="align-middle py-2 pr-4">Stale Claims</th>
-            <th className="align-middle py-2 pr-4">Deprecated Claims</th>
-            <th className="align-middle py-2 pr-4">Error</th>
+            <th className="align-middle py-2 pr-4">{t("Agent")}</th>
+            <th className="align-middle py-2 pr-4">{t("Stale Claims")}</th>
+            <th className="align-middle py-2 pr-4">{t("Deprecated Claims")}</th>
+            <th className="align-middle py-2 pr-4">{t("Error")}</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-100">
@@ -238,6 +243,8 @@ function runIdFromRouteState(state: unknown) {
 }
 
 export function SweepPage() {
+  const t = useT()
+  const language = useLanguage()
   const location = useLocation()
   const navigate = useNavigate()
   const routeRunId = runIdFromRouteState(location.state)
@@ -278,37 +285,35 @@ export function SweepPage() {
   const latestFindingCount = useMemo(() => findingCount(latest), [latest])
   const nextSweepAt = overviewData?.sweep_schedule?.next_sweep_at ?? null
 
-  if (isLoading) return <div className="rounded-lg border border-slate-200 bg-white p-6 text-sm text-slate-500">Loading sweep history...</div>
+  if (isLoading) return <div className="rounded-lg border border-slate-200 bg-white p-6 text-sm text-slate-500">{t("Loading sweep history...")}</div>
   if (error) return <div className="rounded-lg border border-rose-200 bg-rose-50 p-6 text-sm text-rose-700">{String(error)}</div>
 
   return (
     <PageContainer
-      title="Sweep"
-      subtitle="Review claim aging findings, maintainer notifications, and retryable notification failures."
+      title={t("Sweep")}
+      subtitle={t("Review claim aging findings, maintainer notifications, and retryable notification failures.")}
       actions={
         <button
           type="button"
           className="rounded-md bg-blue-700 px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-blue-800 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-500 disabled:hover:bg-slate-200"
           disabled={isStaticDemo || triggerSweep.isPending}
-          title={isStaticDemo ? 'Static preview is read-only' : undefined}
+          title={isStaticDemo ? t("Static preview is read-only") : undefined}
           onClick={() => triggerSweep.mutate()}
         >
-          {isStaticDemo ? 'Trigger Sweep (read-only)' : triggerSweep.isPending ? 'Running Sweep...' : 'Trigger Sweep Now'}
+          {isStaticDemo ? t("Trigger Sweep (read-only)") : triggerSweep.isPending ? t("Running Sweep...") : t("Trigger Sweep Now")}
         </button>
       }
     >
-      <section className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs text-slate-600">
-        Sweep sends ClaimAttributeUpdate suggestions, but claim status changes remain owned by each agent.
-      </section>
+      <section className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs text-slate-600">{t("Sweep sends ClaimAttributeUpdate suggestions, but claim status changes remain owned by each agent.")}</section>
 
       <div className="grid gap-2.5 xl:grid-cols-6">
         {[
-          ['Last Sweep', latest ? formatDateTime(latest.triggered_at) : 'N/A', latest ? formatRelativeMinutes(latest.triggered_at) : 'No runs'],
-          ['Next Sweep (ETA)', nextSweepAt ? formatDateTime(nextSweepAt) : 'N/A', nextSweepAt ? formatRelativeMinutes(nextSweepAt) : 'not scheduled'],
-          ['Total Findings', latestFindingCount, 'latest run'],
-          ['Stale Claims', latest?.report.stale_claims.length ?? 0, 'current run'],
-          ['Deprecated Claims', latest?.report.deprecated_claims.length ?? 0, 'current run'],
-          ['Notified Agents', notificationsOf(latest).length, `${notificationErrorsOf(latest).length} errors`],
+          [t("Last Sweep"), latest ? formatDateTime(latest.triggered_at) : t("N/A"), latest ? formatRelativeMinutes(latest.triggered_at, language) : t("No runs")],
+          [t("Next Sweep (ETA)"), nextSweepAt ? formatDateTime(nextSweepAt) : t("N/A"), nextSweepAt ? formatRelativeMinutes(nextSweepAt, language) : t("not scheduled")],
+          [t("Total Findings"), latestFindingCount, t("latest run")],
+          [t("Stale Claims"), latest?.report.stale_claims.length ?? 0, t("current run")],
+          [t("Deprecated Claims"), latest?.report.deprecated_claims.length ?? 0, t("current run")],
+          [t("Notified Agents"), notificationsOf(latest).length, t('{count} errors', { count: notificationErrorsOf(latest).length })],
         ].map(([label, value, detail]) => (
           <div key={label as string} className="rounded-md border border-slate-200 bg-white px-3 py-2.5">
             <div className="text-[11px] text-slate-500">{label}</div>
@@ -320,7 +325,7 @@ export function SweepPage() {
 
       <FilterBar>
         <label className="space-y-1 text-xs text-slate-600">
-          <span className="font-medium text-slate-700">Time Range</span>
+          <span className="font-medium text-slate-700">{t("Time Range")}</span>
           <select
             className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none"
             value={timeRange}
@@ -330,14 +335,14 @@ export function SweepPage() {
               setPage(1)
             }}
           >
-            <option value="all">All Time</option>
-            <option value="24h">Last 24 hours</option>
-            <option value="7d">Last 7 days</option>
-            <option value="30d">Last 30 days</option>
+            <option value="all">{t("All Time")}</option>
+            <option value="24h">{t("Last 24 hours")}</option>
+            <option value="7d">{t("Last 7 days")}</option>
+            <option value="30d">{t("Last 30 days")}</option>
           </select>
         </label>
         <label className="space-y-1 text-xs text-slate-600">
-          <span className="font-medium text-slate-700">Triggered By</span>
+          <span className="font-medium text-slate-700">{t("Triggered By")}</span>
           <select
             className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm outline-none"
             value={triggerFilter}
@@ -346,10 +351,10 @@ export function SweepPage() {
               setPage(1)
             }}
           >
-            <option value="all">All Triggers</option>
-            <option value="manual">Manual</option>
-            <option value="maintainer_startup">Maintainer startup</option>
-            <option value="ticker">Scheduled ticker</option>
+            <option value="all">{t("All Triggers")}</option>
+            <option value="manual">{t("Manual")}</option>
+            <option value="maintainer_startup">{t("Maintainer startup")}</option>
+            <option value="ticker">{t("Scheduled ticker")}</option>
           </select>
         </label>
         <button
@@ -361,43 +366,41 @@ export function SweepPage() {
             setTriggerFilter('all')
             setPage(1)
           }}
-        >
-          Reset
-        </button>
+        >{t("Reset")}</button>
       </FilterBar>
 
       <section className="space-y-3">
         <div className="flex items-center gap-2">
-          <h2 className="text-sm font-semibold tracking-tight text-slate-900">Sweep History</h2>
+          <h2 className="text-sm font-semibold tracking-tight text-slate-900">{t("Sweep History")}</h2>
           <StatusBadge tone="info">{filteredRuns.length}</StatusBadge>
         </div>
         <DataTable
           columns={[
-            { key: 'triggeredAt', header: 'Triggered At', render: (row: SweepRunRecord) => <span className="font-mono text-xs">{formatDateTime(row.triggered_at)}</span> },
-            { key: 'trigger', header: 'Triggered By', render: (row: SweepRunRecord) => <span className="text-xs font-medium text-slate-700">{triggerLabel(row.trigger)}</span> },
+            { key: 'triggeredAt', header: t("Triggered At"), render: (row: SweepRunRecord) => <span className="font-mono text-xs">{formatDateTime(row.triggered_at)}</span> },
+            { key: 'trigger', header: t("Triggered By"), render: (row: SweepRunRecord) => <span className="text-xs font-medium text-slate-700">{t(triggerLabel(row.trigger))}</span> },
             {
               key: 'findings',
-              header: 'Findings',
+              header: t("Findings"),
               render: (row: SweepRunRecord) => <span className="font-mono text-xs">{findingCount(row)}</span>,
             },
-            { key: 'stale', header: 'Stale Claims', render: (row: SweepRunRecord) => <span className="font-mono text-xs">{row.report.stale_claims.length}</span> },
-            { key: 'deprecated', header: 'Deprecated Claims', render: (row: SweepRunRecord) => <span className="font-mono text-xs">{row.report.deprecated_claims.length}</span> },
-            { key: 'notifications', header: 'Notifications', render: (row: SweepRunRecord) => <span className="font-mono text-xs">{notificationsOf(row).length}</span> },
+            { key: 'stale', header: t("Stale Claims"), render: (row: SweepRunRecord) => <span className="font-mono text-xs">{row.report.stale_claims.length}</span> },
+            { key: 'deprecated', header: t("Deprecated Claims"), render: (row: SweepRunRecord) => <span className="font-mono text-xs">{row.report.deprecated_claims.length}</span> },
+            { key: 'notifications', header: t("Notifications"), render: (row: SweepRunRecord) => <span className="font-mono text-xs">{notificationsOf(row).length}</span> },
             {
               key: 'status',
-              header: 'Status',
+              header: t("Status"),
               render: (row: SweepRunRecord) =>
                 notificationErrorsOf(row).length ? (
-                  <StatusBadge tone="warning">retryable errors</StatusBadge>
+                  <StatusBadge tone="warning">{t("retryable errors")}</StatusBadge>
                 ) : (
-                  <StatusBadge tone="success">recorded</StatusBadge>
+                  <StatusBadge tone="success">{t("recorded")}</StatusBadge>
                 ),
             },
           ]}
           rows={pagedRuns}
           getRowId={(row) => row.run_id}
           onRowClick={(row) => setSelectedRunId(row.run_id)}
-          emptyState={data.length ? 'No sweep runs matched the current filters.' : 'No sweep history has been recorded yet.'}
+          emptyState={data.length ? t("No sweep runs matched the current filters.") : t("No sweep history has been recorded yet.")}
         />
         <PaginationBar
           page={page}
@@ -415,41 +418,41 @@ export function SweepPage() {
         modal={false}
         open={Boolean(selectedRun)}
         onClose={() => setSelectedRunId(null)}
-        label="Claim Sweep"
-        title={selectedRun ? formatDateTime(selectedRun.triggered_at) : 'Sweep'}
+        label={t("Claim Sweep")}
+        title={selectedRun ? formatDateTime(selectedRun.triggered_at) : t("Sweep")}
         subtitle={selectedRun?.run_id}
       >
         {selectedRun ? (
           <>
-            <DrawerSection title="Run Summary">
+            <DrawerSection title={t("Run Summary")}>
               <dl className="grid gap-2 text-sm md:grid-cols-2">
-                <div className="min-w-0 rounded-lg bg-slate-50 px-2.5 py-2"><dt className="text-xs text-slate-500">Run ID</dt><dd className="mt-1 break-all font-mono text-[11px] leading-4 text-slate-700">{selectedRun.run_id}</dd></div>
-                <div className="min-w-0 rounded-lg bg-slate-50 px-2.5 py-2"><dt className="text-xs text-slate-500">Trigger</dt><dd className="mt-1 break-words text-xs font-medium leading-4 text-slate-900">{triggerLabel(selectedRun.trigger)}</dd></div>
-                <div className="min-w-0 rounded-lg bg-slate-50 px-2.5 py-2"><dt className="text-xs text-slate-500">Triggered At</dt><dd className="mt-1 break-words font-mono text-xs text-slate-900">{formatDateTime(selectedRun.triggered_at)}</dd></div>
-                <div className="min-w-0 rounded-lg bg-slate-50 px-2.5 py-2"><dt className="text-xs text-slate-500">Findings</dt><dd className="mt-1 font-mono text-xs text-slate-900">{findingCount(selectedRun)}</dd></div>
-                <div className="min-w-0 rounded-lg bg-slate-50 px-2.5 py-2"><dt className="text-xs text-slate-500">Notifications</dt><dd className="mt-1 font-mono text-xs text-slate-900">{notificationsOf(selectedRun).length}</dd></div>
-                <div className="min-w-0 rounded-lg bg-slate-50 px-2.5 py-2"><dt className="text-xs text-slate-500">Errors</dt><dd className="mt-1 font-mono text-xs text-slate-900">{notificationErrorsOf(selectedRun).length}</dd></div>
+                <div className="min-w-0 rounded-lg bg-slate-50 px-2.5 py-2"><dt className="text-xs text-slate-500">{t("Run ID")}</dt><dd className="mt-1 break-all font-mono text-[11px] leading-4 text-slate-700">{selectedRun.run_id}</dd></div>
+                <div className="min-w-0 rounded-lg bg-slate-50 px-2.5 py-2"><dt className="text-xs text-slate-500">{t("Trigger")}</dt><dd className="mt-1 break-words text-xs font-medium leading-4 text-slate-900">{t(triggerLabel(selectedRun.trigger))}</dd></div>
+                <div className="min-w-0 rounded-lg bg-slate-50 px-2.5 py-2"><dt className="text-xs text-slate-500">{t("Triggered At")}</dt><dd className="mt-1 break-words font-mono text-xs text-slate-900">{formatDateTime(selectedRun.triggered_at)}</dd></div>
+                <div className="min-w-0 rounded-lg bg-slate-50 px-2.5 py-2"><dt className="text-xs text-slate-500">{t("Findings")}</dt><dd className="mt-1 font-mono text-xs text-slate-900">{findingCount(selectedRun)}</dd></div>
+                <div className="min-w-0 rounded-lg bg-slate-50 px-2.5 py-2"><dt className="text-xs text-slate-500">{t("Notifications")}</dt><dd className="mt-1 font-mono text-xs text-slate-900">{notificationsOf(selectedRun).length}</dd></div>
+                <div className="min-w-0 rounded-lg bg-slate-50 px-2.5 py-2"><dt className="text-xs text-slate-500">{t("Errors")}</dt><dd className="mt-1 font-mono text-xs text-slate-900">{notificationErrorsOf(selectedRun).length}</dd></div>
               </dl>
             </DrawerSection>
 
             <div className="grid gap-2.5" key={selectedRun.run_id}>
-              <CandidateSection title="Stale Candidates">
+              <CandidateSection title={t("Stale Candidates")}>
                 <CandidateTable rows={selectedRun.report.stale_claims} empty="No stale candidates in this run." />
               </CandidateSection>
-              <CandidateSection title="Deprecated Candidates">
+              <CandidateSection title={t("Deprecated Candidates")}>
                 <CandidateTable rows={selectedRun.report.deprecated_claims} empty="No deprecated candidates in this run." />
               </CandidateSection>
             </div>
 
-            <DrawerSection title="Sweep Notifications">
+            <DrawerSection title={t("Sweep Notifications")}>
               <NotificationTable run={selectedRun} />
             </DrawerSection>
 
-            <DrawerSection title="Suggestions & Current Claims">
+            <DrawerSection title={t("Suggestions & Current Claims")}>
               <SweepClaimComparison key={selectedRun.run_id} run={selectedRun} />
             </DrawerSection>
 
-            <DrawerSection title="Notification Errors">
+            <DrawerSection title={t("Notification Errors")}>
               <NotificationErrorTable run={selectedRun} />
             </DrawerSection>
           </>

@@ -1,3 +1,9 @@
+import { beforeEach } from 'vitest'
+import { setLanguage } from '../i18n'
+
+// 现有行为测试沿用英文断言；语言专用测试另行验证中文默认值。
+beforeEach(() => setLanguage('en'))
+
 import '@testing-library/jest-dom/vitest'
 
 // jsdom 不执行布局；滚动区域的真实尺寸在浏览器验收。

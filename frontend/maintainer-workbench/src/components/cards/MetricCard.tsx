@@ -1,3 +1,4 @@
+import { useT } from '../../i18n'
 import { ArrowRight } from 'lucide-react'
 import { Link } from 'react-router'
 
@@ -19,6 +20,7 @@ const accentText = {
 } as const
 
 export function MetricCard({ label, value, detail, href, accent = 'blue' }: MetricCardProps) {
+  const t = useT()
   const content = (
     <div
       className={cn(
@@ -31,7 +33,7 @@ export function MetricCard({ label, value, detail, href, accent = 'blue' }: Metr
       <div className="mt-1 text-xs text-slate-500">{detail}</div>
       {href ? (
         <div className="mt-2 inline-flex items-center gap-1 text-[11px] font-medium text-blue-700">
-          open <ArrowRight className="h-3 w-3" />
+          {t("Open")} <ArrowRight className="h-3 w-3" />
         </div>
       ) : null}
     </div>

@@ -2,6 +2,7 @@ import type { PropsWithChildren } from 'react'
 
 import { statusTone } from '../../lib/format'
 import { cn } from '../../lib/utils'
+import { useStatusLabel } from '../../i18n/status'
 
 const toneClasses = {
   success: 'bg-[var(--success-weak)] text-[var(--success)]',
@@ -14,9 +15,11 @@ const toneClasses = {
 type StatusBadgeProps = PropsWithChildren<{
   tone?: keyof typeof toneClasses
   className?: string
+  localizeStatus?: boolean
 }>
 
-export function StatusBadge({ children, tone, className }: StatusBadgeProps) {
+export function StatusBadge({ children, tone, className, localizeStatus = false }: StatusBadgeProps) {
+  const label = useStatusLabel()
   const resolvedTone = tone ?? statusTone(String(children))
   return (
     <span
@@ -26,7 +29,7 @@ export function StatusBadge({ children, tone, className }: StatusBadgeProps) {
         className,
       )}
     >
-      {children}
+      {localizeStatus && typeof children === 'string' ? label(children) : children}
     </span>
   )
 }

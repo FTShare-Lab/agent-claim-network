@@ -1,4 +1,5 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { setLanguage } from '../i18n'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { renderWorkbenchRoute } from '../app/test-utils'
@@ -192,6 +193,17 @@ describe('PoliciesPage', () => {
     expect(screen.queryByRole('heading', { name: 'Publish Claim Attribute Update' })).not.toBeInTheDocument()
     expect(await screen.findByText('1 / 2 receipt ACKs')).toBeInTheDocument()
     expect(screen.getByText('2 receipt ACKs for broadcast')).toBeInTheDocument()
+    const before = JSON.stringify(policiesResponse)
+    act(() => setLanguage('zh'))
+    expect(screen.getByText('已收到 1 / 2 个接收确认')).toBeInTheDocument()
+    expect(screen.getByText('广播已收到 2 个接收确认')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Policy 历史' })).toBeInTheDocument()
+    const history = screen.getByRole('heading', { name: 'Policy 历史' }).closest('section')!
+    expect(within(history).getAllByText('活跃').length).toBeGreaterThan(0)
+    expect(within(history).getAllByText('废弃').length).toBeGreaterThan(0)
+    act(() => setLanguage('en'))
+    expect(screen.getByText('2 receipt ACKs for broadcast')).toBeInTheDocument()
+    expect(JSON.stringify(policiesResponse)).toBe(before)
   })
 
   it('shows updated time only for policies that have changed', async () => {

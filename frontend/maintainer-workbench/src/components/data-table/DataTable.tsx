@@ -1,3 +1,4 @@
+import { useT } from '../../i18n'
 import type { KeyboardEvent, MouseEvent } from 'react'
 
 import { cn } from '../../lib/utils'
@@ -25,6 +26,7 @@ export function DataTable<Row>({
   onRowClick,
   emptyState = 'No rows found.',
 }: DataTableProps<Row>) {
+  const t = useT()
   function isNestedInteractiveTarget(target: EventTarget | null, currentTarget: EventTarget) {
     if (!(target instanceof HTMLElement) || target === currentTarget) return false
     return Boolean(
@@ -50,7 +52,7 @@ export function DataTable<Row>({
             <tr>
               {columns.map((column) => (
                 <th key={column.key} scope="col" className={cn('px-3 py-2.5 font-semibold', column.mobileHidden && 'hidden md:table-cell', column.className)}>
-                  {column.header}
+                  {t(column.header)}
                 </th>
               ))}
             </tr>
@@ -59,7 +61,7 @@ export function DataTable<Row>({
             {rows.length === 0 ? (
               <tr>
                 <td className="acn-empty-row px-4 py-12 text-center text-sm text-slate-500" colSpan={columns.length}>
-                  {emptyState}
+                  {t(emptyState)}
                 </td>
               </tr>
             ) : (
@@ -77,7 +79,7 @@ export function DataTable<Row>({
                   onKeyDown={onRowClick ? (event) => activateRow(event, row) : undefined}
                 >
                   {columns.map((column) => (
-                    <td key={column.key} data-label={column.header} className={cn('px-3 py-3 align-top', column.mobileHidden && 'hidden md:table-cell', column.className)}>
+                    <td key={column.key} data-label={t(column.header)} className={cn('px-3 py-3 align-top', column.mobileHidden && 'hidden md:table-cell', column.className)}>
                       {column.render(row)}
                     </td>
                   ))}

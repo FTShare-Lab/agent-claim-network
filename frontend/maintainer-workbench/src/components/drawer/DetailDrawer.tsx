@@ -1,3 +1,4 @@
+import { useT } from '../../i18n'
 import { ChevronLeft, X } from 'lucide-react'
 import { type PropsWithChildren, type ReactNode, useEffect, useId, useRef } from 'react'
 import { createPortal } from 'react-dom'
@@ -67,6 +68,7 @@ export function DetailDrawer({
   modal = true,
   children,
 }: DetailDrawerProps) {
+  const t = useT()
   const dialogRef = useRef<HTMLElement>(null)
   const closeButtonRef = useRef<HTMLButtonElement>(null)
   const onCloseRef = useRef(onClose)
@@ -129,7 +131,7 @@ export function DetailDrawer({
         <button
           type="button"
           tabIndex={-1}
-          aria-label="Close dialog background"
+          aria-label={t("Close dialog background")}
           onClick={() => onCloseRef.current()}
           className="acn-overlay-enter absolute inset-0 h-full w-full cursor-default bg-slate-950/35 backdrop-blur-[2px]"
         />
@@ -176,7 +178,7 @@ export function DetailDrawer({
                 type="button"
                 className="acn-interactive inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-slate-500 hover:bg-slate-200/70 hover:text-slate-900"
                 onClick={() => onCloseRef.current()}
-                aria-label="Close detail drawer"
+                aria-label={t("Close detail drawer")}
               >
                 <X aria-hidden="true" className="h-4 w-4" />
               </button>

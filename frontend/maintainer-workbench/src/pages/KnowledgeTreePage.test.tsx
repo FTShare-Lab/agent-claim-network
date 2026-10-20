@@ -21,9 +21,9 @@ describe('Claims Flow page', () => {
 
   afterEach(() => { cleanup(); vi.unstubAllGlobals() })
 
-  it('requires an explicit root and keeps complete ancestry when search filters hide its sources', async () => {
+  it('shows an overview by default and keeps complete ancestry when search filters hide its sources', async () => {
     render(renderWorkbenchRoute('/knowledge-tree'))
-    expect(await screen.findByText('Choose a Claim, Policy Update, or Claim Attribute Update to explore its flow.')).toBeInTheDocument()
+    expect(await screen.findByRole('region', { name: 'All claims overview' })).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('Search'), { target: { value: 'Release readiness evidence' } })
     const choices = within(screen.getByRole('region', { name: 'Choose root knowledge' }))
     expect(choices.queryByRole('button', { name: /Shared evidence/ })).not.toBeInTheDocument()
@@ -33,6 +33,15 @@ describe('Claims Flow page', () => {
     expect(canvas.getAllByRole('button', { name: 'Claim: Shared evidence' })).toHaveLength(2)
     expect(canvas.getAllByRole('button', { name: 'Policy Update: Reliable execution' })).toHaveLength(2)
     expect(canvas.getByRole('button', { name: 'Claim Attribute Update: Review old evidence' })).toBeInTheDocument()
+    const rootChoice = choices.getByRole('button', { name: /Release readiness/ })
+    expect(rootChoice).toHaveAttribute('aria-pressed', 'true')
+    fireEvent.click(rootChoice)
+    expect(await screen.findByRole('region', { name: 'All claims overview' })).toBeInTheDocument()
+    expect(screen.queryByRole('region', { name: 'Claims flow canvas' })).not.toBeInTheDocument()
+    expect(rootChoice).toHaveAttribute('aria-pressed', 'false')
+    expect(screen.getByLabelText('Search')).toHaveValue('Release readiness evidence')
+    fireEvent.click(rootChoice)
+    expect(await screen.findByRole('region', { name: 'Claims flow canvas' })).toBeInTheDocument()
   })
 
   it('opens claim and policy details in place, follows sources, and supports back and re-rooting', async () => {
