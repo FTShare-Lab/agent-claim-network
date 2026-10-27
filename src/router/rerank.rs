@@ -194,6 +194,7 @@ impl ProviderReranker {
                         retry_base_delay,
                         retry_max_delay,
                     )?
+                    .with_sampling_parameters(Some(0.0), None)
                     .with_reasoning_replay(false)
                     .with_reasoning_effort(cfg.reasoning_effort),
                 ),
@@ -211,6 +212,7 @@ impl ProviderReranker {
                         retry_base_delay,
                         retry_max_delay,
                     )?
+                    .with_sampling_parameters(Some(0.0), None)
                     .with_reasoning_effort(cfg.reasoning_effort)
                     .with_thinking(cfg.anthropic_thinking, cfg.anthropic_thinking_budget_tokens),
                 ),
@@ -598,7 +600,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reranker_passes_configured_reasoning_to_each_provider() {
+    async fn reranker_sends_zero_temperature_and_configured_reasoning_to_each_provider() {
         use crate::config::{AnthropicThinking, ReasoningEffort};
         for provider in [
             RerankProvider::OpenAiChat,
@@ -647,6 +649,8 @@ mod tests {
                 let requests = requests.lock().await;
                 assert!(!requests.is_empty());
                 for request in requests.iter() {
+                    assert_eq!(request["temperature"], json!(0.0));
+                    assert!(request.get("top_p").is_none());
                     if effort.is_none() {
                         assert!(request.get("reasoning_effort").is_none());
                         assert!(request.get("reasoning").is_none());
