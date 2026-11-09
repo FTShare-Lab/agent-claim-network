@@ -18,6 +18,7 @@
 
 <p align="center">
   <a href="#introduction">Introduction</a> ·
+  <a href="#deepseek-harness-plugin">DSH Plugin</a> ·
   <a href="#capabilities">Capabilities</a> ·
   <a href="#deepswe-evaluation">DeepSWE Evaluation</a> ·
   <a href="#quick-start">Quick Start</a> ·
@@ -43,6 +44,12 @@ Run `acn` and describe a task in natural language: research information, edit fi
 Claims add another layer. When ACN compacts context or closes a session, it reviews the conversation and extracts conclusions that are well-supported and likely to remain useful. Each Claim records its scope and supporting evidence. When used by one person, Claims reduce repeated questions in later sessions. When multiple people connect their ACN instances to the same team services, their Claims can be discovered, cited, and disputed by one another—allowing judgments to flow and form a Network. Private Memory remains exclusive to each Agent; only Claims with an explicit holder are shared with the team.
 
 Router and Maintainer are separate executables included in this repository and can be deployed when needed. Leaving both endpoints empty enables standalone mode: all local assistant capabilities remain available, but ACN does not connect to team services.
+
+## DeepSeek Harness Plugin
+
+If you use [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), the [ACN plugin](https://github.com/FTShare-Lab/dsh-plugin-acn) lets you accumulate and reuse Claims across sessions and share experience with your team. In DSH, open **Plugins → Add Plugin**, enter [`@ftai/dsh-plugin-acn`](https://www.npmjs.com/package/@ftai/dsh-plugin-acn), then install and enable it. See the [plugin user guide](https://github.com/FTShare-Lab/dsh-plugin-acn/blob/main/docs/user_guide.md) for setup instructions.
+
+The plugin provides the Agent-side functionality. For team use, your team deploys Router and Maintainer separately; standalone use does not require team services. The plugin does not manage private Memory. It supports Apple Silicon Macs running macOS 13 or later and Windows; see the [compatibility documentation](https://github.com/FTShare-Lab/dsh-plugin-acn/blob/main/docs/dsh-compat.md) for details.
 
 ## Capabilities
 

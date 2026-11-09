@@ -18,6 +18,7 @@
 
 <p align="center">
   <a href="#简介">简介</a> ·
+  <a href="#deepseek-harness-插件">DSH 插件</a> ·
   <a href="#能干什么">能干什么</a> ·
   <a href="#deepswe-评测">DeepSWE 评测</a> ·
   <a href="#快速开始">快速开始</a> ·
@@ -43,6 +44,12 @@
 另外一层是 Claim。压缩上下文或结束会话时，ACN 会复盘本轮里站得住、以后还用得上的结论，落成一条带适用范围和依据的判断。一个人用时，下次少重复问；多人把各自的 ACN 接入同一套团队服务后，这些判断可以互相看见、引用和质疑——流动起来，形成 Network。私有 Memory 仍只属于当前 Agent；团队里共享的是带 holder 的 Claim。
 
 团队服务（Router、Maintainer）是仓库里另外两个可执行文件，按需部署。两个地址都留空，就是单人模式：功能齐全，只是不连团队服务。
+
+## DeepSeek Harness 插件
+
+如果你使用 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)，可以通过 [ACN 插件](https://github.com/FTShare-Lab/dsh-plugin-acn)在会话中积累和复用 Claim，并接入团队分享经验。在 DSH 的「插件 → 添加插件」中填写 [`@ftai/dsh-plugin-acn`](https://www.npmjs.com/package/@ftai/dsh-plugin-acn)，安装并启用即可；配置步骤见[插件使用指南](https://github.com/FTShare-Lab/dsh-plugin-acn/blob/main/docs/user_guide.md)。
+
+插件提供 Agent 端功能。团队使用时，Router 和 Maintainer 仍需由团队自行部署；单人使用无需部署团队服务。插件不管理私有 Memory，支持 Apple Silicon Mac（macOS 13 及以上）和 Windows，具体兼容范围见[插件文档](https://github.com/FTShare-Lab/dsh-plugin-acn/blob/main/docs/dsh-compat.md)。
 
 ## 能干什么
 
